@@ -1,0 +1,16 @@
+/target
+Cargo.lock
+*.profraw
+*.profdata
+.DS_Store
+*.log
+*.mp4
+*.webm
+*.mkv
+*.png
+!assets/**/*.png
+!docs/**/*.png
+.idea/
+.vscode/
+*.swp
+tmp/
