@@ -32,6 +32,9 @@ pub(crate) fn configure_process_group(cmd: &mut Command) {
 }
 
 /// Terminates every process in the Unix process group (or Windows process tree) rooted at `pid`.
+///
+/// SAFETY INVARIANT: On Windows, this MUST ONLY be called while the parent still holds an open
+/// `Child` handle to `pid` (never after reaping), preventing PID-reuse kills of unrelated processes.
 pub(crate) fn kill_process_tree_by_pid(pid: u32) {
     #[cfg(unix)]
     {
@@ -54,6 +57,20 @@ pub(crate) fn kill_process_tree_by_pid(pid: u32) {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
+    }
+}
+
+/// Terminates lingering Unix process-group descendants after the immediate wrapper has exited,
+/// ONLY when an inherited pipe is still open (proving a descendant still occupies `pgid`).
+/// On Windows, never calls `taskkill` on an already-reaped PID to avoid PID-reuse hazards.
+pub(crate) fn kill_lingering_unix_process_group(pgid: u32) {
+    #[cfg(unix)]
+    {
+        kill_process_tree_by_pid(pgid);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
     }
 }
 
@@ -156,7 +173,7 @@ pub(crate) fn probe_ffmpeg_with_timeout(
         .ok();
 
     if stdout_opt.is_none() || stderr_opt.is_none() {
-        kill_process_tree_by_pid(child_pid);
+        kill_lingering_unix_process_group(child_pid);
         if stdout_opt.is_none() {
             stdout_opt = out_rx.recv_timeout(Duration::from_millis(200)).ok();
         }

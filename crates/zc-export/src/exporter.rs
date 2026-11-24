@@ -15,7 +15,7 @@ use image::{ExtendedColorType, ImageEncoder};
 use crate::ExportError;
 use crate::ffmpeg::{
     BoundedStderrBuffer, MAX_STDERR_BYTES, build_ffmpeg_os_args_with_output,
-    configure_process_group, kill_process_tree_and_reap, kill_process_tree_by_pid,
+    configure_process_group, kill_lingering_unix_process_group, kill_process_tree_and_reap,
     resolve_ffmpeg_binary,
 };
 use crate::padding::pad_rgba_frame_into;
@@ -41,8 +41,8 @@ impl SharedChildGuard {
         }
     }
 
-    /// Terminates the entire process tree (wrapper + descendants) and reaps the child if still present.
-    /// Still terminates the process group by `pid` even if the wrapper has already exited and been reaped.
+    /// Terminates the entire process tree (wrapper + descendants) and reaps the child if still live.
+    /// Does nothing if the child was already reaped (never killing a potentially reused PID on Windows/Unix).
     fn kill_and_reap(&self) {
         let mut guard = self
             .child
@@ -50,8 +50,20 @@ impl SharedChildGuard {
             .unwrap_or_else(|poison| poison.into_inner());
         if let Some(mut child) = guard.take() {
             kill_process_tree_and_reap(&mut child);
+        }
+    }
+
+    /// Terminates the live child if still running, or (on Unix only) signals the process group
+    /// when inherited pipes are provably still held open by a lingering descendant.
+    fn kill_live_or_lingering_pipes(&self) {
+        let mut guard = self
+            .child
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(mut child) = guard.take() {
+            kill_process_tree_and_reap(&mut child);
         } else {
-            kill_process_tree_by_pid(self.pid);
+            kill_lingering_unix_process_group(self.pid);
         }
     }
 
@@ -127,21 +139,29 @@ where
 
 struct TempDirGuard {
     path: std::path::PathBuf,
+    armed: bool,
 }
 
 impl TempDirGuard {
     fn new(path: std::path::PathBuf) -> Self {
-        Self { path }
+        Self { path, armed: true }
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Preserves the directory on drop (used when rollback fails so original backed-up files remain recoverable).
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -237,7 +257,7 @@ fn publish_staged_png_directory(
     dst_dir: &Path,
     staged_names: &[String],
 ) -> Result<(), ExportError> {
-    let backup_dir = TempDirGuard::new(unique_sibling_temp_path(dst_dir));
+    let mut backup_dir = TempDirGuard::new(unique_sibling_temp_path(dst_dir));
     fs::create_dir_all(backup_dir.path())?;
 
     let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
@@ -283,10 +303,13 @@ fn publish_staged_png_directory(
             if rollback_errors.is_empty() {
                 return Err(ExportError::Io(err));
             }
+            // Preserve the backup directory so any unrestored original frames stay on disk for recovery.
+            backup_dir.disarm();
             return Err(ExportError::Io(std::io::Error::new(
                 err.kind(),
                 format!(
-                    "failed to publish PNG sequence frame ({err}); rollback errors: {}",
+                    "failed to publish PNG sequence frame ({err}); rollback incomplete — original backup directory preserved at {} (errors: {})",
+                    backup_dir.path().display(),
                     rollback_errors.join("; ")
                 ),
             )));
@@ -593,14 +616,14 @@ where
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
             loop {
                 if cancel.load(Ordering::Acquire) {
-                    child_guard.kill_and_reap();
+                    child_guard.kill_live_or_lingering_pipes();
                     return Err(ExportError::Cancelled);
                 }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     // A descendant may still hold stderr open after the wrapper exited;
-                    // terminate the entire process group so pipes close promptly.
-                    child_guard.kill_and_reap();
+                    // terminate lingering Unix process-group descendants so pipes close promptly.
+                    child_guard.kill_live_or_lingering_pipes();
                     match stderr_rx.recv_timeout(Duration::from_millis(200)) {
                         Ok(text) => {
                             stderr_finished = true;
@@ -653,10 +676,11 @@ where
         Ok(())
     })();
 
-    // Ensure the entire process group (even if wrapper already exited) is terminated on error/cancel
-    // or whenever a pipe worker is still open, then join ONLY workers that completed within the
-    // bounded grace window so a detached descendant outside our process group can never hang export.
-    if result.is_err() || !writer_finished || !stderr_finished {
+    // Only kill live children on error, or (on Unix) lingering descendants if pipes are still open.
+    // Never signal an already-reaped PID when pipes have already closed cleanly.
+    if !writer_finished || !stderr_finished {
+        child_guard.kill_live_or_lingering_pipes();
+    } else if result.is_err() {
         child_guard.kill_and_reap();
     }
     if !writer_finished {
@@ -1106,5 +1130,25 @@ mod tests {
             assert_eq!(report.frames_exported, 5);
             assert_ne!(fs::read(&existing_dest).expect("read new mp4"), sentinel);
         }
+    }
+
+    #[test]
+    fn temp_dir_guard_disarm_preserves_backup_directory_for_recovery() {
+        let dir = unique_test_path("disarmed_backup");
+        fs::create_dir_all(&dir).expect("create backup dir");
+        let file = dir.join("frame_000001.png");
+        fs::write(&file, b"ORIGINAL-BACKUP").expect("write backup file");
+
+        {
+            let mut guard = TempDirGuard::new(dir.clone());
+            guard.disarm();
+        }
+
+        assert!(
+            file.exists(),
+            "disarmed backup directory must remain on disk when rollback fails"
+        );
+        assert_eq!(fs::read(&file).expect("read backup"), b"ORIGINAL-BACKUP");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

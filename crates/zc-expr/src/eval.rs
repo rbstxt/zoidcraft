@@ -1,7 +1,7 @@
 //! Deterministic tree-walking evaluator with arena-allocated environments,
 //! strict step and recursion budgets, vector arithmetic, and host scene handles.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::f64::consts::PI;
 use std::rc::Rc;
 
@@ -82,6 +82,45 @@ pub fn evaluate_program(
     evaluator.export_value(&completion, 0, &mut export_nodes, &mut export_bytes)
 }
 
+/// Immutable shared string with cached O(1) ASCII flag so `.length`, `s[i]`,
+/// `charAt`, `charCodeAt`, and ASCII slicing run in true O(1) time even on 4 MiB strings.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct JsStr {
+    text: Rc<str>,
+    is_ascii: bool,
+}
+
+impl JsStr {
+    fn from_rc(text: Rc<str>) -> Self {
+        let is_ascii = text.is_ascii();
+        Self { text, is_ascii }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::ops::Deref for JsStr {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl From<String> for JsStr {
+    fn from(s: String) -> Self {
+        Self::from_rc(Rc::from(s))
+    }
+}
+
+impl From<&str> for JsStr {
+    fn from(s: &str) -> Self {
+        Self::from_rc(Rc::from(s))
+    }
+}
+
 #[derive(Debug, Clone)]
 enum RuntimeValue {
     /// Sentinel used by statements that do not update the completion value.
@@ -90,7 +129,7 @@ enum RuntimeValue {
     Null,
     Bool(bool),
     Number(f64),
-    String(Rc<str>),
+    String(JsStr),
     Array(usize),
     Object(usize),
     Closure(usize),
@@ -147,6 +186,7 @@ struct Evaluator<'a> {
     arrays: Vec<Vec<RuntimeValue>>,
     objects: Vec<BTreeMap<String, RuntimeValue>>,
     closures: Vec<Closure>,
+    literal_strings: HashMap<String, JsStr>,
     rng: Option<DetRng>,
     stringifying_arrays: Vec<usize>,
 }
@@ -163,8 +203,58 @@ impl<'a> Evaluator<'a> {
             arrays: Vec::new(),
             objects: Vec::new(),
             closures: Vec::new(),
+            literal_strings: HashMap::new(),
             rng: None,
             stringifying_arrays: Vec::new(),
+        }
+    }
+
+    fn charge_work(&mut self, units: usize) -> Result<(), ExprError> {
+        let delta = (units as u64).max(1);
+        self.steps = self.steps.saturating_add(delta);
+        if self.steps > self.config.max_steps {
+            return Err(ExprError::StepLimitExceeded {
+                limit: self.config.max_steps,
+            });
+        }
+        Ok(())
+    }
+
+    fn intern_literal_string(&mut self, s: &str) -> Result<RuntimeValue, ExprError> {
+        if let Some(js) = self.literal_strings.get(s) {
+            return Ok(RuntimeValue::String(js.clone()));
+        }
+        self.check_string_alloc(s.len())?;
+        let js = JsStr::from(s);
+        self.literal_strings.insert(s.to_owned(), js.clone());
+        Ok(RuntimeValue::String(js))
+    }
+
+    fn string_char_len(&mut self, s: &JsStr) -> Result<usize, ExprError> {
+        if s.is_ascii {
+            Ok(s.len())
+        } else {
+            self.charge_work(s.len() / 16)?;
+            Ok(s.chars().count())
+        }
+    }
+
+    fn string_char_at(&mut self, s: &JsStr, idx: usize) -> Result<Option<char>, ExprError> {
+        if s.is_ascii {
+            Ok(s.as_bytes().get(idx).map(|&b| char::from(b)))
+        } else {
+            self.charge_work((idx.min(s.len())) / 16)?;
+            Ok(s.chars().nth(idx))
+        }
+    }
+
+    fn string_byte_offset_for_char_index(s: &JsStr, char_idx: usize) -> usize {
+        if s.is_ascii {
+            char_idx.min(s.len())
+        } else {
+            s.char_indices()
+                .nth(char_idx)
+                .map_or(s.len(), |(byte_idx, _)| byte_idx)
         }
     }
 
@@ -190,7 +280,7 @@ impl<'a> Evaluator<'a> {
 
     fn alloc_string(&mut self, s: String) -> Result<RuntimeValue, ExprError> {
         self.check_string_alloc(s.len())?;
-        Ok(RuntimeValue::String(Rc::from(s)))
+        Ok(RuntimeValue::String(JsStr::from(s)))
     }
 
     fn check_array_alloc(&mut self, elem_count: usize) -> Result<(), ExprError> {
@@ -295,28 +385,34 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn intern_value(&mut self, val: Value) -> RuntimeValue {
+    fn intern_value(&mut self, val: Value) -> Result<RuntimeValue, ExprError> {
         match val {
-            Value::Undefined => RuntimeValue::Undefined,
-            Value::Null => RuntimeValue::Null,
-            Value::Bool(b) => RuntimeValue::Bool(b),
-            Value::Number(n) => RuntimeValue::Number(n),
-            Value::String(s) => RuntimeValue::String(Rc::from(s)),
+            Value::Undefined => Ok(RuntimeValue::Undefined),
+            Value::Null => Ok(RuntimeValue::Null),
+            Value::Bool(b) => Ok(RuntimeValue::Bool(b)),
+            Value::Number(n) => Ok(RuntimeValue::Number(n)),
+            Value::String(s) => self.alloc_string(s),
             Value::Array(items) => {
-                let converted: Vec<RuntimeValue> =
-                    items.into_iter().map(|v| self.intern_value(v)).collect();
+                self.check_array_alloc(items.len())?;
+                let mut converted = Vec::with_capacity(items.len());
+                for v in items {
+                    converted.push(self.intern_value(v)?);
+                }
                 let id = self.arrays.len();
                 self.arrays.push(converted);
-                RuntimeValue::Array(id)
+                Ok(RuntimeValue::Array(id))
             }
             Value::Object(map) => {
-                let converted: BTreeMap<String, RuntimeValue> = map
-                    .into_iter()
-                    .map(|(k, v)| (k, self.intern_value(v)))
-                    .collect();
+                self.check_array_alloc(map.len())?;
+                let key_bytes: usize = map.keys().map(String::len).sum();
+                self.charge_alloc_bytes(key_bytes)?;
+                let mut converted = BTreeMap::new();
+                for (k, v) in map {
+                    converted.insert(k, self.intern_value(v)?);
+                }
                 let id = self.objects.len();
                 self.objects.push(converted);
-                RuntimeValue::Object(id)
+                Ok(RuntimeValue::Object(id))
             }
         }
     }
@@ -411,7 +507,7 @@ impl<'a> Evaluator<'a> {
     fn deref_property_handle(&mut self, rv: RuntimeValue) -> Result<RuntimeValue, ExprError> {
         if let RuntimeValue::Handle(HandleRef::Property(prop_id)) = rv {
             let val = self.ctx.property_value(&prop_id)?;
-            Ok(self.intern_value(val))
+            self.intern_value(val)
         } else {
             Ok(rv)
         }
@@ -561,13 +657,13 @@ impl<'a> Evaluator<'a> {
         RuntimeValue::Object(id)
     }
 
-    fn keyframe_to_object(&mut self, kf: KeyframeRecord) -> RuntimeValue {
+    fn keyframe_to_object(&mut self, kf: KeyframeRecord) -> Result<RuntimeValue, ExprError> {
         let mut map = BTreeMap::new();
         map.insert("index".to_string(), RuntimeValue::Number(kf.index as f64));
         map.insert("time".to_string(), RuntimeValue::Number(kf.time));
-        let val = self.intern_value(kf.value);
+        let val = self.intern_value(kf.value)?;
         map.insert("value".to_string(), val);
-        self.alloc_object(map)
+        Ok(self.alloc_object(map))
     }
 
     // -----------------------------------------------------------------------
@@ -717,7 +813,7 @@ impl<'a> Evaluator<'a> {
                     RuntimeValue::Array(id) => self.arrays[id].clone(),
                     RuntimeValue::String(s) => s
                         .chars()
-                        .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
+                        .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
                         .collect(),
                     _ => {
                         return Err(ExprError::TypeError(
@@ -1049,7 +1145,7 @@ impl<'a> Evaluator<'a> {
             RuntimeValue::Array(id) => self.arrays[id].clone(),
             RuntimeValue::String(s) => s
                 .chars()
-                .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
+                .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
                 .collect(),
             _ => {
                 return Err(ExprError::TypeError(
@@ -1112,7 +1208,7 @@ impl<'a> Evaluator<'a> {
                 Some(VarKind::Let | VarKind::Const) => self.push_env(Some(env)),
                 _ => env,
             };
-            let kv = RuntimeValue::String(Rc::from(key));
+            let kv = RuntimeValue::String(JsStr::from(key));
             match for_in.kind {
                 Some(kind) => self.bind_pattern(&for_in.target, kv, iter_env, kind)?,
                 None => {
@@ -1162,7 +1258,7 @@ impl<'a> Evaluator<'a> {
                         let mut err_obj = BTreeMap::new();
                         err_obj.insert(
                             "message".to_string(),
-                            RuntimeValue::String(Rc::from(err.to_string())),
+                            RuntimeValue::String(JsStr::from(err.to_string())),
                         );
                         let err_val = self.alloc_object(err_obj);
                         self.bind_pattern(pat, err_val, catch_env, VarKind::Let)?;
@@ -1198,7 +1294,7 @@ impl<'a> Evaluator<'a> {
                 Literal::Null => RuntimeValue::Null,
                 Literal::Bool(b) => RuntimeValue::Bool(*b),
                 Literal::Number(n) => RuntimeValue::Number(*n),
-                Literal::String(s) => RuntimeValue::String(Rc::from(s.as_str())),
+                Literal::String(s) => self.intern_literal_string(s)?,
             }),
             Expr::Ident(name) => self.resolve_ident(name, env),
             Expr::Template(parts) => {
@@ -1222,7 +1318,7 @@ impl<'a> Evaluator<'a> {
                     self.charge_alloc_bytes(piece.len())?;
                     out.push_str(&piece);
                 }
-                Ok(RuntimeValue::String(Rc::from(out)))
+                Ok(RuntimeValue::String(JsStr::from(out)))
             }
             Expr::Array(elems) => {
                 let mut items = Vec::with_capacity(elems.len());
@@ -1271,10 +1367,11 @@ impl<'a> Evaluator<'a> {
                                         )));
                                     }
                                     self.check_string_alloc(s.len())?;
-                                    items
-                                        .extend(s.chars().map(|c| {
-                                            RuntimeValue::String(Rc::from(c.to_string()))
-                                        }));
+                                    items.extend(
+                                        s.chars().map(|c| {
+                                            RuntimeValue::String(JsStr::from(c.to_string()))
+                                        }),
+                                    );
                                 }
                                 _ => {
                                     return Err(ExprError::TypeError(
@@ -1411,11 +1508,11 @@ impl<'a> Evaluator<'a> {
             "fps" => return Ok(RuntimeValue::Number(self.ctx.fps())),
             "value" => {
                 let v = self.ctx.value();
-                return Ok(self.intern_value(v));
+                return self.intern_value(v);
             }
             "properties" => {
                 let props = self.ctx.properties();
-                return Ok(self.intern_value(Value::Object(props)));
+                return self.intern_value(Value::Object(props));
             }
             "Math" => return Ok(RuntimeValue::Namespace(NamespaceKind::Math)),
             "isNaN" | "isFinite" | "parseInt" | "parseFloat" => {
@@ -1507,10 +1604,10 @@ impl<'a> Evaluator<'a> {
                         Err(ExprError::ReferenceError(_)) => RuntimeValue::Undefined,
                         Err(e) => return Err(e),
                     };
-                    return Ok(RuntimeValue::String(Rc::from(self.typeof_value(&val)?)));
+                    return Ok(RuntimeValue::String(JsStr::from(self.typeof_value(&val)?)));
                 }
                 let val = self.eval_expr(expr, env)?;
-                Ok(RuntimeValue::String(Rc::from(self.typeof_value(&val)?)))
+                Ok(RuntimeValue::String(JsStr::from(self.typeof_value(&val)?)))
             }
             UnaryOp::Delete => match expr {
                 Expr::Member { object, prop } => {
@@ -1676,6 +1773,16 @@ impl<'a> Evaluator<'a> {
                 let obj = self.eval_expr(object, env)?;
                 match obj {
                     RuntimeValue::Object(id) => {
+                        if !self.objects[id].contains_key(prop) {
+                            if self.objects[id].len() >= MAX_ARRAY_LEN {
+                                return Err(ExprError::RangeError(format!(
+                                    "object property count exceeds {MAX_ARRAY_LEN} limit"
+                                )));
+                            }
+                            self.charge_alloc_bytes(
+                                prop.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES),
+                            )?;
+                        }
                         self.objects[id].insert(prop.clone(), val);
                         Ok(())
                     }
@@ -1697,20 +1804,32 @@ impl<'a> Evaluator<'a> {
                             return Err(ExprError::RangeError("invalid array index".to_string()));
                         }
                         let ui = i as usize;
-                        if ui > 100_000 {
-                            return Err(ExprError::RangeError(
-                                "array index exceeds sandbox limit".to_string(),
-                            ));
+                        if ui >= MAX_ARRAY_LEN {
+                            return Err(ExprError::RangeError(format!(
+                                "array index {ui} exceeds {MAX_ARRAY_LEN} limit"
+                            )));
                         }
-                        let arr = &mut self.arrays[id];
-                        if ui >= arr.len() {
-                            arr.resize(ui + 1, RuntimeValue::Undefined);
+                        let cur_len = self.arrays[id].len();
+                        if ui >= cur_len {
+                            let added = ui + 1 - cur_len;
+                            self.check_array_alloc(added)?;
+                            self.arrays[id].resize(ui + 1, RuntimeValue::Undefined);
                         }
-                        arr[ui] = val;
+                        self.arrays[id][ui] = val;
                         Ok(())
                     }
                     RuntimeValue::Object(id) => {
                         let key = self.runtime_to_js_string(&idx)?;
+                        if !self.objects[id].contains_key(&key) {
+                            if self.objects[id].len() >= MAX_ARRAY_LEN {
+                                return Err(ExprError::RangeError(format!(
+                                    "object property count exceeds {MAX_ARRAY_LEN} limit"
+                                )));
+                            }
+                            self.charge_alloc_bytes(
+                                key.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES),
+                            )?;
+                        }
                         self.objects[id].insert(key, val);
                         Ok(())
                     }
@@ -1746,7 +1865,7 @@ impl<'a> Evaluator<'a> {
                     let mut combined = String::with_capacity(total);
                     combined.push_str(&ls);
                     combined.push_str(&rs);
-                    return Ok(RuntimeValue::String(Rc::from(combined)));
+                    return Ok(RuntimeValue::String(JsStr::from(combined)));
                 }
                 // Vector arithmetic (component-wise + scalar broadcast).
                 if let Some(res) = self.try_vector_arith(&left, &right, BinaryOp::Add)? {
@@ -1985,13 +2104,13 @@ impl<'a> Evaluator<'a> {
             }
             RuntimeValue::String(s) => {
                 if prop == "length" {
-                    return Ok(RuntimeValue::Number(s.chars().count() as f64));
+                    let len = self.string_char_len(s)?;
+                    return Ok(RuntimeValue::Number(len as f64));
                 }
                 if let Ok(idx) = prop.parse::<usize>() {
-                    return Ok(s
-                        .chars()
-                        .nth(idx)
-                        .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
+                    return Ok(self
+                        .string_char_at(s, idx)?
+                        .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
                         .unwrap_or(RuntimeValue::Undefined));
                 }
                 Ok(RuntimeValue::Undefined)
@@ -2017,7 +2136,7 @@ impl<'a> Evaluator<'a> {
         if matches!(obj, RuntimeValue::Handle(HandleRef::Controls)) {
             let name = self.runtime_to_js_string(&idx)?;
             let val = self.ctx.control(&name, None)?;
-            return Ok(self.intern_value(val));
+            return self.intern_value(val);
         }
 
         // Auto-deref PropertyHandle when indexed like `thisProperty[0]` or `prop("./Pos")[1]`.
@@ -2041,11 +2160,10 @@ impl<'a> Evaluator<'a> {
             }
             RuntimeValue::String(s) => {
                 if let RuntimeValue::Number(n) = idx {
-                    if n >= 0.0 && n.fract() == 0.0 {
-                        return Ok(s
-                            .chars()
-                            .nth(n as usize)
-                            .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
+                    if n >= 0.0 && n.fract() == 0.0 && n.is_finite() {
+                        return Ok(self
+                            .string_char_at(&s, n as usize)?
+                            .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
                             .unwrap_or(RuntimeValue::Undefined));
                     }
                     return Ok(RuntimeValue::Undefined);
@@ -2073,11 +2191,11 @@ impl<'a> Evaluator<'a> {
             HandleRef::Property(id) => match prop {
                 "value" => {
                     let v = self.ctx.property_value(id)?;
-                    Ok(self.intern_value(v))
+                    self.intern_value(v)
                 }
                 "velocity" => {
                     let v = self.ctx.property_velocity(id, self.ctx.time())?;
-                    Ok(self.intern_value(v))
+                    self.intern_value(v)
                 }
                 "speed" => {
                     let s = self.ctx.property_speed(id, self.ctx.time())?;
@@ -2087,7 +2205,7 @@ impl<'a> Evaluator<'a> {
                 "name" => Ok(self
                     .ctx
                     .handle_name(id)
-                    .map(|s| RuntimeValue::String(Rc::from(s)))
+                    .map(|s| RuntimeValue::String(JsStr::from(s)))
                     .unwrap_or(RuntimeValue::Undefined)),
                 "parent" => match self.ctx.parent_of(id, 1)? {
                     Some(p) => Ok(RuntimeValue::Handle(p)),
@@ -2095,7 +2213,7 @@ impl<'a> Evaluator<'a> {
                 },
                 "length" => {
                     let v = self.ctx.property_value(id)?;
-                    let rv = self.intern_value(v);
+                    let rv = self.intern_value(v)?;
                     self.get_property(&rv, "length")
                 }
                 _ => Ok(RuntimeValue::Undefined),
@@ -2107,7 +2225,7 @@ impl<'a> Evaluator<'a> {
                 "name" => Ok(self
                     .ctx
                     .handle_name(id)
-                    .map(|s| RuntimeValue::String(Rc::from(s)))
+                    .map(|s| RuntimeValue::String(JsStr::from(s)))
                     .unwrap_or(RuntimeValue::Undefined)),
                 "parent" => match self.ctx.parent_of(id, 1)? {
                     Some(p) => Ok(RuntimeValue::Handle(p)),
@@ -2122,7 +2240,7 @@ impl<'a> Evaluator<'a> {
             },
             HandleRef::Controls => {
                 let val = self.ctx.control(prop, None)?;
-                Ok(self.intern_value(val))
+                self.intern_value(val)
             }
         }
     }
@@ -2202,7 +2320,7 @@ impl<'a> Evaluator<'a> {
                         RuntimeValue::String(s) => {
                             out.extend(
                                 s.chars()
-                                    .map(|c| RuntimeValue::String(Rc::from(c.to_string()))),
+                                    .map(|c| RuntimeValue::String(JsStr::from(c.to_string()))),
                             );
                         }
                         _ => {
@@ -2471,7 +2589,7 @@ impl<'a> Evaluator<'a> {
                             self.check_array_alloc(count)?;
                             self.check_string_alloc(s.len())?;
                             s.chars()
-                                .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
+                                .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
                                 .collect()
                         }
                         _ => Vec::new(),
@@ -2536,7 +2654,7 @@ impl<'a> Evaluator<'a> {
                             out.push(ch);
                         }
                     }
-                    Ok(RuntimeValue::String(Rc::from(out)))
+                    Ok(RuntimeValue::String(JsStr::from(out)))
                 }
                 _ => Err(ExprError::TypeError(format!(
                     "String.{method} is not a function"
@@ -2555,7 +2673,7 @@ impl<'a> Evaluator<'a> {
                             self.charge_alloc_bytes(key_bytes)?;
                             self.objects[id]
                                 .keys()
-                                .map(|k| RuntimeValue::String(Rc::from(k.as_str())))
+                                .map(|k| RuntimeValue::String(JsStr::from(k.as_str())))
                                 .collect()
                         }
                         RuntimeValue::Array(id) => {
@@ -2563,7 +2681,7 @@ impl<'a> Evaluator<'a> {
                             self.check_array_alloc(n)?;
                             self.charge_alloc_bytes(n.saturating_mul(8))?;
                             (0..n)
-                                .map(|i| RuntimeValue::String(Rc::from(i.to_string())))
+                                .map(|i| RuntimeValue::String(JsStr::from(i.to_string())))
                                 .collect()
                         }
                         _ => Vec::new(),
@@ -2617,7 +2735,7 @@ impl<'a> Evaluator<'a> {
                     };
                     let mut out = Vec::with_capacity(pairs.len());
                     for (k, val) in pairs {
-                        out.push(self.alloc_array(vec![RuntimeValue::String(Rc::from(k)), val]));
+                        out.push(self.alloc_array(vec![RuntimeValue::String(JsStr::from(k)), val]));
                     }
                     Ok(self.alloc_array(out))
                 }
@@ -2676,7 +2794,7 @@ impl<'a> Evaluator<'a> {
                         }
                     };
                     let parsed = json_parse(&s)?;
-                    Ok(self.intern_value(parsed))
+                    self.intern_value(parsed)
                 }
                 _ => Err(ExprError::TypeError(format!(
                     "JSON.{method} is not a function"
@@ -2702,7 +2820,7 @@ impl<'a> Evaluator<'a> {
                         None => self.ctx.time(),
                     };
                     let val = self.ctx.property_value_at_time(id, t)?;
-                    Ok(self.intern_value(val))
+                    self.intern_value(val)
                 }
                 "velocityAtTime" => {
                     let t = match args.first() {
@@ -2710,7 +2828,7 @@ impl<'a> Evaluator<'a> {
                         None => self.ctx.time(),
                     };
                     let val = self.ctx.property_velocity(id, t)?;
-                    Ok(self.intern_value(val))
+                    self.intern_value(val)
                 }
                 "speedAtTime" => {
                     let t = match args.first() {
@@ -2734,7 +2852,7 @@ impl<'a> Evaluator<'a> {
                         )));
                     }
                     let kf = self.ctx.property_key(id, idx_f as usize)?;
-                    Ok(self.keyframe_to_object(kf))
+                    self.keyframe_to_object(kf)
                 }
                 "nearestKey" => {
                     let t = match args.first() {
@@ -2742,13 +2860,13 @@ impl<'a> Evaluator<'a> {
                         None => self.ctx.time(),
                     };
                     let kf = self.ctx.property_nearest_key(id, t)?;
-                    Ok(self.keyframe_to_object(kf))
+                    self.keyframe_to_object(kf)
                 }
                 "parent" => self.resolve_parent_call(id, &args),
                 _ => {
                     // Fall back to methods on the property's underlying value (e.g. array/string).
                     let val = self.ctx.property_value(id)?;
-                    let rv = self.intern_value(val);
+                    let rv = self.intern_value(val)?;
                     self.call_method_on(rv, method, args, false)
                 }
             },
@@ -3006,7 +3124,7 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => ",".to_string(),
                 };
-                Ok(RuntimeValue::String(Rc::from(
+                Ok(RuntimeValue::String(JsStr::from(
                     self.join_array_to_string(id, &sep)?,
                 )))
             }
@@ -3188,81 +3306,97 @@ impl<'a> Evaluator<'a> {
 
     fn call_string_method(
         &mut self,
-        s: &str,
+        s: &JsStr,
         method: &str,
         args: Vec<RuntimeValue>,
     ) -> Result<RuntimeValue, ExprError> {
-        let chars: Vec<char> = s.chars().collect();
-        let len = chars.len() as isize;
         match method {
             "toLowerCase" => {
+                self.charge_work(s.len() / 16)?;
                 self.check_string_alloc(s.len())?;
-                Ok(RuntimeValue::String(Rc::from(s.to_lowercase())))
+                Ok(RuntimeValue::String(JsStr::from(s.to_lowercase())))
             }
             "toUpperCase" => {
+                self.charge_work(s.len() / 16)?;
                 self.check_string_alloc(s.len())?;
-                Ok(RuntimeValue::String(Rc::from(s.to_uppercase())))
+                Ok(RuntimeValue::String(JsStr::from(s.to_uppercase())))
             }
             "trim" => {
+                self.charge_work(s.len() / 16)?;
                 let t = s.trim();
                 self.check_string_alloc(t.len())?;
-                Ok(RuntimeValue::String(Rc::from(t)))
+                Ok(RuntimeValue::String(JsStr::from(t)))
             }
             "trimStart" => {
+                self.charge_work(s.len() / 16)?;
                 let t = s.trim_start();
                 self.check_string_alloc(t.len())?;
-                Ok(RuntimeValue::String(Rc::from(t)))
+                Ok(RuntimeValue::String(JsStr::from(t)))
             }
             "trimEnd" => {
+                self.charge_work(s.len() / 16)?;
                 let t = s.trim_end();
                 self.check_string_alloc(t.len())?;
-                Ok(RuntimeValue::String(Rc::from(t)))
+                Ok(RuntimeValue::String(JsStr::from(t)))
             }
             "slice" => {
+                let char_len = self.string_char_len(s)? as isize;
                 let start = match args.first() {
-                    Some(v) => normalize_slice_index(self.runtime_to_number(v)?, len),
+                    Some(v) => normalize_slice_index(self.runtime_to_number(v)?, char_len),
                     None => 0,
                 };
                 let end = match args.get(1) {
                     Some(v) if !matches!(v, RuntimeValue::Undefined) => {
-                        normalize_slice_index(self.runtime_to_number(v)?, len)
+                        normalize_slice_index(self.runtime_to_number(v)?, char_len)
                     }
-                    _ => len as usize,
+                    _ => char_len as usize,
                 };
                 if start < end {
-                    let byte_est: usize = chars[start..end].iter().map(|c| c.len_utf8()).sum();
-                    self.check_string_alloc(byte_est)?;
-                    let out: String = chars[start..end].iter().collect();
-                    Ok(RuntimeValue::String(Rc::from(out)))
+                    let b_lo = Self::string_byte_offset_for_char_index(s, start);
+                    let b_hi = Self::string_byte_offset_for_char_index(s, end);
+                    let slice = &s.as_str()[b_lo..b_hi];
+                    self.charge_work(slice.len() / 16)?;
+                    self.check_string_alloc(slice.len())?;
+                    Ok(RuntimeValue::String(JsStr::from(slice)))
                 } else {
-                    Ok(RuntimeValue::String(Rc::from("")))
+                    Ok(RuntimeValue::String(JsStr::from("")))
                 }
             }
             "substring" => {
+                let char_len = self.string_char_len(s)?;
                 let a = match args.first() {
-                    Some(v) => clamp_f64(self.runtime_to_number(v)?, 0.0, len as f64) as usize,
+                    Some(v) => clamp_f64(self.runtime_to_number(v)?, 0.0, char_len as f64) as usize,
                     None => 0,
                 };
                 let b = match args.get(1) {
                     Some(v) if !matches!(v, RuntimeValue::Undefined) => {
-                        clamp_f64(self.runtime_to_number(v)?, 0.0, len as f64) as usize
+                        clamp_f64(self.runtime_to_number(v)?, 0.0, char_len as f64) as usize
                     }
-                    _ => len as usize,
+                    _ => char_len,
                 };
                 let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                let byte_est: usize = chars[lo..hi].iter().map(|c| c.len_utf8()).sum();
-                self.check_string_alloc(byte_est)?;
-                let out: String = chars[lo..hi].iter().collect();
-                Ok(RuntimeValue::String(Rc::from(out)))
+                let b_lo = Self::string_byte_offset_for_char_index(s, lo);
+                let b_hi = Self::string_byte_offset_for_char_index(s, hi);
+                let slice = &s.as_str()[b_lo..b_hi];
+                self.charge_work(slice.len() / 16)?;
+                self.check_string_alloc(slice.len())?;
+                Ok(RuntimeValue::String(JsStr::from(slice)))
             }
             "indexOf" => {
                 let pat = match args.first() {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                self.charge_work(s.len().saturating_add(pat.len()) / 16)?;
                 let idx = s
                     .find(&pat)
-                    .map(|byte_idx| s[..byte_idx].chars().count() as f64)
+                    .map(|byte_idx| {
+                        if s.is_ascii {
+                            byte_idx as f64
+                        } else {
+                            s.as_str()[..byte_idx].chars().count() as f64
+                        }
+                    })
                     .unwrap_or(-1.0);
                 Ok(RuntimeValue::Number(idx))
             }
@@ -3271,6 +3405,7 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                self.charge_work(s.len().saturating_add(pat.len()) / 16)?;
                 Ok(RuntimeValue::Bool(s.contains(&pat)))
             }
             "startsWith" => {
@@ -3278,6 +3413,7 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                self.charge_work(pat.len() / 16)?;
                 Ok(RuntimeValue::Bool(s.starts_with(&pat)))
             }
             "endsWith" => {
@@ -3285,6 +3421,7 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                self.charge_work(pat.len() / 16)?;
                 Ok(RuntimeValue::Bool(s.ends_with(&pat)))
             }
             "split" => {
@@ -3294,24 +3431,24 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => {
                         self.check_string_alloc(s.len())?;
-                        return Ok(self.alloc_array(vec![RuntimeValue::String(Rc::from(s))]));
+                        return Ok(self.alloc_array(vec![RuntimeValue::String(s.clone())]));
                     }
                 };
+                self.charge_work(s.len() / 16)?;
                 let part_count = if sep.is_empty() {
-                    chars.len()
+                    self.string_char_len(s)?
                 } else {
                     s.matches(&sep).count().saturating_add(1)
                 };
                 self.check_array_alloc(part_count)?;
                 self.check_string_alloc(s.len())?;
                 let parts: Vec<RuntimeValue> = if sep.is_empty() {
-                    chars
-                        .into_iter()
-                        .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
+                    s.chars()
+                        .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
                         .collect()
                 } else {
                     s.split(&sep)
-                        .map(|part| RuntimeValue::String(Rc::from(part)))
+                        .map(|part| RuntimeValue::String(JsStr::from(part)))
                         .collect()
                 };
                 Ok(self.alloc_array(parts))
@@ -3325,13 +3462,14 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                self.charge_work(s.len() / 16)?;
                 let est = s
                     .len()
                     .saturating_sub(from.len())
                     .checked_add(to.len())
                     .ok_or_else(|| ExprError::RangeError("replace string overflow".to_string()))?;
                 self.check_string_alloc(est)?;
-                Ok(RuntimeValue::String(Rc::from(s.replacen(&from, &to, 1))))
+                Ok(RuntimeValue::String(JsStr::from(s.replacen(&from, &to, 1))))
             }
             "replaceAll" => {
                 let from = match args.first() {
@@ -3342,8 +3480,9 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                self.charge_work(s.len() / 16)?;
                 let matches = if from.is_empty() {
-                    chars.len().saturating_add(1)
+                    self.string_char_len(s)?.saturating_add(1)
                 } else {
                     s.matches(&from).count()
                 };
@@ -3359,27 +3498,30 @@ impl<'a> Evaluator<'a> {
                         ExprError::RangeError("replaceAll string overflow".to_string())
                     })?;
                 self.check_string_alloc(est)?;
-                Ok(RuntimeValue::String(Rc::from(s.replace(&from, &to))))
+                Ok(RuntimeValue::String(JsStr::from(s.replace(&from, &to))))
             }
             "charAt" => {
                 let idx = match args.first() {
                     Some(v) => self.runtime_to_number(v)?,
                     None => 0.0,
                 };
-                let out = if idx >= 0.0 && (idx as usize) < chars.len() {
-                    chars[idx as usize].to_string()
+                let out = if idx >= 0.0 && idx.is_finite() {
+                    self.string_char_at(s, idx as usize)?
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 };
-                Ok(RuntimeValue::String(Rc::from(out)))
+                Ok(RuntimeValue::String(JsStr::from(out)))
             }
             "charCodeAt" => {
                 let idx = match args.first() {
                     Some(v) => self.runtime_to_number(v)?,
                     None => 0.0,
                 };
-                let out = if idx >= 0.0 && (idx as usize) < chars.len() {
-                    (chars[idx as usize] as u32) as f64
+                let out = if idx >= 0.0 && idx.is_finite() {
+                    self.string_char_at(s, idx as usize)?
+                        .map_or(f64::NAN, |c| (c as u32) as f64)
                 } else {
                     f64::NAN
                 };
@@ -3397,8 +3539,9 @@ impl<'a> Evaluator<'a> {
                 let total_bytes = s.len().checked_mul(count_usize).ok_or_else(|| {
                     ExprError::RangeError("string repeat length overflow".to_string())
                 })?;
+                self.charge_work(total_bytes / 16)?;
                 self.check_string_alloc(total_bytes)?;
-                Ok(RuntimeValue::String(Rc::from(s.repeat(count_usize))))
+                Ok(RuntimeValue::String(JsStr::from(s.repeat(count_usize))))
             }
             _ => Err(ExprError::TypeError(format!(
                 "String.prototype.{method} is not a function"
@@ -3426,7 +3569,7 @@ impl<'a> Evaluator<'a> {
                 let prec = digits as usize;
                 self.alloc_string(format!("{n:.prec$}"))
             }
-            "toString" => Ok(RuntimeValue::String(Rc::from(format_js_number(n)))),
+            "toString" => Ok(RuntimeValue::String(JsStr::from(format_js_number(n)))),
             _ => Err(ExprError::TypeError(format!(
                 "Number.prototype.{method} is not a function"
             ))),
@@ -3550,7 +3693,7 @@ impl<'a> Evaluator<'a> {
                 let b = self.export_arg(&args, 1)?;
                 let t = self.number_arg(&args, 2, 0.0)?;
                 let res = lerp_value(&a, &b, t)?;
-                Ok(self.intern_value(res))
+                self.intern_value(res)
             }
             "linear" => self.builtin_linear(&args),
             "catmullRom" => {
@@ -3560,7 +3703,7 @@ impl<'a> Evaluator<'a> {
                 let p3 = self.export_arg(&args, 3)?;
                 let t = self.number_arg(&args, 4, 0.0)?;
                 let res = catmull_rom_value(&p0, &p1, &p2, &p3, t)?;
-                Ok(self.intern_value(res))
+                self.intern_value(res)
             }
             "ease" => self.builtin_ease(&args),
             "easeIn" => self.builtin_ae_ease_dir(&args, true),
@@ -3635,7 +3778,7 @@ impl<'a> Evaluator<'a> {
                 let seed_offset = self.rng.as_ref().map_or(0.0, DetRng::seed_offset);
                 let base_val = self.ctx.value();
                 let res = eval_wiggle(&base_val, freq, &amp, octaves, amp_mult, t, seed_offset);
-                Ok(self.intern_value(res))
+                self.intern_value(res)
             }
 
             // --- Expressions+ Scene & Property Access ---
@@ -3673,7 +3816,7 @@ impl<'a> Evaluator<'a> {
                     _ => None,
                 };
                 let val = self.ctx.control(&ctrl_name, stable_id.as_deref())?;
-                Ok(self.intern_value(val))
+                self.intern_value(val)
             }
             "toWorld" => {
                 let pt = match args.first() {
@@ -3775,14 +3918,14 @@ impl<'a> Evaluator<'a> {
             let a = self.export_arg(args, 3)?;
             let b = self.export_arg(args, 4)?;
             let res = ae_linear(t, t_min, t_max, &a, &b)?;
-            return Ok(self.intern_value(res));
+            return self.intern_value(res);
         }
         // Vanilla CM3 3-argument form: `linear(a, b, t) = (b - a) * t + a`
         let a = self.export_arg(args, 0)?;
         let b = self.export_arg(args, 1)?;
         let t = self.number_arg(args, 2, 0.0)?;
         let res = lerp_value(&a, &b, t)?;
-        Ok(self.intern_value(res))
+        self.intern_value(res)
     }
 
     fn builtin_ease(&mut self, args: &[RuntimeValue]) -> Result<RuntimeValue, ExprError> {
@@ -3799,7 +3942,7 @@ impl<'a> Evaluator<'a> {
             let a = self.export_arg(args, 3)?;
             let b = self.export_arg(args, 4)?;
             let res = ae_ease(t, t_min, t_max, &a, &b)?;
-            return Ok(self.intern_value(res));
+            return self.intern_value(res);
         }
         // Vanilla CM3 form: `ease(t, family = "Quadratic", dir = "InOut")`
         let t = self.number_arg(args, 0, 0.0)?;
@@ -3830,7 +3973,7 @@ impl<'a> Evaluator<'a> {
             } else {
                 ae_ease_out(t, t_min, t_max, &a, &b)?
             };
-            Ok(self.intern_value(res))
+            self.intern_value(res)
         } else {
             let t = clamp_f64(self.number_arg(args, 0, 0.0)?, 0.0, 1.0);
             let s = if is_in {

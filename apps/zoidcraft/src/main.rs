@@ -945,12 +945,13 @@ impl ZoidCraftApp {
         let mut omitted_embedded_count = 0usize;
         if !include_assets {
             for rec in project_to_save.assets.values_mut() {
-                if rec.bytes.is_some() {
+                if rec.bytes.take().is_some() {
                     omitted_embedded_count += 1;
+                    rec.external = true;
+                    rec.missing = true;
+                } else {
+                    rec.external = true;
                 }
-                rec.bytes = None;
-                rec.external = true;
-                rec.missing = rec.url.is_none();
             }
         }
 
@@ -996,6 +997,29 @@ impl ZoidCraftApp {
         else {
             return;
         };
+
+        let file_len = match fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(err) => {
+                self.show_toast(format!("Failed to inspect media file: {err}"));
+                return;
+            }
+        };
+        let existing_asset_bytes: u64 = self
+            .session
+            .project
+            .assets
+            .values()
+            .filter_map(|r| r.bytes.as_ref())
+            .map(|b| b.len() as u64)
+            .fold(0_u64, u64::saturating_add);
+        if existing_asset_bytes.saturating_add(file_len) > zc_project::MAX_RETAINED_ASSET_BYTES {
+            self.show_toast(format!(
+                "Cannot import media: total embedded assets would exceed {} MiB project limit",
+                zc_project::MAX_RETAINED_ASSET_BYTES / (1024 * 1024)
+            ));
+            return;
+        }
 
         let bytes = match fs::read(&path) {
             Ok(b) => b,
