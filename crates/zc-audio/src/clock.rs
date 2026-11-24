@@ -54,6 +54,11 @@ struct ClockShared {
     /// Queued hardware output latency in samples derived from CPAL's `OutputCallbackInfo`
     /// playback timestamp (so the visual playhead tracks audible output rather than leading it).
     output_latency_samples: AtomicU64,
+    /// Epoch id most recently latched by the real-time audio callback.
+    callback_latched_epoch: AtomicU64,
+    /// Exact submission sample index where `callback_latched_epoch` first began rendering,
+    /// eliminating any 1-buffer skip when seek/resume races an in-flight callback.
+    callback_epoch_start_sample: AtomicU64,
     speed_bits: AtomicU64,
     fps_bits: AtomicU64,
     total_frames_bits: AtomicU64,
@@ -85,6 +90,8 @@ impl ClockShared {
             anchor_sample_count: AtomicU64::new(0),
             hardware_sample_count: AtomicU64::new(0),
             output_latency_samples: AtomicU64::new(0),
+            callback_latched_epoch: AtomicU64::new(0),
+            callback_epoch_start_sample: AtomicU64::new(0),
             speed_bits: AtomicU64::new(0.0_f64.to_bits()),
             fps_bits: AtomicU64::new(clean_fps.to_bits()),
             total_frames_bits: AtomicU64::new(clean_total.to_bits()),
@@ -133,13 +140,17 @@ impl ClockShared {
         }
     }
 
-    /// Computes exact frame at a given hardware sample count without mutating state.
+    /// Computes exact frame at a given hardware sample count relative to `anchor_sample`.
     #[inline]
-    fn evaluate_at_sample(snap: &PlaybackSnapshot, hw_sample: u64) -> (f64, bool) {
+    fn evaluate_at_sample_from(
+        snap: &PlaybackSnapshot,
+        hw_sample: u64,
+        anchor_sample: u64,
+    ) -> (f64, bool) {
         if snap.speed == 0.0 {
             return (snap.anchor_exact_frame, false);
         }
-        let elapsed_samples = hw_sample.saturating_sub(snap.anchor_sample_count) as f64;
+        let elapsed_samples = hw_sample.saturating_sub(anchor_sample) as f64;
         let elapsed_sec = elapsed_samples / f64::from(snap.sample_rate);
         let raw_frame = snap.anchor_exact_frame + elapsed_sec * snap.fps * snap.speed;
         apply_bounds(raw_frame, snap.total_frames, snap.loop_enabled)
@@ -162,10 +173,17 @@ impl ClockShared {
         }
 
         let raw_frame = if snap.hardware_clock_active {
-            let hw = self.audible_sample_count();
-            let elapsed_samples = hw.saturating_sub(snap.anchor_sample_count) as f64;
-            let elapsed_sec = elapsed_samples / f64::from(snap.sample_rate);
-            snap.anchor_exact_frame + elapsed_sec * snap.fps * snap.speed
+            let latched_epoch = self.callback_latched_epoch.load(Ordering::Acquire);
+            if latched_epoch != snap.epoch_id {
+                // Audio callback has not yet started rendering this epoch; hold at anchor frame.
+                snap.anchor_exact_frame
+            } else {
+                let anchor = self.callback_epoch_start_sample.load(Ordering::Acquire);
+                let hw = self.audible_sample_count();
+                let elapsed_samples = hw.saturating_sub(anchor) as f64;
+                let elapsed_sec = elapsed_samples / f64::from(snap.sample_rate);
+                snap.anchor_exact_frame + elapsed_sec * snap.fps * snap.speed
+            }
         } else {
             let elapsed_sec = self
                 .wall_anchor
@@ -351,7 +369,15 @@ impl MasterPlaybackClock {
     #[must_use]
     pub fn exact_frame_at_sample(&self, sample_count: u64) -> f64 {
         let snap = self.snapshot();
-        ClockShared::evaluate_at_sample(&snap, sample_count).0
+        let anchor = if self.shared.callback_latched_epoch.load(Ordering::Acquire) == snap.epoch_id
+        {
+            self.shared
+                .callback_epoch_start_sample
+                .load(Ordering::Acquire)
+        } else {
+            snap.anchor_sample_count
+        };
+        ClockShared::evaluate_at_sample_from(&snap, sample_count, anchor).0
     }
 
     /// Returns `true` when playback speed is non-zero.
@@ -471,8 +497,18 @@ impl MasterPlaybackClock {
         });
     }
 
-    /// Advances the hardware sample counter by `sample_frames` (called by the `cpal` callback or tests).
+    /// Advances the hardware sample counter by `sample_frames` (called by headless drivers or tests).
     pub fn advance_hardware_samples(&self, sample_frames: u64) -> u64 {
+        let start_hw = self.shared.hardware_sample_count.load(Ordering::Acquire);
+        let snap = self.shared.read_snapshot();
+        if self.shared.callback_latched_epoch.load(Ordering::Relaxed) != snap.epoch_id {
+            self.shared
+                .callback_epoch_start_sample
+                .store(start_hw, Ordering::Release);
+            self.shared
+                .callback_latched_epoch
+                .store(snap.epoch_id, Ordering::Release);
+        }
         self.shared
             .hardware_sample_count
             .fetch_add(sample_frames, Ordering::AcqRel)
@@ -642,6 +678,19 @@ fn render_callback_frames<T, F>(
     // Read the current submitted sample cursor BEFORE filling, then advance it AFTER
     // filling the buffer so the visual playhead never jumps ahead of an unfilled buffer.
     let start_hw = shared.hardware_sample_count.load(Ordering::Acquire);
+    // Latch the exact submission cursor where this epoch first starts rendering so an
+    // in-flight callback racing a seek/resume can never cause the new epoch to skip a buffer.
+    let epoch_anchor = if shared.callback_latched_epoch.load(Ordering::Relaxed) != snap.epoch_id {
+        shared
+            .callback_epoch_start_sample
+            .store(start_hw, Ordering::Release);
+        shared
+            .callback_latched_epoch
+            .store(snap.epoch_id, Ordering::Release);
+        start_hw
+    } else {
+        shared.callback_epoch_start_sample.load(Ordering::Relaxed)
+    };
 
     if snap.speed == 0.0 || mix.is_none() || snap.fps <= 0.0 {
         for slot in output.iter_mut() {
@@ -653,7 +702,8 @@ fn render_callback_frames<T, F>(
 
         for (i, frame_chunk) in output.chunks_exact_mut(channels).enumerate() {
             let hw = start_hw.saturating_add(i as u64);
-            let (exact_frame, hit_stop) = ClockShared::evaluate_at_sample(&snap, hw);
+            let (exact_frame, hit_stop) =
+                ClockShared::evaluate_at_sample_from(&snap, hw, epoch_anchor);
             let sample_pair = if hit_stop || mix_len == 0 {
                 [0.0_f32, 0.0_f32]
             } else {
@@ -803,5 +853,49 @@ mod tests {
         clock.advance_hardware_samples(24_000);
         assert!((clock.exact_frame() - 59.0).abs() < 1e-6);
         assert!(!clock.is_playing());
+    }
+
+    #[test]
+    fn seek_racing_inflight_callback_does_not_skip_first_buffer() {
+        let clock = MasterPlaybackClock::new(30.0, 300.0);
+        clock.set_hardware_clock_mode(true, STANDARD_SAMPLE_RATE);
+        clock.play();
+
+        // Build a ramp mix where sample value encodes exact sample index / 100000.0.
+        let mix: Vec<[f32; 2]> = (0..96_000)
+            .map(|i| {
+                let v = (i as f32) / 100_000.0;
+                [v, v]
+            })
+            .collect();
+
+        // Simulate callback #1 capturing old epoch before seek, then seek happens mid-callback,
+        // then callback #1 finishes and advances `hardware_sample_count` by 512 frames.
+        clock.seek_preserving_playback(30.0); // frame 30 = 1.0s = sample 48_000
+        clock
+            .shared
+            .hardware_sample_count
+            .fetch_add(512, Ordering::Release);
+
+        // Now callback #2 starts with the new epoch and fills 512 stereo frames.
+        let mut out = vec![0.0_f32; 512 * 2];
+        render_callback_frames(
+            &clock.shared,
+            Some(&mix),
+            f64::from(STANDARD_SAMPLE_RATE),
+            2,
+            None,
+            &mut out,
+            |s| s,
+        );
+
+        // Sample 0 of callback #2 must be at EXACTLY sample 48_000 (0.48), NOT 48_512!
+        assert!(
+            (out[0] - 0.48).abs() < 1e-5,
+            "expected first sample at exact seek target 0.48, got {}",
+            out[0]
+        );
+        // Visual playhead stays at 30.0 while that 512-sample buffer is queued at the DAC.
+        assert!((clock.exact_frame() - 30.0).abs() < 1e-6);
     }
 }

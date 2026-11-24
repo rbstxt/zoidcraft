@@ -448,9 +448,23 @@ where
         }
 
         let status = child_guard.wait_cancellable(cancel)?;
-        let stderr_text = stderr_rx
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap_or_default();
+        let stderr_text = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(ExportError::Cancelled);
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break String::new();
+                }
+                match stderr_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                    Ok(text) => break text,
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break String::new(),
+                }
+            }
+        };
 
         if cancel.load(Ordering::Acquire) {
             return Err(ExportError::Cancelled);
@@ -506,10 +520,17 @@ fn publish_temp_output(src: &Path, dst: &Path) -> Result<(), ExportError> {
                     let _ = fs::remove_file(&backup);
                     Ok(())
                 }
-                Err(replace_err) => {
-                    let _ = fs::rename(&backup, dst);
-                    Err(ExportError::Io(replace_err))
-                }
+                Err(replace_err) => match fs::rename(&backup, dst) {
+                    Ok(()) => Err(ExportError::Io(replace_err)),
+                    Err(rollback_err) => Err(ExportError::Io(std::io::Error::new(
+                        replace_err.kind(),
+                        format!(
+                            "failed to publish export to {} ({replace_err}); rollback of original file from backup {} also failed ({rollback_err})",
+                            dst.display(),
+                            backup.display()
+                        ),
+                    ))),
+                },
             }
         }
         Err(err) => Err(ExportError::Io(err)),
