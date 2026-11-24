@@ -3,8 +3,7 @@
 //! ZoidCraft headless CLI, batch renderer, `.pz` converter, effect self-test runner,
 //! and JSON-Lines session control loop (L5 headless — zero GUI dependencies).
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,11 +13,11 @@ use std::sync::atomic::AtomicBool;
 
 use clap::{Parser, Subcommand};
 use image::{RgbImage, RgbaImage};
-use zc_anim::{DynamicProperty, InterpolationMode, Keyframe, StaticBehavior};
+#[cfg(test)]
+use zc_audio::project_has_active_audio_in_range;
 use zc_audio::{
-    AudioBuffer, AudioClipScheduleItem, AudioError, AudioExprContext, ClipAudioSampleParams,
-    STANDARD_SAMPLE_RATE, decode_audio_bytes, eval_audio_expression_or_fallback,
-    try_mix_offline_stereo_animated,
+    STANDARD_SAMPLE_RATE, mix_project_audio_with_precomps_filtered,
+    project_has_active_audio_in_range_with_precomp,
 };
 use zc_export::{
     AudioCodec, ExportContainer, ExportError, ExportSettings, QualityMode, VideoCodec,
@@ -26,8 +25,9 @@ use zc_export::{
 };
 use zc_plugin::PluginRegistry;
 use zc_project::{
-    LayerKind, Project, PropertyTrack, PropertyValue, Sequence,
-    StaticBehavior as ProjectStaticBehavior, Uuid, export_pz, import_pz, load_zcraft, save_zcraft,
+    AssetKind, Layer, LayerKind, Project, PropertyKeyframe, PropertyTrack, PropertyValue, Uuid,
+    VideoClip, VideoTrack, create_effect_by_id, export_pz, import_pz, load_zcraft, save_zcraft,
+    standard_effect_catalog, zoidium_effect_catalog,
 };
 use zc_render::ProjectRenderEngine;
 use zc_session::{Session, dispatch_json_lines};
@@ -149,8 +149,8 @@ enum Commands {
         ffmpeg: Option<PathBuf>,
     },
 
-    /// Run a headless GPU self-test across all 44 standard effects, 12 plugin effects,
-    /// and the default 3D scene.
+    /// Run a headless GPU self-test across all 44 standard effects, all 36 plugin effects
+    /// (80 total), and the default 3D scene.
     SelftestEffects {
         /// Test frame width in pixels.
         #[arg(long, default_value_t = 128)]
@@ -627,7 +627,11 @@ fn parse_audio_codec(
     }
 }
 
-fn build_scalar_property(track: &PropertyTrack, default: f64) -> DynamicProperty<f64> {
+#[cfg(test)]
+fn build_scalar_property(track: &PropertyTrack, default: f64) -> zc_anim::DynamicProperty<f64> {
+    use zc_anim::{DynamicProperty, InterpolationMode, Keyframe, StaticBehavior};
+    use zc_project::StaticBehavior as ProjectStaticBehavior;
+
     let base = match &track.value {
         PropertyValue::Number(v) => *v,
         _ => default,
@@ -649,8 +653,6 @@ fn build_scalar_property(track: &PropertyTrack, default: f64) -> DynamicProperty
     prop.keyframes.clear();
     for kf in &track.keyframes {
         if let PropertyValue::Number(v) = kf.value {
-            // Match CM3 tween bitfield strictly: low byte == 0 is Hold (takes precedence),
-            // and Bezier requires `(tween >> 8) == 1`.
             let ease_idx = (kf.tween & 0xFF) as u8;
             let is_bezier = ease_idx != 0 && (kf.tween >> 8) == 1;
             let tween_code = if is_bezier {
@@ -664,9 +666,6 @@ fn build_scalar_property(track: &PropertyTrack, default: f64) -> DynamicProperty
             if mode == InterpolationMode::Bezier {
                 key.in_tangent = Some(kf.control_points[0]);
             }
-            // Always preserve `k0.out_tangent` even when `k0` itself is not Bezier, because
-            // CM3 stores `(tween >> 8) == 1` on the segment's end keyframe `k1` while `k0`
-            // supplies the segment's outgoing handle (`control_points[1]`).
             key.out_tangent = Some(kf.control_points[1]);
             key.continuous_tangent = kf.continuous_tangent;
             prop.set_keyframe(key);
@@ -683,588 +682,22 @@ fn eval_scalar_track(track: &PropertyTrack, frame: f64, default: f64) -> f64 {
     build_scalar_property(track, default).evaluate(frame)
 }
 
-/// Maximum nested Precomp+ composition recursion depth when flattening audio tracks.
-const MAX_AUDIO_COMPOSITION_DEPTH: usize = 16;
-
-/// Resolved audio clip collected from either the root sequence or a nested Precomp+ composition.
-struct FlattenedAudioClip {
-    /// Start frame in root sequence coordinates.
-    root_start_frame: f64,
-    /// Duration in root sequence coordinates.
-    root_length_frames: f64,
-    /// Asset ID referencing `project.assets`.
-    asset_id: String,
-    /// Stack of enclosing precomp time mappings (outermost -> innermost) mapping a root
-    /// sequence frame into this clip's own local frame.
-    parent_chain: Vec<ParentCompMap>,
-    /// Clip's own local start frame inside its immediate owning sequence.
-    own_start_frame: f64,
-    /// Clip's own length in its immediate owning sequence.
-    own_length_frames: f64,
-    /// Immediate owning sequence FPS.
-    own_fps: f64,
-    /// Compiled `time`, `volume`, `pan` properties + optional expressions.
-    props: CompiledAudioClipProps,
-}
-
-struct ParentCompMap {
-    clip_start: f64,
-    clip_length: f64,
-    parent_fps: f64,
-    child_fps: f64,
-    has_time_keyframes: bool,
-    time_prop: DynamicProperty<f64>,
-    time_expr: Option<String>,
-    controls_by_name: HashMap<String, f64>,
-    controls_by_id: HashMap<String, f64>,
-}
-
-struct CompiledAudioClipProps {
-    has_time_keyframes: bool,
-    time: DynamicProperty<f64>,
-    time_expr: Option<String>,
-    volume: DynamicProperty<f64>,
-    volume_expr: Option<String>,
-    pan: DynamicProperty<f64>,
-    pan_expr: Option<String>,
-    controls_by_name: HashMap<String, f64>,
-    controls_by_id: HashMap<String, f64>,
-}
-
-/// Control-rate cache (32-sample blocks at 48 kHz = ~0.67 ms) so expression-driven audio clips
-/// mix smoothly and deterministically without re-parsing expressions 48,000 times per second.
-struct ExprSampleCache {
-    block_origin_frame: f64,
-    block_step_frames: f64,
-    p0: ClipAudioSampleParams,
-    p1: ClipAudioSampleParams,
-    valid: bool,
-}
-
-impl ExprSampleCache {
-    fn new(block_step_frames: f64) -> Self {
-        Self {
-            block_origin_frame: 0.0,
-            block_step_frames: block_step_frames.max(1e-6),
-            p0: ClipAudioSampleParams {
-                media_time_sec: 0.0,
-                volume: 1.0,
-                pan: 0.0,
-            },
-            p1: ClipAudioSampleParams {
-                media_time_sec: 0.0,
-                volume: 1.0,
-                pan: 0.0,
-            },
-            valid: false,
-        }
-    }
-}
-
-fn collect_sequence_controls(
-    seq: &Sequence,
-    eval_frame: f64,
-) -> (HashMap<String, f64>, HashMap<String, f64>) {
-    let mut by_name = HashMap::new();
-    let mut by_id = HashMap::new();
-    for ctl in &seq.controls {
-        let val = match &ctl.track.value {
-            PropertyValue::Number(_) => build_scalar_property(&ctl.track, 0.0).evaluate(eval_frame),
-            PropertyValue::Option(idx) => f64::from(*idx),
-            PropertyValue::Text(s) => s.trim().parse::<f64>().unwrap_or(0.0),
-            _ => 0.0,
-        };
-        by_name.insert(ctl.name.clone(), val);
-        by_id.insert(ctl.id.clone(), val);
-    }
-    (by_name, by_id)
-}
-
-fn non_empty_expr(expr: &Option<String>) -> Option<String> {
-    expr.as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-}
-
-fn eval_time_track(
-    has_keyframes: bool,
-    prop: &DynamicProperty<f64>,
-    expr: Option<&str>,
-    local_frame: f64,
-    fps: f64,
-    controls_by_name: &HashMap<String, f64>,
-    controls_by_id: &HashMap<String, f64>,
-) -> f64 {
-    let raw_time = if has_keyframes {
-        prop.evaluate(local_frame)
-    } else {
-        prop.evaluate(0.0) + local_frame / fps
-    };
-    match expr {
-        Some(src) => {
-            // Per Zoidium engine.js:107, a clip's `time` expression receives the pre-expression
-            // keyframed time as both `time` and `value`.
-            let ctx = AudioExprContext {
-                frame: local_frame,
-                time: raw_time,
-                fps,
-                value: raw_time,
-                controls_by_name,
-                controls_by_id,
-            };
-            eval_audio_expression_or_fallback(src, &ctx)
-        }
-        None => raw_time,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_sequence_audio_clips(
-    project: &Project,
-    seq: &Sequence,
-    root_window_start: f64,
-    root_window_end: f64,
-    parent_chain: &[ParentCompMap],
-    visited_comps: &mut Vec<Uuid>,
-    depth: usize,
-    out: &mut Vec<FlattenedAudioClip>,
-) {
-    let seq_fps = f64::from(seq.fps.max(1));
-    // Zoidium solo semantics: `hasSolo = tracks.some(t => t.solo)` regardless of enabled/muted.
-    let any_audio_solo = seq.audio_tracks.iter().any(|t| t.solo);
-    let (controls_by_name, controls_by_id) = collect_sequence_controls(seq, 0.0);
-
-    for track in &seq.audio_tracks {
-        if !track.enabled || track.muted || (any_audio_solo && !track.solo) {
-            continue;
-        }
-        for clip in &track.clips {
-            if clip.length <= 0.0 {
-                continue;
-            }
-            let (clip_root_start, clip_root_length) = if parent_chain.is_empty() {
-                if clip.start + clip.length <= root_window_start || clip.start >= root_window_end {
-                    continue;
-                }
-                (clip.start, clip.length)
-            } else {
-                // Nested composition clips are active within the enclosing root clip window;
-                // exact per-sample visibility is checked via `parent_chain` time remapping.
-                (
-                    root_window_start,
-                    (root_window_end - root_window_start).max(0.0),
-                )
-            };
-            let Some(asset_id) = clip.media.as_deref() else {
-                continue;
-            };
-            if project
-                .assets
-                .get(asset_id)
-                .and_then(|r| r.bytes.as_deref())
-                .is_none()
-            {
-                continue;
-            }
-
-            let has_time_keyframes = !clip.time_curve.keyframes.is_empty();
-            let time = build_scalar_property(&clip.time_curve, 0.0);
-            let volume = build_scalar_property(&clip.audio.volume, 1.0);
-            let pan = build_scalar_property(&clip.audio.pan, 0.0);
-
-            out.push(FlattenedAudioClip {
-                root_start_frame: clip_root_start,
-                root_length_frames: clip_root_length,
-                asset_id: asset_id.to_owned(),
-                parent_chain: parent_chain
-                    .iter()
-                    .map(|p| ParentCompMap {
-                        clip_start: p.clip_start,
-                        clip_length: p.clip_length,
-                        parent_fps: p.parent_fps,
-                        child_fps: p.child_fps,
-                        has_time_keyframes: p.has_time_keyframes,
-                        time_prop: p.time_prop.clone(),
-                        time_expr: p.time_expr.clone(),
-                        controls_by_name: p.controls_by_name.clone(),
-                        controls_by_id: p.controls_by_id.clone(),
-                    })
-                    .collect(),
-                own_start_frame: clip.start,
-                own_length_frames: clip.length,
-                own_fps: seq_fps,
-                props: CompiledAudioClipProps {
-                    has_time_keyframes,
-                    time,
-                    time_expr: non_empty_expr(&clip.time_curve.expression),
-                    volume,
-                    volume_expr: non_empty_expr(&clip.audio.volume.expression),
-                    pan,
-                    pan_expr: non_empty_expr(&clip.audio.pan.expression),
-                    controls_by_name: controls_by_name.clone(),
-                    controls_by_id: controls_by_id.clone(),
-                },
-            });
-        }
-    }
-
-    // Recursively flatten audio from nested Precomp+ compositions on active video tracks.
-    if depth >= MAX_AUDIO_COMPOSITION_DEPTH {
-        return;
-    }
-    let any_video_solo = seq.video_tracks.iter().any(|t| t.solo);
-    for vtrack in &seq.video_tracks {
-        if !vtrack.enabled || (any_video_solo && !vtrack.solo) {
-            continue;
-        }
-        for vclip in &vtrack.clips {
-            if vclip.length <= 0.0 {
-                continue;
-            }
-            let LayerKind::PrecompRef { composition_id } = vclip.layer.kind else {
-                continue;
-            };
-            if visited_comps.contains(&composition_id) {
-                continue;
-            }
-            let Some(child_seq) = project.compositions.get(&composition_id) else {
-                continue;
-            };
-            let (child_root_start, child_root_end) = if parent_chain.is_empty() {
-                let s = vclip.start.max(root_window_start);
-                let e = (vclip.start + vclip.length).min(root_window_end);
-                if e <= s {
-                    continue;
-                }
-                (s, e)
-            } else {
-                (root_window_start, root_window_end)
-            };
-
-            let mut next_chain: Vec<ParentCompMap> = parent_chain
-                .iter()
-                .map(|p| ParentCompMap {
-                    clip_start: p.clip_start,
-                    clip_length: p.clip_length,
-                    parent_fps: p.parent_fps,
-                    child_fps: p.child_fps,
-                    has_time_keyframes: p.has_time_keyframes,
-                    time_prop: p.time_prop.clone(),
-                    time_expr: p.time_expr.clone(),
-                    controls_by_name: p.controls_by_name.clone(),
-                    controls_by_id: p.controls_by_id.clone(),
-                })
-                .collect();
-            next_chain.push(ParentCompMap {
-                clip_start: vclip.start,
-                clip_length: vclip.length,
-                parent_fps: seq_fps,
-                child_fps: f64::from(child_seq.fps.max(1)),
-                has_time_keyframes: !vclip.time_curve.keyframes.is_empty(),
-                time_prop: build_scalar_property(&vclip.time_curve, 0.0),
-                time_expr: non_empty_expr(&vclip.time_curve.expression),
-                controls_by_name: controls_by_name.clone(),
-                controls_by_id: controls_by_id.clone(),
-            });
-
-            visited_comps.push(composition_id);
-            collect_sequence_audio_clips(
-                project,
-                child_seq,
-                child_root_start,
-                child_root_end,
-                &next_chain,
-                visited_comps,
-                depth + 1,
-                out,
-            );
-            visited_comps.pop();
-        }
-    }
-}
-
-fn eval_flattened_clip_params(
-    clip: &FlattenedAudioClip,
-    root_local_frame: f64,
-) -> ClipAudioSampleParams {
-    // Convert root-clip-local frame through any enclosing Precomp+ layers down to the clip's
-    // immediate owning sequence frame.
-    let mut seq_frame = clip.root_start_frame + root_local_frame;
-    for parent in &clip.parent_chain {
-        let p_local = seq_frame - parent.clip_start;
-        if p_local < 0.0 || p_local >= parent.clip_length {
-            return ClipAudioSampleParams {
-                media_time_sec: -1.0,
-                volume: 0.0,
-                pan: 0.0,
-            };
-        }
-        let child_time_sec = eval_time_track(
-            parent.has_time_keyframes,
-            &parent.time_prop,
-            parent.time_expr.as_deref(),
-            p_local,
-            parent.parent_fps,
-            &parent.controls_by_name,
-            &parent.controls_by_id,
-        );
-        seq_frame = child_time_sec * parent.child_fps;
-    }
-
-    let own_local = if clip.parent_chain.is_empty() {
-        root_local_frame
-    } else {
-        seq_frame - clip.own_start_frame
-    };
-    if own_local < 0.0 || own_local >= clip.own_length_frames {
-        return ClipAudioSampleParams {
-            media_time_sec: -1.0,
-            volume: 0.0,
-            pan: 0.0,
-        };
-    }
-
-    let p = &clip.props;
-    let media_time_sec = eval_time_track(
-        p.has_time_keyframes,
-        &p.time,
-        p.time_expr.as_deref(),
-        own_local,
-        clip.own_fps,
-        &p.controls_by_name,
-        &p.controls_by_id,
-    );
-
-    let base_vol = p.volume.evaluate(own_local);
-    let volume = match p.volume_expr.as_deref() {
-        Some(src) => {
-            let ctx = AudioExprContext {
-                frame: own_local,
-                time: media_time_sec,
-                fps: clip.own_fps,
-                value: base_vol,
-                controls_by_name: &p.controls_by_name,
-                controls_by_id: &p.controls_by_id,
-            };
-            eval_audio_expression_or_fallback(src, &ctx)
-        }
-        None => base_vol,
-    };
-
-    let base_pan = p.pan.evaluate(own_local);
-    let pan = match p.pan_expr.as_deref() {
-        Some(src) => {
-            let ctx = AudioExprContext {
-                frame: own_local,
-                time: media_time_sec,
-                fps: clip.own_fps,
-                value: base_pan,
-                controls_by_name: &p.controls_by_name,
-                controls_by_id: &p.controls_by_id,
-            };
-            eval_audio_expression_or_fallback(src, &ctx)
-        }
-        None => base_pan,
-    };
-
-    ClipAudioSampleParams {
-        media_time_sec,
-        volume: volume as f32,
-        pan: pan as f32,
-    }
-}
-
-fn project_has_active_audio_in_range(
-    project: &Project,
-    start_seq_frame: f64,
-    end_seq_frame: f64,
-) -> bool {
-    let mut visited = vec![project.sequence.id];
-    let mut clips = Vec::new();
-    collect_sequence_audio_clips(
-        project,
-        &project.sequence,
-        start_seq_frame,
-        end_seq_frame,
-        &[],
-        &mut visited,
-        0,
-        &mut clips,
-    );
-    let mut checked_silent: HashSet<&str> = HashSet::new();
-    for clip in &clips {
-        if checked_silent.contains(clip.asset_id.as_str()) {
-            continue;
-        }
-        let Some(record) = project.assets.get(&clip.asset_id) else {
-            continue;
-        };
-        let Some(bytes) = record.bytes.as_deref() else {
-            continue;
-        };
-        let ext_hint = Path::new(&record.filename)
-            .extension()
-            .and_then(|e| e.to_str());
-        match decode_audio_bytes(bytes, ext_hint) {
-            Ok(buf) if !buf.is_empty() => return true,
-            Ok(_) | Err(AudioError::NoAudioTrack) => {
-                // Video-only container or empty audio track -> treat as silent.
-                checked_silent.insert(clip.asset_id.as_str());
-            }
-            Err(_) => {
-                // Keep audio stream enabled on unexpected decode errors so mix_project_audio reports them.
-                return true;
-            }
-        }
-    }
-    false
-}
-
 fn mix_project_audio(
     project: &Project,
     start_seq_frame: u32,
     total_seq_frames: f64,
-    seq_fps: f64,
+    _seq_fps: f64,
     sample_rate: u32,
 ) -> Result<Option<Vec<[f32; 2]>>, String> {
-    if !total_seq_frames.is_finite() || total_seq_frames <= 0.0 {
-        return Ok(None);
-    }
-    let range_start = f64::from(start_seq_frame);
-    let range_end = range_start + total_seq_frames;
-    let mut visited = vec![project.sequence.id];
-    let mut flattened = Vec::new();
-    collect_sequence_audio_clips(
+    let plugins = build_plugins_for_project(project);
+    mix_project_audio_with_precomps_filtered(
         project,
-        &project.sequence,
-        range_start,
-        range_end,
-        &[],
-        &mut visited,
-        0,
-        &mut flattened,
-    );
-
-    let mut buffers: HashMap<String, AudioBuffer> = HashMap::new();
-    let mut silent_assets: HashSet<String> = HashSet::new();
-    let mut scheduled: Vec<AudioClipScheduleItem> = Vec::new();
-    let mut active_clips: Vec<FlattenedAudioClip> = Vec::new();
-
-    for clip in flattened {
-        if silent_assets.contains(&clip.asset_id) {
-            continue;
-        }
-        if !buffers.contains_key(&clip.asset_id) {
-            let Some(record) = project.assets.get(&clip.asset_id) else {
-                continue;
-            };
-            let Some(bytes) = record.bytes.as_deref() else {
-                continue;
-            };
-            let ext_hint = Path::new(&record.filename)
-                .extension()
-                .and_then(|e| e.to_str());
-            match decode_audio_bytes(bytes, ext_hint) {
-                Ok(decoded) => {
-                    if decoded.is_empty() {
-                        silent_assets.insert(clip.asset_id.clone());
-                        continue;
-                    }
-                    buffers.insert(clip.asset_id.clone(), decoded);
-                }
-                Err(AudioError::NoAudioTrack) => {
-                    // Video-only container on an audio clip contributes silence (matching Zoidium).
-                    tracing::debug!(
-                        "audio asset `{}` has no audio track; treating as silent",
-                        clip.asset_id
-                    );
-                    silent_assets.insert(clip.asset_id.clone());
-                    continue;
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "failed to decode audio asset `{}`: {e}",
-                        clip.asset_id
-                    ));
-                }
-            }
-        }
-
-        let p0 = eval_flattened_clip_params(&clip, 0.0);
-        let p1 = eval_flattened_clip_params(&clip, clip.root_length_frames);
-        let rate = zc_audio::effective_playback_rate(
-            p0.media_time_sec,
-            p1.media_time_sec,
-            clip.root_length_frames,
-            seq_fps,
-        );
-        scheduled.push(AudioClipScheduleItem {
-            clip_start_frame: clip.root_start_frame - range_start,
-            clip_length_frames: clip.root_length_frames,
-            media_start_sec: p0.media_time_sec.max(0.0),
-            playback_rate: rate,
-            volume: p0.volume,
-            pan: p0.pan,
-            buffer_id: clip.asset_id.clone(),
-        });
-        active_clips.push(clip);
-    }
-
-    if scheduled.is_empty() {
-        return Ok(None);
-    }
-
-    // 32-sample control-rate block (~0.67 ms at 48 kHz) for expression-driven clips.
-    let block_frames = (32.0 / f64::from(sample_rate.max(1))) * seq_fps;
-    let caches: Vec<RefCell<ExprSampleCache>> = active_clips
-        .iter()
-        .map(|_| RefCell::new(ExprSampleCache::new(block_frames)))
-        .collect();
-
-    let mixed = try_mix_offline_stereo_animated(
+        f64::from(start_seq_frame),
         total_seq_frames,
-        seq_fps,
         sample_rate,
-        &scheduled,
-        &buffers,
-        |idx, _item, local_frame| {
-            let clip = &active_clips[idx];
-            let has_expr = clip.props.time_expr.is_some()
-                || clip.props.volume_expr.is_some()
-                || clip.props.pan_expr.is_some()
-                || clip.parent_chain.iter().any(|p| p.time_expr.is_some());
-            if !has_expr {
-                return eval_flattened_clip_params(clip, local_frame);
-            }
-            let mut cache = caches[idx].borrow_mut();
-            if !cache.valid
-                || local_frame < cache.block_origin_frame
-                || local_frame > cache.block_origin_frame + cache.block_step_frames
-            {
-                let b0 = local_frame;
-                let b1 = (local_frame + cache.block_step_frames).min(clip.root_length_frames);
-                cache.block_origin_frame = b0;
-                cache.p0 = eval_flattened_clip_params(clip, b0);
-                cache.p1 = eval_flattened_clip_params(clip, b1);
-                cache.valid = true;
-            }
-            if cache.p0.media_time_sec < 0.0 || cache.p1.media_time_sec < 0.0 {
-                return eval_flattened_clip_params(clip, local_frame);
-            }
-            let frac = ((local_frame - cache.block_origin_frame) / cache.block_step_frames)
-                .clamp(0.0, 1.0);
-            let frac32 = frac as f32;
-            ClipAudioSampleParams {
-                media_time_sec: cache.p0.media_time_sec
-                    + (cache.p1.media_time_sec - cache.p0.media_time_sec) * frac,
-                volume: cache.p0.volume + (cache.p1.volume - cache.p0.volume) * frac32,
-                pan: cache.p0.pan + (cache.p1.pan - cache.p0.pan) * frac32,
-            }
-        },
+        plugins.is_enabled("precomp-plus"),
     )
-    .map_err(|e| format!("failed to mix project audio: {e}"))?;
-    Ok(Some(mixed))
+    .map_err(|e| format!("failed to mix project audio: {e}"))
 }
 
 fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
@@ -1315,6 +748,7 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
     let container = parse_container(args.format, args.out)?;
     let video_codec = parse_video_codec(args.video_codec, container, args.transparent)?;
     let sample_rate = args.sample_rate;
+    let plugins = build_plugins_for_project(&project);
     let has_active_audio = if container.is_audio_only() {
         true
     } else if matches!(
@@ -1323,10 +757,11 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
     ) {
         false
     } else {
-        project_has_active_audio_in_range(
+        project_has_active_audio_in_range_with_precomp(
             &project,
             f64::from(args.start_frame),
             f64::from(args.start_frame) + audio_seq_frames,
+            plugins.is_enabled("precomp-plus"),
         )
     };
     let audio_codec = parse_audio_codec(args.audio_codec, container, has_active_audio)?;
@@ -1394,7 +829,6 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
         return Ok(());
     }
 
-    let plugins = build_plugins_for_project(&project);
     let mut engine = ProjectRenderEngine::new_headless()
         .map_err(|e| format!("failed to initialize headless GPU renderer: {e}"))?;
     engine.set_transparent_background(args.transparent);
@@ -1437,6 +871,24 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
     Ok(())
 }
 
+fn build_selftest_gradient_png(width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let u = x as f32 / width.max(1) as f32;
+            let v = y as f32 / height.max(1) as f32;
+            // Vibrant red/amber/blue diagonal pattern (avoiding pure chroma-green so keying
+            // effects retain visible foreground pixels).
+            let r = (40.0 + u * 200.0).clamp(0.0, 255.0) as u8;
+            let g = (30.0 + (u * v) * 140.0).clamp(0.0, 255.0) as u8;
+            let b = (60.0 + (1.0 - v) * 180.0).clamp(0.0, 255.0) as u8;
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    zc_render::encode_png(&rgba, width, height)
+        .map_err(|e| format!("failed to encode selftest gradient PNG: {e}"))
+}
+
 fn cmd_selftest_effects(width: u32, height: u32) -> Result<(), String> {
     let mut engine = ProjectRenderEngine::new_headless()
         .map_err(|e| format!("failed to initialize headless GPU renderer: {e}"))?;
@@ -1444,16 +896,32 @@ fn cmd_selftest_effects(width: u32, height: u32) -> Result<(), String> {
         .selftest_all_effects(width, height)
         .map_err(|e| format!("selftest failed: {e}"))?;
 
+    let mut tested_std: HashSet<String> = HashSet::new();
+    let mut tested_plugin: HashSet<String> = HashSet::new();
+    let mut std_passed = 0usize;
+    let mut plugin_passed = 0usize;
+
     for entry in &report.entries {
         let kind = if entry.is_plugin { "plugin" } else { "std" };
+        if entry.is_plugin {
+            tested_plugin.insert(entry.effect_id.to_ascii_lowercase());
+            if entry.passed {
+                plugin_passed += 1;
+            }
+        } else {
+            tested_std.insert(entry.effect_id.to_ascii_lowercase());
+            if entry.passed {
+                std_passed += 1;
+            }
+        }
         if entry.passed {
             println!(
-                "PASS [{kind:6}] {:<20} non_zero_pixels={}",
+                "PASS [{kind:6}] {:<24} non_zero_pixels={}",
                 entry.effect_id, entry.non_zero_pixels
             );
         } else {
             eprintln!(
-                "FAIL [{kind:6}] {:<20} bypassed={} error={}",
+                "FAIL [{kind:6}] {:<24} bypassed={} error={}",
                 entry.effect_id,
                 entry.bypassed,
                 entry.error.as_deref().unwrap_or("unknown"),
@@ -1461,8 +929,153 @@ fn cmd_selftest_effects(width: u32, height: u32) -> Result<(), String> {
         }
     }
 
+    // Verify all remaining catalog entries across standard_effect_catalog() (44) and
+    // zoidium_effect_catalog() (36) — 80 total — through the full ProjectRenderEngine pipeline.
+    let mut all_plugins = PluginRegistry::new();
+    for desc in zoidium_effect_catalog() {
+        if let Some(pid) = desc.plugin_id {
+            let _ = all_plugins.enable(pid);
+        }
+    }
+    let test_png = build_selftest_gradient_png(width, height)?;
+    let expected_bytes = (width as usize) * (height as usize) * 4;
+
+    let mut run_catalog_effect = |effect_id: &str, is_plugin: bool, plugin_id: Option<&str>| {
+        let mut proj = Project::new_cm3_default();
+        proj.sequence.resolution = [width, height];
+        proj.sequence.fps = 30;
+        proj.sequence.length_frames = 30.0;
+        if let Some(pid) = plugin_id {
+            proj.plugin_requirements.insert(pid.to_owned());
+        }
+        let asset_id = proj.insert_binary_asset(
+            AssetKind::Image,
+            "selftest_grad.png".to_owned(),
+            test_png.clone(),
+        );
+
+        let mut base_layer = Layer::new(
+            "Base",
+            LayerKind::Image {
+                image: Some(asset_id.clone()),
+            },
+            [width, height],
+        );
+        // Animate position across frames 0..10 so temporal/motion effects observe real motion.
+        base_layer.position = PropertyTrack {
+            animated: true,
+            expression: None,
+            static_behavior: zc_project::StaticBehavior::Constant,
+            value: PropertyValue::Vec2([0.0, 0.0]),
+            keyframes: vec![
+                PropertyKeyframe::linear(0.0, PropertyValue::Vec2([-12.0, -6.0])),
+                PropertyKeyframe::linear(10.0, PropertyValue::Vec2([12.0, 6.0])),
+            ],
+            channels: Vec::new(),
+        };
+
+        let mut fx_layer = base_layer.clone();
+        fx_layer.id = Uuid::new_v4();
+        fx_layer.name = format!("FX {effect_id}");
+
+        let fx_res = create_effect_by_id(effect_id).ok_or_else(|| {
+            format!(
+                "catalog effect `{effect_id}` could not be instantiated via create_effect_by_id"
+            )
+        });
+
+        let kind = if is_plugin { "plugin" } else { "std" };
+        match fx_res.and_then(|fx| {
+            fx_layer.effects.push(fx);
+            proj.sequence.video_tracks = vec![
+                VideoTrack {
+                    id: Uuid::new_v4(),
+                    name: "Track 1".to_owned(),
+                    enabled: true,
+                    solo: false,
+                    locked: false,
+                    is_3d: false,
+                    clips: vec![VideoClip {
+                        id: Uuid::new_v4(),
+                        name: "Base Clip".to_owned(),
+                        start: 0.0,
+                        length: 30.0,
+                        link: None,
+                        media: None,
+                        time_curve: PropertyTrack::linear_time_curve(30.0, 30),
+                        layer: base_layer,
+                        preserved: BTreeMap::new(),
+                    }],
+                    preserved: BTreeMap::new(),
+                },
+                VideoTrack {
+                    id: Uuid::new_v4(),
+                    name: "Track 2".to_owned(),
+                    enabled: true,
+                    solo: false,
+                    locked: false,
+                    is_3d: false,
+                    clips: vec![VideoClip {
+                        id: Uuid::new_v4(),
+                        name: format!("FX Clip {effect_id}"),
+                        start: 0.0,
+                        length: 30.0,
+                        link: None,
+                        media: None,
+                        time_curve: PropertyTrack::linear_time_curve(30.0, 30),
+                        layer: fx_layer,
+                        preserved: BTreeMap::new(),
+                    }],
+                    preserved: BTreeMap::new(),
+                },
+            ];
+            engine
+                .render_frame_rgba8(&proj, &all_plugins, 5.0, width, height)
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(pixels) => {
+                let non_zero = pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|px| px[0] > 0 || px[1] > 0 || px[2] > 0 || px[3] > 0)
+                    .count();
+                if pixels.len() == expected_bytes && non_zero > 0 {
+                    println!("PASS [{kind:6}] {effect_id:<24} non_zero_pixels={non_zero}");
+                    true
+                } else {
+                    eprintln!(
+                        "FAIL [{kind:6}] {effect_id:<24} error=empty output (bytes={}, non_zero_pixels={non_zero})",
+                        pixels.len()
+                    );
+                    false
+                }
+            }
+            Err(err) => {
+                eprintln!("FAIL [{kind:6}] {effect_id:<24} error={err}");
+                false
+            }
+        }
+    };
+
+    for desc in standard_effect_catalog() {
+        let lower = desc.id.to_ascii_lowercase();
+        if tested_std.insert(lower) && run_catalog_effect(desc.id, false, desc.plugin_id) {
+            std_passed += 1;
+        }
+    }
+    for desc in zoidium_effect_catalog() {
+        let lower = desc.id.to_ascii_lowercase();
+        if tested_plugin.insert(lower) && run_catalog_effect(desc.id, true, desc.plugin_id) {
+            plugin_passed += 1;
+        }
+    }
+
+    let std_total = standard_effect_catalog().len().max(report.standard_total);
+    let plugin_total = zoidium_effect_catalog().len().max(tested_plugin.len());
+
     println!(
-        "{} [scene ] {:<20} non_black_pixels={}",
+        "{} [scene ] {:<24} non_black_pixels={}",
         if report.default_scene_passed {
             "PASS"
         } else {
@@ -1472,17 +1085,19 @@ fn cmd_selftest_effects(width: u32, height: u32) -> Result<(), String> {
         report.default_scene_non_black_pixels,
     );
     println!(
-        "Summary ({}x{}): standard {}/{}, plugin {}/{}, default_3d={}",
+        "Summary ({}x{}): standard {}/{}, plugin {}/{}, total {}/{}, default_3d={}",
         report.width,
         report.height,
-        report.standard_passed,
-        report.standard_total,
-        report.plugin_passed,
-        report.plugin_total,
+        std_passed,
+        std_total,
+        plugin_passed,
+        plugin_total,
+        std_passed + plugin_passed,
+        std_total + plugin_total,
         report.default_scene_passed,
     );
 
-    if report.all_passed() {
+    if std_passed == std_total && plugin_passed == plugin_total && report.default_scene_passed {
         Ok(())
     } else {
         Err("one or more effects or default 3D scene failed GPU self-test".to_owned())
@@ -1819,11 +1434,11 @@ mod tests {
         // Create a nested composition with an audio clip driven by volume & pan expressions:
         // volume = "0.4", pan = "1.0" (hard right -> L=0, R = (0.5+0.5)*0.4 = 0.4)
         let comp_id = Uuid::new_v4();
-        let mut comp_seq = Sequence {
+        let mut comp_seq = zc_project::Sequence {
             id: comp_id,
             fps: project.sequence.fps,
             length_frames: 30.0,
-            ..Sequence::default()
+            ..zc_project::Sequence::default()
         };
         let mut audio_data = zc_project::AudioClipData::default();
         audio_data.volume.expression = Some("0.4".to_owned());
@@ -1879,6 +1494,21 @@ mod tests {
             preserved: std::collections::BTreeMap::new(),
         }];
 
+        // Without `precomp-plus` enabled, CLI audio matches video by skipping PrecompRef clips.
+        assert!(
+            !project_has_active_audio_in_range_with_precomp(&project, 0.0, 15.0, false),
+            "nested Precomp+ audio must be skipped when precomp-plus is disabled"
+        );
+        assert!(
+            mix_project_audio(&project, 0, 15.0, fps, sr)
+                .expect("disabled precomp mix ok")
+                .is_none(),
+            "CLI mixer must skip nested Precomp+ audio when precomp-plus is not required"
+        );
+
+        project
+            .plugin_requirements
+            .insert("precomp-plus".to_owned());
         assert!(project_has_active_audio_in_range(&project, 0.0, 15.0));
         let mixed = mix_project_audio(&project, 0, 15.0, fps, sr)
             .expect("nested audio mix ok")
@@ -2174,7 +1804,7 @@ mod tests {
         //    must still evaluate all keyframes (matching CM3).
         let mut unanimated = PropertyTrack::number(0.0);
         unanimated.animated = false;
-        unanimated.static_behavior = ProjectStaticBehavior::Constant;
+        unanimated.static_behavior = zc_project::StaticBehavior::Constant;
         unanimated.keyframes = vec![
             zc_project::PropertyKeyframe::linear(0.0, PropertyValue::Number(0.0)),
             zc_project::PropertyKeyframe::linear(10.0, PropertyValue::Number(1.0)),
@@ -2249,6 +1879,21 @@ mod tests {
         assert!(
             (actual - fallback_default_tangent).abs() > 1.0,
             "k0 custom out_tangent must meaningfully differ from default [10.0, 0.0] tangent"
+        );
+    }
+
+    #[test]
+    fn cli_selftest_effects_covers_all_80_catalog_effects_and_default_scene() {
+        assert_eq!(standard_effect_catalog().len(), 44);
+        assert_eq!(zoidium_effect_catalog().len(), 36);
+        let require_gpu = std::env::var("ZOIDCRAFT_REQUIRE_GPU")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        if !require_gpu && ProjectRenderEngine::new_headless().is_err() {
+            return;
+        }
+        cmd_selftest_effects(64, 64).expect(
+            "all 44 standard + 36 plugin effects + default 3D scene must pass GPU selftest",
         );
     }
 }

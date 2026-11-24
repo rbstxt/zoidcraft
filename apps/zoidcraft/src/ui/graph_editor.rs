@@ -13,6 +13,9 @@ use zc_anim::{
     curve_from_segment, eval_cubic_bezier, eval_easing, eval_segment_bezier, handles_from_curve,
 };
 use zc_color::{Hsl, Rgb, ThemePalette};
+use zc_expr::{
+    CompiledExpr, EvalConfig, ExprContext, ExprError, ExprMode, HandleId, Value as ExprValue,
+};
 use zc_session::{Command, Session, SessionProperty};
 
 use super::gestures::{GestureClassifier, ScrollDevice, pointer_on_layer, unoccluded_hover_pos};
@@ -127,6 +130,14 @@ pub struct DraggedGraphKey {
     pub continuous_tangent: bool,
 }
 
+/// Graph Editor Y-axis plot mode (`Value` curve vs `Speed` velocity derivative `dv/dt`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GraphPlotMode {
+    #[default]
+    Value,
+    Speed,
+}
+
 /// Active interaction state machine inside the Graph Editor canvas.
 #[derive(Debug, Clone, Default)]
 pub enum GraphDragState {
@@ -159,6 +170,15 @@ pub enum GraphDragState {
         key_value: f64,
         grab_start_pos: Pos2,
         orig_tangent: [f64; 2],
+        changed: bool,
+    },
+    DraggingSpeedHandle {
+        key: GraphKeyId,
+        is_out: bool,
+        prev_local_frame: f64,
+        next_local_frame: f64,
+        key_abs_frame: f64,
+        fps: f64,
         changed: bool,
     },
     DraggingEasingPad {
@@ -216,6 +236,7 @@ pub struct GraphEditorState {
     pub snap_guide_frame: Option<f64>,
     pub window_focused: bool,
     pub gesture_classifier: GestureClassifier,
+    pub plot_mode: GraphPlotMode,
     collapsed: bool,
     maximized: bool,
     link_axes: bool,
@@ -225,6 +246,7 @@ pub struct GraphEditorState {
     show_help_card: bool,
     copied_keys: Vec<CopiedGraphKey>,
     easing_clipboard: Option<String>,
+    easing_css_input: String,
 }
 
 impl Default for GraphEditorState {
@@ -257,6 +279,7 @@ impl GraphEditorState {
             snap_guide_frame: None,
             window_focused: true,
             gesture_classifier: GestureClassifier::new(),
+            plot_mode: GraphPlotMode::Value,
             collapsed: false,
             maximized: false,
             link_axes: false,
@@ -266,6 +289,7 @@ impl GraphEditorState {
             show_help_card: false,
             copied_keys: Vec::new(),
             easing_clipboard: None,
+            easing_css_input: String::new(),
         }
     }
 
@@ -279,7 +303,9 @@ impl GraphEditorState {
         if !matches!(self.drag_state, GraphDragState::None) {
             if matches!(
                 self.drag_state,
-                GraphDragState::DraggingHandle { .. } | GraphDragState::DraggingEasingPad { .. }
+                GraphDragState::DraggingHandle { .. }
+                    | GraphDragState::DraggingSpeedHandle { .. }
+                    | GraphDragState::DraggingEasingPad { .. }
             ) && session.history.is_in_transaction()
             {
                 let _ = session.cancel_transaction();
@@ -289,6 +315,77 @@ impl GraphEditorState {
             cancelled = true;
         }
         cancelled
+    }
+
+    /// Auto-fits the Y bounds around the Speed Graph velocity range (including 0 u/s baseline).
+    pub fn fit_speed_y(
+        &mut self,
+        tracks: &[CurveTrack],
+        doc: &zc_session::SessionDocument,
+        fps: f64,
+        canvas_size: Vec2,
+    ) {
+        let mut min_v = 0.0_f64;
+        let mut max_v = 0.0_f64;
+        let mut any = false;
+
+        for track in tracks {
+            if !self.is_track_visible(&track.track_key) {
+                continue;
+            }
+            if track.is_expression {
+                let f0 = 0.0;
+                let f1 = doc.sequence_length.max(30.0);
+                for (_, vel) in
+                    sample_expression_velocity_curve(track, doc, &self.handles, f0, f1, 64)
+                {
+                    if vel.is_finite() {
+                        min_v = min_v.min(vel);
+                        max_v = max_v.max(vel);
+                        any = true;
+                    }
+                }
+            } else if track.keyframes.len() >= 2 {
+                for pair in track.keyframes.windows(2) {
+                    let k0 = &pair[0];
+                    let k1 = &pair[1];
+                    let span = (k1.local_frame - k0.local_frame).max(1e-6);
+                    for s in 0..=16 {
+                        let f = k0.local_frame + span * (s as f64 / 16.0);
+                        let vel = eval_segment_velocity(track, k0, k1, f, fps, &self.handles);
+                        if vel.is_finite() {
+                            min_v = min_v.min(vel);
+                            max_v = max_v.max(vel);
+                            any = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !any {
+            self.center_y = 0.0;
+            self.zoom_y = (20.0 / f64::from(canvas_size.y.max(64.0))).clamp(1e-6, 10000.0);
+            return;
+        }
+
+        let span_v = (max_v - min_v).max(10.0) * 1.35;
+        self.center_y = 0.5 * (min_v + max_v);
+        self.zoom_y = (span_v / f64::from(canvas_size.y.max(64.0))).clamp(1e-6, 10000.0);
+    }
+
+    /// Auto-fits the view bounds for the active plot mode (Value or Speed).
+    pub fn fit_curves_for_mode(
+        &mut self,
+        tracks: &[CurveTrack],
+        doc: &zc_session::SessionDocument,
+        fps: f64,
+        canvas_size: Vec2,
+    ) {
+        self.fit_curves(tracks, canvas_size);
+        if self.plot_mode == GraphPlotMode::Speed {
+            self.fit_speed_y(tracks, doc, fps, canvas_size);
+        }
     }
 
     /// Auto-fits the view bounds around all currently visible keyframes (with 1.3x margin).
@@ -412,7 +509,364 @@ pub struct CurveTrack {
     pub color: Color32,
     pub frame_offset: f64,
     pub is_expression: bool,
+    pub expression: Option<String>,
     pub keyframes: Vec<CurveKeyframe>,
+}
+
+/// Evaluates the numerical derivative `dv / dt` (in units/sec) of `track` within segment `[k0, k1]`
+/// at `local_frame`, using a symmetric central finite difference `(eval(f+eps) - eval(f-eps)) / (2*eps/fps)`
+/// (clamping to one-sided differences at segment endpoints so discontinuities stay exact).
+#[must_use]
+pub fn eval_segment_velocity(
+    track: &CurveTrack,
+    k0: &CurveKeyframe,
+    k1: &CurveKeyframe,
+    local_frame: f64,
+    fps: f64,
+    handles: &BTreeMap<GraphKeyId, BezierHandlePair>,
+) -> f64 {
+    let safe_fps = if fps.is_finite() && fps > 0.0 {
+        fps
+    } else {
+        30.0
+    };
+    let span = k1.local_frame - k0.local_frame;
+    if span <= 1e-9 {
+        return 0.0;
+    }
+    let (mode, _) = InterpolationMode::from_cm3_tween_code(k1.tween);
+    if mode == InterpolationMode::Discrete {
+        return 0.0;
+    }
+    let f = local_frame.clamp(k0.local_frame, k1.local_frame);
+    let eps = (span * 1e-3).clamp(1e-4, 0.05);
+    let f_lo = (f - eps).max(k0.local_frame);
+    let f_hi = (f + eps).min(k1.local_frame);
+    let df = f_hi - f_lo;
+    if df <= 1e-9 {
+        return 0.0;
+    }
+    let v_lo = eval_curve_segment(track, k0, k1, f_lo, handles);
+    let v_hi = eval_curve_segment(track, k0, k1, f_hi, handles);
+    ((v_hi - v_lo) / df) * safe_fps
+}
+
+/// Evaluates the numerical derivative `dv / dt` (in units/sec) of `track` at `local_frame`.
+#[must_use]
+pub fn eval_curve_velocity(
+    track: &CurveTrack,
+    local_frame: f64,
+    fps: f64,
+    handles: &BTreeMap<GraphKeyId, BezierHandlePair>,
+) -> f64 {
+    if track.keyframes.len() < 2 {
+        return 0.0;
+    }
+    let first = &track.keyframes[0];
+    let last = &track.keyframes[track.keyframes.len() - 1];
+    if local_frame < first.local_frame || local_frame > last.local_frame {
+        return 0.0;
+    }
+    let idx = track
+        .keyframes
+        .partition_point(|k| k.local_frame <= local_frame)
+        .clamp(1, track.keyframes.len() - 1);
+    eval_segment_velocity(
+        track,
+        &track.keyframes[idx - 1],
+        &track.keyframes[idx],
+        local_frame,
+        fps,
+        handles,
+    )
+}
+
+/// Converts a Speed Graph handle drag `(dx_frames, speed_u_per_s)` back into a valid relative
+/// Bezier control-point tangent `[dx, dy]` for `BezierSegment`.
+#[must_use]
+pub fn speed_handle_to_tangent(
+    dx_frames: f64,
+    speed_units_per_sec: f64,
+    fps: f64,
+    is_out: bool,
+    segment_span: f64,
+) -> [f64; 2] {
+    let safe_fps = if fps.is_finite() && fps > 0.0 {
+        fps
+    } else {
+        30.0
+    };
+    let span = segment_span.max(1e-3);
+    let min_dx = (span * 0.02).clamp(1e-3, 0.5);
+    let dx = if is_out {
+        dx_frames.clamp(min_dx, span)
+    } else {
+        dx_frames.clamp(-span, -min_dx)
+    };
+    let dy = (speed_units_per_sec / safe_fps) * dx;
+    [dx, dy]
+}
+
+struct GraphExprContext<'a> {
+    track: &'a CurveTrack,
+    doc: &'a zc_session::SessionDocument,
+    handles: &'a BTreeMap<GraphKeyId, BezierHandlePair>,
+    local_frame: f64,
+    fps: f64,
+}
+
+impl GraphExprContext<'_> {
+    fn pre_expr_value_at_local_frame(&self, local_f: f64) -> ExprValue {
+        if self.track.channel_index.is_some() {
+            // Reconstruct vector pre-expression value from the track's keyframes if possible.
+            if let Some(first) = self.track.keyframes.first()
+                && let Some(arr) = first.full_value.as_array()
+            {
+                let ch = self.track.channel_index.unwrap_or(0);
+                let mut out: Vec<ExprValue> = arr
+                    .iter()
+                    .map(|v| ExprValue::Number(v.as_f64().unwrap_or(0.0)))
+                    .collect();
+                if ch < out.len() {
+                    out[ch] = ExprValue::Number(self.track.evaluate_at(local_f, self.handles));
+                }
+                return ExprValue::Array(out);
+            }
+        }
+        ExprValue::Number(self.track.evaluate_at(local_f, self.handles))
+    }
+}
+
+impl ExprContext for GraphExprContext<'_> {
+    fn frame(&self) -> f64 {
+        self.local_frame
+    }
+
+    fn fps(&self) -> f64 {
+        self.fps
+    }
+
+    fn value(&self) -> ExprValue {
+        self.pre_expr_value_at_local_frame(self.local_frame)
+    }
+
+    fn property_address(&self) -> Option<String> {
+        Some(format!("{}.{}", self.track.target_id, self.track.property))
+    }
+
+    fn property_value_at_time(&self, id: &HandleId, seconds: f64) -> Result<ExprValue, ExprError> {
+        if self.this_property_id().as_ref() == Some(id) {
+            Ok(self.pre_expr_value_at_local_frame(seconds * self.fps))
+        } else {
+            Err(ExprError::NotFound(format!("property '{}'", id.as_str())))
+        }
+    }
+
+    fn control(&self, name: &str, _stable_id: Option<&str>) -> Result<ExprValue, ExprError> {
+        let key = if name.starts_with("ctl_") {
+            name.to_owned()
+        } else {
+            format!("ctl_{name}")
+        };
+        let prop = self
+            .doc
+            .sequence_properties
+            .get(&key)
+            .or_else(|| self.doc.sequence_properties.get(name))
+            .ok_or_else(|| ExprError::NotFound(format!("control '{name}'")))?;
+        let abs_f = self.track.frame_offset + self.local_frame;
+        let val = eval_session_prop_simple(prop, abs_f);
+        Ok(json_to_expr_value(&val))
+    }
+}
+
+fn eval_session_prop_simple(prop: &SessionProperty, frame: f64) -> Value {
+    if prop.keyframes.is_empty() {
+        return prop.default_value.clone();
+    }
+    if prop.keyframes.len() == 1 || frame <= prop.keyframes[0].frame {
+        return prop.keyframes[0].value.clone();
+    }
+    let last = &prop.keyframes[prop.keyframes.len() - 1];
+    if frame >= last.frame {
+        return last.value.clone();
+    }
+    let idx = prop
+        .keyframes
+        .partition_point(|k| k.frame <= frame)
+        .clamp(1, prop.keyframes.len() - 1);
+    let k0 = &prop.keyframes[idx - 1];
+    let k1 = &prop.keyframes[idx];
+    let span = (k1.frame - k0.frame).max(1e-9);
+    let u = ((frame - k0.frame) / span).clamp(0.0, 1.0);
+    if let (Some(a), Some(b)) = (k0.value.as_f64(), k1.value.as_f64()) {
+        return Value::from(a + (b - a) * u);
+    }
+    k0.value.clone()
+}
+
+fn json_to_expr_value(v: &Value) -> ExprValue {
+    match v {
+        Value::Null => ExprValue::Null,
+        Value::Bool(b) => ExprValue::Bool(*b),
+        Value::Number(n) => ExprValue::Number(n.as_f64().unwrap_or(0.0)),
+        Value::String(s) => ExprValue::String(s.clone()),
+        Value::Array(arr) => ExprValue::Array(arr.iter().map(json_to_expr_value).collect()),
+        Value::Object(map) => ExprValue::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_expr_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn extract_channel_from_expr_value(val: &ExprValue, channel_index: Option<usize>) -> Option<f64> {
+    match (val, channel_index) {
+        (ExprValue::Array(items), Some(ch)) => items
+            .get(ch)
+            .map(ExprValue::to_number)
+            .filter(|n| n.is_finite()),
+        (ExprValue::Array(items), None) => items
+            .first()
+            .map(ExprValue::to_number)
+            .filter(|n| n.is_finite()),
+        (other, _) => {
+            let n = other.to_number();
+            n.is_finite().then_some(n)
+        }
+    }
+}
+
+/// Evaluates an expression-driven `CurveTrack` at a single `local_frame` using a pre-compiled program.
+fn eval_compiled_expr_at(
+    compiled: &CompiledExpr,
+    track: &CurveTrack,
+    doc: &zc_session::SessionDocument,
+    handles: &BTreeMap<GraphKeyId, BezierHandlePair>,
+    local_frame: f64,
+    config: &EvalConfig,
+) -> f64 {
+    let fps = doc.fps.max(1.0);
+    let ctx = GraphExprContext {
+        track,
+        doc,
+        handles,
+        local_frame,
+        fps,
+    };
+    let outcome = compiled.evaluate_with_fallback(&ctx, config);
+    extract_channel_from_expr_value(&outcome.value, track.channel_index)
+        .unwrap_or_else(|| track.evaluate_at(local_frame, handles))
+}
+
+fn compile_track_expression(track: &CurveTrack) -> Option<CompiledExpr> {
+    let src = track.expression.as_deref()?.trim();
+    if src.is_empty() {
+        return None;
+    }
+    CompiledExpr::compile(src, ExprMode::ExpressionsPlus)
+        .or_else(|_| CompiledExpr::compile(src, ExprMode::VanillaCm3))
+        .ok()
+}
+
+fn graph_expr_eval_config() -> EvalConfig {
+    EvalConfig {
+        mode: ExprMode::ExpressionsPlus,
+        max_steps: 25_000,
+        max_recursion: 64,
+    }
+}
+
+/// Evaluates `track` at `local_frame`, executing its live expression when present.
+#[must_use]
+pub fn eval_track_live_value(
+    track: &CurveTrack,
+    doc: &zc_session::SessionDocument,
+    handles: &BTreeMap<GraphKeyId, BezierHandlePair>,
+    local_frame: f64,
+) -> f64 {
+    if let Some(compiled) = compile_track_expression(track) {
+        let cfg = graph_expr_eval_config();
+        return eval_compiled_expr_at(&compiled, track, doc, handles, local_frame, &cfg);
+    }
+    track.evaluate_at(local_frame, handles)
+}
+
+/// Samples an expression-driven curve across `[start_abs_frame, end_abs_frame]` into `(abs_frame, value)` points.
+#[must_use]
+pub fn sample_expression_curve(
+    track: &CurveTrack,
+    doc: &zc_session::SessionDocument,
+    handles: &BTreeMap<GraphKeyId, BezierHandlePair>,
+    start_abs_frame: f64,
+    end_abs_frame: f64,
+    steps: usize,
+) -> Vec<(f64, f64)> {
+    let steps = steps.clamp(2, 400);
+    let span = end_abs_frame - start_abs_frame;
+    if !span.is_finite() || span <= 0.0 {
+        return Vec::new();
+    }
+    let compiled = compile_track_expression(track);
+    let cfg = graph_expr_eval_config();
+    let mut out = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let u = i as f64 / steps as f64;
+        let abs_f = start_abs_frame + span * u;
+        let local_f = abs_f - track.frame_offset;
+        let v = match compiled.as_ref() {
+            Some(prog) => eval_compiled_expr_at(prog, track, doc, handles, local_f, &cfg),
+            None => track.evaluate_at(local_f, handles),
+        };
+        if v.is_finite() {
+            out.push((abs_f, v));
+        }
+    }
+    out
+}
+
+/// Samples the numerical velocity `dv/dt` (in units/sec) of an expression-driven curve across
+/// `[start_abs_frame, end_abs_frame]`.
+#[must_use]
+pub fn sample_expression_velocity_curve(
+    track: &CurveTrack,
+    doc: &zc_session::SessionDocument,
+    handles: &BTreeMap<GraphKeyId, BezierHandlePair>,
+    start_abs_frame: f64,
+    end_abs_frame: f64,
+    steps: usize,
+) -> Vec<(f64, f64)> {
+    let steps = steps.clamp(2, 400);
+    let span = end_abs_frame - start_abs_frame;
+    if !span.is_finite() || span <= 0.0 {
+        return Vec::new();
+    }
+    let fps = doc.fps.max(1.0);
+    let compiled = compile_track_expression(track);
+    let cfg = graph_expr_eval_config();
+    let eps = 0.05_f64;
+    let inv_2dt = fps / (2.0 * eps);
+    let mut out = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let u = i as f64 / steps as f64;
+        let abs_f = start_abs_frame + span * u;
+        let local_f = abs_f - track.frame_offset;
+        let (v_lo, v_hi) = match compiled.as_ref() {
+            Some(prog) => (
+                eval_compiled_expr_at(prog, track, doc, handles, local_f - eps, &cfg),
+                eval_compiled_expr_at(prog, track, doc, handles, local_f + eps, &cfg),
+            ),
+            None => (
+                track.evaluate_at(local_f - eps, handles),
+                track.evaluate_at(local_f + eps, handles),
+            ),
+        };
+        let vel = (v_hi - v_lo) * inv_2dt;
+        if vel.is_finite() {
+            out.push((abs_f, vel));
+        }
+    }
+    out
 }
 
 impl CurveTrack {
@@ -627,7 +1081,11 @@ fn expand_property_map(
     graph_plus: bool,
 ) {
     for (name, prop) in props {
-        if !prop.animated || prop.keyframes.is_empty() {
+        let has_expr = prop
+            .expression
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if (!prop.animated && !has_expr) || prop.keyframes.is_empty() {
             continue;
         }
         expand_single_property(out, target_id, prefix, name, frame_offset, prop, graph_plus);
@@ -646,6 +1104,12 @@ fn expand_single_property(
     let Some(first) = prop.keyframes.first() else {
         return;
     };
+    let expr = prop
+        .expression
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     match &first.value {
         Value::Number(_) => {
             let mut kfs: Vec<CurveKeyframe> = prop
@@ -678,7 +1142,8 @@ fn expand_single_property(
                 display_name: format!("{prefix}{name}"),
                 color,
                 frame_offset,
-                is_expression: prop.expression.is_some(),
+                is_expression: expr.is_some(),
+                expression: expr,
                 keyframes: kfs,
             });
         }
@@ -716,7 +1181,8 @@ fn expand_single_property(
                     display_name: format!("{prefix}{name}.{}", AXIS_NAMES[ch]),
                     color: AXIS_COLORS[ch],
                     frame_offset,
-                    is_expression: prop.expression.is_some(),
+                    is_expression: expr.is_some(),
+                    expression: expr.clone(),
                     keyframes: kfs,
                 });
             }
@@ -921,6 +1387,7 @@ pub fn show_graph_editor_window(
         state.drag_state,
         GraphDragState::DraggingKeys { .. }
             | GraphDragState::DraggingHandle { .. }
+            | GraphDragState::DraggingSpeedHandle { .. }
             | GraphDragState::DraggingEasingPad { .. }
             | GraphDragState::Marquee { .. }
     );
@@ -950,7 +1417,10 @@ pub fn show_graph_editor_panel(
     {
         state.solo_track = None;
     }
-    if !matches!(state.drag_state, GraphDragState::DraggingHandle { .. }) {
+    if !matches!(
+        state.drag_state,
+        GraphDragState::DraggingHandle { .. } | GraphDragState::DraggingSpeedHandle { .. }
+    ) {
         sync_handles_from_tracks(&mut state.handles, &tracks);
     }
 
@@ -962,6 +1432,7 @@ pub fn show_graph_editor_panel(
         (full_rect.width() - TRACK_LIST_WIDTH).max(200.0),
         (full_rect.height() - 150.0).max(160.0),
     );
+    let fps = session.document().fps.max(1.0);
 
     // Top toolbar: Graph Editor 2 big preset tiles (68x54) + Custom easings (50x30) + tool tiles (38x32),
     // or compact vanilla CM3 toolbar strip.
@@ -979,6 +1450,11 @@ pub fn show_graph_editor_panel(
     } else {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            if show_plot_mode_toggle(ui, state, palette) {
+                let doc = session.document().clone();
+                state.fit_curves_for_mode(&tracks, &doc, fps, est_canvas_size);
+            }
+            ui.separator();
             if toolbar_chip(ui, "Hold", false, palette) {
                 apply_tween_to_selected(session, state, &tracks, 0, &mut action);
             }
@@ -999,7 +1475,8 @@ pub fn show_graph_editor_panel(
             }
             ui.separator();
             if toolbar_chip(ui, "Fit (\\)", false, palette) {
-                state.fit_curves(&tracks, est_canvas_size);
+                let doc = session.document().clone();
+                state.fit_curves_for_mode(&tracks, &doc, fps, est_canvas_size);
             }
             if toolbar_chip(ui, "Snap", state.snap_enabled, palette) {
                 state.snap_enabled = !state.snap_enabled;
@@ -1058,9 +1535,65 @@ pub fn show_graph_editor_panel(
     let canvas_rect =
         Rect::from_min_max(pos2(right_rect.left(), ruler_rect.bottom()), right_rect.max);
 
-    // Graph Editor keyboard shortcuts when unoccluded-hovered and no text field has focus.
-    if !ui.ctx().egui_wants_keyboard_input() && unoccluded_hover_pos(ui, main_rect).is_some() {
-        let (k_f, k_bslash, k_h, k_v, k_s, k_i, k_t, k_r, k_k, k_n) = ui.input(|i| {
+    // Graph Editor keyboard shortcuts & Cmd/Ctrl+C/V clipboard when focused/hovered and no text input has focus.
+    let graph_hovered = unoccluded_hover_pos(ui, full_rect).is_some();
+    let canvas_hovered = unoccluded_hover_pos(ui, main_rect).is_some();
+    if !ui.ctx().egui_wants_keyboard_input() && (state.window_focused || graph_hovered) {
+        let (has_copy, has_paste_key, pasted_text) = ui.input(|i| {
+            let cmd = i.modifiers.command || i.modifiers.ctrl;
+            let mut ev_copy = false;
+            let mut ev_paste: Option<String> = None;
+            for ev in &i.events {
+                match ev {
+                    egui::Event::Copy => ev_copy = true,
+                    egui::Event::Paste(text) => ev_paste = Some(text.clone()),
+                    _ => {}
+                }
+            }
+            (
+                ev_copy || (cmd && i.key_pressed(egui::Key::C)),
+                cmd && i.key_pressed(egui::Key::V),
+                ev_paste,
+            )
+        });
+
+        if has_copy {
+            if !state.selected_keys.is_empty() {
+                copy_selected_graph_keys(state, &tracks);
+            }
+            if easing_plus || state.selected_keys.is_empty() {
+                let [x1, y1, x2, y2] = state.easing_plus_curve;
+                let css = format!("cubic-bezier({x1:.4}, {y1:.4}, {x2:.4}, {y2:.4})");
+                state.easing_clipboard = Some(css.clone());
+                if state.selected_keys.is_empty() {
+                    ui.ctx().copy_text(css);
+                }
+            }
+        }
+
+        if let Some(ref text) = pasted_text {
+            let trimmed = text.trim();
+            let looks_like_css = trimmed.to_ascii_lowercase().contains("cubic-bezier");
+            if looks_like_css && let Some(parsed) = parse_cubic_bezier_str(trimmed) {
+                apply_parsed_easing_curve(session, state, &tracks, parsed, &mut action);
+            } else if !state.copied_keys.is_empty() {
+                paste_graph_keys_at_playhead(session, state, &tracks, &mut action);
+            } else if let Some(parsed) = parse_cubic_bezier_str(trimmed) {
+                apply_parsed_easing_curve(session, state, &tracks, parsed, &mut action);
+            }
+        } else if has_paste_key {
+            if !state.copied_keys.is_empty() {
+                paste_graph_keys_at_playhead(session, state, &tracks, &mut action);
+            } else if let Some(ref clip) = state.easing_clipboard.clone()
+                && let Some(parsed) = parse_cubic_bezier_str(clip)
+            {
+                apply_parsed_easing_curve(session, state, &tracks, parsed, &mut action);
+            }
+        }
+    }
+
+    if !ui.ctx().egui_wants_keyboard_input() && canvas_hovered {
+        let (k_f, k_bslash, k_h, k_v, k_s, k_i, k_t, k_r, k_k, k_n, k_del) = ui.input(|i| {
             let no_mod = !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt;
             (
                 no_mod && i.key_pressed(egui::Key::F),
@@ -1073,12 +1606,18 @@ pub fn show_graph_editor_panel(
                 no_mod && i.key_pressed(egui::Key::R),
                 no_mod && i.key_pressed(egui::Key::K),
                 no_mod && i.key_pressed(egui::Key::N),
+                no_mod && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)),
             )
         });
         if k_f {
             state.frame_selected_keys(&tracks, canvas_rect.size());
+            if state.plot_mode == GraphPlotMode::Speed {
+                let doc = session.document().clone();
+                state.fit_speed_y(&tracks, &doc, fps, canvas_rect.size());
+            }
         } else if k_bslash {
-            state.fit_curves(&tracks, canvas_rect.size());
+            let doc = session.document().clone();
+            state.fit_curves_for_mode(&tracks, &doc, fps, canvas_rect.size());
         } else if k_h && graph_plus {
             state.pan_tool = true;
         } else if k_v && graph_plus {
@@ -1095,6 +1634,8 @@ pub fn show_graph_editor_panel(
             insert_key_at_playhead(session, state, &tracks, &mut action);
         } else if k_n && graph_plus {
             state.normalize_curves = !state.normalize_curves;
+        } else if k_del && !state.selected_keys.is_empty() {
+            delete_selected_graph_keys(session, state, &mut action);
         }
     }
 
@@ -1171,10 +1712,38 @@ fn show_channel_track_list(
                     let visible = state.is_track_visible(&track.track_key);
                     let soloed = state.solo_track.as_deref() == Some(track.track_key.as_str());
                     let local_f = session.playback.current_frame - track.frame_offset;
-                    let live_val = track.evaluate_at(local_f, &state.handles);
+                    let fps = session.document().fps.max(1.0);
+                    let live_val = match state.plot_mode {
+                        GraphPlotMode::Value => eval_track_live_value(
+                            track,
+                            session.document(),
+                            &state.handles,
+                            local_f,
+                        ),
+                        GraphPlotMode::Speed => {
+                            if track.is_expression {
+                                let eps = 0.05;
+                                let v0 = eval_track_live_value(
+                                    track,
+                                    session.document(),
+                                    &state.handles,
+                                    local_f - eps,
+                                );
+                                let v1 = eval_track_live_value(
+                                    track,
+                                    session.document(),
+                                    &state.handles,
+                                    local_f + eps,
+                                );
+                                ((v1 - v0) / (2.0 * eps)) * fps
+                            } else {
+                                eval_curve_velocity(track, local_f, fps, &state.handles)
+                            }
+                        }
+                    };
                     let has_solo = track.channel_index.is_some();
 
-                    // Row order per Spec 02 §4.2: [swatch] [name] [value] [Eye] [Solo (axes only)].
+                    // Row order per Spec 02 §4.2: [swatch] [fx?] [name] [value] [Eye] [Solo (axes only)].
                     let row_w = ui.available_width().max(40.0);
                     let (row_rect, _) = ui.allocate_exact_size(vec2(row_w, 20.0), Sense::hover());
                     let p = ui.painter();
@@ -1273,10 +1842,13 @@ fn show_channel_track_list(
                     }
                     right_cursor -= 4.0;
 
-                    // Live value readout (Graph Editor 2) positioned left of Eye/Solo.
-                    if graph_plus {
-                        let val_str = format!("{live_val:.2}");
-                        let val_w = (val_str.len() as f32 * 6.5).clamp(32.0, 56.0);
+                    // Live value readout (Graph Editor 2 or Speed mode) positioned left of Eye/Solo.
+                    if graph_plus || state.plot_mode == GraphPlotMode::Speed {
+                        let val_str = match state.plot_mode {
+                            GraphPlotMode::Value => format!("{live_val:.2}"),
+                            GraphPlotMode::Speed => format!("{live_val:.1}u/s"),
+                        };
+                        let val_w = (val_str.len() as f32 * 6.2).clamp(32.0, 62.0);
                         let val_rect = Rect::from_min_max(
                             pos2(
                                 (right_cursor - val_w).max(row_rect.left() + 40.0),
@@ -1288,16 +1860,47 @@ fn show_channel_track_list(
                             pos2(val_rect.right(), cy),
                             Align2::RIGHT_CENTER,
                             val_str,
-                            FontId::monospace(11.0),
+                            FontId::monospace(10.5),
                             Color32::from_rgb(0x7e, 0x8f, 0xb9),
                         );
                         right_cursor = val_rect.left() - 4.0;
                     }
 
-                    // Truncated channel / property name between swatch and value/icons.
+                    // Expression `fx` badge when this track is driven by an expression.
+                    let mut name_left = row_rect.left() + 17.0;
+                    if track.is_expression {
+                        let fx_rect =
+                            Rect::from_center_size(pos2(name_left + 10.0, cy), vec2(18.0, 13.0));
+                        p.rect(
+                            fx_rect,
+                            CornerRadius::same(2),
+                            Color32::from_rgb(0x3a, 0x2d, 0x52),
+                            Stroke::new(1.0, Color32::from_rgb(0xc7, 0x92, 0xea)),
+                            StrokeKind::Inside,
+                        );
+                        p.text(
+                            fx_rect.center(),
+                            Align2::CENTER_CENTER,
+                            "fx",
+                            FontId::monospace(9.0),
+                            Color32::from_rgb(0xe0, 0xc0, 0xff),
+                        );
+                        if let Some(ref expr_src) = track.expression {
+                            let _ = ui
+                                .interact(
+                                    fx_rect,
+                                    ui.scope_id().with(("g_fx_badge", &track.track_key)),
+                                    Sense::hover(),
+                                )
+                                .on_hover_text(format!("Expression:\n{expr_src}"));
+                        }
+                        name_left = fx_rect.right() + 4.0;
+                    }
+
+                    // Truncated channel / property name between swatch/fx and value/icons.
                     let name_rect = Rect::from_min_max(
-                        pos2(row_rect.left() + 17.0, row_rect.top()),
-                        pos2(right_cursor.max(row_rect.left() + 17.0), row_rect.bottom()),
+                        pos2(name_left, row_rect.top()),
+                        pos2(right_cursor.max(name_left), row_rect.bottom()),
                     );
                     let label_color = if visible {
                         COLOR_TEXT
@@ -1628,13 +2231,23 @@ fn show_curve_canvas(
     // Adaptive 1-2-5-10 integer-snapped grid lines.
     paint_adaptive_grid(&painter, state, rect, graph_plus);
 
-    // Paint all visible curves.
+    let fps = session.document().fps.max(1.0);
+    let doc_snapshot = session.document().clone();
+
+    // Paint all visible curves (Value mode or Speed velocity mode, plus live expression evaluation).
     let (drag_df, drag_dv) = match &state.drag_state {
         GraphDragState::DraggingKeys {
             preview_df,
             preview_dv,
             ..
-        } => (*preview_df, *preview_dv),
+        } => (
+            *preview_df,
+            if state.plot_mode == GraphPlotMode::Speed {
+                0.0
+            } else {
+                *preview_dv
+            },
+        ),
         _ => (0.0, 0.0),
     };
 
@@ -1642,7 +2255,38 @@ fn show_curve_canvas(
         if !state.is_track_visible(&track.track_key) || track.keyframes.is_empty() {
             continue;
         }
-        paint_curve_track(&painter, state, track, rect, drag_df, drag_dv, graph_plus);
+        match state.plot_mode {
+            GraphPlotMode::Value => {
+                if track.is_expression {
+                    paint_expression_curve_track(
+                        &painter,
+                        state,
+                        track,
+                        &doc_snapshot,
+                        rect,
+                        graph_plus,
+                        false,
+                    );
+                } else {
+                    paint_curve_track(&painter, state, track, rect, drag_df, drag_dv, graph_plus);
+                }
+            }
+            GraphPlotMode::Speed => {
+                if track.is_expression {
+                    paint_expression_curve_track(
+                        &painter,
+                        state,
+                        track,
+                        &doc_snapshot,
+                        rect,
+                        graph_plus,
+                        true,
+                    );
+                } else {
+                    paint_speed_curve_track(&painter, state, track, rect, drag_df, fps, graph_plus);
+                }
+            }
+        }
     }
 
     // Crisp integer-snapped 1 px Playhead line (#b71e1e in Graph Editor 2, #ff0000aa in Vanilla CM3).
@@ -1671,13 +2315,23 @@ fn show_curve_canvas(
     }
 
     // Handle click selection first (toggles Shift+Click exactly once; never double-toggle across
-    // drag_started_by and clicked_by), then hit-test Bezier handles & keyframe drags.
+    // drag_started_by and clicked_by), then hit-test Bezier/Speed handles & keyframe drags.
     let mut hit_handled = false;
     if !(graph_plus && state.pan_tool) && !space_down {
         if resp.clicked_by(PointerButton::Primary)
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            if let Some((track, kf_idx)) = hit_test_keyframe(state, tracks, rect, pos) {
+            let hit_kf = match state.plot_mode {
+                GraphPlotMode::Value => hit_test_keyframe(state, tracks, rect, pos),
+                GraphPlotMode::Speed => hit_test_speed_keyframe(state, tracks, rect, fps, pos),
+            };
+            let hit_handle = match state.plot_mode {
+                GraphPlotMode::Value => hit_test_bezier_handle(state, tracks, rect, pos).is_some(),
+                GraphPlotMode::Speed => {
+                    hit_test_speed_handle(state, tracks, rect, fps, pos).is_some()
+                }
+            };
+            if let Some((track, kf_idx)) = hit_kf {
                 let kf = &track.keyframes[kf_idx];
                 let key_id = GraphKeyId::new(
                     &track.target_id,
@@ -1696,8 +2350,7 @@ fn show_curve_canvas(
                 }
                 sync_easing_plus_from_selection(state, tracks);
                 hit_handled = true;
-            } else if !modifiers.shift && hit_test_bezier_handle(state, tracks, rect, pos).is_none()
-            {
+            } else if !modifiers.shift && !hit_handle {
                 state.selected_keys.clear();
                 hit_handled = true;
             }
@@ -1705,7 +2358,57 @@ fn show_curve_canvas(
             && resp.drag_started_by(PointerButton::Primary)
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            if let Some((key_id, is_out, prev_f, next_f, abs_f, val, orig_tangent)) =
+            if state.plot_mode == GraphPlotMode::Speed {
+                if let Some((key_id, is_out, prev_f, next_f, abs_f)) =
+                    hit_test_speed_handle(state, tracks, rect, fps, pos)
+                {
+                    if session.begin_transaction("Edit Speed Handles").is_ok() {
+                        state.drag_state = GraphDragState::DraggingSpeedHandle {
+                            key: key_id,
+                            is_out,
+                            prev_local_frame: prev_f,
+                            next_local_frame: next_f,
+                            key_abs_frame: abs_f,
+                            fps,
+                            changed: false,
+                        };
+                    }
+                    hit_handled = true;
+                } else if let Some((track, kf_idx)) =
+                    hit_test_speed_keyframe(state, tracks, rect, fps, pos)
+                {
+                    let kf = &track.keyframes[kf_idx];
+                    let key_id = GraphKeyId::new(
+                        &track.target_id,
+                        &track.property,
+                        track.channel_index,
+                        kf.local_frame,
+                    );
+                    let already_selected = state.selected_keys.contains(&key_id);
+                    if !modifiers.shift && !already_selected {
+                        state.selected_keys.clear();
+                        state.selected_keys.push(key_id.clone());
+                        if graph_plus && state.link_axes {
+                            expand_linked_axis_selection(state, tracks, &key_id);
+                        }
+                    }
+                    if !modifiers.shift || already_selected {
+                        let dragged = collect_dragged_graph_keys(tracks, &state.selected_keys);
+                        if !dragged.is_empty() {
+                            state.drag_state = GraphDragState::DraggingKeys {
+                                start_pos: pos,
+                                anchor_orig_abs_frame: track.frame_offset + kf.local_frame,
+                                anchor_orig_value: kf.value,
+                                preview_df: 0.0,
+                                preview_dv: 0.0,
+                                keys: dragged,
+                                moved: false,
+                            };
+                        }
+                    }
+                    hit_handled = true;
+                }
+            } else if let Some((key_id, is_out, prev_f, next_f, abs_f, val, orig_tangent)) =
                 hit_test_bezier_handle(state, tracks, rect, pos)
             {
                 if session.begin_transaction("Edit Bezier Handles").is_ok() {
@@ -1769,8 +2472,19 @@ fn show_curve_canvas(
         }
     }
 
-    // Paint keyframe dots/squares & selected Bezier tangent handles on top of curves.
-    paint_keyframes_and_handles(&painter, state, tracks, rect, drag_df, drag_dv, graph_plus);
+    // Paint keyframe dots/squares & selected Bezier/Speed tangent handles on top of curves.
+    match state.plot_mode {
+        GraphPlotMode::Value => {
+            paint_keyframes_and_handles(
+                &painter, state, tracks, rect, drag_df, drag_dv, graph_plus,
+            );
+        }
+        GraphPlotMode::Speed => {
+            paint_speed_keyframes_and_handles(
+                &painter, state, tracks, rect, drag_df, fps, graph_plus,
+            );
+        }
+    }
 
     // Inline curve labels in Graph Editor 2 when enabled.
     if graph_plus && state.show_curve_labels {
@@ -1782,8 +2496,25 @@ fn show_curve_canvas(
                 let lx = state
                     .frame_to_screen_x(track.frame_offset + last.local_frame, rect)
                     .clamp(rect.left() + 8.0, rect.right() - 72.0);
+                let label_val = match state.plot_mode {
+                    GraphPlotMode::Value => {
+                        if track.is_expression {
+                            eval_track_live_value(
+                                track,
+                                &doc_snapshot,
+                                &state.handles,
+                                last.local_frame,
+                            )
+                        } else {
+                            last.value
+                        }
+                    }
+                    GraphPlotMode::Speed => {
+                        eval_curve_velocity(track, last.local_frame, fps, &state.handles)
+                    }
+                };
                 let ly = state
-                    .value_to_screen_y(last.value, rect)
+                    .value_to_screen_y(label_val, rect)
                     .clamp(rect.top() + 10.0, rect.bottom() - 10.0);
                 painter.text(
                     pos2(lx + 8.0, ly - 8.0),
@@ -1910,31 +2641,368 @@ fn paint_adaptive_grid(
     for i in fy0..=fy1 {
         let v = i as f64 * minor_y;
         let y = state.value_to_screen_y(v, rect).round();
-        let color = if i == 0 {
-            zero_col
+        let is_zero = i == 0;
+        let color = if is_zero {
+            if state.plot_mode == GraphPlotMode::Speed {
+                Color32::from_rgb(0x88, 0x99, 0xbb)
+            } else {
+                zero_col
+            }
         } else if i % 5 == 0 {
             major_col
         } else {
             minor_col
         };
+        let line_h = if is_zero && state.plot_mode == GraphPlotMode::Speed {
+            1.5
+        } else {
+            1.0
+        };
         painter.rect_filled(
-            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), 1.0)),
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), line_h)),
             CornerRadius::ZERO,
             color,
         );
         if i % 5 == 0 {
-            let label = if major_y >= 1.0 {
+            let num = if major_y >= 1.0 {
                 format!("{v:.0}")
             } else {
                 format!("{v:.2}")
+            };
+            let label = match state.plot_mode {
+                GraphPlotMode::Value => num,
+                GraphPlotMode::Speed => format!("{num} u/s"),
             };
             painter.text(
                 pos2(rect.left() + 4.0, y - 2.0),
                 Align2::LEFT_BOTTOM,
                 label,
                 FontId::monospace(10.0),
-                COLOR_LABEL_MUTED,
+                if is_zero && state.plot_mode == GraphPlotMode::Speed {
+                    COLOR_TEXT
+                } else {
+                    COLOR_LABEL_MUTED
+                },
             );
+        }
+    }
+}
+
+fn paint_expression_curve_track(
+    painter: &egui::Painter,
+    state: &GraphEditorState,
+    track: &CurveTrack,
+    doc: &zc_session::SessionDocument,
+    rect: Rect,
+    graph_plus: bool,
+    speed_mode: bool,
+) {
+    let min_f = state.screen_x_to_frame(rect.left(), rect);
+    let max_f = state.screen_x_to_frame(rect.right(), rect);
+    let steps = ((rect.width() / 2.5).round() as usize).clamp(48, 300);
+    let samples = if speed_mode {
+        sample_expression_velocity_curve(track, doc, &state.handles, min_f, max_f, steps)
+    } else {
+        sample_expression_curve(track, doc, &state.handles, min_f, max_f, steps)
+    };
+    if samples.len() < 2 {
+        return;
+    }
+    let pts: Vec<Pos2> = samples
+        .into_iter()
+        .map(|(f, v)| {
+            pos2(
+                state.frame_to_screen_x(f, rect),
+                state.value_to_screen_y(v, rect),
+            )
+        })
+        .collect();
+    let stroke_w = if graph_plus { 2.4 } else { 2.0 };
+    // Subtle glow underlay so live expression waveforms stand out distinctly from keyed curves.
+    let glow_color =
+        Color32::from_rgba_unmultiplied(track.color.r(), track.color.g(), track.color.b(), 56);
+    painter.add(Shape::line(
+        pts.clone(),
+        Stroke::new(stroke_w + 3.5, glow_color),
+    ));
+    paint_dashed_polyline(painter, &pts, Stroke::new(stroke_w, track.color), 7.0, 4.0);
+}
+
+fn paint_speed_curve_track(
+    painter: &egui::Painter,
+    state: &GraphEditorState,
+    track: &CurveTrack,
+    rect: Rect,
+    drag_df: f64,
+    fps: f64,
+    graph_plus: bool,
+) {
+    let stroke_w = if graph_plus { 2.4 } else { 2.0 };
+    let stroke = Stroke::new(stroke_w, track.color);
+    let ext_stroke = Stroke::new(1.25, track.color.gamma_multiply(0.5));
+    let jump_stroke = Stroke::new(1.0, track.color.gamma_multiply(0.45));
+
+    let mut adjusted: Vec<(CurveKeyframe, f64)> = track
+        .keyframes
+        .iter()
+        .map(|k| {
+            let id = GraphKeyId::new(
+                &track.target_id,
+                &track.property,
+                track.channel_index,
+                k.local_frame,
+            );
+            let sel = state.selected_keys.contains(&id);
+            (
+                CurveKeyframe {
+                    local_frame: k.local_frame + if sel { drag_df } else { 0.0 },
+                    value: k.value,
+                    full_value: k.full_value.clone(),
+                    tween: k.tween,
+                    control_points: k.control_points,
+                    continuous_tangent: k.continuous_tangent,
+                },
+                k.local_frame,
+            )
+        })
+        .collect();
+    adjusted.sort_by(|a, b| a.0.local_frame.total_cmp(&b.0.local_frame));
+
+    let zero_y = state.value_to_screen_y(0.0, rect);
+    let first = &adjusted[0].0;
+    let x_first = state.frame_to_screen_x(track.frame_offset + first.local_frame, rect);
+    if x_first > rect.left() {
+        painter.line_segment(
+            [pos2(rect.left(), zero_y), pos2(x_first, zero_y)],
+            ext_stroke,
+        );
+    }
+    let last = &adjusted[adjusted.len() - 1].0;
+    let x_last = state.frame_to_screen_x(track.frame_offset + last.local_frame, rect);
+    if x_last < rect.right() {
+        painter.line_segment(
+            [pos2(x_last, zero_y), pos2(rect.right(), zero_y)],
+            ext_stroke,
+        );
+    }
+
+    let mut prev_end_pt: Option<Pos2> = None;
+    for pair in adjusted.windows(2) {
+        let (k0, orig_f0) = &pair[0];
+        let (k1, orig_f1) = &pair[1];
+        let span = k1.local_frame - k0.local_frame;
+        if span <= 1e-9 {
+            continue;
+        }
+        // Build temporary handle lookup keyed by shifted local frames for accurate live drag preview.
+        let mut preview_handles = state.handles.clone();
+        if (k0.local_frame - *orig_f0).abs() > 1e-9 {
+            let old0 = GraphKeyId::new(
+                &track.target_id,
+                &track.property,
+                track.channel_index,
+                *orig_f0,
+            );
+            if let Some(h) = state.handles.get(&old0).copied() {
+                let new0 = GraphKeyId::new(
+                    &track.target_id,
+                    &track.property,
+                    track.channel_index,
+                    k0.local_frame,
+                );
+                preview_handles.insert(new0, h);
+            }
+        }
+        if (k1.local_frame - *orig_f1).abs() > 1e-9 {
+            let old1 = GraphKeyId::new(
+                &track.target_id,
+                &track.property,
+                track.channel_index,
+                *orig_f1,
+            );
+            if let Some(h) = state.handles.get(&old1).copied() {
+                let new1 = GraphKeyId::new(
+                    &track.target_id,
+                    &track.property,
+                    track.channel_index,
+                    k1.local_frame,
+                );
+                preview_handles.insert(new1, h);
+            }
+        }
+
+        let steps = 48_usize;
+        let mut pts = Vec::with_capacity(steps + 1);
+        for s in 0..=steps {
+            let u = s as f64 / steps as f64;
+            let f = k0.local_frame + span * u;
+            let vel = eval_segment_velocity(track, k0, k1, f, fps, &preview_handles);
+            pts.push(pos2(
+                state.frame_to_screen_x(track.frame_offset + f, rect),
+                state.value_to_screen_y(vel, rect),
+            ));
+        }
+        if let (Some(prev_pt), Some(&first_pt)) = (prev_end_pt, pts.first())
+            && (prev_pt.y - first_pt.y).abs() > 1.5
+        {
+            paint_dashed_polyline(painter, &[prev_pt, first_pt], jump_stroke, 3.0, 3.0);
+        }
+        prev_end_pt = pts.last().copied();
+        painter.add(Shape::line(pts, stroke));
+    }
+}
+
+fn speed_keyframe_anchor_velocity(
+    state: &GraphEditorState,
+    track: &CurveTrack,
+    idx: usize,
+    fps: f64,
+) -> f64 {
+    let kf = &track.keyframes[idx];
+    let in_v = idx
+        .checked_sub(1)
+        .and_then(|p| track.keyframes.get(p))
+        .map(|prev| eval_segment_velocity(track, prev, kf, kf.local_frame, fps, &state.handles));
+    let out_v = track
+        .keyframes
+        .get(idx + 1)
+        .map(|next| eval_segment_velocity(track, kf, next, kf.local_frame, fps, &state.handles));
+    match (in_v, out_v) {
+        (Some(a), Some(b)) => 0.5 * (a + b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => 0.0,
+    }
+}
+
+fn speed_handle_screen_pos(
+    state: &GraphEditorState,
+    rect: Rect,
+    abs_frame: f64,
+    speed: f64,
+    dx_frames: f64,
+    is_out: bool,
+) -> Pos2 {
+    let origin = pos2(
+        state.frame_to_screen_x(abs_frame, rect),
+        state.value_to_screen_y(speed, rect),
+    );
+    let raw_x = state.frame_to_screen_x(abs_frame + dx_frames, rect);
+    let delta_x = raw_x - origin.x;
+    let clamped_x = if is_out {
+        origin.x + delta_x.max(MIN_HANDLE_SCREEN_PX)
+    } else {
+        origin.x + delta_x.min(-MIN_HANDLE_SCREEN_PX)
+    };
+    pos2(clamped_x, origin.y)
+}
+
+fn paint_speed_keyframes_and_handles(
+    painter: &egui::Painter,
+    state: &GraphEditorState,
+    tracks: &[CurveTrack],
+    rect: Rect,
+    drag_df: f64,
+    fps: f64,
+    graph_plus: bool,
+) {
+    for track in tracks {
+        if !state.is_track_visible(&track.track_key) || track.is_expression {
+            continue;
+        }
+        for (idx, kf) in track.keyframes.iter().enumerate() {
+            let key_id = GraphKeyId::new(
+                &track.target_id,
+                &track.property,
+                track.channel_index,
+                kf.local_frame,
+            );
+            let selected = state.selected_keys.contains(&key_id);
+            let abs_f = track.frame_offset + kf.local_frame + if selected { drag_df } else { 0.0 };
+            let anchor_vel = speed_keyframe_anchor_velocity(state, track, idx, fps);
+            let center = pos2(
+                state.frame_to_screen_x(abs_f, rect),
+                state.value_to_screen_y(anchor_vel, rect),
+            );
+            let hp = state.handles.get(&key_id).copied().unwrap_or_default();
+
+            if selected {
+                if let Some(eff_in) = effective_in_tangent(state, track, idx, hp)
+                    && let Some(prev) = idx.checked_sub(1).and_then(|p| track.keyframes.get(p))
+                {
+                    let in_vel =
+                        eval_segment_velocity(track, prev, kf, kf.local_frame, fps, &state.handles);
+                    let anchor_in = pos2(
+                        state.frame_to_screen_x(abs_f, rect),
+                        state.value_to_screen_y(in_vel, rect),
+                    );
+                    let handle_pos =
+                        speed_handle_screen_pos(state, rect, abs_f, in_vel, eff_in[0], false);
+                    painter.line_segment([anchor_in, handle_pos], Stroke::new(1.2, COLOR_HANDLE));
+                    painter.circle(
+                        handle_pos,
+                        4.5,
+                        if hp.continuous {
+                            Color32::from_rgb(0xe8, 0xd4, 0x60)
+                        } else {
+                            Color32::from_rgb(0xe0, 0xa0, 0x40)
+                        },
+                        Stroke::new(1.5, Color32::BLACK),
+                    );
+                }
+
+                if let Some(eff_out) = effective_out_tangent(state, track, idx, hp)
+                    && let Some(next) = track.keyframes.get(idx + 1)
+                {
+                    let out_vel =
+                        eval_segment_velocity(track, kf, next, kf.local_frame, fps, &state.handles);
+                    let anchor_out = pos2(
+                        state.frame_to_screen_x(abs_f, rect),
+                        state.value_to_screen_y(out_vel, rect),
+                    );
+                    let handle_pos =
+                        speed_handle_screen_pos(state, rect, abs_f, out_vel, eff_out[0], true);
+                    painter.line_segment([anchor_out, handle_pos], Stroke::new(1.2, COLOR_HANDLE));
+                    painter.circle(
+                        handle_pos,
+                        4.5,
+                        if hp.continuous {
+                            Color32::from_rgb(0xe8, 0xd4, 0x60)
+                        } else {
+                            Color32::from_rgb(0xe0, 0xa0, 0x40)
+                        },
+                        Stroke::new(1.5, Color32::BLACK),
+                    );
+                }
+            }
+
+            if graph_plus {
+                let radius = 5.0;
+                let stroke_w = if selected { 3.0 } else { 2.2 };
+                let fill = if selected {
+                    COLOR_TEXT_BRIGHT
+                } else {
+                    Color32::from_rgb(0x1b, 0x1b, 0x1b)
+                };
+                painter.circle(center, radius, fill, Stroke::new(stroke_w, track.color));
+            } else {
+                let sq = Rect::from_center_size(
+                    pos2(center.x.round(), center.y.round()),
+                    vec2(8.0, 8.0),
+                );
+                let fill = if selected {
+                    Color32::from_rgb(0xcc, 0xcc, 0xcc)
+                } else {
+                    Color32::BLACK
+                };
+                painter.rect(
+                    sq,
+                    CornerRadius::ZERO,
+                    fill,
+                    Stroke::new(1.0, track.color),
+                    StrokeKind::Outside,
+                );
+            }
         }
     }
 }
@@ -2277,7 +3345,11 @@ fn process_graph_drag(
                     moved = true;
                 }
                 let mut raw_df = f64::from(delta_px.x) * state.zoom_x;
-                let mut raw_dv = -f64::from(delta_px.y) * state.zoom_y;
+                let mut raw_dv = if state.plot_mode == GraphPlotMode::Speed {
+                    0.0
+                } else {
+                    -f64::from(delta_px.y) * state.zoom_y
+                };
 
                 // Shift locks to dominant axis (horizontal frame-only or vertical value-only).
                 if modifiers.shift {
@@ -2585,6 +3657,90 @@ fn process_graph_drag(
                 let _ = session.commit_transaction(changed);
             }
         }
+        GraphDragState::DraggingSpeedHandle {
+            key,
+            is_out,
+            prev_local_frame,
+            next_local_frame,
+            key_abs_frame,
+            fps,
+            mut changed,
+        } => {
+            if let Some(pos) = pointer_pos {
+                let target_frame = state.screen_x_to_frame(pos.x, rect);
+                let target_speed = state.screen_y_to_value(pos.y, rect);
+                let raw_dx = target_frame - key_abs_frame;
+                let out_span = (next_local_frame - key.local_frame()).max(1e-3);
+                let in_span = (key.local_frame() - prev_local_frame).max(1e-3);
+                let span = if is_out { out_span } else { in_span };
+                let tangent = speed_handle_to_tangent(raw_dx, target_speed, fps, is_out, span);
+
+                let updated_pair = {
+                    let entry = state.handles.entry(key.clone()).or_default();
+                    if modifiers.alt {
+                        entry.continuous = false;
+                    }
+                    if is_out {
+                        entry.out_tangent = tangent;
+                        if entry.continuous && prev_local_frame < key.local_frame() {
+                            entry.in_tangent = speed_handle_to_tangent(
+                                -tangent[0],
+                                target_speed,
+                                fps,
+                                false,
+                                in_span,
+                            );
+                        }
+                    } else {
+                        entry.in_tangent = tangent;
+                        if entry.continuous && next_local_frame > key.local_frame() {
+                            entry.out_tangent = speed_handle_to_tangent(
+                                -tangent[0],
+                                target_speed,
+                                fps,
+                                true,
+                                out_span,
+                            );
+                        }
+                    }
+                    *entry
+                };
+
+                if session
+                    .set_keyframe_bezier_handles(
+                        &key.target_id,
+                        &key.property,
+                        key.local_frame(),
+                        [updated_pair.in_tangent, updated_pair.out_tangent],
+                        updated_pair.continuous,
+                        None,
+                    )
+                    .is_ok()
+                {
+                    changed = true;
+                    action.curves_modified = true;
+                }
+                ensure_bezier_tween_for_handle(session, tracks, &key, is_out, action);
+                if updated_pair.continuous {
+                    ensure_bezier_tween_for_handle(session, tracks, &key, !is_out, action);
+                }
+            }
+
+            if primary_down {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                state.drag_state = GraphDragState::DraggingSpeedHandle {
+                    key,
+                    is_out,
+                    prev_local_frame,
+                    next_local_frame,
+                    key_abs_frame,
+                    fps,
+                    changed,
+                };
+            } else if session.history.is_in_transaction() {
+                let _ = session.commit_transaction(changed);
+            }
+        }
         GraphDragState::Marquee {
             origin,
             mut current,
@@ -2611,14 +3767,21 @@ fn process_graph_drag(
                 if !additive {
                     state.selected_keys.clear();
                 }
+                let fps = session.document().fps.max(1.0);
                 for track in tracks {
                     if !state.is_track_visible(&track.track_key) || track.is_expression {
                         continue;
                     }
-                    for kf in &track.keyframes {
+                    for (idx, kf) in track.keyframes.iter().enumerate() {
+                        let y_val = match state.plot_mode {
+                            GraphPlotMode::Value => kf.value,
+                            GraphPlotMode::Speed => {
+                                speed_keyframe_anchor_velocity(state, track, idx, fps)
+                            }
+                        };
                         let pt = pos2(
                             state.frame_to_screen_x(track.frame_offset + kf.local_frame, rect),
-                            state.value_to_screen_y(kf.value, rect),
+                            state.value_to_screen_y(y_val, rect),
                         );
                         if sel_rect.contains(pt) {
                             let kid = GraphKeyId::new(
@@ -2936,12 +4099,13 @@ fn show_easing_plus_panel(
             {
                 curve_edited = true;
             }
-            if toolbar_chip(ui, "Copy", false, palette) {
+            if toolbar_chip(ui, "Copy CSS", false, palette) {
                 let css = format!(
                     "cubic-bezier({:.4}, {:.4}, {:.4}, {:.4})",
                     nx1, ny1, nx2, ny2
                 );
                 state.easing_clipboard = Some(css.clone());
+                state.easing_css_input = css.clone();
                 ui.ctx().copy_text(css);
             }
         });
@@ -2971,20 +4135,54 @@ fn show_easing_plus_panel(
             {
                 curve_edited = true;
             }
-            if toolbar_chip(ui, "Paste", false, palette)
-                && let Some(ref clip) = state.easing_clipboard
-                && let Some(parsed) = parse_cubic_bezier_str(clip)
+            let css_input_id = ui.scope_id().with("easing_plus_css_input");
+            let css_resp = ui.add(
+                egui::TextEdit::singleline(&mut state.easing_css_input)
+                    .id(css_input_id)
+                    .desired_width(116.0)
+                    .font(FontId::monospace(10.0))
+                    .hint_text("cubic-bezier(...)"),
+            );
+            if css_resp.changed()
+                && let Some(parsed) = parse_cubic_bezier_str(&state.easing_css_input)
             {
                 nx1 = parsed[0];
                 ny1 = parsed[1];
                 nx2 = parsed[2];
                 ny2 = parsed[3];
+                state.easing_clipboard = Some(state.easing_css_input.clone());
                 curve_edited = true;
+            }
+            if toolbar_chip(ui, "Paste CSS", false, palette) {
+                let parsed = parse_cubic_bezier_str(&state.easing_css_input).or_else(|| {
+                    state
+                        .easing_clipboard
+                        .as_deref()
+                        .and_then(parse_cubic_bezier_str)
+                });
+                if let Some(parsed) = parsed {
+                    nx1 = parsed[0];
+                    ny1 = parsed[1];
+                    nx2 = parsed[2];
+                    ny2 = parsed[3];
+                    state.easing_css_input = format!(
+                        "cubic-bezier({:.4}, {:.4}, {:.4}, {:.4})",
+                        nx1, ny1, nx2, ny2
+                    );
+                    curve_edited = true;
+                } else {
+                    css_resp.request_focus();
+                }
             }
         });
 
         if curve_edited {
-            state.easing_plus_curve = [nx1.clamp(0.0, 1.0), ny1, nx2.clamp(0.0, 1.0), ny2];
+            state.easing_plus_curve = [
+                nx1.clamp(0.0, 1.0),
+                ny1.clamp(-2.0, 3.0),
+                nx2.clamp(0.0, 1.0),
+                ny2.clamp(-2.0, 3.0),
+            ];
             if ny1 > 1.0 + 1e-8 || ny2 > 1.0 + 1e-8 {
                 state.overshoot_top = true;
             }
@@ -3486,6 +4684,201 @@ fn hit_test_bezier_handle(
     hit
 }
 
+fn apply_parsed_easing_curve(
+    session: &mut Session,
+    state: &mut GraphEditorState,
+    tracks: &[CurveTrack],
+    parsed: [f64; 4],
+    action: &mut GraphEditorAction,
+) {
+    let clamped = [
+        parsed[0].clamp(0.0, 1.0),
+        parsed[1].clamp(-2.0, 3.0),
+        parsed[2].clamp(0.0, 1.0),
+        parsed[3].clamp(-2.0, 3.0),
+    ];
+    state.easing_plus_curve = clamped;
+    state.easing_css_input = format!(
+        "cubic-bezier({:.4}, {:.4}, {:.4}, {:.4})",
+        clamped[0], clamped[1], clamped[2], clamped[3]
+    );
+    state.easing_clipboard = Some(state.easing_css_input.clone());
+    if clamped[1] > 1.0 + 1e-8 || clamped[3] > 1.0 + 1e-8 {
+        state.overshoot_top = true;
+    }
+    if clamped[1] < -1e-8 || clamped[3] < -1e-8 {
+        state.overshoot_bottom = true;
+    }
+    apply_easing_plus_curve_to_selection(session, state, tracks, action);
+}
+
+fn show_plot_mode_toggle(
+    ui: &mut Ui,
+    state: &mut GraphEditorState,
+    palette: &ThemePalette,
+) -> bool {
+    let mut switched = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let is_val = state.plot_mode == GraphPlotMode::Value;
+        let is_spd = state.plot_mode == GraphPlotMode::Speed;
+        let seg_btn = |ui: &mut Ui, label: &str, active: bool, tooltip: &str| -> bool {
+            let (rect, resp) = ui.allocate_exact_size(vec2(46.0, 22.0), Sense::click());
+            let resp = resp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(tooltip);
+            let p = ui.painter();
+            p.rect(
+                rect,
+                CornerRadius::ZERO,
+                if active {
+                    rgb_color(palette.focus)
+                } else if resp.hovered() {
+                    COLOR_TILE_HOVER
+                } else {
+                    COLOR_TILE_BG
+                },
+                Stroke::new(
+                    1.0,
+                    if active {
+                        rgb_color(palette.focus)
+                    } else {
+                        COLOR_BORDER
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+            p.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::monospace(10.5),
+                if active {
+                    COLOR_TEXT_BRIGHT
+                } else {
+                    COLOR_TEXT
+                },
+            );
+            resp.clicked()
+        };
+        if seg_btn(
+            ui,
+            "Value",
+            is_val,
+            "Value Graph (property value over time)",
+        ) && !is_val
+        {
+            state.plot_mode = GraphPlotMode::Value;
+            switched = true;
+        }
+        if seg_btn(
+            ui,
+            "Speed",
+            is_spd,
+            "Speed Graph (velocity derivative dv/dt in units/sec)",
+        ) && !is_spd
+        {
+            state.plot_mode = GraphPlotMode::Speed;
+            switched = true;
+        }
+    });
+    switched
+}
+
+type SpeedHandleHit = (GraphKeyId, bool, f64, f64, f64);
+
+fn hit_test_speed_handle(
+    state: &GraphEditorState,
+    tracks: &[CurveTrack],
+    rect: Rect,
+    fps: f64,
+    pointer: Pos2,
+) -> Option<SpeedHandleHit> {
+    let mut best_dist = 12.0_f32;
+    let mut hit = None;
+    for track in tracks {
+        if !state.is_track_visible(&track.track_key) || track.is_expression {
+            continue;
+        }
+        for (idx, kf) in track.keyframes.iter().enumerate() {
+            let key_id = GraphKeyId::new(
+                &track.target_id,
+                &track.property,
+                track.channel_index,
+                kf.local_frame,
+            );
+            if !state.selected_keys.contains(&key_id) {
+                continue;
+            }
+            let abs_f = track.frame_offset + kf.local_frame;
+            let hp = state.handles.get(&key_id).copied().unwrap_or_default();
+            let prev_f = idx
+                .checked_sub(1)
+                .and_then(|p| track.keyframes.get(p))
+                .map_or(kf.local_frame, |k| k.local_frame);
+            let next_f = track
+                .keyframes
+                .get(idx + 1)
+                .map_or(kf.local_frame, |k| k.local_frame);
+
+            if let Some(eff_in) = effective_in_tangent(state, track, idx, hp)
+                && let Some(prev) = idx.checked_sub(1).and_then(|p| track.keyframes.get(p))
+            {
+                let in_vel =
+                    eval_segment_velocity(track, prev, kf, kf.local_frame, fps, &state.handles);
+                let pos = speed_handle_screen_pos(state, rect, abs_f, in_vel, eff_in[0], false);
+                let d = pointer.distance(pos);
+                if d < best_dist {
+                    best_dist = d;
+                    hit = Some((key_id.clone(), false, prev_f, next_f, abs_f));
+                }
+            }
+            if let Some(eff_out) = effective_out_tangent(state, track, idx, hp)
+                && let Some(next) = track.keyframes.get(idx + 1)
+            {
+                let out_vel =
+                    eval_segment_velocity(track, kf, next, kf.local_frame, fps, &state.handles);
+                let pos = speed_handle_screen_pos(state, rect, abs_f, out_vel, eff_out[0], true);
+                let d = pointer.distance(pos);
+                if d < best_dist {
+                    best_dist = d;
+                    hit = Some((key_id, true, prev_f, next_f, abs_f));
+                }
+            }
+        }
+    }
+    hit
+}
+
+fn hit_test_speed_keyframe<'a>(
+    state: &GraphEditorState,
+    tracks: &'a [CurveTrack],
+    rect: Rect,
+    fps: f64,
+    pointer: Pos2,
+) -> Option<(&'a CurveTrack, usize)> {
+    let mut best_dist = 11.0_f32;
+    let mut hit = None;
+    for track in tracks {
+        if !state.is_track_visible(&track.track_key) || track.is_expression {
+            continue;
+        }
+        for (idx, kf) in track.keyframes.iter().enumerate() {
+            let vel = speed_keyframe_anchor_velocity(state, track, idx, fps);
+            let pt = pos2(
+                state.frame_to_screen_x(track.frame_offset + kf.local_frame, rect),
+                state.value_to_screen_y(vel, rect),
+            );
+            let d = pointer.distance(pt);
+            if d < best_dist {
+                best_dist = d;
+                hit = Some((track, idx));
+            }
+        }
+    }
+    hit
+}
+
 fn hit_test_keyframe<'a>(
     state: &GraphEditorState,
     tracks: &'a [CurveTrack],
@@ -3882,6 +5275,16 @@ fn show_g2_toolbar(
 
                 ui.add_space(if narrow { 6.0 } else { 14.0 });
 
+                // Segmented Value | Speed mode toggle.
+                ui.vertical(|ui| {
+                    ui.add_space(4.0);
+                    if show_plot_mode_toggle(ui, state, palette) {
+                        let fps = session.document().fps.max(1.0);
+                        let doc = session.document().clone();
+                        state.fit_curves_for_mode(tracks, &doc, fps, est_canvas_size);
+                    }
+                });
+
                 // Right-aligned 38x32 Tool Tiles (Spec 02 §4.2).
                 if g2_tool_tile(
                     ui,
@@ -3939,7 +5342,9 @@ fn show_g2_toolbar(
                     "Fit all visible curves (\\)",
                     palette,
                 ) {
-                    state.fit_curves(tracks, est_canvas_size);
+                    let fps = session.document().fps.max(1.0);
+                    let doc = session.document().clone();
+                    state.fit_curves_for_mode(tracks, &doc, fps, est_canvas_size);
                 }
                 if g2_tool_tile(
                     ui,
@@ -3951,6 +5356,11 @@ fn show_g2_toolbar(
                     palette,
                 ) {
                     state.frame_selected_keys(tracks, est_canvas_size);
+                    if state.plot_mode == GraphPlotMode::Speed {
+                        let fps = session.document().fps.max(1.0);
+                        let doc = session.document().clone();
+                        state.fit_speed_y(tracks, &doc, fps, est_canvas_size);
+                    }
                 }
                 if g2_tool_tile(
                     ui,
@@ -4240,6 +5650,10 @@ fn show_g2_status_bar(
         COLOR_BORDER,
     );
 
+    let mode_badge = match state.plot_mode {
+        GraphPlotMode::Value => "Mode: Value",
+        GraphPlotMode::Speed => "Mode: Speed (u/s)",
+    };
     let tool_badge = if state.pan_tool {
         "Tool: Pan (H)"
     } else {
@@ -4271,6 +5685,10 @@ fn show_g2_status_bar(
     let mut x = rect.left() + 10.0;
     let cy = rect.center().y;
     for (badge, accent) in [
+        (
+            mode_badge.to_string(),
+            state.plot_mode == GraphPlotMode::Speed,
+        ),
         (tool_badge.to_string(), false),
         (sel_badge, !state.selected_keys.is_empty()),
         (snap_badge.to_string(), state.snap_enabled),
@@ -4659,13 +6077,21 @@ fn paint_dashed_circle(painter: &egui::Painter, center: Pos2, radius: f32, strok
     }
 }
 
-fn parse_cubic_bezier_str(raw: &str) -> Option<[f64; 4]> {
-    let trimmed = raw.trim();
-    let body = trimmed
-        .strip_prefix("cubic-bezier(")
-        .and_then(|s| s.strip_suffix(')'))
-        .or_else(|| trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')))
-        .unwrap_or(trimmed);
+/// Parses CSS `cubic-bezier(x1, y1, x2, y2)` (case-insensitive), `[x1, y1, x2, y2]`,
+/// or bare 4-number strings into `[x1, y1, x2, y2]` with `x1, x2` clamped to `[0, 1]`.
+#[must_use]
+pub fn parse_cubic_bezier_str(raw: &str) -> Option<[f64; 4]> {
+    let trimmed = raw.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let body = if let Some(idx) = lower.find("cubic-bezier(") {
+        let after = &trimmed[idx + "cubic-bezier(".len()..];
+        let close = after.find(')')?;
+        &after[..close]
+    } else if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        inner
+    } else {
+        trimmed
+    };
     let nums: Vec<f64> = body
         .split(|c: char| c == ',' || c.is_whitespace())
         .filter(|tok| !tok.is_empty())
@@ -4726,12 +6152,111 @@ mod tests {
             Some([0.25, 0.1, 0.25, 1.4])
         );
         assert_eq!(
+            parse_cubic_bezier_str("CUBIC-BEZIER( 0.42 , -0.2 , 0.58 , 1.0 );"),
+            Some([0.42, -0.2, 0.58, 1.0])
+        );
+        assert_eq!(
             parse_cubic_bezier_str("[0.42, -0.2, 0.58, 1.0]"),
             Some([0.42, -0.2, 0.58, 1.0])
         );
         assert_eq!(
             parse_cubic_bezier_str("1.5, 0.0, -0.5, 1.0"),
             Some([1.0, 0.0, 0.0, 1.0])
+        );
+        assert_eq!(parse_cubic_bezier_str("not-a-curve"), None);
+    }
+
+    #[test]
+    fn speed_graph_numerical_derivative_and_handle_conversion() {
+        // Linear ramp from 0 to 120 over 30 frames at 30 fps => exact velocity = 120 u/s.
+        let track = CurveTrack {
+            track_key: "clip1:opacity".to_string(),
+            target_id: "clip1".to_string(),
+            property: "opacity".to_string(),
+            channel_index: None,
+            display_name: "opacity".to_string(),
+            color: COLOR_AXIS_X,
+            frame_offset: 0.0,
+            is_expression: false,
+            expression: None,
+            keyframes: vec![
+                CurveKeyframe {
+                    local_frame: 0.0,
+                    value: 0.0,
+                    full_value: serde_json::json!(0.0),
+                    tween: 1,
+                    control_points: [[-10.0, 0.0], [10.0, 0.0]],
+                    continuous_tangent: true,
+                },
+                CurveKeyframe {
+                    local_frame: 30.0,
+                    value: 120.0,
+                    full_value: serde_json::json!(120.0),
+                    tween: 1,
+                    control_points: [[-10.0, 0.0], [10.0, 0.0]],
+                    continuous_tangent: true,
+                },
+            ],
+        };
+        let handles = BTreeMap::new();
+        let v_mid = eval_curve_velocity(&track, 15.0, 30.0, &handles);
+        assert!(
+            (v_mid - 120.0).abs() < 1e-3,
+            "expected 120 u/s for linear ramp, got {v_mid}"
+        );
+        assert_eq!(eval_curve_velocity(&track, -5.0, 30.0, &handles), 0.0);
+        assert_eq!(eval_curve_velocity(&track, 40.0, 30.0, &handles), 0.0);
+
+        // Speed handle conversion: outgoing handle dx=10 frames at speed 150 u/s @ 30 fps => dy = 50.
+        let out_t = speed_handle_to_tangent(10.0, 150.0, 30.0, true, 30.0);
+        assert!((out_t[0] - 10.0).abs() < 1e-9);
+        assert!((out_t[1] - 50.0).abs() < 1e-9);
+        // Incoming handle dx=-15 frames at speed 150 u/s @ 30 fps => dy = -75.
+        let in_t = speed_handle_to_tangent(-15.0, 150.0, 30.0, false, 30.0);
+        assert!((in_t[0] - (-15.0)).abs() < 1e-9);
+        assert!((in_t[1] - (-75.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn expression_curve_sampling_evaluates_live_waveform() {
+        let session = Session::new();
+        let track = CurveTrack {
+            track_key: "clip1:x".to_string(),
+            target_id: "clip1".to_string(),
+            property: "x".to_string(),
+            channel_index: None,
+            display_name: "x".to_string(),
+            color: COLOR_AXIS_X,
+            frame_offset: 0.0,
+            is_expression: true,
+            expression: Some("Math.sin(time * Math.PI) * 100".to_string()),
+            keyframes: vec![CurveKeyframe {
+                local_frame: 0.0,
+                value: 0.0,
+                full_value: serde_json::json!(0.0),
+                tween: 1,
+                control_points: [[-10.0, 0.0], [10.0, 0.0]],
+                continuous_tangent: true,
+            }],
+        };
+        let handles = BTreeMap::new();
+        let samples = sample_expression_curve(&track, session.document(), &handles, 0.0, 30.0, 30);
+        assert_eq!(samples.len(), 31);
+        // At frame 0 (time = 0s): sin(0) * 100 = 0
+        assert!(samples[0].1.abs() < 1e-3);
+        // At frame 15 (time = 0.5s at 30 fps): sin(pi/2) * 100 = 100
+        assert!(
+            (samples[15].1 - 100.0).abs() < 1e-2,
+            "expected ~100 at half-second peak, got {}",
+            samples[15].1
+        );
+        // Velocity at frame 0 (t=0) of 100*sin(pi*t) is 100*pi ~= 314.159 u/s.
+        let vel_samples =
+            sample_expression_velocity_curve(&track, session.document(), &handles, 0.0, 30.0, 30);
+        assert!(
+            (vel_samples[0].1 - 100.0 * std::f64::consts::PI).abs() < 2.0,
+            "expected ~314.16 u/s at t=0, got {}",
+            vel_samples[0].1
         );
     }
 

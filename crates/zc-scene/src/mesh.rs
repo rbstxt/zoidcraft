@@ -50,12 +50,14 @@ pub fn compute_bounds(vertices: &[Vertex3D]) -> Aabb3 {
     Aabb3 { min, max }
 }
 
-/// Indexed triangle mesh with axis-aligned bounds.
+/// Indexed triangle mesh with axis-aligned bounds and optional per-vertex RGBA colors.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MeshData {
     pub vertices: Vec<Vertex3D>,
     pub indices: Vec<u32>,
     pub bounds: Aabb3,
+    /// Optional linear RGBA vertex colors (1:1 with `vertices` when populated, empty when unused).
+    pub colors: Vec<[f32; 4]>,
 }
 
 impl MeshData {
@@ -67,6 +69,19 @@ impl MeshData {
             vertices,
             indices,
             bounds,
+            colors: Vec::new(),
+        }
+    }
+
+    /// Creates a mesh with explicit per-vertex RGBA colors and computes its bounding box.
+    #[must_use]
+    pub fn with_colors(vertices: Vec<Vertex3D>, indices: Vec<u32>, colors: Vec<[f32; 4]>) -> Self {
+        let bounds = compute_bounds(&vertices);
+        Self {
+            vertices,
+            indices,
+            bounds,
+            colors,
         }
     }
 
@@ -80,6 +95,7 @@ impl MeshData {
                 min: Vec3::ZERO,
                 max: Vec3::ZERO,
             },
+            colors: Vec::new(),
         }
     }
 
@@ -122,8 +138,14 @@ impl MeshData {
     /// Splits shared vertices per triangle and assigns exact geometric flat normals.
     pub fn compute_flat_normals(&mut self) {
         let tri_count = self.indices.len() / 3;
+        let has_colors = self.colors.len() == self.vertices.len() && !self.colors.is_empty();
         let mut out_verts = Vec::with_capacity(tri_count * 3);
         let mut out_indices = Vec::with_capacity(tri_count * 3);
+        let mut out_colors = if has_colors {
+            Vec::with_capacity(tri_count * 3)
+        } else {
+            Vec::new()
+        };
 
         for tri in self.indices.as_chunks::<3>().0 {
             let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
@@ -152,6 +174,11 @@ impl MeshData {
             out_verts.push(v0);
             out_verts.push(v1);
             out_verts.push(v2);
+            if has_colors {
+                out_colors.push(self.colors[i0]);
+                out_colors.push(self.colors[i1]);
+                out_colors.push(self.colors[i2]);
+            }
             out_indices.push(base);
             out_indices.push(base + 1);
             out_indices.push(base + 2);
@@ -159,6 +186,7 @@ impl MeshData {
 
         self.vertices = out_verts;
         self.indices = out_indices;
+        self.colors = out_colors;
         self.recompute_bounds();
     }
 
@@ -241,7 +269,21 @@ impl MeshData {
         if other.vertices.is_empty() {
             return;
         }
-        let base = self.vertices.len() as u32;
+        let prev_len = self.vertices.len();
+        let base = prev_len as u32;
+        let self_has = self.colors.len() == prev_len && !self.colors.is_empty();
+        let other_has = other.colors.len() == other.vertices.len() && !other.colors.is_empty();
+        if self_has || other_has {
+            if !self_has {
+                self.colors.resize(prev_len, [1.0, 1.0, 1.0, 1.0]);
+            }
+            if other_has {
+                self.colors.extend_from_slice(&other.colors);
+            } else {
+                self.colors
+                    .resize(prev_len + other.vertices.len(), [1.0, 1.0, 1.0, 1.0]);
+            }
+        }
         self.vertices.extend_from_slice(&other.vertices);
         self.indices.extend(other.indices.iter().map(|&i| i + base));
         self.recompute_bounds();
@@ -313,8 +355,14 @@ pub fn subdivide_mesh(mesh: &MeshData, polygon_count: u32) -> MeshData {
     }
 
     let out_vert_count = source_tris * template.len() * 3;
+    let has_colors = mesh.colors.len() == mesh.vertices.len() && !mesh.colors.is_empty();
     let mut vertices = Vec::with_capacity(out_vert_count);
     let mut indices = Vec::with_capacity(out_vert_count);
+    let mut colors = if has_colors {
+        Vec::with_capacity(out_vert_count)
+    } else {
+        Vec::new()
+    };
 
     for tri in mesh.indices.as_chunks::<3>().0 {
         let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
@@ -325,6 +373,21 @@ pub fn subdivide_mesh(mesh: &MeshData, polygon_count: u32) -> MeshData {
         let v1 = mesh.vertices[i1];
         let v2 = mesh.vertices[i2];
         let slot = v0.material_slot;
+        let c0 = if has_colors {
+            mesh.colors[i0]
+        } else {
+            [1.0; 4]
+        };
+        let c1 = if has_colors {
+            mesh.colors[i1]
+        } else {
+            [1.0; 4]
+        };
+        let c2 = if has_colors {
+            mesh.colors[i2]
+        } else {
+            [1.0; 4]
+        };
 
         for sub in &template {
             let base = vertices.len() as u32;
@@ -349,6 +412,14 @@ pub fn subdivide_mesh(mesh: &MeshData, polygon_count: u32) -> MeshData {
                     w[0] * v0.uv[1] + w[1] * v1.uv[1] + w[2] * v2.uv[1],
                 ];
                 vertices.push(Vertex3D::new(pos, n, uv, slot));
+                if has_colors {
+                    colors.push([
+                        w[0] * c0[0] + w[1] * c1[0] + w[2] * c2[0],
+                        w[0] * c0[1] + w[1] * c1[1] + w[2] * c2[1],
+                        w[0] * c0[2] + w[1] * c1[2] + w[2] * c2[2],
+                        w[0] * c0[3] + w[1] * c1[3] + w[2] * c2[3],
+                    ]);
+                }
             }
             indices.push(base);
             indices.push(base + 1);
@@ -356,7 +427,7 @@ pub fn subdivide_mesh(mesh: &MeshData, polygon_count: u32) -> MeshData {
         }
     }
 
-    MeshData::new(vertices, indices)
+    MeshData::with_colors(vertices, indices, colors)
 }
 
 /// CM3 `Box` (`objectType = 1`): axis-aligned box centered at the origin.

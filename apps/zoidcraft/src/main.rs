@@ -13,46 +13,48 @@ mod ui;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use egui::{Align2, Area, Color32, CornerRadius, Frame, Id, Key, Order, Pos2, Rect, Stroke, Vec2};
 use serde_json::{Value, json};
 use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
 use zc_audio::{
-    AudioBuffer, AudioClipScheduleItem, AudioError, AudioMixWindow, AudioOutputHandle,
-    ClipAudioSampleParams, MasterPlaybackClock, STANDARD_SAMPLE_RATE, WaveformPeaks,
-    apply_gain_and_pan, decode_audio_bytes, effective_playback_rate,
-    try_mix_offline_stereo_animated,
+    AudioBuffer, AudioError, AudioMixWindow, AudioOutputHandle, MasterPlaybackClock,
+    STANDARD_SAMPLE_RATE, WaveformPeaks, apply_gain_and_pan,
+    collect_flattened_audio_clips_with_precomp, decode_audio_bytes, mix_flattened_audio_clips,
 };
 use zc_export::{
     AudioCodec, ExportContainer as CoreExportContainer, ExportError, ExportProgress, ExportReport,
     ExportSettings as CoreExportSettings, QualityMode, VideoCodec, export_video_with_progress,
     probe_ffmpeg,
 };
-use zc_expr::{CompiledExpr, EvalConfig, ExprContext, ExprError, ExprMode};
+use zc_geom::{EulerOrder as GeomEulerOrder, Mat4, Transform3D, Vec3};
+use zc_plugin::PluginRegistry;
 use zc_project::{
-    AssetKind, LayerKind, MediaItem, Project, PropertyKeyframe, PropertyTrack, PropertyValue,
-    SequenceControl, SequenceControlKind, Uuid, export_pz, import_pz, load_zcraft, save_zcraft,
+    AssetKind, LayerKind, MediaItem, Project, Uuid, export_pz, import_pz, load_zcraft, save_zcraft,
     write_atomic,
 };
+use zc_render::scene3d::mat4_perspective_rh;
 use zc_render::{
     CameraParams, ProjectRenderEngine, RenderError, RenderOverrides, RenderTarget, encode_png,
     readback_rgba8, unpremultiply_rgba8,
 };
-use zc_session::{Command, Session, SessionProperty};
+use zc_session::{Command, Session, SessionClip, SessionObject3D, SessionProperty};
 
 use ui::graph_editor::{GraphDragState, GraphEditorState, show_graph_editor_window};
 use ui::layout::{Cm3Workspace, PanelFocus, UiAction};
 use ui::panels::{
-    ExportAudioCodec, ExportCm3Preset, ExportContainer as UiExportContainer, ExportMode,
-    ExportRateControl, ExportSettings as UiExportSettings, ExportStatus, ExportVideoCodec,
-    PanelsState, ProjectAction,
+    ExportAudioCodec, ExportCm3Preset, ExportContainer as UiExportContainer, ExportJobStatus,
+    ExportMode, ExportQueueJob, ExportRateControl, ExportSettings as UiExportSettings,
+    ExportStatus, ExportVideoCodec, PanelsState, ProjectAction, RecoverySnapshotInfo,
 };
+use ui::pro_editors::show_pro_editor_windows;
 use ui::shortcuts::dispatch_shortcuts;
 use ui::theme::{
     BG_PANEL, BG_SUNKEN, BG_TITLE, BORDER_PANEL, Cm3Theme, FONT_COMPACT, FONT_SMALL, TEXT_BRIGHT,
@@ -62,6 +64,8 @@ use ui::timeline::{AudioWaveformPeaks, TimelineDragState, TimelineViewState, sho
 use ui::viewport::{EditorCameraState, ViewportDragState, ViewportState, show_viewport};
 
 const TOAST_LIFETIME: Duration = Duration::from_secs(4);
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_RECOVERY_SNAPSHOTS: usize = 10;
 const CLEAR_BG_RGBA: [f32; 4] = [29.0 / 255.0, 29.0 / 255.0, 29.0 / 255.0, 1.0];
 /// Maximum live audio playback mix window duration in seconds (60s = 2.88M stereo frames at 48 kHz,
 /// well inside `zc-audio`'s 32 Mi sample cap even for multi-hour timelines).
@@ -78,7 +82,17 @@ struct ViewportRenderKey {
     height: u32,
     scene_hash: u64,
     editing_camera: bool,
+    active_camera_hash: u64,
     camera_bits: [u32; 9],
+}
+
+fn hash_optional_str(opt: Option<&str>) -> u64 {
+    let Some(s) = opt else {
+        return 0;
+    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    fnv_mix(&mut h, s.as_bytes());
+    h.max(1)
 }
 
 fn pack_camera_bits(cam: &EditorCameraState) -> [u32; 9] {
@@ -184,6 +198,7 @@ impl ViewportGpuPresenter {
         width: u32,
         height: u32,
         editing_camera: bool,
+        active_camera_id: Option<&str>,
         editor_cam: &EditorCameraState,
         key: ViewportRenderKey,
     ) -> Result<bool, RenderError> {
@@ -193,11 +208,31 @@ impl ViewportGpuPresenter {
 
         let aspect = (width.max(1) as f32) / (height.max(1) as f32);
         let selected_scene3d_uuid = selected_single_scene3d_clip_uuid(session);
-        let editing_camera_active = editing_camera
+        let camera_override = active_camera_id.and_then(|cam_id| {
+            let clip_uuid = selected_scene3d_uuid?;
+            let params = resolve_scene_camera_override_params(
+                session,
+                clip_uuid,
+                cam_id,
+                frame,
+                width as f32,
+                height as f32,
+            )?;
+            Some(RenderOverrides {
+                editing_camera_clip_id: Some(clip_uuid),
+                editing_camera: Some(params),
+                selected_object_ids: Vec::new(),
+            })
+        });
+
+        let editing_camera_active = camera_override.is_none()
+            && editing_camera
             && session
                 .selection
                 .is_editing_camera_active(&session.playback, selected_scene3d_uuid.is_some());
-        let overrides = if editing_camera_active {
+        let overrides = if let Some(ov) = camera_override {
+            Some(ov)
+        } else if editing_camera_active {
             let selected_object_ids: Vec<Uuid> = session
                 .selection
                 .object_3d_ids
@@ -378,6 +413,8 @@ struct ActiveExportJob {
     cancel: Arc<AtomicBool>,
     rx: Receiver<ExportWorkerEvent>,
     handle: Option<JoinHandle<()>>,
+    started_at: Instant,
+    queue_job_id: Option<u64>,
 }
 
 impl ActiveExportJob {
@@ -509,6 +546,59 @@ fn is_audio_extension(ext: &str) -> bool {
     )
 }
 
+/// Immutable project & plugin state captured at the moment a job is added to the export queue
+/// so switching projects later cannot cause a queued job to export the wrong project.
+#[derive(Clone)]
+struct ExportQueueSnapshot {
+    project: Project,
+    plugins: PluginRegistry,
+    active_composition_id: Option<String>,
+    decoded_audio: HashMap<String, Arc<AudioBuffer>>,
+}
+
+impl ExportQueueSnapshot {
+    fn effective_fps(&self) -> f64 {
+        let seq = self
+            .active_composition_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .and_then(|uuid| self.project.compositions.get(&uuid))
+            .unwrap_or(&self.project.sequence);
+        seq.exact_fps
+            .unwrap_or_else(|| f64::from(seq.fps.max(1)))
+            .max(1.0)
+    }
+}
+
+/// Promotes `active_composition_id` (when present in `project.compositions`) into
+/// `project.sequence`, moving the previous root sequence into `project.compositions`
+/// under its original `Uuid`. This ensures both `ProjectRenderEngine` and `zc_audio`
+/// render and mix the target child composition while preserving nested composition links.
+fn promote_active_composition_for_export(
+    project: &mut Project,
+    active_composition_id: Option<&str>,
+) {
+    let Some(comp_id) = active_composition_id.and_then(|s| Uuid::parse_str(s).ok()) else {
+        return;
+    };
+    let Some(mut comp_seq) = project.compositions.remove(&comp_id) else {
+        return;
+    };
+    // Preserve root-only sequence controls as fallbacks so child expressions referencing
+    // root controls by stable ID or name continue to resolve after swapping `project.sequence`.
+    for root_ctl in &project.sequence.controls {
+        let already_defined = comp_seq
+            .controls
+            .iter()
+            .any(|c| c.id == root_ctl.id || c.name == root_ctl.name);
+        if !already_defined {
+            comp_seq.controls.push(root_ctl.clone());
+        }
+    }
+    let prev_root = std::mem::replace(&mut project.sequence, comp_seq);
+    project.compositions.insert(prev_root.id, prev_root);
+}
+
 struct ZoidCraftApp {
     session: Session,
     theme: Cm3Theme,
@@ -548,6 +638,18 @@ struct ZoidCraftApp {
     active_export: Option<ActiveExportJob>,
     /// Cancelled export workers from previous projects being reaped asynchronously without touching the current project's `export_status`.
     retired_exports: Vec<ActiveExportJob>,
+    /// Monotonic identifier counter for queued export jobs.
+    next_export_job_id: u64,
+    /// Captured project/plugin snapshots keyed by `ExportQueueJob::id`.
+    export_queue_snapshots: HashMap<u64, ExportQueueSnapshot>,
+    /// Directory storing periodic `.zcraft` autosave recovery snapshots.
+    recovery_dir: PathBuf,
+    /// Timestamp of the last autosave tick.
+    last_autosave_at: Instant,
+    /// Session revision captured by the most recent disk autosave snapshot.
+    last_autosave_revision: u64,
+    /// Optional non-blocking crash-recovery banner offered on launch when a recovery snapshot exists.
+    startup_recovery_banner: Option<RecoverySnapshotInfo>,
     pending_eyedropper: Option<(String, String)>,
     eyedropper_swallow_pointer: bool,
     pending_unsaved_dialog: Option<PendingUnsavedAction>,
@@ -605,6 +707,12 @@ impl ZoidCraftApp {
 
         let init_epoch = session.playback.epoch_id;
         let init_loop = session.playback.looping;
+        let init_revision = session.revision();
+
+        let recovery_dir = default_recovery_dir();
+        let recovery_snapshots = list_recovery_snapshots_in_dir(&recovery_dir);
+        let startup_recovery_banner = recovery_snapshots.first().cloned();
+        workspace.panels.recovery_snapshots = recovery_snapshots;
 
         Self {
             session,
@@ -635,6 +743,12 @@ impl ZoidCraftApp {
             ffmpeg_probe_rx: Some(probe_rx),
             active_export: None,
             retired_exports: Vec::new(),
+            next_export_job_id: 1,
+            export_queue_snapshots: HashMap::new(),
+            recovery_dir,
+            last_autosave_at: Instant::now(),
+            last_autosave_revision: init_revision,
+            startup_recovery_banner,
             pending_eyedropper: None,
             eyedropper_swallow_pointer: false,
             pending_unsaved_dialog: None,
@@ -923,15 +1037,34 @@ impl ZoidCraftApp {
         };
 
         if let Some(res) = finished_result {
-            if let Some(mut job) = self.active_export.take()
-                && let Some(handle) = job.handle.take()
-            {
-                let _ = handle.join();
-            }
+            let finished_queue_id = if let Some(mut job) = self.active_export.take() {
+                let qid = job.queue_job_id;
+                if let Some(handle) = job.handle.take() {
+                    let _ = handle.join();
+                }
+                qid
+            } else {
+                None
+            };
             self.workspace.panels.export_status.exporting = false;
+            self.workspace.panels.export_status.live_fps = None;
+            self.workspace.panels.export_status.eta_secs = None;
+            let mut was_cancelled = false;
             match res {
                 Ok(report) => {
                     self.workspace.panels.export_status.progress = 1.0;
+                    self.workspace.panels.export_status.last_completed_output =
+                        Some(report.output_path.clone());
+                    if let Some(qid) = finished_queue_id
+                        && let Some(qjob) = self
+                            .workspace
+                            .panels
+                            .export_queue
+                            .iter_mut()
+                            .find(|j| j.id == qid)
+                    {
+                        qjob.status = ExportJobStatus::Completed;
+                    }
                     let msg = if report.frames_exported == 0 && report.audio_samples_written > 0 {
                         format!(
                             "Audio export complete: {} samples -> {}",
@@ -950,10 +1083,32 @@ impl ZoidCraftApp {
                 }
                 Err(err) => {
                     self.workspace.panels.export_status.progress = 0.0;
+                    was_cancelled = err.to_ascii_lowercase().contains("cancel");
+                    if let Some(qid) = finished_queue_id
+                        && let Some(qjob) = self
+                            .workspace
+                            .panels
+                            .export_queue
+                            .iter_mut()
+                            .find(|j| j.id == qid)
+                    {
+                        qjob.status = if was_cancelled {
+                            ExportJobStatus::Cancelled
+                        } else {
+                            ExportJobStatus::Failed(err.clone())
+                        };
+                    }
+                    if was_cancelled {
+                        self.workspace.panels.export_queue_running = false;
+                    }
                     let msg = format!("Export stopped: {err}");
                     self.workspace.panels.export_status.status_message = msg.clone();
                     self.show_toast(msg);
                 }
+            }
+
+            if self.workspace.panels.export_queue_running && !was_cancelled {
+                self.start_next_queued_export();
             }
         }
     }
@@ -972,16 +1127,19 @@ impl ZoidCraftApp {
         let frame = self.session.playback.current_frame;
         let frame_index = (frame * 1000.0).round() as i64;
         let selected_scene3d_uuid = selected_single_scene3d_clip_uuid(&self.session);
-        let editing_camera = self
-            .session
-            .selection
-            .is_editing_camera_active(&self.session.playback, selected_scene3d_uuid.is_some());
+        let active_camera_hash = hash_optional_str(self.viewport.active_camera_id.as_deref());
+        let editing_camera = self.viewport.active_camera_id.is_none()
+            && self
+                .session
+                .selection
+                .is_editing_camera_active(&self.session.playback, selected_scene3d_uuid.is_some());
         let key = ViewportRenderKey {
             frame_index,
             width: render_w,
             height: render_h,
             scene_hash: compute_scene_hash(&self.session),
             editing_camera,
+            active_camera_hash,
             camera_bits: if editing_camera {
                 pack_camera_bits(&self.viewport.camera)
             } else {
@@ -1016,6 +1174,7 @@ impl ZoidCraftApp {
         }
 
         let (frame, render_w, render_h, editing_camera, key) = self.current_viewport_render_key();
+        let active_camera_id = self.viewport.active_camera_id.clone();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -1027,6 +1186,7 @@ impl ZoidCraftApp {
             render_w,
             render_h,
             editing_camera,
+            active_camera_id.as_deref(),
             &self.viewport.camera,
             key,
         ) {
@@ -1063,6 +1223,15 @@ impl ZoidCraftApp {
             &mut self.workspace.panels.export_status,
         );
         std::mem::swap(
+            &mut fresh_panels.export_queue,
+            &mut self.workspace.panels.export_queue,
+        );
+        fresh_panels.export_queue_running = self.workspace.panels.export_queue_running;
+        std::mem::swap(
+            &mut fresh_panels.recovery_snapshots,
+            &mut self.workspace.panels.recovery_snapshots,
+        );
+        std::mem::swap(
             &mut fresh_panels.app_settings,
             &mut self.workspace.panels.app_settings,
         );
@@ -1070,11 +1239,14 @@ impl ZoidCraftApp {
         self.workspace.panels.plugin_notice = None;
         self.workspace.panels.floating_windows.clear_focus();
         self.workspace.audio_meter = Default::default();
+        self.workspace.viewport_draw_tool = None;
 
         self.timeline.drag_state = TimelineDragState::None;
         self.timeline.snap_guide_x = None;
         self.timeline.box_selected_clips.clear();
         self.viewport.drag_state = ViewportDragState::None;
+        self.viewport.active_draw_tool = None;
+        self.viewport.active_camera_id = None;
         self.viewport.reset_2d_view();
 
         self.graph_editor.focused_property = None;
@@ -1782,7 +1954,14 @@ impl ZoidCraftApp {
             }
         }
 
-        for at in &self.session.project.sequence.audio_tracks {
+        let all_audio_tracks = self.session.project.sequence.audio_tracks.iter().chain(
+            self.session
+                .project
+                .compositions
+                .values()
+                .flat_map(|c| c.audio_tracks.iter()),
+        );
+        for at in all_audio_tracks {
             for ac in &at.clips {
                 let Some(asset_key) = ac.media.as_deref() else {
                     continue;
@@ -1889,6 +2068,7 @@ impl ZoidCraftApp {
             {
                 Ok(()) => {
                     let msg = format!("Exported PNG frame -> {}", path.display());
+                    self.workspace.panels.export_status.last_completed_output = Some(path);
                     self.workspace.panels.export_status.status_message = msg.clone();
                     self.show_toast(msg);
                 }
@@ -1903,39 +2083,47 @@ impl ZoidCraftApp {
 
         // Video or PNG Sequence background export mode:
         // Pre-validate codec/settings and FFmpeg availability BEFORE opening the native file dialog.
+        if let Err(msg) = self.validate_export_pre_dialog(&ui_cfg) {
+            self.workspace.panels.export_status.status_message = msg.clone();
+            self.show_toast(msg);
+            return;
+        }
+
+        let Some(output_path) = self.prompt_export_output_path(&ui_cfg) else {
+            return;
+        };
+
+        self.workspace.panels.export_queue_running = false;
+        if let Err(msg) = self.spawn_background_export(&ui_cfg, output_path, None, None) {
+            self.workspace.panels.export_status.status_message = msg.clone();
+            self.show_toast(msg);
+        }
+    }
+
+    fn validate_export_pre_dialog(&self, ui_cfg: &UiExportSettings) -> Result<(), String> {
         let seq_fps = self.session.document().fps.max(1.0);
         let start_seq_frame = ui_cfg.start_frame.round().max(0.0) as u32;
         let end_seq_frame = (ui_cfg
             .end_frame
             .round()
             .max(f64::from(start_seq_frame) + 1.0)) as u32;
-        let mut core_settings = match convert_export_settings(
-            &ui_cfg,
+        let core_settings = convert_export_settings(
+            ui_cfg,
             seq_fps,
             start_seq_frame,
             end_seq_frame,
             PathBuf::from("zoidcraft_export_preview"),
-        ) {
-            Ok(settings) => settings,
-            Err(err) => {
-                let msg = format!("Invalid export settings: {err}");
-                self.workspace.panels.export_status.status_message = msg.clone();
-                self.show_toast(msg);
-                return;
-            }
-        };
-        if let Err(err) = core_settings.validate() {
-            let msg = format!("Invalid export settings: {err}");
-            self.workspace.panels.export_status.status_message = msg.clone();
-            self.show_toast(msg);
-            return;
-        }
+        )
+        .map_err(|err| format!("Invalid export settings: {err}"))?;
+        core_settings
+            .validate()
+            .map_err(|err| format!("Invalid export settings: {err}"))?;
         let needs_ffmpeg = !matches!(
             core_settings.container,
             CoreExportContainer::PngSequence | CoreExportContainer::Wav
         );
         if needs_ffmpeg && !self.workspace.panels.export_status.ffmpeg_available {
-            let msg = if self.ffmpeg_probe_rx.is_some() {
+            return Err(if self.ffmpeg_probe_rx.is_some() {
                 "Still checking FFmpeg availability; please try exporting again in a moment."
                     .to_owned()
             } else {
@@ -1943,51 +2131,233 @@ impl ZoidCraftApp {
                     "Cannot start export: FFmpeg is unavailable ({}).",
                     self.workspace.panels.export_status.ffmpeg_version
                 )
-            };
-            self.workspace.panels.export_status.status_message = msg.clone();
-            self.show_toast(msg);
-            return;
+            });
         }
+        Ok(())
+    }
 
+    fn prompt_export_output_path(&mut self, ui_cfg: &UiExportSettings) -> Option<PathBuf> {
         self.pause_playback_for_modal_dialog();
-        let output_path = if ui_cfg.container == UiExportContainer::PngSequence {
-            let chosen = rfd::FileDialog::new().pick_folder();
-            self.last_tick = Instant::now();
-            let Some(dir) = chosen else {
-                return;
-            };
-            dir
+        let chosen = if ui_cfg.container == UiExportContainer::PngSequence {
+            rfd::FileDialog::new().pick_folder()
         } else {
             let (label, ext) = export_file_dialog_filter(ui_cfg.container);
             let default_name = format!(
                 "{}.{ext}",
                 sanitize_filename(&self.session.document().project_name)
             );
-            let chosen = rfd::FileDialog::new()
+            rfd::FileDialog::new()
                 .add_filter(label, &[ext])
                 .set_file_name(default_name)
-                .save_file();
-            self.last_tick = Instant::now();
-            let Some(file) = chosen else {
-                return;
-            };
-            file
+                .save_file()
         };
+        self.last_tick = Instant::now();
+        chosen
+    }
 
-        core_settings.output_path = output_path;
-        if let Err(err) = core_settings.validate() {
-            let msg = format!("Invalid export settings: {err}");
+    fn capture_export_queue_snapshot(&mut self) -> ExportQueueSnapshot {
+        let project = self.session.to_project();
+        let plugins = self.session.plugins.clone();
+        let active_composition_id = self
+            .session
+            .document()
+            .active_composition_id
+            .map(|id| id.to_string());
+        let decoded_audio = self
+            .decoded_audio
+            .iter()
+            .filter(|(asset_id, _)| project.assets.contains_key(*asset_id))
+            .map(|(asset_id, buf)| (asset_id.clone(), Arc::clone(buf)))
+            .collect();
+        ExportQueueSnapshot {
+            project,
+            plugins,
+            active_composition_id,
+            decoded_audio,
+        }
+    }
+
+    fn enqueue_export_job(&mut self, ui_cfg: UiExportSettings, output_path: PathBuf) -> u64 {
+        let snapshot = self.capture_export_queue_snapshot();
+        let label = format_export_job_label(&snapshot.project.name, &ui_cfg);
+        let id = self.next_export_job_id;
+        self.next_export_job_id = self.next_export_job_id.saturating_add(1);
+        self.export_queue_snapshots.insert(id, snapshot);
+        queue_add_job(
+            &mut self.workspace.panels.export_queue,
+            id,
+            label,
+            output_path,
+            ui_cfg,
+        );
+        id
+    }
+
+    fn prune_export_queue_snapshots(&mut self) {
+        let queued_ids: HashSet<u64> = self
+            .workspace
+            .panels
+            .export_queue
+            .iter()
+            .filter(|job| job.status == ExportJobStatus::Queued)
+            .map(|job| job.id)
+            .collect();
+        self.export_queue_snapshots
+            .retain(|job_id, _| queued_ids.contains(job_id));
+    }
+
+    #[cfg(test)]
+    fn remove_export_queue_job(&mut self, job_id: u64) {
+        if let Some(pos) = self
+            .workspace
+            .panels
+            .export_queue
+            .iter()
+            .position(|j| j.id == job_id && j.status != ExportJobStatus::Running)
+        {
+            self.workspace.panels.export_queue.remove(pos);
+        }
+        self.export_queue_snapshots.remove(&job_id);
+    }
+
+    #[cfg(test)]
+    fn clear_finished_export_queue(&mut self) {
+        self.workspace
+            .panels
+            .export_queue
+            .retain(|j| matches!(j.status, ExportJobStatus::Queued | ExportJobStatus::Running));
+        self.prune_export_queue_snapshots();
+    }
+
+    fn handle_add_to_export_queue(&mut self, ui_cfg: UiExportSettings) {
+        if let Err(msg) = self.validate_export_pre_dialog(&ui_cfg) {
             self.workspace.panels.export_status.status_message = msg.clone();
             self.show_toast(msg);
             return;
         }
+        let Some(output_path) = self.prompt_export_output_path(&ui_cfg) else {
+            return;
+        };
+        let label = format_export_job_label(&self.session.document().project_name, &ui_cfg);
+        let _ = self.enqueue_export_job(ui_cfg, output_path);
+        self.show_toast(format!("Added to export queue: {label}"));
+    }
 
-        // Snapshot project & share only in-range decoded audio Arcs (zero PCM deep-copy).
-        let export_project = self.session.project.clone();
-        let export_plugins = self.session.plugins.clone();
-        let export_audio_buffers = collect_in_range_audio_arcs(
-            &self.session,
-            &self.decoded_audio,
+    fn handle_run_export_queue(&mut self) {
+        if self.active_export.is_some() {
+            return;
+        }
+        self.workspace.panels.export_queue_running = true;
+        self.start_next_queued_export();
+    }
+
+    fn start_next_queued_export(&mut self) {
+        while let Some(idx) = queue_next_pending_index(&self.workspace.panels.export_queue) {
+            let (job_id, output_path, ui_cfg) = {
+                let job = &mut self.workspace.panels.export_queue[idx];
+                job.status = ExportJobStatus::Running;
+                (job.id, job.output_path.clone(), job.settings.clone())
+            };
+            let snapshot = self.export_queue_snapshots.remove(&job_id);
+            let launch_result = match snapshot {
+                Some(snap) => {
+                    self.spawn_background_export(&ui_cfg, output_path, Some(job_id), Some(snap))
+                }
+                None => Err(format!(
+                    "Queued export job #{job_id} is missing its captured project snapshot."
+                )),
+            };
+            match launch_result {
+                Ok(()) => return,
+                Err(err) => {
+                    if let Some(job) = self
+                        .workspace
+                        .panels
+                        .export_queue
+                        .iter_mut()
+                        .find(|j| j.id == job_id)
+                    {
+                        job.status = ExportJobStatus::Failed(err.clone());
+                    }
+                    self.show_toast(err);
+                }
+            }
+        }
+        self.workspace.panels.export_queue_running = false;
+        self.show_toast("Export queue finished");
+    }
+
+    fn spawn_background_export(
+        &mut self,
+        ui_cfg: &UiExportSettings,
+        output_path: PathBuf,
+        queue_job_id: Option<u64>,
+        queued_snapshot: Option<ExportQueueSnapshot>,
+    ) -> Result<(), String> {
+        let (seq_fps, mut export_project, export_plugins, active_composition_id, audio_source) =
+            if let Some(snap) = queued_snapshot {
+                let fps = snap.effective_fps();
+                (
+                    fps,
+                    snap.project,
+                    snap.plugins,
+                    snap.active_composition_id,
+                    Some(snap.decoded_audio),
+                )
+            } else {
+                let project = self.session.to_project();
+                let plugins = self.session.plugins.clone();
+                let active_comp = self
+                    .session
+                    .document()
+                    .active_composition_id
+                    .map(|id| id.to_string());
+                let active_seq = active_comp
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .and_then(|uuid| project.compositions.get(&uuid))
+                    .unwrap_or(&project.sequence);
+                let fps = active_seq
+                    .exact_fps
+                    .unwrap_or_else(|| f64::from(active_seq.fps.max(1)))
+                    .max(1.0);
+                (fps, project, plugins, active_comp, None)
+            };
+
+        promote_active_composition_for_export(
+            &mut export_project,
+            active_composition_id.as_deref(),
+        );
+
+        let start_seq_frame = ui_cfg.start_frame.round().max(0.0) as u32;
+        let end_seq_frame = (ui_cfg
+            .end_frame
+            .round()
+            .max(f64::from(start_seq_frame) + 1.0)) as u32;
+        let core_settings =
+            convert_export_settings(ui_cfg, seq_fps, start_seq_frame, end_seq_frame, output_path)
+                .map_err(|err| format!("Invalid export settings: {err}"))?;
+        core_settings
+            .validate()
+            .map_err(|err| format!("Invalid export settings: {err}"))?;
+
+        let needs_ffmpeg = !matches!(
+            core_settings.container,
+            CoreExportContainer::PngSequence | CoreExportContainer::Wav
+        );
+        if needs_ffmpeg && !self.workspace.panels.export_status.ffmpeg_available {
+            return Err(format!(
+                "Cannot start export: FFmpeg is unavailable ({}).",
+                self.workspace.panels.export_status.ffmpeg_version
+            ));
+        }
+
+        // Share only in-range decoded audio Arcs (zero PCM deep-copy) from the snapshot or live session.
+        let audio_cache = audio_source.as_ref().unwrap_or(&self.decoded_audio);
+        let export_audio_buffers = collect_in_range_audio_arcs_for_project(
+            &export_project,
+            export_plugins.is_enabled("precomp-plus"),
+            audio_cache,
             &core_settings,
             start_seq_frame,
             end_seq_frame,
@@ -2072,23 +2442,25 @@ impl ZoidCraftApp {
             Ok(join_handle) => {
                 self.workspace.panels.export_status.exporting = true;
                 self.workspace.panels.export_status.progress = 0.0;
+                self.workspace.panels.export_status.live_fps = None;
+                self.workspace.panels.export_status.eta_secs = None;
                 self.workspace.panels.export_status.status_message =
                     "Starting export worker...".to_owned();
                 self.active_export = Some(ActiveExportJob {
                     cancel,
                     rx,
                     handle: Some(join_handle),
+                    started_at: Instant::now(),
+                    queue_job_id,
                 });
+                Ok(())
             }
-            Err(err) => {
-                let msg = format!("Failed to spawn export worker: {err}");
-                self.workspace.panels.export_status.status_message = msg.clone();
-                self.show_toast(msg);
-            }
+            Err(err) => Err(format!("Failed to spawn export worker: {err}")),
         }
     }
 
     fn cancel_active_export(&mut self) {
+        self.workspace.panels.export_queue_running = false;
         if let Some(job) = &self.active_export {
             job.request_cancel();
             self.workspace.panels.export_status.status_message = "Cancelling export...".to_owned();
@@ -2099,13 +2471,128 @@ impl ZoidCraftApp {
     /// project immediately gets a clean, unblocked `export_status` and cannot be overwritten by
     /// late events from the previous project's worker.
     fn detach_active_export(&mut self) {
+        self.workspace.panels.export_queue_running = false;
         if let Some(job) = self.active_export.take() {
+            if let Some(qid) = job.queue_job_id
+                && let Some(qjob) = self
+                    .workspace
+                    .panels
+                    .export_queue
+                    .iter_mut()
+                    .find(|j| j.id == qid)
+            {
+                qjob.status = ExportJobStatus::Cancelled;
+            }
             job.request_cancel();
             self.retired_exports.push(job);
         }
         self.workspace.panels.export_status.exporting = false;
         self.workspace.panels.export_status.progress = 0.0;
+        self.workspace.panels.export_status.live_fps = None;
+        self.workspace.panels.export_status.eta_secs = None;
         self.workspace.panels.export_status.status_message = "Ready".to_owned();
+    }
+
+    fn handle_open_output_folder(&mut self, path: &Path) {
+        if let Err(err) = open_output_folder_in_os(path) {
+            self.show_toast(format!("Failed to open output folder: {err}"));
+        }
+    }
+
+    fn refresh_recovery_snapshots(&mut self) {
+        self.workspace.panels.recovery_snapshots =
+            list_recovery_snapshots_in_dir(&self.recovery_dir);
+    }
+
+    fn maybe_periodic_autosave(&mut self, ctx: &egui::Context) {
+        let rev = self.session.revision();
+        let needs_snapshot = self.session.is_dirty() && rev != self.last_autosave_revision;
+        if !needs_snapshot {
+            return;
+        }
+        if self.last_autosave_at.elapsed() >= AUTOSAVE_INTERVAL {
+            self.last_autosave_at = Instant::now();
+            if self.session.history.is_in_transaction() {
+                return;
+            }
+            let project_to_save = prepare_project_for_pz_export(&self.session);
+            match save_recovery_snapshot_to_dir(
+                &project_to_save,
+                &self.recovery_dir,
+                MAX_RECOVERY_SNAPSHOTS,
+            ) {
+                Ok(_) => {
+                    self.last_autosave_revision = rev;
+                    self.refresh_recovery_snapshots();
+                }
+                Err(err) => {
+                    tracing::warn!("autosave recovery snapshot failed: {err}");
+                }
+            }
+        } else {
+            ctx.request_repaint_after(Duration::from_secs(5));
+        }
+    }
+
+    fn handle_save_recovery_snapshot_now(&mut self) {
+        if self.session.history.is_in_transaction() {
+            let _ = self.session.commit_transaction(true);
+        }
+        let project_to_save = prepare_project_for_pz_export(&self.session);
+        match save_recovery_snapshot_to_dir(
+            &project_to_save,
+            &self.recovery_dir,
+            MAX_RECOVERY_SNAPSHOTS,
+        ) {
+            Ok(info) => {
+                self.last_autosave_at = Instant::now();
+                self.last_autosave_revision = self.session.revision();
+                self.refresh_recovery_snapshots();
+                self.show_toast(format!("Saved recovery snapshot: {}", info.filename));
+            }
+            Err(err) => {
+                self.show_toast(format!("Failed to save recovery snapshot: {err}"));
+            }
+        }
+    }
+
+    fn handle_restore_recovery_snapshot(&mut self, path: &Path) {
+        match load_zcraft(path) {
+            Ok(project) => {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("recovery snapshot")
+                    .to_owned();
+                self.load_project_into_session(project, None);
+                self.startup_recovery_banner = None;
+                self.last_autosave_at = Instant::now();
+                self.last_autosave_revision = self.session.revision();
+                self.show_toast(format!("Restored recovery snapshot: {name}"));
+            }
+            Err(err) => {
+                self.show_toast(format!("Failed to restore recovery snapshot: {err}"));
+            }
+        }
+    }
+
+    fn handle_delete_recovery_snapshot(&mut self, path: &Path) {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                if self
+                    .startup_recovery_banner
+                    .as_ref()
+                    .is_some_and(|b| b.path == path)
+                {
+                    self.startup_recovery_banner = None;
+                }
+                self.refresh_recovery_snapshots();
+                self.show_toast("Deleted recovery snapshot");
+            }
+            Err(err) => {
+                self.show_toast(format!("Failed to delete recovery snapshot: {err}"));
+            }
+        }
     }
 
     fn handle_eyedropper_click(&mut self, ctx: &egui::Context) -> bool {
@@ -2404,6 +2891,47 @@ impl ZoidCraftApp {
                 });
         }
 
+        // Non-blocking startup crash-recovery banner.
+        if self.pending_eyedropper.is_none()
+            && let Some(snap) = self.startup_recovery_banner.clone()
+        {
+            let mut restore_clicked = false;
+            let mut dismiss_clicked = false;
+            Area::new(Id::unique("zc_recovery_banner"))
+                .order(Order::Foreground)
+                .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 10.0))
+                .show(ctx, |ui| {
+                    Frame::NONE
+                        .fill(BG_TITLE)
+                        .stroke(Stroke::new(1.0, self.theme.accent()))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Recovery snapshot available: {}",
+                                        snap.filename
+                                    ))
+                                    .font(self.theme.font(FONT_SMALL))
+                                    .color(TEXT_BRIGHT),
+                                );
+                                if ui.button("Restore Latest").clicked() {
+                                    restore_clicked = true;
+                                }
+                                if ui.button("Dismiss").clicked() {
+                                    dismiss_clicked = true;
+                                }
+                            });
+                        });
+                });
+            if restore_clicked {
+                self.handle_restore_recovery_snapshot(&snap.path);
+            } else if dismiss_clicked {
+                self.startup_recovery_banner = None;
+            }
+        }
+
         // Eyedropper active banner.
         if self.pending_eyedropper.is_some() {
             Area::new(Id::unique("zc_eyedropper_banner"))
@@ -2514,6 +3042,7 @@ impl eframe::App for ZoidCraftApp {
         self.tick_playback_and_meter(&ctx);
         let was_playing = self.session.playback.is_playing();
         self.poll_export_worker(&ctx);
+        self.maybe_periodic_autosave(&ctx);
 
         if self.pending_unsaved_dialog.is_none() {
             let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
@@ -2653,6 +3182,10 @@ impl eframe::App for ZoidCraftApp {
         let mut canvas_rect_this_frame: Option<Rect> = None;
         let mut viewport_rect_this_frame: Option<Rect> = None;
 
+        // Sync shortcuts -> toolbar before workspace renders so toolbar reflects V/P/Q immediately.
+        let draw_tool_before_ui = self.viewport.active_draw_tool;
+        self.workspace.viewport_draw_tool = draw_tool_before_ui;
+
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(BG_SUNKEN))
             .show(ui, |ui| {
@@ -2682,8 +3215,17 @@ impl eframe::App for ZoidCraftApp {
                 );
             });
 
+        // Bidirectional draw-tool sync: toolbar clicks propagate into viewport; viewport mutations propagate back.
+        if self.workspace.viewport_draw_tool != draw_tool_before_ui {
+            self.viewport.active_draw_tool = self.workspace.viewport_draw_tool;
+            ctx.request_repaint();
+        } else if self.viewport.active_draw_tool != draw_tool_before_ui {
+            self.workspace.viewport_draw_tool = self.viewport.active_draw_tool;
+        }
+
         self.last_canvas_rect = canvas_rect_this_frame;
         self.last_viewport_rect = viewport_rect_this_frame;
+        self.prune_export_queue_snapshots();
 
         // 6. Process bubbled workspace/panel/timeline actions.
         if let Some((target_id, prop)) = open_graph_target {
@@ -2726,7 +3268,17 @@ impl eframe::App for ZoidCraftApp {
                     self.graph_editor.window_focused = true;
                 }
                 UiAction::StartExport(cfg) => self.handle_start_export(cfg),
+                UiAction::AddToExportQueue(cfg) => self.handle_add_to_export_queue(cfg),
+                UiAction::RunExportQueue => self.handle_run_export_queue(),
                 UiAction::CancelExport => self.cancel_active_export(),
+                UiAction::OpenOutputFolder(path) => self.handle_open_output_folder(&path),
+                UiAction::SaveRecoverySnapshotNow => self.handle_save_recovery_snapshot_now(),
+                UiAction::RestoreRecoverySnapshot(path) => {
+                    self.handle_restore_recovery_snapshot(&path);
+                }
+                UiAction::DeleteRecoverySnapshot(path) => {
+                    self.handle_delete_recovery_snapshot(&path);
+                }
                 UiAction::EyedropperActivate {
                     target_id,
                     property,
@@ -2764,6 +3316,24 @@ impl eframe::App for ZoidCraftApp {
         self.workspace.graph_open = self.graph_editor.open;
         if self.graph_editor.open != graph_open_before_window {
             ctx.request_repaint();
+        }
+
+        // Keep Pro Editor floating windows (Node Graph Editor & Color Looks Setup) rendered
+        // even when Viewport or Timeline is maximized and `show_side_panel` is skipped.
+        if matches!(
+            self.workspace.maximized_panel,
+            Some(PanelFocus::Viewport | PanelFocus::Timeline)
+        ) {
+            let screen_rect = ctx.input(|i| i.viewport_rect());
+            show_pro_editor_windows(
+                &ctx,
+                screen_rect,
+                &mut self.workspace.panels.floating_windows,
+                &mut self.workspace.panels.node_graph_editor,
+                &mut self.workspace.panels.looks_editor,
+                &mut self.session,
+                &self.theme,
+            );
         }
 
         // 8. Post-UI repaint scheduling & transport synchronization so UI mutations
@@ -2851,6 +3421,273 @@ fn selected_single_scene3d_clip_uuid(session: &Session) -> Option<Uuid> {
         })
     });
     is_scene3d.then_some(clip_uuid)
+}
+
+fn is_camera_3d_kind(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "camera"
+            | "zoidium:camera-plus/camera"
+            | "zoidium:camera-plus/camera_plus"
+            | "zoidium:camera-plus/camera-plus"
+            | "zoidium:camera_plus/camera"
+            | "zoidium:camera_plus/camera_plus"
+            | "zoidcraft:camera-plus/camera"
+            | "zoidcraft:camera-plus/camera-plus"
+    )
+}
+
+fn is_camera_plus_3d_kind(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "zoidium:camera-plus/camera"
+            | "zoidium:camera-plus/camera_plus"
+            | "zoidium:camera-plus/camera-plus"
+            | "zoidium:camera_plus/camera"
+            | "zoidium:camera_plus/camera_plus"
+            | "zoidcraft:camera-plus/camera"
+            | "zoidcraft:camera-plus/camera-plus"
+    )
+}
+
+fn eval_prop_vec3_at(prop: Option<&SessionProperty>, local_frame: f64, fallback: Vec3) -> Vec3 {
+    let Some(p) = prop else {
+        return fallback;
+    };
+    let read_vec3 = |v: &Value| -> Option<Vec3> {
+        let arr = v.as_array()?;
+        if arr.len() >= 3 {
+            Some(Vec3::new(
+                arr[0].as_f64()? as f32,
+                arr[1].as_f64()? as f32,
+                arr[2].as_f64()? as f32,
+            ))
+        } else {
+            None
+        }
+    };
+    if p.keyframes.is_empty() {
+        return read_vec3(&p.default_value).unwrap_or(fallback);
+    }
+    if p.keyframes.len() == 1 || local_frame <= p.keyframes[0].frame {
+        return read_vec3(&p.keyframes[0].value)
+            .or_else(|| read_vec3(&p.default_value))
+            .unwrap_or(fallback);
+    }
+    let last = &p.keyframes[p.keyframes.len() - 1];
+    if local_frame >= last.frame {
+        return read_vec3(&last.value)
+            .or_else(|| read_vec3(&p.default_value))
+            .unwrap_or(fallback);
+    }
+    let idx = p
+        .keyframes
+        .partition_point(|k| k.frame <= local_frame)
+        .clamp(1, p.keyframes.len() - 1);
+    let k0 = &p.keyframes[idx - 1];
+    let k1 = &p.keyframes[idx];
+    let v0 = read_vec3(&k0.value).unwrap_or(fallback);
+    let v1 = read_vec3(&k1.value).unwrap_or(v0);
+    let span = k1.frame - k0.frame;
+    if span <= 1e-9 {
+        return v0;
+    }
+    let (mode, easing) = InterpolationMode::from_cm3_tween_code(k1.tween);
+    match mode {
+        InterpolationMode::Discrete => v0,
+        InterpolationMode::Interpolated => {
+            let u = ((local_frame - k0.frame) / span).clamp(0.0, 1.0);
+            let e = eval_easing(easing, u) as f32;
+            v0 + (v1 - v0) * e
+        }
+        InterpolationMode::Bezier => {
+            let eval_ch = |a: f32, b: f32| {
+                eval_segment_bezier(
+                    BezierSegment {
+                        start_frame: k0.frame,
+                        start_value: f64::from(a),
+                        out_tangent: k0.control_points[1],
+                        end_frame: k1.frame,
+                        end_value: f64::from(b),
+                        in_tangent: k1.control_points[0],
+                    },
+                    local_frame,
+                ) as f32
+            };
+            Vec3::new(
+                eval_ch(v0.x, v1.x),
+                eval_ch(v0.y, v1.y),
+                eval_ch(v0.z, v1.z),
+            )
+        }
+    }
+}
+
+fn eval_euler_order_3d(obj: &SessionObject3D, local_frame: f64) -> GeomEulerOrder {
+    let idx = eval_prop_f64(obj.properties.get("rotationOrder"), local_frame, 0.0).round() as i32;
+    match idx {
+        1 => GeomEulerOrder::XZY,
+        2 => GeomEulerOrder::YXZ,
+        3 => GeomEulerOrder::YZX,
+        4 => GeomEulerOrder::ZXY,
+        5 => GeomEulerOrder::ZYX,
+        _ => GeomEulerOrder::XYZ,
+    }
+}
+
+fn compute_session_object_world_matrix(
+    objects: &[SessionObject3D],
+    object_id: &str,
+    local_frame: f64,
+    depth: usize,
+) -> Mat4 {
+    if depth >= 32 {
+        return Mat4::IDENTITY;
+    }
+    let Some(obj) = objects.iter().find(|o| o.id == object_id) else {
+        return Mat4::IDENTITY;
+    };
+    let parent = obj.parent_id.as_deref().map_or(Mat4::IDENTITY, |pid| {
+        compute_session_object_world_matrix(objects, pid, local_frame, depth + 1)
+    });
+    let tf = Transform3D {
+        position: eval_prop_vec3_at(obj.properties.get("position"), local_frame, Vec3::ZERO),
+        rotation: eval_prop_vec3_at(obj.properties.get("rotation"), local_frame, Vec3::ZERO),
+        scale: eval_prop_vec3_at(obj.properties.get("scale"), local_frame, Vec3::ONE),
+        euler_order: eval_euler_order_3d(obj, local_frame),
+    };
+    parent * tf.to_matrix()
+}
+
+/// Computes `CameraParams` for a specific 3D scene camera chosen in the viewport Camera Switcher,
+/// allowing `ViewportGpuPresenter` to render through `RenderOverrides.editing_camera`.
+fn resolve_scene_camera_override_params(
+    session: &Session,
+    clip_uuid: Uuid,
+    active_camera_id: &str,
+    frame: f64,
+    width: f32,
+    height: f32,
+) -> Option<CameraParams> {
+    let clip_id_str = clip_uuid.to_string();
+    let clip: &SessionClip = session
+        .document()
+        .video_tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .find(|c| c.id == clip_id_str)?;
+    let cam_obj = clip
+        .objects_3d
+        .iter()
+        .find(|o| o.id == active_camera_id && is_camera_3d_kind(&o.kind))?;
+
+    let local_frame = frame - clip.start;
+    let w = width.max(1.0);
+    let h = height.max(1.0);
+    let aspect = (w / h).max(0.01);
+
+    let world = compute_session_object_world_matrix(&clip.objects_3d, &cam_obj.id, local_frame, 0);
+    let view = if world.determinant().abs() > 1e-8 {
+        world.inverse()
+    } else {
+        Mat4::IDENTITY
+    };
+    let view_cols = view.to_cols_array_2d();
+    let eye = world.w_axis.truncate().to_array();
+
+    let cam_kind =
+        eval_prop_f64(cam_obj.properties.get("camera.kind"), local_frame, 0.0).round() as i32;
+    let zoom = (eval_prop_f64(cam_obj.properties.get("zoom"), local_frame, 1.0) as f32).max(1e-4);
+    let near = (eval_prop_f64(cam_obj.properties.get("near"), local_frame, 0.1) as f32).max(1e-4);
+    let far =
+        (eval_prop_f64(cam_obj.properties.get("far"), local_frame, 5000.0) as f32).max(near + 1.0);
+    let film_offset_x = cam_obj
+        .properties
+        .get("filmOffsetX")
+        .or_else(|| cam_obj.properties.get("film_offset_x"))
+        .map_or(0.0, |p| eval_prop_f64(Some(p), local_frame, 0.0)) as f32;
+    let film_offset_y = cam_obj
+        .properties
+        .get("filmOffsetY")
+        .or_else(|| cam_obj.properties.get("film_offset_y"))
+        .map_or(0.0, |p| eval_prop_f64(Some(p), local_frame, 0.0)) as f32;
+
+    if cam_kind == 1 {
+        return Some(CameraParams::orthographic_film_offset(
+            view_cols,
+            eye,
+            w,
+            h,
+            zoom,
+            film_offset_x,
+            film_offset_y,
+            near,
+            far,
+        ));
+    }
+
+    let focal_prop = cam_obj
+        .properties
+        .get("focalLength")
+        .or_else(|| cam_obj.properties.get("focal_length"));
+    let gate_prop = cam_obj
+        .properties
+        .get("filmGate")
+        .or_else(|| cam_obj.properties.get("film_gate"));
+    let focal_length = (eval_prop_f64(focal_prop, local_frame, 35.0) as f32).max(1e-3);
+    let film_gate = (eval_prop_f64(gate_prop, local_frame, 36.0) as f32).max(1e-3);
+    let uses_film_gate = is_camera_plus_3d_kind(&cam_obj.kind)
+        || (film_gate - 36.0).abs() > 1e-4
+        || focal_prop.is_some_and(|p| p.animated || p.keyframes.len() > 1)
+        || (focal_length - 35.0).abs() > 1e-4;
+    let has_film_offset = film_offset_x.abs() > 1e-6 || film_offset_y.abs() > 1e-6;
+
+    if uses_film_gate {
+        Some(CameraParams::perspective_film_gate(
+            view_cols,
+            eye,
+            focal_length,
+            film_gate,
+            aspect,
+            zoom,
+            film_offset_x,
+            film_offset_y,
+            near,
+            far,
+        ))
+    } else if has_film_offset {
+        let base_fov = (eval_prop_f64(cam_obj.properties.get("fov"), local_frame, 60.0) as f32)
+            .clamp(1.0, 179.0);
+        let fov_rad = base_fov.to_radians();
+        let film_height = film_gate / aspect.max(1.0);
+        let equiv_focal = (film_height * 0.5) / (fov_rad * 0.5).tan().max(1e-5);
+        Some(CameraParams::perspective_film_gate(
+            view_cols,
+            eye,
+            equiv_focal,
+            film_gate,
+            aspect,
+            zoom,
+            film_offset_x,
+            film_offset_y,
+            near,
+            far,
+        ))
+    } else {
+        let base_fov = (eval_prop_f64(cam_obj.properties.get("fov"), local_frame, 60.0) as f32)
+            .clamp(1.0, 179.0);
+        let fov_rad = base_fov.to_radians();
+        let eff_rad = (2.0 * ((fov_rad * 0.5).tan() / zoom).atan())
+            .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians());
+        let proj = mat4_perspective_rh(eff_rad, aspect, near, far);
+        let vp = (Mat4::from_cols_array_2d(&proj) * view).to_cols_array_2d();
+        Some(CameraParams {
+            view: view_cols,
+            proj,
+            view_proj: vp,
+            eye_position: eye,
+        })
+    }
 }
 
 fn find_non_overlapping_start(
@@ -3366,6 +4203,235 @@ fn convert_export_settings(
     })
 }
 
+fn compute_export_fps_and_eta(
+    completed_frames: u32,
+    total_frames: u32,
+    elapsed_secs: f64,
+) -> (Option<f64>, Option<f64>) {
+    if completed_frames == 0 || !elapsed_secs.is_finite() || elapsed_secs <= 1e-4 {
+        return (None, None);
+    }
+    let fps = f64::from(completed_frames) / elapsed_secs;
+    if !fps.is_finite() || fps <= 0.0 {
+        return (None, None);
+    }
+    let remaining = total_frames.saturating_sub(completed_frames);
+    let eta = (f64::from(remaining) / fps).max(0.0);
+    (Some(fps), Some(eta))
+}
+
+fn format_eta_mm_ss(eta_secs: f64) -> String {
+    let total = eta_secs.max(0.0).round() as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+fn format_export_job_label(project_name: &str, cfg: &UiExportSettings) -> String {
+    let (_, ext) = export_file_dialog_filter(cfg.container);
+    if cfg.container.is_audio_only() {
+        format!(
+            "{project_name} ({} · {} Hz)",
+            ext.to_ascii_uppercase(),
+            cfg.sample_rate_hz
+        )
+    } else {
+        format!(
+            "{project_name} ({} · {}x{} @ {:.0}fps)",
+            ext.to_ascii_uppercase(),
+            cfg.width,
+            cfg.height,
+            cfg.fps
+        )
+    }
+}
+
+fn queue_add_job(
+    queue: &mut Vec<ExportQueueJob>,
+    id: u64,
+    label: String,
+    output_path: PathBuf,
+    settings: UiExportSettings,
+) {
+    queue.push(ExportQueueJob {
+        id,
+        label,
+        output_path,
+        settings,
+        status: ExportJobStatus::Queued,
+    });
+}
+
+#[cfg(test)]
+fn queue_move_job(queue: &mut [ExportQueueJob], index: usize, delta: isize) -> bool {
+    let Some(target) = index.checked_add_signed(delta) else {
+        return false;
+    };
+    if index >= queue.len() || target >= queue.len() || index == target {
+        return false;
+    }
+    if queue[index].status == ExportJobStatus::Running
+        || queue[target].status == ExportJobStatus::Running
+    {
+        return false;
+    }
+    queue.swap(index, target);
+    true
+}
+
+fn queue_next_pending_index(queue: &[ExportQueueJob]) -> Option<usize> {
+    queue
+        .iter()
+        .position(|job| job.status == ExportJobStatus::Queued)
+}
+
+fn open_output_folder_in_os(path: &Path) -> Result<(), String> {
+    let folder = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    };
+    #[cfg(target_os = "macos")]
+    let res = ProcessCommand::new("open").arg(&folder).spawn();
+    #[cfg(target_os = "windows")]
+    let res = ProcessCommand::new("explorer").arg(&folder).spawn();
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let res = ProcessCommand::new("xdg-open").arg(&folder).spawn();
+
+    res.map(|_| ()).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Real Disk Autosave & Crash Recovery Helpers (Zero External Crates)
+// ---------------------------------------------------------------------------
+
+fn default_recovery_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("ZoidCraft")
+                .join("recovery");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
+            return PathBuf::from(appdata).join("ZoidCraft").join("recovery");
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(xdg).join("zoidcraft").join("recovery");
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("zoidcraft")
+                .join("recovery");
+        }
+    }
+    std::env::temp_dir().join("zoidcraft-recovery")
+}
+
+fn parse_autosave_timestamp_secs(filename: &str, fallback_secs: u64) -> u64 {
+    let Some(stem) = filename
+        .strip_prefix("autosave-")
+        .and_then(|s| s.strip_suffix(".zcraft"))
+    else {
+        return fallback_secs;
+    };
+    let head = stem.split('-').next().unwrap_or(stem);
+    head.parse::<u64>().unwrap_or(fallback_secs)
+}
+
+fn list_recovery_snapshots_in_dir(dir: &Path) -> Vec<RecoverySnapshotInfo> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut snapshots = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(filename) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        if !filename.starts_with("autosave-") || !filename.ends_with(".zcraft") {
+            continue;
+        }
+        let meta = entry.metadata().ok();
+        let size_bytes = meta.as_ref().map_or(0, fs::Metadata::len);
+        let modified_secs = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        let timestamp_secs = parse_autosave_timestamp_secs(&filename, modified_secs);
+        snapshots.push(RecoverySnapshotInfo {
+            filename,
+            timestamp_secs,
+            size_bytes,
+            path,
+        });
+    }
+    snapshots.sort_by(|a, b| {
+        b.timestamp_secs
+            .cmp(&a.timestamp_secs)
+            .then_with(|| b.filename.cmp(&a.filename))
+    });
+    snapshots
+}
+
+fn save_recovery_snapshot_to_dir(
+    project: &Project,
+    dir: &Path,
+    max_keep: usize,
+) -> Result<RecoverySnapshotInfo, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("failed to create recovery directory: {e}"))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    let mut candidate_name = format!("autosave-{secs}-{millis:03}.zcraft");
+    let mut path = dir.join(&candidate_name);
+    let mut seq = 1u32;
+    while path.exists() {
+        candidate_name = format!("autosave-{secs}-{millis:03}-{seq}.zcraft");
+        path = dir.join(&candidate_name);
+        seq = seq.saturating_add(1);
+    }
+
+    save_zcraft(project, &path).map_err(|e| format!("failed to write recovery snapshot: {e}"))?;
+    let size_bytes = fs::metadata(&path).map_or(0, |m| m.len());
+
+    // Prune older snapshots beyond `max_keep`, keeping the newest entries.
+    let all = list_recovery_snapshots_in_dir(dir);
+    for old in all.into_iter().skip(max_keep.max(1)) {
+        let _ = fs::remove_file(&old.path);
+    }
+
+    Ok(RecoverySnapshotInfo {
+        filename: candidate_name,
+        timestamp_secs: secs,
+        size_bytes,
+        path,
+    })
+}
+
 fn poll_export_job(
     job: &ActiveExportJob,
     status: &mut ExportStatus,
@@ -3380,12 +4446,26 @@ fn poll_export_job(
                 } else {
                     1.0
                 };
+                let elapsed = job.started_at.elapsed().as_secs_f64();
+                let (live_fps, eta_secs) =
+                    compute_export_fps_and_eta(p.completed_frames, p.total_frames, elapsed);
                 status.exporting = true;
                 status.progress = frac;
-                status.status_message = format!(
-                    "Rendering frame {} / {}",
-                    p.completed_frames, p.total_frames
-                );
+                status.live_fps = live_fps;
+                status.eta_secs = eta_secs;
+                status.status_message = match (live_fps, eta_secs) {
+                    (Some(fps), Some(eta)) => format!(
+                        "Rendering frame {} / {} · {:.1} fps · ETA {}",
+                        p.completed_frames,
+                        p.total_frames,
+                        fps,
+                        format_eta_mm_ss(eta),
+                    ),
+                    _ => format!(
+                        "Rendering frame {} / {}",
+                        p.completed_frames, p.total_frames
+                    ),
+                };
             }
             Ok(ExportWorkerEvent::Finished(res)) => {
                 finished_result = Some(res);
@@ -3403,20 +4483,27 @@ fn poll_export_job(
     finished_result
 }
 
-fn collect_clip_audio_assets(project: &Project) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for at in &project.sequence.audio_tracks {
-        for ac in &at.clips {
-            if let Some(asset_id) = ac.media.as_deref() {
-                map.insert(ac.id.to_string(), asset_id.to_owned());
-            }
-        }
-    }
-    map
-}
-
+#[cfg(test)]
 fn collect_in_range_audio_arcs(
     session: &Session,
+    cached_buffers: &HashMap<String, Arc<AudioBuffer>>,
+    settings: &CoreExportSettings,
+    start_seq_frame: u32,
+    end_seq_frame: u32,
+) -> HashMap<String, Arc<AudioBuffer>> {
+    collect_in_range_audio_arcs_for_project(
+        &session.project,
+        session.plugins.is_enabled("precomp-plus"),
+        cached_buffers,
+        settings,
+        start_seq_frame,
+        end_seq_frame,
+    )
+}
+
+fn collect_in_range_audio_arcs_for_project(
+    project: &Project,
+    precomp_enabled: bool,
     cached_buffers: &HashMap<String, Arc<AudioBuffer>>,
     settings: &CoreExportSettings,
     start_seq_frame: u32,
@@ -3431,35 +4518,17 @@ fn collect_in_range_audio_arcs(
     {
         return selected;
     }
-    let clip_assets = collect_clip_audio_assets(&session.project);
-    let doc = session.document();
-    let any_solo = doc.audio_tracks.iter().any(|t| t.solo);
-    let range_start = f64::from(start_seq_frame);
-    let range_end = f64::from(end_seq_frame);
-
-    for track in &doc.audio_tracks {
-        let audible = if any_solo {
-            track.enabled && track.solo
-        } else {
-            track.enabled
-        };
-        if !audible {
-            continue;
-        }
-        for clip in &track.clips {
-            if clip.length <= 0.0
-                || clip.start + clip.length <= range_start
-                || clip.start >= range_end
-            {
-                continue;
-            }
-            if let Some(asset_id) = clip_assets.get(&clip.id)
-                && let Some(buf) = cached_buffers.get(asset_id)
-            {
-                selected
-                    .entry(asset_id.clone())
-                    .or_insert_with(|| Arc::clone(buf));
-            }
+    let flattened = collect_flattened_audio_clips_with_precomp(
+        project,
+        f64::from(start_seq_frame),
+        f64::from(end_seq_frame),
+        precomp_enabled,
+    );
+    for clip in &flattened {
+        if let Some(buf) = cached_buffers.get(&clip.asset_id) {
+            selected
+                .entry(clip.asset_id.clone())
+                .or_insert_with(|| Arc::clone(buf));
         }
     }
     selected
@@ -3543,295 +4612,77 @@ fn validate_save_without_assets_target(
     Ok(())
 }
 
-fn compile_audio_prop_expr(prop: Option<&SessionProperty>, mode: ExprMode) -> Option<CompiledExpr> {
-    let source = prop?.expression.as_deref()?.trim();
-    if source.is_empty() {
-        return None;
-    }
-    CompiledExpr::compile(source, mode).ok()
-}
-
-fn eval_project_track_f64(track: &PropertyTrack, frame: f64, fallback: f64) -> f64 {
-    if track.keyframes.is_empty() {
-        return track.value.as_f64().unwrap_or(fallback);
-    }
-    if track.keyframes.len() == 1 {
-        return track.keyframes[0].value.as_f64().unwrap_or(fallback);
-    }
-    let mut kfs: Vec<&PropertyKeyframe> = track.keyframes.iter().collect();
-    kfs.sort_by(|a, b| a.frame.total_cmp(&b.frame));
-    if frame <= kfs[0].frame {
-        return kfs[0].value.as_f64().unwrap_or(fallback);
-    }
-    let last = kfs[kfs.len() - 1];
-    if frame >= last.frame {
-        return last.value.as_f64().unwrap_or(fallback);
-    }
-    let idx = kfs
-        .partition_point(|k| k.frame <= frame)
-        .clamp(1, kfs.len() - 1);
-    let k0 = kfs[idx - 1];
-    let k1 = kfs[idx];
-    let v0 = k0.value.as_f64().unwrap_or(fallback);
-    let v1 = k1.value.as_f64().unwrap_or(v0);
-    let span = k1.frame - k0.frame;
-    if span <= 1e-9 {
-        return v0;
-    }
-    let ease_idx = (k1.tween & 0xFF) as u8;
-    let is_bezier = ease_idx != 0 && (k1.tween >> 8) == 1;
-    let tween_code = if is_bezier {
-        (1u16 << 8) | u16::from(ease_idx)
-    } else {
-        u16::from(ease_idx)
-    };
-    let (mode, easing) = InterpolationMode::from_cm3_tween_code(tween_code);
-    match mode {
-        InterpolationMode::Discrete => v0,
-        InterpolationMode::Interpolated => {
-            let u = ((frame - k0.frame) / span).clamp(0.0, 1.0);
-            let e = eval_easing(easing, u);
-            v0 + (v1 - v0) * e
-        }
-        InterpolationMode::Bezier => eval_segment_bezier(
-            BezierSegment {
-                start_frame: k0.frame,
-                start_value: v0,
-                out_tangent: k0.control_points[1],
-                end_frame: k1.frame,
-                end_value: v1,
-                in_tangent: k1.control_points[0],
-            },
-            frame,
-        ),
-    }
-}
-
-fn eval_sequence_control_expr_value(ctrl: &SequenceControl, seq_frame: f64) -> zc_expr::Value {
-    if !ctrl.track.channels.is_empty() {
-        let vals = ctrl
-            .track
-            .channels
-            .iter()
-            .map(|ch| zc_expr::Value::Number(eval_project_track_f64(ch, seq_frame, 0.0)))
-            .collect();
-        return zc_expr::Value::Array(vals);
-    }
-    let step_value = || -> &PropertyValue {
-        if ctrl.track.keyframes.is_empty() {
-            return &ctrl.track.value;
-        }
-        let mut best: Option<&PropertyKeyframe> = None;
-        for kf in &ctrl.track.keyframes {
-            if kf.frame <= seq_frame && best.is_none_or(|b| kf.frame >= b.frame) {
-                best = Some(kf);
-            }
-        }
-        best.or_else(|| {
-            ctrl.track
-                .keyframes
-                .iter()
-                .min_by(|a, b| a.frame.total_cmp(&b.frame))
-        })
-        .map_or(&ctrl.track.value, |kf| &kf.value)
-    };
-    match &ctrl.track.value {
-        PropertyValue::Number(_) => {
-            zc_expr::Value::Number(eval_project_track_f64(&ctrl.track, seq_frame, 0.0))
-        }
-        PropertyValue::Option(idx) => zc_expr::Value::Number(eval_project_track_f64(
-            &ctrl.track,
-            seq_frame,
-            f64::from(*idx),
-        )),
-        PropertyValue::Bool(_) => {
-            let active = match step_value() {
-                PropertyValue::Bool(b) => *b,
-                PropertyValue::Number(n) => *n != 0.0,
-                _ => false,
-            };
-            if ctrl.kind == SequenceControlKind::Checkbox {
-                zc_expr::Value::Number(if active { 1.0 } else { 0.0 })
-            } else {
-                zc_expr::Value::Bool(active)
-            }
-        }
-        PropertyValue::Text(_) => {
-            let text = step_value().as_str().unwrap_or("");
-            if ctrl.kind == SequenceControlKind::Checkbox {
-                zc_expr::Value::Number(text.trim().parse::<f64>().unwrap_or(0.0))
-            } else {
-                zc_expr::Value::String(text.to_owned())
-            }
-        }
-        PropertyValue::Vec2(v) => {
-            let arr = step_value().as_vec2().unwrap_or(*v);
-            zc_expr::Value::Array(arr.into_iter().map(zc_expr::Value::Number).collect())
-        }
-        PropertyValue::Vec3(v) | PropertyValue::Color(v) => {
-            let arr = step_value().as_vec3().unwrap_or(*v);
-            zc_expr::Value::Array(arr.into_iter().map(zc_expr::Value::Number).collect())
-        }
-        PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) => {
-            let arr = step_value().as_vec4().unwrap_or(*v);
-            zc_expr::Value::Array(arr.into_iter().map(zc_expr::Value::Number).collect())
-        }
-        _ => zc_expr::Value::Number(0.0),
-    }
-}
-
-struct GuiAudioExprContext<'a> {
-    frame: f64,
-    time: f64,
-    fps: f64,
-    value: zc_expr::Value,
-    seq_frame: f64,
-    controls: &'a [SequenceControl],
-}
-
-impl ExprContext for GuiAudioExprContext<'_> {
-    fn frame(&self) -> f64 {
-        self.frame
-    }
-
-    fn time(&self) -> f64 {
-        self.time
-    }
-
-    fn fps(&self) -> f64 {
-        self.fps
-    }
-
-    fn value(&self) -> zc_expr::Value {
-        self.value.clone()
-    }
-
-    fn properties(&self) -> BTreeMap<String, zc_expr::Value> {
-        BTreeMap::new()
-    }
-
-    fn control(&self, name: &str, stable_id: Option<&str>) -> Result<zc_expr::Value, ExprError> {
-        let ctrl_opt = if let Some(sid) = stable_id {
-            self.controls.iter().find(|c| c.id == sid)
-        } else {
-            self.controls.iter().find(|c| c.name == name)
-        };
-        let Some(ctrl) = ctrl_opt else {
-            return Err(ExprError::NotFound(match stable_id {
-                Some(sid) => format!("control '{name}' (id '{sid}')"),
-                None => format!("control '{name}'"),
-            }));
-        };
-        Ok(eval_sequence_control_expr_value(ctrl, self.seq_frame))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn eval_compiled_audio_expr(
-    compiled: &CompiledExpr,
-    local_frame: f64,
-    time_sec: f64,
-    fps: f64,
-    base_value: f64,
-    seq_frame: f64,
-    controls: &[SequenceControl],
-    config: &EvalConfig,
-) -> f64 {
-    let safe_fps = fps.max(1.0);
-    let ctx = GuiAudioExprContext {
-        frame: local_frame,
-        time: time_sec,
-        fps: safe_fps,
-        value: zc_expr::Value::Number(base_value),
-        seq_frame,
-        controls,
-    };
-    let outcome = compiled.evaluate_with_fallback(&ctx, config);
-    outcome
-        .value
-        .as_f64()
-        .filter(|v| v.is_finite())
-        .unwrap_or(base_value)
-}
-
 fn compute_audio_mix_hash(
     session: &Session,
     decoded_audio: &HashMap<String, Arc<AudioBuffer>>,
     fps: f64,
     seq_len: f64,
 ) -> u64 {
-    let clip_assets = collect_clip_audio_assets(&session.project);
-    let doc = session.document();
-    let any_solo = doc.audio_tracks.iter().any(|t| t.solo);
+    let precomp_enabled = session.plugins.is_enabled("precomp-plus");
+    let flattened = collect_flattened_audio_clips_with_precomp(
+        &session.project,
+        0.0,
+        seq_len.max(1.0),
+        precomp_enabled,
+    );
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut active_clips = 0_usize;
-    let mut any_expr = false;
 
     fnv_mix_f64(&mut hash, fps);
     fnv_mix_f64(&mut hash, seq_len);
+    fnv_mix(&mut hash, &session.revision().to_le_bytes());
     fnv_mix(
         &mut hash,
-        &[u8::from(session.plugins.is_enabled("expressions-plus"))],
+        &[
+            u8::from(session.plugins.is_enabled("expressions-plus")),
+            u8::from(precomp_enabled),
+        ],
     );
 
-    for track in &doc.audio_tracks {
-        let audible = if any_solo {
-            track.enabled && track.solo
-        } else {
-            track.enabled
-        };
-        if !audible {
+    for clip in &flattened {
+        let has_audio = decoded_audio.contains_key(&clip.asset_id)
+            || session
+                .project
+                .assets
+                .get(&clip.asset_id)
+                .and_then(|r| r.bytes.as_ref())
+                .is_some();
+        if !has_audio {
             continue;
         }
-        for clip in &track.clips {
-            if clip.length <= 0.0 {
-                continue;
-            }
-            let Some(asset_id) = clip_assets.get(&clip.id) else {
-                continue;
-            };
-            let has_audio = decoded_audio.contains_key(asset_id)
-                || session
-                    .project
-                    .assets
-                    .get(asset_id)
-                    .and_then(|r| r.bytes.as_ref())
-                    .is_some();
-            if !has_audio {
-                continue;
-            }
-            active_clips += 1;
-            fnv_mix(&mut hash, &(asset_id.len() as u64).to_le_bytes());
-            fnv_mix(&mut hash, asset_id.as_bytes());
-            fnv_mix_f64(&mut hash, clip.start);
-            fnv_mix_f64(&mut hash, clip.length);
-            fnv_mix_f64(&mut hash, clip.time_start);
-            fnv_mix_f64(&mut hash, clip.time_end);
-            fnv_mix(&mut hash, &[u8::from(clip.time_animated)]);
-            for prop_name in ["volume", "pan", "time"] {
-                fnv_mix(&mut hash, prop_name.as_bytes());
-                if let Some(prop) = clip.properties.get(prop_name) {
-                    fnv_mix(&mut hash, &[1]);
-                    if prop
-                        .expression
-                        .as_deref()
-                        .is_some_and(|e| !e.trim().is_empty())
-                    {
-                        any_expr = true;
-                    }
-                    fnv_mix_prop(&mut hash, prop);
-                } else {
-                    fnv_mix(&mut hash, &[0]);
-                }
+        active_clips += 1;
+        fnv_mix(&mut hash, &(clip.asset_id.len() as u64).to_le_bytes());
+        fnv_mix(&mut hash, clip.asset_id.as_bytes());
+        fnv_mix_f64(&mut hash, clip.root_start_frame);
+        fnv_mix_f64(&mut hash, clip.root_length_frames);
+        fnv_mix_f64(&mut hash, clip.own_start_frame);
+        fnv_mix_f64(&mut hash, clip.own_length_frames);
+        fnv_mix_f64(&mut hash, clip.own_fps);
+        fnv_mix_f64(&mut hash, clip.media_offset_sec);
+        fnv_mix(&mut hash, &(clip.depth as u64).to_le_bytes());
+    }
+
+    if active_clips == 0 {
+        return 0;
+    }
+
+    // Fold audio track properties/keyframes/expressions + sequence controls + nested compositions
+    // so direct mutations (including Bezier handle edits and Precomp+ edits) invalidate immediately.
+    let _ = serde_json::to_writer(FnvWriter(&mut hash), &session.project.sequence.audio_tracks);
+    let _ = serde_json::to_writer(FnvWriter(&mut hash), &session.project.sequence.controls);
+    if !session.project.compositions.is_empty() {
+        let mut comp_ids: Vec<Uuid> = session.project.compositions.keys().copied().collect();
+        comp_ids.sort();
+        for cid in comp_ids {
+            if let Some(comp) = session.project.compositions.get(&cid) {
+                fnv_mix(&mut hash, cid.as_bytes());
+                let _ = serde_json::to_writer(FnvWriter(&mut hash), &comp.audio_tracks);
+                let _ = serde_json::to_writer(FnvWriter(&mut hash), &comp.controls);
             }
         }
     }
 
-    if any_expr {
-        let _ = serde_json::to_writer(FnvWriter(&mut hash), &session.project.sequence.controls);
-    }
-
-    if active_clips == 0 { 0 } else { hash.max(1) }
+    hash.max(1)
 }
 
 fn build_offline_export_audio(
@@ -3860,15 +4711,6 @@ fn build_offline_export_audio(
     )
 }
 
-struct PreparedAudioClipProps<'a> {
-    clip_start: f64,
-    props: &'a BTreeMap<String, SessionProperty>,
-    time_animated: bool,
-    volume_expr: Option<CompiledExpr>,
-    pan_expr: Option<CompiledExpr>,
-    time_expr: Option<CompiledExpr>,
-}
-
 fn mix_sequence_audio_stereo(
     session: &Session,
     cached_buffers: &HashMap<String, Arc<AudioBuffer>>,
@@ -3877,222 +4719,84 @@ fn mix_sequence_audio_stereo(
     start_seq_frame: u32,
     end_seq_frame: u32,
 ) -> Result<Option<Vec<[f32; 2]>>, String> {
-    let clip_assets = collect_clip_audio_assets(&session.project);
-    if clip_assets.is_empty() && cached_buffers.is_empty() {
-        return Ok(None);
-    }
-    let expr_config = if session.plugins.is_enabled("expressions-plus") {
-        EvalConfig::expressions_plus()
-    } else {
-        EvalConfig::vanilla()
-    };
-    let controls = &session.project.sequence.controls;
-    let safe_fps = seq_fps.max(1.0);
-    // Share Arc references without copying PCM sample data.
-    let mut buffers: HashMap<String, Arc<AudioBuffer>> = HashMap::new();
-    let mut silent_assets: HashSet<String> = HashSet::new();
-    let doc = session.document();
-    let any_solo = doc.audio_tracks.iter().any(|t| t.solo);
-    let mut items = Vec::new();
-    let mut clip_props: Vec<PreparedAudioClipProps<'_>> = Vec::new();
     let range_start = f64::from(start_seq_frame);
     let range_end = f64::from(end_seq_frame);
+    let flattened = collect_flattened_audio_clips_with_precomp(
+        &session.project,
+        range_start,
+        range_end,
+        session.plugins.is_enabled("precomp-plus"),
+    );
+    if flattened.is_empty() {
+        return Ok(None);
+    }
 
-    for track in &doc.audio_tracks {
-        let audible = if any_solo {
-            track.enabled && track.solo
-        } else {
-            track.enabled
-        };
-        if !audible {
+    let safe_fps = seq_fps.max(1.0);
+    let mut buffers: HashMap<String, Arc<AudioBuffer>> = HashMap::new();
+    let mut silent_assets: HashSet<String> = HashSet::new();
+    let mut active_clips = Vec::new();
+
+    for clip in flattened {
+        if silent_assets.contains(&clip.asset_id) {
             continue;
         }
-        for clip in &track.clips {
-            if clip.length <= 0.0
-                || clip.start + clip.length <= range_start
-                || clip.start >= range_end
-            {
-                continue;
-            }
-            let Some(asset_id) = clip_assets.get(&clip.id) else {
-                continue;
-            };
-            if silent_assets.contains(asset_id) {
-                continue;
-            }
-            if !buffers.contains_key(asset_id) {
-                if let Some(cached) = cached_buffers.get(asset_id) {
-                    if cached.is_empty() {
-                        silent_assets.insert(asset_id.clone());
-                        continue;
-                    }
-                    buffers.insert(asset_id.clone(), Arc::clone(cached));
-                } else {
-                    let Some(rec) = session.project.assets.get(asset_id) else {
-                        continue;
-                    };
-                    let Some(bytes) = rec.bytes.as_deref() else {
-                        continue;
-                    };
-                    let ext = Path::new(&rec.filename)
-                        .extension()
-                        .and_then(|e| e.to_str());
-                    match decode_audio_bytes(bytes, ext) {
-                        Ok(decoded) => {
-                            if decoded.is_empty() {
-                                silent_assets.insert(asset_id.clone());
-                                continue;
-                            }
-                            buffers.insert(asset_id.clone(), Arc::new(decoded));
-                        }
-                        Err(AudioError::NoAudioTrack) => {
-                            tracing::debug!(
-                                "audio asset `{asset_id}` has no audio track; treating as silent"
-                            );
-                            silent_assets.insert(asset_id.clone());
+        if !buffers.contains_key(&clip.asset_id) {
+            if let Some(cached) = cached_buffers.get(&clip.asset_id) {
+                if cached.is_empty() {
+                    silent_assets.insert(clip.asset_id.clone());
+                    continue;
+                }
+                buffers.insert(clip.asset_id.clone(), Arc::clone(cached));
+            } else {
+                let Some(rec) = session.project.assets.get(&clip.asset_id) else {
+                    continue;
+                };
+                let Some(bytes) = rec.bytes.as_deref() else {
+                    continue;
+                };
+                let ext = Path::new(&rec.filename)
+                    .extension()
+                    .and_then(|e| e.to_str());
+                match decode_audio_bytes(bytes, ext) {
+                    Ok(decoded) => {
+                        if decoded.is_empty() {
+                            silent_assets.insert(clip.asset_id.clone());
                             continue;
                         }
-                        Err(err) => {
-                            return Err(format!(
-                                "failed to decode audio asset `{asset_id}`: {err}"
-                            ));
-                        }
+                        buffers.insert(clip.asset_id.clone(), Arc::new(decoded));
+                    }
+                    Err(AudioError::NoAudioTrack) => {
+                        tracing::debug!(
+                            "audio asset `{}` has no audio track; treating as silent",
+                            clip.asset_id
+                        );
+                        silent_assets.insert(clip.asset_id.clone());
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(format!(
+                            "failed to decode audio asset `{}`: {err}",
+                            clip.asset_id
+                        ));
                     }
                 }
             }
-            let rate =
-                effective_playback_rate(clip.time_start, clip.time_end, clip.length, safe_fps);
-            let volume_expr =
-                compile_audio_prop_expr(clip.properties.get("volume"), expr_config.mode);
-            let pan_expr = compile_audio_prop_expr(clip.properties.get("pan"), expr_config.mode);
-            let time_expr = compile_audio_prop_expr(clip.properties.get("time"), expr_config.mode);
-            let media_time_0 = if clip.time_animated || time_expr.is_some() {
-                let base_t0 = eval_prop_f64(clip.properties.get("time"), 0.0, clip.time_start);
-                time_expr.as_ref().map_or(base_t0, |e| {
-                    eval_compiled_audio_expr(
-                        e,
-                        0.0,
-                        base_t0,
-                        safe_fps,
-                        base_t0,
-                        clip.start,
-                        controls,
-                        &expr_config,
-                    )
-                })
-            } else {
-                clip.time_start
-            };
-            let volume_base = eval_prop_f64(clip.properties.get("volume"), 0.0, 1.0);
-            let volume = volume_expr.as_ref().map_or(volume_base, |e| {
-                eval_compiled_audio_expr(
-                    e,
-                    0.0,
-                    media_time_0,
-                    safe_fps,
-                    volume_base,
-                    clip.start,
-                    controls,
-                    &expr_config,
-                )
-            }) as f32;
-            let pan_base = eval_prop_f64(clip.properties.get("pan"), 0.0, 0.0);
-            let pan = pan_expr.as_ref().map_or(pan_base, |e| {
-                eval_compiled_audio_expr(
-                    e,
-                    0.0,
-                    media_time_0,
-                    safe_fps,
-                    pan_base,
-                    clip.start,
-                    controls,
-                    &expr_config,
-                )
-            }) as f32;
-            items.push(AudioClipScheduleItem {
-                clip_start_frame: clip.start - range_start,
-                clip_length_frames: clip.length,
-                media_start_sec: clip.time_start,
-                playback_rate: rate,
-                volume,
-                pan,
-                buffer_id: asset_id.clone(),
-            });
-            clip_props.push(PreparedAudioClipProps {
-                clip_start: clip.start,
-                props: &clip.properties,
-                time_animated: clip.time_animated,
-                volume_expr,
-                pan_expr,
-                time_expr,
-            });
         }
+        active_clips.push(clip);
     }
 
-    if items.is_empty() {
+    if active_clips.is_empty() {
         return Ok(None);
     }
     let seq_span_frames = f64::from(end_seq_frame.saturating_sub(start_seq_frame).max(1));
     let sr = sample_rate.max(8_000);
-    try_mix_offline_stereo_animated(
+    mix_flattened_audio_clips(
+        &active_clips,
+        range_start,
         seq_span_frames,
         safe_fps,
         sr,
-        &items,
         &buffers,
-        |clip_idx, clip, local_frame| {
-            let prepared = &clip_props[clip_idx];
-            let seq_frame = prepared.clip_start + local_frame;
-            let linear_time = clip.media_start_sec + (local_frame / safe_fps) * clip.playback_rate;
-            let media_time_sec = if prepared.time_animated || prepared.time_expr.is_some() {
-                let base_t = eval_prop_f64(prepared.props.get("time"), local_frame, linear_time);
-                prepared.time_expr.as_ref().map_or(base_t, |e| {
-                    eval_compiled_audio_expr(
-                        e,
-                        local_frame,
-                        base_t,
-                        safe_fps,
-                        base_t,
-                        seq_frame,
-                        controls,
-                        &expr_config,
-                    )
-                })
-            } else {
-                linear_time
-            };
-            let base_vol = eval_prop_f64(prepared.props.get("volume"), local_frame, 1.0);
-            let volume = prepared.volume_expr.as_ref().map_or(base_vol, |e| {
-                eval_compiled_audio_expr(
-                    e,
-                    local_frame,
-                    media_time_sec,
-                    safe_fps,
-                    base_vol,
-                    seq_frame,
-                    controls,
-                    &expr_config,
-                )
-            }) as f32;
-            let base_pan = eval_prop_f64(prepared.props.get("pan"), local_frame, 0.0);
-            let pan = prepared.pan_expr.as_ref().map_or(base_pan, |e| {
-                eval_compiled_audio_expr(
-                    e,
-                    local_frame,
-                    media_time_sec,
-                    safe_fps,
-                    base_pan,
-                    seq_frame,
-                    controls,
-                    &expr_config,
-                )
-            }) as f32;
-            ClipAudioSampleParams {
-                media_time_sec,
-                volume,
-                pan,
-            }
-        },
     )
     .map(Some)
     .map_err(|err| format!("failed to mix sequence audio: {err}"))
@@ -4108,123 +4812,63 @@ fn sample_live_audio_meter(
     if buffers.is_empty() {
         return (0.0, 0.0);
     }
-    let expr_config = if session.plugins.is_enabled("expressions-plus") {
-        EvalConfig::expressions_plus()
-    } else {
-        EvalConfig::vanilla()
-    };
-    let controls = &session.project.sequence.controls;
-    let clip_assets = collect_clip_audio_assets(&session.project);
-    let doc = session.document();
-    let any_solo = doc.audio_tracks.iter().any(|t| t.solo);
     let safe_fps = fps.max(1.0);
+    let dt_frames = (METER_WINDOW as f64 / f64::from(STANDARD_SAMPLE_RATE)) * safe_fps;
+    let flattened = collect_flattened_audio_clips_with_precomp(
+        &session.project,
+        frame,
+        frame + dt_frames.max(1.0),
+        session.plugins.is_enabled("precomp-plus"),
+    );
+    if flattened.is_empty() {
+        return (0.0, 0.0);
+    }
+
     let mut mix_l = [0.0_f32; METER_WINDOW];
     let mut mix_r = [0.0_f32; METER_WINDOW];
     let mut has_active_audio = false;
 
-    for track in &doc.audio_tracks {
-        let audible = if any_solo {
-            track.enabled && track.solo
-        } else {
-            track.enabled
-        };
-        if !audible {
+    for clip in &flattened {
+        let local_f = frame - clip.root_start_frame;
+        if local_f < 0.0 || local_f >= clip.root_length_frames {
             continue;
         }
-        for clip in &track.clips {
-            if clip.length <= 0.0 || frame < clip.start || frame >= clip.start + clip.length {
-                continue;
-            }
-            let Some(asset_id) = clip_assets.get(&clip.id) else {
-                continue;
-            };
-            let Some(buf) = buffers.get(asset_id) else {
-                continue;
-            };
-            let total_frames = buf.frame_count();
-            if total_frames == 0 {
-                continue;
-            }
-            let local_f = frame - clip.start;
-            let rate =
-                effective_playback_rate(clip.time_start, clip.time_end, clip.length, safe_fps);
-            let sr = f64::from(buf.sample_rate.max(1));
-            let linear_t = clip.time_start + (local_f / safe_fps) * rate;
-            let time_expr = compile_audio_prop_expr(clip.properties.get("time"), expr_config.mode);
-            let (base_t, effective_rate) = if clip.time_animated || time_expr.is_some() {
-                let eval_time = |lf: f64| -> f64 {
-                    let lin = clip.time_start + (lf / safe_fps) * rate;
-                    let base = eval_prop_f64(clip.properties.get("time"), lf, lin);
-                    time_expr.as_ref().map_or(base, |e| {
-                        eval_compiled_audio_expr(
-                            e,
-                            lf,
-                            base,
-                            safe_fps,
-                            base,
-                            clip.start + lf,
-                            controls,
-                            &expr_config,
-                        )
-                    })
-                };
-                let t0 = eval_time(local_f);
-                let dt_frames = (METER_WINDOW as f64 / f64::from(STANDARD_SAMPLE_RATE)) * safe_fps;
-                let t1 = eval_time(local_f + dt_frames.max(1e-4));
-                let local_rate = (t1 - t0) / (dt_frames.max(1e-4) / safe_fps);
-                (t0, local_rate)
-            } else {
-                (linear_t, rate)
-            };
-            let base_pos = base_t * sr;
-            let step_samples = (sr / f64::from(STANDARD_SAMPLE_RATE)) * effective_rate;
-            let base_vol = eval_prop_f64(clip.properties.get("volume"), local_f, 1.0);
-            let vol = compile_audio_prop_expr(clip.properties.get("volume"), expr_config.mode)
-                .as_ref()
-                .map_or(base_vol, |e| {
-                    eval_compiled_audio_expr(
-                        e,
-                        local_f,
-                        base_t,
-                        safe_fps,
-                        base_vol,
-                        frame,
-                        controls,
-                        &expr_config,
-                    )
-                })
-                .max(0.0) as f32;
-            let base_pan = eval_prop_f64(clip.properties.get("pan"), local_f, 0.0);
-            let pan = compile_audio_prop_expr(clip.properties.get("pan"), expr_config.mode)
-                .as_ref()
-                .map_or(base_pan, |e| {
-                    eval_compiled_audio_expr(
-                        e,
-                        local_f,
-                        base_t,
-                        safe_fps,
-                        base_pan,
-                        frame,
-                        controls,
-                        &expr_config,
-                    )
-                }) as f32;
+        let Some(buf) = buffers.get(&clip.asset_id) else {
+            continue;
+        };
+        let total_frames = buf.frame_count();
+        if total_frames == 0 {
+            continue;
+        }
+        let p0 = clip.evaluate_params(local_f);
+        if !p0.media_time_sec.is_finite() || p0.media_time_sec < 0.0 {
+            continue;
+        }
+        let probe_dt = dt_frames.max(1e-4);
+        let p1 = clip.evaluate_params((local_f + probe_dt).min(clip.root_length_frames - 1e-6));
+        let effective_rate = if p1.media_time_sec.is_finite() && p1.media_time_sec >= 0.0 {
+            (p1.media_time_sec - p0.media_time_sec) / (probe_dt / safe_fps)
+        } else {
+            1.0
+        };
+        let sr = f64::from(buf.sample_rate.max(1));
+        let base_pos = p0.media_time_sec * sr;
+        let step_samples = (sr / f64::from(STANDARD_SAMPLE_RATE)) * effective_rate;
 
-            for i in 0..METER_WINDOW {
-                let pos = base_pos + (i as f64) * step_samples;
-                if pos < 0.0 {
-                    continue;
-                }
-                let fi = pos as usize;
-                if fi >= total_frames {
-                    break;
-                }
-                let stereo = buf.read_stereo_frame(fi);
-                let [out_l, out_r] = apply_gain_and_pan(stereo, vol, pan);
-                mix_l[i] += out_l;
-                mix_r[i] += out_r;
-                has_active_audio = true;
+        for i in 0..METER_WINDOW {
+            let pos = base_pos + (i as f64) * step_samples;
+            if pos < 0.0 {
+                continue;
             }
+            let fi = pos as usize;
+            if fi >= total_frames {
+                break;
+            }
+            let stereo = buf.read_stereo_frame(fi);
+            let [out_l, out_r] = apply_gain_and_pan(stereo, p0.volume, p0.pan);
+            mix_l[i] += out_l;
+            mix_r[i] += out_r;
+            has_active_audio = true;
         }
     }
 
@@ -4426,6 +5070,8 @@ mod tests {
             cancel,
             rx,
             handle: None,
+            started_at: Instant::now(),
+            queue_job_id: None,
         };
         let mut status = ExportStatus {
             exporting: true,
@@ -4829,6 +5475,8 @@ mod tests {
             cancel: Arc::clone(&cancel),
             rx,
             handle: Some(handle),
+            started_at: Instant::now(),
+            queue_job_id: None,
         };
         let started = Instant::now();
         let joined = job.cancel_and_join_bounded(Duration::from_millis(25));
@@ -5187,6 +5835,12 @@ mod tests {
             ffmpeg_probe_rx: None,
             active_export: None,
             retired_exports: Vec::new(),
+            next_export_job_id: 1,
+            export_queue_snapshots: HashMap::new(),
+            recovery_dir: std::env::temp_dir().join("zoidcraft-test-recovery"),
+            last_autosave_at: Instant::now(),
+            last_autosave_revision: 0,
+            startup_recovery_banner: None,
             pending_eyedropper: None,
             eyedropper_swallow_pointer: false,
             pending_unsaved_dialog: None,
@@ -5373,92 +6027,19 @@ mod tests {
 
     #[test]
     fn gui_audio_expressions_resolve_sequence_controls_and_media_time_sec() {
+        use zc_project::{
+            PropertyKeyframe, PropertyTrack, PropertyValue, SequenceControl, SequenceControlKind,
+        };
+
         let mut session = Session::new();
         session
             .plugins
             .enable("expressions-plus")
             .expect("enable expressions-plus");
-        session.project.sequence.controls = vec![
-            SequenceControl {
-                id: "ctl-gain-1".to_owned(),
-                name: "Gain".to_owned(),
-                kind: SequenceControlKind::Slider,
-                track: PropertyTrack::number(0.25),
-                preserved: BTreeMap::new(),
-            },
-            SequenceControl {
-                id: "ctl-gain-2".to_owned(),
-                name: "Gain".to_owned(),
-                kind: SequenceControlKind::Slider,
-                track: PropertyTrack::number(0.75),
-                preserved: BTreeMap::new(),
-            },
-            SequenceControl {
-                id: "ctl-ramp".to_owned(),
-                name: "Ramp".to_owned(),
-                kind: SequenceControlKind::Slider,
-                track: PropertyTrack {
-                    animated: true,
-                    expression: None,
-                    static_behavior: zc_project::StaticBehavior::Constant,
-                    value: PropertyValue::Number(0.0),
-                    keyframes: vec![
-                        PropertyKeyframe::linear(0.0, PropertyValue::Number(0.0)),
-                        PropertyKeyframe::linear(30.0, PropertyValue::Number(1.0)),
-                    ],
-                    channels: Vec::new(),
-                },
-                preserved: BTreeMap::new(),
-            },
-            SequenceControl {
-                id: "ctl-check".to_owned(),
-                name: "Gate".to_owned(),
-                kind: SequenceControlKind::Checkbox,
-                track: PropertyTrack::constant(PropertyValue::Text("1".to_owned())),
-                preserved: BTreeMap::new(),
-            },
-        ];
 
-        let cfg = EvalConfig::expressions_plus();
-        let controls = &session.project.sequence.controls;
-
-        // Direct control() lookup by name, by stable id, animated control, checkbox, and missing id.
-        let e_name = CompiledExpr::compile("control('Gain')", cfg.mode).expect("compile");
-        assert!(
-            (eval_compiled_audio_expr(&e_name, 0.0, 0.0, 30.0, 9.0, 0.0, controls, &cfg) - 0.25)
-                .abs()
-                < 1e-9
-        );
-        let e_id =
-            CompiledExpr::compile("control('Gain', 'ctl-gain-2')", cfg.mode).expect("compile");
-        assert!(
-            (eval_compiled_audio_expr(&e_id, 0.0, 0.0, 30.0, 9.0, 0.0, controls, &cfg) - 0.75)
-                .abs()
-                < 1e-9
-        );
-        let e_bad_id =
-            CompiledExpr::compile("control('Gain', 'missing-id')", cfg.mode).expect("compile");
-        assert!(
-            (eval_compiled_audio_expr(&e_bad_id, 0.0, 0.0, 30.0, 0.42, 0.0, controls, &cfg) - 0.42)
-                .abs()
-                < 1e-9,
-            "missing stable_id must not fall back to name lookup"
-        );
-        let e_ramp = CompiledExpr::compile("control('Ramp')", cfg.mode).expect("compile");
-        assert!(
-            (eval_compiled_audio_expr(&e_ramp, 0.0, 0.0, 30.0, 0.0, 15.0, controls, &cfg) - 0.5)
-                .abs()
-                < 1e-9
-        );
-        let e_gate = CompiledExpr::compile("control('Gate')", cfg.mode).expect("compile");
-        assert!(
-            (eval_compiled_audio_expr(&e_gate, 0.0, 0.0, 30.0, 0.0, 0.0, controls, &cfg) - 1.0)
-                .abs()
-                < 1e-9
-        );
-
-        // End-to-end mix & VU meter: verify `time` receives evaluated `media_time_sec` (0.8s)
-        // instead of `local_frame / fps` (0.1s at frame 3), combined with `control('Gain', 'ctl-gain-2')`.
+        // End-to-end mix & VU meter via shared `zc_audio` pipeline: verify `time` receives
+        // evaluated `media_time_sec` (0.8s) instead of `local_frame / fps` (0.1s at frame 3),
+        // combined with `control('Gain', 'ctl-gain-2')`, plus animated control & missing stable id.
         let sr = STANDARD_SAMPLE_RATE;
         let wav = zc_audio::encode_wav_pcm16_stereo(&vec![[0.5, 0.5]; (sr as usize) * 2], sr);
         let asset_id =
@@ -5503,8 +6084,8 @@ mod tests {
                 expression: Some("time * control('Gain', 'ctl-gain-2')".to_owned()),
             })
             .expect("set volume expr");
-        // Re-populate `project.sequence.controls` after session commands (since `execute`
-        // re-syncs `project` from `document.sequence_properties`).
+        // Populate `project.sequence.controls` including duplicate name with distinct stable IDs
+        // and animated Ramp control.
         session.project.sequence.controls = vec![
             SequenceControl {
                 id: "ctl-gain-1".to_owned(),
@@ -5518,6 +6099,23 @@ mod tests {
                 name: "Gain".to_owned(),
                 kind: SequenceControlKind::Slider,
                 track: PropertyTrack::number(0.75),
+                preserved: BTreeMap::new(),
+            },
+            SequenceControl {
+                id: "ctl-ramp".to_owned(),
+                name: "Ramp".to_owned(),
+                kind: SequenceControlKind::Slider,
+                track: PropertyTrack {
+                    animated: true,
+                    expression: None,
+                    static_behavior: zc_project::StaticBehavior::Constant,
+                    value: PropertyValue::Number(0.0),
+                    keyframes: vec![
+                        PropertyKeyframe::linear(0.0, PropertyValue::Number(0.0)),
+                        PropertyKeyframe::linear(30.0, PropertyValue::Number(1.0)),
+                    ],
+                    channels: Vec::new(),
+                },
                 preserved: BTreeMap::new(),
             },
         ];
@@ -5751,6 +6349,647 @@ mod tests {
             sample_live_audio_meter(&solo_session, &cache, 5.0, 30.0),
             (0.0, 0.0),
             "muted solo track must silence sample_live_audio_meter"
+        );
+    }
+
+    #[test]
+    fn autosave_snapshot_save_list_and_prune_in_temp_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "zoidcraft_autosave_test_{}_{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut project = Project::new_cm3_default();
+        project.name = "Recovery Test Project".to_owned();
+
+        // Save 5 snapshots with max_keep = 3; older ones must be pruned automatically.
+        for idx in 0..5 {
+            project.name = format!("Recovery Snapshot {idx}");
+            let saved = save_recovery_snapshot_to_dir(&project, &dir, 3)
+                .expect("save recovery snapshot must succeed");
+            assert!(saved.path.is_file());
+            assert!(saved.size_bytes > 0);
+            assert!(saved.filename.starts_with("autosave-"));
+            assert!(saved.filename.ends_with(".zcraft"));
+        }
+
+        let listed = list_recovery_snapshots_in_dir(&dir);
+        assert_eq!(
+            listed.len(),
+            3,
+            "pruning must retain only the newest 3 recovery snapshots"
+        );
+        // Latest snapshot must be readable via load_zcraft and preserve project data.
+        let restored = load_zcraft(&listed[0].path).expect("restored snapshot must load cleanly");
+        assert!(restored.name.starts_with("Recovery Snapshot"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_queue_add_reorder_status_progression_and_eta_formatting() {
+        let mut queue = Vec::new();
+        let cfg_a = UiExportSettings {
+            container: UiExportContainer::Mp4,
+            width: 1920,
+            height: 1080,
+            fps: 60.0,
+            ..UiExportSettings::default()
+        };
+        let cfg_b = UiExportSettings {
+            container: UiExportContainer::WebM,
+            width: 1280,
+            height: 720,
+            fps: 30.0,
+            ..UiExportSettings::default()
+        };
+
+        queue_add_job(
+            &mut queue,
+            1,
+            format_export_job_label("Intro", &cfg_a),
+            PathBuf::from("/tmp/intro.mp4"),
+            cfg_a,
+        );
+        queue_add_job(
+            &mut queue,
+            2,
+            format_export_job_label("Teaser", &cfg_b),
+            PathBuf::from("/tmp/teaser.webm"),
+            cfg_b,
+        );
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue_next_pending_index(&queue), Some(0));
+
+        // Reorder job 2 above job 1.
+        assert!(queue_move_job(&mut queue, 1, -1));
+        assert_eq!(queue[0].id, 2);
+        assert_eq!(queue[1].id, 1);
+
+        // Running job cannot be reordered; status progression selects next Queued item.
+        queue[0].status = ExportJobStatus::Running;
+        assert!(!queue_move_job(&mut queue, 0, 1));
+        assert_eq!(queue_next_pending_index(&queue), Some(1));
+        queue[0].status = ExportJobStatus::Completed;
+        queue[1].status = ExportJobStatus::Completed;
+        assert_eq!(queue_next_pending_index(&queue), None);
+
+        // Live FPS & ETA calculations + formatting.
+        let (fps, eta) = compute_export_fps_and_eta(50, 300, 2.0);
+        assert!((fps.unwrap() - 25.0).abs() < 1e-6);
+        assert!((eta.unwrap() - 10.0).abs() < 1e-6);
+        assert_eq!(format_eta_mm_ss(10.0), "00:10");
+        assert_eq!(format_eta_mm_ss(125.0), "02:05");
+        assert_eq!(format_eta_mm_ss(3665.0), "1:01:05");
+        assert_eq!(compute_export_fps_and_eta(0, 300, 2.0), (None, None));
+    }
+
+    #[test]
+    fn gui_nested_precomp_audio_detected_mixed_and_metered() {
+        use zc_project::{
+            AudioClip, AudioClipData, AudioTrack, Layer, PropertyTrack, Sequence, VideoClip,
+            VideoTrack,
+        };
+
+        let mut project = Project::new_cm3_default();
+        let sr = STANDARD_SAMPLE_RATE;
+        let wav = zc_audio::encode_wav_pcm16_stereo(&vec![[0.5, 0.5]; sr as usize], sr);
+        let asset_id =
+            project.insert_binary_asset(AssetKind::Av, "nested.wav".to_owned(), wav.clone());
+        let decoded = Arc::new(decode_audio_bytes(&wav, Some("wav")).expect("decode wav"));
+        let mut cache = HashMap::new();
+        cache.insert(asset_id.clone(), decoded);
+
+        let comp_id = Uuid::new_v4();
+        let mut comp_seq = Sequence {
+            id: comp_id,
+            fps: project.sequence.fps,
+            length_frames: 30.0,
+            ..Sequence::default()
+        };
+        let audio_data = AudioClipData {
+            volume: PropertyTrack::number(0.6),
+            ..AudioClipData::default()
+        };
+        comp_seq.audio_tracks.push(AudioTrack {
+            id: Uuid::new_v4(),
+            name: "Precomp Audio".to_owned(),
+            enabled: true,
+            muted: false,
+            solo: false,
+            locked: false,
+            clips: vec![AudioClip {
+                id: Uuid::new_v4(),
+                name: "Nested Clip".to_owned(),
+                start: 0.0,
+                length: 20.0,
+                link: None,
+                media: Some(asset_id),
+                time_curve: PropertyTrack::linear_time_curve(20.0, comp_seq.fps),
+                audio: audio_data,
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        });
+        project.compositions.insert(comp_id, comp_seq);
+
+        // No top-level audio tracks at all — only the nested PrecompRef clip on a video track!
+        project.sequence.audio_tracks.clear();
+        project.sequence.video_tracks = vec![VideoTrack {
+            id: Uuid::new_v4(),
+            name: "V1".to_owned(),
+            enabled: true,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![VideoClip {
+                id: Uuid::new_v4(),
+                name: "Precomp Ref".to_owned(),
+                start: 0.0,
+                length: 20.0,
+                link: None,
+                media: None,
+                time_curve: PropertyTrack::linear_time_curve(20.0, project.sequence.fps),
+                layer: Layer::new(
+                    "Precomp",
+                    LayerKind::PrecompRef {
+                        composition_id: comp_id,
+                    },
+                    project.sequence.resolution,
+                ),
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        }];
+
+        // When `precomp-plus` is disabled, nested Precomp+ audio stays silent (matching video).
+        let disabled_session =
+            Session::from_project(project.clone(), zc_plugin::PluginRegistry::new());
+        let fps = disabled_session.document().fps;
+        assert_eq!(
+            compute_audio_mix_hash(&disabled_session, &cache, fps, 60.0),
+            0,
+            "nested Precomp+ audio must be silent when precomp-plus plugin is disabled"
+        );
+        assert!(
+            mix_sequence_audio_stereo(&disabled_session, &cache, sr, fps, 0, 20)
+                .expect("disabled precomp mix succeeds")
+                .is_none(),
+            "nested Precomp+ audio must not mix when precomp-plus plugin is disabled"
+        );
+
+        let mut plugins = zc_plugin::PluginRegistry::new();
+        let _ = plugins.enable("precomp-plus");
+        let session = Session::from_project(project, plugins);
+
+        // 1. Live audio mix hash detects nested Precomp+ audio when precomp-plus is enabled.
+        assert_ne!(
+            compute_audio_mix_hash(&session, &cache, fps, 60.0),
+            0,
+            "compute_audio_mix_hash must detect nested Precomp+ audio"
+        );
+
+        // 2. Export audio arc collection includes nested Precomp+ audio asset.
+        let wav_settings = convert_export_settings(
+            &UiExportSettings {
+                container: UiExportContainer::Wav,
+                sample_rate_hz: sr,
+                ..UiExportSettings::default()
+            },
+            fps,
+            0,
+            20,
+            PathBuf::from("nested.wav"),
+        )
+        .expect("wav settings");
+        assert_eq!(
+            collect_in_range_audio_arcs(&session, &cache, &wav_settings, 0, 20).len(),
+            1
+        );
+
+        // 3. GUI sequence mixer mixes nested Precomp+ audio (0.5 * 0.6 = 0.30).
+        let mixed = mix_sequence_audio_stereo(&session, &cache, sr, fps, 0, 20)
+            .expect("nested audio mix succeeds")
+            .expect("nested audio produces samples");
+        let mid = mixed[mixed.len() / 2];
+        assert!(
+            (mid[0] - 0.30).abs() < 0.02 && (mid[1] - 0.30).abs() < 0.02,
+            "nested Precomp+ audio must mix at ~0.30, got {mid:?}"
+        );
+
+        // 4. Live VU meter registers nested Precomp+ audio.
+        let (rms_l, rms_r) = sample_live_audio_meter(&session, &cache, 5.0, fps);
+        assert!(
+            (rms_l - 0.30).abs() < 0.02 && (rms_r - 0.30).abs() < 0.02,
+            "live VU meter must register nested Precomp+ audio (~0.30), got ({rms_l}, {rms_r})"
+        );
+    }
+
+    #[test]
+    fn active_camera_override_updates_render_key_and_resolves_camera_params() {
+        let mut app = make_headless_app_for_test();
+        let clip_id = app.session.document().video_tracks[0].clips[0].id.clone();
+        let clip_uuid = Uuid::parse_str(&clip_id).expect("clip uuid");
+        let _ = app
+            .session
+            .selection
+            .select_clip(clip_id.clone(), Some("scene"), false);
+
+        // Add a second 3D camera at a distinct position.
+        let cam_id = app
+            .session
+            .execute(Command::AddObject3D {
+                clip_id,
+                kind: "camera".to_owned(),
+                name: Some("Alt Cam".to_owned()),
+                parent_id: None,
+            })
+            .expect("add camera")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        app.session
+            .execute(Command::SetPropertyValue {
+                target_id: cam_id.clone(),
+                property: "position".to_owned(),
+                value: json!([25.0, 12.0, 90.0]),
+            })
+            .expect("set camera position");
+
+        let (_, _, _, _, key_default) = app.current_viewport_render_key();
+        app.viewport.active_camera_id = Some(cam_id.clone());
+        let (_, _, _, editing_cam_flag, key_override) = app.current_viewport_render_key();
+
+        assert_ne!(
+            key_override.active_camera_hash, key_default.active_camera_hash,
+            "selecting a scene camera in Camera Switcher must change ViewportRenderKey"
+        );
+        assert!(
+            !editing_cam_flag,
+            "explicit active_camera_id override takes precedence over editing_camera"
+        );
+
+        let params = resolve_scene_camera_override_params(
+            &app.session,
+            clip_uuid,
+            &cam_id,
+            0.0,
+            1280.0,
+            720.0,
+        )
+        .expect("camera override must resolve CameraParams");
+        assert!((params.eye_position[0] - 25.0).abs() < 1e-4);
+        assert!((params.eye_position[1] - 12.0).abs() < 1e-4);
+        assert!((params.eye_position[2] - 90.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn queued_export_snapshot_preserves_original_project_across_project_switch_and_cleanup() {
+        let mut app = make_headless_app_for_test();
+
+        // Configure Project A with a distinct name, fps, and active composition.
+        app.session
+            .execute(Command::SetProjectName {
+                name: "Project Alpha".to_owned(),
+            })
+            .expect("rename project A");
+        app.session
+            .execute(Command::SetFps { fps: 60.0 })
+            .expect("set project A fps");
+        let comp_res = app
+            .session
+            .execute(Command::CreateComposition {
+                name: "Alpha Subcomp".to_owned(),
+                resolution: [1280, 720],
+                fps: 48,
+                length_frames: 120,
+            })
+            .expect("create comp");
+        let comp_id_str = comp_res["comp_id"].as_str().unwrap().to_owned();
+        let comp_uuid = Uuid::parse_str(&comp_id_str).unwrap();
+        app.session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(comp_uuid),
+            })
+            .expect("activate comp");
+
+        let cfg_a = UiExportSettings {
+            container: UiExportContainer::Mp4,
+            width: 1280,
+            height: 720,
+            fps: 48.0,
+            ..UiExportSettings::default()
+        };
+        let job_a = app.enqueue_export_job(cfg_a, PathBuf::from("/tmp/alpha_out.mp4"));
+
+        // Switch the active session to a completely different Project B.
+        app.perform_new_project();
+        app.session
+            .execute(Command::SetProjectName {
+                name: "Project Beta".to_owned(),
+            })
+            .expect("rename project B");
+        app.session
+            .execute(Command::SetFps { fps: 24.0 })
+            .expect("set project B fps");
+
+        // Resolving Job A's snapshot MUST return Project A (not Project B!).
+        let snap_a = app
+            .export_queue_snapshots
+            .get(&job_a)
+            .expect("job A snapshot must survive project switch");
+        assert_eq!(snap_a.project.name, "Project Alpha");
+        assert_eq!(
+            snap_a.active_composition_id.as_deref(),
+            Some(comp_id_str.as_str())
+        );
+        assert!((snap_a.effective_fps() - 48.0).abs() < 1e-6);
+        assert_eq!(app.session.document().project_name, "Project Beta");
+
+        // Enqueue jobs for Project B and verify Remove & Clear Finished clean up snapshots.
+        let job_b = app.enqueue_export_job(
+            UiExportSettings::default(),
+            PathBuf::from("/tmp/beta_remove.mp4"),
+        );
+        let job_c = app.enqueue_export_job(
+            UiExportSettings::default(),
+            PathBuf::from("/tmp/beta_finished.mp4"),
+        );
+        assert_eq!(app.export_queue_snapshots.len(), 3);
+
+        app.remove_export_queue_job(job_b);
+        assert!(!app.export_queue_snapshots.contains_key(&job_b));
+        assert_eq!(app.export_queue_snapshots.len(), 2);
+
+        if let Some(job) = app
+            .workspace
+            .panels
+            .export_queue
+            .iter_mut()
+            .find(|j| j.id == job_c)
+        {
+            job.status = ExportJobStatus::Completed;
+        }
+        app.clear_finished_export_queue();
+        assert!(!app.export_queue_snapshots.contains_key(&job_c));
+        assert!(app.export_queue_snapshots.contains_key(&job_a));
+        assert_eq!(app.export_queue_snapshots.len(), 1);
+    }
+
+    #[test]
+    fn queued_export_from_child_composition_promotes_and_mixes_child_not_root() {
+        use zc_project::{
+            AudioClip, AudioClipData, AudioTrack, Layer, PropertyTrack, Sequence, VideoClip,
+            VideoTrack,
+        };
+
+        let sr = STANDARD_SAMPLE_RATE;
+        let mut project = Project::new_cm3_default();
+        project.name = "Child Comp Export Test".to_owned();
+        project.sequence.name = "Root Comp".to_owned();
+        project.sequence.fps = 30;
+        project.sequence.exact_fps = None;
+        project.sequence.length_frames = 60.0;
+        let root_id = project.sequence.id;
+
+        let root_wav = zc_audio::encode_wav_pcm16_stereo(&vec![[0.80, 0.80]; sr as usize * 2], sr);
+        let child_wav = zc_audio::encode_wav_pcm16_stereo(&vec![[0.25, 0.25]; sr as usize * 2], sr);
+        let root_audio_id =
+            project.insert_binary_asset(AssetKind::Av, "root.wav".to_owned(), root_wav.clone());
+        let child_audio_id =
+            project.insert_binary_asset(AssetKind::Av, "child.wav".to_owned(), child_wav.clone());
+        let root_decoded =
+            Arc::new(decode_audio_bytes(&root_wav, Some("wav")).expect("decode root wav"));
+        let child_decoded =
+            Arc::new(decode_audio_bytes(&child_wav, Some("wav")).expect("decode child wav"));
+
+        // Root sequence has distinct video clip ("Root Video") and loud audio (0.80).
+        project.sequence.video_tracks = vec![VideoTrack {
+            id: Uuid::new_v4(),
+            name: "V1".to_owned(),
+            enabled: true,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![VideoClip {
+                id: Uuid::new_v4(),
+                name: "Root Video".to_owned(),
+                start: 0.0,
+                length: 60.0,
+                link: None,
+                media: None,
+                time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                layer: Layer::new(
+                    "Root Video",
+                    LayerKind::Shape2D { shapes: Vec::new() },
+                    [1920, 1080],
+                ),
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        }];
+        project.sequence.audio_tracks = vec![AudioTrack {
+            id: Uuid::new_v4(),
+            name: "A1".to_owned(),
+            enabled: true,
+            muted: false,
+            solo: false,
+            locked: false,
+            clips: vec![AudioClip {
+                id: Uuid::new_v4(),
+                name: "Root Audio".to_owned(),
+                start: 0.0,
+                length: 60.0,
+                link: None,
+                media: Some(root_audio_id.clone()),
+                time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                audio: AudioClipData::default(),
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        }];
+
+        // Child composition has different FPS (48), distinct video ("Child Video"), and quieter audio (0.25).
+        let child_comp_id = Uuid::new_v4();
+        let child_seq = Sequence {
+            id: child_comp_id,
+            name: "Child Comp".to_owned(),
+            resolution: [1280, 720],
+            fps: 48,
+            exact_fps: Some(48.0),
+            length_frames: 48.0,
+            video_tracks: vec![VideoTrack {
+                id: Uuid::new_v4(),
+                name: "V1".to_owned(),
+                enabled: true,
+                solo: false,
+                locked: false,
+                is_3d: false,
+                clips: vec![VideoClip {
+                    id: Uuid::new_v4(),
+                    name: "Child Video".to_owned(),
+                    start: 0.0,
+                    length: 48.0,
+                    link: None,
+                    media: None,
+                    time_curve: PropertyTrack::linear_time_curve(48.0, 48),
+                    layer: Layer::new(
+                        "Child Video",
+                        LayerKind::Shape2D { shapes: Vec::new() },
+                        [1280, 720],
+                    ),
+                    preserved: BTreeMap::new(),
+                }],
+                preserved: BTreeMap::new(),
+            }],
+            audio_tracks: vec![AudioTrack {
+                id: Uuid::new_v4(),
+                name: "A1".to_owned(),
+                enabled: true,
+                muted: false,
+                solo: false,
+                locked: false,
+                clips: vec![AudioClip {
+                    id: Uuid::new_v4(),
+                    name: "Child Audio".to_owned(),
+                    start: 0.0,
+                    length: 48.0,
+                    link: None,
+                    media: Some(child_audio_id.clone()),
+                    time_curve: PropertyTrack::linear_time_curve(48.0, 48),
+                    audio: AudioClipData::default(),
+                    preserved: BTreeMap::new(),
+                }],
+                preserved: BTreeMap::new(),
+            }],
+            ..Sequence::default()
+        };
+        project.compositions.insert(child_comp_id, child_seq);
+
+        let mut app = make_headless_app_for_test();
+        app.session = Session::from_project(project, PluginRegistry::new());
+        app.decoded_audio
+            .insert(root_audio_id.clone(), root_decoded);
+        app.decoded_audio
+            .insert(child_audio_id.clone(), child_decoded);
+
+        // Activate child composition and enqueue export job.
+        app.session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(child_comp_id),
+            })
+            .expect("activate child composition");
+        let ui_cfg = UiExportSettings {
+            container: UiExportContainer::Wav,
+            sample_rate_hz: sr,
+            fps: 48.0,
+            start_frame: 0.0,
+            end_frame: 24.0,
+            ..UiExportSettings::default()
+        };
+        let job_id = app.enqueue_export_job(ui_cfg.clone(), PathBuf::from("/tmp/child_export.wav"));
+        let snap = app
+            .export_queue_snapshots
+            .remove(&job_id)
+            .expect("captured snapshot");
+
+        let seq_fps = snap.effective_fps();
+        assert!((seq_fps - 48.0).abs() < 1e-6);
+
+        let mut export_project = snap.project;
+        promote_active_composition_for_export(
+            &mut export_project,
+            snap.active_composition_id.as_deref(),
+        );
+
+        // Promoted export project must render child composition (not root), while retaining root in compositions.
+        assert_eq!(export_project.sequence.id, child_comp_id);
+        assert_eq!(export_project.sequence.name, "Child Comp");
+        assert_eq!(export_project.sequence.fps, 48);
+        assert_eq!(
+            export_project.sequence.video_tracks[0].clips[0].name,
+            "Child Video"
+        );
+        assert!(
+            export_project.compositions.contains_key(&root_id),
+            "previous root sequence must be preserved in compositions map"
+        );
+
+        let core_settings = convert_export_settings(
+            &ui_cfg,
+            seq_fps,
+            0,
+            24,
+            PathBuf::from("/tmp/child_export.wav"),
+        )
+        .expect("core export settings");
+
+        // Audio arc collection must pick only child_audio (not root_audio).
+        let export_audio_buffers = collect_in_range_audio_arcs_for_project(
+            &export_project,
+            snap.plugins.is_enabled("precomp-plus"),
+            &snap.decoded_audio,
+            &core_settings,
+            0,
+            24,
+        );
+        assert!(export_audio_buffers.contains_key(&child_audio_id));
+        assert!(!export_audio_buffers.contains_key(&root_audio_id));
+
+        // Offline audio mix must come from child composition (~0.25) at 48 fps (24/48 = 0.5s = 24_000 samples).
+        let export_session = Session::from_project(export_project, snap.plugins);
+        let mixed = build_offline_export_audio(
+            &export_session,
+            &export_audio_buffers,
+            &core_settings,
+            seq_fps,
+            0,
+            24,
+        )
+        .expect("offline audio mix succeeds")
+        .expect("offline audio produces stereo samples");
+        assert_eq!(
+            mixed.len(),
+            (sr / 2) as usize,
+            "24 frames at 48 fps must produce 0.5s of audio samples"
+        );
+        let mid = mixed[mixed.len() / 2];
+        assert!(
+            (mid[0] - 0.25).abs() < 0.02 && (mid[1] - 0.25).abs() < 0.02,
+            "exported audio must mix child composition (~0.25), not root (~0.80), got {mid:?}"
+        );
+    }
+
+    #[test]
+    fn promote_active_composition_preserves_root_only_controls_as_fallback() {
+        let mut project = Project::new_cm3_default();
+        let root_ctrl = zc_project::SequenceControl {
+            id: "ctl-global-gain".to_owned(),
+            name: "GlobalGain".to_owned(),
+            kind: zc_project::SequenceControlKind::Slider,
+            track: zc_project::PropertyTrack::constant(zc_project::PropertyValue::Number(0.75)),
+            preserved: BTreeMap::new(),
+        };
+        project.sequence.controls.push(root_ctrl);
+
+        let mut child = Project::new_cm3_default().sequence;
+        let child_id = Uuid::new_v4();
+        child.id = child_id;
+        child.name = "Child".to_owned();
+        child.controls.clear();
+        project.compositions.insert(child_id, child);
+
+        promote_active_composition_for_export(&mut project, Some(&child_id.to_string()));
+        assert_eq!(project.sequence.id, child_id);
+        assert!(
+            project
+                .sequence
+                .controls
+                .iter()
+                .any(|c| c.id == "ctl-global-gain" && c.name == "GlobalGain"),
+            "promoted child export must retain root-only sequence controls as fallbacks"
         );
     }
 }

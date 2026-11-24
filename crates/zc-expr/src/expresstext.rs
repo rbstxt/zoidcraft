@@ -2,11 +2,15 @@
 //! - C4D-style Formula micro-language (`expresstext-formula.js`)
 //! - Seeded PRNG, 3D integer-lattice / fractal value noise, and stagger ranks (`expresstext-random.js`)
 //! - Letter selection & linear/box/sphere field falloff (`expresstext-select.js`)
-//! - Per-letter effectors: Shake, Plain, Random, Formula, Twist, Wrap, Orbit, Spline (`expresstext-effectors.js`)
-//! - Delay / Blend / Spring chase simulation (`expresstext-delay.js`)
+//! - All 11 per-letter effectors: Shake, Plain, Random, Formula, Delay, Spline, Orbit,
+//!   Repeater, Twist, Wrap, Voronoi (`expresstext-effectors.js`, `expresstext-layout.js`,
+//!   `expresstext-voronoi.js`, `expresstext-delay.js`)
+//! - `LettersMode` (`PerText` vs `AcrossTexts`) and `expressProperties` JSON parser
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::{E, PI};
+
+use serde::{Deserialize, Serialize};
 
 use crate::builtins::js_round;
 
@@ -22,6 +26,8 @@ pub const DELAY_SPRING_STIFF: f64 = 0.08;
 pub const DELAY_SPRING_DAMP: f64 = 0.9;
 pub const DELAY_SPRING_DAMP_MIN: f64 = 0.5;
 pub const DELAY_SIM_WINDOW: usize = 7200;
+pub const REPEATER_MAX_COPIES: usize = 64;
+pub const VORONOI_MAX_CHUNKS: usize = 64;
 
 /// Property value stored in an ExpressText+ effector layer.
 #[derive(Debug, Clone, PartialEq)]
@@ -1012,7 +1018,7 @@ pub fn eval_formula(src: &str, scope: &FormulaScope) -> f64 {
 // (`expresstext-effectors.js` & `expresstext-delay.js`)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EffectorKind {
     Shake,
     Plain,
@@ -1023,9 +1029,26 @@ pub enum EffectorKind {
     Orbit,
     Spline,
     Delay,
+    Repeater,
+    Voronoi,
 }
 
 impl EffectorKind {
+    /// Canonical Zoidium panel order for all 11 ExpressText+ effectors.
+    pub const ALL: [Self; 11] = [
+        Self::Shake,
+        Self::Plain,
+        Self::Random,
+        Self::Formula,
+        Self::Delay,
+        Self::Spline,
+        Self::Orbit,
+        Self::Repeater,
+        Self::Twist,
+        Self::Wrap,
+        Self::Voronoi,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Shake => "shake",
@@ -1037,6 +1060,106 @@ impl EffectorKind {
             Self::Orbit => "orbit",
             Self::Spline => "spline",
             Self::Delay => "delay",
+            Self::Repeater => "repeater",
+            Self::Voronoi => "voronoi",
+        }
+    }
+
+    /// Parses a short effector name (`"repeater"`), display name (`"Repeater"`),
+    /// or full Zoidium object type (`"zoidium:expresstext-plus/repeater"`).
+    pub fn from_name(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        let tail = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        let head = tail.split_whitespace().next().unwrap_or(tail);
+        match head.to_ascii_lowercase().as_str() {
+            "shake" => Some(Self::Shake),
+            "plain" => Some(Self::Plain),
+            "random" => Some(Self::Random),
+            "formula" => Some(Self::Formula),
+            "twist" => Some(Self::Twist),
+            "wrap" => Some(Self::Wrap),
+            "orbit" => Some(Self::Orbit),
+            "spline" => Some(Self::Spline),
+            "delay" => Some(Self::Delay),
+            "repeater" => Some(Self::Repeater),
+            "voronoi" => Some(Self::Voronoi),
+            _ => None,
+        }
+    }
+
+    /// Infers the effector kind from a prefixed property key (`"repeaterCopies"` -> `Repeater`),
+    /// matching Zoidium `expresstext-sections.js:kindOfKey`.
+    pub fn from_property_key(key: &str) -> Option<Self> {
+        for kind in Self::ALL {
+            let prefix = kind.as_str();
+            if key == prefix {
+                return Some(kind);
+            }
+            if let Some(rest) = key.strip_prefix(prefix)
+                && rest.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+            {
+                return Some(kind);
+            }
+        }
+        None
+    }
+}
+
+/// Container letter numbering scope (`expresstext-constants.js` / `expresstext-layout.js`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LettersMode {
+    /// Each 3D text child gets its own independent `0..len` letter run.
+    #[default]
+    PerText = 0,
+    /// All 3D text children under the ExpressText+ container share one connected letter run.
+    AcrossTexts = 1,
+}
+
+impl LettersMode {
+    /// Matches Zoidium `lettersScopeOf`: explicit `0` is `PerText`, everything else fails
+    /// closed to `AcrossTexts`.
+    pub fn from_raw(value: f64) -> Self {
+        if value.is_finite() && js_round(value) as i32 == 0 {
+            Self::PerText
+        } else {
+            Self::AcrossTexts
+        }
+    }
+}
+
+/// Builds the `(LetterList, self_start_global_index)` for `self_text_index` given the letter
+/// counts of every sibling text object under an ExpressText+ container.
+pub fn build_letter_run_for_text(
+    mode: LettersMode,
+    text_letter_counts: &[usize],
+    self_text_index: usize,
+) -> (LetterList, usize) {
+    let self_count = text_letter_counts
+        .get(self_text_index)
+        .copied()
+        .unwrap_or(0);
+    match mode {
+        LettersMode::PerText => (
+            LetterList {
+                total: self_count,
+                order: (0..self_count).collect(),
+            },
+            0,
+        ),
+        LettersMode::AcrossTexts => {
+            let total: usize = text_letter_counts.iter().copied().sum();
+            let self_start: usize = text_letter_counts
+                .iter()
+                .take(self_text_index)
+                .copied()
+                .sum();
+            (
+                LetterList {
+                    total,
+                    order: (0..total).collect(),
+                },
+                self_start,
+            )
         }
     }
 }
@@ -2017,7 +2140,7 @@ pub fn evaluate_effectors(
     let mut out = LetterControls::default();
     for layer in layers {
         match layer.kind {
-            EffectorKind::Delay => {}
+            EffectorKind::Delay | EffectorKind::Repeater | EffectorKind::Voronoi => {}
             EffectorKind::Shake => {
                 evaluate_shake(
                     layer.props,
@@ -2341,6 +2464,1221 @@ pub fn evaluate_stack(
     stage_tail
 }
 
+// ---------------------------------------------------------------------------
+// Repeater Effector (`expresstext-layout.js` & `expresstext-render.js`)
+// ---------------------------------------------------------------------------
+
+/// Distribution mode for ExpressText+ Repeater copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RepeaterMode {
+    /// Step linearly per copy slot (`offset * slot`).
+    #[default]
+    Linear = 0,
+    /// Scatter deterministically within `[range_min, range_max]` using 3D lattice hash.
+    Random = 1,
+    /// Trail behind the letter's per-frame velocity (`-velocity * lag * slot`).
+    Echo = 2,
+}
+
+impl RepeaterMode {
+    pub fn from_raw(value: f64) -> Self {
+        match if value.is_finite() {
+            js_round(value) as i32
+        } else {
+            0
+        } {
+            1 => Self::Random,
+            2 => Self::Echo,
+            _ => Self::Linear,
+        }
+    }
+}
+
+/// Evaluated parameters for one Repeater effector layer at a given frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RepeaterSpec {
+    pub copies: usize,
+    pub mode: RepeaterMode,
+    pub offset: [f64; 3],
+    pub rotation_step: [f64; 3],
+    pub scale_step: [f64; 3],
+    pub range_min: [f64; 3],
+    pub range_max: [f64; 3],
+    pub seed: f64,
+    pub lag: f64,
+    /// Fade factor in `[0, 1]` (Zoidium `repeaterFade / 100`).
+    pub fade: f64,
+    /// Starting opacity for slot 0..copies fade (default `1.0`).
+    pub opacity_start: f64,
+    /// Optional explicit end opacity at `slot == copies`; when `None`, uses Zoidium
+    /// `1.0 - fade * (slot / copies)`.
+    pub opacity_end: Option<f64>,
+}
+
+impl Default for RepeaterSpec {
+    fn default() -> Self {
+        Self {
+            copies: 3,
+            mode: RepeaterMode::Linear,
+            offset: [10.0, 0.0, 0.0],
+            rotation_step: [0.0, 0.0, 0.0],
+            scale_step: [1.0, 1.0, 1.0],
+            range_min: [-10.0, -10.0, -10.0],
+            range_max: [10.0, 10.0, 10.0],
+            seed: 1.0,
+            lag: 2.0,
+            fade: 0.5,
+            opacity_start: 1.0,
+            opacity_end: None,
+        }
+    }
+}
+
+/// One generated ghost copy instance for a letter produced by a Repeater effector.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RepeaterInstance {
+    /// Index of the Repeater layer inside the evaluated effector stack.
+    pub layer_index: usize,
+    /// 1-based copy slot (`1..=copies`).
+    pub copy_index: usize,
+    /// Weighted position delta added on top of the letter's evaluated position.
+    pub position_offset: [f64; 3],
+    /// Weighted Euler rotation delta (radians) added on top of the letter's rotation.
+    pub rotation_offset: [f64; 3],
+    /// Weighted scale multiplier applied on top of the letter's scale.
+    pub scale_multiplier: [f64; 3],
+    /// Full composed `LetterControls` for this ghost instance.
+    pub controls: LetterControls,
+    /// Per-copy opacity multiplier in `[0, 1]`.
+    pub opacity: f64,
+    /// Effective effector weight (strength * field falloff) for this letter.
+    pub weight: f64,
+}
+
+/// Reads a [`RepeaterSpec`] from an ExpressText+ property map at `frame`.
+pub fn repeater_spec_from_props(props: &dyn EtPropReader, frame: f64) -> RepeaterSpec {
+    let enabled = read_num(props, "repeaterEnable", frame, 1.0) != 0.0;
+    let copies = if enabled {
+        let raw = read_num(props, "repeaterCopies", frame, 3.0);
+        let floored = if raw.is_finite() {
+            raw.floor() as isize
+        } else {
+            3
+        };
+        floored.clamp(0, REPEATER_MAX_COPIES as isize) as usize
+    } else {
+        0
+    };
+    let offset = if props.read("repeaterOffset", frame).is_some() {
+        read_vec3(props, "repeaterOffset", frame, [10.0, 0.0, 0.0])
+    } else {
+        read_vec3(props, "repeaterPosition", frame, [10.0, 0.0, 0.0])
+    };
+    let rotation_step = read_vec3(props, "repeaterRotation", frame, [0.0, 0.0, 0.0]);
+    let scale_step = read_vec3(props, "repeaterScale", frame, [1.0, 1.0, 1.0]);
+    let fade = (read_num(props, "repeaterFade", frame, 50.0) / 100.0).clamp(0.0, 1.0);
+    let opacity_start = read_num(props, "repeaterOpacityStart", frame, 1.0).clamp(0.0, 1.0);
+    let opacity_end = props
+        .read("repeaterOpacityEnd", frame)
+        .map(|v| v.as_number(1.0 - fade).clamp(0.0, 1.0));
+    RepeaterSpec {
+        copies,
+        mode: RepeaterMode::from_raw(read_num(props, "repeaterMode", frame, 0.0)),
+        offset,
+        rotation_step,
+        scale_step,
+        range_min: read_vec3(props, "repeaterRangeMin", frame, [-10.0, -10.0, -10.0]),
+        range_max: read_vec3(props, "repeaterRangeMax", frame, [10.0, 10.0, 10.0]),
+        seed: read_num(props, "repeaterSeed", frame, 1.0),
+        lag: read_num(props, "repeaterLag", frame, 2.0).max(0.0),
+        fade,
+        opacity_start,
+        opacity_end,
+    }
+}
+
+/// Raw unweighted copy offset for 1-based `slot`, matching Zoidium
+/// `expresstext-layout.js:repeaterCopyOffset`.
+pub fn repeater_copy_offset(
+    spec: &RepeaterSpec,
+    letter_index: usize,
+    slot: usize,
+    velocity: Option<[f64; 3]>,
+) -> [f64; 3] {
+    let slot_f = slot as f64;
+    match spec.mode {
+        RepeaterMode::Echo => {
+            let v = velocity.unwrap_or([0.0, 0.0, 0.0]);
+            [
+                -v[0] * spec.lag * slot_f,
+                -v[1] * spec.lag * slot_f,
+                -v[2] * spec.lag * slot_f,
+            ]
+        }
+        RepeaterMode::Random => {
+            let seed_int = js_round(
+                (if spec.seed.is_finite() {
+                    spec.seed
+                } else {
+                    1.0
+                }) * 1000.0,
+            ) as i32;
+            let mut out = [0.0; 3];
+            for (axis, out_val) in out.iter_mut().enumerate() {
+                let u = hash_lattice(
+                    letter_index as i32,
+                    (slot as i32).wrapping_mul(57).wrapping_add(11),
+                    (axis as i32).wrapping_mul(131).wrapping_add(7),
+                    seed_int,
+                );
+                *out_val = spec.range_min[axis] + (spec.range_max[axis] - spec.range_min[axis]) * u;
+            }
+            out
+        }
+        RepeaterMode::Linear => [
+            spec.offset[0] * slot_f,
+            spec.offset[1] * slot_f,
+            spec.offset[2] * slot_f,
+        ],
+    }
+}
+
+/// Opacity multiplier in `[0, 1]` for 1-based `slot`, matching Zoidium
+/// `expresstext-layout.js:repeaterCopyOpacity` (and supporting explicit start/end fade).
+pub fn repeater_copy_opacity(spec: &RepeaterSpec, slot: usize) -> f64 {
+    if spec.copies == 0 {
+        return 1.0;
+    }
+    let t = (slot as f64) / (spec.copies as f64);
+    if let Some(end_op) = spec.opacity_end {
+        (spec.opacity_start + (end_op - spec.opacity_start) * t).clamp(0.0, 1.0)
+    } else {
+        (spec.opacity_start * (1.0 - spec.fade * t)).clamp(0.0, 1.0)
+    }
+}
+
+/// Evaluates all Repeater effector layers in `layers` for one letter at `frame`, returning
+/// per-copy instance transforms and opacity multipliers.
+pub fn evaluate_expresstext_repeater_instances(
+    layers: &[EffectorLayer<'_>],
+    frame: f64,
+    index: usize,
+    list: &LetterList,
+    base: [f64; 3],
+    aux: &EvalAux,
+) -> Vec<RepeaterInstance> {
+    let sections = sections_at(layers, frame);
+    let mut active_repeaters = Vec::new();
+    let mut needs_echo_velocity = false;
+
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        if layer.kind != EffectorKind::Repeater {
+            continue;
+        }
+        if read_num(layer.props, "repeaterEnable", frame, 1.0) == 0.0 {
+            continue;
+        }
+        let ctx = letter_context(layer.props, "repeater", frame, index, list, &sections);
+        if !is_letter_selected(&ctx.selected, index) {
+            continue;
+        }
+        let weight = apply_field_weight(ctx.strength, layer.props, "repeater", frame, base);
+        if !weight.is_finite() || weight <= 0.0 {
+            continue;
+        }
+        let local_frame = frame - ctx.delay;
+        let spec = repeater_spec_from_props(layer.props, local_frame);
+        if spec.copies == 0 {
+            continue;
+        }
+        if spec.mode == RepeaterMode::Echo {
+            needs_echo_velocity = true;
+        }
+        active_repeaters.push((layer_idx, spec, weight));
+    }
+
+    if active_repeaters.is_empty() {
+        return Vec::new();
+    }
+
+    let base_controls = evaluate_stack(layers, frame, index, list, base, aux);
+    let velocity = if needs_echo_velocity {
+        let prev = evaluate_stack(layers, frame - 1.0, index, list, base, aux);
+        Some([
+            base_controls.position[0] - prev.position[0],
+            base_controls.position[1] - prev.position[1],
+            base_controls.position[2] - prev.position[2],
+        ])
+    } else {
+        None
+    };
+
+    let total_instances: usize = active_repeaters.iter().map(|(_, s, _)| s.copies).sum();
+    let mut out = Vec::with_capacity(total_instances);
+
+    for (layer_index, spec, weight) in active_repeaters {
+        for slot in 1..=spec.copies {
+            let raw = repeater_copy_offset(&spec, index, slot, velocity);
+            let slot_w = (slot as f64) * weight;
+            let pos_off = [raw[0] * weight, raw[1] * weight, raw[2] * weight];
+            let rot_off = [
+                spec.rotation_step[0] * slot_w,
+                spec.rotation_step[1] * slot_w,
+                spec.rotation_step[2] * slot_w,
+            ];
+            let scl_mul = [
+                spec.scale_step[0].max(1e-6).powf(slot_w),
+                spec.scale_step[1].max(1e-6).powf(slot_w),
+                spec.scale_step[2].max(1e-6).powf(slot_w),
+            ];
+            let controls = LetterControls {
+                position: [
+                    base_controls.position[0] + pos_off[0],
+                    base_controls.position[1] + pos_off[1],
+                    base_controls.position[2] + pos_off[2],
+                ],
+                rotation: [
+                    base_controls.rotation[0] + rot_off[0],
+                    base_controls.rotation[1] + rot_off[1],
+                    base_controls.rotation[2] + rot_off[2],
+                ],
+                scale: [
+                    (base_controls.scale[0] * scl_mul[0]).max(1e-6),
+                    (base_controls.scale[1] * scl_mul[1]).max(1e-6),
+                    (base_controls.scale[2] * scl_mul[2]).max(1e-6),
+                ],
+            };
+            out.push(RepeaterInstance {
+                layer_index,
+                copy_index: slot,
+                position_offset: pos_off,
+                rotation_offset: rot_off,
+                scale_multiplier: scl_mul,
+                controls,
+                opacity: repeater_copy_opacity(&spec, slot),
+                weight,
+            });
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Voronoi Shatter Effector (`expresstext-voronoi.js` & `expresstext-render.js`)
+// ---------------------------------------------------------------------------
+
+/// Halton low-discrepancy sequence value in `[0, 1)` (`expresstext-voronoi.js:10-21`).
+pub fn halton_sequence(index: f64, base: f64) -> f64 {
+    let mut f = 1.0;
+    let mut r = 0.0;
+    let mut i = if index.is_finite() {
+        (index.floor() as i64).max(1)
+    } else {
+        1
+    };
+    let b = if base.is_finite() {
+        (base.floor() as i64).max(2)
+    } else {
+        2
+    };
+    while i > 0 {
+        f /= b as f64;
+        r += f * ((i % b) as f64);
+        i /= b;
+    }
+    r
+}
+
+/// One raw Voronoi cell partitioned from a glyph's triangles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoronoiCell {
+    pub positions: Vec<f32>,
+    pub normals: Vec<f32>,
+    pub uvs: Vec<f32>,
+    pub center: [f64; 3],
+    pub triangle_indices: Vec<usize>,
+}
+
+/// Offset and Euler rotation (radians) of one Voronoi chunk (`expresstext-voronoi.js:111-126`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoronoiChunkPose {
+    pub offset: [f64; 3],
+    pub rotation: [f64; 3],
+}
+
+/// Deterministic Voronoi shatter parameters for a single glyph mesh.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoronoiGlyphParams {
+    /// Target Voronoi cell count (`1..=64`, Zoidium `voronoiChunks`, default `8`).
+    pub cells: usize,
+    /// Deterministic site & sign seed (Zoidium `voronoiSeed`, default `1.0`).
+    pub seed: f64,
+    /// Extra deterministic per-chunk random scatter displacement (default `0.0`).
+    pub scatter: f64,
+    /// Radial outward explosion distance (Zoidium `voronoiExplode`, default `0.0`).
+    pub distance: f64,
+    /// Tumble Euler rotation amplitude in radians (Zoidium `voronoiSpin`, default `[0, 0, 0]`).
+    pub spin: [f64; 3],
+    /// Downward gravity displacement along `-Y` (default `0.0`).
+    pub gravity: f64,
+    /// Site jitter blend in `[0, 1]` (`1.0` = full Halton distribution matching Zoidium).
+    pub randomness: f64,
+    /// Uniform scale multiplier per shattered chunk (default `1.0`).
+    pub scale: f64,
+    /// Effective effector weight (strength * field falloff, default `1.0`).
+    pub weight: f64,
+    /// Letter index used to salt deterministic per-chunk spin signs.
+    pub letter_index: usize,
+}
+
+impl Default for VoronoiGlyphParams {
+    fn default() -> Self {
+        Self {
+            cells: 8,
+            seed: 1.0,
+            scatter: 0.0,
+            distance: 0.0,
+            spin: [0.0, 0.0, 0.0],
+            gravity: 0.0,
+            randomness: 1.0,
+            scale: 1.0,
+            weight: 1.0,
+            letter_index: 0,
+        }
+    }
+}
+
+/// One shattered glyph chunk ready for rendering in `zc-render`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShatteredVoronoiChunk {
+    pub cell_index: usize,
+    /// Original cell triangle vertex positions (9 floats per triangle).
+    pub positions: Vec<f32>,
+    /// Original cell triangle vertex normals (9 floats per triangle, if provided).
+    pub normals: Vec<f32>,
+    /// Original cell triangle vertex UVs (6 floats per triangle, if provided).
+    pub uvs: Vec<f32>,
+    /// Centroid of the cell in glyph-local space.
+    pub center: [f64; 3],
+    /// World/glyph-local displacement vector for this chunk.
+    pub offset: [f64; 3],
+    /// Signed tumble Euler rotation (radians) about `center`.
+    pub rotation: [f64; 3],
+    /// Chunk scale multiplier about `center`.
+    pub scale: [f64; 3],
+    /// Deterministic per-axis spin signs (`-1.0` or `1.0`).
+    pub signs: [f64; 3],
+}
+
+/// Partitions flat triangle arrays (`9` floats per triangle in `positions` / `normals`,
+/// `6` floats per triangle in `uvs`) into Halton-seeded Voronoi cells matching Zoidium
+/// `expresstext-voronoi.js:splitVoronoiCells`.
+pub fn split_voronoi_cells(
+    positions: &[f32],
+    normals: &[f32],
+    uvs: &[f32],
+    count: usize,
+    seed: f64,
+) -> Vec<VoronoiCell> {
+    split_voronoi_cells_with_randomness(positions, normals, uvs, count, seed, 1.0)
+}
+
+fn split_voronoi_cells_with_randomness(
+    positions: &[f32],
+    normals: &[f32],
+    uvs: &[f32],
+    count: usize,
+    seed: f64,
+    randomness: f64,
+) -> Vec<VoronoiCell> {
+    let tri_count = positions.len() / 9;
+    let want = count.clamp(1, VORONOI_MAX_CHUNKS);
+    if tri_count == 0 {
+        return Vec::new();
+    }
+
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+    let usable = tri_count * 9;
+    for chunk in positions[..usable].as_chunks::<3>().0 {
+        let x = f64::from(chunk[0]);
+        let y = f64::from(chunk[1]);
+        let z = f64::from(chunk[2]);
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+        if z < min_z {
+            min_z = z;
+        }
+        if z > max_z {
+            max_z = z;
+        }
+    }
+
+    let seed_num = if seed.is_finite() { seed } else { 1.0 };
+    let seed_frac = seed_num - seed_num.floor() + if seed_num < 0.0 { 1.0 } else { 0.0 };
+    let span_x = if max_x > min_x { max_x - min_x } else { 1.0 };
+    let span_y = if max_y > min_y { max_y - min_y } else { 1.0 };
+    let span_z = if max_z > min_z { max_z - min_z } else { 1.0 };
+    let rand_blend = if randomness.is_finite() {
+        randomness.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+
+    let site_count = want.min(tri_count);
+    let mut sites = Vec::with_capacity(site_count);
+    for s in 0..site_count {
+        let hx = (halton_sequence((s + 1) as f64, 2.0) + seed_frac * 0.618_033_988_7) % 1.0;
+        let hy = (halton_sequence((s + 1) as f64, 3.0) + seed_frac * 0.381_966_011_3) % 1.0;
+        let hz = (halton_sequence((s + 1) as f64, 5.0) + seed_frac * 0.5) % 1.0;
+        let ux = (s as f64 + 0.5) / (site_count as f64);
+        let jx = ux + (hx - ux) * rand_blend;
+        let jy = 0.5 + (hy - 0.5) * rand_blend;
+        let jz = 0.5 + (hz - 0.5) * rand_blend;
+        sites.push([
+            min_x + span_x * jx,
+            min_y + span_y * jy,
+            min_z + span_z * jz,
+        ]);
+    }
+
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); site_count];
+    for t in 0..tri_count {
+        let base = t * 9;
+        let cx = (f64::from(positions[base])
+            + f64::from(positions[base + 3])
+            + f64::from(positions[base + 6]))
+            / 3.0;
+        let cy = (f64::from(positions[base + 1])
+            + f64::from(positions[base + 4])
+            + f64::from(positions[base + 7]))
+            / 3.0;
+        let cz = (f64::from(positions[base + 2])
+            + f64::from(positions[base + 5])
+            + f64::from(positions[base + 8]))
+            / 3.0;
+        let mut best = 0usize;
+        let mut best_d = f64::INFINITY;
+        for (s, site) in sites.iter().enumerate() {
+            let dx = cx - site[0];
+            let dy = cy - site[1];
+            let dz = cz - site[2];
+            let d = dx * dx + dy * dy + dz * dz;
+            if d < best_d {
+                best_d = d;
+                best = s;
+            }
+        }
+        buckets[best].push(t);
+    }
+
+    let mut out = Vec::new();
+    for tris in buckets {
+        if tris.is_empty() {
+            continue;
+        }
+        let mut pos_out = Vec::with_capacity(tris.len() * 9);
+        let mut nor_out = Vec::with_capacity(if normals.is_empty() {
+            0
+        } else {
+            tris.len() * 9
+        });
+        let mut uv_out = Vec::with_capacity(if uvs.is_empty() { 0 } else { tris.len() * 6 });
+        let mut ccx = 0.0;
+        let mut ccy = 0.0;
+        let mut ccz = 0.0;
+        for &t in &tris {
+            let p_base = t * 9;
+            pos_out.extend_from_slice(&positions[p_base..p_base + 9]);
+            if normals.len() >= p_base + 9 {
+                nor_out.extend_from_slice(&normals[p_base..p_base + 9]);
+            }
+            let u_base = t * 6;
+            if uvs.len() >= u_base + 6 {
+                uv_out.extend_from_slice(&uvs[u_base..u_base + 6]);
+            }
+            ccx += (f64::from(positions[p_base])
+                + f64::from(positions[p_base + 3])
+                + f64::from(positions[p_base + 6]))
+                / 3.0;
+            ccy += (f64::from(positions[p_base + 1])
+                + f64::from(positions[p_base + 4])
+                + f64::from(positions[p_base + 7]))
+                / 3.0;
+            ccz += (f64::from(positions[p_base + 2])
+                + f64::from(positions[p_base + 5])
+                + f64::from(positions[p_base + 8]))
+                / 3.0;
+        }
+        let n = tris.len() as f64;
+        out.push(VoronoiCell {
+            positions: pos_out,
+            normals: nor_out,
+            uvs: uv_out,
+            center: [ccx / n, ccy / n, ccz / n],
+            triangle_indices: tris,
+        });
+    }
+    out
+}
+
+/// Computes radial explosion offset and signed spin for one Voronoi chunk, matching Zoidium
+/// `expresstext-voronoi.js:voronoiChunkPose`.
+pub fn voronoi_chunk_pose(
+    chunk_center: [f64; 3],
+    letter_center: [f64; 3],
+    explode: f64,
+    spin: [f64; 3],
+    signs: [f64; 3],
+) -> VoronoiChunkPose {
+    let dx = chunk_center[0] - letter_center[0];
+    let dy = chunk_center[1] - letter_center[1];
+    let dz = chunk_center[2] - letter_center[2];
+    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+    let dir = if len > 1e-9 {
+        [dx / len, dy / len, dz / len]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let ex = if explode.is_finite() { explode } else { 0.0 };
+    VoronoiChunkPose {
+        offset: [dir[0] * ex, dir[1] * ex, dir[2] * ex],
+        rotation: [spin[0] * signs[0], spin[1] * signs[1], spin[2] * signs[2]],
+    }
+}
+
+/// Deterministically shatters a glyph's triangle mesh into Halton-seeded Voronoi chunks with
+/// evaluated explosion, scatter, gravity, tumble spin, and per-chunk scale.
+pub fn shatter_glyph_triangles(
+    positions: &[f32],
+    normals: &[f32],
+    uvs: &[f32],
+    letter_center: Option<[f64; 3]>,
+    params: &VoronoiGlyphParams,
+) -> Vec<ShatteredVoronoiChunk> {
+    let cells = split_voronoi_cells_with_randomness(
+        positions,
+        normals,
+        uvs,
+        params.cells,
+        params.seed,
+        params.randomness,
+    );
+    if cells.is_empty() {
+        return Vec::new();
+    }
+
+    let center = letter_center.unwrap_or_else(|| {
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        let usable = (positions.len() / 9) * 9;
+        for v in positions[..usable].as_chunks::<3>().0 {
+            for axis in 0..3 {
+                let c = f64::from(v[axis]);
+                if c < min[axis] {
+                    min[axis] = c;
+                }
+                if c > max[axis] {
+                    max[axis] = c;
+                }
+            }
+        }
+        [
+            0.5 * (min[0] + max[0]),
+            0.5 * (min[1] + max[1]),
+            0.5 * (min[2] + max[2]),
+        ]
+    });
+
+    let seed_num = if params.seed.is_finite() {
+        params.seed
+    } else {
+        1.0
+    };
+    let seed_int = js_round(seed_num * 1000.0) as i32;
+    let w = if params.weight.is_finite() {
+        params.weight.max(0.0)
+    } else {
+        0.0
+    };
+    let explode = if params.distance.is_finite() {
+        params.distance * w
+    } else {
+        0.0
+    };
+    let spin = [params.spin[0] * w, params.spin[1] * w, params.spin[2] * w];
+    let scatter = if params.scatter.is_finite() {
+        params.scatter * w
+    } else {
+        0.0
+    };
+    let gravity = if params.gravity.is_finite() {
+        params.gravity * w
+    } else {
+        0.0
+    };
+    let chunk_scale = if params.scale.is_finite() {
+        (1.0 + (params.scale - 1.0) * w).max(1e-6)
+    } else {
+        1.0
+    };
+
+    let mut out = Vec::with_capacity(cells.len());
+    for (ci, cell) in cells.into_iter().enumerate() {
+        let mut signs = [1.0; 3];
+        for (ax, sign) in signs.iter_mut().enumerate() {
+            let iy = (params.letter_index as i32)
+                .wrapping_mul(131)
+                .wrapping_add((ax as i32).wrapping_mul(17));
+            *sign = if hash_lattice(ci as i32, iy, seed_int, 0) > 0.5 {
+                1.0
+            } else {
+                -1.0
+            };
+        }
+
+        let mut pose = voronoi_chunk_pose(cell.center, center, explode, spin, signs);
+
+        if scatter != 0.0 {
+            for (ax, off) in pose.offset.iter_mut().enumerate() {
+                let jitter = hash_lattice(
+                    ci as i32,
+                    (params.letter_index as i32).wrapping_mul(73) + 19,
+                    (ax as i32).wrapping_mul(29) + 5,
+                    seed_int,
+                ) * 2.0
+                    - 1.0;
+                *off += jitter * scatter;
+            }
+        }
+        if gravity != 0.0 {
+            let g_var = 0.5
+                + 0.5
+                    * hash_lattice(
+                        ci as i32,
+                        (params.letter_index as i32).wrapping_mul(97) + 31,
+                        41,
+                        seed_int,
+                    );
+            pose.offset[1] -= gravity * g_var;
+        }
+
+        out.push(ShatteredVoronoiChunk {
+            cell_index: ci,
+            positions: cell.positions,
+            normals: cell.normals,
+            uvs: cell.uvs,
+            center: cell.center,
+            offset: pose.offset,
+            rotation: pose.rotation,
+            scale: [chunk_scale; 3],
+            signs,
+        });
+    }
+    out
+}
+
+/// Applies a [`ShatteredVoronoiChunk`]'s pose (`scale`, `rotation`, `offset`) around its
+/// centroid to produce baked triangle vertex positions.
+pub fn apply_chunk_pose_to_positions(chunk: &ShatteredVoronoiChunk) -> Vec<f32> {
+    let mut baked = Vec::with_capacity(chunk.positions.len());
+    for v in chunk.positions.as_chunks::<3>().0 {
+        let rel = [
+            (f64::from(v[0]) - chunk.center[0]) * chunk.scale[0],
+            (f64::from(v[1]) - chunk.center[1]) * chunk.scale[1],
+            (f64::from(v[2]) - chunk.center[2]) * chunk.scale[2],
+        ];
+        let spun = rotate_euler_xyz(rel, chunk.rotation);
+        baked.push((chunk.center[0] + spun[0] + chunk.offset[0]) as f32);
+        baked.push((chunk.center[1] + spun[1] + chunk.offset[1]) as f32);
+        baked.push((chunk.center[2] + spun[2] + chunk.offset[2]) as f32);
+    }
+    baked
+}
+
+/// Evaluates all enabled Voronoi effector layers in `layers` for one letter at `frame`
+/// (partition cell count & seed from the first enabled Voronoi layer; explode, spin,
+/// scatter, and gravity summed across all active layers, matching `expresstext-render.js:712-724,864-882`).
+pub fn evaluate_expresstext_voronoi_params(
+    layers: &[EffectorLayer<'_>],
+    frame: f64,
+    index: usize,
+    list: &LetterList,
+    base: [f64; 3],
+) -> Option<VoronoiGlyphParams> {
+    let sections = sections_at(layers, frame);
+    let mut first_partition: Option<(usize, f64, f64)> = None;
+    let mut explode = 0.0;
+    let mut spin = [0.0; 3];
+    let mut scatter = 0.0;
+    let mut gravity = 0.0;
+    let mut scale_acc = 1.0;
+    let mut total_weight = 0.0;
+
+    for layer in layers {
+        if layer.kind != EffectorKind::Voronoi {
+            continue;
+        }
+        if read_num(layer.props, "voronoiEnable", frame, 1.0) == 0.0 {
+            continue;
+        }
+        if first_partition.is_none() {
+            let raw_chunks = read_num(
+                layer.props,
+                if layer.props.read("voronoiChunks", frame).is_some() {
+                    "voronoiChunks"
+                } else {
+                    "voronoiCells"
+                },
+                frame,
+                8.0,
+            );
+            let chunks = (if raw_chunks.is_finite() {
+                raw_chunks.floor() as isize
+            } else {
+                8
+            })
+            .clamp(0, VORONOI_MAX_CHUNKS as isize) as usize;
+            if chunks > 0 {
+                let seed = read_num(layer.props, "voronoiSeed", frame, 1.0);
+                let randomness =
+                    read_num(layer.props, "voronoiRandomness", frame, 1.0).clamp(0.0, 1.0);
+                first_partition = Some((chunks, seed, randomness));
+            }
+        }
+        let ctx = letter_context(layer.props, "voronoi", frame, index, list, &sections);
+        if !is_letter_selected(&ctx.selected, index) {
+            continue;
+        }
+        let w = apply_field_weight(ctx.strength, layer.props, "voronoi", frame, base);
+        if !w.is_finite() || w <= 0.0 {
+            continue;
+        }
+        let local = frame - ctx.delay;
+        let dist_key = if layer.props.read("voronoiExplode", local).is_some() {
+            "voronoiExplode"
+        } else {
+            "voronoiDistance"
+        };
+        explode += read_num(layer.props, dist_key, local, 0.0) * w;
+        let sv = read_vec3(layer.props, "voronoiSpin", local, [0.0, 0.0, 0.0]);
+        spin[0] += sv[0] * w;
+        spin[1] += sv[1] * w;
+        spin[2] += sv[2] * w;
+        scatter += read_num(layer.props, "voronoiScatter", local, 0.0) * w;
+        gravity += read_num(layer.props, "voronoiGravity", local, 0.0) * w;
+        let s = read_num(layer.props, "voronoiScale", local, 1.0);
+        scale_acc *= (1.0 + (s - 1.0) * w).max(1e-6);
+        total_weight += w;
+    }
+
+    let (cells, seed, randomness) = first_partition?;
+    if total_weight <= 0.0 {
+        return None;
+    }
+    Some(VoronoiGlyphParams {
+        cells,
+        seed,
+        scatter,
+        distance: explode,
+        spin,
+        gravity,
+        randomness,
+        scale: scale_acc,
+        // Distance/spin/scatter/gravity/scale are already weighted per layer above.
+        weight: 1.0,
+        letter_index: index,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Zoidium `expressProperties` JSON Parser (`Vec<ExpressEffectorConfig>`)
+// ---------------------------------------------------------------------------
+
+/// Owned effector configuration parsed from a Zoidium `expressProperties` /
+/// `customProperties` / `objects` JSON block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpressEffectorConfig {
+    pub kind: EffectorKind,
+    pub properties: BTreeMap<String, EtValue>,
+}
+
+impl ExpressEffectorConfig {
+    pub fn as_layer(&self) -> EffectorLayer<'_> {
+        EffectorLayer {
+            kind: self.kind,
+            props: &self.properties,
+        }
+    }
+}
+
+impl EtPropReader for ExpressEffectorConfig {
+    fn read(&self, key: &str, frame: f64) -> Option<EtValue> {
+        self.properties.read(key, frame)
+    }
+}
+
+/// Complete container-level ExpressText+ configuration parsed from JSON.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpressTextConfig {
+    pub letters_mode: LettersMode,
+    pub rotation_order: String,
+    pub effectors: Vec<ExpressEffectorConfig>,
+}
+
+impl Default for ExpressTextConfig {
+    fn default() -> Self {
+        Self {
+            letters_mode: LettersMode::PerText,
+            rotation_order: "XYZ".to_string(),
+            effectors: Vec::new(),
+        }
+    }
+}
+
+fn json_to_et_value(raw: &serde_json::Value) -> Option<EtValue> {
+    match raw {
+        serde_json::Value::Number(n) => n.as_f64().filter(|v| v.is_finite()).map(EtValue::Number),
+        serde_json::Value::Bool(b) => Some(EtValue::Number(if *b { 1.0 } else { 0.0 })),
+        serde_json::Value::String(s) => Some(EtValue::Text(s.clone())),
+        serde_json::Value::Array(arr) => {
+            if arr.len() >= 3 {
+                let x = arr[0].as_f64()?;
+                let y = arr[1].as_f64()?;
+                let z = arr[2].as_f64()?;
+                if x.is_finite() && y.is_finite() && z.is_finite() {
+                    return Some(EtValue::Vec3([x, y, z]));
+                }
+            }
+            None
+        }
+        serde_json::Value::Object(map) => {
+            // CM3 serialized property wrapper: `{ "value": ... }` or `{ "keyframes": [{ "value": ... }] }`.
+            if let Some(inner) = map.get("value")
+                && let Some(v) = json_to_et_value(inner)
+            {
+                return Some(v);
+            }
+            if let Some(serde_json::Value::Array(kfs)) = map.get("keyframes")
+                && let Some(first) = kfs.first()
+                && let Some(inner) = first.get("value").or_else(|| first.get("v"))
+                && let Some(v) = json_to_et_value(inner)
+            {
+                return Some(v);
+            }
+            // Vector3 serialized as `{ "objects": [ { "value": x }, { "value": y }, { "value": z } ] }`.
+            if let Some(objs) = map.get("objects") {
+                let items = json_raw_array(objs);
+                if items.len() >= 3 {
+                    let x = json_to_et_value(items[0]).map(|v| v.as_number(0.0));
+                    let y = json_to_et_value(items[1]).map(|v| v.as_number(0.0));
+                    let z = json_to_et_value(items[2]).map(|v| v.as_number(0.0));
+                    if let (Some(x), Some(y), Some(z)) = (x, y, z) {
+                        return Some(EtValue::Vec3([x, y, z]));
+                    }
+                }
+            }
+            None
+        }
+        serde_json::Value::Null => None,
+    }
+}
+
+/// Normalizes either a JSON array `[a, b]` or CM3 numeric-keyed list `{"0": a, "1": b, "length": 2}`.
+fn json_raw_array(val: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match val {
+        serde_json::Value::Array(arr) => arr.iter().collect(),
+        serde_json::Value::Object(map) => {
+            let len = map
+                .get("length")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n.min(256) as usize);
+            let mut out = Vec::new();
+            if let Some(count) = len {
+                for i in 0..count {
+                    if let Some(v) = map.get(&i.to_string()) {
+                        out.push(v);
+                    }
+                }
+            } else {
+                let mut indexed: Vec<(usize, &serde_json::Value)> = map
+                    .iter()
+                    .filter_map(|(k, v)| k.parse::<usize>().ok().map(|idx| (idx, v)))
+                    .collect();
+                indexed.sort_by_key(|(idx, _)| *idx);
+                out.extend(indexed.into_iter().map(|(_, v)| v));
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_flat_express_props_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<ExpressEffectorConfig> {
+    let mut grouped: BTreeMap<usize, BTreeMap<String, EtValue>> = BTreeMap::new();
+    for (key, raw_val) in map {
+        if let Some(kind) = EffectorKind::from_property_key(key)
+            && let Some(et_val) = json_to_et_value(raw_val)
+        {
+            let order_idx = EffectorKind::ALL
+                .iter()
+                .position(|&k| k == kind)
+                .unwrap_or(0);
+            grouped
+                .entry(order_idx)
+                .or_default()
+                .insert(key.clone(), et_val);
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(idx, properties)| ExpressEffectorConfig {
+            kind: EffectorKind::ALL[idx],
+            properties,
+        })
+        .collect()
+}
+
+fn parse_custom_section(item: &serde_json::Value) -> Option<ExpressEffectorConfig> {
+    let obj = item.as_object()?;
+    let mut props = BTreeMap::new();
+    let mut detected_kind: Option<EffectorKind> = obj
+        .get("kind")
+        .or_else(|| obj.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(EffectorKind::from_name)
+        .or_else(|| {
+            obj.get("type")
+                .and_then(|t| {
+                    t.as_str()
+                        .or_else(|| t.get("name").and_then(serde_json::Value::as_str))
+                })
+                .and_then(EffectorKind::from_name)
+        });
+
+    let def_rows = obj
+        .get("type")
+        .and_then(|t| t.get("objects"))
+        .map(json_raw_array)
+        .unwrap_or_default();
+    let live_rows = obj.get("objects").map(json_raw_array).unwrap_or_default();
+
+    for (idx, row) in live_rows.iter().enumerate() {
+        let key = row
+            .get("effectorKey")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                row.get("definition")
+                    .and_then(|d| d.get("effectorKey"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| {
+                def_rows
+                    .get(idx)
+                    .and_then(|d| d.get("effectorKey"))
+                    .and_then(serde_json::Value::as_str)
+            });
+        if let Some(k) = key {
+            if detected_kind.is_none() {
+                detected_kind = EffectorKind::from_property_key(k);
+            }
+            if let Some(v) = json_to_et_value(row) {
+                props.insert(k.to_string(), v);
+            }
+        }
+    }
+
+    if let Some(serde_json::Value::Object(explicit)) = obj
+        .get("properties")
+        .or_else(|| obj.get("expressProperties"))
+    {
+        for (k, v) in explicit {
+            if detected_kind.is_none() {
+                detected_kind = EffectorKind::from_property_key(k);
+            }
+            if let Some(et_val) = json_to_et_value(v) {
+                props.insert(k.clone(), et_val);
+            }
+        }
+    }
+
+    let kind = detected_kind?;
+    Some(ExpressEffectorConfig {
+        kind,
+        properties: props,
+    })
+}
+
+/// Resolves Zoidium's container `LettersMode` from a container or `expressProperties` JSON block,
+/// matching `expresstext-plugin.js:migrateLettersScope` & `expresstext-layout.js:lettersScopeOf`.
+pub fn resolve_letters_mode(value: &serde_json::Value, has_content: bool) -> LettersMode {
+    let ep = value
+        .get("expressProperties")
+        .filter(|v| v.is_object())
+        .unwrap_or(value);
+    let Some(map) = ep.as_object() else {
+        return if has_content {
+            LettersMode::AcrossTexts
+        } else {
+            LettersMode::PerText
+        };
+    };
+    if let Some(raw_mode) = map.get("lettersMode") {
+        if let Some(s) = raw_mode.as_str() {
+            return match s.trim().to_ascii_lowercase().as_str() {
+                "pertext" | "per_text" | "per text" | "0" => LettersMode::PerText,
+                _ => LettersMode::AcrossTexts,
+            };
+        }
+        if let Some(v) = json_to_et_value(raw_mode) {
+            return LettersMode::from_raw(v.as_number(1.0));
+        }
+    }
+    let has_version = map.contains_key("lettersVersion");
+    let looks_pre_scope = !map.is_empty();
+    if !has_version && (looks_pre_scope || has_content) {
+        LettersMode::AcrossTexts
+    } else {
+        LettersMode::PerText
+    }
+}
+
+/// Parses a Zoidium ExpressText+ object JSON or `expressProperties` JSON block into
+/// container settings (`LettersMode`, `rotation_order`) and ordered `Vec<ExpressEffectorConfig>`.
+pub fn parse_express_text_config(value: &serde_json::Value) -> Result<ExpressTextConfig, String> {
+    if value.is_null() {
+        return Ok(ExpressTextConfig::default());
+    }
+    if let Some(arr) = value.as_array() {
+        let effectors = arr.iter().filter_map(parse_custom_section).collect();
+        return Ok(ExpressTextConfig {
+            letters_mode: LettersMode::PerText,
+            rotation_order: "XYZ".to_string(),
+            effectors,
+        });
+    }
+    let Some(root) = value.as_object() else {
+        return Err("expressProperties JSON must be an object or array".to_string());
+    };
+
+    let has_custom = root
+        .get("customProperties")
+        .is_some_and(|v| !json_raw_array(v).is_empty());
+    let has_objects = root
+        .get("objects")
+        .is_some_and(|v| !json_raw_array(v).is_empty());
+    let letters_mode = resolve_letters_mode(value, has_custom || has_objects);
+
+    let ep_map = root
+        .get("expressProperties")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(root);
+
+    let rotation_order = ep_map
+        .get("rotationOrder")
+        .and_then(json_to_et_value)
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|s| matches!(s.as_str(), "XYZ" | "XZY" | "YXZ" | "YZX" | "ZXY" | "ZYX"))
+        .unwrap_or_else(|| "XYZ".to_string());
+
+    let mut effectors = Vec::new();
+
+    // 1. Explicit `effectors` array if present.
+    if let Some(list) = root.get("effectors").or_else(|| ep_map.get("effectors")) {
+        for item in json_raw_array(list) {
+            if let Some(cfg) = parse_custom_section(item) {
+                effectors.push(cfg);
+            }
+        }
+    }
+
+    // 2. Zoidium v9 inline `customProperties` effector sections (panel order).
+    if let Some(customs) = root.get("customProperties") {
+        for item in json_raw_array(customs) {
+            if let Some(cfg) = parse_custom_section(item) {
+                effectors.push(cfg);
+            }
+        }
+    }
+
+    // 3. Legacy child effector objects in `objects`.
+    if let Some(objs) = root.get("objects") {
+        for child in json_raw_array(objs) {
+            if let Some(kind) = child
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .and_then(EffectorKind::from_name)
+            {
+                let mut props = BTreeMap::new();
+                if let Some(child_ep) = child
+                    .get("expressProperties")
+                    .or_else(|| child.get("properties"))
+                    .and_then(serde_json::Value::as_object)
+                {
+                    for (k, v) in child_ep {
+                        if let Some(et_val) = json_to_et_value(v) {
+                            props.insert(k.clone(), et_val);
+                        }
+                    }
+                }
+                effectors.push(ExpressEffectorConfig {
+                    kind,
+                    properties: props,
+                });
+            }
+        }
+    }
+
+    // 4. Flat prefixed keys inside `expressProperties` (or root map).
+    effectors.extend(parse_flat_express_props_map(ep_map));
+
+    Ok(ExpressTextConfig {
+        letters_mode,
+        rotation_order,
+        effectors,
+    })
+}
+
+/// Parses Zoidium's `expressProperties` (or full ExpressText+ object) JSON into
+/// `Vec<ExpressEffectorConfig>`.
+pub fn parse_express_properties(
+    value: &serde_json::Value,
+) -> Result<Vec<ExpressEffectorConfig>, String> {
+    parse_express_text_config(value).map(|cfg| cfg.effectors)
+}
+
+/// Parses a raw JSON string containing Zoidium's `expressProperties` into
+/// `Vec<ExpressEffectorConfig>`.
+pub fn parse_express_properties_str(json: &str) -> Result<Vec<ExpressEffectorConfig>, String> {
+    let val: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid expressProperties JSON: {e}"))?;
+    parse_express_properties(&val)
+}
+
+/// Parses a raw JSON string into [`ExpressTextConfig`].
+pub fn parse_express_text_config_str(json: &str) -> Result<ExpressTextConfig, String> {
+    let val: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid ExpressText+ JSON: {e}"))?;
+    parse_express_text_config(&val)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2556,5 +3894,320 @@ mod tests {
             max_spring > 100.0,
             "spring mode should overshoot 100, got {max_spring}"
         );
+    }
+
+    #[test]
+    fn repeater_linear_random_echo_fade_and_step_offsets() {
+        let list = LetterList {
+            total: 3,
+            order: vec![0, 1, 2],
+        };
+        let aux = EvalAux::default();
+
+        // 1. Linear repeater with rotation/scale step & opacity fade.
+        let mut lin = BTreeMap::new();
+        lin.insert("repeaterEnable".into(), EtValue::Number(1.0));
+        lin.insert("repeaterMode".into(), EtValue::Number(0.0));
+        lin.insert("repeaterCopies".into(), EtValue::Number(4.0));
+        lin.insert("repeaterOffset".into(), EtValue::Vec3([5.0, 2.0, -1.0]));
+        lin.insert("repeaterRotation".into(), EtValue::Vec3([0.0, 0.0, 0.25]));
+        lin.insert("repeaterScale".into(), EtValue::Vec3([0.9, 0.9, 1.0]));
+        lin.insert("repeaterFade".into(), EtValue::Number(80.0));
+
+        let layers = [EffectorLayer {
+            kind: EffectorKind::Repeater,
+            props: &lin,
+        }];
+        let instances =
+            evaluate_expresstext_repeater_instances(&layers, 10.0, 1, &list, [0.0, 0.0, 0.0], &aux);
+        assert_eq!(instances.len(), 4);
+        assert_eq!(instances[0].copy_index, 1);
+        assert!(approx_eq(instances[0].position_offset[0], 5.0, 1e-12));
+        assert!(approx_eq(instances[3].position_offset[0], 20.0, 1e-12));
+        assert!(approx_eq(instances[3].position_offset[1], 8.0, 1e-12));
+        assert!(approx_eq(instances[3].rotation_offset[2], 1.0, 1e-12));
+        assert!(approx_eq(instances[1].scale_multiplier[0], 0.81, 1e-12));
+        // Slot 1/4 fade 80% -> 1 - 0.8*0.25 = 0.8; slot 4/4 -> 1 - 0.8 = 0.2.
+        assert!(approx_eq(instances[0].opacity, 0.8, 1e-12));
+        assert!(approx_eq(instances[3].opacity, 0.2, 1e-12));
+
+        // 2. Explicit opacity start/end overrides default fade.
+        lin.insert("repeaterOpacityStart".into(), EtValue::Number(0.9));
+        lin.insert("repeaterOpacityEnd".into(), EtValue::Number(0.1));
+        let layers_op = [EffectorLayer {
+            kind: EffectorKind::Repeater,
+            props: &lin,
+        }];
+        let op_inst = evaluate_expresstext_repeater_instances(
+            &layers_op,
+            10.0,
+            1,
+            &list,
+            [0.0, 0.0, 0.0],
+            &aux,
+        );
+        assert!(approx_eq(op_inst[3].opacity, 0.1, 1e-12));
+        assert!(approx_eq(op_inst[1].opacity, 0.5, 1e-12));
+
+        // 3. Random mode determinism & range bounds.
+        let mut rnd = BTreeMap::new();
+        rnd.insert("repeaterMode".into(), EtValue::Number(1.0));
+        rnd.insert("repeaterCopies".into(), EtValue::Number(5.0));
+        rnd.insert(
+            "repeaterRangeMin".into(),
+            EtValue::Vec3([-10.0, -20.0, -5.0]),
+        );
+        rnd.insert("repeaterRangeMax".into(), EtValue::Vec3([10.0, 20.0, 5.0]));
+        rnd.insert("repeaterSeed".into(), EtValue::Number(42.0));
+        let rnd_layers = [EffectorLayer {
+            kind: EffectorKind::Repeater,
+            props: &rnd,
+        }];
+        let r_a = evaluate_expresstext_repeater_instances(
+            &rnd_layers,
+            0.0,
+            0,
+            &list,
+            [0.0, 0.0, 0.0],
+            &aux,
+        );
+        let r_b = evaluate_expresstext_repeater_instances(
+            &rnd_layers,
+            0.0,
+            0,
+            &list,
+            [0.0, 0.0, 0.0],
+            &aux,
+        );
+        assert_eq!(r_a, r_b);
+        for inst in &r_a {
+            assert!((-10.0..=10.0).contains(&inst.position_offset[0]));
+            assert!((-20.0..=20.0).contains(&inst.position_offset[1]));
+            assert!((-5.0..=5.0).contains(&inst.position_offset[2]));
+        }
+
+        // 4. Echo mode trails animated velocity `-v * lag * slot`.
+        struct MovingPlain;
+        impl EtPropReader for MovingPlain {
+            fn read(&self, key: &str, frame: f64) -> Option<EtValue> {
+                if key == "plainPosition" {
+                    Some(EtValue::Vec3([frame * 4.0, 0.0, 0.0]))
+                } else {
+                    None
+                }
+            }
+        }
+        let moving = MovingPlain;
+        let mut echo = BTreeMap::new();
+        echo.insert("repeaterMode".into(), EtValue::Number(2.0));
+        echo.insert("repeaterCopies".into(), EtValue::Number(3.0));
+        echo.insert("repeaterLag".into(), EtValue::Number(2.5));
+        let echo_layers = [
+            EffectorLayer {
+                kind: EffectorKind::Plain,
+                props: &moving,
+            },
+            EffectorLayer {
+                kind: EffectorKind::Repeater,
+                props: &echo,
+            },
+        ];
+        let echo_inst = evaluate_expresstext_repeater_instances(
+            &echo_layers,
+            10.0,
+            0,
+            &list,
+            [0.0, 0.0, 0.0],
+            &aux,
+        );
+        assert_eq!(echo_inst.len(), 3);
+        // Velocity = [4, 0, 0], lag = 2.5 -> slot 1 offset = -10, slot 3 offset = -30.
+        assert!(approx_eq(echo_inst[0].position_offset[0], -10.0, 1e-12));
+        assert!(approx_eq(echo_inst[2].position_offset[0], -30.0, 1e-12));
+        assert!(approx_eq(echo_inst[2].controls.position[0], 10.0, 1e-12));
+    }
+
+    #[test]
+    fn voronoi_halton_shatter_is_deterministic_and_conserves_triangles() {
+        // Halton sequence exact base-2 and base-3 values.
+        assert!(approx_eq(halton_sequence(1.0, 2.0), 0.5, 1e-12));
+        assert!(approx_eq(halton_sequence(2.0, 2.0), 0.25, 1e-12));
+        assert!(approx_eq(halton_sequence(3.0, 2.0), 0.75, 1e-12));
+        assert!(approx_eq(halton_sequence(1.0, 3.0), 1.0 / 3.0, 1e-12));
+        assert!(approx_eq(halton_sequence(2.0, 3.0), 2.0 / 3.0, 1e-12));
+
+        // Build a 4x4 grid of 32 triangles in [0..4, 0..4, 0..1].
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let mut uvs = Vec::new();
+        for gy in 0..4 {
+            for gx in 0..4 {
+                let x0 = gx as f32;
+                let x1 = (gx + 1) as f32;
+                let y0 = gy as f32;
+                let y1 = (gy + 1) as f32;
+                let z = ((gx + gy) % 2) as f32 * 0.5;
+                // Tri 1
+                positions.extend_from_slice(&[x0, y0, z, x1, y0, z, x1, y1, z]);
+                normals.extend_from_slice(&[0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+                uvs.extend_from_slice(&[
+                    x0 / 4.0,
+                    y0 / 4.0,
+                    x1 / 4.0,
+                    y0 / 4.0,
+                    x1 / 4.0,
+                    y1 / 4.0,
+                ]);
+                // Tri 2
+                positions.extend_from_slice(&[x0, y0, z, x1, y1, z, x0, y1, z]);
+                normals.extend_from_slice(&[0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+                uvs.extend_from_slice(&[
+                    x0 / 4.0,
+                    y0 / 4.0,
+                    x1 / 4.0,
+                    y1 / 4.0,
+                    x0 / 4.0,
+                    y1 / 4.0,
+                ]);
+            }
+        }
+
+        let params = VoronoiGlyphParams {
+            cells: 8,
+            seed: 3.25,
+            scatter: 1.5,
+            distance: 10.0,
+            spin: [0.5, 1.0, 0.25],
+            gravity: 2.0,
+            randomness: 1.0,
+            scale: 0.85,
+            weight: 1.0,
+            letter_index: 2,
+        };
+
+        let chunks_a = shatter_glyph_triangles(&positions, &normals, &uvs, None, &params);
+        let chunks_b = shatter_glyph_triangles(&positions, &normals, &uvs, None, &params);
+        assert_eq!(chunks_a, chunks_b);
+        assert!(chunks_a.len() >= 4 && chunks_a.len() <= 8);
+
+        // Every input triangle must appear in exactly one Voronoi chunk.
+        let total_tris: usize = chunks_a.iter().map(|c| c.positions.len() / 9).sum();
+        assert_eq!(total_tris, 32);
+        for chunk in &chunks_a {
+            assert_eq!(chunk.normals.len(), chunk.positions.len());
+            assert_eq!(chunk.uvs.len(), (chunk.positions.len() / 9) * 6);
+            assert!(approx_eq(chunk.scale[0], 0.85, 1e-12));
+            let baked = apply_chunk_pose_to_positions(chunk);
+            assert_eq!(baked.len(), chunk.positions.len());
+            assert!(baked.iter().all(|v| v.is_finite()));
+        }
+
+        // Stack-level Voronoi evaluation with field falloff.
+        let mut vor = BTreeMap::new();
+        vor.insert("voronoiEnable".into(), EtValue::Number(1.0));
+        vor.insert("voronoiChunks".into(), EtValue::Number(6.0));
+        vor.insert("voronoiExplode".into(), EtValue::Number(12.0));
+        vor.insert("voronoiSpin".into(), EtValue::Vec3([0.2, 0.4, 0.6]));
+        vor.insert("voronoiSeed".into(), EtValue::Number(9.0));
+        vor.insert("voronoiField".into(), EtValue::Number(1.0)); // Linear X ramp
+        vor.insert(
+            "voronoiFieldPosition".into(),
+            EtValue::Vec3([0.0, 0.0, 0.0]),
+        );
+        vor.insert(
+            "voronoiFieldScale".into(),
+            EtValue::Vec3([100.0, 100.0, 100.0]),
+        );
+        let layers = [EffectorLayer {
+            kind: EffectorKind::Voronoi,
+            props: &vor,
+        }];
+        let list = LetterList {
+            total: 2,
+            order: vec![0, 1],
+        };
+        let evaluated =
+            evaluate_expresstext_voronoi_params(&layers, 0.0, 0, &list, [0.0, 0.0, 0.0])
+                .expect("voronoi should be active at linear midpoint");
+        assert_eq!(evaluated.cells, 6);
+        // Midpoint of linear field -> weight 0.5 -> explode 6.0.
+        assert!(approx_eq(evaluated.distance, 6.0, 1e-12));
+    }
+
+    #[test]
+    fn parses_express_properties_json_and_letters_mode() {
+        let json = r#"{
+            "type": "zoidium:expresstext-plus/expresstext",
+            "expressProperties": {
+                "rotationOrder": "YXZ",
+                "lettersMode": 0,
+                "lettersVersion": 1
+            },
+            "customProperties": [
+                {
+                    "type": {
+                        "name": "Repeater",
+                        "objects": [
+                            { "effectorKey": "repeaterEnable" },
+                            { "effectorKey": "repeaterCopies" },
+                            { "effectorKey": "repeaterOffset" }
+                        ]
+                    },
+                    "objects": [
+                        { "value": 1 },
+                        { "value": 5 },
+                        { "value": [12, 0, -4] }
+                    ]
+                },
+                {
+                    "type": { "name": "Voronoi" },
+                    "objects": [
+                        { "effectorKey": "voronoiEnable", "value": 1 },
+                        { "effectorKey": "voronoiChunks", "value": 12 },
+                        { "effectorKey": "voronoiExplode", "value": 25.0 }
+                    ]
+                }
+            ]
+        }"#;
+        let cfg = parse_express_text_config_str(json).expect("config must parse");
+        assert_eq!(cfg.letters_mode, LettersMode::PerText);
+        assert_eq!(cfg.rotation_order, "YXZ");
+        assert_eq!(cfg.effectors.len(), 2);
+        assert_eq!(cfg.effectors[0].kind, EffectorKind::Repeater);
+        assert_eq!(
+            cfg.effectors[0].properties.get("repeaterCopies"),
+            Some(&EtValue::Number(5.0))
+        );
+        assert_eq!(
+            cfg.effectors[0].properties.get("repeaterOffset"),
+            Some(&EtValue::Vec3([12.0, 0.0, -4.0]))
+        );
+        assert_eq!(cfg.effectors[1].kind, EffectorKind::Voronoi);
+        assert_eq!(
+            cfg.effectors[1].properties.get("voronoiChunks"),
+            Some(&EtValue::Number(12.0))
+        );
+
+        // Pre-scope legacy container with content defaults to AcrossTexts.
+        let legacy = serde_json::json!({
+            "expressProperties": {
+                "plainEnable": 1,
+                "plainPosition": [4, 5, 6]
+            },
+            "objects": [{ "type": "text" }]
+        });
+        let legacy_cfg = parse_express_text_config(&legacy).expect("legacy must parse");
+        assert_eq!(legacy_cfg.letters_mode, LettersMode::AcrossTexts);
+        assert_eq!(legacy_cfg.effectors.len(), 1);
+        assert_eq!(legacy_cfg.effectors[0].kind, EffectorKind::Plain);
+
+        // Verify PerText vs AcrossTexts letter run helper.
+        let (per_list, per_start) = build_letter_run_for_text(LettersMode::PerText, &[3, 5, 2], 1);
+        assert_eq!(per_list.total, 5);
+        assert_eq!(per_start, 0);
+        let (acr_list, acr_start) =
+            build_letter_run_for_text(LettersMode::AcrossTexts, &[3, 5, 2], 1);
+        assert_eq!(acr_list.total, 10);
+        assert_eq!(acr_start, 3);
     }
 }

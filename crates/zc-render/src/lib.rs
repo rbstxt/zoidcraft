@@ -6,6 +6,8 @@ pub mod context;
 pub mod effects;
 pub mod engine;
 pub mod scene3d;
+pub mod shape_plus;
+pub mod text_plus_2d;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

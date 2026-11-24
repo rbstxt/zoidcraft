@@ -148,7 +148,7 @@ impl Default for SceneLight {
     }
 }
 
-/// Per-material shading and UV transform parameters.
+/// Per-material shading, Material+ surface shader, multi-slot, and UV transform parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct MaterialParams {
     pub shading: ShadingModel,
@@ -179,6 +179,68 @@ pub struct MaterialParams {
     /// Whether `albedo_view` is uploaded with premultiplied RGB (default `true` for
     /// backwards compatibility with existing callers; set `false` for straight-alpha uploads).
     pub albedo_premultiplied: bool,
+    /// Multiply albedo & opacity by per-vertex RGBA colors (`@location(5)`), e.g. Voronoi random colors.
+    pub use_vertex_color: bool,
+    /// Optional per-face material slot filter (`Some(0)` = outer/front, `Some(1)` = cap/side, `None` = all).
+    pub material_slot_filter: Option<u32>,
+    /// Adds subtle hardware depth bias (`constant=1, slope_scale=1.0`) to prevent Z-fighting on coplanar cap faces.
+    pub polygon_offset_cap: bool,
+    /// Per-material shadow reception toggle (combined with `MeshDrawCall::receive_shadow`, default `true`).
+    pub receive_shadow: bool,
+    /// Enables Material+ Ambient Occlusion modulation (`surface-shader.js`).
+    pub ao_enabled: bool,
+    /// Ambient Occlusion intensity (`0.0..=1.0`, default `0.0`).
+    pub ao_intensity: f32,
+    /// Ambient Occlusion tint color (default `[0.0, 0.0, 0.0]`).
+    pub ao_color: [f32; 3],
+    /// Ambient Occlusion power/distance exponent (default `1.0`).
+    pub ao_distance: f32,
+    /// Enables Material+ quantized Cel Shading (`surface-shader.js`).
+    pub cel_enabled: bool,
+    /// Quantized diffuse lighting steps (default `4.0`).
+    pub cel_steps: f32,
+    /// Blend between quantized cel bands and smooth lighting (`0.0..=1.0`, default `0.1`).
+    pub cel_smoothness: f32,
+    /// Quantized specular lighting steps (default `6.0`).
+    pub cel_specular_steps: f32,
+    /// Enables Material+ Fresnel rim color mixing (`surface-shader.js`).
+    pub fresnel_enabled: bool,
+    /// Fresnel rim tint color (default `[1.0, 1.0, 1.0]`).
+    pub fresnel_color: [f32; 3],
+    /// Fresnel exponent (`pow(1.0 - max(dot(N, V), 0.0), power)`, default `4.0`).
+    pub fresnel_power: f32,
+    /// Fresnel mix strength (`0.0..=1.0`, default `0.7`).
+    pub fresnel_mix_strength: f32,
+    /// Enables Material+ 4-stop inline Color Ramp modulation (zero extra texture binding).
+    pub ramp_enabled: bool,
+    /// Ramp input source: `0` = luminance, `1` = normalY, `2` = fresnel, `3` = uv.x, `4` = uv.y.
+    pub ramp_source: u32,
+    /// Color ramp blend factor (`0.0..=1.0`, default `1.0`).
+    pub ramp_factor: f32,
+    /// 4-stop color ramp (`rgb = color`, `a = stop position in [0.0, 1.0]`).
+    pub ramp_colors: [[f32; 4]; 4],
+    /// Enables 3D procedural gradient noise bump normal perturbation in `fs_main`.
+    pub bump_noise_enabled: bool,
+    /// Procedural bump normal perturbation strength (default `0.0`).
+    pub bump_strength: f32,
+    /// Spatial frequency scale for 3D procedural bump noise (default `4.0`).
+    pub bump_noise_scale: f32,
+    /// UV projection mode: `0` = UV, `1` = Spherical, `2` = Cylindrical, `3` = Cubic/Triplanar.
+    pub uv_projection: u32,
+    /// Projection scale `[sx, sy]` (default `[1.0, 1.0]`).
+    pub proj_scale: [f32; 2],
+    /// Projection translation `[tx, ty]` (default `[0.0, 0.0]`).
+    pub proj_translate: [f32; 2],
+    /// Projection rotation in radians (default `0.0`).
+    pub proj_rotation: f32,
+    /// Enables procedural hemisphere environment reflection when no equirectangular `env_view` is bound.
+    pub reflection_enabled: bool,
+    /// Procedural environment reflection sky color (default `[0.75, 0.85, 1.0]`).
+    pub reflection_env_color_top: [f32; 3],
+    /// Procedural environment reflection ground color (default `[0.22, 0.20, 0.18]`).
+    pub reflection_env_color_bottom: [f32; 3],
+    /// Azimuth rotation of environment reflection lookup in radians (default `0.0`).
+    pub env_rotation: f32,
 }
 
 impl Default for MaterialParams {
@@ -205,6 +267,42 @@ impl Default for MaterialParams {
             alpha_test: 0.0,
             reflection_intensity: 1.0,
             albedo_premultiplied: true,
+            use_vertex_color: false,
+            material_slot_filter: None,
+            polygon_offset_cap: false,
+            receive_shadow: true,
+            ao_enabled: false,
+            ao_intensity: 0.0,
+            ao_color: [0.0, 0.0, 0.0],
+            ao_distance: 1.0,
+            cel_enabled: false,
+            cel_steps: 4.0,
+            cel_smoothness: 0.1,
+            cel_specular_steps: 6.0,
+            fresnel_enabled: false,
+            fresnel_color: [1.0, 1.0, 1.0],
+            fresnel_power: 4.0,
+            fresnel_mix_strength: 0.7,
+            ramp_enabled: false,
+            ramp_source: 0,
+            ramp_factor: 1.0,
+            ramp_colors: [
+                [0.0, 0.0, 0.0, 0.0],
+                [0.33, 0.33, 0.33, 0.33],
+                [0.67, 0.67, 0.67, 0.67],
+                [1.0, 1.0, 1.0, 1.0],
+            ],
+            bump_noise_enabled: false,
+            bump_strength: 0.0,
+            bump_noise_scale: 4.0,
+            uv_projection: 0,
+            proj_scale: [1.0, 1.0],
+            proj_translate: [0.0, 0.0],
+            proj_rotation: 0.0,
+            reflection_enabled: false,
+            reflection_env_color_top: [0.75, 0.85, 1.0],
+            reflection_env_color_bottom: [0.22, 0.20, 0.18],
+            env_rotation: 0.0,
         }
     }
 }
@@ -296,6 +394,77 @@ pub struct Scene3DRenderOptions<'a> {
     /// Set `true` if custom particle sprite textures are uploaded with straight alpha
     /// instead of premultiplied alpha (`false` by default for backwards compatibility).
     pub particle_sprites_straight_alpha: bool,
+}
+
+/// Screen-space additive HDR optical lens flare draw submission.
+#[derive(Debug, Clone, Copy)]
+pub struct OpticalFlareDrawCall {
+    /// Projected flare source position in NDC `[-1, 1]` (`+X` right, `+Y` up).
+    pub screen_pos_ndc: [f32; 2],
+    /// Projected flare source depth in `wgpu` `[0, 1]` NDC depth for occlusion testing.
+    pub depth_ndc: f32,
+    /// Flare tint color `[r, g, b]`.
+    pub color: [f32; 3],
+    /// Overall brightness multiplier (default `1.0`).
+    pub brightness: f32,
+    /// Overall flare scale multiplier (default `1.0`).
+    pub scale: f32,
+    /// Horizontal anamorphic streak intensity (`0.0` = off, `1.0` = full streak).
+    pub anamorphic: f32,
+    /// Number of chromatic iris ghosts mirrored across screen center (`0..=8`).
+    pub ghosts: u32,
+    /// Number of directional starburst rays (`0..=24`).
+    pub starburst_rays: u32,
+    /// Chromatic halo ring intensity (`0.0..=2.0`).
+    pub ring_intensity: f32,
+    /// When `true`, samples the 3D depth buffer around `screen_pos_ndc` to hide behind 3D geometry.
+    pub occlusion_enabled: bool,
+    /// Rotation angle of starburst & anamorphic elements in radians.
+    pub rotation_rad: f32,
+}
+
+impl Default for OpticalFlareDrawCall {
+    fn default() -> Self {
+        Self {
+            screen_pos_ndc: [0.0, 0.0],
+            depth_ndc: 0.5,
+            color: [1.0, 0.92, 0.8],
+            brightness: 1.0,
+            scale: 1.0,
+            anamorphic: 0.5,
+            ghosts: 4,
+            starburst_rays: 8,
+            ring_intensity: 0.4,
+            occlusion_enabled: true,
+            rotation_rad: 0.0,
+        }
+    }
+}
+
+/// Extended per-pass 3D rendering options passed to [`Scene3DRenderer::render_with_extended_options`].
+#[derive(Clone, Copy, Default)]
+pub struct Scene3DExtendedOptions<'a> {
+    /// Base render options (editor lines, PBR+ maps, DOF, lighting mode, particle sprites).
+    pub base: Scene3DRenderOptions<'a>,
+    /// Optional per-mesh Ambient Occlusion texture views (indexed parallel to `input.meshes`).
+    pub mesh_ao_views: &'a [Option<&'a wgpu::TextureView>],
+    /// Requested 2D shadow map resolution in pixels (`0` = keep default `SHADOW_MAP_SIZE = 1024`;
+    /// clamped safely to `[256, min(4096, device.limits().max_texture_dimension_2d)]`).
+    pub shadow_map_size: u32,
+    /// Optional screen-space Optical Flares composited additively with depth occlusion after the 3D pass.
+    pub optical_flares: &'a [OpticalFlareDrawCall],
+}
+
+/// Per-mesh draw submission for a registered 3D custom WGSL material shader.
+pub struct CustomMaterial3DDrawCall<'a> {
+    pub mesh: &'a GpuMesh,
+    pub model: [[f32; 4]; 4],
+    pub normal_matrix: [[f32; 4]; 4],
+    pub side: CullSide,
+    pub blend: MaterialBlend,
+    pub time: f32,
+    pub params_a: [f32; 4],
+    pub params_b: [f32; 4],
 }
 
 /// Camera transform and projection matrices (column-major, right-handed, `[0, 1]` Z).
@@ -423,24 +592,74 @@ impl MeshVertex {
     }
 }
 
+/// Per-vertex linear RGBA color attribute bound at vertex slot 1 (`@location(5)`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct MeshVertexColor {
+    pub color: [f32; 4],
+}
+
+impl MeshVertexColor {
+    const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![
+        5 => Float32x4,
+    ];
+
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
 /// Uploaded indexed GPU mesh ready for drawing.
 #[derive(Debug)]
 pub struct GpuMesh {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub index_count: u32,
+    /// Per-vertex RGBA color buffer (`@location(5)`, defaults to `[1, 1, 1, 1]` per vertex).
+    pub color_buffer: wgpu::Buffer,
 }
 
 impl GpuMesh {
-    /// Uploads vertex and `u32` index buffers to the GPU.
+    /// Uploads vertex and `u32` index buffers to the GPU with default white per-vertex colors.
     pub fn from_slices(
         ctx: &GpuContext,
         vertices: &[MeshVertex],
         indices: &[u32],
         label: Option<&str>,
     ) -> Self {
+        Self::from_slices_with_colors(ctx, vertices, &[], indices, label)
+    }
+
+    /// Uploads vertex, per-vertex RGBA color, and `u32` index buffers to the GPU.
+    /// When `colors` is empty, defaults every vertex color to `[1.0, 1.0, 1.0, 1.0]`.
+    pub fn from_slices_with_colors(
+        ctx: &GpuContext,
+        vertices: &[MeshVertex],
+        colors: &[[f32; 4]],
+        indices: &[u32],
+        label: Option<&str>,
+    ) -> Self {
         let v_bytes = bytemuck::cast_slice(vertices);
         let i_bytes = bytemuck::cast_slice(indices);
+        let color_data: Vec<MeshVertexColor> = if colors.is_empty() {
+            vec![
+                MeshVertexColor {
+                    color: [1.0, 1.0, 1.0, 1.0]
+                };
+                vertices.len().max(1)
+            ]
+        } else {
+            (0..vertices.len().max(1))
+                .map(|i| MeshVertexColor {
+                    color: colors.get(i).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]),
+                })
+                .collect()
+        };
+        let c_bytes = bytemuck::cast_slice(&color_data);
 
         let vertex_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label,
@@ -450,6 +669,16 @@ impl GpuMesh {
         });
         if !v_bytes.is_empty() {
             ctx.queue.write_buffer(&vertex_buffer, 0, v_bytes);
+        }
+
+        let color_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label,
+            size: (c_bytes.len().max(16)) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if !c_bytes.is_empty() {
+            ctx.queue.write_buffer(&color_buffer, 0, c_bytes);
         }
 
         let index_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -466,7 +695,28 @@ impl GpuMesh {
             vertex_buffer,
             index_buffer,
             index_count: indices.len() as u32,
+            color_buffer,
         }
+    }
+
+    /// Uploads a [`zc_scene::MeshData`] directly, including optional per-vertex `colors`
+    /// (e.g. Voronoi random fragment colors) and `material_slot` indices.
+    pub fn from_mesh_data(
+        ctx: &GpuContext,
+        mesh: &zc_scene::MeshData,
+        label: Option<&str>,
+    ) -> Self {
+        let vertices: Vec<MeshVertex> = mesh
+            .vertices
+            .iter()
+            .map(|v| MeshVertex {
+                position: v.position,
+                normal: v.normal,
+                uv: v.uv,
+                material_slot: v.material_slot,
+            })
+            .collect();
+        Self::from_slices_with_colors(ctx, &vertices, &mesh.colors, &mesh.indices, label)
     }
 }
 
@@ -547,6 +797,8 @@ pub struct Scene3DPassInput<'a> {
 struct ShadowUniforms {
     light_view_proj: [[f32; 4]; 4],
     model: [[f32; 4]; 4],
+    /// `x = material_slot_filter (0xFFFF_FFFF = all slots)`, `yzw = 0`.
+    slot_filter: [u32; 4],
 }
 
 #[repr(C)]
@@ -569,7 +821,7 @@ struct SceneUniforms {
     view: [[f32; 4]; 4],
     shadow_view_projs: [[[f32; 4]; 4]; MAX_SHADOW_MAPS_2D],
     camera_pos_light_count: [f32; 4],
-    /// `x = active 2D shadow count`, `y = primary 2D receiver bias`, `z = 1.0 / SHADOW_MAP_SIZE`,
+    /// `x = active 2D shadow count`, `y = primary 2D receiver bias`, `z = 1.0 / shadow_map_size_2d`,
     /// `w = linear_lighting (0.0 = Three.js r91 sRGB, 1.0 = linear)`.
     shadow_params: [f32; 4],
     /// Per-2D-shadow-slot receiver bias.
@@ -593,9 +845,27 @@ struct ObjectUniforms {
     specular_refl: [f32; 4],
     uv_transform_a: [f32; 4],
     uv_transform_b: [f32; 4],
-    /// `x = alpha_test`, `yzw = 0.0`.
+    /// `x = alpha_test`, `y = bump_strength`, `z = bump_noise_scale`, `w = env_rotation`.
     extra_params: [f32; 4],
+    /// `x = bitflags`, `y = shading_mode`, `z = material_slot_filter (0xFFFF_FFFF = all)`,
+    /// `w = (uv_projection & 0xFF) | ((ramp_source & 0xFF) << 8)`.
     flags: [u32; 4],
+    /// `rgb = ao_color`, `w = ao_intensity`.
+    ao_color_intensity: [f32; 4],
+    /// `x = ao_distance`, `y = cel_steps`, `z = cel_smoothness`, `w = cel_specular_steps`.
+    ao_cel_params: [f32; 4],
+    /// `rgb = fresnel_color`, `w = fresnel_power`.
+    fresnel_color_power: [f32; 4],
+    /// `x = fresnel_mix_strength`, `y = ramp_factor`, `z = proj_rotation.cos()`, `w = proj_rotation.sin()`.
+    fresnel_ramp_proj: [f32; 4],
+    /// `xy = proj_scale`, `zw = proj_translate`.
+    proj_scale_translate: [f32; 4],
+    /// `rgb = reflection_env_color_top`, `w = 0.0`.
+    env_color_top: [f32; 4],
+    /// `rgb = reflection_env_color_bottom`, `w = 0.0`.
+    env_color_bottom: [f32; 4],
+    /// 4-stop inline color ramp (`rgb = color`, `a = stop position in [0.0, 1.0]`).
+    ramp_stops: [[f32; 4]; 4],
 }
 
 #[repr(C)]
@@ -609,12 +879,42 @@ struct DofUniforms {
     focus_blur_params: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct OpticalFlareUniforms {
+    /// `xy = screen_pos_ndc`, `z = depth_ndc`, `w = aspect (width / height)`.
+    pos_depth_aspect: [f32; 4],
+    /// `xy = (width, height)`, `zw = (1.0 / width, 1.0 / height)`.
+    resolution_inv: [f32; 4],
+    /// `rgb = color`, `w = brightness`.
+    color_brightness: [f32; 4],
+    /// `x = scale`, `y = anamorphic`, `z = ring_intensity`, `w = rotation_rad`.
+    shape_params: [f32; 4],
+    /// `x = ghosts`, `y = starburst_rays`, `z = occlusion_enabled (0.0/1.0)`, `w = 0.0`.
+    counts_occlusion: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct CustomShader3DUniforms {
+    view_proj: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
+    normal_matrix: [[f32; 4]; 4],
+    /// `xyz = camera eye_position`, `w = time`.
+    camera_pos_time: [f32; 4],
+    params_a: [f32; 4],
+    params_b: [f32; 4],
+}
+
 const _: () = {
+    assert!(std::mem::size_of::<ShadowUniforms>() == 144);
     assert!(std::mem::size_of::<LightGpu>() == 80);
     assert!(std::mem::size_of::<SceneUniforms>() == 1104);
-    assert!(std::mem::size_of::<ObjectUniforms>() == 256);
+    assert!(std::mem::size_of::<ObjectUniforms>() == 432);
     assert!(std::mem::size_of::<ParticleUniforms>() == 144);
     assert!(std::mem::size_of::<DofUniforms>() == 48);
+    assert!(std::mem::size_of::<OpticalFlareUniforms>() == 80);
+    assert!(std::mem::size_of::<CustomShader3DUniforms>() == 240);
 };
 
 /// Colored 3D wireframe line vertex used for editor grid, AABB, CameraHelper, and LightHelper overlays.
@@ -660,12 +960,21 @@ struct MeshPipelineKey {
     format: wgpu::TextureFormat,
     side: CullSide,
     blend: MaterialBlend,
+    polygon_offset_cap: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ParticlePipelineKey {
     format: wgpu::TextureFormat,
     blend: ParticleBlend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CustomMaterialPipelineKey {
+    shader_key: String,
+    format: wgpu::TextureFormat,
+    side: CullSide,
+    blend: MaterialBlend,
 }
 
 struct ShadowAssignment {
@@ -678,8 +987,10 @@ struct ShadowAssignment {
 }
 
 /// Forward 3D `wgpu` renderer with multi-light + omni point PCF shadows,
-/// PBR/Phong/Lambert/Basic/Matcap shading, Camera+ 3-pass bokeh DOF,
-/// editing-camera gizmos, and instanced billboard particles.
+/// dynamic shadow map sizing, Material+ surface shading (AO, Cel, Fresnel, Color Ramp,
+/// Procedural Bump Noise, UV Projections, Environment Reflection), per-vertex colors,
+/// multi-slot materials, Camera+ 3-pass bokeh DOF, depth-occluded Optical Flares,
+/// 3D custom shader materials, editing-camera gizmos, and instanced billboard particles.
 pub struct Scene3DRenderer {
     shadow_shader: wgpu::ShaderModule,
     mesh_shader: wgpu::ShaderModule,
@@ -688,6 +999,7 @@ pub struct Scene3DRenderer {
     dof_tile_shader: wgpu::ShaderModule,
     dof_dilate_shader: wgpu::ShaderModule,
     dof_composite_shader: wgpu::ShaderModule,
+    optical_flare_shader: wgpu::ShaderModule,
     shadow_pipeline_current: wgpu::RenderPipeline,
     shadow_pipeline_legacy: wgpu::RenderPipeline,
     mesh_pipelines: HashMap<MeshPipelineKey, wgpu::RenderPipeline>,
@@ -698,6 +1010,11 @@ pub struct Scene3DRenderer {
     dof_tile_pipeline: wgpu::RenderPipeline,
     dof_dilate_pipeline: wgpu::RenderPipeline,
     dof_composite_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    optical_flare_bgl: wgpu::BindGroupLayout,
+    optical_flare_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    custom_material_shaders: HashMap<String, wgpu::ShaderModule>,
+    custom_material_pipelines: HashMap<CustomMaterialPipelineKey, wgpu::RenderPipeline>,
+    shadow_map_size_2d: u32,
     _shadow_maps_2d_tex: wgpu::Texture,
     shadow_maps_2d_array_view: wgpu::TextureView,
     shadow_maps_2d_layer_views: Vec<wgpu::TextureView>,
@@ -722,7 +1039,7 @@ pub struct Scene3DRenderer {
 
 impl Scene3DRenderer {
     /// Initializes shaders, multi-light shadow arrays, default textures, DOF passes,
-    /// and editor grid geometry.
+    /// Optical Flares pass, and editor grid geometry.
     pub fn new(ctx: &GpuContext) -> Result<Self, RenderError> {
         let shadow_shader = ctx
             .device
@@ -766,6 +1083,12 @@ impl Scene3DRenderer {
                 label: Some("zc-render scene3d dof composite wgsl"),
                 source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(DOF_COMPOSITE_WGSL)),
             });
+        let optical_flare_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zc-render scene3d optical flare wgsl"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(OPTICAL_FLARE_WGSL)),
+            });
 
         let shadow_pipeline_current =
             create_shadow_pipeline(ctx, &shadow_shader, CompatMode::Current);
@@ -794,11 +1117,13 @@ impl Scene3DRenderer {
             "zc-render dof dilate pipeline",
         );
         let dof_composite_bgl = create_dof_composite_bind_group_layout(ctx);
+        let optical_flare_bgl = create_optical_flare_bind_group_layout(ctx);
 
+        let initial_shadow_size = clamp_shadow_map_size(ctx, SHADOW_MAP_SIZE);
         let (shadow_maps_2d_tex, shadow_maps_2d_array_view, shadow_maps_2d_layer_views) =
             create_depth_array_texture(
                 ctx,
-                SHADOW_MAP_SIZE,
+                initial_shadow_size,
                 MAX_SHADOW_MAPS_2D as u32,
                 "zc-render 2d shadow map array",
             );
@@ -882,6 +1207,7 @@ impl Scene3DRenderer {
             dof_tile_shader,
             dof_dilate_shader,
             dof_composite_shader,
+            optical_flare_shader,
             shadow_pipeline_current,
             shadow_pipeline_legacy,
             mesh_pipelines: HashMap::new(),
@@ -892,6 +1218,11 @@ impl Scene3DRenderer {
             dof_tile_pipeline,
             dof_dilate_pipeline,
             dof_composite_pipelines: HashMap::new(),
+            optical_flare_bgl,
+            optical_flare_pipelines: HashMap::new(),
+            custom_material_shaders: HashMap::new(),
+            custom_material_pipelines: HashMap::new(),
+            shadow_map_size_2d: initial_shadow_size,
             _shadow_maps_2d_tex: shadow_maps_2d_tex,
             shadow_maps_2d_array_view,
             shadow_maps_2d_layer_views,
@@ -913,6 +1244,38 @@ impl Scene3DRenderer {
             grid_vertex_buffer,
             grid_vertex_count: grid_verts.len() as u32,
         })
+    }
+
+    /// Returns the currently allocated 2D directional/spot shadow map resolution (in pixels).
+    pub fn shadow_map_size(&self) -> u32 {
+        self.shadow_map_size_2d
+    }
+
+    /// Dynamically resizes the 2D directional/spot shadow map texture array (`0` resets to
+    /// [`SHADOW_MAP_SIZE`]; values are safely clamped to `[256, min(4096, max_texture_dimension_2d)]`).
+    pub fn set_shadow_map_size(&mut self, ctx: &GpuContext, requested_size: u32) {
+        let target = clamp_shadow_map_size(
+            ctx,
+            if requested_size == 0 {
+                SHADOW_MAP_SIZE
+            } else {
+                requested_size
+            },
+        );
+        if target == self.shadow_map_size_2d {
+            return;
+        }
+        let (tex, array_view, layer_views) = create_depth_array_texture(
+            ctx,
+            target,
+            MAX_SHADOW_MAPS_2D as u32,
+            "zc-render 2d shadow map array",
+        );
+        self._shadow_maps_2d_tex = tex;
+        self.shadow_maps_2d_array_view = array_view;
+        self.shadow_maps_2d_layer_views = layer_views;
+        self.shadow_map_size_2d = target;
+        self.shadow_initialized = false;
     }
 
     /// Renders a 3D scene into premultiplied RGBA `color_target` with
@@ -966,6 +1329,29 @@ impl Scene3DRenderer {
         input: &Scene3DPassInput<'_>,
         options: &Scene3DRenderOptions<'_>,
     ) -> Result<(), RenderError> {
+        self.render_with_extended_options(
+            ctx,
+            color_target,
+            depth_target,
+            input,
+            &Scene3DExtendedOptions {
+                base: *options,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Renders a 3D scene with Wave 2C extended options (AO maps, dynamic shadow map size,
+    /// depth-occluded Optical Flares, Material+ surface shading, multi-slot & vertex colors).
+    pub fn render_with_extended_options(
+        &mut self,
+        ctx: &GpuContext,
+        color_target: &RenderTarget,
+        depth_target: &RenderTarget,
+        input: &Scene3DPassInput<'_>,
+        ext: &Scene3DExtendedOptions<'_>,
+    ) -> Result<(), RenderError> {
+        let options = &ext.base;
         if depth_target.format != wgpu::TextureFormat::Depth32Float {
             return Err(RenderError::UnsupportedFormat(depth_target.format));
         }
@@ -974,6 +1360,10 @@ impl Scene3DRenderer {
                 width: depth_target.width,
                 height: depth_target.height,
             });
+        }
+
+        if ext.shadow_map_size > 0 {
+            self.set_shadow_map_size(ctx, ext.shadow_map_size);
         }
 
         let dof_active = options
@@ -988,6 +1378,9 @@ impl Scene3DRenderer {
             )?;
             self.ensure_dof_composite_pipeline(ctx, color_target.format);
         }
+        if !ext.optical_flares.is_empty() {
+            self.ensure_optical_flare_pipeline(ctx, color_target.format);
+        }
 
         // Pre-warm all needed pipelines before encoding commands.
         for draw in input.meshes {
@@ -996,6 +1389,7 @@ impl Scene3DRenderer {
                 format: color_target.format,
                 side: effective_cull_side(draw.material.side, neg_scale),
                 blend: draw.material.blend,
+                polygon_offset_cap: draw.material.polygon_offset_cap,
             };
             self.ensure_mesh_pipeline(ctx, key);
         }
@@ -1093,6 +1487,7 @@ impl Scene3DRenderer {
             input.lights,
             &shadow_assign,
             options.linear_lighting,
+            self.shadow_map_size_2d,
         );
         let scene_ubo = create_uniform_buffer(
             ctx,
@@ -1120,11 +1515,13 @@ impl Scene3DRenderer {
                 .get(draw_idx)
                 .copied()
                 .unwrap_or_default();
+            let ao_view = ext.mesh_ao_views.get(draw_idx).copied().flatten();
             let neg_scale = mat4_upper3x3_det(draw.model) < 0.0;
             let key = MeshPipelineKey {
                 format: color_target.format,
                 side: effective_cull_side(draw.material.side, neg_scale),
                 blend: draw.material.blend,
+                polygon_offset_cap: draw.material.polygon_offset_cap,
             };
             let pipeline = &self.mesh_pipelines[&key];
             let bgl0 = pipeline.get_bind_group_layout(0);
@@ -1157,7 +1554,7 @@ impl Scene3DRenderer {
                 ],
             });
 
-            let obj_u = build_object_uniforms(draw, &extra_maps, neg_scale);
+            let obj_u = build_object_uniforms(draw, &extra_maps, ao_view.is_some(), neg_scale);
             let obj_ubo =
                 create_uniform_buffer(ctx, "zc-render object ubo", bytemuck::bytes_of(&obj_u));
 
@@ -1175,6 +1572,7 @@ impl Scene3DRenderer {
                 .unwrap_or(&self.fallback_white.view);
             let alpha_map = extra_maps.alpha_view.unwrap_or(&self.fallback_white.view);
             let env_map = extra_maps.env_view.unwrap_or(&self.fallback_white.view);
+            let ao_map = ao_view.unwrap_or(&self.fallback_white.view);
 
             let mat_sampler = match draw.material.wrap {
                 TextureWrap::ClampToEdge => &self.clamp_sampler,
@@ -1229,6 +1627,10 @@ impl Scene3DRenderer {
                     wgpu::BindGroupEntry {
                         binding: 10,
                         resource: wgpu::BindingResource::Sampler(&self.clamp_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 11,
+                        resource: wgpu::BindingResource::TextureView(ao_map),
                     },
                 ],
             });
@@ -1490,6 +1892,7 @@ impl Scene3DRenderer {
                 rpass.set_bind_group(0, &item.scene_bg, &[]);
                 rpass.set_bind_group(1, &item.obj_bg, &[]);
                 rpass.set_vertex_buffer(0, item.mesh.vertex_buffer.slice(..));
+                rpass.set_vertex_buffer(1, item.mesh.color_buffer.slice(..));
                 rpass.set_index_buffer(item.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 rpass.draw_indexed(0..item.mesh.index_count, 0, 0..1);
             }
@@ -1556,11 +1959,219 @@ impl Scene3DRenderer {
             );
         }
 
+        // 4. Optional Optical Flares additive HDR pass with depth-buffer occlusion.
+        if !ext.optical_flares.is_empty() {
+            let flare_pipeline = &self.optical_flare_pipelines[&color_target.format];
+            encode_optical_flares_pass(
+                ctx,
+                &mut encoder,
+                &self.optical_flare_bgl,
+                flare_pipeline,
+                &self.depth_nearest_sampler,
+                color_target,
+                depth_target,
+                ext.optical_flares,
+            );
+        }
+
         let _ = (
             &self.shadow_shader,
             &self.dof_tile_shader,
             &self.dof_dilate_shader,
         );
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        Ok(())
+    }
+
+    /// Renders additive HDR screen-space optical lens flares over `color_target` with
+    /// real depth-buffer occlusion sampled from `depth_target` via `textureSampleLevel`
+    /// (100% Linux Mesa OpenGL/GLES safe).
+    pub fn render_optical_flares(
+        &mut self,
+        ctx: &GpuContext,
+        color_target: &RenderTarget,
+        depth_target: &RenderTarget,
+        flares: &[OpticalFlareDrawCall],
+    ) -> Result<(), RenderError> {
+        if depth_target.format != wgpu::TextureFormat::Depth32Float {
+            return Err(RenderError::UnsupportedFormat(depth_target.format));
+        }
+        if color_target.width != depth_target.width || color_target.height != depth_target.height {
+            return Err(RenderError::InvalidDimensions {
+                width: depth_target.width,
+                height: depth_target.height,
+            });
+        }
+        if flares.is_empty() {
+            return Ok(());
+        }
+
+        self.ensure_optical_flare_pipeline(ctx, color_target.format);
+        let flare_pipeline = &self.optical_flare_pipelines[&color_target.format];
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zc-render optical flares encoder"),
+            });
+        encode_optical_flares_pass(
+            ctx,
+            &mut encoder,
+            &self.optical_flare_bgl,
+            flare_pipeline,
+            &self.depth_nearest_sampler,
+            color_target,
+            depth_target,
+            flares,
+        );
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        Ok(())
+    }
+
+    /// Compiles and caches a custom 3D WGSL material shader under `key`.
+    ///
+    /// `wgsl_fragment_body` must define:
+    /// ```wgsl
+    /// fn custom_material_fs(
+    ///     world_pos: vec3<f32>,
+    ///     world_normal: vec3<f32>,
+    ///     uv: vec2<f32>,
+    ///     vertex_color: vec4<f32>,
+    ///     camera_pos: vec3<f32>,
+    ///     time: f32,
+    ///     params_a: vec4<f32>,
+    ///     params_b: vec4<f32>,
+    /// ) -> vec4<f32>
+    /// ```
+    /// Invalid WGSL returns `Err(RenderError::Shader(_))` without panicking.
+    pub fn register_custom_material_shader(
+        &mut self,
+        ctx: &GpuContext,
+        key: &str,
+        wgsl_fragment_body: &str,
+    ) -> Result<(), RenderError> {
+        let full_src = format!(
+            "{CUSTOM_MATERIAL_3D_PRELUDE}\n{wgsl_fragment_body}\n{CUSTOM_MATERIAL_3D_EPILOGUE}"
+        );
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zc-render custom 3d material wgsl"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(full_src)),
+            });
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            return Err(RenderError::Shader(format!(
+                "custom 3D material '{key}' compilation failed: {err}"
+            )));
+        }
+        // Evict stale pipelines for this key so subsequent draws rebuild with the new shader.
+        self.custom_material_pipelines
+            .retain(|k, _| k.shader_key != key);
+        self.custom_material_shaders.insert(key.to_owned(), module);
+        Ok(())
+    }
+
+    /// Draws a 3D mesh using a previously registered custom 3D WGSL material shader directly into
+    /// `(color_target, depth_target)` with `LoadOp::Load` (preserving existing 3D color and depth).
+    pub fn render_custom_material_mesh(
+        &mut self,
+        ctx: &GpuContext,
+        color_target: &RenderTarget,
+        depth_target: &RenderTarget,
+        camera: &CameraParams,
+        shader_key: &str,
+        draw: &CustomMaterial3DDrawCall<'_>,
+    ) -> Result<(), RenderError> {
+        if depth_target.format != wgpu::TextureFormat::Depth32Float {
+            return Err(RenderError::UnsupportedFormat(depth_target.format));
+        }
+        if color_target.width != depth_target.width || color_target.height != depth_target.height {
+            return Err(RenderError::InvalidDimensions {
+                width: depth_target.width,
+                height: depth_target.height,
+            });
+        }
+        if !self.custom_material_shaders.contains_key(shader_key) {
+            return Err(RenderError::Shader(format!(
+                "custom 3D material shader '{shader_key}' is not registered"
+            )));
+        }
+        if draw.mesh.index_count == 0 {
+            return Ok(());
+        }
+
+        let neg_scale = mat4_upper3x3_det(draw.model) < 0.0;
+        let key = CustomMaterialPipelineKey {
+            shader_key: shader_key.to_owned(),
+            format: color_target.format,
+            side: effective_cull_side(draw.side, neg_scale),
+            blend: draw.blend,
+        };
+        self.ensure_custom_material_pipeline(ctx, &key)?;
+        let pipeline = &self.custom_material_pipelines[&key];
+        let bgl = pipeline.get_bind_group_layout(0);
+
+        let u = CustomShader3DUniforms {
+            view_proj: camera.view_proj,
+            model: draw.model,
+            normal_matrix: draw.normal_matrix,
+            camera_pos_time: [
+                camera.eye_position[0],
+                camera.eye_position[1],
+                camera.eye_position[2],
+                draw.time,
+            ],
+            params_a: draw.params_a,
+            params_b: draw.params_b,
+        };
+        let ubo = create_uniform_buffer(ctx, "zc-render custom 3d mat ubo", bytemuck::bytes_of(&u));
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zc-render custom 3d mat bg"),
+            layout: &bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ubo.as_entire_binding(),
+            }],
+        });
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zc-render custom 3d mat encoder"),
+            });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("zc-render custom 3d mat pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_target.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(pipeline);
+            rpass.set_bind_group(0, &bg, &[]);
+            rpass.set_vertex_buffer(0, draw.mesh.vertex_buffer.slice(..));
+            rpass.set_vertex_buffer(1, draw.mesh.color_buffer.slice(..));
+            rpass.set_index_buffer(draw.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            rpass.draw_indexed(0..draw.mesh.index_count, 0, 0..1);
+        }
         ctx.queue.submit(std::iter::once(encoder.finish()));
         Ok(())
     }
@@ -1695,75 +2306,99 @@ impl Scene3DRenderer {
         self.dof_composite_pipelines.insert(format, pipeline);
     }
 
-    fn ensure_mesh_pipeline(&mut self, ctx: &GpuContext, key: MeshPipelineKey) {
-        if self.mesh_pipelines.contains_key(&key) {
+    fn ensure_optical_flare_pipeline(&mut self, ctx: &GpuContext, format: wgpu::TextureFormat) {
+        if self.optical_flare_pipelines.contains_key(&format) {
             return;
         }
+        let layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zc-render optical flare pipeline layout"),
+                bind_group_layouts: &[Some(&self.optical_flare_bgl)],
+                immediate_size: 0,
+            });
+        // Additive HDR RGB over existing 3D color; premultiplied alpha union so transparent
+        // backgrounds also receive visible flare glow when composited onto 2D layers.
+        let blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("zc-render optical flare pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &self.optical_flare_shader,
+                    entry_point: Some("vs_fullscreen"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.optical_flare_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        self.optical_flare_pipelines.insert(format, pipeline);
+    }
+
+    fn ensure_custom_material_pipeline(
+        &mut self,
+        ctx: &GpuContext,
+        key: &CustomMaterialPipelineKey,
+    ) -> Result<(), RenderError> {
+        if self.custom_material_pipelines.contains_key(key) {
+            return Ok(());
+        }
+        let module = self
+            .custom_material_shaders
+            .get(&key.shader_key)
+            .ok_or_else(|| {
+                RenderError::Shader(format!(
+                    "custom 3D material shader '{}' is not registered",
+                    key.shader_key
+                ))
+            })?;
         let cull_mode = match key.side {
             CullSide::Front => Some(wgpu::Face::Back),
             CullSide::Back => Some(wgpu::Face::Front),
             CullSide::Both => None,
         };
-        let (blend_state, depth_write) = match key.blend {
-            MaterialBlend::Opaque => (wgpu::BlendState::REPLACE, true),
-            MaterialBlend::Normal => (wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, false),
-            MaterialBlend::Additive => (
-                wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::One,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::One,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                },
-                false,
-            ),
-            MaterialBlend::Subtractive => (
-                wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::Zero,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrc,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::Zero,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                },
-                false,
-            ),
-            MaterialBlend::Multiply => (
-                wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::Dst,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::Dst,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                },
-                false,
-            ),
-        };
-
+        let (blend_state, depth_write) = material_blend_state(key.blend);
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pipeline = ctx
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("zc-render scene3d mesh pipeline"),
+                label: Some("zc-render custom 3d material pipeline"),
                 layout: None,
                 vertex: wgpu::VertexState {
-                    module: &self.mesh_shader,
+                    module,
                     entry_point: Some("vs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(MeshVertex::layout())],
+                    buffers: &[Some(MeshVertex::layout()), Some(MeshVertexColor::layout())],
                 },
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1776,6 +2411,74 @@ impl Scene3DRenderer {
                     depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: key.format,
+                        blend: Some(blend_state),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            return Err(RenderError::Shader(format!(
+                "custom 3D material '{}' pipeline error: {err}",
+                key.shader_key
+            )));
+        }
+        self.custom_material_pipelines.insert(key.clone(), pipeline);
+        Ok(())
+    }
+
+    fn ensure_mesh_pipeline(&mut self, ctx: &GpuContext, key: MeshPipelineKey) {
+        if self.mesh_pipelines.contains_key(&key) {
+            return;
+        }
+        let cull_mode = match key.side {
+            CullSide::Front => Some(wgpu::Face::Back),
+            CullSide::Back => Some(wgpu::Face::Front),
+            CullSide::Both => None,
+        };
+        let (blend_state, depth_write) = material_blend_state(key.blend);
+        let depth_bias = if key.polygon_offset_cap {
+            wgpu::DepthBiasState {
+                constant: 1,
+                slope_scale: 1.0,
+                clamp: 0.0,
+            }
+        } else {
+            wgpu::DepthBiasState::default()
+        };
+
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("zc-render scene3d mesh pipeline"),
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &self.mesh_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(MeshVertex::layout()), Some(MeshVertexColor::layout())],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: depth_bias,
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
@@ -1896,6 +2599,213 @@ impl Scene3DRenderer {
                 cache: None,
             });
         self.particle_pipelines.insert(key, pipeline);
+    }
+}
+
+fn material_blend_state(blend: MaterialBlend) -> (wgpu::BlendState, bool) {
+    match blend {
+        MaterialBlend::Opaque => (wgpu::BlendState::REPLACE, true),
+        MaterialBlend::Normal => (wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, false),
+        MaterialBlend::Additive => (
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            false,
+        ),
+        MaterialBlend::Subtractive => (
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            false,
+        ),
+        MaterialBlend::Multiply => (
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            false,
+        ),
+    }
+}
+
+fn clamp_shadow_map_size(ctx: &GpuContext, requested: u32) -> u32 {
+    let max_dim = ctx
+        .device
+        .limits()
+        .max_texture_dimension_2d
+        .clamp(256, 4096);
+    requested.clamp(256, max_dim)
+}
+
+fn create_optical_flare_bind_group_layout(ctx: &GpuContext) -> wgpu::BindGroupLayout {
+    ctx.device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("zc-render optical flare bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_optical_flares_pass(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    flare_bgl: &wgpu::BindGroupLayout,
+    flare_pipeline: &wgpu::RenderPipeline,
+    depth_nearest_sampler: &wgpu::Sampler,
+    color_target: &RenderTarget,
+    depth_target: &RenderTarget,
+    flares: &[OpticalFlareDrawCall],
+) {
+    let width = color_target.width.max(1) as f32;
+    let height = color_target.height.max(1) as f32;
+    let aspect = width / height;
+
+    let mut prepared = Vec::with_capacity(flares.len());
+    for flare in flares {
+        let brightness = if flare.brightness.is_finite() {
+            flare.brightness.max(0.0)
+        } else {
+            0.0
+        };
+        if brightness <= 0.0 {
+            continue;
+        }
+        let scale = if flare.scale.is_finite() {
+            flare.scale.max(0.01)
+        } else {
+            1.0
+        };
+        let anamorphic = if flare.anamorphic.is_finite() {
+            flare.anamorphic.clamp(0.0, 4.0)
+        } else {
+            0.0
+        };
+        let ring = if flare.ring_intensity.is_finite() {
+            flare.ring_intensity.clamp(0.0, 4.0)
+        } else {
+            0.0
+        };
+        let rot = if flare.rotation_rad.is_finite() {
+            flare.rotation_rad
+        } else {
+            0.0
+        };
+        let u = OpticalFlareUniforms {
+            pos_depth_aspect: [
+                flare.screen_pos_ndc[0],
+                flare.screen_pos_ndc[1],
+                flare.depth_ndc,
+                aspect,
+            ],
+            resolution_inv: [width, height, 1.0 / width, 1.0 / height],
+            color_brightness: [flare.color[0], flare.color[1], flare.color[2], brightness],
+            shape_params: [scale, anamorphic, ring, rot],
+            counts_occlusion: [
+                (flare.ghosts.min(8)) as f32,
+                (flare.starburst_rays.min(24)) as f32,
+                if flare.occlusion_enabled { 1.0 } else { 0.0 },
+                0.0,
+            ],
+        };
+        let ubo = create_uniform_buffer(ctx, "zc-render optical flare ubo", bytemuck::bytes_of(&u));
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zc-render optical flare bg"),
+            layout: flare_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&depth_target.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(depth_nearest_sampler),
+                },
+            ],
+        });
+        prepared.push((ubo, bg));
+    }
+
+    if prepared.is_empty() {
+        return;
+    }
+
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("zc-render optical flares pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &color_target.view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(flare_pipeline);
+    for (_ubo, bg) in &prepared {
+        pass.set_bind_group(0, bg, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
@@ -2123,6 +3033,12 @@ fn encode_shadow_layer_pass(
         let u = ShadowUniforms {
             light_view_proj,
             model: draw.model,
+            slot_filter: [
+                draw.material.material_slot_filter.unwrap_or(u32::MAX),
+                0,
+                0,
+                0,
+            ],
         };
         let buf = create_uniform_buffer(ctx, "zc-render shadow ubo", bytemuck::bytes_of(&u));
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2476,6 +3392,7 @@ fn build_scene_uniforms(
     lights: &[SceneLight],
     shadow_assign: &ShadowAssignment,
     linear_lighting: bool,
+    shadow_map_size_2d: u32,
 ) -> SceneUniforms {
     let count = lights.len().min(MAX_SCENE_LIGHTS);
     let mut gpu_lights = [LightGpu::zeroed(); MAX_SCENE_LIGHTS];
@@ -2550,6 +3467,8 @@ fn build_scene_uniforms(
         .map(|c| c.2)
         .unwrap_or(0.0);
 
+    let shadow_texel = 1.0 / (shadow_map_size_2d.max(1) as f32);
+
     SceneUniforms {
         view_proj: camera.view_proj,
         view: camera.view,
@@ -2563,7 +3482,7 @@ fn build_scene_uniforms(
         shadow_params: [
             shadow_assign.spot_dir_casters.len() as f32,
             primary_bias,
-            1.0 / (SHADOW_MAP_SIZE as f32),
+            shadow_texel,
             if linear_lighting { 1.0 } else { 0.0 },
         ],
         shadow_biases,
@@ -2575,6 +3494,7 @@ fn build_scene_uniforms(
 fn build_object_uniforms(
     draw: &MeshDrawCall<'_>,
     extra_maps: &MeshExtraMaps<'_>,
+    has_ao_map: bool,
     neg_scale: bool,
 ) -> ObjectUniforms {
     let m = &draw.material;
@@ -2591,7 +3511,7 @@ fn build_object_uniforms(
     if m.flat_shading {
         bitflags |= 1 << 3;
     }
-    if draw.receive_shadow {
+    if draw.receive_shadow && m.receive_shadow {
         bitflags |= 1 << 4;
     }
     if neg_scale {
@@ -2615,6 +3535,30 @@ fn build_object_uniforms(
     if m.albedo_premultiplied {
         bitflags |= 1 << 11;
     }
+    if m.use_vertex_color {
+        bitflags |= 1 << 12;
+    }
+    if has_ao_map {
+        bitflags |= 1 << 13;
+    }
+    if m.ao_enabled || (has_ao_map && m.ao_intensity > 0.0) {
+        bitflags |= 1 << 14;
+    }
+    if m.cel_enabled {
+        bitflags |= 1 << 15;
+    }
+    if m.fresnel_enabled {
+        bitflags |= 1 << 16;
+    }
+    if m.ramp_enabled {
+        bitflags |= 1 << 17;
+    }
+    if m.bump_noise_enabled && m.bump_strength.is_finite() && m.bump_strength.abs() > 1e-6 {
+        bitflags |= 1 << 18;
+    }
+    if m.reflection_enabled {
+        bitflags |= 1 << 19;
+    }
 
     let emissive_intensity = if m.emissive_intensity.is_finite() {
         m.emissive_intensity.max(0.0)
@@ -2631,6 +3575,68 @@ fn build_object_uniforms(
     } else {
         0.0
     };
+    let bump_strength = if m.bump_strength.is_finite() {
+        m.bump_strength.clamp(-10.0, 10.0)
+    } else {
+        0.0
+    };
+    let bump_noise_scale = if m.bump_noise_scale.is_finite() {
+        m.bump_noise_scale.clamp(0.01, 1024.0)
+    } else {
+        4.0
+    };
+    let env_rotation = if m.env_rotation.is_finite() {
+        m.env_rotation
+    } else {
+        0.0
+    };
+    let ao_intensity = if m.ao_intensity.is_finite() {
+        m.ao_intensity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let ao_distance = if m.ao_distance.is_finite() {
+        m.ao_distance.max(0.001)
+    } else {
+        1.0
+    };
+    let cel_steps = if m.cel_steps.is_finite() {
+        m.cel_steps.max(1.0)
+    } else {
+        4.0
+    };
+    let cel_smoothness = if m.cel_smoothness.is_finite() {
+        m.cel_smoothness.clamp(0.0, 1.0)
+    } else {
+        0.1
+    };
+    let cel_specular_steps = if m.cel_specular_steps.is_finite() {
+        m.cel_specular_steps.max(1.0)
+    } else {
+        6.0
+    };
+    let fresnel_power = if m.fresnel_power.is_finite() {
+        m.fresnel_power.max(0.01)
+    } else {
+        4.0
+    };
+    let fresnel_mix_strength = if m.fresnel_mix_strength.is_finite() {
+        m.fresnel_mix_strength.clamp(0.0, 1.0)
+    } else {
+        0.7
+    };
+    let ramp_factor = if m.ramp_factor.is_finite() {
+        m.ramp_factor.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let proj_rot = if m.proj_rotation.is_finite() {
+        m.proj_rotation
+    } else {
+        0.0
+    };
+    let slot_filter = m.material_slot_filter.unwrap_or(u32::MAX);
+    let packed_modes = (m.uv_projection & 0xFF) | ((m.ramp_source & 0xFF) << 8);
 
     ObjectUniforms {
         model: draw.model,
@@ -2666,8 +3672,41 @@ fn build_object_uniforms(
             m.uv_rotation.cos(),
             m.uv_rotation.sin(),
         ],
-        extra_params: [alpha_test, 0.0, 0.0, 0.0],
-        flags: [bitflags, m.shading as u32, 0, 0],
+        extra_params: [alpha_test, bump_strength, bump_noise_scale, env_rotation],
+        flags: [bitflags, m.shading as u32, slot_filter, packed_modes],
+        ao_color_intensity: [m.ao_color[0], m.ao_color[1], m.ao_color[2], ao_intensity],
+        ao_cel_params: [ao_distance, cel_steps, cel_smoothness, cel_specular_steps],
+        fresnel_color_power: [
+            m.fresnel_color[0],
+            m.fresnel_color[1],
+            m.fresnel_color[2],
+            fresnel_power,
+        ],
+        fresnel_ramp_proj: [
+            fresnel_mix_strength,
+            ramp_factor,
+            proj_rot.cos(),
+            proj_rot.sin(),
+        ],
+        proj_scale_translate: [
+            m.proj_scale[0],
+            m.proj_scale[1],
+            m.proj_translate[0],
+            m.proj_translate[1],
+        ],
+        env_color_top: [
+            m.reflection_env_color_top[0],
+            m.reflection_env_color_top[1],
+            m.reflection_env_color_top[2],
+            0.0,
+        ],
+        env_color_bottom: [
+            m.reflection_env_color_bottom[0],
+            m.reflection_env_color_bottom[1],
+            m.reflection_env_color_bottom[2],
+            0.0,
+        ],
+        ramp_stops: m.ramp_colors,
     }
 }
 
@@ -3485,6 +4524,7 @@ const SHADOW_WGSL: &str = r#"
 struct ShadowUniforms {
     light_view_proj: mat4x4<f32>,
     model: mat4x4<f32>,
+    slot_filter: vec4<u32>,
 };
 
 @group(0) @binding(0)
@@ -3499,6 +4539,9 @@ struct VertexIn {
 
 @vertex
 fn vs_shadow(v: VertexIn) -> @builtin(position) vec4<f32> {
+    if (u_shadow.slot_filter.x != 0xffffffffu && v.material_slot != u_shadow.slot_filter.x) {
+        return vec4<f32>(0.0, 0.0, 2.0, 1.0);
+    }
     let world_pos = u_shadow.model * vec4<f32>(v.position, 1.0);
     return u_shadow.light_view_proj * world_pos;
 }
@@ -3539,6 +4582,14 @@ struct ObjectUniforms {
     uv_transform_b: vec4<f32>,
     extra_params: vec4<f32>,
     flags: vec4<u32>,
+    ao_color_intensity: vec4<f32>,
+    ao_cel_params: vec4<f32>,
+    fresnel_color_power: vec4<f32>,
+    fresnel_ramp_proj: vec4<f32>,
+    proj_scale_translate: vec4<f32>,
+    env_color_top: vec4<f32>,
+    env_color_bottom: vec4<f32>,
+    ramp_stops: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> u_scene: SceneUniforms;
@@ -3557,12 +4608,14 @@ struct ObjectUniforms {
 @group(1) @binding(8) var alpha_tex: texture_2d<f32>;
 @group(1) @binding(9) var env_tex: texture_2d<f32>;
 @group(1) @binding(10) var clamp_sampler: sampler;
+@group(1) @binding(11) var ao_tex: texture_2d<f32>;
 
 struct VertexIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) material_slot: u32,
+    @location(5) color: vec4<f32>,
 };
 
 struct VertexOut {
@@ -3570,6 +4623,10 @@ struct VertexOut {
     @location(0) world_pos: vec3<f32>,
     @location(1) world_normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
+    @location(3) color: vec4<f32>,
+    @location(4) @interpolate(flat) material_slot: u32,
+    @location(5) local_pos: vec3<f32>,
+    @location(6) local_normal: vec3<f32>,
 };
 
 @vertex
@@ -3582,7 +4639,55 @@ fn vs_main(v: VertexIn) -> VertexOut {
     let n_len = length(n_raw);
     out.world_normal = select(vec3<f32>(0.0, 1.0, 0.0), n_raw / n_len, n_len > 1e-6);
     out.uv = v.uv;
+    out.color = v.color;
+    out.material_slot = v.material_slot;
+    out.local_pos = v.position;
+    out.local_normal = v.normal;
     return out;
+}
+
+fn project_uv(mesh_uv: vec2<f32>, local_pos: vec3<f32>, local_normal: vec3<f32>, proj_mode: u32) -> vec2<f32> {
+    if (proj_mode == 0u) {
+        return mesh_uv;
+    }
+    let ps = u_obj.proj_scale_translate.xy;
+    let pt = u_obj.proj_scale_translate.zw;
+    let cs = u_obj.fresnel_ramp_proj.z;
+    let sn = u_obj.fresnel_ramp_proj.w;
+    let scaled = vec3<f32>(
+        local_pos.x * ps.x + pt.x,
+        local_pos.y * ps.y + pt.y,
+        local_pos.z * ps.x,
+    );
+    let p = vec3<f32>(
+        cs * scaled.x + sn * scaled.z,
+        scaled.y,
+        -sn * scaled.x + cs * scaled.z,
+    );
+    if (proj_mode == 1u) {
+        // Spherical projection matching Zoidium `surface-shader.js`
+        let radius = max(length(p), 1e-4);
+        return vec2<f32>(
+            atan2(p.x, p.z) * RECIPROCAL_PI2 + 0.5,
+            asin(clamp(p.y / radius, -1.0, 1.0)) * RECIPROCAL_PI + 0.5,
+        );
+    }
+    if (proj_mode == 2u) {
+        // Cylindrical projection matching Zoidium `surface-shader.js`
+        return vec2<f32>(
+            atan2(p.x, p.z) * RECIPROCAL_PI2 + 0.5,
+            p.y * 0.5 + 0.5,
+        );
+    }
+    // Cubic / triplanar projection matching Zoidium `surface-shader.js`
+    let abs_n = abs(safe_normalize(local_normal, vec3<f32>(0.0, 1.0, 0.0)));
+    if (abs_n.x >= abs_n.y && abs_n.x >= abs_n.z) {
+        return vec2<f32>(p.z, p.y);
+    }
+    if (abs_n.y >= abs_n.z) {
+        return vec2<f32>(p.x, p.z);
+    }
+    return vec2<f32>(p.x, p.y);
 }
 
 fn transform_uv(uv: vec2<f32>) -> vec2<f32> {
@@ -3596,6 +4701,72 @@ fn transform_uv(uv: vec2<f32>) -> vec2<f32> {
     let u = s.x * cs * du + s.x * sn * dv + c.x + o.x;
     let v = -s.y * sn * du + s.y * cs * dv + c.y + o.y;
     return vec2<f32>(u, v);
+}
+
+fn hash31(p: vec3<f32>) -> f32 {
+    var q = fract(p * 0.1031);
+    q = q + vec3<f32>(dot(q, q.yzx + vec3<f32>(33.33)));
+    return fract((q.x + q.y) * q.z);
+}
+
+// Quintic-interpolated 3D value noise with analytical spatial derivative `(value, d/dx, d/dy, d/dz)`.
+fn noise3d_deriv(p: vec3<f32>) -> vec4<f32> {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+
+    let a = hash31(i + vec3<f32>(0.0, 0.0, 0.0));
+    let b = hash31(i + vec3<f32>(1.0, 0.0, 0.0));
+    let c = hash31(i + vec3<f32>(0.0, 1.0, 0.0));
+    let d = hash31(i + vec3<f32>(1.0, 1.0, 0.0));
+    let e = hash31(i + vec3<f32>(0.0, 0.0, 1.0));
+    let g = hash31(i + vec3<f32>(1.0, 0.0, 1.0));
+    let h = hash31(i + vec3<f32>(0.0, 1.0, 1.0));
+    let k = hash31(i + vec3<f32>(1.0, 1.0, 1.0));
+
+    let k0 = a;
+    let k1 = b - a;
+    let k2 = c - a;
+    let k3 = e - a;
+    let k4 = a - b - c + d;
+    let k5 = a - c - e + h;
+    let k6 = a - b - e + g;
+    let k7 = -a + b + c - d + e - g - h + k;
+
+    let val = k0 + k1 * u.x + k2 * u.y + k3 * u.z
+        + k4 * u.x * u.y + k5 * u.y * u.z + k6 * u.z * u.x
+        + k7 * u.x * u.y * u.z;
+    let grad = du * vec3<f32>(
+        k1 + k4 * u.y + k6 * u.z + k7 * u.y * u.z,
+        k2 + k5 * u.z + k4 * u.x + k7 * u.z * u.x,
+        k3 + k6 * u.x + k5 * u.y + k7 * u.x * u.y,
+    );
+    return vec4<f32>(val, grad);
+}
+
+fn evaluate_ramp_4(t_in: f32) -> vec3<f32> {
+    let t = clamp(t_in, 0.0, 1.0);
+    let s0 = u_obj.ramp_stops[0];
+    let s1 = u_obj.ramp_stops[1];
+    let s2 = u_obj.ramp_stops[2];
+    let s3 = u_obj.ramp_stops[3];
+    if (t <= s0.w) {
+        return s0.rgb;
+    }
+    if (t <= s1.w) {
+        let f = clamp((t - s0.w) / max(s1.w - s0.w, 1e-5), 0.0, 1.0);
+        return mix(s0.rgb, s1.rgb, f);
+    }
+    if (t <= s2.w) {
+        let f = clamp((t - s1.w) / max(s2.w - s1.w, 1e-5), 0.0, 1.0);
+        return mix(s1.rgb, s2.rgb, f);
+    }
+    if (t <= s3.w) {
+        let f = clamp((t - s2.w) / max(s3.w - s2.w, 1e-5), 0.0, 1.0);
+        return mix(s2.rgb, s3.rgb, f);
+    }
+    return s3.rgb;
 }
 
 fn shadow_bias_for_slot(slot: u32) -> f32 {
@@ -3779,7 +4950,10 @@ fn safe_normalize(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
-    let uv = transform_uv(fin.uv);
+    let uv_projection = u_obj.flags.w & 255u;
+    let ramp_source = (u_obj.flags.w >> 8u) & 255u;
+    let base_uv = project_uv(fin.uv, fin.local_pos, fin.local_normal, uv_projection);
+    let uv = transform_uv(base_uv);
     // Flip V: zc-scene meshes emit OpenGL bottom-up UVs (v=0 bottom, v=1 top),
     // while images upload top-down (v=0 top).
     let sample_uv = vec2<f32>(uv.x, 1.0 - uv.y);
@@ -3792,6 +4966,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     let roughness_sample = textureSample(roughness_tex, mat_sampler, sample_uv);
     let metalness_sample = textureSample(metalness_tex, mat_sampler, sample_uv);
     let alpha_sample = textureSample(alpha_tex, mat_sampler, sample_uv);
+    let ao_sample = textureSample(ao_tex, mat_sampler, sample_uv);
     let dpdx_pos = dpdx(fin.world_pos);
     let dpdy_pos = dpdy(fin.world_pos);
     let dpdx_uv = dpdx(uv);
@@ -3808,7 +4983,16 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     let has_alpha_map = (u_obj.flags.x & 512u) != 0u;
     let has_env_map = (u_obj.flags.x & 1024u) != 0u;
     let albedo_premul = (u_obj.flags.x & 2048u) != 0u;
+    let use_vertex_color = (u_obj.flags.x & 4096u) != 0u;
+    let has_ao_map = (u_obj.flags.x & 8192u) != 0u;
+    let ao_enabled = (u_obj.flags.x & 16384u) != 0u;
+    let cel_enabled = (u_obj.flags.x & 32768u) != 0u;
+    let fresnel_enabled = (u_obj.flags.x & 65536u) != 0u;
+    let ramp_enabled = (u_obj.flags.x & 131072u) != 0u;
+    let bump_noise_enabled = (u_obj.flags.x & 262144u) != 0u;
+    let reflection_enabled = (u_obj.flags.x & 524288u) != 0u;
     let shading_mode = u_obj.flags.y;
+    let slot_filter = u_obj.flags.z;
 
     let albedo_unpremul = select(
         vec3<f32>(0.0),
@@ -3819,8 +5003,10 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     let albedo_straight = select(vec3<f32>(1.0), albedo_tex_rgb, has_albedo);
     let tex_alpha = select(1.0, albedo_sample.a, has_albedo);
     let alpha_map_factor = select(1.0, alpha_sample.g, has_alpha_map);
-    let albedo = u_obj.base_color_opacity.rgb * albedo_straight;
-    let final_alpha = clamp(u_obj.base_color_opacity.w * tex_alpha * alpha_map_factor, 0.0, 1.0);
+    let vcol_rgb = select(vec3<f32>(1.0), fin.color.rgb, use_vertex_color);
+    let vcol_a = select(1.0, fin.color.a, use_vertex_color);
+    var albedo = u_obj.base_color_opacity.rgb * albedo_straight * vcol_rgb;
+    let final_alpha = clamp(u_obj.base_color_opacity.w * tex_alpha * alpha_map_factor * vcol_a, 0.0, 1.0);
 
     var n = safe_normalize(fin.world_normal, vec3<f32>(0.0, 1.0, 0.0));
     let effective_front = select(is_front, !is_front, neg_scale);
@@ -3851,6 +5037,19 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
         }
     }
 
+    // Material+ 3D procedural gradient-noise normal perturbation.
+    if (bump_noise_enabled) {
+        let b_scale = u_obj.extra_params.z;
+        let b_strength = u_obj.extra_params.y;
+        let p_noise = fin.local_pos * b_scale;
+        let nd1 = noise3d_deriv(p_noise);
+        let nd2 = noise3d_deriv(p_noise * 2.03 + vec3<f32>(17.3, 9.2, 5.7));
+        let grad_local = nd1.yzw * 0.6667 + nd2.yzw * 0.3333 * 2.03;
+        let grad_world = (u_obj.normal_matrix * vec4<f32>(grad_local, 0.0)).xyz;
+        let surf_grad = grad_world - n * dot(grad_world, n);
+        n = safe_normalize(n - surf_grad * b_strength, n);
+    }
+
     // View-space spherical Matcap projection matching Zoidium `matcap.frag.glsl:14-20`.
     let view_pos = (u_scene.view * vec4<f32>(fin.world_pos, 1.0)).xyz;
     let view_dir_vs = safe_normalize(-view_pos, vec3<f32>(0.0, 0.0, 1.0));
@@ -3866,15 +5065,53 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
 
     // Equirectangular environment reflection lookup (unconditional for uniform control flow).
     let v_dir = safe_normalize(u_scene.camera_pos_light_count.xyz - fin.world_pos, vec3<f32>(0.0, 0.0, 1.0));
-    let refl_dir = safe_normalize(reflect(-v_dir, n), n);
+    let refl_raw = safe_normalize(reflect(-v_dir, n), n);
+    let env_rot = u_obj.extra_params.w;
+    let er_c = cos(env_rot);
+    let er_s = sin(env_rot);
+    let refl_dir = vec3<f32>(
+        er_c * refl_raw.x - er_s * refl_raw.z,
+        refl_raw.y,
+        er_s * refl_raw.x + er_c * refl_raw.z,
+    );
     let env_u = atan2(refl_dir.z, refl_dir.x) * RECIPROCAL_PI2 + 0.5;
     let env_v = 1.0 - (asin(clamp(refl_dir.y, -1.0, 1.0)) * RECIPROCAL_PI + 0.5);
     let env_sample = textureSample(env_tex, clamp_sampler, vec2<f32>(env_u, env_v));
 
-    // Alpha test cutoff (must occur after all textureSample/derivative calls).
+    // Per-face material_slot filter and alpha test cutoff (strictly after all textureSample/derivative calls).
+    if (slot_filter != 0xffffffffu && fin.material_slot != slot_filter) {
+        discard;
+    }
     let alpha_test = u_obj.extra_params.x;
     if (alpha_test > 0.0 && final_alpha < alpha_test) {
         discard;
+    }
+
+    // Material+ inline 4-stop Color Ramp.
+    if (ramp_enabled) {
+        var ramp_t = clamp(dot(albedo, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
+        if (ramp_source == 1u) {
+            ramp_t = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+        } else if (ramp_source == 2u) {
+            ramp_t = clamp(1.0 - max(dot(n, v_dir), 0.0), 0.0, 1.0);
+        } else if (ramp_source == 3u) {
+            ramp_t = clamp(uv.x, 0.0, 1.0);
+        } else if (ramp_source == 4u) {
+            ramp_t = clamp(uv.y, 0.0, 1.0);
+        }
+        let ramp_col = evaluate_ramp_4(ramp_t);
+        albedo = mix(albedo, ramp_col, clamp(u_obj.fresnel_ramp_proj.y, 0.0, 1.0));
+    }
+
+    // Material+ Fresnel Rim tinting matching Zoidium `surface-shader.js:155-159`.
+    if (fresnel_enabled) {
+        let fresnel_base = clamp(1.0 - max(dot(n, v_dir), 0.0), 0.0, 1.0);
+        let fresnel_w = clamp(
+            pow(fresnel_base, max(u_obj.fresnel_color_power.w, 0.01)) * u_obj.fresnel_ramp_proj.x,
+            0.0,
+            1.0,
+        );
+        albedo = mix(albedo, u_obj.fresnel_color_power.rgb, fresnel_w);
     }
 
     let emissive_map_rgb = select(vec3<f32>(1.0), emissive_sample.rgb, has_emissive_map);
@@ -3889,15 +5126,15 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     if (shading_mode == 4u) {
         // Matcap: fallback vec4(0.5, 0.5, 0.5, 1.0), alpha = clamp(matcap.a * opacity, 0, 1).
         let mc = select(vec4<f32>(0.5, 0.5, 0.5, 1.0), matcap_sample, has_matcap);
-        let mc_alpha = clamp(mc.a * u_obj.base_color_opacity.w * alpha_map_factor, 0.0, 1.0);
-        let rgb = clamp(u_obj.base_color_opacity.rgb * mc.rgb + emissive_raw, vec3<f32>(0.0), vec3<f32>(1.0));
+        let mc_alpha = clamp(mc.a * u_obj.base_color_opacity.w * alpha_map_factor * vcol_a, 0.0, 1.0);
+        let rgb = clamp(u_obj.base_color_opacity.rgb * vcol_rgb * mc.rgb + emissive_raw, vec3<f32>(0.0), vec3<f32>(1.0));
         return vec4<f32>(rgb * mc_alpha, mc_alpha);
     }
 
     // Three.js r91 evaluates lit materials directly in sRGB when gammaInput/gammaOutput are false.
     // Opt-in linear lighting is supported via `u_scene.shadow_params.w > 0.5`.
     let use_linear = u_scene.shadow_params.w > 0.5;
-    let albedo_c = select(albedo, srgb_to_linear(u_obj.base_color_opacity.rgb) * srgb_to_linear(albedo_straight), use_linear);
+    let albedo_c = select(albedo, srgb_to_linear(albedo), use_linear);
     let emissive_c = select(emissive_raw, srgb_to_linear(emissive_raw), use_linear);
     let specular_c = select(u_obj.specular_refl.rgb, srgb_to_linear(u_obj.specular_refl.rgb), use_linear);
 
@@ -3909,7 +5146,10 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     let diffuse_albedo = select(albedo_c, albedo_c * (1.0 - metalness), shading_mode == 1u);
     let f0 = mix(vec3<f32>(0.04), albedo_c, metalness);
 
-    var lit = emissive_c;
+    var direct_diff_acc = vec3<f32>(0.0);
+    var indirect_diff_acc = vec3<f32>(0.0);
+    var direct_spec_acc = vec3<f32>(0.0);
+    var indirect_spec_acc = vec3<f32>(0.0);
     let light_count = u32(clamp(u_scene.camera_pos_light_count.w, 0.0, 8.0));
 
     for (var i: u32 = 0u; i < light_count; i = i + 1u) {
@@ -3920,7 +5160,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
 
         if (kind == 5u) {
             // Ambient: Three.js multiplies ambient by PI, cancelled by BRDF_Diffuse_Lambert (1/PI).
-            lit = lit + diffuse_albedo * l_color;
+            indirect_diff_acc = indirect_diff_acc + diffuse_albedo * l_color;
             continue;
         }
         if (kind == 4u) {
@@ -3929,7 +5169,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
             let hemi_t = dot(n, hemi_dir) * 0.5 + 0.5;
             let ground_rgb = select(light.ground_kind.rgb, srgb_to_linear(light.ground_kind.rgb), use_linear);
             let hemi_col = mix(ground_rgb, base_light_rgb, hemi_t) * light.color_intensity.w;
-            lit = lit + diffuse_albedo * hemi_col;
+            indirect_diff_acc = indirect_diff_acc + diffuse_albedo * hemi_col;
             continue;
         }
 
@@ -3992,29 +5232,69 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
             let f = fresnel_schlick_three(f0, l_dot_h);
             let g = g_ggx_smith_correlated(alpha, n_dot_l, n_dot_v);
             let d = d_ggx(alpha, n_dot_h);
-            let direct_spec = irradiance * (f * g * d);
-            let direct_diff = irradiance * (RECIPROCAL_PI * diffuse_albedo);
-            lit = lit + direct_diff + direct_spec;
+            direct_spec_acc = direct_spec_acc + irradiance * (f * g * d);
+            direct_diff_acc = direct_diff_acc + irradiance * (RECIPROCAL_PI * diffuse_albedo);
         } else if (shading_mode == 2u) {
             // Blinn-Phong (Three.js r91 RE_Direct_BlinnPhong + BRDF_Specular_BlinnPhong)
-            let direct_diff = irradiance * (RECIPROCAL_PI * diffuse_albedo);
+            direct_diff_acc = direct_diff_acc + irradiance * (RECIPROCAL_PI * diffuse_albedo);
             let f = fresnel_schlick_three(specular_c, l_dot_h);
             let d_bp = RECIPROCAL_PI * (shininess * 0.5 + 1.0) * pow(n_dot_h, shininess);
-            let direct_spec = irradiance * (f * 0.25 * d_bp);
-            lit = lit + direct_diff + direct_spec;
+            direct_spec_acc = direct_spec_acc + irradiance * (f * 0.25 * d_bp);
         } else {
             // Lambert
-            lit = lit + irradiance * (RECIPROCAL_PI * diffuse_albedo);
+            direct_diff_acc = direct_diff_acc + irradiance * (RECIPROCAL_PI * diffuse_albedo);
         }
     }
 
-    // Environment-map IBL reflection for StandardPbr when env_view is bound.
-    if (shading_mode == 1u && has_env_map) {
-        let env_rgb = select(env_sample.rgb, srgb_to_linear(env_sample.rgb), use_linear);
+    // Environment-map IBL reflection for StandardPbr: uses equirectangular env_tex when bound,
+    // or procedural hemisphere sky/ground gradient when `reflection_enabled == true`.
+    if (shading_mode == 1u && (has_env_map || reflection_enabled)) {
+        var env_rgb = vec3<f32>(0.0);
+        if (has_env_map) {
+            env_rgb = select(env_sample.rgb, srgb_to_linear(env_sample.rgb), use_linear);
+        } else {
+            let h_t = smoothstep(0.0, 1.0, clamp(refl_dir.y * 0.5 + 0.5, 0.0, 1.0));
+            let top_c = select(u_obj.env_color_top.rgb, srgb_to_linear(u_obj.env_color_top.rgb), use_linear);
+            let bot_c = select(u_obj.env_color_bottom.rgb, srgb_to_linear(u_obj.env_color_bottom.rgb), use_linear);
+            let horizon_band = exp(-abs(refl_dir.y) * mix(6.0, 1.5, roughness)) * 0.25;
+            env_rgb = mix(bot_c, top_c, h_t) + top_c * horizon_band;
+        }
         let env_brdf = brdf_specular_ggx_env(n_dot_v, f0, roughness);
-        lit = lit + env_rgb * u_obj.specular_refl.w * env_brdf;
+        indirect_spec_acc = indirect_spec_acc + env_rgb * u_obj.specular_refl.w * env_brdf;
     }
 
+    // Material+ Ambient Occlusion modulation matching Zoidium `surface-shader.js:203-222`.
+    if (ao_enabled && has_ao_map) {
+        let ao_int = clamp(u_obj.ao_color_intensity.w, 0.0, 1.0);
+        let ao_dist = max(u_obj.ao_cel_params.x, 0.001);
+        let ao_raw = pow(clamp(ao_sample.r, 0.0, 1.0), ao_dist);
+        let ao_fac = mix(1.0, ao_raw, ao_int);
+        let ao_col_c = select(u_obj.ao_color_intensity.rgb, srgb_to_linear(u_obj.ao_color_intensity.rgb), use_linear);
+        indirect_diff_acc = indirect_diff_acc * mix(vec3<f32>(1.0), ao_col_c, ao_int) * ao_fac;
+        indirect_spec_acc = indirect_spec_acc * ao_fac;
+    }
+
+    // Material+ quantized Cel Shading matching Zoidium `surface-shader.js:224-239`.
+    if (cel_enabled) {
+        let luma_w = vec3<f32>(0.299, 0.587, 0.114);
+        let cel_diff = dot(direct_diff_acc + indirect_diff_acc, luma_w);
+        let cel_spec = dot(direct_spec_acc + indirect_spec_acc, luma_w);
+        let diff_levels = max(u_obj.ao_cel_params.y, 1.0);
+        let spec_levels = max(u_obj.ao_cel_params.w, 1.0);
+        let smooth_k = clamp(u_obj.ao_cel_params.z, 0.0, 1.0);
+        var diff_q = floor(cel_diff * diff_levels + 0.5) / diff_levels;
+        var spec_q = floor(cel_spec * spec_levels + 0.5) / spec_levels;
+        diff_q = mix(diff_q, cel_diff, smooth_k);
+        spec_q = mix(spec_q, cel_spec, smooth_k);
+        let diff_scale = select(1.0, diff_q / max(cel_diff, 1e-4), cel_diff > 1e-4);
+        let spec_scale = select(1.0, spec_q / max(cel_spec, 1e-4), cel_spec > 1e-4);
+        direct_diff_acc = direct_diff_acc * diff_scale;
+        indirect_diff_acc = indirect_diff_acc * diff_scale;
+        direct_spec_acc = direct_spec_acc * spec_scale;
+        indirect_spec_acc = indirect_spec_acc * spec_scale;
+    }
+
+    let lit = emissive_c + direct_diff_acc + indirect_diff_acc + direct_spec_acc + indirect_spec_acc;
     let lit_clamped = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
     let rgb = select(lit_clamped, linear_to_srgb(lit_clamped), use_linear);
     return vec4<f32>(rgb * final_alpha, final_alpha);
@@ -4399,6 +5679,219 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
+const OPTICAL_FLARE_WGSL: &str = r#"
+const PI: f32 = 3.14159265359;
+
+struct OpticalFlareUniforms {
+    pos_depth_aspect: vec4<f32>,
+    resolution_inv: vec4<f32>,
+    color_brightness: vec4<f32>,
+    shape_params: vec4<f32>,
+    counts_occlusion: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u_flare: OpticalFlareUniforms;
+@group(0) @binding(1) var t_depth: texture_2d<f32>;
+@group(0) @binding(2) var s_depth: sampler;
+
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    return vec4<f32>(pos[vid], 0.0, 1.0);
+}
+
+fn poly_dist(p: vec2<f32>, sides: f32) -> f32 {
+    let l = length(p);
+    if (l < 1e-5) {
+        return 0.0;
+    }
+    let ang = atan2(p.y, p.x);
+    let seg = 2.0 * PI / sides;
+    return cos(floor(0.5 + ang / seg) * seg - ang) * l;
+}
+
+@fragment
+fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let res = max(u_flare.resolution_inv.xy, vec2<f32>(1.0));
+    let inv_res = u_flare.resolution_inv.zw;
+    let src_ndc = u_flare.pos_depth_aspect.xy;
+    let src_depth = u_flare.pos_depth_aspect.z;
+    let aspect = max(u_flare.pos_depth_aspect.w, 1e-4);
+
+    // 5-tap depth occlusion test around flare source UV (unconditional for uniform control flow;
+    // uses textureSampleLevel on non-filtering float depth binding for 100% Linux OpenGL/GLES safety).
+    let src_uv = vec2<f32>(src_ndc.x * 0.5 + 0.5, 0.5 - src_ndc.y * 0.5);
+    let tap_r = inv_res * 2.0;
+    let d0 = textureSampleLevel(t_depth, s_depth, clamp(src_uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
+    let d1 = textureSampleLevel(t_depth, s_depth, clamp(src_uv + vec2<f32>( tap_r.x,  tap_r.y), vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
+    let d2 = textureSampleLevel(t_depth, s_depth, clamp(src_uv + vec2<f32>(-tap_r.x,  tap_r.y), vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
+    let d3 = textureSampleLevel(t_depth, s_depth, clamp(src_uv + vec2<f32>( tap_r.x, -tap_r.y), vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
+    let d4 = textureSampleLevel(t_depth, s_depth, clamp(src_uv + vec2<f32>(-tap_r.x, -tap_r.y), vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
+
+    let eps = 0.0005;
+    let vis_sum =
+        select(0.0, 1.0, d0 + eps >= src_depth) +
+        select(0.0, 1.0, d1 + eps >= src_depth) +
+        select(0.0, 1.0, d2 + eps >= src_depth) +
+        select(0.0, 1.0, d3 + eps >= src_depth) +
+        select(0.0, 1.0, d4 + eps >= src_depth);
+    let in_frustum = src_depth >= 0.0 && src_depth <= 1.0;
+    let occ_enabled = u_flare.counts_occlusion.z > 0.5;
+    let raw_vis = select(1.0, vis_sum * 0.2, occ_enabled);
+    let occlusion_vis = select(0.0, raw_vis, in_frustum);
+    if (occlusion_vis <= 0.001) {
+        return vec4<f32>(0.0);
+    }
+
+    let frag_ndc = vec2<f32>(
+        frag_pos.x * inv_res.x * 2.0 - 1.0,
+        1.0 - frag_pos.y * inv_res.y * 2.0,
+    );
+    let p = vec2<f32>(frag_ndc.x * aspect, frag_ndc.y);
+    let src = vec2<f32>(src_ndc.x * aspect, src_ndc.y);
+    let scale = max(u_flare.shape_params.x, 0.01);
+    let anamorphic = u_flare.shape_params.y;
+    let ring_intensity = u_flare.shape_params.z;
+    let rot_rad = u_flare.shape_params.w;
+    let ghost_count = u32(clamp(u_flare.counts_occlusion.x + 0.5, 0.0, 8.0));
+    let ray_count = u_flare.counts_occlusion.y;
+    let base_col = u_flare.color_brightness.rgb;
+    let brightness = u_flare.color_brightness.w;
+
+    let d = p - src;
+    let cr = cos(rot_rad);
+    let sr = sin(rot_rad);
+    let d_rot = vec2<f32>(cr * d.x + sr * d.y, -sr * d.x + cr * d.y);
+    let base_size = 0.32 * scale;
+    let q = d_rot / base_size;
+    let r = length(q);
+
+    // 1. Bright core glow (Zoidium `optflares-shaders.js` etype 0).
+    let core = exp(-r * r * 90.0) * 1.5 + exp(-r * r * 14.0) * 0.7 + exp(-r * r * 3.0) * 0.45;
+    var col = base_col * core;
+
+    // 2. Directional starburst rays.
+    if (ray_count >= 1.0 && r > 1e-5) {
+        let ang = atan2(q.y, q.x);
+        let r1 = pow(abs(cos(ang * ray_count * 0.5)), 24.0);
+        let r2 = pow(abs(cos(ang * ray_count + 0.35)), 48.0) * 0.45;
+        let rays = (r1 + r2) * exp(-r * 1.5);
+        col = col + base_col * rays * 1.1;
+    }
+
+    // 3. Anamorphic horizontal streak.
+    if (anamorphic > 0.001) {
+        let qs = vec2<f32>(d_rot.x / (base_size * 3.2), d_rot.y / (base_size * 0.35));
+        let streak_core = exp(-qs.y * qs.y * 45.0) * exp(-qs.x * qs.x * 1.1);
+        let streak_halo = exp(-qs.y * qs.y * 8.0) * exp(-qs.x * qs.x * 0.38);
+        let streak_tint = mix(base_col, vec3<f32>(0.55, 0.78, 1.0), 0.35);
+        col = col + streak_tint * (streak_core * 1.3 + streak_halo * 0.4) * anamorphic;
+    }
+
+    // 4. Chromatic halo ring.
+    if (ring_intensity > 0.001) {
+        let rr = exp(-pow((r - 0.786) * 24.0, 2.0));
+        let gg = exp(-pow((r - 0.800) * 26.0, 2.0));
+        let bb = exp(-pow((r - 0.814) * 24.0, 2.0));
+        let ring_glow = exp(-pow((r - 0.800) * 6.0, 2.0)) * 0.2;
+        col = col + (base_col * (gg * 1.1 + ring_glow) + vec3<f32>(rr, gg, bb) * 0.28) * ring_intensity;
+    }
+
+    // 5. Chromatic iris ghosts mirrored across screen center (0, 0).
+    let axis = -src;
+    let axis_len = length(axis);
+    let axis_fade = smoothstep(0.0, 0.03, axis_len);
+    if (ghost_count > 0u && axis_fade > 0.001) {
+        for (var i: u32 = 0u; i < ghost_count; i = i + 1u) {
+            let fi = f32(i);
+            let frac = (fi + 0.5) / f32(ghost_count);
+            let t = 0.45 + frac * 1.95;
+            let anchor = src + axis * t;
+            let g_size = base_size * (0.28 + 0.42 * fract(sin(fi * 12.9898 + 1.23) * 43758.5453));
+            let gd = (p - anchor) / max(g_size, 1e-4);
+            let pd_r = poly_dist(gd * 0.96, 6.0);
+            let pd_g = poly_dist(gd, 6.0);
+            let pd_b = poly_dist(gd * 1.04, 6.0);
+            let g_r = smoothstep(1.05, 0.45, pd_r) * 0.22 + exp(-pow((pd_r - 0.95) * 6.0, 2.0)) * 0.14;
+            let g_g = smoothstep(1.05, 0.45, pd_g) * 0.22 + exp(-pow((pd_g - 0.95) * 6.0, 2.0)) * 0.14;
+            let g_b = smoothstep(1.05, 0.45, pd_b) * 0.22 + exp(-pow((pd_b - 0.95) * 6.0, 2.0)) * 0.14;
+            let g_col = vec3<f32>(g_r, g_g, g_b) * mix(vec3<f32>(1.0), base_col, 0.6);
+            col = col + g_col * axis_fade;
+        }
+    }
+
+    col = max(col * brightness * occlusion_vis, vec3<f32>(0.0));
+    let alpha = clamp(max(col.r, max(col.g, col.b)), 0.0, 1.0);
+    return vec4<f32>(col, alpha);
+}
+"#;
+
+const CUSTOM_MATERIAL_3D_PRELUDE: &str = r#"
+struct CustomShader3DUniforms {
+    view_proj: mat4x4<f32>,
+    model: mat4x4<f32>,
+    normal_matrix: mat4x4<f32>,
+    camera_pos_time: vec4<f32>,
+    params_a: vec4<f32>,
+    params_b: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u_custom: CustomShader3DUniforms;
+
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) material_slot: u32,
+    @location(5) color: vec4<f32>,
+};
+
+struct VertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+    @location(1) world_normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(v: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    let world_pos = u_custom.model * vec4<f32>(v.position, 1.0);
+    out.clip_pos = u_custom.view_proj * world_pos;
+    out.world_pos = world_pos.xyz;
+    let n_raw = (u_custom.normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
+    let n_len = length(n_raw);
+    out.world_normal = select(vec3<f32>(0.0, 1.0, 0.0), n_raw / n_len, n_len > 1e-6);
+    out.uv = v.uv;
+    out.color = v.color;
+    return out;
+}
+"#;
+
+const CUSTOM_MATERIAL_3D_EPILOGUE: &str = r#"
+@fragment
+fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
+    let n = select(vec3<f32>(0.0, 1.0, 0.0), normalize(fin.world_normal), length(fin.world_normal) > 1e-6);
+    let c = custom_material_fs(
+        fin.world_pos,
+        n,
+        fin.uv,
+        fin.color,
+        u_custom.camera_pos_time.xyz,
+        u_custom.camera_pos_time.w,
+        u_custom.params_a,
+        u_custom.params_b,
+    );
+    let a = clamp(c.a, 0.0, 1.0);
+    return vec4<f32>(clamp(c.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * a, a);
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4526,7 +6019,7 @@ mod tests {
         };
         let lights = [spot_default_bias, spot_custom_bias, point_shadow];
         let assign_cur = assign_shadow_lights(&lights, &[], CompatMode::Current);
-        let u_cur = build_scene_uniforms(&cam, &lights, &assign_cur, false);
+        let u_cur = build_scene_uniforms(&cam, &lights, &assign_cur, false, SHADOW_MAP_SIZE);
 
         assert!((u_cur.lights[0].position_distance[3] - 42.0).abs() < 1e-5);
         assert!((u_cur.lights[0].cos_inner_decay_penumbra[1] - 2.5).abs() < 1e-5);
@@ -4542,7 +6035,7 @@ mod tests {
         assert!((u_cur.point_shadow_params[0][2] - 0.002).abs() < 1e-6);
 
         let assign_leg = assign_shadow_lights(&lights, &[], CompatMode::Legacy);
-        let u_leg = build_scene_uniforms(&cam, &lights, &assign_leg, false);
+        let u_leg = build_scene_uniforms(&cam, &lights, &assign_leg, false, SHADOW_MAP_SIZE);
         assert!((u_leg.shadow_biases[0] - 0.0).abs() < 1e-6);
         assert!((u_leg.shadow_biases[1] - 0.0).abs() < 1e-6);
         assert!((u_leg.point_shadow_params[0][2] - 0.0).abs() < 1e-6);
@@ -4687,14 +6180,17 @@ mod tests {
                 MaterialBlend::Subtractive,
                 MaterialBlend::Multiply,
             ] {
-                renderer.ensure_mesh_pipeline(
-                    &ctx,
-                    MeshPipelineKey {
-                        format: fmt,
-                        side,
-                        blend,
-                    },
-                );
+                for polygon_offset_cap in [false, true] {
+                    renderer.ensure_mesh_pipeline(
+                        &ctx,
+                        MeshPipelineKey {
+                            format: fmt,
+                            side,
+                            blend,
+                            polygon_offset_cap,
+                        },
+                    );
+                }
             }
         }
         renderer.ensure_lines_pipeline(&ctx, fmt);
@@ -4702,6 +6198,7 @@ mod tests {
             renderer.ensure_particle_pipeline(&ctx, ParticlePipelineKey { format: fmt, blend });
         }
         renderer.ensure_dof_composite_pipeline(&ctx, fmt);
+        renderer.ensure_optical_flare_pipeline(&ctx, fmt);
         let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "WGSL / pipeline validation error: {err:?}");
@@ -4717,6 +6214,7 @@ mod tests {
             ("DOF_TILE_WGSL", DOF_TILE_WGSL),
             ("DOF_DILATE_WGSL", DOF_DILATE_WGSL),
             ("DOF_COMPOSITE_WGSL", DOF_COMPOSITE_WGSL),
+            ("OPTICAL_FLARE_WGSL", OPTICAL_FLARE_WGSL),
         ];
 
         // Static OpenGL/GLES (Naga GLSL backend) guard:
@@ -4753,6 +6251,7 @@ mod tests {
         }
         assert!(!DOF_TILE_WGSL.contains("textureLoad(t_depth"));
         assert!(!DOF_COMPOSITE_WGSL.contains("textureLoad(t_depth"));
+        assert!(!OPTICAL_FLARE_WGSL.contains("textureLoad(t_depth"));
 
         // Verify every WGSL shader module compiles cleanly under wgpu.
         let Some(ctx) = headless_ctx_or_skip() else {
@@ -5210,5 +6709,1121 @@ mod tests {
                 height: 16
             })
         ));
+    }
+
+    fn create_split_quad_mesh_data() -> zc_scene::MeshData {
+        use zc_scene::{MeshData, Vertex3D};
+        // Full-view quad on Z=0: left half [-1..0] is material_slot=0 (red),
+        // right half [0..1] is material_slot=1 (green).
+        let vertices = vec![
+            // Left half (slot 0)
+            Vertex3D::new([-1.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0], 0),
+            Vertex3D::new([0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.5, 0.0], 0),
+            Vertex3D::new([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.5, 1.0], 0),
+            Vertex3D::new([-1.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0], 0),
+            // Right half (slot 1)
+            Vertex3D::new([0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.5, 0.0], 1),
+            Vertex3D::new([1.0, -1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0], 1),
+            Vertex3D::new([1.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0], 1),
+            Vertex3D::new([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.5, 1.0], 1),
+        ];
+        let colors = vec![
+            [1.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+        ];
+        let indices = vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7];
+        MeshData::with_colors(vertices, indices, colors)
+    }
+
+    fn ortho_front_camera() -> CameraParams {
+        let view = mat4_look_at_rh([0.0, 0.0, 5.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let proj = mat4_orthographic_rh(-1.0, 1.0, -1.0, 1.0, 0.1, 20.0);
+        CameraParams {
+            view,
+            proj,
+            view_proj: mat4_mul(proj, view),
+            eye_position: [0.0, 0.0, 5.0],
+        }
+    }
+
+    #[test]
+    fn vertex_colors_render_distinct_red_and_green_halves() {
+        let Some(ctx) = headless_ctx_or_skip() else {
+            return;
+        };
+        let mut renderer = Scene3DRenderer::new(&ctx).expect("scene3d renderer");
+        let color = RenderTarget::new(&ctx, 64, 64, wgpu::TextureFormat::Rgba8Unorm, Some("c"))
+            .expect("color");
+        let depth = RenderTarget::new(&ctx, 64, 64, wgpu::TextureFormat::Depth32Float, Some("d"))
+            .expect("depth");
+        let mesh_data = create_split_quad_mesh_data();
+        let mesh = GpuMesh::from_mesh_data(&ctx, &mesh_data, Some("vcol quad"));
+        let cam = ortho_front_camera();
+
+        // 1. With use_vertex_color = true, left half must be red and right half must be green.
+        let draw_vc = [MeshDrawCall {
+            mesh: &mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::Basic,
+                base_color: [1.0, 1.0, 1.0],
+                use_vertex_color: true,
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &draw_vc,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render vertex colors");
+        let px = readback_rgba8(&ctx, &color);
+        let left = (32 * 64 + 16) * 4;
+        let right = (32 * 64 + 48) * 4;
+        assert!(
+            px[left] > 230 && px[left + 1] < 20 && px[left + 2] < 20 && px[left + 3] == 255,
+            "expected red left half with vertex colors, got {:?}",
+            &px[left..left + 4]
+        );
+        assert!(
+            px[right] < 20 && px[right + 1] > 230 && px[right + 2] < 20 && px[right + 3] == 255,
+            "expected green right half with vertex colors, got {:?}",
+            &px[right..right + 4]
+        );
+
+        // 2. With use_vertex_color = false, both halves ignore vertex colors and render white.
+        let draw_plain = [MeshDrawCall {
+            mesh: &mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::Basic,
+                base_color: [1.0, 1.0, 1.0],
+                use_vertex_color: false,
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &draw_plain,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render without vertex colors");
+        let px_plain = readback_rgba8(&ctx, &color);
+        assert_eq!(&px_plain[left..left + 4], &[255, 255, 255, 255]);
+        assert_eq!(&px_plain[right..right + 4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn multi_slot_materials_and_polygon_offset_cap_render_distinct_slots() {
+        let Some(ctx) = headless_ctx_or_skip() else {
+            return;
+        };
+        let mut renderer = Scene3DRenderer::new(&ctx).expect("scene3d renderer");
+        let color = RenderTarget::new(&ctx, 64, 64, wgpu::TextureFormat::Rgba8Unorm, Some("c"))
+            .expect("color");
+        let depth = RenderTarget::new(&ctx, 64, 64, wgpu::TextureFormat::Depth32Float, Some("d"))
+            .expect("depth");
+        let mesh = GpuMesh::from_mesh_data(&ctx, &create_split_quad_mesh_data(), Some("slot quad"));
+        let cam = ortho_front_camera();
+
+        let draws = [
+            MeshDrawCall {
+                mesh: &mesh,
+                model: mat4_identity(),
+                normal_matrix: mat4_identity(),
+                material: MaterialParams {
+                    shading: ShadingModel::Basic,
+                    base_color: [1.0, 0.1, 0.1],
+                    material_slot_filter: Some(0),
+                    ..Default::default()
+                },
+                albedo_view: None,
+                normal_view: None,
+                matcap_view: None,
+                cast_shadow: false,
+                receive_shadow: false,
+            },
+            MeshDrawCall {
+                mesh: &mesh,
+                model: mat4_identity(),
+                normal_matrix: mat4_identity(),
+                material: MaterialParams {
+                    shading: ShadingModel::Basic,
+                    base_color: [0.1, 0.2, 1.0],
+                    material_slot_filter: Some(1),
+                    polygon_offset_cap: true,
+                    ..Default::default()
+                },
+                albedo_view: None,
+                normal_view: None,
+                matcap_view: None,
+                cast_shadow: false,
+                receive_shadow: false,
+            },
+        ];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &draws,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render multi-slot");
+        let px = readback_rgba8(&ctx, &color);
+        let left = (32 * 64 + 16) * 4;
+        let right = (32 * 64 + 48) * 4;
+        assert!(
+            px[left] > 230 && px[left + 2] < 40,
+            "expected slot 0 red on left half, got {:?}",
+            &px[left..left + 4]
+        );
+        assert!(
+            px[right] < 40 && px[right + 2] > 230,
+            "expected slot 1 blue on right half, got {:?}",
+            &px[right..right + 4]
+        );
+    }
+
+    #[test]
+    fn material_plus_cel_fresnel_ramp_bump_uv_proj_ao_and_env_reflection() {
+        let Some(ctx) = headless_ctx_or_skip() else {
+            return;
+        };
+        let mut renderer = Scene3DRenderer::new(&ctx).expect("scene3d renderer");
+        let color = RenderTarget::new(&ctx, 64, 64, wgpu::TextureFormat::Rgba8Unorm, Some("c"))
+            .expect("color");
+        let depth = RenderTarget::new(&ctx, 64, 64, wgpu::TextureFormat::Depth32Float, Some("d"))
+            .expect("depth");
+        let cam = ortho_front_camera();
+
+        // Build a curved strip whose normals sweep from [-0.95, 0, 0.31] on the left
+        // to [0, 0, 1] at center to [+0.95, 0, 0.31] on the right.
+        let mut curved_verts = Vec::new();
+        let mut curved_indices = Vec::new();
+        let segs = 32usize;
+        for i in 0..=segs {
+            let t = i as f32 / segs as f32;
+            let x = -1.0 + 2.0 * t;
+            let ang = (t - 0.5) * 2.6; // -1.3..+1.3 rad
+            let n = [ang.sin(), 0.0, ang.cos()];
+            curved_verts.push(MeshVertex {
+                position: [x, -1.0, 0.0],
+                normal: n,
+                uv: [t, 0.0],
+                material_slot: 0,
+            });
+            curved_verts.push(MeshVertex {
+                position: [x, 1.0, 0.0],
+                normal: n,
+                uv: [t, 1.0],
+                material_slot: 0,
+            });
+            if i < segs {
+                let b = (i * 2) as u32;
+                curved_indices.extend_from_slice(&[b, b + 2, b + 3, b, b + 3, b + 1]);
+            }
+        }
+        let curved_mesh =
+            GpuMesh::from_slices(&ctx, &curved_verts, &curved_indices, Some("curved"));
+        let flat_mesh = GpuMesh::from_mesh_data(&ctx, &create_split_quad_mesh_data(), Some("flat"));
+        let dir_light = [SceneLight {
+            kind: LightKind::Directional,
+            color: [1.0, 1.0, 1.0],
+            position: [0.0, 0.0, 10.0],
+            target: [0.0, 0.0, 0.0],
+            intensity: 1.0,
+            cast_shadow: false,
+            ..Default::default()
+        }];
+
+        // 1. Cel shading quantizes continuous shading into discrete luminance bands.
+        let draw_smooth = [MeshDrawCall {
+            mesh: &curved_mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::Lambert,
+                base_color: [1.0, 1.0, 1.0],
+                cel_enabled: false,
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &dir_light,
+                    meshes: &draw_smooth,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render smooth");
+        let px_smooth = readback_rgba8(&ctx, &color);
+        let smooth_levels: std::collections::BTreeSet<u8> =
+            (2..62).map(|x| px_smooth[(32 * 64 + x) * 4]).collect();
+
+        let draw_cel = [MeshDrawCall {
+            mesh: &curved_mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::Lambert,
+                base_color: [1.0, 1.0, 1.0],
+                cel_enabled: true,
+                cel_steps: 2.0,
+                cel_smoothness: 0.0,
+                cel_specular_steps: 2.0,
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &dir_light,
+                    meshes: &draw_cel,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render cel");
+        let px_cel = readback_rgba8(&ctx, &color);
+        let cel_levels: std::collections::BTreeSet<u8> =
+            (2..62).map(|x| px_cel[(32 * 64 + x) * 4]).collect();
+        assert!(
+            cel_levels.len() <= 4 && cel_levels.len() < smooth_levels.len(),
+            "cel shading should quantize into <=4 bands (got {} vs smooth {})",
+            cel_levels.len(),
+            smooth_levels.len()
+        );
+
+        // 2. Fresnel rim shifts grazing edges toward blue while center stays red.
+        let draw_fresnel = [MeshDrawCall {
+            mesh: &curved_mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::Basic,
+                base_color: [1.0, 0.0, 0.0],
+                fresnel_enabled: true,
+                fresnel_color: [0.0, 0.0, 1.0],
+                fresnel_power: 2.0,
+                fresnel_mix_strength: 1.0,
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &draw_fresnel,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render fresnel");
+        let px_fresnel = readback_rgba8(&ctx, &color);
+        let center_px = (32 * 64 + 32) * 4;
+        let edge_px = (32 * 64 + 2) * 4;
+        assert!(
+            px_fresnel[center_px] > 230 && px_fresnel[center_px + 2] < 20,
+            "fresnel center should remain red, got {:?}",
+            &px_fresnel[center_px..center_px + 4]
+        );
+        assert!(
+            px_fresnel[edge_px + 2] > 100
+                && px_fresnel[edge_px + 2] > px_fresnel[center_px + 2] + 80,
+            "fresnel grazing edge should shift strongly blue, got {:?}",
+            &px_fresnel[edge_px..edge_px + 4]
+        );
+
+        // 3. Color ramp (UV.x source) maps left to red and right to blue.
+        let draw_ramp = [MeshDrawCall {
+            mesh: &flat_mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::Basic,
+                base_color: [1.0, 1.0, 1.0],
+                ramp_enabled: true,
+                ramp_source: 3, // uv.x
+                ramp_factor: 1.0,
+                ramp_colors: [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [1.0, 1.0, 0.0, 0.33],
+                    [0.0, 1.0, 0.0, 0.67],
+                    [0.0, 0.0, 1.0, 1.0],
+                ],
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &draw_ramp,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render ramp");
+        let px_ramp = readback_rgba8(&ctx, &color);
+        let left_edge = (32 * 64 + 2) * 4;
+        let right_edge = (32 * 64 + 61) * 4;
+        assert!(
+            px_ramp[left_edge] > 200 && px_ramp[left_edge + 2] < 30,
+            "ramp left should be red, got {:?}",
+            &px_ramp[left_edge..left_edge + 4]
+        );
+        assert!(
+            px_ramp[right_edge + 2] > 200 && px_ramp[right_edge] < 30,
+            "ramp right should be blue, got {:?}",
+            &px_ramp[right_edge..right_edge + 4]
+        );
+
+        // 4. Procedural 3D bump noise perturbs normals on a flat lit quad, creating luminance variance.
+        let angled_light = [SceneLight {
+            kind: LightKind::Directional,
+            color: [1.0, 1.0, 1.0],
+            position: [8.0, 6.0, 6.0],
+            target: [0.0, 0.0, 0.0],
+            intensity: 1.0,
+            cast_shadow: false,
+            ..Default::default()
+        }];
+        let draw_bump = [MeshDrawCall {
+            mesh: &flat_mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::Lambert,
+                base_color: [1.0, 1.0, 1.0],
+                bump_noise_enabled: true,
+                bump_strength: 2.5,
+                bump_noise_scale: 8.0,
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &angled_light,
+                    meshes: &draw_bump,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render bump noise");
+        let px_bump = readback_rgba8(&ctx, &color);
+        let (mut min_l, mut max_l) = (255u8, 0u8);
+        for y in 8..56 {
+            for x in 8..56 {
+                let v = px_bump[(y * 64 + x) * 4];
+                min_l = min_l.min(v);
+                max_l = max_l.max(v);
+            }
+        }
+        assert!(
+            max_l.saturating_sub(min_l) >= 35,
+            "procedural bump noise must create normal-driven luminance variation, got range {min_l}..{max_l}"
+        );
+
+        // 5. Cubic UV projection (mode=3) with 2x1 red/blue texture samples distinct halves.
+        let split_tex = ctx
+            .create_rgba8_texture("red-blue 2x1", 2, 1, &[255, 0, 0, 255, 0, 0, 255, 255])
+            .expect("split tex");
+        let draw_proj = [MeshDrawCall {
+            mesh: &flat_mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::Basic,
+                base_color: [1.0, 1.0, 1.0],
+                uv_projection: 3, // Cubic
+                proj_scale: [0.5, 0.5],
+                proj_translate: [0.5, 0.5],
+                wrap: TextureWrap::ClampToEdge,
+                albedo_premultiplied: false,
+                ..Default::default()
+            },
+            albedo_view: Some(&split_tex.view),
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &draw_proj,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render cubic projection");
+        let px_proj = readback_rgba8(&ctx, &color);
+        let p_left = (32 * 64 + 8) * 4;
+        let p_right = (32 * 64 + 56) * 4;
+        assert!(
+            px_proj[p_left] > 200 && px_proj[p_right + 2] > 200,
+            "cubic UV projection should map left->red and right->blue, got left={:?} right={:?}",
+            &px_proj[p_left..p_left + 4],
+            &px_proj[p_right..p_right + 4]
+        );
+
+        // 6. Ambient Occlusion map darkens left half (black AO) vs right half (white AO) under ambient light.
+        let ao_tex = ctx
+            .create_rgba8_texture("ao 2x1", 2, 1, &[0, 0, 0, 255, 255, 255, 255, 255])
+            .expect("ao tex");
+        let amb_light = [SceneLight {
+            kind: LightKind::Ambient,
+            color: [1.0, 1.0, 1.0],
+            intensity: 1.0,
+            cast_shadow: false,
+            ..Default::default()
+        }];
+        let draw_ao = [MeshDrawCall {
+            mesh: &flat_mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::StandardPbr,
+                base_color: [1.0, 1.0, 1.0],
+                metalness: 0.0,
+                roughness: 1.0,
+                wrap: TextureWrap::ClampToEdge,
+                ao_enabled: true,
+                ao_intensity: 0.9,
+                ao_color: [1.0, 1.0, 1.0],
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        let ao_views = [Some(&ao_tex.view)];
+        renderer
+            .render_with_extended_options(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &amb_light,
+                    meshes: &draw_ao,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+                &Scene3DExtendedOptions {
+                    mesh_ao_views: &ao_views,
+                    ..Default::default()
+                },
+            )
+            .expect("render AO");
+        let px_ao = readback_rgba8(&ctx, &color);
+        assert!(
+            px_ao[p_left] < 60 && px_ao[p_right] > 200,
+            "AO map must darken occluded left half vs bright right half, got left={} right={}",
+            px_ao[p_left],
+            px_ao[p_right]
+        );
+
+        // 7. Procedural environment reflection illuminates pure metal with zero lights.
+        let draw_env = [MeshDrawCall {
+            mesh: &flat_mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::StandardPbr,
+                base_color: [1.0, 1.0, 1.0],
+                metalness: 1.0,
+                roughness: 0.1,
+                reflection_enabled: true,
+                reflection_intensity: 1.0,
+                reflection_env_color_top: [0.2, 0.5, 1.0],
+                reflection_env_color_bottom: [0.2, 0.5, 1.0],
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &draw_env,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render procedural env reflection");
+        let px_env = readback_rgba8(&ctx, &color);
+        assert!(
+            px_env[center_px + 2] > 180 && px_env[center_px + 2] > px_env[center_px] + 80,
+            "procedural env reflection should give metallic surface crisp blue sky reflection, got {:?}",
+            &px_env[center_px..center_px + 4]
+        );
+    }
+
+    #[test]
+    fn dynamic_shadow_map_2048_and_shadow_modes_render_cleanly() {
+        let Some(ctx) = headless_ctx_or_skip() else {
+            return;
+        };
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut renderer = Scene3DRenderer::new(&ctx).expect("scene3d renderer");
+        let color = RenderTarget::new(&ctx, 64, 64, wgpu::TextureFormat::Rgba8Unorm, Some("c"))
+            .expect("color");
+        let depth = RenderTarget::new(&ctx, 64, 64, wgpu::TextureFormat::Depth32Float, Some("d"))
+            .expect("depth");
+        let box_mesh = create_unit_box_mesh(&ctx);
+        let cam = CameraParams::perspective_look_at(
+            [0.0, 8.0, 12.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            45.0,
+            1.0,
+            0.1,
+            200.0,
+        );
+        let light = [SceneLight {
+            kind: LightKind::Directional,
+            color: [1.0, 1.0, 1.0],
+            position: [0.0, 20.0, 0.1],
+            target: [0.0, 0.0, 0.0],
+            intensity: 1.0,
+            cast_shadow: true,
+            ..Default::default()
+        }];
+
+        // Floor receiver scaled 12x0.2x12 at y=0, occluder box 2x2x2 at y=3.
+        let floor_model = [
+            [12.0, 0.0, 0.0, 0.0],
+            [0.0, 0.2, 0.0, 0.0],
+            [0.0, 0.0, 12.0, 0.0],
+            [0.0, -0.1, 0.0, 1.0],
+        ];
+        let caster_model = [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0],
+            [0.0, 3.0, 0.0, 1.0],
+        ];
+        let draws = [
+            MeshDrawCall {
+                mesh: &box_mesh,
+                model: floor_model,
+                normal_matrix: mat4_identity(),
+                material: MaterialParams {
+                    shading: ShadingModel::Lambert,
+                    base_color: [1.0, 1.0, 1.0],
+                    ..Default::default()
+                },
+                albedo_view: None,
+                normal_view: None,
+                matcap_view: None,
+                cast_shadow: false,
+                receive_shadow: true,
+            },
+            MeshDrawCall {
+                mesh: &box_mesh,
+                model: caster_model,
+                normal_matrix: mat4_identity(),
+                material: MaterialParams {
+                    shading: ShadingModel::Lambert,
+                    base_color: [1.0, 1.0, 1.0],
+                    ..Default::default()
+                },
+                albedo_view: None,
+                normal_view: None,
+                matcap_view: None,
+                cast_shadow: true,
+                receive_shadow: false,
+            },
+        ];
+
+        for compat_mode in [CompatMode::Current, CompatMode::Legacy] {
+            renderer
+                .render_with_extended_options(
+                    &ctx,
+                    &color,
+                    &depth,
+                    &Scene3DPassInput {
+                        camera: cam,
+                        lights: &light,
+                        meshes: &draws,
+                        particles: &[],
+                        compat_mode,
+                        editing_camera: false,
+                        selection_aabb: None,
+                    },
+                    &Scene3DExtendedOptions {
+                        shadow_map_size: 2048,
+                        ..Default::default()
+                    },
+                )
+                .expect("render with 2048 shadow map");
+        }
+        let expected_size = clamp_shadow_map_size(&ctx, 2048);
+        assert_eq!(renderer.shadow_map_size(), expected_size);
+
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        let err = pollster::block_on(scope.pop());
+        assert!(
+            err.is_none(),
+            "GPU validation error with 2048 shadow map: {err:?}"
+        );
+
+        // Verify shadow is visible on floor right under the caster at origin (32, 32)
+        // vs bright lit floor on the side (10, 32) for CompatMode::Current.
+        renderer
+            .render_with_extended_options(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &light,
+                    meshes: &draws,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+                &Scene3DExtendedOptions {
+                    shadow_map_size: 2048,
+                    ..Default::default()
+                },
+            )
+            .expect("render Current 2048 shadow map");
+        let px = readback_rgba8(&ctx, &color);
+        let floor_row = 32usize;
+        let dark_center = px[(floor_row * 64 + 32) * 4];
+        let lit_side = px[(floor_row * 64 + 10) * 4];
+        assert!(
+            lit_side > 180 && dark_center < lit_side.saturating_sub(100),
+            "expected dark shadow under caster ({dark_center}) vs bright lit floor ({lit_side})"
+        );
+
+        // Verify receive_shadow = false removes shadow on the floor.
+        let mut draws_no_recv = [
+            MeshDrawCall {
+                mesh: &box_mesh,
+                model: floor_model,
+                normal_matrix: mat4_identity(),
+                material: MaterialParams {
+                    shading: ShadingModel::Lambert,
+                    base_color: [1.0, 1.0, 1.0],
+                    receive_shadow: false,
+                    ..Default::default()
+                },
+                albedo_view: None,
+                normal_view: None,
+                matcap_view: None,
+                cast_shadow: false,
+                receive_shadow: true,
+            },
+            MeshDrawCall {
+                mesh: &box_mesh,
+                model: caster_model,
+                normal_matrix: mat4_identity(),
+                material: MaterialParams {
+                    shading: ShadingModel::Lambert,
+                    base_color: [1.0, 1.0, 1.0],
+                    ..Default::default()
+                },
+                albedo_view: None,
+                normal_view: None,
+                matcap_view: None,
+                cast_shadow: true,
+                receive_shadow: false,
+            },
+        ];
+        renderer
+            .render_with_extended_options(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &light,
+                    meshes: &draws_no_recv,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+                &Scene3DExtendedOptions {
+                    shadow_map_size: 2048,
+                    ..Default::default()
+                },
+            )
+            .expect("render receive_shadow=false");
+        let px_no_recv = readback_rgba8(&ctx, &color);
+        assert!(
+            px_no_recv[(floor_row * 64 + 32) * 4] > 180,
+            "receive_shadow=false floor should remain fully lit, got {}",
+            px_no_recv[(floor_row * 64 + 32) * 4]
+        );
+
+        // Verify cast_shadow = false on the box also removes the floor shadow.
+        draws_no_recv[0].material.receive_shadow = true;
+        draws_no_recv[1].cast_shadow = false;
+        renderer
+            .render_with_extended_options(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &light,
+                    meshes: &draws_no_recv,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+                &Scene3DExtendedOptions {
+                    shadow_map_size: 2048,
+                    ..Default::default()
+                },
+            )
+            .expect("render cast_shadow=false");
+        let px_no_cast = readback_rgba8(&ctx, &color);
+        assert!(
+            px_no_cast[(floor_row * 64 + 32) * 4] > 180,
+            "cast_shadow=false occluder must not cast a floor shadow, got {}",
+            px_no_cast[(floor_row * 64 + 32) * 4]
+        );
+    }
+
+    #[test]
+    fn optical_flares_render_bright_unoccluded_and_dimmed_when_depth_occluded() {
+        let Some(ctx) = headless_ctx_or_skip() else {
+            return;
+        };
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut renderer = Scene3DRenderer::new(&ctx).expect("scene3d renderer");
+        let color = RenderTarget::new(&ctx, 64, 64, wgpu::TextureFormat::Rgba8Unorm, Some("c"))
+            .expect("color");
+        let depth = RenderTarget::new(&ctx, 64, 64, wgpu::TextureFormat::Depth32Float, Some("d"))
+            .expect("depth");
+        let cam = ortho_front_camera();
+        let box_mesh = create_unit_box_mesh(&ctx);
+        let flare = OpticalFlareDrawCall {
+            screen_pos_ndc: [0.0, 0.0],
+            depth_ndc: 0.5,
+            color: [1.0, 0.9, 0.7],
+            brightness: 1.5,
+            scale: 1.0,
+            anamorphic: 1.0,
+            ghosts: 4,
+            starburst_rays: 8,
+            ring_intensity: 0.5,
+            occlusion_enabled: true,
+            rotation_rad: 0.0,
+        };
+
+        // 1. Empty scene (depth = 1.0 everywhere) -> flare at depth_ndc = 0.5 is fully unoccluded.
+        renderer
+            .render_with_extended_options(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &[],
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+                &Scene3DExtendedOptions {
+                    optical_flares: &[flare],
+                    ..Default::default()
+                },
+            )
+            .expect("render unoccluded optical flare");
+        let px_open = readback_rgba8(&ctx, &color);
+        let center = (32 * 64 + 32) * 4;
+        let streak_pt = (32 * 64 + 46) * 4;
+        assert!(
+            px_open[center] > 220 && px_open[center + 3] > 220,
+            "unoccluded optical flare core must be bright, got {:?}",
+            &px_open[center..center + 4]
+        );
+        assert!(
+            px_open[streak_pt] > 20 || px_open[streak_pt + 2] > 20,
+            "unoccluded optical flare must emit anamorphic horizontal streak, got {:?}",
+            &px_open[streak_pt..streak_pt + 4]
+        );
+
+        // 2. Place an opaque black box at z=0 (depth_ndc ≈ 0.22 in [0.1, 20] ortho) in front of
+        //    the flare at depth_ndc = 0.5 -> depth occlusion must hide the flare completely!
+        let occluder = [MeshDrawCall {
+            mesh: &box_mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::Basic,
+                base_color: [0.0, 0.0, 0.0],
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        renderer
+            .render_with_extended_options(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &occluder,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+                &Scene3DExtendedOptions {
+                    optical_flares: &[flare],
+                    ..Default::default()
+                },
+            )
+            .expect("render occluded optical flare");
+        let px_occ = readback_rgba8(&ctx, &color);
+        assert!(
+            px_occ[center] < 10 && px_occ[center + 1] < 10 && px_occ[center + 2] < 10,
+            "depth-occluded optical flare must be hidden behind 3D geometry, got {:?}",
+            &px_occ[center..center + 4]
+        );
+
+        // 3. Standalone `render_optical_flares` with occlusion_enabled = false shines over the occluder.
+        let unoccluded_override = OpticalFlareDrawCall {
+            occlusion_enabled: false,
+            ..flare
+        };
+        renderer
+            .render_optical_flares(&ctx, &color, &depth, &[unoccluded_override])
+            .expect("render standalone optical flare");
+        let px_forced = readback_rgba8(&ctx, &color);
+        assert!(
+            px_forced[center] > 220,
+            "optical flare with occlusion_enabled=false must shine through geometry, got {:?}",
+            &px_forced[center..center + 4]
+        );
+
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "Optical flare GPU validation error: {err:?}");
+    }
+
+    #[test]
+    fn custom_3d_material_shader_compiles_renders_and_rejects_invalid_wgsl() {
+        let Some(ctx) = headless_ctx_or_skip() else {
+            return;
+        };
+        let mut renderer = Scene3DRenderer::new(&ctx).expect("scene3d renderer");
+        let color = RenderTarget::new(&ctx, 32, 32, wgpu::TextureFormat::Rgba8Unorm, Some("c"))
+            .expect("color");
+        let depth = RenderTarget::new(&ctx, 32, 32, wgpu::TextureFormat::Depth32Float, Some("d"))
+            .expect("depth");
+        let box_mesh = create_unit_box_mesh(&ctx);
+        let cam = ortho_front_camera();
+
+        // Clear color & depth first via empty 3D pass.
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &[],
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("clear");
+
+        // Invalid WGSL must return Err(RenderError::Shader(_)) without panicking.
+        let bad_res = renderer.register_custom_material_shader(&ctx, "broken", "fn oops( {");
+        assert!(matches!(bad_res, Err(RenderError::Shader(_))));
+
+        // Valid WGSL custom 3D shader renders magenta from params_a.
+        let good_body = r#"
+            fn custom_material_fs(
+                world_pos: vec3<f32>,
+                world_normal: vec3<f32>,
+                uv: vec2<f32>,
+                vertex_color: vec4<f32>,
+                camera_pos: vec3<f32>,
+                time: f32,
+                params_a: vec4<f32>,
+                params_b: vec4<f32>,
+            ) -> vec4<f32> {
+                return vec4<f32>(params_a.rgb, 1.0);
+            }
+        "#;
+        renderer
+            .register_custom_material_shader(&ctx, "magenta", good_body)
+            .expect("register custom 3d shader");
+        renderer
+            .render_custom_material_mesh(
+                &ctx,
+                &color,
+                &depth,
+                &cam,
+                "magenta",
+                &CustomMaterial3DDrawCall {
+                    mesh: &box_mesh,
+                    model: mat4_identity(),
+                    normal_matrix: mat4_identity(),
+                    side: CullSide::Front,
+                    blend: MaterialBlend::Opaque,
+                    time: 0.0,
+                    params_a: [1.0, 0.0, 1.0, 1.0],
+                    params_b: [0.0; 4],
+                },
+            )
+            .expect("render custom 3d material");
+        let px = readback_rgba8(&ctx, &color);
+        let center = (16 * 32 + 16) * 4;
+        assert!(
+            px[center] > 240
+                && px[center + 1] < 10
+                && px[center + 2] > 240
+                && px[center + 3] == 255,
+            "expected magenta custom 3D material output, got {:?}",
+            &px[center..center + 4]
+        );
     }
 }

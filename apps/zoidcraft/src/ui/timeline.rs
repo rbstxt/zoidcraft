@@ -11,19 +11,21 @@ use serde_json::Value;
 use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
 use zc_color::{Hsl, Rgb, ThemePalette, choose_clip_label_color};
 use zc_session::{
-    Command, KeyframeRef, Session, SessionClip, SessionProperty, SessionTrack,
+    ClipSnapshot, Command, KeyframeRef, Session, SessionClip, SessionProperty, SessionTrack,
     TIME_FORMAT_FRAME_NUMBER, TIME_FORMAT_TIMECODE_FRAMES, TIME_FORMAT_TIMECODE_MS, TrackKind,
 };
 
 use super::gestures::{
     GestureClassifier, ScrollDevice, pointer_on_layer, rect_contains_unoccluded_pointer,
 };
-use super::theme::{Cm3Icon, TEXT_MUTED, TEXT_PRIMARY, paint_cm3_icon};
+use super::theme::{Cm3Icon, MARKER_GREEN, TEXT_MUTED, TEXT_PRIMARY, paint_cm3_icon};
 
 // ---------------------------------------------------------------------------
 // Exact CM3 Timeline Geometry & Palette Constants (Spec 01 §1.7, Spec 02 §1)
 // ---------------------------------------------------------------------------
 
+/// Active Precomp+ composition breadcrumb bar height (`24 px`).
+pub const BREADCRUMB_BAR_HEIGHT: f32 = 24.0;
 /// Fixed left header column width (`200 px`).
 pub const HEADER_WIDTH: f32 = 200.0;
 /// Time ruler & top-left timecode box height (`35 px`).
@@ -304,6 +306,21 @@ pub enum TimelineDragState {
     TrimmingLeft(TrimDragState),
     TrimmingRight(TrimDragState),
     DraggingKeyframe(KeyframeDragState),
+    DraggingMarker {
+        index: usize,
+        orig_frame: f64,
+        preview_frame: f64,
+        name: String,
+        color: Option<String>,
+        moved: bool,
+    },
+    InlineRenamingMarker {
+        index: usize,
+        frame: f64,
+        buffer: String,
+        color: Option<String>,
+        just_opened: bool,
+    },
     DraggingDivider {
         start_y: f32,
         start_split_y: f32,
@@ -323,6 +340,130 @@ pub enum TimelineDragState {
         original_name: String,
         just_opened: bool,
     },
+}
+
+/// Active composition breadcrumb descriptor when editing inside a nested Precomp+.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositionBreadcrumb {
+    pub comp_id: zc_project::Uuid,
+    pub main_name: String,
+    pub comp_name: String,
+}
+
+/// Returns the active composition breadcrumb info if the session is currently editing a nested Precomp+.
+#[must_use]
+pub fn active_composition_breadcrumb(session: &Session) -> Option<CompositionBreadcrumb> {
+    let comp_id = session.document().active_composition_id?;
+    let main_name = if session.project.sequence.name.trim().is_empty() {
+        "Main".to_string()
+    } else {
+        session.project.sequence.name.clone()
+    };
+    let comp_name = session
+        .project
+        .compositions
+        .get(&comp_id)
+        .map(|c| c.name.clone())
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "Precomp".to_string());
+    Some(CompositionBreadcrumb {
+        comp_id,
+        main_name,
+        comp_name,
+    })
+}
+
+#[derive(Debug, Clone)]
+enum TimelineContextMenu {
+    Clip {
+        pos: Pos2,
+        clip_id: String,
+        clip_name: String,
+        clip_start: f64,
+        clip_length: f64,
+        locked: bool,
+    },
+    Lane {
+        pos: Pos2,
+        tracks_height: f32,
+    },
+    Ruler {
+        pos: Pos2,
+        clicked_frame: f64,
+    },
+    Marker {
+        pos: Pos2,
+        index: usize,
+        frame: f64,
+        name: String,
+        color: Option<String>,
+    },
+}
+
+const MARKER_PRESET_COLORS: [(&str, &str, Color32); 6] = [
+    ("Emerald", "#70c29d", Color32::from_rgb(0x70, 0xc2, 0x9d)),
+    ("Amber", "#e0a040", Color32::from_rgb(0xe0, 0xa0, 0x40)),
+    ("Coral", "#ed6a68", Color32::from_rgb(0xed, 0x6a, 0x68)),
+    ("Sky", "#64b5f6", Color32::from_rgb(0x64, 0xb5, 0xf6)),
+    ("Violet", "#c792ea", Color32::from_rgb(0xc7, 0x92, 0xea)),
+    ("Lime", "#81c784", Color32::from_rgb(0x81, 0xc7, 0x84)),
+];
+
+/// Parses a `#rrggbb` hex color string into an `egui::Color32`.
+#[must_use]
+pub fn parse_marker_hex_color(hex: &str) -> Option<Color32> {
+    let trimmed = hex.trim().strip_prefix('#')?;
+    if trimmed.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&trimmed[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&trimmed[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&trimmed[4..6], 16).ok()?;
+    Some(Color32::from_rgb(r, g, b))
+}
+
+fn marker_color_at(seq: &zc_project::Sequence, index: usize) -> (Option<String>, Color32) {
+    let raw = seq
+        .preserved
+        .get("markerColors")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.get(index))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let color = raw
+        .as_deref()
+        .and_then(parse_marker_hex_color)
+        .unwrap_or(MARKER_GREEN);
+    (raw, color)
+}
+
+/// Hit-tests timeline markers along `ruler_rect`, returning the closest marker index within 9 px.
+#[must_use]
+pub fn hit_test_marker(
+    markers: &[zc_project::Marker],
+    ruler_rect: Rect,
+    scroll_x: f64,
+    fps: f64,
+    zoom: f64,
+    pointer: Pos2,
+) -> Option<usize> {
+    if !ruler_rect.contains(pointer) {
+        return None;
+    }
+    let mut best_dist = 9.0_f32;
+    let mut hit = None;
+    for (idx, m) in markers.iter().enumerate() {
+        let mx = ruler_rect.left() + (frame_to_px(m.frame, fps, zoom) - scroll_x) as f32;
+        if mx < ruler_rect.left() - 10.0 || mx > ruler_rect.right() + 10.0 {
+            continue;
+        }
+        let dx = (pointer.x - mx).abs();
+        if dx < best_dist && pointer.y >= ruler_rect.top() + 8.0 {
+            best_dist = dx;
+            hit = Some(idx);
+        }
+    }
+    hit
 }
 
 /// Signals emitted by [`show_timeline`] for the host application shell.
@@ -357,9 +498,11 @@ pub struct TimelineViewState {
     pub keyframe_area_height: f32,
     pub cached_frame_spans: Vec<(f64, f64)>,
     pub gesture_classifier: GestureClassifier,
+    pub clip_clipboard: Vec<ClipSnapshot>,
     track_height_accum: f32,
     scrollbar_drag_offset: Option<f32>,
     kf_splitter_drag: Option<(f32, f32)>,
+    context_menu: Option<TimelineContextMenu>,
 }
 
 impl Default for TimelineViewState {
@@ -394,9 +537,11 @@ impl TimelineViewState {
             keyframe_area_height: KEYFRAME_AREA_HEIGHT,
             cached_frame_spans: Vec::new(),
             gesture_classifier: GestureClassifier::new(),
+            clip_clipboard: Vec::new(),
             track_height_accum: 0.0,
             scrollbar_drag_offset: None,
             kf_splitter_drag: None,
+            context_menu: None,
         }
     }
 
@@ -439,11 +584,12 @@ impl TimelineViewState {
         self.scroll_x = 0.0;
     }
 
-    /// Cancels any active drag, marquee, or inline clip rename. Returns `true` if something was cancelled.
+    /// Cancels any active drag, marquee, context menu, or inline clip/marker rename. Returns `true` if something was cancelled.
     pub fn cancel_active_interaction(&mut self, session: &mut Session) -> bool {
         let had_kf_drag = self.kf_splitter_drag.take().is_some();
+        let had_menu = self.context_menu.take().is_some();
         if matches!(self.drag_state, TimelineDragState::None) {
-            return had_kf_drag;
+            return had_kf_drag || had_menu;
         }
         if session.history.is_in_transaction() {
             let _ = session.cancel_transaction();
@@ -521,6 +667,9 @@ fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
                         );
                     }
                 }
+                if track.kind == TrackKind::Video {
+                    collect_mask_and_shape_plus_keyframe_rows(&mut rows, session, clip);
+                }
                 break;
             }
         }
@@ -535,6 +684,175 @@ fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
         &doc.sequence_properties,
     );
     rows
+}
+
+fn collect_mask_and_shape_plus_keyframe_rows(
+    out: &mut Vec<KeyframeLaneRow>,
+    session: &Session,
+    clip: &SessionClip,
+) {
+    let Ok(clip_uuid) = zc_project::Uuid::parse_str(&clip.id) else {
+        return;
+    };
+    let seq = session.active_sequence();
+    let Some(vc) = seq
+        .video_tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .find(|c| c.id == clip_uuid)
+    else {
+        return;
+    };
+
+    // 1. Animated LayerMask properties (path keyframes + preserved animated mask props).
+    if let Some(masks) = seq.layer_masks.get(&vc.layer.id) {
+        for mask in masks {
+            let mask_name = if mask.name.trim().is_empty() {
+                mask.id.as_str()
+            } else {
+                mask.name.as_str()
+            };
+            if (mask.path.animated || mask.path.keyframes.len() > 1)
+                && !mask.path.keyframes.is_empty()
+            {
+                let keyframes = mask
+                    .path
+                    .keyframes
+                    .iter()
+                    .map(|k| KeyframeLaneItem {
+                        local_frame: k.frame,
+                        value: serde_json::to_value(&k.value).unwrap_or(Value::Null),
+                        tween: k.tween as u16,
+                        control_points: k.control_points,
+                        continuous_tangent: k.continuous_tangent,
+                    })
+                    .collect();
+                out.push(KeyframeLaneRow {
+                    target_id: format!("mask:{}:{}", clip.id, mask.id),
+                    property: "path".to_string(),
+                    display_label: format!("Mask:{mask_name}.path"),
+                    frame_offset: clip.start,
+                    locked: true,
+                    keyframes,
+                });
+            }
+            for (prop_key, prop_val) in &mask.preserved {
+                if let Some(kfs) = extract_json_keyframes(prop_val) {
+                    out.push(KeyframeLaneRow {
+                        target_id: format!("mask:{}:{}", clip.id, mask.id),
+                        property: prop_key.clone(),
+                        display_label: format!("Mask:{mask_name}.{prop_key}"),
+                        frame_offset: clip.start,
+                        locked: true,
+                        keyframes: kfs,
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Animated Shape+ payload tracks (and preserved Shape+ / layer animated tracks).
+    if let zc_project::LayerKind::Plugin {
+        plugin_type,
+        payload,
+    } = &vc.layer.kind
+        && plugin_type.contains("shape-plus")
+    {
+        collect_shape_plus_payload_rows(out, &clip.id, clip.start, payload, 0);
+    }
+    for (key, val) in &vc.layer.preserved {
+        if key == "shapePlus" {
+            collect_shape_plus_payload_rows(out, &clip.id, clip.start, val, 0);
+        } else if let Some(kfs) = extract_json_keyframes(val) {
+            out.push(KeyframeLaneRow {
+                target_id: format!("preserved:{}", clip.id),
+                property: key.clone(),
+                display_label: format!("Layer.{key}"),
+                frame_offset: clip.start,
+                locked: true,
+                keyframes: kfs,
+            });
+        }
+    }
+}
+
+fn collect_shape_plus_payload_rows(
+    out: &mut Vec<KeyframeLaneRow>,
+    clip_id: &str,
+    frame_offset: f64,
+    payload: &Value,
+    depth: usize,
+) {
+    if depth > 16 {
+        return;
+    }
+    let Some(contents) = payload.get("contents").and_then(Value::as_array) else {
+        return;
+    };
+    for item in contents {
+        let item_id = item.get("id").and_then(Value::as_str).unwrap_or("item");
+        let item_kind = item.get("kind").and_then(Value::as_str).unwrap_or("shape");
+        let item_name = item
+            .get("properties")
+            .and_then(|p| p.get("name"))
+            .and_then(|v| {
+                v.as_str()
+                    .or_else(|| v.get("value").and_then(Value::as_str))
+            })
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(item_kind);
+
+        if let Some(props) = item.get("properties").and_then(Value::as_object) {
+            for (prop_name, prop_val) in props {
+                if let Some(kfs) = extract_json_keyframes(prop_val) {
+                    out.push(KeyframeLaneRow {
+                        target_id: format!("shape_plus:{clip_id}:{item_id}"),
+                        property: prop_name.clone(),
+                        display_label: format!("Shape+:{item_name}.{prop_name}"),
+                        frame_offset,
+                        locked: true,
+                        keyframes: kfs,
+                    });
+                }
+            }
+        }
+        collect_shape_plus_payload_rows(out, clip_id, frame_offset, item, depth + 1);
+    }
+}
+
+fn extract_json_keyframes(val: &Value) -> Option<Vec<KeyframeLaneItem>> {
+    let obj = val.as_object()?;
+    let kfs_arr = obj.get("keyframes").and_then(Value::as_array)?;
+    if kfs_arr.is_empty() {
+        return None;
+    }
+    let is_animated = obj
+        .get("animated")
+        .and_then(Value::as_bool)
+        .unwrap_or(kfs_arr.len() > 1);
+    if !is_animated && kfs_arr.len() <= 1 {
+        return None;
+    }
+    let mut items: Vec<KeyframeLaneItem> = kfs_arr
+        .iter()
+        .filter_map(|k| {
+            let f = k.get("frame").and_then(Value::as_f64)?;
+            let v = k.get("value").cloned().unwrap_or(Value::Null);
+            let tween = k.get("tween").and_then(Value::as_u64).unwrap_or(1) as u16;
+            Some(KeyframeLaneItem {
+                local_frame: f,
+                value: v,
+                tween,
+                control_points: [[-10.0, 0.0], [10.0, 0.0]],
+                continuous_tangent: true,
+            })
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    items.sort_by(|a, b| a.local_frame.total_cmp(&b.local_frame));
+    Some(items)
 }
 
 fn push_property_rows(
@@ -582,6 +900,11 @@ fn collect_clip_snap_targets(session: &Session, exclude_ids: &BTreeSet<String>) 
         session.playback.current_frame.round(),
         doc.sequence_length,
     ];
+    for marker in &session.active_sequence().markers {
+        if marker.frame.is_finite() {
+            targets.push(marker.frame);
+        }
+    }
     for track in doc.video_tracks.iter().chain(doc.audio_tracks.iter()) {
         for clip in &track.clips {
             if exclude_ids.contains(&clip.id) {
@@ -709,34 +1032,48 @@ pub fn show_timeline(
     let fps = session.document().fps.max(1.0);
     let total_frames = session.document().sequence_length.max(1.0);
 
-    // Compute exact CM3 vertical layout rects.
-    let content_left = panel_rect.left() + HEADER_WIDTH;
-    let content_width = (panel_rect.right() - content_left).max(1.0);
+    // Optional Precomp+ Active Composition Breadcrumb Bar at the top of the timeline.
+    let breadcrumb = active_composition_breadcrumb(session);
+    let breadcrumb_h = if breadcrumb.is_some() {
+        BREADCRUMB_BAR_HEIGHT
+    } else {
+        0.0
+    };
+    let breadcrumb_rect =
+        Rect::from_min_size(panel_rect.min, vec2(panel_rect.width(), breadcrumb_h));
+    let body_rect = Rect::from_min_max(
+        pos2(panel_rect.left(), panel_rect.top() + breadcrumb_h),
+        panel_rect.max,
+    );
+
+    // Compute exact CM3 vertical layout rects inside `body_rect`.
+    let content_left = body_rect.left() + HEADER_WIDTH;
+    let content_width = (body_rect.right() - content_left).max(1.0);
     state.last_viewport_width = content_width;
 
-    let timecode_rect = Rect::from_min_size(panel_rect.min, vec2(HEADER_WIDTH, RULER_HEIGHT));
+    let timecode_rect = Rect::from_min_size(body_rect.min, vec2(HEADER_WIDTH, RULER_HEIGHT));
     let ruler_rect = Rect::from_min_size(
-        pos2(content_left, panel_rect.top()),
+        pos2(content_left, body_rect.top()),
         vec2(content_width, RULER_HEIGHT),
     );
 
     let kf_top = ruler_rect.bottom();
-    let max_kf_h = (panel_rect.height() - RULER_HEIGHT - KEYFRAME_SPLITTER_HEIGHT - 24.0).max(0.0);
+    let max_kf_h = (body_rect.height() - RULER_HEIGHT - KEYFRAME_SPLITTER_HEIGHT - 24.0).max(0.0);
     let kf_height = state.keyframe_area_height.clamp(0.0, max_kf_h);
     let kf_header_rect = Rect::from_min_size(
-        pos2(panel_rect.left(), kf_top),
+        pos2(body_rect.left(), kf_top),
         vec2(HEADER_WIDTH, kf_height),
     );
     let kf_lanes_rect =
         Rect::from_min_size(pos2(content_left, kf_top), vec2(content_width, kf_height));
 
     let kf_splitter_rect = Rect::from_min_size(
-        pos2(panel_rect.left(), kf_top + kf_height),
-        vec2(panel_rect.width(), KEYFRAME_SPLITTER_HEIGHT),
+        pos2(body_rect.left(), kf_top + kf_height),
+        vec2(body_rect.width(), KEYFRAME_SPLITTER_HEIGHT),
     );
 
     let tracks_top = kf_splitter_rect.bottom();
-    let tracks_bottom = panel_rect.bottom().max(tracks_top + DIVIDER_HEIGHT);
+    let tracks_bottom = body_rect.bottom().max(tracks_top + DIVIDER_HEIGHT);
     let tracks_height = (tracks_bottom - tracks_top).max(DIVIDER_HEIGHT);
 
     if !state.video_audio_split_custom || state.video_audio_split_y < 0.0 {
@@ -752,21 +1089,21 @@ pub fn show_timeline(
     }
 
     let video_rect = Rect::from_min_max(
-        pos2(panel_rect.left(), tracks_top),
-        pos2(panel_rect.right(), tracks_top + state.video_audio_split_y),
+        pos2(body_rect.left(), tracks_top),
+        pos2(body_rect.right(), tracks_top + state.video_audio_split_y),
     );
     let video_header_rect =
         Rect::from_min_max(video_rect.min, pos2(content_left, video_rect.bottom()));
     let video_lanes_rect = Rect::from_min_max(pos2(content_left, video_rect.top()), video_rect.max);
 
     let divider_rect = Rect::from_min_size(
-        pos2(panel_rect.left(), video_rect.bottom()),
-        vec2(panel_rect.width(), DIVIDER_HEIGHT),
+        pos2(body_rect.left(), video_rect.bottom()),
+        vec2(body_rect.width(), DIVIDER_HEIGHT),
     );
 
     let audio_rect = Rect::from_min_max(
-        pos2(panel_rect.left(), divider_rect.bottom()),
-        pos2(panel_rect.right(), tracks_bottom),
+        pos2(body_rect.left(), divider_rect.bottom()),
+        pos2(body_rect.right(), tracks_bottom),
     );
     let audio_header_rect =
         Rect::from_min_max(audio_rect.min, pos2(content_left, audio_rect.bottom()));
@@ -775,9 +1112,9 @@ pub fn show_timeline(
     let scrollbar_rect = Rect::from_min_max(
         pos2(
             content_left,
-            (panel_rect.bottom() - SCROLLBAR_HEIGHT).max(tracks_top),
+            (body_rect.bottom() - SCROLLBAR_HEIGHT).max(tracks_top),
         ),
-        pos2(panel_rect.right(), panel_rect.bottom()),
+        pos2(body_rect.right(), body_rect.bottom()),
     );
 
     // Playback page-flip follow auto-scroll (Spec 02 §2.2).
@@ -798,7 +1135,7 @@ pub fn show_timeline(
     handle_wheel_and_middle_pan(
         ui,
         state,
-        panel_rect,
+        body_rect,
         ruler_rect,
         kf_header_rect,
         video_header_rect,
@@ -819,10 +1156,22 @@ pub fn show_timeline(
     let painter = ui.painter();
     painter.rect_filled(panel_rect, CornerRadius::ZERO, COLOR_PANEL_BG);
 
-    // 1. Timecode box (200 x 35 px: left frame/timecode + right sunken "Render Time" toggle).
-    paint_and_interact_timecode(ui, session, palette, timecode_rect, fps);
+    // 0. Optional Active Composition Breadcrumb Bar (Precomp+).
+    if let Some(ref crumb) = breadcrumb {
+        paint_and_interact_breadcrumb_bar(
+            ui,
+            session,
+            palette,
+            breadcrumb_rect,
+            crumb,
+            &mut action,
+        );
+    }
 
-    // 2. Time Ruler (full-height minor/major ticks, 14 px #656565 labels, selection bar, playhead scrub).
+    // 1. Timecode box (200 x 35 px: left timecode + Snap Magnet toggle + right "Render Time" toggle).
+    paint_and_interact_timecode(ui, session, state, palette, timecode_rect, fps);
+
+    // 2. Time Ruler (ticks, labels, interactive markers, selection bar, playhead scrub).
     if paint_and_interact_ruler(
         ui,
         session,
@@ -832,6 +1181,7 @@ pub fn show_timeline(
         fps,
         total_frames,
         max_scroll_x,
+        &mut action,
     ) {
         action.playhead_scrubbed = true;
     }
@@ -879,7 +1229,7 @@ pub fn show_timeline(
         &mut action,
     );
 
-    // 7. Complete active clip drag / trim / marquee state machines across full panel.
+    // 7. Complete active clip drag / trim / marker / marquee state machines across full panel.
     process_active_drag_state(
         ui,
         session,
@@ -899,17 +1249,17 @@ pub fn show_timeline(
 
     // 9. Snap indicator guide line (clipped to x >= 200 px, full height to panel bottom).
     let content_clip = Rect::from_min_max(
-        pos2(content_left, panel_rect.top()),
-        pos2(panel_rect.right(), panel_rect.bottom()),
+        pos2(content_left, body_rect.top()),
+        pos2(body_rect.right(), body_rect.bottom()),
     );
     let overlay_painter = ui.painter().with_clip_rect(content_clip);
     if let Some(snap_x) = state.snap_guide_x
         && snap_x >= content_left
-        && snap_x <= panel_rect.right()
+        && snap_x <= body_rect.right()
     {
-        let sx = snap_x.round().clamp(content_left, panel_rect.right() - 1.0);
+        let sx = snap_x.round().clamp(content_left, body_rect.right() - 1.0);
         overlay_painter.rect_filled(
-            Rect::from_min_size(pos2(sx, panel_rect.top()), vec2(1.0, panel_rect.height())),
+            Rect::from_min_size(pos2(sx, body_rect.top()), vec2(1.0, body_rect.height())),
             CornerRadius::ZERO,
             COLOR_SNAP_GUIDE,
         );
@@ -919,14 +1269,14 @@ pub fn show_timeline(
     //     preview cache bar painted OVER the stem at the ruler top (matching Zoidium).
     let playhead_screen_x = content_left
         + (frame_to_px(session.playback.current_frame, fps, state.zoom) - state.scroll_x) as f32;
-    if playhead_screen_x >= content_left - 0.5 && playhead_screen_x <= panel_rect.right() + 0.5 {
+    if playhead_screen_x >= content_left - 0.5 && playhead_screen_x <= body_rect.right() + 0.5 {
         let ph_x_int = playhead_screen_x
             .round()
-            .clamp(content_left, panel_rect.right() - 1.0);
+            .clamp(content_left, body_rect.right() - 1.0);
         overlay_painter.rect_filled(
             Rect::from_min_size(
-                pos2(ph_x_int, panel_rect.top()),
-                vec2(1.0, panel_rect.height()),
+                pos2(ph_x_int, body_rect.top()),
+                vec2(1.0, body_rect.height()),
             ),
             CornerRadius::ZERO,
             COLOR_PLAYHEAD,
@@ -945,7 +1295,7 @@ pub fn show_timeline(
             let x1 = (content_left + (frame_to_px(end_f, fps, state.zoom) - state.scroll_x) as f32)
                 .round()
                 .max(x0 + 1.0);
-            if x1 < content_left || x0 > panel_rect.right() {
+            if x1 < content_left || x0 > body_rect.right() {
                 continue;
             }
             overlay_painter.rect_filled(
@@ -961,7 +1311,7 @@ pub fn show_timeline(
         let x1 = (content_left + (frame_to_px(f0 + 5.0, fps, state.zoom) - state.scroll_x) as f32)
             .round()
             .max(x0 + 1.0);
-        if x1 >= content_left && x0 <= panel_rect.right() {
+        if x1 >= content_left && x0 <= body_rect.right() {
             overlay_painter.rect_filled(
                 Rect::from_min_max(pos2(x0, cache_top), pos2(x1, cache_top + 3.0)),
                 CornerRadius::ZERO,
@@ -969,6 +1319,9 @@ pub fn show_timeline(
             );
         }
     }
+
+    // 11. Floating dark CM3 right-click context menu (clip, track lane, ruler, marker).
+    show_timeline_context_menu(ui, session, state, palette, &mut action);
 
     let _ = panel_resp;
     action
@@ -1229,21 +1582,191 @@ fn handle_wheel_and_middle_pan(
     }
 }
 
-fn paint_and_interact_timecode(
+fn paint_and_interact_breadcrumb_bar(
     ui: &mut Ui,
     session: &mut Session,
     palette: &ThemePalette,
     rect: Rect,
+    crumb: &CompositionBreadcrumb,
+    action: &mut TimelineAction,
+) {
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(
+        rect,
+        CornerRadius::ZERO,
+        Color32::from_rgb(0x1f, 0x24, 0x30),
+    );
+    painter.rect_filled(
+        Rect::from_min_size(
+            pos2(rect.left(), (rect.bottom() - 1.0).round()),
+            vec2(rect.width(), 1.0),
+        ),
+        CornerRadius::ZERO,
+        rgb_to_color32(palette.focus),
+    );
+
+    let back_rect = Rect::from_min_size(
+        pos2(rect.left() + 6.0, rect.top() + 3.0),
+        vec2(114.0, rect.height() - 6.0),
+    );
+    let back_resp = ui
+        .interact(
+            back_rect,
+            ui.scope_id().with("timeline_precomp_back_main"),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Return to Main composition timeline");
+    let back_bg = if back_resp.hovered() {
+        rgb_to_color32(palette.focus)
+    } else {
+        Color32::from_rgb(0x2d, 0x36, 0x4c)
+    };
+    painter.rect_filled(back_rect, CornerRadius::same(2), back_bg);
+    paint_crisp_border_1px(&painter, back_rect, rgb_to_color32(palette.focus));
+    painter.text(
+        back_rect.center(),
+        Align2::CENTER_CENTER,
+        "<- Back to Main",
+        FontId::monospace(10.5),
+        Color32::from_rgb(0xe8, 0xee, 0xfc),
+    );
+    if back_resp.clicked() {
+        if session
+            .execute(Command::SetActiveComposition { comp_id: None })
+            .is_ok()
+        {
+            action.clips_modified = true;
+        }
+        return;
+    }
+
+    let cy = rect.center().y;
+    let mut x = back_rect.right() + 10.0;
+    let main_w = (crumb.main_name.len() as f32 * 6.8 + 4.0).max(28.0);
+    let main_rect =
+        Rect::from_min_size(pos2(x, rect.top() + 2.0), vec2(main_w, rect.height() - 4.0));
+    let main_resp = ui
+        .interact(
+            main_rect,
+            ui.scope_id().with("timeline_precomp_crumb_main"),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+    painter.text(
+        pos2(x, cy),
+        Align2::LEFT_CENTER,
+        &crumb.main_name,
+        FontId::monospace(11.5),
+        if main_resp.hovered() {
+            Color32::from_rgb(0xe8, 0xee, 0xfc)
+        } else {
+            TEXT_MUTED
+        },
+    );
+    if main_resp.clicked() {
+        if session
+            .execute(Command::SetActiveComposition { comp_id: None })
+            .is_ok()
+        {
+            action.clips_modified = true;
+        }
+        return;
+    }
+    x += main_w + 4.0;
+    painter.text(
+        pos2(x, cy),
+        Align2::LEFT_CENTER,
+        ">",
+        FontId::monospace(11.5),
+        TEXT_MUTED,
+    );
+    x += 14.0;
+    painter.text(
+        pos2(x, cy),
+        Align2::LEFT_CENTER,
+        &crumb.comp_name,
+        FontId::monospace(11.5),
+        Color32::from_rgb(0xe8, 0xee, 0xfc),
+    );
+
+    let badge_rect = Rect::from_min_size(
+        pos2((rect.right() - 62.0).max(x + 60.0), rect.top() + 4.0),
+        vec2(56.0, rect.height() - 8.0),
+    );
+    if badge_rect.right() <= rect.right() - 4.0 {
+        painter.rect_filled(
+            badge_rect,
+            CornerRadius::same(2),
+            rgb_to_color32_alpha(palette.focus, 150),
+        );
+        painter.text(
+            badge_rect.center(),
+            Align2::CENTER_CENTER,
+            "PRECOMP",
+            FontId::monospace(9.5),
+            Color32::from_rgb(0xe8, 0xee, 0xfc),
+        );
+    }
+}
+
+fn paint_snap_magnet_icon(painter: &egui::Painter, rect: Rect, active: bool, hovered: bool) {
+    let c = rect.center();
+    let body_col = if active {
+        Color32::from_rgb(0xe4, 0xe4, 0xe4)
+    } else if hovered {
+        Color32::from_rgb(0xbc, 0xbc, 0xbc)
+    } else {
+        Color32::from_rgb(0x78, 0x78, 0x78)
+    };
+    let tip_col = if active {
+        Color32::from_rgb(0xed, 0x6a, 0x68)
+    } else {
+        body_col
+    };
+    // Crisp U-shaped magnet opening downward.
+    let w = 4.2_f32;
+    let top_y = c.y - 3.0;
+    let bot_y = c.y + 4.5;
+    let s = Stroke::new(1.8, body_col);
+    // Semicircular arch on top.
+    let mut arch = Vec::with_capacity(9);
+    for i in 0..=8 {
+        let a = std::f32::consts::PI + (i as f32 / 8.0) * std::f32::consts::PI;
+        arch.push(pos2(c.x + a.cos() * w, top_y + a.sin() * w));
+    }
+    painter.add(Shape::line(arch, s));
+    // Two vertical prongs.
+    painter.line_segment([pos2(c.x - w, top_y), pos2(c.x - w, bot_y - 2.0)], s);
+    painter.line_segment([pos2(c.x + w, top_y), pos2(c.x + w, bot_y - 2.0)], s);
+    // Magnet tips.
+    let ts = Stroke::new(2.0, tip_col);
+    painter.line_segment([pos2(c.x - w, bot_y - 2.0), pos2(c.x - w, bot_y)], ts);
+    painter.line_segment([pos2(c.x + w, bot_y - 2.0), pos2(c.x + w, bot_y)], ts);
+}
+
+fn paint_and_interact_timecode(
+    ui: &mut Ui,
+    session: &mut Session,
+    state: &mut TimelineViewState,
+    palette: &ThemePalette,
+    rect: Rect,
     fps: f64,
 ) {
-    let toggle_w = 85.0;
+    let toggle_w = 74.0;
     let toggle_h = 22.0;
+    let btn_top = rect.top() + 6.0;
     let toggle_rect = Rect::from_min_size(
-        pos2(rect.right() - 4.0 - toggle_w, rect.top() + 4.0),
+        pos2(rect.right() - 4.0 - toggle_w, btn_top),
         vec2(toggle_w, toggle_h),
     );
+    let snap_w = 22.0;
+    let snap_rect = Rect::from_min_size(
+        pos2(toggle_rect.left() - 4.0 - snap_w, btn_top),
+        vec2(snap_w, toggle_h),
+    );
     let timecode_hit_rect =
-        Rect::from_min_max(rect.min, pos2(toggle_rect.left() - 2.0, rect.bottom()));
+        Rect::from_min_max(rect.min, pos2(snap_rect.left() - 2.0, rect.bottom()));
 
     let resp = ui.interact(
         timecode_hit_rect,
@@ -1252,6 +1775,18 @@ fn paint_and_interact_timecode(
     );
     if resp.secondary_clicked() {
         session.playback.cycle_time_format();
+    }
+
+    let snap_resp = ui
+        .interact(
+            snap_rect,
+            ui.scope_id().with("timeline_snap_magnet_btn"),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Snap to clips, playhead & markers");
+    if snap_resp.clicked_by(PointerButton::Primary) {
+        state.snap_enabled = !state.snap_enabled;
     }
 
     let toggle_resp = ui
@@ -1271,20 +1806,41 @@ fn paint_and_interact_timecode(
 
     let text = session.playback.format_timecode(fps);
     let tc_font_px = if session.playback.time_format % 3 == TIME_FORMAT_FRAME_NUMBER {
-        16.0
+        15.0
     } else {
-        12.5
+        11.2
     };
     let tc_painter = ui.painter().with_clip_rect(timecode_hit_rect);
     tc_painter.text(
-        pos2(rect.left() + 10.0, rect.top() + 16.0),
+        pos2(rect.left() + 7.0, rect.center().y),
         Align2::LEFT_CENTER,
         text,
         FontId::monospace(tc_font_px),
         COLOR_TIMECODE_TEXT,
     );
 
-    // Sunken 85x22 #202020 / 1px #1b1b1b "Render Time" toggle box matching Zoidium `01_startup_clean.png`.
+    // Visible Snap Magnet toggle button with active highlight styling.
+    let snap_bg = if state.snap_enabled {
+        if snap_resp.hovered() {
+            rgb_to_color32(palette.focus)
+        } else {
+            rgb_to_color32_alpha(palette.focus, 145)
+        }
+    } else if snap_resp.hovered() {
+        Color32::from_rgb(0x2c, 0x2c, 0x2c)
+    } else {
+        Color32::from_rgb(0x20, 0x20, 0x20)
+    };
+    let snap_border = if state.snap_enabled {
+        rgb_to_color32(palette.focus)
+    } else {
+        Color32::from_rgb(0x1b, 0x1b, 0x1b)
+    };
+    painter.rect_filled(snap_rect, CornerRadius::ZERO, snap_bg);
+    paint_crisp_border_1px(painter, snap_rect, snap_border);
+    paint_snap_magnet_icon(painter, snap_rect, state.snap_enabled, snap_resp.hovered());
+
+    // Sunken #202020 / 1px #1b1b1b "Render Time" toggle box matching Zoidium.
     let fmt = session.playback.time_format % 3;
     let is_active = fmt != TIME_FORMAT_FRAME_NUMBER;
     let toggle_label = match fmt {
@@ -1314,7 +1870,7 @@ fn paint_and_interact_timecode(
         toggle_rect.center(),
         Align2::CENTER_CENTER,
         toggle_label,
-        FontId::monospace(11.0),
+        FontId::monospace(10.0),
         toggle_fg,
     );
 }
@@ -1329,6 +1885,7 @@ fn paint_and_interact_ruler(
     fps: f64,
     total_frames: f64,
     max_scroll_x: f64,
+    action: &mut TimelineAction,
 ) -> bool {
     let resp = ui.interact(
         rect,
@@ -1337,14 +1894,115 @@ fn paint_and_interact_ruler(
     );
     let mut scrubbed = false;
 
+    let markers_snapshot: Vec<(f64, String, Option<String>, Color32)> = {
+        let seq = session.active_sequence();
+        seq.markers
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let (raw_col, col) = marker_color_at(seq, i);
+                (m.frame, m.label.clone(), raw_col, col)
+            })
+            .collect()
+    };
+
+    let hovered_marker = resp.hover_pos().and_then(|pos| {
+        hit_test_marker(
+            &session.active_sequence().markers,
+            rect,
+            state.scroll_x,
+            fps,
+            state.zoom,
+            pos,
+        )
+    });
+
     if resp.hovered() {
         state.hover = TimelineHover::Ruler;
-        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+        ui.ctx().set_cursor_icon(if hovered_marker.is_some() {
+            CursorIcon::PointingHand
+        } else {
+            CursorIcon::ResizeHorizontal
+        });
     }
 
-    if resp.drag_started_by(PointerButton::Primary)
-        || (resp.clicked_by(PointerButton::Primary)
-            && matches!(state.drag_state, TimelineDragState::None))
+    // Marker & Ruler right-click context menu.
+    if resp.secondary_clicked()
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        if let Some(m_idx) = hit_test_marker(
+            &session.active_sequence().markers,
+            rect,
+            state.scroll_x,
+            fps,
+            state.zoom,
+            pos,
+        ) && let Some((frame, name, color, _)) = markers_snapshot.get(m_idx)
+        {
+            state.context_menu = Some(TimelineContextMenu::Marker {
+                pos,
+                index: m_idx,
+                frame: *frame,
+                name: name.clone(),
+                color: color.clone(),
+            });
+        } else {
+            let content_x = (f64::from(pos.x - rect.left()) + state.scroll_x).max(0.0);
+            let clicked_frame = px_to_frame(content_x, fps, state.zoom)
+                .round()
+                .clamp(0.0, (total_frames - 1.0).max(0.0));
+            state.context_menu = Some(TimelineContextMenu::Ruler { pos, clicked_frame });
+        }
+    }
+
+    // Marker double-click (inline rename), single-click (jump playhead), or drag-move.
+    let mut marker_handled = false;
+    if matches!(state.drag_state, TimelineDragState::None)
+        && let Some(pos) = resp.interact_pointer_pos()
+        && let Some(m_idx) = hit_test_marker(
+            &session.active_sequence().markers,
+            rect,
+            state.scroll_x,
+            fps,
+            state.zoom,
+            pos,
+        )
+        && let Some((m_frame, m_name, m_color, _)) = markers_snapshot.get(m_idx)
+    {
+        if resp.double_clicked_by(PointerButton::Primary) {
+            state.drag_state = TimelineDragState::InlineRenamingMarker {
+                index: m_idx,
+                frame: *m_frame,
+                buffer: m_name.clone(),
+                color: m_color.clone(),
+                just_opened: true,
+            };
+            state.focused = true;
+            marker_handled = true;
+        } else if resp.drag_started_by(PointerButton::Primary) {
+            state.drag_state = TimelineDragState::DraggingMarker {
+                index: m_idx,
+                orig_frame: *m_frame,
+                preview_frame: *m_frame,
+                name: m_name.clone(),
+                color: m_color.clone(),
+                moved: false,
+            };
+            state.focused = true;
+            marker_handled = true;
+        } else if resp.clicked_by(PointerButton::Primary) {
+            let target = m_frame.clamp(0.0, (total_frames - 1.0).max(0.0));
+            let _ = session.execute(Command::SetFrame { frame: target });
+            state.focused = true;
+            scrubbed = true;
+            marker_handled = true;
+        }
+    }
+
+    if !marker_handled
+        && (resp.drag_started_by(PointerButton::Primary)
+            || (resp.clicked_by(PointerButton::Primary)
+                && matches!(state.drag_state, TimelineDragState::None)))
     {
         state.drag_state = TimelineDragState::ScrubbingPlayhead;
         state.focused = true;
@@ -1443,7 +2101,178 @@ fn paint_and_interact_ruler(
             }
         }
     }
+
+    // Interactive timeline markers rendered as crisp colored diamond/flag pins with short labels.
+    let dragging_marker = match &state.drag_state {
+        TimelineDragState::DraggingMarker {
+            index,
+            preview_frame,
+            ..
+        } => Some((*index, *preview_frame)),
+        _ => None,
+    };
+    let renaming_marker_idx = match &state.drag_state {
+        TimelineDragState::InlineRenamingMarker { index, .. } => Some(*index),
+        _ => None,
+    };
+
+    for (idx, (m_frame, m_label, _, m_color)) in markers_snapshot.iter().enumerate() {
+        let display_frame = match dragging_marker {
+            Some((di, pf)) if di == idx => pf,
+            _ => *m_frame,
+        };
+        let mx = (rect.left()
+            + (frame_to_px(display_frame, fps, state.zoom) - state.scroll_x) as f32)
+            .round();
+        if mx < rect.left() - 12.0 || mx > rect.right() + 12.0 {
+            continue;
+        }
+        let is_hovered =
+            hovered_marker == Some(idx) || dragging_marker.is_some_and(|(di, _)| di == idx);
+        let pin_col = if is_hovered {
+            Color32::from_rgb(
+                m_color.r().saturating_add(28),
+                m_color.g().saturating_add(28),
+                m_color.b().saturating_add(28),
+            )
+        } else {
+            *m_color
+        };
+
+        // Vertical pin stem to ruler bottom.
+        painter.rect_filled(
+            Rect::from_min_max(
+                pos2(mx, rect.bottom() - 15.0),
+                pos2(mx + 1.0, rect.bottom()),
+            ),
+            CornerRadius::ZERO,
+            pin_col,
+        );
+        // Diamond flag pin head.
+        let cy = rect.bottom() - 10.0;
+        let r = 5.0;
+        let pts = vec![
+            pos2(mx + 0.5, cy - r),
+            pos2(mx + 0.5 + r, cy),
+            pos2(mx + 0.5, cy + r),
+            pos2(mx + 0.5 - r, cy),
+        ];
+        painter.add(Shape::convex_polygon(
+            pts,
+            pin_col,
+            Stroke::new(1.0, Color32::from_rgb(0x16, 0x16, 0x16)),
+        ));
+
+        // Optional short label badge right of pin (hidden while inline-renaming this marker).
+        if !m_label.trim().is_empty() && renaming_marker_idx != Some(idx) {
+            let short_label: String = m_label.chars().take(16).collect();
+            let lbl_w = (short_label.len() as f32 * 5.8 + 6.0).min(100.0);
+            let lbl_rect = Rect::from_min_size(pos2(mx + 6.5, cy - 6.5), vec2(lbl_w, 13.0));
+            painter.rect_filled(
+                lbl_rect,
+                CornerRadius::same(1),
+                Color32::from_rgba_unmultiplied(0x1d, 0x1d, 0x1d, 215),
+            );
+            painter.rect_stroke(
+                lbl_rect,
+                CornerRadius::same(1),
+                Stroke::new(1.0, pin_col.gamma_multiply(0.7)),
+                StrokeKind::Inside,
+            );
+            painter.with_clip_rect(lbl_rect.intersect(rect)).text(
+                pos2(lbl_rect.left() + 3.0, lbl_rect.center().y),
+                Align2::LEFT_CENTER,
+                short_label,
+                FontId::monospace(9.5),
+                Color32::from_rgb(0xe4, 0xe4, 0xe4),
+            );
+        }
+    }
+
+    // Inline marker rename input directly on the ruler when double-clicked or renamed from menu.
+    if matches!(
+        state.drag_state,
+        TimelineDragState::InlineRenamingMarker { .. }
+    ) {
+        paint_inline_marker_rename(ui, session, state, rect, fps, action);
+    }
+
     scrubbed
+}
+
+fn paint_inline_marker_rename(
+    ui: &mut Ui,
+    session: &mut Session,
+    state: &mut TimelineViewState,
+    ruler_rect: Rect,
+    fps: f64,
+    action: &mut TimelineAction,
+) {
+    let (index, frame, mut buffer, color, just_opened) = match &mut state.drag_state {
+        TimelineDragState::InlineRenamingMarker {
+            index,
+            frame,
+            buffer,
+            color,
+            just_opened,
+        } => {
+            let opened = *just_opened;
+            *just_opened = false;
+            (*index, *frame, buffer.clone(), color.clone(), opened)
+        }
+        _ => return,
+    };
+
+    let mx = (ruler_rect.left() + (frame_to_px(frame, fps, state.zoom) - state.scroll_x) as f32)
+        .clamp(
+            ruler_rect.left() + 4.0,
+            (ruler_rect.right() - 124.0).max(ruler_rect.left() + 4.0),
+        );
+    let edit_rect = Rect::from_min_size(pos2(mx, ruler_rect.bottom() - 18.0), vec2(120.0, 17.0));
+    let p = ui.painter();
+    p.rect_filled(edit_rect, CornerRadius::ZERO, COLOR_RENAME_BG);
+    paint_crisp_border_1px(p, edit_rect, COLOR_RENAME_BORDER);
+
+    let edit_resp = ui.scope_builder(
+        egui::UiBuilder::new().max_rect(edit_rect.shrink(1.0)),
+        |ui| {
+            ui.visuals_mut().extreme_bg_color = COLOR_RENAME_BG;
+            ui.visuals_mut().selection.bg_fill = Color32::from_rgb(0x38, 0x46, 0x68);
+            ui.add(
+                TextEdit::singleline(&mut buffer)
+                    .font(FontId::monospace(11.5))
+                    .text_color(Color32::BLACK)
+                    .frame(egui::Frame::NONE)
+                    .desired_width(edit_rect.width() - 4.0),
+            )
+        },
+    );
+
+    if just_opened {
+        edit_resp.inner.request_focus();
+    }
+    if let TimelineDragState::InlineRenamingMarker { buffer: dst, .. } = &mut state.drag_state {
+        *dst = buffer.clone();
+    }
+
+    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if escape {
+        state.drag_state = TimelineDragState::None;
+    } else if enter || (!just_opened && edit_resp.inner.lost_focus()) {
+        if session
+            .execute(Command::UpdateMarker {
+                index,
+                frame,
+                name: buffer.trim().to_string(),
+                color,
+            })
+            .is_ok()
+        {
+            action.clips_modified = true;
+        }
+        state.drag_state = TimelineDragState::None;
+    }
 }
 
 fn paint_and_interact_keyframes(
@@ -1573,8 +2402,18 @@ fn paint_and_interact_keyframes(
             if kf_resp.clicked_by(PointerButton::Primary) {
                 clicked_any_diamond = true;
                 state.focused = true;
-                let kf_ref = KeyframeRef::new(&row.target_id, &row.property, None, local_frame);
-                session.selection.select_keyframe(kf_ref, modifiers.shift);
+                if row.locked
+                    && (row.target_id.starts_with("mask:")
+                        || row.target_id.starts_with("shape_plus:")
+                        || row.target_id.starts_with("preserved:"))
+                {
+                    let target_f = (row.frame_offset + local_frame).round().max(0.0);
+                    let _ = session.execute(Command::SetFrame { frame: target_f });
+                    action.playhead_scrubbed = true;
+                } else {
+                    let kf_ref = KeyframeRef::new(&row.target_id, &row.property, None, local_frame);
+                    session.selection.select_keyframe(kf_ref, modifiers.shift);
+                }
             } else if kf_resp.drag_started_by(PointerButton::Primary) {
                 clicked_any_diamond = true;
                 state.focused = true;
@@ -2029,20 +2868,29 @@ fn paint_and_interact_tracks(
                 state.hover = TimelineHover::ClipBody(clip.id.clone());
             }
 
-            // Right-click clip -> inline rename.
-            if (body_resp.secondary_clicked()
+            // Right-click clip -> Pro Clip context menu (Split, Copy, Duplicate, Pre-compose, Freeze, Reverse, Rename, Delete).
+            if body_resp.secondary_clicked()
                 || left_resp.secondary_clicked()
-                || right_resp.secondary_clicked())
-                && !track.locked
+                || right_resp.secondary_clicked()
             {
                 interacted_clip = true;
-                let current_name = clip_display_name(clip).to_string();
-                state.drag_state = TimelineDragState::InlineRenamingClip {
+                state.focused = true;
+                if !is_selected {
+                    let _ = session.selection.select_clip(&clip.id, None, false);
+                }
+                let menu_pos = body_resp
+                    .interact_pointer_pos()
+                    .or_else(|| left_resp.interact_pointer_pos())
+                    .or_else(|| right_resp.interact_pointer_pos())
+                    .unwrap_or(clip_rect.center());
+                state.context_menu = Some(TimelineContextMenu::Clip {
+                    pos: menu_pos,
                     clip_id: clip.id.clone(),
-                    buffer: current_name.clone(),
-                    original_name: current_name,
-                    just_opened: true,
-                };
+                    clip_name: clip_display_name(clip).to_string(),
+                    clip_start: clip.start,
+                    clip_length: clip.length,
+                    locked: track.locked,
+                });
                 continue;
             }
 
@@ -2135,15 +2983,13 @@ fn paint_and_interact_tracks(
         }
     }
 
-    // Empty track lane clicks / marquee / right-click quick seek.
+    // Empty track lane clicks / marquee / right-click track lane context menu.
     if !interacted_clip {
         if lane_bg_resp.secondary_clicked()
             && let Some(pos) = lane_bg_resp.interact_pointer_pos()
         {
-            let content_x = (f64::from(pos.x - lanes_rect.left()) + state.scroll_x).max(0.0);
-            let frame = px_to_frame(content_x, fps, state.zoom).round().max(0.0);
-            let _ = session.execute(Command::SetFrame { frame });
-            action.playhead_scrubbed = true;
+            state.focused = true;
+            state.context_menu = Some(TimelineContextMenu::Lane { pos, tracks_height });
         } else if lane_bg_resp.clicked_by(PointerButton::Primary) && !modifiers.shift {
             session.selection.clear_clips();
         } else if lane_bg_resp.drag_started_by(PointerButton::Primary)
@@ -3151,8 +3997,70 @@ fn process_active_drag_state(
                 action.clips_modified = true;
             }
         }
+        TimelineDragState::DraggingMarker {
+            index,
+            orig_frame,
+            mut preview_frame,
+            name,
+            color,
+            mut moved,
+        } => {
+            let mut snap_targets = collect_clip_snap_targets(session, &BTreeSet::new());
+            // Remove this marker's own original frame so it doesn't stick to itself.
+            if let Some(pos) = snap_targets
+                .iter()
+                .position(|&f| (f - orig_frame).abs() < 1e-6)
+            {
+                snap_targets.remove(pos);
+            }
+            if let Some(pos) = pointer_pos {
+                let content_x = (f64::from(pos.x - ruler_rect.left()) + state.scroll_x).max(0.0);
+                let raw_frame = px_to_frame(content_x, fps, state.zoom)
+                    .round()
+                    .clamp(0.0, (total_frames - 1.0).max(0.0));
+                let (snapped, snap_hit) =
+                    snap_frame(raw_frame, &snap_targets, fps, state.zoom, snap_active);
+                if let Some(sa) = snap_hit {
+                    state.snap_guide_x = Some(
+                        ruler_rect.left()
+                            + (frame_to_px(sa, fps, state.zoom) - state.scroll_x) as f32,
+                    );
+                }
+                preview_frame = snapped.clamp(0.0, (total_frames - 1.0).max(0.0));
+                if (preview_frame - orig_frame).abs() > 1e-6 {
+                    moved = true;
+                }
+            }
+            if primary_down {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                state.drag_state = TimelineDragState::DraggingMarker {
+                    index,
+                    orig_frame,
+                    preview_frame,
+                    name,
+                    color,
+                    moved,
+                };
+            } else if moved
+                && session
+                    .execute(Command::UpdateMarker {
+                        index,
+                        frame: preview_frame,
+                        name,
+                        color,
+                    })
+                    .is_ok()
+            {
+                action.clips_modified = true;
+            }
+        }
         TimelineDragState::DraggingKeyframe(mut drag) => {
             let mut snap_targets = vec![0.0, session.playback.current_frame.round(), total_frames];
+            for marker in &session.active_sequence().markers {
+                if marker.frame.is_finite() {
+                    snap_targets.push(marker.frame);
+                }
+            }
             for row in collect_keyframe_rows(session) {
                 for item in row.keyframes {
                     let is_dragged = drag.keyframes.iter().any(|dk| {
@@ -3490,6 +4398,446 @@ fn paint_and_interact_scrollbar(
     };
     ui.painter()
         .rect_filled(thumb_rect, CornerRadius::same(2), thumb_color);
+}
+
+fn show_timeline_context_menu(
+    ui: &mut Ui,
+    session: &mut Session,
+    state: &mut TimelineViewState,
+    palette: &ThemePalette,
+    action: &mut TimelineAction,
+) {
+    let Some(menu) = state.context_menu.clone() else {
+        return;
+    };
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.context_menu = None;
+        return;
+    }
+
+    let anchor = match &menu {
+        TimelineContextMenu::Clip { pos, .. }
+        | TimelineContextMenu::Lane { pos, .. }
+        | TimelineContextMenu::Ruler { pos, .. }
+        | TimelineContextMenu::Marker { pos, .. } => *pos,
+    };
+    let viewport = ui.ctx().input(|i| i.viewport_rect());
+    let est_w = 216.0_f32;
+    let est_h = match &menu {
+        TimelineContextMenu::Clip { .. } => 236.0,
+        TimelineContextMenu::Lane { .. } => 126.0,
+        TimelineContextMenu::Ruler { .. } => 64.0,
+        TimelineContextMenu::Marker { .. } => 124.0,
+    };
+    let clamped_x = anchor
+        .x
+        .min(viewport.right() - est_w - 6.0)
+        .max(viewport.left() + 4.0)
+        .round();
+    let clamped_y = anchor
+        .y
+        .min(viewport.bottom() - est_h - 6.0)
+        .max(viewport.top() + 4.0)
+        .round();
+
+    let mut close_menu = false;
+    let playhead = session.playback.current_frame.round().max(0.0);
+    let area_resp = egui::Area::new(ui.scope_id().with("timeline_context_menu_area"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos2(clamped_x, clamped_y))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::NONE
+                .fill(Color32::from_rgb(0x24, 0x24, 0x24))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(0x3f, 0x3f, 0x3f)))
+                .inner_margin(egui::Margin::symmetric(4, 4))
+                .corner_radius(CornerRadius::ZERO)
+                .show(ui, |ui| {
+                    ui.set_min_width(est_w - 8.0);
+                    ui.spacing_mut().item_spacing = vec2(0.0, 2.0);
+
+                    let menu_item =
+                        |ui: &mut Ui, label: &str, enabled: bool, danger: bool| -> bool {
+                            let (r, resp) = ui.allocate_exact_size(
+                                vec2((est_w - 10.0).max(120.0), 22.0),
+                                if enabled {
+                                    Sense::click()
+                                } else {
+                                    Sense::hover()
+                                },
+                            );
+                            let resp = if enabled {
+                                resp.on_hover_cursor(CursorIcon::PointingHand)
+                            } else {
+                                resp
+                            };
+                            let bg = if enabled && resp.hovered() {
+                                rgb_to_color32(palette.focus)
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+                            if bg != Color32::TRANSPARENT {
+                                ui.painter().rect_filled(r, CornerRadius::ZERO, bg);
+                            }
+                            let fg = if !enabled {
+                                Color32::from_rgb(0x66, 0x66, 0x66)
+                            } else if danger && !resp.hovered() {
+                                Color32::from_rgb(0xdf, 0x9b, 0x9b)
+                            } else if resp.hovered() {
+                                Color32::from_rgb(0xee, 0xee, 0xee)
+                            } else {
+                                TEXT_PRIMARY
+                            };
+                            ui.painter().text(
+                                pos2(r.left() + 8.0, r.center().y),
+                                Align2::LEFT_CENTER,
+                                label,
+                                FontId::monospace(12.0),
+                                fg,
+                            );
+                            enabled && resp.clicked()
+                        };
+
+                    let menu_sep = |ui: &mut Ui| {
+                        let (sr, _) =
+                            ui.allocate_exact_size(vec2(est_w - 10.0, 6.0), Sense::hover());
+                        ui.painter().rect_filled(
+                            Rect::from_min_size(
+                                pos2(sr.left() + 4.0, sr.center().y.round()),
+                                vec2(sr.width() - 8.0, 1.0),
+                            ),
+                            CornerRadius::ZERO,
+                            Color32::from_rgb(0x36, 0x36, 0x36),
+                        );
+                    };
+
+                    match &menu {
+                        TimelineContextMenu::Clip {
+                            clip_id,
+                            clip_name,
+                            clip_start,
+                            clip_length,
+                            locked,
+                            ..
+                        } => {
+                            let can_split = !locked
+                                && playhead > *clip_start + 1e-3
+                                && playhead < *clip_start + *clip_length - 1e-3;
+                            if menu_item(ui, "Split at Playhead", can_split, false) {
+                                if session
+                                    .execute(Command::SplitClip {
+                                        clip_id: clip_id.clone(),
+                                        at_frame: playhead,
+                                    })
+                                    .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+
+                            let sel_ids: Vec<String> =
+                                if session.selection.clip_ids.contains(clip_id) {
+                                    session.selection.clip_ids.clone()
+                                } else {
+                                    vec![clip_id.clone()]
+                                };
+                            let sel_uuids: Vec<zc_project::Uuid> = sel_ids
+                                .iter()
+                                .filter_map(|id| zc_project::Uuid::parse_str(id).ok())
+                                .collect();
+
+                            if menu_item(ui, "Copy", !sel_uuids.is_empty(), false) {
+                                if let Ok(snaps) = session.copy_clips(&sel_uuids) {
+                                    state.clip_clipboard = snaps;
+                                }
+                                close_menu = true;
+                            }
+
+                            if menu_item(ui, "Duplicate", !locked, false) {
+                                if sel_ids.len() > 1 {
+                                    if session.begin_transaction("Duplicate Clips").is_ok() {
+                                        let mut changed = false;
+                                        for cid in &sel_ids {
+                                            if session
+                                                .execute(Command::DuplicateClip {
+                                                    clip_id: cid.clone(),
+                                                })
+                                                .is_ok()
+                                            {
+                                                changed = true;
+                                            }
+                                        }
+                                        let _ = session.commit_transaction(changed);
+                                        if changed {
+                                            action.clips_modified = true;
+                                        }
+                                    }
+                                } else if session
+                                    .execute(Command::DuplicateClip {
+                                        clip_id: clip_id.clone(),
+                                    })
+                                    .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+
+                            if menu_item(
+                                ui,
+                                "Pre-compose Selected...",
+                                !locked && !sel_uuids.is_empty(),
+                                false,
+                            ) {
+                                let name =
+                                    format!("Precomp {}", session.project.compositions.len() + 1);
+                                if session
+                                    .execute(Command::PrecomposeClips {
+                                        clip_ids: sel_uuids.clone(),
+                                        name,
+                                    })
+                                    .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+
+                            let clip_uuid = zc_project::Uuid::parse_str(clip_id).ok();
+                            if menu_item(
+                                ui,
+                                "Freeze Frame at Playhead",
+                                !locked && clip_uuid.is_some(),
+                                false,
+                            ) {
+                                if let Some(uid) = clip_uuid
+                                    && session
+                                        .execute(Command::FreezeClipFrame {
+                                            clip_id: uid,
+                                            frame: playhead,
+                                        })
+                                        .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+
+                            if menu_item(ui, "Reverse Clip", !locked && clip_uuid.is_some(), false)
+                            {
+                                if let Some(uid) = clip_uuid
+                                    && session
+                                        .execute(Command::ReverseClip { clip_id: uid })
+                                        .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+
+                            menu_sep(ui);
+
+                            if menu_item(ui, "Rename", !locked, false) {
+                                state.drag_state = TimelineDragState::InlineRenamingClip {
+                                    clip_id: clip_id.clone(),
+                                    buffer: clip_name.clone(),
+                                    original_name: clip_name.clone(),
+                                    just_opened: true,
+                                };
+                                close_menu = true;
+                            }
+
+                            if menu_item(ui, "Delete", !locked, true) {
+                                if sel_ids.len() > 1 {
+                                    if session.begin_transaction("Delete Clips").is_ok() {
+                                        let mut changed = false;
+                                        for cid in &sel_ids {
+                                            if session
+                                                .execute(Command::DeleteClip {
+                                                    clip_id: cid.clone(),
+                                                })
+                                                .is_ok()
+                                            {
+                                                changed = true;
+                                            }
+                                        }
+                                        let _ = session.commit_transaction(changed);
+                                        if changed {
+                                            action.clips_modified = true;
+                                        }
+                                    }
+                                } else if session
+                                    .execute(Command::DeleteClip {
+                                        clip_id: clip_id.clone(),
+                                    })
+                                    .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+                        }
+                        TimelineContextMenu::Lane { tracks_height, .. } => {
+                            let can_paste = !state.clip_clipboard.is_empty();
+                            if menu_item(ui, "Paste at Playhead", can_paste, false) {
+                                if session
+                                    .execute(Command::PasteClips {
+                                        clips: state.clip_clipboard.clone(),
+                                        target_frame: playhead,
+                                    })
+                                    .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+                            if menu_item(ui, "Add Marker at Playhead", true, false) {
+                                let count = session.active_sequence().markers.len();
+                                if session
+                                    .execute(Command::AddMarker {
+                                        frame: playhead,
+                                        name: format!("Marker {}", count + 1),
+                                        color: None,
+                                    })
+                                    .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+                            menu_sep(ui);
+                            if menu_item(ui, "Add Video Track", true, false) {
+                                add_track_of_kind(session, state, TrackKind::Video, *tracks_height);
+                                action.clips_modified = true;
+                                close_menu = true;
+                            }
+                            if menu_item(ui, "Add Audio Track", true, false) {
+                                add_track_of_kind(session, state, TrackKind::Audio, *tracks_height);
+                                action.clips_modified = true;
+                                close_menu = true;
+                            }
+                        }
+                        TimelineContextMenu::Ruler { clicked_frame, .. } => {
+                            if menu_item(ui, "Add Marker at Playhead", true, false) {
+                                let count = session.active_sequence().markers.len();
+                                if session
+                                    .execute(Command::AddMarker {
+                                        frame: playhead,
+                                        name: format!("Marker {}", count + 1),
+                                        color: None,
+                                    })
+                                    .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+                            let here_label = format!("Add Marker Here (F:{:.0})", clicked_frame);
+                            if menu_item(ui, &here_label, true, false) {
+                                let count = session.active_sequence().markers.len();
+                                if session
+                                    .execute(Command::AddMarker {
+                                        frame: *clicked_frame,
+                                        name: format!("Marker {}", count + 1),
+                                        color: None,
+                                    })
+                                    .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+                        }
+                        TimelineContextMenu::Marker {
+                            index,
+                            frame,
+                            name,
+                            color,
+                            ..
+                        } => {
+                            if menu_item(ui, "Jump to Marker", true, false) {
+                                let _ = session.execute(Command::SetFrame { frame: *frame });
+                                action.playhead_scrubbed = true;
+                                close_menu = true;
+                            }
+                            if menu_item(ui, "Rename Marker...", true, false) {
+                                state.drag_state = TimelineDragState::InlineRenamingMarker {
+                                    index: *index,
+                                    frame: *frame,
+                                    buffer: name.clone(),
+                                    color: color.clone(),
+                                    just_opened: true,
+                                };
+                                close_menu = true;
+                            }
+                            menu_sep(ui);
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                ui.colored_label(
+                                    TEXT_MUTED,
+                                    egui::RichText::new("Color:").monospace().size(11.0),
+                                );
+                                ui.add_space(4.0);
+                                for (cname, hex, sw_col) in MARKER_PRESET_COLORS {
+                                    let (sw_rect, sw_resp) =
+                                        ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+                                    let sw_resp = sw_resp
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text(cname);
+                                    let active = color.as_deref() == Some(hex);
+                                    ui.painter().rect_filled(
+                                        sw_rect.shrink(2.0),
+                                        CornerRadius::same(2),
+                                        sw_col,
+                                    );
+                                    if active || sw_resp.hovered() {
+                                        ui.painter().rect_stroke(
+                                            sw_rect.shrink(1.0),
+                                            CornerRadius::same(2),
+                                            Stroke::new(1.5, Color32::WHITE),
+                                            StrokeKind::Inside,
+                                        );
+                                    }
+                                    if sw_resp.clicked() {
+                                        if session
+                                            .execute(Command::UpdateMarker {
+                                                index: *index,
+                                                frame: *frame,
+                                                name: name.clone(),
+                                                color: Some(hex.to_string()),
+                                            })
+                                            .is_ok()
+                                        {
+                                            action.clips_modified = true;
+                                        }
+                                        close_menu = true;
+                                    }
+                                }
+                            });
+                            menu_sep(ui);
+                            if menu_item(ui, "Delete Marker", true, true) {
+                                if session
+                                    .execute(Command::DeleteMarker { index: *index })
+                                    .is_ok()
+                                {
+                                    action.clips_modified = true;
+                                }
+                                close_menu = true;
+                            }
+                        }
+                    }
+                });
+        });
+
+    let clicked_outside = ui.input(|i| {
+        (i.pointer.primary_pressed() || i.pointer.secondary_pressed())
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|p| !area_resp.response.rect.contains(p))
+    });
+    if close_menu || clicked_outside {
+        state.context_menu = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3836,6 +5184,211 @@ mod tests {
         assert!(p1 < 0.8 && p1 > 0.79);
         let p2 = decay_audio_meter_peak(0.2, 0.5);
         assert!((p2 - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn marker_hit_testing_and_snapping_include_marker_frames() {
+        let mut session = Session::new();
+        session
+            .execute(Command::AddMarker {
+                frame: 45.0,
+                name: "Drop".to_string(),
+                color: Some("#ed6a68".to_string()),
+            })
+            .expect("add marker");
+        session
+            .execute(Command::AddMarker {
+                frame: 120.0,
+                name: "Outro".to_string(),
+                color: None,
+            })
+            .expect("add second marker");
+
+        // Snap targets include marker frames so clips & keyframes snap cleanly to markers.
+        let targets = collect_clip_snap_targets(&session, &BTreeSet::new());
+        assert!(targets.iter().any(|&f| (f - 45.0).abs() < 1e-9));
+        assert!(targets.iter().any(|&f| (f - 120.0).abs() < 1e-9));
+
+        let fps = 30.0;
+        let zoom = 0.3;
+        let (snapped, hit_frame) = snap_frame(44.6, &targets, fps, zoom, true);
+        assert_eq!(snapped, 45.0);
+        assert_eq!(hit_frame, Some(45.0));
+
+        // Marker hit testing on ruler.
+        let ruler_rect = Rect::from_min_size(pos2(200.0, 0.0), vec2(800.0, RULER_HEIGHT));
+        let m0_x = ruler_rect.left() + frame_to_px(45.0, fps, zoom) as f32;
+        assert_eq!(
+            hit_test_marker(
+                &session.active_sequence().markers,
+                ruler_rect,
+                0.0,
+                fps,
+                zoom,
+                pos2(m0_x + 2.0, ruler_rect.bottom() - 8.0),
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            hit_test_marker(
+                &session.active_sequence().markers,
+                ruler_rect,
+                0.0,
+                fps,
+                zoom,
+                pos2(m0_x + 40.0, ruler_rect.bottom() - 8.0),
+            ),
+            None
+        );
+        assert_eq!(
+            parse_marker_hex_color("#ed6a68"),
+            Some(Color32::from_rgb(0xed, 0x6a, 0x68))
+        );
+    }
+
+    #[test]
+    fn active_composition_breadcrumb_reflects_nested_precomp() {
+        let mut session = Session::new();
+        assert_eq!(active_composition_breadcrumb(&session), None);
+
+        let created = session
+            .execute(Command::CreateComposition {
+                name: "Intro Precomp".to_string(),
+                resolution: [1920, 1080],
+                fps: 30,
+                length_frames: 150,
+            })
+            .expect("create comp");
+        let comp_id = zc_project::Uuid::parse_str(
+            created
+                .get("comp_id")
+                .and_then(Value::as_str)
+                .expect("comp_id"),
+        )
+        .expect("uuid");
+
+        session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(comp_id),
+            })
+            .expect("enter comp");
+        let crumb = active_composition_breadcrumb(&session).expect("breadcrumb active");
+        assert_eq!(crumb.comp_id, comp_id);
+        assert_eq!(crumb.comp_name, "Intro Precomp");
+
+        session
+            .execute(Command::SetActiveComposition { comp_id: None })
+            .expect("return to main");
+        assert_eq!(active_composition_breadcrumb(&session), None);
+    }
+
+    #[test]
+    fn keyframe_dope_sheet_includes_animated_layer_mask_and_shape_plus_rows() {
+        let mut session = Session::new();
+        let v_track_id = session.document().video_tracks[0].id.clone();
+        let added = session
+            .execute(Command::AddClip {
+                track_id: v_track_id,
+                kind: "zoidium:shape-plus/layer".to_string(),
+                name: Some("Vector Layer".to_string()),
+                start: 10.0,
+                length: 60.0,
+            })
+            .expect("add shape-plus clip");
+        let clip_id_str = added
+            .get("clip_id")
+            .and_then(Value::as_str)
+            .expect("clip_id")
+            .to_string();
+        let clip_uuid = zc_project::Uuid::parse_str(&clip_id_str).expect("uuid");
+        let _ = session.selection.select_clip(&clip_id_str, None, false);
+
+        // Attach an animated Shape+ payload with keyframed roundness.
+        let payload = serde_json::json!({
+            "schemaVersion": 1,
+            "renderVersion": 1,
+            "contents": [
+                {
+                    "id": "s1",
+                    "kind": "rectangle",
+                    "properties": {
+                        "name": "Rect 1",
+                        "roundness": {
+                            "animated": true,
+                            "keyframes": [
+                                { "frame": 0.0, "value": 0.0, "tween": 1 },
+                                { "frame": 30.0, "value": 24.0, "tween": 1 }
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+        session
+            .execute(Command::UpdateShapePlusPayload {
+                clip_id: clip_uuid,
+                payload,
+            })
+            .expect("update shape-plus");
+
+        // Attach an animated LayerMask path.
+        let mut path_track = zc_project::PropertyTrack::constant(zc_project::PropertyValue::Json(
+            serde_json::json!([]),
+        ));
+        path_track.animated = true;
+        path_track.keyframes = vec![
+            zc_project::PropertyKeyframe::from_cm3_tween(
+                0.0,
+                zc_project::PropertyValue::Json(serde_json::json!([])),
+                1,
+                [[-10.0, 0.0], [10.0, 0.0]],
+                true,
+            ),
+            zc_project::PropertyKeyframe::from_cm3_tween(
+                20.0,
+                zc_project::PropertyValue::Json(serde_json::json!([])),
+                1,
+                [[-10.0, 0.0], [10.0, 0.0]],
+                true,
+            ),
+        ];
+        let mask = zc_project::LayerMask {
+            id: "mask-1".to_string(),
+            name: "Reveal Mask".to_string(),
+            enabled: true,
+            mode: zc_project::MaskMode::Add,
+            invert: false,
+            feather: 0.0,
+            expansion: 0.0,
+            opacity: 1.0,
+            closed: true,
+            locked: false,
+            outline_color: String::new(),
+            vertex_ids: Vec::new(),
+            vertex_modes: BTreeMap::new(),
+            path: path_track,
+            preserved: BTreeMap::new(),
+        };
+        session
+            .execute(Command::AddLayerMask {
+                clip_id: clip_uuid,
+                mask,
+            })
+            .expect("add mask");
+
+        let rows = collect_keyframe_rows(&session);
+        assert!(
+            rows.iter()
+                .any(|r| r.display_label == "Mask:Reveal Mask.path" && r.keyframes.len() == 2),
+            "expected animated LayerMask row in dope sheet, got {:?}",
+            rows.iter().map(|r| &r.display_label).collect::<Vec<_>>()
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.display_label == "Shape+:Rect 1.roundness" && r.keyframes.len() == 2),
+            "expected animated Shape+ row in dope sheet, got {:?}",
+            rows.iter().map(|r| &r.display_label).collect::<Vec<_>>()
+        );
     }
 
     #[test]

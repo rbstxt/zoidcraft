@@ -1869,6 +1869,9 @@ pub struct VoronoiFractureParams {
     pub gravity: f32,
     /// Per-fragment motion variation randomness (`0..100`, default `0`).
     pub randomness: f32,
+    /// When `true` (Zoidium `colors == 1`), populates `MeshData::colors` per fragment via
+    /// [`voronoi_piece_color`].
+    pub random_colors: bool,
     pub field: Option<EffectorField>,
 }
 
@@ -1889,6 +1892,7 @@ impl Default for VoronoiFractureParams {
             fragment_scale: 100.0,
             gravity: 0.0,
             randomness: 0.0,
+            random_colors: false,
             field: None,
         }
     }
@@ -2347,7 +2351,12 @@ pub fn apply_voronoi_fracture_with_params(
         || (params.fragment_scale - 100.0).abs() > 1e-6
         || params.gravity.abs() > 1e-8;
     if cells == 1 && !has_motion {
-        return mesh.clone();
+        let mut cloned = mesh.clone();
+        if params.random_colors {
+            let c = voronoi_piece_color(params.seed, 0);
+            cloned.colors = vec![[c[0], c[1], c[2], 1.0]; cloned.vertices.len()];
+        }
+        return cloned;
     }
 
     let sites = generate_voronoi_sites(mesh, params);
@@ -2413,6 +2422,7 @@ pub fn apply_voronoi_fracture_with_params(
 
     let mut out_verts: Vec<Vertex3D> = Vec::new();
     let mut out_indices: Vec<u32> = Vec::new();
+    let mut out_colors: Vec<[f32; 4]> = Vec::new();
 
     for (ci, &site_c) in sites.iter().enumerate() {
         if out_indices.len() / 3 >= MAX_VORONOI_OUTPUT_TRIS {
@@ -2577,6 +2587,13 @@ pub fn apply_voronoi_fracture_with_params(
         let cy = f64::from(local_centroid.y);
         let cz = f64::from(local_centroid.z);
 
+        let piece_rgba = if params.random_colors {
+            let c = voronoi_piece_color(seed, piece);
+            Some([c[0], c[1], c[2], 1.0])
+        } else {
+            None
+        };
+
         // Emit transformed fragment vertices (and transform back from deformer frame if needed).
         for poly in &cell_polys {
             if out_indices.len() / 3 >= MAX_VORONOI_OUTPUT_TRIS {
@@ -2620,6 +2637,9 @@ pub fn apply_voronoi_fracture_with_params(
                     v.uv,
                     v.material_slot,
                 ));
+                if let Some(rgba) = piece_rgba {
+                    out_colors.push(rgba);
+                }
             }
             for k in 1..(poly.len() - 1) {
                 out_indices.push(base);
@@ -2629,7 +2649,76 @@ pub fn apply_voronoi_fracture_with_params(
         }
     }
 
-    MeshData::new(out_verts, out_indices)
+    MeshData::with_colors(out_verts, out_indices, out_colors)
+}
+
+/// Parses 1-based Voronoi character selection ranges matching Zoidium
+/// `plugins/scene-plus/effector-fracture-characters.js` (`parseCharacterSelection` +
+/// `matchesCharacter`).
+///
+/// - Empty or whitespace-only `spec` selects all characters (`vec![true; total_chars]`), even when
+///   `invert` is `true` (matching Zoidium's `if (selection.all) return true;`).
+/// - Comma-separated tokens accept single 1-based integers (`"5"`) or inclusive ranges (`"1-3"`).
+/// - Any malformed token (non-numeric, `0`, `end < start`, empty segment) invalidates the entire
+///   selection and returns `vec![false; total_chars]`.
+/// - Valid non-empty selections return a boolean mask of length `total_chars`, optionally inverted.
+#[must_use]
+pub fn parse_character_ranges(spec: &str, total_chars: usize, invert: bool) -> Vec<bool> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return vec![true; total_chars];
+    }
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for raw_token in trimmed.split(',') {
+        let token = raw_token.trim();
+        if token.is_empty() {
+            return vec![false; total_chars];
+        }
+        let parsed = if let Some((lhs, rhs)) = token.split_once('-') {
+            let lhs = lhs.trim();
+            let rhs = rhs.trim();
+            if lhs.is_empty()
+                || rhs.is_empty()
+                || !lhs.bytes().all(|b| b.is_ascii_digit())
+                || !rhs.bytes().all(|b| b.is_ascii_digit())
+            {
+                return vec![false; total_chars];
+            }
+            let Ok(first) = lhs.parse::<usize>() else {
+                return vec![false; total_chars];
+            };
+            let Ok(last) = rhs.parse::<usize>() else {
+                return vec![false; total_chars];
+            };
+            if first < 1 || last < first {
+                return vec![false; total_chars];
+            }
+            (first, last)
+        } else {
+            if !token.bytes().all(|b| b.is_ascii_digit()) {
+                return vec![false; total_chars];
+            }
+            let Ok(first) = token.parse::<usize>() else {
+                return vec![false; total_chars];
+            };
+            if first < 1 {
+                return vec![false; total_chars];
+            }
+            (first, first)
+        };
+        ranges.push(parsed);
+    }
+
+    (0..total_chars)
+        .map(|idx| {
+            let number = idx + 1;
+            let included = ranges
+                .iter()
+                .any(|&(first, last)| number >= first && number <= last);
+            if invert { !included } else { included }
+        })
+        .collect()
 }
 
 /// Deterministic Effector `Voronoi Fracture` (backwards-compatible signature): clips `mesh` into

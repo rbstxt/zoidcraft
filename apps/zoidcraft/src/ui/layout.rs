@@ -2,6 +2,8 @@
 //! animated Elevator rail, File & Playback toolbars, Audio Level Meter,
 //! and global shortcut dispatcher (Spec 01 §1 & §6).
 
+use std::path::PathBuf;
+
 use egui::{
     Align, Align2, Area, Color32, CornerRadius, CursorIcon, Frame, Id, Key, Layout, Mesh, Order,
     Painter, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, UiBuilder,
@@ -631,7 +633,13 @@ pub enum UiAction {
         property: String,
     },
     StartExport(ExportSettings),
+    AddToExportQueue(ExportSettings),
+    RunExportQueue,
     CancelExport,
+    OpenOutputFolder(PathBuf),
+    SaveRecoverySnapshotNow,
+    RestoreRecoverySnapshot(PathBuf),
+    DeleteRecoverySnapshot(PathBuf),
     EyedropperActivate {
         target_id: String,
         property: String,
@@ -677,7 +685,7 @@ pub struct Cm3Workspace {
     /// Motion Path toolbar toggle state.
     pub motion_path_visible: bool,
     /// Active viewport shape/vector drawing tool (`0` = shape pen, `1` = bezier pen, `2` = pencil).
-    viewport_draw_tool: Option<u8>,
+    pub viewport_draw_tool: Option<u8>,
     /// Tracks whether the bottom inspector sub-pane (vs top list sub-pane) is focused on split tabs.
     split_inspector_focus_bottom: bool,
     /// Whether the Graph Editor floating window is currently open (drives Graph toolbar button border).
@@ -1284,7 +1292,15 @@ impl Cm3Workspace {
                 PanelAction::NewProject => UiAction::NewProject,
                 PanelAction::ImportMedia => UiAction::ImportMedia,
                 PanelAction::StartExport(cfg) => UiAction::StartExport(cfg),
+                PanelAction::AddToExportQueue(cfg) => UiAction::AddToExportQueue(cfg),
+                PanelAction::RunExportQueue => UiAction::RunExportQueue,
                 PanelAction::CancelExport => UiAction::CancelExport,
+                PanelAction::OpenOutputFolder(path) => UiAction::OpenOutputFolder(path),
+                PanelAction::SaveRecoverySnapshotNow => UiAction::SaveRecoverySnapshotNow,
+                PanelAction::RestoreRecoverySnapshot(path) => {
+                    UiAction::RestoreRecoverySnapshot(path)
+                }
+                PanelAction::DeleteRecoverySnapshot(path) => UiAction::DeleteRecoverySnapshot(path),
                 PanelAction::EyedropperActivate {
                     target_id,
                     property,

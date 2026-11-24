@@ -17,11 +17,22 @@ pub enum ObjLoadError {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum SmoothKey {
+    /// Vertex already specifies an explicit `vn` index.
+    Explicit,
+    /// Missing `vn` with active non-zero smoothing group ID.
+    Group(u32),
+    /// Missing `vn` with `s off` / `s 0` — isolated per face for hard flat normals.
+    Flat(u32),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct VertexKey {
     pos: usize,
     uv: Option<usize>,
     norm: Option<usize>,
     material_slot: u32,
+    smooth: SmoothKey,
 }
 
 fn resolve_obj_index(raw: i64, len: usize, line: usize) -> Result<usize, ObjLoadError> {
@@ -243,6 +254,13 @@ pub fn parse_obj(source: &str) -> Result<MeshData, ObjLoadError> {
     let mut has_seen_usemtl = false;
     let mut has_unassigned_faces = false;
 
+    // Default smoothing group 1 keeps smooth normal averaging when no `s` directive appears.
+    // `s off` or `s 0` sets `current_smoothing = 0` (flat per-face normals).
+    let mut current_smoothing: u32 = 1;
+    let mut named_smoothing: HashMap<String, u32> = HashMap::new();
+    let mut next_named_smoothing: u32 = 0x8000_0000;
+    let mut face_counter: u32 = 0;
+
     let mut vertices: Vec<Vertex3D> = Vec::new();
     let mut missing_normal: Vec<bool> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
@@ -333,10 +351,27 @@ pub fn parse_obj(source: &str) -> Result<MeshData, ObjLoadError> {
                     current_slot = *material_map.entry(name.to_owned()).or_insert(next_id);
                 }
             }
+            "s" => {
+                let raw = parts.next().unwrap_or("off");
+                if raw.eq_ignore_ascii_case("off") || raw == "0" {
+                    current_smoothing = 0;
+                } else if let Ok(group_id) = raw.parse::<u32>() {
+                    current_smoothing = group_id;
+                } else {
+                    current_smoothing =
+                        *named_smoothing.entry(raw.to_owned()).or_insert_with(|| {
+                            let id = next_named_smoothing;
+                            next_named_smoothing = next_named_smoothing.saturating_add(1);
+                            id
+                        });
+                }
+            }
             "f" => {
                 if !has_seen_usemtl {
                     has_unassigned_faces = true;
                 }
+                let face_id = face_counter;
+                face_counter = face_counter.wrapping_add(1);
                 let mut face_verts: Vec<u32> = Vec::new();
                 for token in parts {
                     let mut comps = token.split('/');
@@ -369,11 +404,20 @@ pub fn parse_obj(source: &str) -> Result<MeshData, ObjLoadError> {
                         None
                     };
 
+                    let smooth = if norm_idx.is_some() {
+                        SmoothKey::Explicit
+                    } else if current_smoothing == 0 {
+                        SmoothKey::Flat(face_id)
+                    } else {
+                        SmoothKey::Group(current_smoothing)
+                    };
+
                     let key = VertexKey {
                         pos: pos_idx,
                         uv: uv_idx,
                         norm: norm_idx,
                         material_slot: current_slot,
+                        smooth,
                     };
 
                     let idx = if let Some(&existing) = dedup.get(&key) {
@@ -400,7 +444,7 @@ pub fn parse_obj(source: &str) -> Result<MeshData, ObjLoadError> {
                 triangulate_face(&face_verts, &vertices, &mut indices);
             }
             _ => {
-                // Ignore unsupported/metadata statements (o, g, s, mtllib, vp, l, etc.)
+                // Ignore unsupported/metadata statements (o, g, mtllib, vp, l, etc.)
             }
         }
     }

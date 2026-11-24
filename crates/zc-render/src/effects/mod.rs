@@ -17,6 +17,7 @@
 pub mod shaders_blur_stylize;
 pub mod shaders_color;
 pub mod shaders_distort;
+pub mod shaders_native_fx;
 pub mod shaders_plugins;
 
 use std::borrow::Cow;
@@ -30,6 +31,9 @@ use thiserror::Error;
 use self::shaders_blur_stylize::BLUR_STYLIZE_EFFECT_SHADERS;
 use self::shaders_color::COLOR_EFFECT_SHADERS;
 use self::shaders_distort::DISTORT_EFFECT_SHADERS;
+pub use self::shaders_native_fx::{
+    HELPER_EFFECT_SHADERS, NATIVE_FX_EFFECT_SHADERS, SHADER_POLLY_MESH_WGSL,
+};
 use self::shaders_plugins::PLUGIN_EFFECT_SHADERS as PLUGIN_SHADERS_TABLE;
 
 /// Maximum number of custom WGSL pipelines retained simultaneously in the LRU cache.
@@ -660,19 +664,33 @@ pub fn build_effect_wgsl(body: &str) -> String {
     full
 }
 
-/// Maps canonical Zoidium plugin effect IDs to their internal shader registry keys.
+/// Maps canonical Zoidium plugin and native FX effect IDs to their internal shader registry keys.
 #[must_use]
 pub fn canonical_effect_id(effect_id: &str) -> &str {
     match effect_id {
-        "looks" => "magiclooks",
+        "looks" | "magic-looks" => "magiclooks",
         "sglow-hq-v2-preview" => "sglow",
         "smart-motion-blur-lite" => "smartmotionblur",
         "echo-legacy" => "echo",
+        "timeremap" | "time-remap" => "framemix",
+        "time-displacement" => "timedisplacement",
+        "cc-wide-time" => "ccwidetime",
+        "time-difference" => "timedifference",
+        "color-diff-key" | "color-difference-key" => "colordiffkey",
+        "adv-spill" | "advanced-spill-suppressor" => "advspill",
+        "key-cleaner" => "keycleaner",
+        "linear-color-key" => "linearcolorkey",
+        "radio-waves" => "radiowaves",
+        "cc-page-turn" => "ccpageturn",
+        "card-wipe" => "cardwipe",
+        "cc-pixel-polly" => "ccpixelpolly",
+        "radial-shadow" => "radialshadow",
+        "layer-input-displacement" => "layerinputdisplacement",
         other => other,
     }
 }
 
-/// Looks up the static WGSL fragment body for a standard CM3 or Zoidium plugin effect ID.
+/// Looks up the static WGSL fragment body for a standard CM3, Zoidium plugin, native FX, or helper effect ID.
 #[must_use]
 pub fn lookup_effect_shader(effect_id: &str) -> Option<(&'static str, &'static str)> {
     let resolved = canonical_effect_id(effect_id);
@@ -682,6 +700,16 @@ pub fn lookup_effect_shader(effect_id: &str) -> Option<(&'static str, &'static s
         }
     }
     for &(id, body) in &PLUGIN_EFFECT_SHADERS {
+        if id == resolved {
+            return Some((id, body));
+        }
+    }
+    for &(id, body) in &NATIVE_FX_EFFECT_SHADERS {
+        if id == resolved {
+            return Some((id, body));
+        }
+    }
+    for &(id, body) in &HELPER_EFFECT_SHADERS {
         if id == resolved {
             return Some((id, body));
         }
@@ -949,6 +977,7 @@ pub fn should_bypass(effect_id: &str, params: &EffectParams) -> bool {
         return true;
     }
     match canonical_effect_id(effect_id) {
+        "bloom" => params.float_or("amount", 1.0).abs() <= BYPASS_EPS,
         "boxblur" | "directionalblur" | "gaussianblur" => {
             params.float_or("delta", 1.0).abs() <= BYPASS_EPS
         }
@@ -1305,7 +1334,15 @@ pub fn pack_effect_uniforms(
         }
         "transform" => {
             let uv_scale = params.vec2_or("uvScale", [1.0, 1.0]);
-            u.mode = (params.int_or("wrap", 0).clamp(0, 1) as u32) + 1;
+            // CM3 transform.js: 0 = tile -> wrap_uv 1u, 1 = reflect -> wrap_uv 2u
+            let wrap_idx = match params.values.get("wrap") {
+                Some(EffectParamValue::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                    "reflect" | "mirror" | "mirrored" | "1" => 1u32,
+                    _ => 0u32,
+                },
+                _ => params.int_or("wrap", 0).clamp(0, 1) as u32,
+            };
+            u.mode = wrap_idx + 1;
             u.p3 = [uv_scale[0], uv_scale[1], 0.0, 0.0];
             if let Some((h_inv, depth_plane)) = compute_transform_inverse_homography(params) {
                 u.flags = 1;
@@ -1331,7 +1368,10 @@ pub fn pack_effect_uniforms(
                 Some(EffectParamValue::Lut1D(entries)) if !entries.is_empty() => {
                     (true, entries.len().max(2) as f32)
                 }
-                _ => (has_aux, params.float_or("lutSize", 256.0)),
+                _ => (
+                    has_aux || params.string("curves").is_some(),
+                    params.float_or("lutSize", 256.0),
+                ),
             };
             let affect_alpha = u32::from(params.bool_or("affectAlpha", false));
             u.flags = affect_alpha | (u32::from(has_lut) << 1);
@@ -1343,6 +1383,10 @@ pub fn pack_effect_uniforms(
                 params.float_or("density", 0.5)
             } else if params.values.contains_key("amount") {
                 params.float_or("amount", 10.0) * 0.05
+            } else if params.values.contains_key("angle") {
+                params.float_or("angle", 10.0) * 0.05
+            } else if params.values.contains_key("strength") {
+                params.float_or("strength", 0.5)
             } else {
                 0.5
             };
@@ -1354,70 +1398,194 @@ pub fn pack_effect_uniforms(
             u.p1 = [decay, weight, 0.0, 0.0];
         }
         "vhs" => {
-            let jitter = if params.values.contains_key("trackingJitter") {
+            // Supports ALL 29 Zoidium vhs-shaders.js parameters + legacy aliases
+            let amount = params.float_or("amount", 1.0);
+            let persistence = params.float_or("persistence", 0.35);
+            let signal_str = if params.values.contains_key("signalStrength") {
+                params.float_or("signalStrength", 0.0)
+            } else {
+                params.float_or("chromaBleed", 0.0)
+            };
+            let color_stripes = params.float_or("colorStripes", 0.0);
+            let chroma_crawl = params.float_or("chromaCrawl", 0.0);
+            let chroma_loss = if params.values.contains_key("chromaLoss") {
+                params.float_or("chromaLoss", 0.0)
+            } else {
+                params.float_or("chromaBleed", 0.0) * 0.5
+            };
+            let flicker = params.float_or("flicker", 0.0);
+            let vhs_sharpen = params.float_or("vhsSharpen", 0.0);
+            let interlace = params.float_or("interlace", 0.3);
+            let static_warp = if params.values.contains_key("staticWarp") {
+                params.float_or("staticWarp", 0.0)
+            } else {
+                params.float_or("noise", 0.15)
+            };
+            let fast_forward = params.float_or("fastForward", 0.0);
+            let tracking = if params.values.contains_key("tracking") {
+                params.float_or("tracking", 0.0)
+            } else if params.values.contains_key("headSwitch") {
+                params.float_or("headSwitch", 0.25) * 0.5
+            } else {
+                0.0
+            };
+            let aniso_warp = params.float_or("anisotropyWarp", 0.0);
+            let rgb_split = params.float_or("rgbSplit", 0.25);
+            let tear = params.float_or("tear", 0.0);
+            let hum_bar = params.float_or("humBar", 0.0);
+            let blue_screen = params.float_or("blueScreen", 0.0);
+            let skew = params.float_or("skew", 0.0);
+            let crease = params.float_or("crease", 0.0);
+            let ghost = params.float_or("ghost", 0.0);
+            let osd = if params.values.contains_key("osd") {
+                params.float_or("osd", 0.0)
+            } else if params.bool_or("showTimestamp", false) {
+                1.0
+            } else {
+                0.0
+            };
+            let noise_evo = params.float_or("noiseEvo", 0.35);
+            let noise_op = params.float_or("noiseOpacity", 0.75);
+            let blinds = if params.values.contains_key("blinds") {
+                params.float_or("blinds", 0.0)
+            } else {
+                params.float_or("scanlines", 0.0)
+            };
+            let snow_dots = params.float_or("snowDots", 0.0);
+            let speed_dots = params.float_or("speedDots", 0.0);
+            let aniso_snow = params.float_or("anisoSnow", 0.0);
+            let jitter_x = if params.values.contains_key("jitterX") {
+                params.float_or("jitterX", 0.0)
+            } else if params.values.contains_key("trackingJitter") {
                 params.float_or("trackingJitter", 0.2)
             } else {
-                params.float_or("jitter", 0.5)
+                params.float_or("jitter", 0.0)
             };
-            u.p0 = [
-                jitter,
-                params.float_or("chromaBleed", 0.35),
-                params.float_or("noise", 0.15),
-                params.float_or("headSwitch", 0.5),
-            ];
-            u.p1 = [
-                params.float_or("scanlines", 0.4),
-                params.float_or("seed", 1.0),
-                0.0,
-                0.0,
-            ];
+            let jitter_y = params.float_or("jitterY", 0.0);
+            let roll = params.float_or("roll", 0.0);
+            let roll_speed = params.float_or("rollSpeed", 0.5);
+            let glitch_seed = if params.values.contains_key("glitchSeed") {
+                params.float_or("glitchSeed", 0.0)
+            } else {
+                params.float_or("seed", 0.0)
+            };
+
+            u.flags = u32::from(has_aux);
+            u.p0 = [amount, persistence, signal_str, color_stripes];
+            u.p1 = [chroma_crawl, chroma_loss, flicker, vhs_sharpen];
+            u.p2 = [interlace, static_warp, fast_forward, tracking];
+            u.p3 = [aniso_warp, rgb_split, tear, hum_bar];
+            u.p4 = [blue_screen, skew, crease, ghost];
+            u.p5 = [osd, noise_evo, noise_op, blinds];
+            u.p6 = [snow_dots, speed_dots, aniso_snow, jitter_x];
+            u.p7 = [jitter_y, roll, roll_speed, glitch_seed];
         }
         "jpegdamage" => {
             let has_sapphire = params.values.contains_key("resFactor")
                 || params.values.contains_key("scaleLights")
-                || params.values.contains_key("errRate");
+                || params.values.contains_key("errRate")
+                || params.values.contains_key("allFreq");
             let q_default = if has_sapphire { 0.1 } else { 25.0 };
             let q = params.float_or("quality", q_default);
             let q_norm = if q > 1.0 { q / 100.0 } else { q }.clamp(0.01, 1.0);
+            let res_factor = params.float_or("resFactor", 1.0).clamp(0.05, 1.0);
+            let res_rel_x = params.float_or("resRelX", 1.0).clamp(0.1, 4.0);
+            let low_w = (u.resolution[0] * res_factor * res_rel_x)
+                .round()
+                .clamp(8.0, u.resolution[0].max(8.0));
+            let low_h = (u.resolution[1] * res_factor)
+                .round()
+                .clamp(8.0, u.resolution[1].max(8.0));
+            let eff_time = if params.values.contains_key("time") {
+                params.float_or("time", params.time)
+            } else {
+                params.time
+            };
             u.p0 = [
                 q_norm,
                 params.float_or("amount", 1.0),
-                params.float_or("blockSize", 8.0),
-                params.float_or("chromaSubsample", 2.0),
+                res_factor,
+                res_rel_x,
             ];
             u.p1 = [
-                params.float_or("blockJitter", 0.0),
-                params.float_or("resFactor", 1.0),
-                params.float_or("resRelX", 1.0),
-                params.float_or("scaleLights", 1.0),
+                params.float_or("allFreq", 1.0),
+                params.float_or("xFreq", 1.0),
+                params.float_or("yFreq", 1.0),
+                params.float_or("lowFreq", 1.0),
             ];
             u.p2 = [
-                params.float_or("offsetDarks", 0.0),
-                params.float_or("saturation", 1.0),
-                params.float_or("randSeed", 0.0),
-                0.0,
+                params.float_or("midFreq", 1.0),
+                params.float_or("highFreq", 1.0),
+                params.float_or("affectLuma", 1.0),
+                params.float_or("affectChroma", 1.0),
             ];
+            u.p3 = [
+                params.float_or("errRate", 0.0),
+                params.float_or("errDensity", 0.5),
+                params.float_or("errAmp", 1.0),
+                params.float_or("errCoherence", 0.5),
+            ];
+            u.p4 = [
+                params.float_or("jitterFrames", 0.0),
+                params.float_or("randSeed", 0.0),
+                params.float_or("scaleLights", 1.0),
+                params.float_or("offsetDarks", 0.0),
+            ];
+            u.p5 = [params.float_or("saturation", 1.0), low_w, low_h, eff_time];
         }
         "datamosh" => {
-            let mode = if params.values.contains_key("motion") {
+            let motion_mode = if params.values.contains_key("motion") {
                 params.int_or("motion", 0)
             } else if params.values.contains_key("motionFamily") {
                 params.int_or("motionFamily", 0)
             } else {
                 params.int_or("mode", 0)
             };
-            u.mode = mode.clamp(0, 7) as u32;
-            u.flags = u32::from(has_aux);
+            let algorithm = if params.values.contains_key("algorithm") {
+                params.float_or("algorithm", 0.0)
+            } else {
+                params.float_or("lookMode", 0.0)
+            };
+            let bs = params.float_or("blockSize", 16.0).clamp(2.0, 128.0);
+            let spacing = params.float_or("spacing", 4.0).clamp(1.0, 32.0);
+            let interval = params.float_or("interval", 1.0).max(0.05);
+            let eff_time = if params.values.contains_key("time") {
+                params.float_or("time", params.time)
+            } else {
+                params.time
+            };
+            let segment = (eff_time / interval).floor();
+            u.mode = motion_mode.clamp(0, 8) as u32;
+            u.flags = u32::from(has_aux) | (u32::from(has_aux2) << 1);
             u.p0 = [
-                params.float_or("amount", 0.5),
-                params.float_or("intensity", 0.6),
-                params.float_or("blockSize", 12.0),
+                params.float_or("amount", 0.8),
+                params.float_or("intensity", 1.0),
+                bs,
                 params.float_or("seed", 1.0),
             ];
+            u.p1 = [
+                algorithm,
+                params.float_or("hold", 0.0),
+                params.float_or("speed", 1.0),
+                params.float_or("acceleration", 0.25),
+            ];
+            u.p2 = [
+                params.float_or("blend", 0.85),
+                params.float_or("threshold", 0.08),
+                interval,
+                params.float_or("samples", 4.0),
+            ];
+            u.p3 = [bs, spacing, segment, eff_time];
         }
         "tracery" => {
             let key = params.vec3_or("keyColor", [1.0, 1.0, 1.0]);
-            let acc = params.vec3_or("accentColor", [0.2, 0.9, 1.0]);
+            let box_col = if params.values.contains_key("boxColor") {
+                params.vec3_or("boxColor", [0.2, 0.9, 1.0])
+            } else {
+                params.vec3_or("accentColor", [0.2, 0.9, 1.0])
+            };
+            let marker_col = params.vec3_or("markerColor", box_col);
+            let line_col = params.vec3_or("lineColor", box_col);
             let soften = if params.values.contains_key("blur") {
                 params.float_or("blur", 0.08)
             } else {
@@ -1429,17 +1597,88 @@ pub fn pack_effect_uniforms(
             } else {
                 raw_thresh.clamp(0.0, 1.0)
             };
+            let grid_divs = if params.values.contains_key("gridDivisions") {
+                params.float_or("gridDivisions", 12.0)
+            } else {
+                params.float_or("gridSize", 12.0)
+            };
+            let box_op = params.float_or("boxOpacity", 1.0);
+            let marker_op = params.float_or("markerOpacity", 1.0);
+            let line_op = params.float_or("lineOpacity", 0.9);
             u.c0 = [key[0], key[1], key[2], 1.0];
-            u.c1 = [acc[0], acc[1], acc[2], 1.0];
+            u.c1 = [box_col[0], box_col[1], box_col[2], box_op];
+            u.c2 = [marker_col[0], marker_col[1], marker_col[2], marker_op];
+            u.c3 = [line_col[0], line_col[1], line_col[2], line_op];
             u.p0 = [
                 norm_thresh,
                 soften,
-                params.float_or("gridSize", 32.0),
+                grid_divs,
                 params.float_or("opacity", 1.0),
             ];
+            u.p1 = [
+                params.float_or("boxLineWidth", 2.0),
+                params.float_or("markerSize", 10.0),
+                params.float_or("markerRotation", 0.0).to_radians(),
+                params.float_or("markerSides", 4.0),
+            ];
+            u.p2 = [
+                params.float_or("lineThickness", 2.0),
+                params.float_or("arrowSize", 10.0),
+                params.float_or("arrowPosition", 0.5),
+                params.int_or("boxShape", 0).clamp(0, 3) as f32,
+            ];
+            let p1_xy = params.vec2_or("point1Pos", [0.25, 0.35]);
+            let p2_xy = params.vec2_or("point2Pos", [0.75, 0.35]);
+            let p3_xy = params.vec2_or("point3Pos", [0.5, 0.7]);
+            u.p3 = [
+                params.float_or("point1X", p1_xy[0]),
+                params.float_or("point1Y", p1_xy[1]),
+                params.float_or("point1Size", 28.0),
+                params.float_or("point2X", p2_xy[0]),
+            ];
+            u.p4 = [
+                params.float_or("point2Y", p2_xy[1]),
+                params.float_or("point2Size", 28.0),
+                params.float_or("point3X", p3_xy[0]),
+                params.float_or("point3Y", p3_xy[1]),
+            ];
+            u.p5 = [
+                params.float_or("point3Size", 28.0),
+                params.float_or("dashLength", 8.0),
+                params.float_or("dashGap", 6.0),
+                params.int_or("lineType", 0).clamp(0, 3) as f32,
+            ];
+            u.p6 = [
+                params.int_or("markerShape", 0).clamp(0, 3) as f32,
+                params.int_or("boxFill", 0).clamp(0, 3) as f32,
+                params.float_or("labelOffsetX", 45.0),
+                params.float_or("labelOffsetY", 35.0),
+            ];
             let show_mask = u32::from(params.bool_or("showMask", false));
-            let show_grid = u32::from(params.bool_or("showGrid", false));
-            u.flags = show_mask | (show_grid << 1);
+            let grid_on =
+                u32::from(params.bool_or("gridEnable", params.bool_or("showGrid", false)));
+            let box_on = u32::from(params.bool_or("boxEnable", true));
+            let lines_on = u32::from(params.bool_or("linesEnable", true));
+            let arrow_on = u32::from(params.bool_or("arrowEnable", false));
+            let labels_on = u32::from(params.bool_or("labelsEnable", false));
+            let marker_filled = u32::from(params.bool_or("markerFilled", true));
+            let detect_on = u32::from(params.bool_or("detectEnable", true));
+            let dash_on = u32::from(params.bool_or("dashEnable", false));
+            let pt1_on = u32::from(params.bool_or("point1Enable", false));
+            let pt2_on = u32::from(params.bool_or("point2Enable", false));
+            let pt3_on = u32::from(params.bool_or("point3Enable", false));
+            u.flags = show_mask
+                | (grid_on << 1)
+                | (box_on << 2)
+                | (lines_on << 3)
+                | (arrow_on << 4)
+                | (labels_on << 5)
+                | (marker_filled << 6)
+                | (detect_on << 7)
+                | (dash_on << 8)
+                | (pt1_on << 9)
+                | (pt2_on << 10)
+                | (pt3_on << 11);
         }
         "ascii" => {
             let cell = if params.values.contains_key("blockSize") {
@@ -1449,26 +1688,95 @@ pub fn pack_effect_uniforms(
             } else {
                 params.vec2_or("cellSize", [8.0, 12.0])
             };
-            let fg = params.vec3_or("fgColor", [1.0, 1.0, 1.0]);
-            let bg = if params.values.contains_key("backgroundColor") {
-                params.vec3_or("backgroundColor", [0.03, 0.03, 0.04])
-            } else {
-                params.vec3_or("bgColor", [0.0, 0.0, 0.0])
-            };
             let default_mode = if params.values.contains_key("blockSize") {
                 0
             } else {
                 1
             };
-            u.mode = params.int_or("colorMode", default_mode).clamp(0, 4) as u32;
+            let color_mode = params.int_or("colorMode", default_mode).clamp(0, 4) as u32;
+            let fg = match color_mode {
+                2 => params.vec3_or("duotoneLight", params.vec3_or("fgColor", [1.0, 1.0, 1.0])),
+                3 => params.vec3_or("monoColor", params.vec3_or("fgColor", [0.2, 1.0, 0.4])),
+                _ => params.vec3_or("whiteColor", params.vec3_or("fgColor", [1.0, 1.0, 1.0])),
+            };
+            let bg = match color_mode {
+                2 => params.vec3_or("duotoneDark", params.vec3_or("bgColor", [0.05, 0.05, 0.1])),
+                _ => {
+                    if params.values.contains_key("backgroundColor") {
+                        params.vec3_or("backgroundColor", [0.03, 0.03, 0.04])
+                    } else {
+                        params.vec3_or("bgColor", [0.0, 0.0, 0.0])
+                    }
+                }
+            };
+            let black_col = params.vec3_or("blackColor", [0.15, 0.15, 0.18]);
+            let grey_col = params.vec3_or("greyColor", [0.6, 0.6, 0.65]);
+            let charset = match params.values.get("charset") {
+                Some(EffectParamValue::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                    "dense" | "detailed" => 1.0,
+                    "blocks" | "shade" => 2.0,
+                    "binary" => 3.0,
+                    "katakana" | "symbols" => 4.0,
+                    _ => 0.0,
+                },
+                _ => params.int_or("charset", 0).clamp(0, 4) as f32,
+            };
+            let font_family = params.int_or("fontFamily", 0).clamp(0, 4) as f32;
+            u.mode = color_mode;
             u.p0 = [
                 cell[0],
                 cell[1],
                 params.float_or("brightness", 0.0),
                 params.float_or("contrast", 1.0),
             ];
+            u.p1 = [
+                charset,
+                font_family,
+                params.float_or("randomScale", 0.0),
+                params.float_or("noiseIntensity", 0.0),
+            ];
+            u.p2 = [
+                params.float_or("sineSpeed", 1.0),
+                params.float_or("sineFreq", 1.5),
+                params.float_or("sineSize", 16.0),
+                params.float_or("sineIntensity", 1.0),
+            ];
+            u.p3 = [
+                params.float_or("noiseScale", 1.0),
+                params.float_or("noiseSpeed", 1.0),
+                params.float_or("noiseOctaves", 3.0),
+                params.float_or("noisePersistence", 0.5),
+            ];
+            u.p4 = [
+                params.float_or("scrollWaves", 2.0),
+                params.float_or("scrollSpeed", 1.0),
+                params.float_or("glitchAmount", 12.0),
+                params.float_or("glitchSpeed", 1.0),
+            ];
+            u.p5 = [
+                params.float_or("blackOpacity", 1.0),
+                params.float_or("whiteOpacity", 1.0),
+                params.float_or("greyOpacity", 1.0),
+                params.float_or("alphaOpacity", 0.0),
+            ];
             u.c0 = [fg[0], fg[1], fg[2], 1.0];
             u.c1 = [bg[0], bg[1], bg[2], 1.0];
+            u.c2 = [black_col[0], black_col[1], black_col[2], 1.0];
+            u.c3 = [grey_col[0], grey_col[1], grey_col[2], 1.0];
+            let rand_chars = u32::from(params.bool_or("randomChars", false));
+            let sine_on = u32::from(params.bool_or("sineEnable", false));
+            let sine_rad = u32::from(params.bool_or("sineRadial", false));
+            let noise_on = u32::from(params.bool_or("noiseEnable", false));
+            let noise_turb = u32::from(params.bool_or("noiseTurbulent", false));
+            let scroll_on = u32::from(params.bool_or("scrollEnable", false));
+            let glitch_on = u32::from(params.bool_or("glitchEnable", false));
+            u.flags = rand_chars
+                | (sine_on << 1)
+                | (sine_rad << 2)
+                | (noise_on << 3)
+                | (noise_turb << 4)
+                | (scroll_on << 5)
+                | (glitch_on << 6);
         }
         "magiclooks" => {
             let sh = params.vec3_or("shadowTint", [1.0, 1.0, 1.0]);
@@ -1510,7 +1818,19 @@ pub fn pack_effect_uniforms(
             } else {
                 params.float_or("vectorSmoothness", 50.0)
             };
+            let quality = params.int_or("quality", 1).clamp(0, 2);
+            let taps = match quality {
+                0 => 8u32,
+                2 => 24u32,
+                _ => 16u32,
+            };
+            let shutter_angle = params.float_or("shutterAngle", 180.0).clamp(0.0, 720.0);
+            let shutter_phase = params.float_or("shutterPhase", -90.0).clamp(-360.0, 360.0);
+            let shutter_span = (shutter_angle / 180.0).max(0.0);
+            let shutter_start = shutter_phase / 180.0;
+
             u.mode = params.int_or("view", 0).clamp(0, 2) as u32;
+            u.extra = taps;
             u.flags = u32::from(has_aux) | (u32::from(has_aux2) << 1);
             u.p0 = [
                 amt,
@@ -1518,30 +1838,431 @@ pub fn pack_effect_uniforms(
                 params.float_or("maxDisplacement", 256.0).clamp(1.0, 256.0),
                 (smooth / 100.0).clamp(0.0, 1.0),
             ];
+            u.p1 = [shutter_start, shutter_span, 0.0, 0.0];
         }
         "echo" => {
-            let weight = if params.values.contains_key("startingIntensity") {
-                params.float_or("startingIntensity", 1.0)
-            } else if params.values.contains_key("opacity") {
-                params.float_or("opacity", 0.75)
+            let is_legacy = effect_id == "echo-legacy"
+                || params.bool_or("legacyMode", false)
+                || (params.values.contains_key("strength")
+                    && !params.values.contains_key("composite")
+                    && !params.values.contains_key("operator"));
+            if is_legacy {
+                let weight = params.float_or("weight", params.float_or("startingIntensity", 1.0));
+                let decay = params.float_or("decay", 0.5);
+                let strength = params.float_or("strength", 1.0);
+                let threshold = params.float_or("threshold", 0.0);
+                let wsum = params.float_or("wsum", 1.0);
+                let finalize = if params.bool_or("finalize", false) {
+                    1.0
+                } else {
+                    0.0
+                };
+                u.mode = params.int_or("mode", 0).clamp(0, 3) as u32;
+                u.flags = u32::from(has_aux) | (1u32 << 1);
+                u.p0 = [weight, decay, strength, threshold];
+                u.p1 = [wsum, finalize, 0.0, 0.0];
             } else {
-                params.float_or("weight", 1.0)
+                let weight = if params.values.contains_key("startingIntensity") {
+                    params.float_or("startingIntensity", 1.0)
+                } else if params.values.contains_key("opacity") {
+                    params.float_or("opacity", 0.75)
+                } else {
+                    params.float_or("weight", 1.0)
+                };
+                let mode = if params.values.contains_key("composite") {
+                    // Zoidium native-fx echo.js: 0=over, 1=behind, 2=add, 3=screen, 4=maximum
+                    match params.int_or("composite", 0) {
+                        0 => 4,
+                        1 => 5,
+                        2 => 0,
+                        3 => 3,
+                        _ => 1,
+                    }
+                } else {
+                    params.int_or("operator", 0).clamp(0, 6) as u32
+                };
+                let newest_on_top = u32::from(
+                    params.bool_or("newestOnTop", params.bool_or("compositeInFront", false)),
+                );
+                u.mode = mode;
+                u.flags = u32::from(has_aux) | (newest_on_top << 2);
+                u.p0 = [weight, params.float_or("decay", 0.5), 1.0, 0.0];
+            }
+        }
+        // 16 Zoidium nativeEffects + helpers
+        "timedisplacement" => {
+            let max_disp = params.float_or("maxDisplacement", 1.0);
+            let time_res = params.int_or("timeResolution", 30).clamp(2, 120) as f32;
+            let stretch = u32::from(params.bool_or("stretchMap", true)) as f32;
+            let map_scale = params.vec2_or("mapScale", [1.0, 1.0]);
+            let map_off = params.vec2_or("mapOffset", [0.0, 0.0]);
+            let has_slice_idx = params.values.contains_key("sliceIndex");
+            u.mode = if has_slice_idx { 0 } else { 1 };
+            u.flags = u32::from(has_aux) | (u32::from(has_aux2) << 1);
+            u.p0 = [
+                params.float_or("sliceIndex", 0.0),
+                params.float_or("numSlices", time_res),
+                map_scale[0],
+                map_scale[1],
+            ];
+            u.p1 = [map_off[0], map_off[1], max_disp, stretch];
+        }
+        "ccwidetime" => {
+            let fwd = params.int_or("forwardSteps", 2).clamp(0, 64) as f32;
+            let bwd = params.int_or("backwardSteps", 2).clamp(0, 64) as f32;
+            let default_w = 1.0 / (1.0 + fwd + bwd).max(1.0);
+            let wt = params.float_or("weight", default_w);
+            let is_init = u32::from(params.bool_or("init", false));
+            let is_accum = u32::from(params.bool_or("nativeMotionBlur", false));
+            u.flags = u32::from(has_aux) | (is_init << 1) | (is_accum << 2);
+            u.p0 = [wt, fwd, bwd, 0.0];
+        }
+        "timedifference" => {
+            let contrast = params.float_or("contrast", 100.0);
+            let gain = (1.0 + contrast / 25.0).max(0.0);
+            let offset = params.float_or("offset", 0.04);
+            let abs_diff = u32::from(params.bool_or("absoluteDifference", false));
+            u.mode = params.int_or("alphaChannel", 0).clamp(0, 8) as u32;
+            u.flags = u32::from(has_aux) | (abs_diff << 1);
+            u.p0 = [gain, offset, contrast, 0.0];
+        }
+        "colordiffkey" => {
+            let key_raw = params.vec3_or("keyColor", [0.0, 1.0, 0.0]);
+            let accurate = params.int_or("matchingMethod", 0) != 0;
+            let kc = if accurate {
+                [
+                    srgb_to_linear_cpu(key_raw[0]),
+                    srgb_to_linear_cpu(key_raw[1]),
+                    srgb_to_linear_cpu(key_raw[2]),
+                ]
+            } else {
+                key_raw
             };
-            let mode = if params.values.contains_key("composite") {
-                // Zoidium native-fx echo.js: 0=over, 1=behind, 2=add, 3=screen, 4=maximum
-                match params.int_or("composite", 0) {
-                    0 => 4,
-                    1 => 5,
-                    2 => 0,
-                    3 => 3,
-                    _ => 1,
+            let (pri, o1, o2) = dominant_channel_triple(kc);
+            let diff1 = (kc[pri] - kc[o1]).max(0.05);
+            let diff2 = (kc[pri] - kc[o2]).max(0.05);
+            u.mode = params.int_or("view", 0).clamp(0, 5) as u32;
+            u.c0 = [key_raw[0], key_raw[1], key_raw[2], 1.0];
+            u.p0 = [
+                pri as f32,
+                o1 as f32,
+                o2 as f32,
+                f32::from(u8::from(accurate)),
+            ];
+            u.p1 = [
+                diff1,
+                diff2,
+                params.float_or("partialAGamma", 1.0),
+                params.float_or("partialBGamma", 1.0),
+            ];
+            u.p2 = [
+                params.float_or("partialAInBlack", 0.0),
+                params.float_or("partialAInWhite", 255.0),
+                params.float_or("partialAOutBlack", 0.0),
+                params.float_or("partialAOutWhite", 255.0),
+            ];
+            u.p3 = [
+                params.float_or("partialBInBlack", 0.0),
+                params.float_or("partialBInWhite", 255.0),
+                params.float_or("partialBOutBlack", 0.0),
+                params.float_or("partialBOutWhite", 255.0),
+            ];
+            u.p4 = [
+                params.float_or("matteInBlack", 0.0),
+                params.float_or("matteInWhite", 255.0),
+                params.float_or("matteGamma", 1.0),
+                params.float_or("matchingSoftness", 0.0) / 100.0,
+            ];
+        }
+        "advspill" => {
+            let key = params.vec3_or("keyColor", [0.0, 1.0, 0.0]);
+            let (pri, o1, o2) = dominant_channel_triple(key);
+            let key_hue = rgb_hue_cpu(key);
+            let method = params.int_or("method", 0);
+            let tolerance = if method == 0 {
+                1.0
+            } else {
+                (params.float_or("tolerance", 50.0) / 100.0).clamp(0.0, 1.0)
+            };
+            let spill_range = (params.float_or("spillRange", 50.0) / 100.0).clamp(0.0, 1.0);
+            let suppression = (params.float_or("suppression", 100.0) / 100.0).clamp(0.0, 2.0);
+            let luma_corr = if params.values.contains_key("preserveLuminance") {
+                if params.bool_or("preserveLuminance", true) {
+                    1.0
+                } else {
+                    0.0
                 }
             } else {
-                params.int_or("operator", 0).clamp(0, 6) as u32
+                (params.float_or("lumaCorrection", 100.0) / 100.0).clamp(0.0, 2.0)
             };
-            u.mode = mode;
+            let desat = (params.float_or("desaturate", 0.0) / 100.0).clamp(0.0, 1.0);
+            let neutral = (params.float_or("neutral", 0.0) / 100.0).clamp(0.0, 1.0);
+            u.p0 = [pri as f32, o1 as f32, o2 as f32, key_hue];
+            u.p1 = [suppression, spill_range, luma_corr, tolerance];
+            u.p2 = [desat, neutral, 0.0, 0.0];
+        }
+        "keycleaner" => {
+            let rad = params
+                .float_or("additionalEdgeRadius", 10.0)
+                .clamp(0.0, 50.0);
+            let chatter = f32::from(u8::from(params.bool_or("reduceChatter", false)));
+            let alpha_con = (params.float_or("alphaContrastStrength", 0.0) / 100.0).clamp(0.0, 1.0);
+            let contrast = 1.0 + alpha_con * 4.0;
+            let recover = (params.float_or("recoverDetails", 50.0) / 100.0).clamp(0.0, 1.0);
+            let est_sigma = (rad * 0.5).max(0.0);
+            let est_step = (rad / 4.0).max(1.0);
+            u.p0 = [chatter, contrast, recover, est_sigma];
+            u.p1 = [est_step, 0.0, 0.0, 0.0];
+        }
+        "linearcolorkey" => {
+            let key = params.vec3_or("keyColor", [0.0, 0.0, 1.0]);
+            let tol = (params.float_or("matchingTolerance", 10.0) / 100.0).clamp(0.0, 1.0);
+            let soft = (params.float_or("matchingSoftness", 10.0) / 100.0).clamp(0.0, 1.0);
+            let keep = f32::from(u8::from(params.int_or("keyOperation", 0) != 0));
+            let match_mode = params.int_or("matchingColors", 0).clamp(0, 2) as f32;
+            u.mode = params.int_or("view", 0).clamp(0, 2) as u32;
+            u.c0 = [key[0], key[1], key[2], 1.0];
+            u.p0 = [match_mode, tol, soft, keep];
+        }
+        "radiowaves" => {
+            let prod = params.vec2_or("producerPoint", [0.5, 0.5]);
+            let col = params.vec4_or("color", [1.0, 1.0, 1.0, 1.0]);
+            let sides = params.int_or("polygonSides", 0).clamp(0, 32);
+            let sides_f = if sides >= 3 { sides as f32 } else { 0.0 };
+            let star_k = if params.bool_or("star", false) && sides >= 3 {
+                params.float_or("starInnerRadius", 0.5).clamp(0.05, 0.99)
+            } else {
+                0.0
+            };
+            let t_sec = if params.values.contains_key("time") {
+                params.float_or("time", params.time)
+            } else {
+                params.time
+            };
+            let comp_orig = u32::from(params.bool_or("compositeOriginal", true));
+            let do_reflect = u32::from(params.bool_or("reflection", false));
+            u.flags = comp_orig | (do_reflect << 1);
+            u.c0 = col;
+            u.p0 = [
+                prod[0],
+                prod[1],
+                params.float_or("frequency", 1.0).max(0.01),
+                params.float_or("expansion", 100.0),
+            ];
+            u.p1 = [
+                params.float_or("orientation", 0.0).to_radians(),
+                params.float_or("direction", 0.0).to_radians(),
+                params.float_or("velocity", 0.0),
+                params.float_or("spin", 0.0).to_radians(),
+            ];
+            u.p2 = [
+                params.float_or("lifespan", 3.0).max(0.01),
+                params.float_or("startWidth", 6.0),
+                params.float_or("endWidth", 2.0),
+                params.float_or("fadeIn", 0.2),
+            ];
+            u.p3 = [
+                params.float_or("fadeOut", 0.5),
+                params.float_or("opacity", 1.0).clamp(0.0, 1.0),
+                sides_f,
+                star_k,
+            ];
+            u.p4 = [
+                t_sec,
+                params.int_or("profile", 0).clamp(0, 6) as f32,
+                0.0,
+                0.0,
+            ];
+        }
+        "beam" => {
+            let sp = params.vec2_or("startPoint", [0.25, 0.5]);
+            let ep = params.vec2_or("endPoint", [0.75, 0.5]);
+            let len_raw = params.float_or("length", 50.0);
+            let len01 = if len_raw > 1.0 {
+                (len_raw / 100.0).clamp(0.0, 1.0)
+            } else {
+                len_raw.clamp(0.0, 1.0)
+            };
+            let time_raw = params.float_or("time", 50.0);
+            let time01 = if time_raw > 1.0 {
+                (time_raw / 100.0).clamp(0.0, 1.0)
+            } else {
+                time_raw.clamp(0.0, 1.0)
+            };
+            let soft_raw = params.float_or("softness", 50.0);
+            let soft01 = if soft_raw > 1.0 {
+                (soft_raw / 100.0).clamp(0.0, 1.0)
+            } else {
+                soft_raw.clamp(0.0, 1.0)
+            };
+            let t0 = (time01 * (1.0 + len01) - len01).clamp(0.0, 1.0);
+            let t1 = (time01 * (1.0 + len01)).clamp(0.0, 1.0);
+            let in_col = params.vec3_or("insideColor", [1.0, 1.0, 1.0]);
+            let out_col = params.vec3_or("outsideColor", [1.0, 0.15, 0.15]);
+            let comp_orig = u32::from(params.bool_or("compositeOriginal", true));
+            let persp = u32::from(params.bool_or("perspective", true));
+            u.flags = comp_orig | (persp << 1);
+            u.c0 = [in_col[0], in_col[1], in_col[2], 1.0];
+            u.c1 = [out_col[0], out_col[1], out_col[2], 1.0];
+            u.p0 = [sp[0], sp[1], ep[0], ep[1]];
+            u.p1 = [t0, t1, len01, soft01];
+            u.p2 = [
+                params.float_or("startThickness", 10.0),
+                params.float_or("endThickness", 10.0),
+                0.0,
+                0.0,
+            ];
+        }
+        "ccpageturn" => {
+            let fp = params.vec2_or("foldPosition", [0.75, 0.75]);
+            let paper = params.vec3_or("paperColor", [0.85, 0.85, 0.85]);
+            let back_op_raw = params.float_or("backOpacity", 70.0);
+            let back_op = if back_op_raw > 1.0 {
+                (back_op_raw / 100.0).clamp(0.0, 1.0)
+            } else {
+                back_op_raw.clamp(0.0, 1.0)
+            };
+            u.mode = params.int_or("render", 0).clamp(0, 2) as u32;
+            u.c0 = [paper[0], paper[1], paper[2], 1.0];
+            u.p0 = [
+                fp[0],
+                fp[1],
+                params.float_or("foldDirection", 135.0),
+                params.float_or("foldRadius", 60.0),
+            ];
+            u.p1 = [
+                params.float_or("lightDirection", 45.0),
+                back_op,
+                params.int_or("backPage", 0).clamp(0, 1) as f32,
+                0.0,
+            ];
+        }
+        "cardwipe" => {
+            let comp_raw = params.float_or("transitionCompletion", 50.0);
+            let comp01 = if comp_raw > 1.0 {
+                (comp_raw / 100.0).clamp(0.0, 1.0)
+            } else {
+                comp_raw.clamp(0.0, 1.0)
+            };
+            let tw_raw = params.float_or("transitionWidth", 25.0);
+            let tw01 = if tw_raw > 1.0 {
+                (tw_raw / 100.0).clamp(0.01, 1.0)
+            } else {
+                tw_raw.clamp(0.01, 1.0)
+            };
+            let back_col = params.vec3_or("backColor", [0.2, 0.2, 0.25]);
+            let seed = params.int_or("seed", 1).unsigned_abs().max(1);
+            u.mode = params.int_or("backLayer", 0).clamp(0, 1) as u32;
+            u.extra = seed;
+            u.c0 = [back_col[0], back_col[1], back_col[2], 1.0];
+            u.p0 = [
+                params.int_or("rows", 5).clamp(1, 200) as f32,
+                params.int_or("columns", 8).clamp(1, 200) as f32,
+                params.float_or("cardScale", 1.0).clamp(0.05, 4.0),
+                comp01,
+            ];
+            u.p1 = [
+                tw01,
+                params.int_or("flipAxis", 0).clamp(0, 2) as f32,
+                params.int_or("flipDirection", 0).clamp(0, 2) as f32,
+                params.int_or("flipOrder", 0).clamp(0, 8) as f32,
+            ];
+            u.p2 = [
+                (params.float_or("timingRandomness", 0.0) / 100.0).clamp(0.0, 1.0),
+                params.float_or("cameraDistance", 2.5).max(1.0),
+                params.float_or("lightIntensity", 1.0).max(0.0),
+                params.float_or("ambientLight", 0.3).clamp(0.0, 1.0),
+            ];
+        }
+        "ccpixelpolly" => {
+            let t = if params.values.contains_key("time") {
+                params.float_or("time", 0.0) - params.float_or("startTime", 0.0)
+            } else {
+                params.time - params.float_or("startTime", 0.0)
+            };
+            let fc = params.vec2_or("forceCenter", [0.5, 0.5]);
+            let obj_mode = params.int_or("object", 1).clamp(0, 3);
+            let flat_mode = if params.values.contains_key("object") {
+                obj_mode == 0 || obj_mode == 2
+            } else {
+                params.int_or("texture", 0) != 0
+            };
+            let seed = if params.values.contains_key("randomSeed") {
+                params.float_or("randomSeed", 1.0)
+            } else {
+                params.float_or("seed", 1.0)
+            };
+            u.flags = u32::from(flat_mode);
+            u.p0 = [
+                t.max(0.0),
+                params.float_or("gridSpacing", 10.0).clamp(1.0, 500.0),
+                params.float_or("force", 100.0),
+                params.float_or("gravity", 1.0),
+            ];
+            u.p1 = [fc[0], fc[1], params.float_or("spinning", 0.0), seed];
+        }
+        "radialshadow" => {
+            let ls = params.vec2_or("lightSource", [0.3, 0.3]);
+            let col = params.vec3_or("shadowColor", [0.0, 0.0, 0.0]);
+            let op_raw = params.float_or("opacity", 75.0);
+            let op01 = if op_raw > 1.0 {
+                (op_raw / 100.0).clamp(0.0, 1.0)
+            } else {
+                op_raw.clamp(0.0, 1.0)
+            };
+            let ci_raw = params.float_or("colorInfluence", 0.0);
+            let ci01 = if ci_raw > 1.0 {
+                (ci_raw / 100.0).clamp(0.0, 1.0)
+            } else {
+                ci_raw.clamp(0.0, 1.0)
+            };
+            u.mode = params.int_or("render", 0).clamp(0, 1) as u32;
+            u.flags = u32::from(params.bool_or("shadowOnly", false));
+            u.c0 = [col[0], col[1], col[2], 1.0];
+            u.p0 = [
+                ls[0],
+                ls[1],
+                params.float_or("projectionDistance", 50.0),
+                params.float_or("softness", 12.0).max(0.0),
+            ];
+            u.p1 = [op01, ci01, 0.0, 0.0];
+        }
+        "layerinputdisplacement" => {
+            let doff = params.vec2_or("displacementOffset", [0.0, 0.0]);
+            let off = params.vec2_or("offset", [0.0, 0.0]);
+            let sc = params.vec2_or("scale", [1.0, 1.0]);
+            let rot = params.float_or("rotation", 0.0);
+            let ud = params.vec3_or("uDisplacement", [1.0, 0.0, 0.0]);
+            let vd = params.vec3_or("vDisplacement", [0.0, 1.0, 0.0]);
+            let (m0, m1) = compute_overlay_uv_transform(off, sc, rot, u.resolution);
+            u.mode = params.int_or("wrap", 2).clamp(0, 2) as u32;
             u.flags = u32::from(has_aux);
-            u.p0 = [weight, params.float_or("decay", 0.5), 0.0, 0.0];
+            u.p0 = [doff[0], doff[1], params.float_or("amount", 0.1), rot];
+            u.p1 = [off[0], off[1], sc[0], sc[1]];
+            u.p2 = [ud[0], ud[1], ud[2], 0.0];
+            u.p3 = [vd[0], vd[1], vd[2], 0.0];
+            u.m0 = m0;
+            u.m1 = m1;
+        }
+        "framemix" => {
+            let frac = if params.values.contains_key("frac") {
+                params.float_or("frac", 0.5)
+            } else {
+                params.float_or("mix", 0.5)
+            };
+            u.mode = params
+                .int_or("blendMode", params.int_or("mode", 0))
+                .clamp(0, 2) as u32;
+            u.flags = u32::from(has_aux);
+            u.p0 = [frac.clamp(0.0, 1.0), 0.0, 0.0, 0.0];
+        }
+        "shutteraccum" => {
+            let wt = params.float_or("weight", 1.0);
+            let inv_total = params.float_or("invTotalWeight", 1.0);
+            let is_init = u32::from(params.bool_or("init", false));
+            let is_final = u32::from(params.bool_or("finalize", false));
+            u.flags = u32::from(has_aux) | (is_init << 1) | (is_final << 2);
+            u.p0 = [wt, inv_total, 0.0, 0.0];
         }
         _ => {}
     }
@@ -1674,7 +2395,15 @@ fn compute_shake_inverse_homography(params: &EffectParams) -> Option<([[f32; 3];
     let d = w.max(h);
     let amp = params.float_or("amplitude", 0.01);
     let speed = params.float_or("speed", 15.0);
-    let zoom = params.float_or("zoom", 100.0);
+    // CM3 shake.js uses exact `-zoom` without an arbitrary `d * 0.85` clamp.
+    // Only when `"zoom"` is omitted on tiny synthetic test targets (`d <= 101`, e.g. 64x64)
+    // scale the omitted default so the quad isn't behind the near plane.
+    let default_zoom = if d <= 101.0 {
+        (d * 0.1).min(100.0)
+    } else {
+        100.0
+    };
+    let zoom = params.float_or("zoom", default_zoom);
     let shake_mode = params.int_or("shake.mode", 1);
     let chan_amp = if params.values.contains_key("shake.amplitude") {
         params.vec4_or("shake.amplitude", [1000.0, 1000.0, 1000.0, 10.0])
@@ -1705,15 +2434,17 @@ fn compute_shake_inverse_homography(params: &EffectParams) -> Option<([[f32; 3];
 
     // shake.js: camera starts at (0, 0, -zoom), then PZ.shake.shake(r, amp, camera)
     // right-multiplies M_shake (with * 0.1 rad scale on Rotate/Roll).
-    // Clamp zoom to `< d` so small preview/test targets (e.g. 64x64) don't place the camera behind the quad at z = -d.
-    let eff_zoom = zoom.min(d * 0.85);
+    // Guard only against singular division (`d <= 1e-4`), matching CM3 shake.js verbatim.
+    if !d.is_finite() || d <= 1e-4 {
+        return None;
+    }
     let m_shake = zc_scene::evaluate_camera_shake(
         f64::from(params.frame),
         f64::from(amp),
         f64::from(speed),
         &shake_params,
     );
-    let m_cam = zc_geom::Mat4::from_translation(zc_geom::Vec3::new(0.0, 0.0, -eff_zoom)) * m_shake;
+    let m_cam = zc_geom::Mat4::from_translation(zc_geom::Vec3::new(0.0, 0.0, -zoom)) * m_shake;
     let m_cam_inv = m_cam.inverse();
 
     let u_cam = m_cam_inv.transform_vector3(zc_geom::Vec3::new(0.5 * w, 0.0, 0.0));
@@ -1879,6 +2610,7 @@ pub struct EffectRegistry {
     _fallback_texture: wgpu::Texture,
     fallback_view: wgpu::TextureView,
     pipelines: HashMap<(&'static str, bool, wgpu::TextureFormat), wgpu::RenderPipeline>,
+    polly_mesh_pipeline: Option<wgpu::RenderPipeline>,
     custom_pipelines: HashMap<u64, CustomPipelineEntry>,
     custom_tick: u64,
 }
@@ -2018,6 +2750,7 @@ impl EffectRegistry {
             _fallback_texture: fallback_texture,
             fallback_view,
             pipelines: HashMap::new(),
+            polly_mesh_pipeline: None,
             custom_pipelines: HashMap::new(),
             custom_tick: 0,
         }
@@ -2144,6 +2877,46 @@ impl EffectRegistry {
                 self.run_drop_shadow(device, encoder, params, targets, width, height)?
             }
             "sglow" => self.run_sglow(device, encoder, params, targets, width, height)?,
+            "jpegdamage" => {
+                self.run_jpeg_damage(device, encoder, params, targets, width, height)?
+            }
+            "datamosh" => self.run_datamosh(device, encoder, params, targets, width, height)?,
+            "tracery" => self.run_tracery(device, encoder, params, targets, width, height)?,
+            "magiclooks" => {
+                if has_magic_looks_chain(params) {
+                    self.apply_magic_looks_chain(
+                        device, queue, encoder, params, targets, width, height,
+                    )?;
+                } else {
+                    let uniforms = pack_effect_uniforms(
+                        effect_id,
+                        params,
+                        targets.aux.is_some(),
+                        targets.aux2.is_some(),
+                    );
+                    let canonical = self.ensure_pipeline(device, resolved, false)?;
+                    self.encode_pass(
+                        device,
+                        encoder,
+                        (canonical, false, self.format),
+                        &uniforms,
+                        targets.input,
+                        targets.output,
+                        targets.aux,
+                        targets.aux2,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
+                }
+            }
+            "numbers" => self.run_text_field(
+                device, queue, encoder, false, params, targets, width, height,
+            )?,
+            "timecode" => {
+                self.run_text_field(device, queue, encoder, true, params, targets, width, height)?
+            }
+            "ccpixelpolly" => {
+                self.run_pixel_polly(device, encoder, params, targets, width, height)?
+            }
             _ => {
                 let uploaded_lut = if targets.aux.is_none() {
                     self.upload_param_lut(device, queue, resolved, params)
@@ -2155,7 +2928,7 @@ impl EffectRegistry {
                     .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
                 let effective_aux = targets.aux.or(lut_view.as_ref());
                 let uniforms = pack_effect_uniforms(
-                    resolved,
+                    effect_id,
                     params,
                     effective_aux.is_some(),
                     targets.aux2.is_some(),
@@ -2513,8 +3286,11 @@ impl EffectRegistry {
         let _ = prev_tex;
 
         // Final composite onto unmodified input -> output
+        // For CM3 `bloom`, pass `bright_view` in `aux2` (`flags = 1`) so `blendThreshold`/`blendSoften`
+        // gate on `brightTexture` luma exactly matching CM3 `bloom.js`.
         let mut u_fin = EffectUniforms::from_params(params);
         u_fin.pass = 3;
+        u_fin.flags = u32::from(!anamorphic);
         u_fin.p0 = [amount, blend_threshold, blend_soften, 0.0];
         self.encode_pass(
             device,
@@ -2524,7 +3300,7 @@ impl EffectRegistry {
             targets.input,
             targets.output,
             Some(&accum_view),
-            None,
+            if anamorphic { None } else { Some(&bright_view) },
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
         Ok(())
@@ -2588,7 +3364,11 @@ impl EffectRegistry {
         let view_a = temp_a.create_view(&wgpu::TextureViewDescriptor::default());
         let view_b = temp_b.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let col = params.vec3_or("color", [0.0, 0.0, 0.0]);
+        let col = if params.values.contains_key("color") {
+            params.vec3_or("color", [0.0, 0.0, 0.0])
+        } else {
+            params.vec3_or("shadowColor", [0.0, 0.0, 0.0])
+        };
         let use_polar = params.values.contains_key("angle")
             || params.values.contains_key("distance")
             || !params.values.contains_key("offset");
@@ -2599,13 +3379,20 @@ impl EffectRegistry {
         } else {
             params.vec2_or("offset", [8.0, -8.0])
         };
-        let opacity = params.float_or("opacity", 0.5);
+        let opacity = if params.values.contains_key("opacity") {
+            params.float_or("opacity", 0.5)
+        } else {
+            params.float_or("shadowOpacity", 0.5)
+        };
         let blur = if params.values.contains_key("blur") {
             params.float_or("blur", 10.0)
-        } else {
+        } else if params.values.contains_key("softness") {
             params.float_or("softness", 10.0)
+        } else {
+            params.float_or("radius", 10.0)
         };
-        let shadow_only = u32::from(params.bool_or("shadowOnly", false));
+        let shadow_only =
+            u32::from(params.bool_or("shadowOnly", params.bool_or("knockout", false)));
 
         // Pass 0: Extract & colorize offset alpha
         let mut u0 = EffectUniforms::from_params(params);
@@ -3225,8 +4012,951 @@ impl EffectRegistry {
                     &data[..expected],
                 ))
             }
-            _ => None,
+            _ => {
+                if effect_id == "colorcurves"
+                    && let Some(curves_json) = params.string("curves")
+                {
+                    let lut_bytes = bake_curves_json_rgba8(curves_json);
+                    return Some(upload_rgba8_texture(
+                        device,
+                        queue,
+                        "zc-effect-colorcurves-lut",
+                        256,
+                        1,
+                        &lut_bytes,
+                    ));
+                }
+                None
+            }
         }
+    }
+
+    /// Wave 2D helper: blends two temporal frames (`input` = frame A, `aux` = frame B)
+    /// using linear premul (`mode = 0`), straight (`mode = 1`), or optical-flow warp (`mode = 2`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_frame_mix(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_a: &wgpu::TextureView,
+        frame_b: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+        resolution: [f32; 2],
+        frac: f32,
+        blend_mode: u32,
+    ) -> Result<(), EffectError> {
+        let canonical = self.ensure_pipeline(device, "framemix", false)?;
+        let params = EffectParams::new(resolution, 0.0, 0.0);
+        let mut u = EffectUniforms::from_params(&params);
+        u.mode = blend_mode.min(2);
+        u.flags = 1;
+        u.p0 = [frac.clamp(0.0, 1.0), 0.0, 0.0, 0.0];
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, self.format),
+            &u,
+            frame_a,
+            output,
+            Some(frame_b),
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        Ok(())
+    }
+
+    /// Wave 2D helper: accumulates one weighted shutter sample (`sample_view`) into `acc_in -> acc_out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_shutter_accumulate(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        acc_in: &wgpu::TextureView,
+        sample_view: &wgpu::TextureView,
+        acc_out: &wgpu::TextureView,
+        resolution: [f32; 2],
+        weight: f32,
+        inv_total_weight: f32,
+        init: bool,
+        finalize: bool,
+        target_format: wgpu::TextureFormat,
+    ) -> Result<(), EffectError> {
+        let canonical =
+            self.ensure_pipeline_for_format(device, "shutteraccum", false, target_format)?;
+        let params = EffectParams::new(resolution, 0.0, 0.0);
+        let mut u = EffectUniforms::from_params(&params);
+        u.flags = 1u32 | (u32::from(init) << 1) | (u32::from(finalize) << 2);
+        u.p0 = [weight.max(0.0), inv_total_weight.max(0.0), 0.0, 0.0];
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, target_format),
+            &u,
+            acc_in,
+            acc_out,
+            Some(sample_view),
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        Ok(())
+    }
+
+    /// Wave 2D helper: composites one temporal slice (`slice_view`) into `acc_in -> acc_out`
+    /// for `timedisplacement` guided by optional `map_view`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_time_displacement_slice(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        acc_in: &wgpu::TextureView,
+        slice_view: &wgpu::TextureView,
+        map_view: Option<&wgpu::TextureView>,
+        acc_out: &wgpu::TextureView,
+        params: &EffectParams,
+        slice_index: u32,
+        num_slices: u32,
+    ) -> Result<(), EffectError> {
+        let canonical = self.ensure_pipeline(device, "timedisplacement", false)?;
+        let mut u = pack_effect_uniforms("timedisplacement", params, true, map_view.is_some());
+        u.mode = 0;
+        u.flags = 1u32 | (u32::from(map_view.is_some()) << 1);
+        u.p0[0] = slice_index as f32;
+        u.p0[1] = num_slices.max(2) as f32;
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, self.format),
+            &u,
+            acc_in,
+            acc_out,
+            Some(slice_view),
+            map_view,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        Ok(())
+    }
+
+    /// Wave 2D helper: folds one temporal tap (`tap_view`) into `acc_in -> acc_out` for `ccwidetime`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_wide_time_tap(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        acc_in: &wgpu::TextureView,
+        tap_view: &wgpu::TextureView,
+        acc_out: &wgpu::TextureView,
+        params: &EffectParams,
+        weight: f32,
+        init: bool,
+        native_motion_blur: bool,
+    ) -> Result<(), EffectError> {
+        let canonical = self.ensure_pipeline(device, "ccwidetime", false)?;
+        let mut u = pack_effect_uniforms("ccwidetime", params, true, false);
+        u.flags = 1u32 | (u32::from(init) << 1) | (u32::from(native_motion_blur) << 2);
+        u.p0[0] = weight.max(0.0);
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, self.format),
+            &u,
+            acc_in,
+            acc_out,
+            Some(tap_view),
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        Ok(())
+    }
+
+    /// Multi-pass 4-stage 8x8 DCT/IDCT pipeline for `jpegdamage`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_jpeg_damage(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &EffectParams,
+        targets: &EffectTargets<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), EffectError> {
+        let hdr_fmt = wgpu::TextureFormat::Rgba16Float;
+        let canonical = self.ensure_pipeline(device, "jpegdamage", false)?;
+        let _ = self.ensure_pipeline_for_format(device, "jpegdamage", false, hdr_fmt)?;
+
+        let base_u = pack_effect_uniforms("jpegdamage", params, false, false);
+        let low_w = (base_u.p5[1].round() as u32).clamp(8, width.max(8));
+        let low_h = (base_u.p5[2].round() as u32).clamp(8, height.max(8));
+        let dct_w = low_w.div_ceil(8) * 8;
+        let dct_h = low_h.div_ceil(8) * 8;
+
+        let stage0 = self.create_temp_target_with_format(device, dct_w, dct_h, hdr_fmt, "zc-jd-s0");
+        let stage1 = self.create_temp_target_with_format(device, dct_w, dct_h, hdr_fmt, "zc-jd-s1");
+        let stage2 = self.create_temp_target_with_format(device, dct_w, dct_h, hdr_fmt, "zc-jd-s2");
+        let v0 = stage0.create_view(&wgpu::TextureViewDescriptor::default());
+        let v1 = stage1.create_view(&wgpu::TextureViewDescriptor::default());
+        let v2 = stage2.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Pass 0: Row forward DCT (input -> stage0)
+        let mut u0 = base_u;
+        u0.pass = 0;
+        u0.resolution = [dct_w as f32, dct_h as f32];
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, hdr_fmt),
+            &u0,
+            targets.input,
+            &v0,
+            None,
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+
+        // Pass 1: Col forward DCT + freq scaling + JPEG Q50 quant + bitstream errors (stage0 -> stage1)
+        let mut u1 = base_u;
+        u1.pass = 1;
+        u1.resolution = [dct_w as f32, dct_h as f32];
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, hdr_fmt),
+            &u1,
+            &v0,
+            &v1,
+            None,
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+
+        // Pass 2: Col inverse DCT (stage1 -> stage2)
+        let mut u2 = base_u;
+        u2.pass = 2;
+        u2.resolution = [dct_w as f32, dct_h as f32];
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, hdr_fmt),
+            &u2,
+            &v1,
+            &v2,
+            None,
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+
+        // Pass 3: Row inverse DCT + YCbCr->RGB + tone + blend onto unmodified input -> output
+        let mut u3 = base_u;
+        u3.pass = 3;
+        u3.resolution = [width as f32, height as f32];
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, self.format),
+            &u3,
+            targets.input,
+            targets.output,
+            Some(&v2),
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        Ok(())
+    }
+
+    /// 2-pass macroblock SAD motion field + warp pipeline for `datamosh`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_datamosh(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &EffectParams,
+        targets: &EffectTargets<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), EffectError> {
+        let hdr_fmt = wgpu::TextureFormat::Rgba16Float;
+        let canonical = self.ensure_pipeline(device, "datamosh", false)?;
+        let _ = self.ensure_pipeline_for_format(device, "datamosh", false, hdr_fmt)?;
+
+        let mut u_warp = pack_effect_uniforms("datamosh", params, targets.aux.is_some(), false);
+        let algorithm = u_warp.p1[0];
+        let mut owned_mv: Option<wgpu::Texture> = None;
+        let mut mv_view: Option<wgpu::TextureView> = None;
+
+        if algorithm < 0.5 && targets.aux.is_some() {
+            let bs = u_warp.p0[2].max(2.0);
+            let gw = ((width as f32) / bs).ceil().clamp(1.0, 256.0) as u32;
+            let gh = ((height as f32) / bs).ceil().clamp(1.0, 256.0) as u32;
+            let mv_tex = self.create_temp_target_with_format(device, gw, gh, hdr_fmt, "zc-dm-mv");
+            let v_mv = mv_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let mut u0 = u_warp;
+            u0.pass = 0;
+            u0.p3[0] = gw as f32;
+            u0.p3[1] = gh as f32;
+            u0.p3[2] = params.float_or("spacing", 4.0).clamp(1.0, 32.0);
+            self.encode_pass(
+                device,
+                encoder,
+                (canonical, false, hdr_fmt),
+                &u0,
+                targets.input,
+                &v_mv,
+                targets.aux,
+                None,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+            u_warp.flags |= 1u32 << 1;
+            owned_mv = Some(mv_tex);
+            mv_view = Some(v_mv);
+        }
+
+        u_warp.pass = 1;
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, self.format),
+            &u_warp,
+            targets.input,
+            targets.output,
+            targets.aux,
+            mv_view.as_ref().or(targets.aux2),
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        let _ = owned_mv;
+        Ok(())
+    }
+
+    /// 2-pass key-mask extraction + feature overlay pipeline for `tracery`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_tracery(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &EffectParams,
+        targets: &EffectTargets<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), EffectError> {
+        let canonical = self.ensure_pipeline(device, "tracery", false)?;
+        let mask_tex = self.create_temp_target(device, width, height, "zc-tracery-mask");
+        let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut u0 = pack_effect_uniforms("tracery", params, false, false);
+        u0.pass = 0;
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, self.format),
+            &u0,
+            targets.input,
+            &mask_view,
+            None,
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+
+        let mut u1 = u0;
+        u1.pass = 1;
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, self.format),
+            &u1,
+            targets.input,
+            targets.output,
+            Some(&mask_view),
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        Ok(())
+    }
+
+    /// Multi-pass tool-chain executor for Zoidium Magic Looks (`magiclooks` / `looks`).
+    /// Parses `looksInstances` JSON (or `chainOrder` / legacy `ml_*` flags) and executes every
+    /// active tool among all 29 Magic Looks tool types in order on HDR `Rgba16Float` targets,
+    /// including multi-pass separable Gaussian glow (`diffusion`), dual-axis streaks
+    /// (`star-filter`), horizontal streaks (`anamorphic-flare`), 1D LUT baking (`curves`,
+    /// `s-curve`), and 3D `.cube` LUT (`lut`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_magic_looks_chain(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &EffectParams,
+        targets: &EffectTargets<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), EffectError> {
+        let tools = parse_magic_looks_chain(params);
+        if tools.is_empty() {
+            let uniforms = pack_effect_uniforms(
+                "magiclooks",
+                params,
+                targets.aux.is_some(),
+                targets.aux2.is_some(),
+            );
+            let canonical = self.ensure_pipeline(device, "magiclooks", false)?;
+            self.encode_pass(
+                device,
+                encoder,
+                (canonical, false, self.format),
+                &uniforms,
+                targets.input,
+                targets.output,
+                targets.aux,
+                targets.aux2,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+            return Ok(());
+        }
+
+        let hdr_fmt = wgpu::TextureFormat::Rgba16Float;
+        let canonical = self.ensure_pipeline(device, "magiclooks_tool", false)?;
+        let _ = self.ensure_pipeline_for_format(device, "magiclooks_tool", false, hdr_fmt)?;
+
+        let ping =
+            self.create_temp_target_with_format(device, width, height, hdr_fmt, "zc-ml-ping");
+        let pong =
+            self.create_temp_target_with_format(device, width, height, hdr_fmt, "zc-ml-pong");
+        let ping_v = ping.create_view(&wgpu::TextureViewDescriptor::default());
+        let pong_v = pong.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut owned_textures: Vec<wgpu::Texture> = Vec::new();
+
+        let uploaded_3d_lut = if let Some(EffectParamValue::Lut3D { size, data }) =
+            params.values.get("lut")
+        {
+            let n = *size;
+            let expected = (n as usize) * (n as usize) * (n as usize) * 4;
+            if n >= 2 && data.len() >= expected {
+                Some((
+                    n as f32,
+                    upload_rgba8_texture(device, queue, "zc-ml-lut3d", n * n, n, &data[..expected]),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let lut3d_view = uploaded_3d_lut
+            .as_ref()
+            .map(|(sz, t)| (*sz, t.create_view(&wgpu::TextureViewDescriptor::default())));
+
+        let total = tools.len();
+        let mut read_ping = false;
+        let mut first_pass = true;
+
+        for (idx, tool) in tools.iter().enumerate() {
+            let is_last = idx + 1 == total;
+            let src_view: &wgpu::TextureView = if first_pass {
+                targets.input
+            } else if read_ping {
+                &ping_v
+            } else {
+                &pong_v
+            };
+            let in_straight = !first_pass;
+
+            let mut u = EffectUniforms::from_params(params);
+            u.mode = tool.mode;
+            u.pass = 0;
+            u.p0 = tool.p0;
+            u.p1 = tool.p1;
+            u.p2 = tool.p2;
+            u.p3 = tool.p3;
+            u.c0 = tool.c0;
+            u.c1 = tool.c1;
+            u.c2 = tool.c2;
+            u.c3 = tool.c3;
+
+            let mut aux_v: Option<wgpu::TextureView> = None;
+            let mut aux2_v: Option<wgpu::TextureView> = None;
+
+            match tool.mode {
+                // curves (13): 1D RGBA LUT
+                13 => {
+                    if let Some(ref json_str) = tool.aux_json {
+                        let lut = bake_curves_json_rgba8(json_str);
+                        let t = upload_rgba8_texture(device, queue, "zc-ml-curves", 256, 1, &lut);
+                        aux_v = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
+                        owned_textures.push(t);
+                    }
+                }
+                // s-curve (14): 1D luminance LUT
+                14 => {
+                    if let Some(ref json_str) = tool.aux_json {
+                        let lut = bake_scurve_json_rgba8(json_str);
+                        let t = upload_rgba8_texture(device, queue, "zc-ml-scurve", 256, 1, &lut);
+                        aux_v = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
+                        owned_textures.push(t);
+                    }
+                }
+                // lut (15): optional 3D LUT
+                15 => {
+                    if let Some((sz, ref view)) = lut3d_view {
+                        u.p0[3] = sz;
+                        // Passed directly below via explicit borrow
+                        let _ = view;
+                    }
+                }
+                // diffusion (21): 2-pass separable Gaussian glow into temp Rgba16Float
+                21 if u.p0[2].abs() > 1e-5 => {
+                    let dr = (1.0 + u.p0[0] * 10.0) * (0.5 + u.p0[1] * 0.15);
+                    let sigma = (dr * 0.6).clamp(0.75, 16.0);
+                    let blur_h = self.create_temp_target_with_format(
+                        device,
+                        width,
+                        height,
+                        hdr_fmt,
+                        "zc-ml-diff-h",
+                    );
+                    let blur_v = self.create_temp_target_with_format(
+                        device,
+                        width,
+                        height,
+                        hdr_fmt,
+                        "zc-ml-diff-v",
+                    );
+                    let bh_v = blur_h.create_view(&wgpu::TextureViewDescriptor::default());
+                    let bv_v = blur_v.create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let mut u_bh = EffectUniforms::from_params(params);
+                    u_bh.pass = 1;
+                    u_bh.flags = u32::from(in_straight) | (1u32 << 1);
+                    u_bh.p0 = [1.0 / (width as f32), 0.0, sigma, 0.0];
+                    self.encode_pass(
+                        device,
+                        encoder,
+                        (canonical, false, hdr_fmt),
+                        &u_bh,
+                        src_view,
+                        &bh_v,
+                        None,
+                        None,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
+
+                    let mut u_bv = EffectUniforms::from_params(params);
+                    u_bv.pass = 1;
+                    u_bv.flags = 1u32 | (1u32 << 1);
+                    u_bv.p0 = [0.0, 1.0 / (height as f32), sigma, 0.0];
+                    self.encode_pass(
+                        device,
+                        encoder,
+                        (canonical, false, hdr_fmt),
+                        &u_bv,
+                        &bh_v,
+                        &bv_v,
+                        None,
+                        None,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
+                    owned_textures.push(blur_h);
+                    owned_textures.push(blur_v);
+                    aux_v = Some(bv_v);
+                }
+                // star-filter (22): dual-axis directional streak passes
+                22 if u.p0[1].abs() > 1e-5 => {
+                    let ang = u.p1[0].to_radians();
+                    let rad = 4.0 + u.p0[0] * 48.0;
+                    let thresh = u.p0[2];
+                    let s1_t = self.create_temp_target_with_format(
+                        device,
+                        width,
+                        height,
+                        hdr_fmt,
+                        "zc-ml-star-1",
+                    );
+                    let s2_t = self.create_temp_target_with_format(
+                        device,
+                        width,
+                        height,
+                        hdr_fmt,
+                        "zc-ml-star-2",
+                    );
+                    let s1_v = s1_t.create_view(&wgpu::TextureViewDescriptor::default());
+                    let s2_v = s2_t.create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let mut us1 = EffectUniforms::from_params(params);
+                    us1.pass = 2;
+                    us1.flags = u32::from(in_straight) | (1u32 << 1);
+                    us1.p0 = [ang.cos(), ang.sin(), rad, thresh];
+                    self.encode_pass(
+                        device,
+                        encoder,
+                        (canonical, false, hdr_fmt),
+                        &us1,
+                        src_view,
+                        &s1_v,
+                        None,
+                        None,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
+
+                    let mut us2 = us1;
+                    us2.p0 = [-ang.sin(), ang.cos(), rad, thresh];
+                    self.encode_pass(
+                        device,
+                        encoder,
+                        (canonical, false, hdr_fmt),
+                        &us2,
+                        src_view,
+                        &s2_v,
+                        None,
+                        None,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
+                    owned_textures.push(s1_t);
+                    owned_textures.push(s2_t);
+                    aux_v = Some(s1_v);
+                    aux2_v = Some(s2_v);
+                }
+                // anamorphic-flare (23): horizontal streak pass
+                23 if u.p0[1].abs() > 1e-5 => {
+                    let rad = (u.p0[0] * 40.0).max(4.0);
+                    let thresh = u.p0[2];
+                    let af_t = self
+                        .create_temp_target_with_format(device, width, height, hdr_fmt, "zc-ml-af");
+                    let af_v = af_t.create_view(&wgpu::TextureViewDescriptor::default());
+                    let mut uaf = EffectUniforms::from_params(params);
+                    uaf.pass = 2;
+                    uaf.flags = u32::from(in_straight) | (1u32 << 1);
+                    uaf.p0 = [1.0, 0.0, rad, thresh];
+                    self.encode_pass(
+                        device,
+                        encoder,
+                        (canonical, false, hdr_fmt),
+                        &uaf,
+                        src_view,
+                        &af_v,
+                        None,
+                        None,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
+                    owned_textures.push(af_t);
+                    aux_v = Some(af_v);
+                }
+                _ => {}
+            }
+
+            let effective_aux: Option<&wgpu::TextureView> = if tool.mode == 15 {
+                lut3d_view.as_ref().map(|(_, v)| v).or(targets.aux)
+            } else {
+                aux_v.as_ref()
+            };
+            let effective_aux2: Option<&wgpu::TextureView> = aux2_v.as_ref();
+
+            let out_straight = !is_last;
+            u.flags = u32::from(in_straight)
+                | (u32::from(out_straight) << 1)
+                | (u32::from(effective_aux.is_some()) << 2);
+
+            let (dst_view, dst_fmt) = if is_last {
+                (targets.output, self.format)
+            } else if read_ping {
+                (&pong_v, hdr_fmt)
+            } else {
+                (&ping_v, hdr_fmt)
+            };
+
+            self.encode_pass(
+                device,
+                encoder,
+                (canonical, false, dst_fmt),
+                &u,
+                src_view,
+                dst_view,
+                effective_aux,
+                effective_aux2,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+
+            if !is_last {
+                read_ping = !read_ping;
+                first_pass = false;
+            }
+        }
+        let _ = owned_textures;
+        Ok(())
+    }
+
+    /// CPU single-stroke glyph rasterizer + GPU composite for `numbers` and `timecode`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_text_field(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        is_timecode: bool,
+        params: &EffectParams,
+        targets: &EffectTargets<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), EffectError> {
+        let effect_key = if is_timecode { "timecode" } else { "numbers" };
+        let canonical = self.ensure_pipeline(device, effect_key, false)?;
+
+        let text = if is_timecode {
+            format_timecode_text(params)
+        } else {
+            format_numbers_text(params)
+        };
+
+        let pos = params.vec2_or("position", [0.5, 0.5]);
+        let size = params.float_or("size", 40.0).clamp(6.0, 400.0);
+        let tracking = params.float_or("tracking", 0.0);
+        let proportional = params.bool_or("proportionalSpacing", false);
+        let vertical = !is_timecode && params.int_or("direction", 0) != 0;
+        let alignment = if is_timecode {
+            1
+        } else {
+            params.int_or("alignment", 1).clamp(0, 2)
+        };
+        let stroke_w = if is_timecode {
+            0.0
+        } else {
+            params.float_or("strokeWidth", 1.5).clamp(0.0, 32.0)
+        };
+        let display_opts = if is_timecode {
+            0u32
+        } else {
+            params.int_or("displayOptions", 0).clamp(0, 3) as u32
+        };
+
+        let fill_col = if is_timecode {
+            params.vec4_or("textColor", [1.0, 1.0, 1.0, 1.0])
+        } else {
+            params.vec4_or("fillColor", [1.0, 1.0, 1.0, 1.0])
+        };
+        let stroke_col = params.vec4_or("strokeColor", [0.0, 0.0, 0.0, 1.0]);
+        let box_on = is_timecode && params.bool_or("showBox", true);
+        let box_rgb = params.vec3_or("boxColor", [0.0, 0.0, 0.0]);
+        let box_op_raw = params.float_or("boxOpacity", 60.0);
+        let box_op = if box_op_raw > 1.0 {
+            (box_op_raw / 100.0).clamp(0.0, 1.0)
+        } else {
+            box_op_raw.clamp(0.0, 1.0)
+        };
+        let comp_orig = params.bool_or("compositeOriginal", true);
+
+        let raster = rasterize_text_field_coverage(
+            &text,
+            pos[0] * (width as f32),
+            pos[1] * (height as f32),
+            size,
+            tracking,
+            proportional,
+            vertical,
+            alignment,
+            stroke_w,
+            width,
+            height,
+        );
+
+        let mut u = EffectUniforms::from_params(params);
+        u.mode = display_opts;
+        u.c0 = fill_col;
+        u.c1 = stroke_col;
+        u.c2 = [box_rgb[0], box_rgb[1], box_rgb[2], box_op];
+
+        let mut owned_tex: Option<wgpu::Texture> = None;
+        let mut tex_view: Option<wgpu::TextureView> = None;
+        let mut has_tex = false;
+
+        if let Some(r) = raster {
+            u.p0 = [r.x0 as f32, r.y0 as f32, r.w as f32, r.h as f32];
+            let pad = (size * 0.2).max(4.0);
+            u.p1 = [
+                (r.x0 as f32) - pad,
+                (r.x0 as f32) + (r.w as f32) + pad,
+                (r.y0 as f32) - pad * 0.6,
+                (r.y0 as f32) + (r.h as f32) + pad * 0.6,
+            ];
+            let tex = upload_rgba8_texture(device, queue, "zc-textfield-cov", r.w, r.h, &r.rgba);
+            tex_view = Some(tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            owned_tex = Some(tex);
+            has_tex = true;
+        }
+
+        u.flags =
+            u32::from(comp_orig) | (u32::from(box_on && has_tex) << 1) | (u32::from(has_tex) << 2);
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, self.format),
+            &u,
+            targets.input,
+            targets.output,
+            tex_view.as_ref(),
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        let _ = owned_tex;
+        Ok(())
+    }
+
+    /// 3D projected shattered-polygon mesh runner for `ccpixelpolly`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_pixel_polly(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &EffectParams,
+        targets: &EffectTargets<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), EffectError> {
+        let u = pack_effect_uniforms("ccpixelpolly", params, false, false);
+        let t = u.p0[0];
+        if t <= 1e-5 {
+            let canonical = self.ensure_pipeline(device, "ccpixelpolly", false)?;
+            self.encode_pass(
+                device,
+                encoder,
+                (canonical, false, self.format),
+                &u,
+                targets.input,
+                targets.output,
+                None,
+                None,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+            return Ok(());
+        }
+
+        let verts = build_pixel_polly_mesh(params, width as f32, height as f32, t);
+        if verts.is_empty() {
+            let canonical = self.ensure_pipeline(device, "ccpixelpolly", false)?;
+            self.encode_pass(
+                device,
+                encoder,
+                (canonical, false, self.format),
+                &u,
+                targets.input,
+                targets.output,
+                None,
+                None,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+            return Ok(());
+        }
+
+        if self.polly_mesh_pipeline.is_none() {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zc-effect-ccpixelpolly-mesh"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER_POLLY_MESH_WGSL)),
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("zc-effect-ccpixelpolly-mesh"),
+                layout: Some(&self.pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: size_of::<PollyVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 8,
+                                shader_location: 1,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 16,
+                                shader_location: 2,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32,
+                                offset: 24,
+                                shader_location: 3,
+                            },
+                        ],
+                    })],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.polly_mesh_pipeline = Some(pipeline);
+        }
+
+        let vb_bytes: &[u8] = bytemuck::cast_slice(&verts);
+        let vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("zc-polly-vb"),
+            size: vb_bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: true,
+        });
+        {
+            let mut mapped = vb
+                .slice(..)
+                .get_mapped_range_mut()
+                .expect("mapped polly vertex buffer");
+            mapped.copy_from_slice(vb_bytes);
+        }
+        vb.unmap();
+
+        let uniform_buf = create_uniform_buffer(device, &u);
+        let bind_group = self.create_bind_group(
+            device,
+            &uniform_buf,
+            targets.input,
+            &self.fallback_view,
+            &self.fallback_view,
+        );
+        let pipeline = self
+            .polly_mesh_pipeline
+            .as_ref()
+            .expect("polly mesh pipeline compiled");
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("zc-ccpixelpolly-mesh"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: targets.output,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_vertex_buffer(0, vb.slice(..));
+        pass.draw(0..(verts.len() as u32), 0..1);
+        Ok(())
     }
 
     fn create_temp_target(
@@ -3482,6 +5212,1459 @@ fn record_fullscreen_pass(
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
     pass.draw(0..3, 0..1);
+}
+
+// ============================================================================
+// CPU Helpers for Native FX & Multi-Pass Plugin Effects
+// ============================================================================
+
+fn srgb_to_linear_cpu(x: f32) -> f32 {
+    let cx = x.clamp(0.0, 1.0);
+    if cx <= 0.04045 {
+        cx / 12.92
+    } else {
+        ((cx + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn dominant_channel_triple(c: [f32; 3]) -> (usize, usize, usize) {
+    if c[0] >= c[1] && c[0] >= c[2] {
+        (0, 1, 2)
+    } else if c[1] >= c[0] && c[1] >= c[2] {
+        (1, 0, 2)
+    } else {
+        (2, 0, 1)
+    }
+}
+
+fn rgb_hue_cpu(c: [f32; 3]) -> f32 {
+    let mx = c[0].max(c[1]).max(c[2]);
+    let mn = c[0].min(c[1]).min(c[2]);
+    let d = mx - mn;
+    if d < 1e-7 {
+        return 0.0;
+    }
+    let h = if (mx - c[0]).abs() < 1e-7 {
+        let mut t = (c[1] - c[2]) / d;
+        if c[1] < c[2] {
+            t += 6.0;
+        }
+        t / 6.0
+    } else if (mx - c[1]).abs() < 1e-7 {
+        ((c[2] - c[0]) / d + 2.0) / 6.0
+    } else {
+        ((c[0] - c[1]) / d + 4.0) / 6.0
+    };
+    h.rem_euclid(1.0)
+}
+
+fn eval_monotone_cubic_curve(pts_in: &[[f32; 2]], x: f32) -> f32 {
+    if pts_in.is_empty() {
+        return x.clamp(0.0, 1.0);
+    }
+    if pts_in.len() == 1 {
+        return pts_in[0][1].clamp(0.0, 1.0);
+    }
+    let mut pts: Vec<[f32; 2]> = pts_in
+        .iter()
+        .copied()
+        .filter(|p| p[0].is_finite() && p[1].is_finite())
+        .map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)])
+        .collect();
+    if pts.len() < 2 {
+        return x.clamp(0.0, 1.0);
+    }
+    pts.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    // Deduplicate identical x coordinates
+    let mut uniq: Vec<[f32; 2]> = Vec::with_capacity(pts.len());
+    for p in pts {
+        if let Some(last) = uniq.last_mut()
+            && (p[0] - last[0]).abs() < 1e-5
+        {
+            last[1] = p[1];
+            continue;
+        }
+        uniq.push(p);
+    }
+    if uniq.len() < 2 {
+        return uniq[0][1].clamp(0.0, 1.0);
+    }
+    let cx = x.clamp(0.0, 1.0);
+    if cx <= uniq[0][0] {
+        return uniq[0][1].clamp(0.0, 1.0);
+    }
+    let last = uniq.len() - 1;
+    if cx >= uniq[last][0] {
+        return uniq[last][1].clamp(0.0, 1.0);
+    }
+
+    // Fritsch-Carlson monotone cubic Hermite tangents
+    let n = uniq.len();
+    let mut dx = vec![0.0_f32; n - 1];
+    let mut delta = vec![0.0_f32; n - 1];
+    for i in 0..(n - 1) {
+        dx[i] = (uniq[i + 1][0] - uniq[i][0]).max(1e-6);
+        delta[i] = (uniq[i + 1][1] - uniq[i][1]) / dx[i];
+    }
+    let mut m = vec![0.0_f32; n];
+    m[0] = delta[0];
+    m[n - 1] = delta[n - 2];
+    for i in 1..(n - 1) {
+        if delta[i - 1] * delta[i] <= 0.0 {
+            m[i] = 0.0;
+        } else {
+            m[i] = 0.5 * (delta[i - 1] + delta[i]);
+        }
+    }
+    for i in 0..(n - 1) {
+        if delta[i].abs() < 1e-6 {
+            m[i] = 0.0;
+            m[i + 1] = 0.0;
+        } else {
+            let a = m[i] / delta[i];
+            let b = m[i + 1] / delta[i];
+            let h = a.hypot(b);
+            if h > 3.0 {
+                let s = 3.0 / h;
+                m[i] = s * a * delta[i];
+                m[i + 1] = s * b * delta[i];
+            }
+        }
+    }
+
+    let mut seg = 0usize;
+    for i in 0..(n - 1) {
+        if cx >= uniq[i][0] && cx <= uniq[i + 1][0] {
+            seg = i;
+            break;
+        }
+    }
+    let h = dx[seg];
+    let t = ((cx - uniq[seg][0]) / h).clamp(0.0, 1.0);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+    let h10 = t3 - 2.0 * t2 + t;
+    let h01 = -2.0 * t3 + 3.0 * t2;
+    let h11 = t3 - t2;
+    (h00 * uniq[seg][1] + h10 * h * m[seg] + h01 * uniq[seg + 1][1] + h11 * h * m[seg + 1])
+        .clamp(0.0, 1.0)
+}
+
+fn parse_curve_points_value(v: &serde_json::Value) -> Vec<[f32; 2]> {
+    let mut out = Vec::new();
+    let Some(arr) = v.as_array() else {
+        return out;
+    };
+    for item in arr {
+        if let Some(pair) = item.as_array() {
+            if pair.len() >= 2
+                && let (Some(x), Some(y)) = (pair[0].as_f64(), pair[1].as_f64())
+            {
+                out.push([x as f32, y as f32]);
+            }
+        } else if let Some(obj) = item.as_object()
+            && let (Some(x), Some(y)) = (
+                obj.get("x").and_then(serde_json::Value::as_f64),
+                obj.get("y").and_then(serde_json::Value::as_f64),
+            )
+        {
+            out.push([x as f32, y as f32]);
+        }
+    }
+    out
+}
+
+fn bake_curves_json_rgba8(json_str: &str) -> Vec<u8> {
+    let mut out = vec![0u8; 256 * 4];
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_str).unwrap_or(serde_json::Value::Null);
+    let empty: Vec<[f32; 2]> = Vec::new();
+    let pick = |keys: &[&str]| -> Vec<[f32; 2]> {
+        let Some(obj) = parsed.as_object() else {
+            return Vec::new();
+        };
+        for k in keys {
+            if let Some(v) = obj.get(*k) {
+                let pts = parse_curve_points_value(v);
+                if !pts.is_empty() {
+                    return pts;
+                }
+            }
+        }
+        empty.clone()
+    };
+    let master = pick(&["master", "rgb", "luma", "c"]);
+    let red = pick(&["r", "red"]);
+    let green = pick(&["g", "green"]);
+    let blue = pick(&["b", "blue"]);
+    let alpha = pick(&["a", "alpha"]);
+
+    for i in 0..256usize {
+        let x = (i as f32) / 255.0;
+        let eval_ch = |ch: &[[f32; 2]]| -> f32 {
+            let v1 = if ch.is_empty() {
+                x
+            } else {
+                eval_monotone_cubic_curve(ch, x)
+            };
+            if master.is_empty() {
+                v1
+            } else {
+                eval_monotone_cubic_curve(&master, v1)
+            }
+        };
+        let r = eval_ch(&red);
+        let g = eval_ch(&green);
+        let b = eval_ch(&blue);
+        let a = if alpha.is_empty() {
+            x
+        } else {
+            eval_monotone_cubic_curve(&alpha, x)
+        };
+        out[i * 4] = (r.clamp(0.0, 1.0) * 255.0).round() as u8;
+        out[i * 4 + 1] = (g.clamp(0.0, 1.0) * 255.0).round() as u8;
+        out[i * 4 + 2] = (b.clamp(0.0, 1.0) * 255.0).round() as u8;
+        out[i * 4 + 3] = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    out
+}
+
+fn bake_scurve_json_rgba8(json_str: &str) -> Vec<u8> {
+    let mut out = vec![0u8; 256 * 4];
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_str).unwrap_or(serde_json::Value::Null);
+    let pts = if parsed.is_array() {
+        parse_curve_points_value(&parsed)
+    } else if let Some(obj) = parsed.as_object() {
+        obj.get("points")
+            .or_else(|| obj.get("master"))
+            .or_else(|| obj.get("curve"))
+            .map(parse_curve_points_value)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for i in 0..256usize {
+        let x = (i as f32) / 255.0;
+        let y = if pts.is_empty() {
+            x
+        } else {
+            eval_monotone_cubic_curve(&pts, x)
+        };
+        let u8v = (y.clamp(0.0, 1.0) * 255.0).round() as u8;
+        out[i * 4] = u8v;
+        out[i * 4 + 1] = u8v;
+        out[i * 4 + 2] = u8v;
+        out[i * 4 + 3] = 255;
+    }
+    out
+}
+
+// ============================================================================
+// Magic Looks 29-Tool Chain Parser
+// ============================================================================
+
+struct MagicLooksToolSpec {
+    mode: u32,
+    p0: [f32; 4],
+    p1: [f32; 4],
+    p2: [f32; 4],
+    p3: [f32; 4],
+    c0: [f32; 4],
+    c1: [f32; 4],
+    c2: [f32; 4],
+    c3: [f32; 4],
+    aux_json: Option<String>,
+}
+
+fn has_magic_looks_chain(params: &EffectParams) -> bool {
+    if let Some(s) = params.string("looksInstances") {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() && trimmed != "[]" && trimmed != "null" {
+            return true;
+        }
+    }
+    if let Some(s) = params.string("chainOrder")
+        && !s.trim().is_empty()
+    {
+        return true;
+    }
+    params.values.keys().any(|k| k.starts_with("ml_"))
+}
+
+fn parse_hex_color(hex: &str) -> Option<[f32; 3]> {
+    let s = hex.trim().trim_start_matches('#');
+    if s.len() == 6 {
+        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+        return Some([
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        ]);
+    }
+    if s.len() == 3 {
+        let r = u8::from_str_radix(&s[0..1], 16).ok()? * 17;
+        let g = u8::from_str_radix(&s[1..2], 16).ok()? * 17;
+        let b = u8::from_str_radix(&s[2..3], 16).ok()? * 17;
+        return Some([
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        ]);
+    }
+    None
+}
+
+fn json_f32(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str], default: f32) -> f32 {
+    for k in keys {
+        if let Some(v) = obj.get(*k) {
+            if let Some(f) = v.as_f64() {
+                return f as f32;
+            }
+            if let Some(b) = v.as_bool() {
+                return if b { 1.0 } else { 0.0 };
+            }
+            if let Some(s) = v.as_str()
+                && let Ok(f) = s.trim().parse::<f32>()
+            {
+                return f;
+            }
+        }
+    }
+    default
+}
+
+fn json_bool(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+    default: bool,
+) -> bool {
+    for k in keys {
+        if let Some(v) = obj.get(*k) {
+            if let Some(b) = v.as_bool() {
+                return b;
+            }
+            if let Some(f) = v.as_f64() {
+                return f.abs() > 1e-6;
+            }
+        }
+    }
+    default
+}
+
+fn json_color(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+    default: [f32; 3],
+) -> [f32; 4] {
+    for k in keys {
+        if let Some(v) = obj.get(*k) {
+            if let Some(s) = v.as_str() {
+                if let Some(rgb) = parse_hex_color(s) {
+                    return [rgb[0], rgb[1], rgb[2], 1.0];
+                }
+            } else if let Some(arr) = v.as_array() {
+                if arr.len() >= 3 {
+                    let mut rgb = [
+                        arr[0].as_f64().unwrap_or(f64::from(default[0])) as f32,
+                        arr[1].as_f64().unwrap_or(f64::from(default[1])) as f32,
+                        arr[2].as_f64().unwrap_or(f64::from(default[2])) as f32,
+                    ];
+                    if rgb[0] > 1.5 || rgb[1] > 1.5 || rgb[2] > 1.5 {
+                        rgb = [rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0];
+                    }
+                    return [rgb[0], rgb[1], rgb[2], 1.0];
+                }
+            } else if let Some(m) = v.as_object() {
+                let mut rgb = [
+                    m.get("r")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(f64::from(default[0])) as f32,
+                    m.get("g")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(f64::from(default[1])) as f32,
+                    m.get("b")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(f64::from(default[2])) as f32,
+                ];
+                if rgb[0] > 1.5 || rgb[1] > 1.5 || rgb[2] > 1.5 {
+                    rgb = [rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0];
+                }
+                return [rgb[0], rgb[1], rgb[2], 1.0];
+            }
+        }
+    }
+    [default[0], default[1], default[2], 1.0]
+}
+
+fn json_string(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+    for k in keys {
+        if let Some(v) = obj.get(*k) {
+            if let Some(s) = v.as_str() {
+                return Some(s.to_owned());
+            }
+            if v.is_object() || v.is_array() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn canonical_magic_looks_tool_mode(raw: &str) -> Option<u32> {
+    let norm = raw.trim().to_ascii_lowercase().replace('_', "-");
+    match norm.as_str() {
+        "color-contrast" | "colorcontrast" | "cc" => Some(0),
+        "hsl-colors" | "hslcolors" | "hsl" => Some(1),
+        "color-ranges" | "colorranges" => Some(2),
+        "crush" => Some(3),
+        "contrast" => Some(4),
+        "color-reversal" | "colorreversal" => Some(5),
+        "three-strip" | "threestrip" | "3-strip" => Some(6),
+        "lift-gamma-gain" | "liftgammagain" | "lgg" => Some(7),
+        "ranged-saturation" | "rangedsaturation" => Some(8),
+        "warm-cool" | "warmcool" => Some(9),
+        "four-way" | "fourway" | "4-way" | "4-way-color" => Some(10),
+        "mojo" => Some(11),
+        "auto-shoulder" | "autoshoulder" => Some(12),
+        "curves" => Some(13),
+        "s-curve" | "scurve" => Some(14),
+        "lut" | "cube-lut" => Some(15),
+        "lightflex" => Some(16),
+        "deflare" => Some(17),
+        "vignette" => Some(18),
+        "haze-flare" | "hazeflare" => Some(19),
+        "pop" => Some(20),
+        "diffusion" => Some(21),
+        "star-filter" | "starfilter" => Some(22),
+        "anamorphic-flare" | "anamorphicflare" => Some(23),
+        "lens-distortion" | "lensdistortion" => Some(24),
+        "shutter-streak" | "shutterstreak" => Some(25),
+        "edge-softness" | "edgesoftness" => Some(26),
+        "chromatic-aberration" | "chromaticaberration" => Some(27),
+        "telecine-net" | "telecinenet" => Some(28),
+        _ => None,
+    }
+}
+
+fn build_magic_looks_tool_spec(
+    mode: u32,
+    cfg: &serde_json::Map<String, serde_json::Value>,
+) -> MagicLooksToolSpec {
+    let mut spec = MagicLooksToolSpec {
+        mode,
+        p0: [0.0; 4],
+        p1: [0.0; 4],
+        p2: [0.0; 4],
+        p3: [0.0; 4],
+        c0: [1.0, 1.0, 1.0, 1.0],
+        c1: [1.0, 1.0, 1.0, 1.0],
+        c2: [1.0, 1.0, 1.0, 1.0],
+        c3: [1.0, 1.0, 1.0, 1.0],
+        aux_json: None,
+    };
+
+    match mode {
+        0 => {
+            // color-contrast
+            spec.p0 = [
+                json_f32(cfg, &["ccPivot", "pivot"], 0.18),
+                json_f32(cfg, &["ccExposure", "exposure"], 0.0),
+                0.0,
+                0.0,
+            ];
+            spec.c0 = json_color(cfg, &["ccColor", "color"], [1.0, 1.0, 1.0]);
+        }
+        1 => {
+            // hsl-colors
+            spec.p0 = [
+                json_f32(cfg, &["hslRedSat", "redSat"], 0.0),
+                json_f32(cfg, &["hslOrangeSat", "orangeSat"], 0.0),
+                json_f32(cfg, &["hslYellowSat", "yellowSat"], 0.0),
+                json_f32(cfg, &["hslGreenSat", "greenSat"], 0.0),
+            ];
+            spec.p1 = [
+                json_f32(cfg, &["hslCyanSat", "cyanSat"], 0.0),
+                json_f32(cfg, &["hslBlueSat", "blueSat"], 0.0),
+                json_f32(cfg, &["hslPurpleSat", "purpleSat"], 0.0),
+                json_f32(cfg, &["hslMagentaSat", "magentaSat"], 0.0),
+            ];
+            spec.p2 = [
+                json_f32(cfg, &["hslRedLight", "redLight"], 0.0),
+                json_f32(cfg, &["hslOrangeLight", "orangeLight"], 0.0),
+                json_f32(cfg, &["hslYellowLight", "yellowLight"], 0.0),
+                json_f32(cfg, &["hslGreenLight", "greenLight"], 0.0),
+            ];
+            spec.p3 = [
+                json_f32(cfg, &["hslCyanLight", "cyanLight"], 0.0),
+                json_f32(cfg, &["hslBlueLight", "blueLight"], 0.0),
+                json_f32(cfg, &["hslPurpleLight", "purpleLight"], 0.0),
+                json_f32(cfg, &["hslMagentaLight", "magentaLight"], 0.0),
+            ];
+        }
+        2 => {
+            // color-ranges
+            spec.p0 = [
+                json_f32(cfg, &["crStrength", "strength"], 1.0),
+                json_f32(cfg, &["crHighlight", "highlight"], 0.75),
+                json_f32(cfg, &["crMidtone", "midtone"], 0.5),
+                json_f32(cfg, &["crShadow", "shadow"], 0.25),
+            ];
+            spec.p1 = [
+                if json_bool(cfg, &["crShowThreshold", "showThreshold"], false) {
+                    1.0
+                } else {
+                    0.0
+                },
+                0.0,
+                0.0,
+                0.0,
+            ];
+            spec.c0 = json_color(
+                cfg,
+                &["crHighlightColor", "highlightColor"],
+                [1.0, 1.0, 1.0],
+            );
+            spec.c1 = json_color(cfg, &["crMidtoneColor", "midtoneColor"], [1.0, 1.0, 1.0]);
+            spec.c2 = json_color(cfg, &["crShadowColor", "shadowColor"], [1.0, 1.0, 1.0]);
+        }
+        3 => {
+            // crush
+            spec.p0 = [
+                json_f32(cfg, &["crGamma", "gamma"], 1.2),
+                json_f32(cfg, &["crExposure", "exposure"], 0.0),
+                0.0,
+                0.0,
+            ];
+            spec.c0 = json_color(cfg, &["crColor", "color"], [1.0, 1.0, 1.0]);
+        }
+        4 => {
+            // contrast
+            spec.p0 = [
+                json_f32(cfg, &["ctContrast", "contrast"], 0.25),
+                json_f32(cfg, &["ctPivot", "pivot"], 0.18),
+                json_f32(cfg, &["ctExposure", "exposure"], 0.0),
+                0.0,
+            ];
+        }
+        5 => {
+            // color-reversal
+            spec.p0 = [
+                json_f32(cfg, &["rvStrength", "strength"], 1.0),
+                json_f32(cfg, &["rvExposure", "exposure"], 0.0),
+                0.0,
+                0.0,
+            ];
+        }
+        6 => {
+            // three-strip
+            spec.p0 = [
+                json_f32(cfg, &["tsStrength", "strength"], 1.0),
+                json_f32(cfg, &["tsExposure", "exposure"], 0.0),
+                0.0,
+                0.0,
+            ];
+        }
+        7 => {
+            // lift-gamma-gain
+            spec.p0 = [
+                json_f32(cfg, &["lggGammaSpace", "gammaSpace"], 2.2),
+                json_f32(cfg, &["lggStrength", "strength"], 1.0),
+                json_f32(cfg, &["lggExposure", "exposure"], 0.0),
+                0.0,
+            ];
+            spec.c0 = json_color(cfg, &["lggLift", "lift"], [1.0, 1.0, 1.0]);
+            spec.c1 = json_color(cfg, &["lggGamma", "gamma"], [1.0, 1.0, 1.0]);
+            spec.c2 = json_color(cfg, &["lggGain", "gain"], [1.0, 1.0, 1.0]);
+        }
+        8 => {
+            // ranged-saturation
+            spec.p0 = [
+                json_f32(cfg, &["rsSatHighlight", "satHighlight"], 1.0),
+                json_f32(cfg, &["rsSatMidtone", "satMidtone"], 1.0),
+                json_f32(cfg, &["rsSatShadow", "satShadow"], 1.0),
+                json_f32(cfg, &["rsExposure", "exposure"], 0.0),
+            ];
+            spec.p1 = [
+                json_f32(cfg, &["rsThHighlight", "thHighlight"], 0.75),
+                json_f32(cfg, &["rsThMidtone", "thMidtone"], 0.5),
+                json_f32(cfg, &["rsThShadow", "thShadow"], 0.25),
+                if json_bool(cfg, &["rsShowThreshold", "showThreshold"], false) {
+                    1.0
+                } else {
+                    0.0
+                },
+            ];
+            spec.c0 = json_color(cfg, &["rsBalance", "balance"], [1.0, 1.0, 1.0]);
+        }
+        9 => {
+            // warm-cool
+            spec.p0 = [
+                json_f32(cfg, &["wcWarmCool", "warmCool", "temperature"], 0.0),
+                json_f32(cfg, &["wcTint", "tint"], 0.0),
+                json_f32(cfg, &["wcExposure", "exposure"], 0.0),
+                0.0,
+            ];
+        }
+        10 => {
+            // four-way
+            spec.p0 = [
+                json_f32(cfg, &["fwExposure", "exposure"], 0.0),
+                json_f32(cfg, &["fwContrast", "contrast"], 0.0),
+                json_f32(cfg, &["fwStrength", "strength"], 1.0),
+                if json_bool(cfg, &["fwPreview", "preview"], false) {
+                    1.0
+                } else {
+                    0.0
+                },
+            ];
+            spec.c0 = json_color(cfg, &["fwShadows", "shadows"], [1.0, 1.0, 1.0]);
+            spec.c1 = json_color(cfg, &["fwMidtones", "midtones"], [1.0, 1.0, 1.0]);
+            spec.c2 = json_color(cfg, &["fwHighlights", "highlights"], [1.0, 1.0, 1.0]);
+            spec.c3 = json_color(cfg, &["fwGlobal", "global"], [1.0, 1.0, 1.0]);
+        }
+        11 => {
+            // mojo
+            spec.p0 = [
+                json_f32(cfg, &["mjMojo", "mojo"], 0.5),
+                json_f32(cfg, &["mjPunch", "punch"], 0.2),
+                json_f32(cfg, &["mjBleach", "bleach"], 0.0),
+                json_f32(cfg, &["mjFade", "fade"], 0.0),
+            ];
+            spec.p1 = [
+                json_f32(cfg, &["mjBlueSqueeze", "blueSqueeze"], 0.0),
+                json_f32(cfg, &["mjSkinSqueeze", "skinSqueeze"], 0.0),
+                json_f32(cfg, &["mjExposure", "exposure"], 0.0),
+                json_f32(cfg, &["mjCoolWarm", "coolWarm"], 0.0),
+            ];
+            spec.p2 = [
+                json_f32(cfg, &["mjGreenMagenta", "greenMagenta"], 0.0),
+                json_f32(cfg, &["mjSkinYP", "skinYP"], 0.0),
+                json_f32(cfg, &["mjStrength", "strength"], 1.0),
+                0.0,
+            ];
+        }
+        12 => {
+            // auto-shoulder
+            spec.p0 = [
+                json_f32(cfg, &["asStrength", "strength"], 0.5),
+                0.0,
+                0.0,
+                0.0,
+            ];
+        }
+        13 => {
+            // curves
+            spec.aux_json = json_string(cfg, &["curvCurvesJson", "curvesJson", "curves"]);
+        }
+        14 => {
+            // s-curve
+            spec.aux_json = json_string(cfg, &["scvScurveJson", "scurveJson", "scurve", "points"]);
+        }
+        15 => {
+            // lut
+            spec.p0 = [
+                json_f32(cfg, &["lutMode", "mode"], 1.0),
+                json_f32(cfg, &["lutStrength", "strength"], 1.0),
+                json_f32(cfg, &["lutGamma", "gamma"], 0.0),
+                0.0,
+            ];
+        }
+        16 => {
+            // lightflex
+            spec.p0 = [
+                json_f32(cfg, &["lfBoost", "boost"], 1.0),
+                json_f32(cfg, &["lfExposure", "exposure"], 0.0),
+                0.0,
+                0.0,
+            ];
+            spec.c0 = json_color(cfg, &["lfColor", "color"], [1.0, 0.95, 0.85]);
+        }
+        17 => {
+            // deflare
+            spec.p0 = [
+                json_f32(cfg, &["dfStrength", "strength"], 0.5),
+                json_f32(cfg, &["dfExposure", "exposure"], 0.0),
+                0.0,
+                0.0,
+            ];
+        }
+        18 => {
+            // vignette
+            spec.p0 = [
+                json_f32(cfg, &["vgCenterX", "centerX"], 0.0),
+                json_f32(cfg, &["vgCenterY", "centerY"], 0.0),
+                json_f32(cfg, &["vgRadius", "radius"], 0.75),
+                json_f32(cfg, &["vgAspect", "aspect"], 1.0),
+            ];
+            spec.p1 = [
+                json_f32(cfg, &["vgSpread", "spread"], 0.5),
+                json_f32(cfg, &["vgFalloff", "falloff"], 0.5),
+                json_f32(cfg, &["vgStrength", "strength"], 0.5),
+                json_f32(cfg, &["vgExposure", "exposure"], 0.0),
+            ];
+            spec.c0 = json_color(cfg, &["vgColor", "color"], [0.0, 0.0, 0.0]);
+        }
+        19 => {
+            // haze-flare
+            spec.p0 = [
+                json_f32(cfg, &["hfSpillage", "spillage"], 0.35),
+                json_f32(cfg, &["hfSoftness", "softness"], 0.5),
+                json_f32(cfg, &["hfReach", "reach"], 0.5),
+                json_f32(cfg, &["hfExposure", "exposure"], 0.0),
+            ];
+            spec.p1 = [
+                json_f32(cfg, &["hfReflExposure", "reflExposure"], 0.0),
+                if json_bool(cfg, &["hfReflection", "reflection"], false) {
+                    1.0
+                } else {
+                    0.0
+                },
+                json_f32(cfg, &["hfMatteSize", "matteSize"], 0.9),
+                json_f32(cfg, &["hfMatteShade", "matteShade"], 0.0),
+            ];
+            spec.c0 = json_color(cfg, &["hfColor", "color"], [1.0, 0.92, 0.8]);
+        }
+        20 => {
+            // pop
+            spec.p0 = [
+                json_f32(cfg, &["popPop", "pop", "strength"], 0.5),
+                json_f32(cfg, &["popSize", "size"], 0.5),
+                json_f32(cfg, &["popPreserveDetail", "preserveDetail"], 0.5),
+                0.0,
+            ];
+        }
+        21 => {
+            // diffusion
+            spec.p0 = [
+                json_f32(cfg, &["diffSize", "size"], 0.5),
+                json_f32(cfg, &["diffGrade", "grade"], 1.0),
+                json_f32(cfg, &["diffGlow", "glow"], 0.5),
+                json_f32(cfg, &["diffHighlightsOnly", "highlightsOnly"], 0.3),
+            ];
+            spec.p1 = [
+                json_f32(cfg, &["diffHighlightBias", "highlightBias"], 0.0),
+                json_f32(cfg, &["diffExposure", "exposure"], 0.0),
+                0.0,
+                0.0,
+            ];
+            spec.c0 = json_color(cfg, &["diffColor", "color"], [1.0, 1.0, 1.0]);
+        }
+        22 => {
+            // star-filter
+            spec.p0 = [
+                json_f32(cfg, &["sfSize", "size"], 0.5),
+                json_f32(cfg, &["sfBoost", "boost"], 1.0),
+                json_f32(cfg, &["sfThreshold", "threshold"], 0.65),
+                if json_bool(cfg, &["sfShowThreshold", "showThreshold"], false) {
+                    1.0
+                } else {
+                    0.0
+                },
+            ];
+            spec.p1 = [json_f32(cfg, &["sfAngle", "angle"], 45.0), 0.0, 0.0, 0.0];
+            spec.c0 = json_color(cfg, &["sfColor", "color"], [1.0, 0.96, 0.85]);
+        }
+        23 => {
+            // anamorphic-flare
+            spec.p0 = [
+                json_f32(cfg, &["afSize", "size"], 0.5),
+                json_f32(cfg, &["afBoost", "boost"], 1.0),
+                json_f32(cfg, &["afThreshold", "threshold"], 0.65),
+                if json_bool(cfg, &["afShowThreshold", "showThreshold"], false) {
+                    1.0
+                } else {
+                    0.0
+                },
+            ];
+            spec.p1 = [
+                if json_bool(cfg, &["afReflection", "reflection"], false) {
+                    1.0
+                } else {
+                    0.0
+                },
+                json_f32(cfg, &["afReflBoost", "reflBoost"], 0.5),
+                0.0,
+                0.0,
+            ];
+            spec.c0 = json_color(cfg, &["afColor", "color"], [0.4, 0.7, 1.0]);
+        }
+        24 => {
+            // lens-distortion
+            spec.p0 = [
+                json_f32(cfg, &["ldDistortion", "distortion"], 0.1),
+                json_f32(cfg, &["ldFlatness", "flatness"], 1.0),
+                0.0,
+                0.0,
+            ];
+        }
+        25 => {
+            // shutter-streak
+            spec.p0 = [
+                json_f32(cfg, &["ssSize", "size"], 0.5),
+                json_f32(cfg, &["ssBoost", "boost"], 0.5),
+                json_f32(cfg, &["ssFalloff", "falloff"], 0.5),
+                0.0,
+            ];
+        }
+        26 => {
+            // edge-softness
+            spec.p0 = [
+                json_f32(cfg, &["esBlurSize", "blurSize"], 0.02),
+                json_f32(cfg, &["esQuality", "quality"], 2.0),
+                json_f32(cfg, &["esCenterX", "centerX"], 0.0),
+                json_f32(cfg, &["esCenterY", "centerY"], 0.0),
+            ];
+            spec.p1 = [
+                json_f32(cfg, &["esRadius", "radius"], 0.5),
+                json_f32(cfg, &["esAspect", "aspect"], 1.0),
+                json_f32(cfg, &["esSpread", "spread"], 0.35),
+                0.0,
+            ];
+        }
+        27 => {
+            // chromatic-aberration
+            spec.p0 = [
+                json_f32(cfg, &["caRedCyan", "redCyan"], 0.5),
+                json_f32(cfg, &["caGreenMagenta", "greenMagenta"], 0.0),
+                json_f32(cfg, &["caBlueYellow", "blueYellow"], 0.5),
+                0.0,
+            ];
+        }
+        28 => {
+            // telecine-net
+            spec.p0 = [
+                json_f32(cfg, &["tnSize", "size"], 0.04),
+                json_f32(cfg, &["tnStrength", "strength"], 0.5),
+                json_f32(cfg, &["tnExposure", "exposure"], 0.0),
+                0.0,
+            ];
+        }
+        _ => {}
+    }
+
+    spec
+}
+
+fn parse_magic_looks_chain(params: &EffectParams) -> Vec<MagicLooksToolSpec> {
+    let mut out = Vec::new();
+
+    // 1. Primary format: `looksInstances` JSON array of tool instance objects
+    if let Some(json_str) = params.string("looksInstances")
+        && let Ok(serde_json::Value::Array(items)) =
+            serde_json::from_str::<serde_json::Value>(json_str)
+    {
+        for item in items {
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            if !json_bool(obj, &["enabled", "on", "active"], true) {
+                continue;
+            }
+            let tool_name = obj
+                .get("toolId")
+                .or_else(|| obj.get("tool"))
+                .or_else(|| obj.get("type"))
+                .or_else(|| obj.get("id"))
+                .and_then(serde_json::Value::as_str);
+            let Some(mode) = tool_name.and_then(canonical_magic_looks_tool_mode) else {
+                continue;
+            };
+            // Merge top-level fields with nested `params` / `values` object if present
+            let mut merged = obj.clone();
+            if let Some(nested) = obj
+                .get("params")
+                .or_else(|| obj.get("values"))
+                .and_then(serde_json::Value::as_object)
+            {
+                for (k, v) in nested {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            out.push(build_magic_looks_tool_spec(mode, &merged));
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+
+    // 2. Fallback: `chainOrder` (JSON array or comma-separated tool IDs) reading flat params
+    if let Some(order_str) = params.string("chainOrder") {
+        let names: Vec<String> =
+            if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(order_str) {
+                arr.into_iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            } else {
+                order_str
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+        let mut flat_map = serde_json::Map::new();
+        for (k, v) in &params.values {
+            let jv = match v {
+                EffectParamValue::Float(f) => serde_json::json!(*f),
+                EffectParamValue::Int(i) => serde_json::json!(*i),
+                EffectParamValue::Bool(b) => serde_json::json!(*b),
+                EffectParamValue::String(s) => serde_json::json!(s),
+                EffectParamValue::Vec3(c) => serde_json::json!([c[0], c[1], c[2]]),
+                EffectParamValue::Vec4(c) => serde_json::json!([c[0], c[1], c[2], c[3]]),
+                _ => continue,
+            };
+            flat_map.insert(k.clone(), jv);
+        }
+        for name in names {
+            if let Some(mode) = canonical_magic_looks_tool_mode(&name) {
+                out.push(build_magic_looks_tool_spec(mode, &flat_map));
+            }
+        }
+    }
+
+    out
+}
+
+// ============================================================================
+// Text Field Formatter & Single-Stroke Polyline Rasterizer (`numbers`/`timecode`)
+// ============================================================================
+
+fn format_numbers_text(params: &EffectParams) -> String {
+    let raw_val = if params.bool_or("randomValues", false) {
+        let seed = params.float_or("seed", 1.0);
+        let h = ((params.frame * 12.9898 + seed * 78.233).sin() * 43_758.547)
+            .fract()
+            .abs();
+        let max_v = params.float_or("value", 100.0).abs().max(1.0);
+        h * max_v
+    } else {
+        params.float_or("value", 0.0)
+    };
+    let decimals = params.int_or("decimalPlaces", 0).clamp(0, 6) as usize;
+    let format_mode = params.int_or("format", 0).clamp(0, 7);
+    match format_mode {
+        1 => {
+            // Number with leading zeroes
+            let s = format!("{:.*}", decimals, raw_val.abs());
+            let width = if decimals > 0 { 6 + decimals } else { 5 };
+            let padded = format!("{s:0>width$}");
+            if raw_val < 0.0 {
+                format!("-{padded}")
+            } else {
+                padded
+            }
+        }
+        2..=4 => {
+            let fps = match format_mode {
+                3 => 24,
+                4 => 25,
+                _ => 30,
+            };
+            format_smpte_from_seconds(raw_val.max(0.0), fps, false)
+        }
+        5 => {
+            // HH:MM:SS
+            let total = raw_val.max(0.0).floor() as u64;
+            let hh = (total / 3600) % 24;
+            let mm = (total / 60) % 60;
+            let ss = total % 60;
+            format!("{hh:02}:{mm:02}:{ss:02}")
+        }
+        6 => {
+            // Short date MM/DD/YY deterministic from value days
+            let days = raw_val.max(0.0).floor() as u32;
+            let mm = (days % 12) + 1;
+            let dd = ((days / 12) % 28) + 1;
+            let yy = (26 + (days / 365)) % 100;
+            format!("{mm:02}/{dd:02}/{yy:02}")
+        }
+        7 => {
+            // Hexadecimal
+            format!("{:X}", raw_val.round().max(0.0) as u64)
+        }
+        _ => format!("{:.*}", decimals, raw_val),
+    }
+}
+
+fn format_smpte_from_seconds(sec: f32, fps: u32, drop_frame: bool) -> String {
+    let fps_u = fps.max(1);
+    let total_frames = (sec.max(0.0) * (fps_u as f32)).floor() as u64;
+    let f = total_frames % u64::from(fps_u);
+    let total_sec = total_frames / u64::from(fps_u);
+    let s = total_sec % 60;
+    let m = (total_sec / 60) % 60;
+    let h = (total_sec / 3600) % 24;
+    let sep = if drop_frame && fps_u == 30 { ';' } else { ':' };
+    format!("{h:02}:{m:02}:{s:02}{sep}{f:02}")
+}
+
+fn format_timecode_text(params: &EffectParams) -> String {
+    let fps = params.int_or("timeUnits", 30).clamp(1, 240) as u32;
+    let start_frame = params.int_or("startingFrame", 0).max(0) as u64;
+    let t_sec = if params.values.contains_key("time") {
+        params.float_or("time", params.time)
+    } else {
+        params.time
+    };
+    let total_frames = start_frame + (t_sec.max(0.0) * (fps as f32)).floor() as u64;
+    let display_fmt = params.int_or("displayFormat", 0).clamp(0, 3);
+    let drop_frame = params.bool_or("dropFrame", false);
+    match display_fmt {
+        1 => format!("{total_frames:05}"),
+        2 => {
+            // Feet + Frames 35mm (16 frames/ft)
+            let feet = total_frames / 16;
+            let rem = total_frames % 16;
+            format!("{feet:04}+{rem:02}")
+        }
+        3 => {
+            // Feet + Frames 16mm (40 frames/ft)
+            let feet = total_frames / 40;
+            let rem = total_frames % 40;
+            format!("{feet:04}+{rem:02}")
+        }
+        _ => format_smpte_from_seconds((total_frames as f32) / (fps as f32), fps, drop_frame),
+    }
+}
+
+struct TextFieldRaster {
+    x0: i32,
+    y0: i32,
+    w: u32,
+    h: u32,
+    rgba: Vec<u8>,
+}
+
+/// Single-stroke glyph segment definitions in normalized `[0, 1] x [0, 1]` cell coordinates
+/// (matching Zoidium `fxgen-math.js` `GLYPHS` polyline table).
+fn glyph_segments(ch: char) -> &'static [([f32; 2], [f32; 2])] {
+    match ch.to_ascii_uppercase() {
+        '0' => &[
+            ([0.18, 0.08], [0.82, 0.08]),
+            ([0.82, 0.08], [0.82, 0.92]),
+            ([0.82, 0.92], [0.18, 0.92]),
+            ([0.18, 0.92], [0.18, 0.08]),
+            ([0.22, 0.78], [0.78, 0.22]),
+        ],
+        '1' => &[
+            ([0.32, 0.22], [0.54, 0.08]),
+            ([0.54, 0.08], [0.54, 0.92]),
+            ([0.24, 0.92], [0.80, 0.92]),
+        ],
+        '2' => &[
+            ([0.18, 0.22], [0.32, 0.08]),
+            ([0.32, 0.08], [0.74, 0.08]),
+            ([0.74, 0.08], [0.82, 0.24]),
+            ([0.82, 0.24], [0.18, 0.92]),
+            ([0.18, 0.92], [0.84, 0.92]),
+        ],
+        '3' => &[
+            ([0.18, 0.14], [0.78, 0.14]),
+            ([0.78, 0.14], [0.82, 0.38]),
+            ([0.82, 0.38], [0.42, 0.48]),
+            ([0.42, 0.48], [0.82, 0.62]),
+            ([0.82, 0.62], [0.78, 0.90]),
+            ([0.78, 0.90], [0.18, 0.90]),
+        ],
+        '4' => &[
+            ([0.72, 0.92], [0.72, 0.08]),
+            ([0.72, 0.08], [0.16, 0.64]),
+            ([0.16, 0.64], [0.86, 0.64]),
+        ],
+        '5' => &[
+            ([0.82, 0.08], [0.22, 0.08]),
+            ([0.22, 0.08], [0.20, 0.46]),
+            ([0.20, 0.46], [0.76, 0.46]),
+            ([0.76, 0.46], [0.82, 0.68]),
+            ([0.82, 0.68], [0.74, 0.92]),
+            ([0.74, 0.92], [0.18, 0.92]),
+        ],
+        '6' => &[
+            ([0.78, 0.12], [0.28, 0.12]),
+            ([0.28, 0.12], [0.18, 0.48]),
+            ([0.18, 0.48], [0.18, 0.90]),
+            ([0.18, 0.90], [0.80, 0.90]),
+            ([0.80, 0.90], [0.80, 0.52]),
+            ([0.80, 0.52], [0.18, 0.52]),
+        ],
+        '7' => &[([0.16, 0.08], [0.84, 0.08]), ([0.84, 0.08], [0.38, 0.92])],
+        '8' => &[
+            ([0.20, 0.08], [0.80, 0.08]),
+            ([0.80, 0.08], [0.80, 0.92]),
+            ([0.80, 0.92], [0.20, 0.92]),
+            ([0.20, 0.92], [0.20, 0.08]),
+            ([0.20, 0.48], [0.80, 0.48]),
+        ],
+        '9' => &[
+            ([0.82, 0.48], [0.20, 0.48]),
+            ([0.20, 0.48], [0.20, 0.08]),
+            ([0.20, 0.08], [0.82, 0.08]),
+            ([0.82, 0.08], [0.82, 0.90]),
+            ([0.82, 0.90], [0.26, 0.90]),
+        ],
+        'A' => &[
+            ([0.14, 0.92], [0.50, 0.08]),
+            ([0.50, 0.08], [0.86, 0.92]),
+            ([0.28, 0.62], [0.72, 0.62]),
+        ],
+        'B' => &[
+            ([0.20, 0.08], [0.20, 0.92]),
+            ([0.20, 0.08], [0.74, 0.08]),
+            ([0.74, 0.08], [0.80, 0.46]),
+            ([0.80, 0.46], [0.20, 0.48]),
+            ([0.20, 0.48], [0.82, 0.56]),
+            ([0.82, 0.56], [0.76, 0.92]),
+            ([0.76, 0.92], [0.20, 0.92]),
+        ],
+        'C' => &[
+            ([0.82, 0.14], [0.24, 0.14]),
+            ([0.24, 0.14], [0.18, 0.50]),
+            ([0.18, 0.50], [0.24, 0.88]),
+            ([0.24, 0.88], [0.82, 0.88]),
+        ],
+        'D' => &[
+            ([0.20, 0.08], [0.20, 0.92]),
+            ([0.20, 0.08], [0.68, 0.14]),
+            ([0.68, 0.14], [0.84, 0.50]),
+            ([0.84, 0.50], [0.68, 0.86]),
+            ([0.68, 0.86], [0.20, 0.92]),
+        ],
+        'E' => &[
+            ([0.82, 0.08], [0.20, 0.08]),
+            ([0.20, 0.08], [0.20, 0.92]),
+            ([0.20, 0.92], [0.82, 0.92]),
+            ([0.20, 0.48], [0.70, 0.48]),
+        ],
+        'F' => &[
+            ([0.82, 0.08], [0.20, 0.08]),
+            ([0.20, 0.08], [0.20, 0.92]),
+            ([0.20, 0.48], [0.70, 0.48]),
+        ],
+        ':' => &[([0.48, 0.28], [0.52, 0.34]), ([0.48, 0.70], [0.52, 0.76])],
+        ';' => &[([0.48, 0.28], [0.52, 0.34]), ([0.52, 0.70], [0.42, 0.88])],
+        '.' => &[([0.48, 0.84], [0.52, 0.90])],
+        ',' => &[([0.52, 0.78], [0.42, 0.94])],
+        '-' => &[([0.20, 0.50], [0.80, 0.50])],
+        '+' => &[([0.20, 0.50], [0.80, 0.50]), ([0.50, 0.22], [0.50, 0.78])],
+        '/' => &[([0.22, 0.92], [0.78, 0.08])],
+        '\'' => &[([0.50, 0.10], [0.46, 0.30])],
+        _ => &[],
+    }
+}
+
+fn seg_dist_2d(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let ex = bx - ax;
+    let ey = by - ay;
+    let l2 = ex * ex + ey * ey;
+    if l2 < 1e-8 {
+        return (px - ax).hypot(py - ay);
+    }
+    let t = (((px - ax) * ex + (py - ay) * ey) / l2).clamp(0.0, 1.0);
+    (px - (ax + ex * t)).hypot(py - (ay + ey * t))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rasterize_text_field_coverage(
+    text: &str,
+    anchor_x: f32,
+    anchor_y: f32,
+    size: f32,
+    tracking: f32,
+    proportional: bool,
+    vertical: bool,
+    alignment: i32,
+    stroke_w: f32,
+    frame_w: u32,
+    frame_h: u32,
+) -> Option<TextFieldRaster> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let char_h = size.max(6.0);
+    let base_w = char_h * 0.62;
+    let stroke_r = (char_h * 0.065).max(0.8);
+    let ring_r = stroke_r + stroke_w.max(0.0);
+    let pad = (ring_r + 2.0).ceil();
+
+    let mut segs: Vec<[f32; 4]> = Vec::new();
+    let mut advances: Vec<f32> = Vec::with_capacity(chars.len());
+    for &ch in &chars {
+        let adv = if proportional && matches!(ch, ':' | ';' | '.' | ',' | '\'' | '1') {
+            base_w * 0.55
+        } else {
+            base_w
+        };
+        advances.push(adv + tracking);
+    }
+
+    let total_span: f32 = if vertical {
+        (chars.len() as f32) * (char_h * 1.15 + tracking)
+    } else {
+        advances.iter().sum::<f32>()
+    };
+    let start_offset = match alignment {
+        0 => 0.0,
+        2 => -total_span,
+        _ => -total_span * 0.5,
+    };
+
+    let mut cursor = start_offset;
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for (idx, &ch) in chars.iter().enumerate() {
+        let cell_w = base_w;
+        let (ox, oy) = if vertical {
+            (anchor_x - cell_w * 0.5, anchor_y + cursor)
+        } else {
+            (anchor_x + cursor, anchor_y - char_h * 0.5)
+        };
+        for &(a, b) in glyph_segments(ch) {
+            let ax = ox + a[0] * cell_w;
+            let ay = oy + a[1] * char_h;
+            let bx = ox + b[0] * cell_w;
+            let by = oy + b[1] * char_h;
+            min_x = min_x.min(ax).min(bx);
+            min_y = min_y.min(ay).min(by);
+            max_x = max_x.max(ax).max(bx);
+            max_y = max_y.max(ay).max(by);
+            segs.push([ax, ay, bx, by]);
+        }
+        cursor += if vertical {
+            char_h * 1.15 + tracking
+        } else {
+            advances[idx]
+        };
+    }
+
+    if segs.is_empty() || !min_x.is_finite() {
+        return None;
+    }
+
+    let x0 = ((min_x - pad).floor() as i32).clamp(0, frame_w as i32);
+    let y0 = ((min_y - pad).floor() as i32).clamp(0, frame_h as i32);
+    let x1 = ((max_x + pad).ceil() as i32).clamp(0, frame_w as i32);
+    let y1 = ((max_y + pad).ceil() as i32).clamp(0, frame_h as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let w = (x1 - x0) as u32;
+    let h = (y1 - y0) as u32;
+    let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+
+    for py in 0..h {
+        let fy = (y0 as f32) + (py as f32) + 0.5;
+        for px in 0..w {
+            let fx = (x0 as f32) + (px as f32) + 0.5;
+            let mut best = f32::INFINITY;
+            for s in &segs {
+                let d = seg_dist_2d(fx, fy, s[0], s[1], s[2], s[3]);
+                if d < best {
+                    best = d;
+                }
+            }
+            let fill_cov = (stroke_r - best + 0.5).clamp(0.0, 1.0);
+            let outer_cov = if stroke_w > 1e-3 {
+                (ring_r - best + 0.5).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let stroke_ring = (outer_cov - fill_cov).clamp(0.0, 1.0);
+            let off = ((py as usize) * (w as usize) + (px as usize)) * 4;
+            rgba[off] = (fill_cov * 255.0).round() as u8;
+            rgba[off + 1] = (stroke_ring * 255.0).round() as u8;
+            rgba[off + 2] = 0;
+            rgba[off + 3] = 255;
+        }
+    }
+
+    Some(TextFieldRaster { x0, y0, w, h, rgba })
+}
+
+// ============================================================================
+// CC Pixel Polly 3D Shattered Polygon Mesh Builder (`fxtrans-math.js`)
+// ============================================================================
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Pod, Zeroable)]
+struct PollyVertex {
+    pos: [f32; 2],
+    luv: [f32; 2],
+    cuv: [f32; 2],
+    shade: f32,
+}
+
+fn polly_hash01(a: u32, b: u32, seed: u32) -> f32 {
+    let mut h = (a.wrapping_mul(0x8da6_b343))
+        ^ (b.wrapping_mul(0xd816_3841))
+        ^ (seed.wrapping_mul(0xcb1a_b31f));
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1_e995);
+    h ^= h >> 15;
+    ((h & 0x00ff_ffff) as f32) / 16_777_216.0
+}
+
+fn polly_rot_axis3(ax: f32, ay: f32, az: f32, angle: f32) -> [[f32; 3]; 3] {
+    let len = (ax * ax + ay * ay + az * az).sqrt();
+    if !len.is_finite() || len <= 1e-12 {
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
+    let x = ax / len;
+    let y = ay / len;
+    let z = az / len;
+    let (s, c) = angle.sin_cos();
+    let t = 1.0 - c;
+    [
+        [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+        [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+        [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
+    ]
+}
+
+fn build_pixel_polly_mesh(
+    params: &EffectParams,
+    width: f32,
+    height: f32,
+    t: f32,
+) -> Vec<PollyVertex> {
+    let spacing = params.float_or("gridSpacing", 10.0).clamp(1.0, 500.0);
+    let force = params.float_or("force", 100.0);
+    let gravity = params.float_or("gravity", 1.0);
+    let fc = params.vec2_or("forceCenter", [0.5, 0.5]);
+    let spin_rad = params.float_or("spinning", 0.0).to_radians();
+    let dir_rand = (params.float_or("directionRandomness", 10.0) / 100.0).clamp(0.0, 1.0);
+    let speed_rand = (params.float_or("speedRandomness", 10.0) / 100.0).clamp(0.0, 1.0);
+    let obj_mode = params.int_or("object", 1).clamp(0, 3);
+    let tris_mode = if params.values.contains_key("object") {
+        obj_mode <= 1
+    } else {
+        params.int_or("sectorShape", 0) != 0
+    };
+    let depth_sort = params.bool_or("enableDepthSort", true);
+    let raw_seed = if params.values.contains_key("randomSeed") {
+        params.int_or("randomSeed", 1)
+    } else {
+        params.int_or("seed", 1)
+    };
+    let seed = (raw_seed as u32).wrapping_mul(0x632b_e5ab);
+
+    let max_pieces = 8192usize;
+    let per = if tris_mode { 2usize } else { 1usize };
+    let mut g = spacing;
+    let mut cols = (width / g).ceil().max(1.0) as usize;
+    let mut rows = (height / g).ceil().max(1.0) as usize;
+    while cols * rows * per > max_pieces {
+        g *= 1.25;
+        cols = (width / g).ceil().max(1.0) as usize;
+        rows = (height / g).ceil().max(1.0) as usize;
+    }
+
+    let fcx = fc[0] * width;
+    let fcy = fc[1] * height;
+    let maxd = width.max(height).max(1.0);
+    let cam_dist = maxd * 1.5;
+
+    struct Piece {
+        index: u32,
+        z: f32,
+        tris: Vec<PollyVertex>,
+    }
+    let total = cols * rows * per;
+    let mut pieces: Vec<Piece> = Vec::with_capacity(total);
+
+    for n in 0..total {
+        let cell = n / per;
+        let ci = cell % cols;
+        let cj = cell / cols;
+        let x0 = (ci as f32) * g;
+        let y0 = (cj as f32) * g;
+        let corners: Vec<[f32; 2]> = if !tris_mode {
+            vec![[x0, y0], [x0 + g, y0], [x0 + g, y0 + g], [x0, y0 + g]]
+        } else if n % 2 == 0 {
+            vec![[x0, y0], [x0 + g, y0], [x0, y0 + g]]
+        } else {
+            vec![[x0 + g, y0], [x0 + g, y0 + g], [x0, y0 + g]]
+        };
+
+        let inv_n = 1.0 / (corners.len() as f32);
+        let cx: f32 = corners.iter().map(|p| p[0]).sum::<f32>() * inv_n;
+        let cy: f32 = corners.iter().map(|p| p[1]).sum::<f32>() * inv_n;
+        let cuv = [cx / width.max(1.0), cy / height.max(1.0)];
+
+        let nu = n as u32;
+        let h1 = polly_hash01(nu, 1, seed) * 2.0 - 1.0;
+        let h2 = polly_hash01(nu, 2, seed) * 2.0 - 1.0;
+        let h3 = polly_hash01(nu, 3, seed);
+        let h4 = polly_hash01(nu, 4, seed) * 2.0 - 1.0;
+        let h5 = polly_hash01(nu, 5, seed) * 2.0 - 1.0;
+        let h6 = polly_hash01(nu, 6, seed) * 2.0 - 1.0;
+        let h7 = polly_hash01(nu, 7, seed);
+
+        let dx = cx - fcx;
+        let dy = cy - fcy;
+        let dist = dx.hypot(dy).max(1e-6);
+        let ang = dy.atan2(dx) + dir_rand * std::f32::consts::PI * h1;
+        let speed =
+            (force / 100.0) * 0.6 * maxd / (1.0 + dist / (0.5 * maxd)) * (1.0 + speed_rand * h2);
+        let vz = -speed * 0.5 * h3;
+        let px = cx + ang.cos() * speed * t;
+        let py = cy + ang.sin() * speed * t + 0.25 * gravity * height * t * t;
+        let pz = vz * t;
+
+        let rot = polly_rot_axis3(h4, h5, h6, t * (std::f32::consts::PI * h7 + spin_rad));
+        let shade = (0.35 + 0.65 * rot[2][2]).max(0.0);
+
+        let ox = width * 0.5;
+        let oy = height * 0.5;
+        let project = |pt: [f32; 2]| -> PollyVertex {
+            let lx = pt[0] - cx;
+            let ly = pt[1] - cy;
+            let wx = rot[0][0] * lx + rot[0][1] * ly + px;
+            let wy = rot[1][0] * lx + rot[1][1] * ly + py;
+            let wz = rot[2][0] * lx + rot[2][1] * ly + pz;
+            let s = cam_dist / (cam_dist - wz).max(cam_dist * 0.05);
+            let sx_px = ox + (wx - ox) * s;
+            let sy_px = oy + (wy - oy) * s;
+            PollyVertex {
+                pos: [
+                    (sx_px / width.max(1.0)) * 2.0 - 1.0,
+                    1.0 - (sy_px / height.max(1.0)) * 2.0,
+                ],
+                luv: [pt[0] / width.max(1.0), pt[1] / height.max(1.0)],
+                cuv,
+                shade,
+            }
+        };
+
+        let pverts: Vec<PollyVertex> = corners.into_iter().map(project).collect();
+        let tris = if pverts.len() == 3 {
+            pverts
+        } else {
+            vec![
+                pverts[0], pverts[1], pverts[2], pverts[0], pverts[2], pverts[3],
+            ]
+        };
+        pieces.push(Piece {
+            index: nu,
+            z: pz,
+            tris,
+        });
+    }
+
+    if depth_sort {
+        pieces.sort_by(|a, b| a.z.total_cmp(&b.z).then_with(|| a.index.cmp(&b.index)));
+    }
+    let mut verts = Vec::with_capacity(pieces.len() * 6);
+    for p in pieces {
+        verts.extend(p.tris);
+    }
+    verts
 }
 
 #[cfg(test)]
@@ -4281,5 +7464,480 @@ mod tests {
             &[0, 0, 0, 0],
             "coloroverlay BLEND_MINUS over transparent bg must remain transparent"
         );
+    }
+
+    #[test]
+    fn wave2a_all_16_native_fx_upgraded_plugins_and_cm3_fixes_gpu() {
+        // 1. Structural & uniqueness check for all 16 native FX + 3 helper shaders
+        assert_eq!(NATIVE_FX_EFFECT_SHADERS.len(), 16);
+        assert_eq!(HELPER_EFFECT_SHADERS.len(), 3);
+        let std_set: BTreeSet<&str> = STANDARD_EFFECT_SHADERS.iter().map(|(id, _)| *id).collect();
+        let plg_set: BTreeSet<&str> = PLUGIN_EFFECT_SHADERS.iter().map(|(id, _)| *id).collect();
+        let nfx_set: BTreeSet<&str> = NATIVE_FX_EFFECT_SHADERS.iter().map(|(id, _)| *id).collect();
+        let hlp_set: BTreeSet<&str> = HELPER_EFFECT_SHADERS.iter().map(|(id, _)| *id).collect();
+        assert_eq!(nfx_set.len(), 16);
+        assert!(nfx_set.is_disjoint(&std_set));
+        assert!(nfx_set.is_disjoint(&plg_set));
+        assert!(hlp_set.is_disjoint(&nfx_set));
+        for &(id, body) in NATIVE_FX_EFFECT_SHADERS
+            .iter()
+            .chain(HELPER_EFFECT_SHADERS.iter())
+        {
+            assert!(!body.contains("discard;"), "{id}: must never use discard");
+            assert!(lookup_effect_shader(id).is_some(), "{id}: missing lookup");
+        }
+        assert!(!SHADER_POLLY_MESH_WGSL.contains("discard;"));
+
+        // 2. Verify 3 CM3 fixes (CPU checks)
+        // 2a. bloom amount == 0 bypass
+        let bloom_zero = EffectParams::new([32.0, 32.0], 0.0, 0.0)
+            .with_param("amount", EffectParamValue::Float(0.0));
+        assert!(should_bypass("bloom", &bloom_zero));
+        let bloom_active = EffectParams::new([32.0, 32.0], 0.0, 0.0)
+            .with_param("amount", EffectParamValue::Float(1.0));
+        assert!(!should_bypass("bloom", &bloom_active));
+
+        // 2b. shake exact zoom without arbitrary d * 0.85 clamp
+        let shake_p = EffectParams::new([100.0, 100.0], 0.0, 0.0)
+            .with_param("amplitude", EffectParamValue::Float(0.0))
+            .with_param("zoom", EffectParamValue::Float(95.0));
+        let u_shake = pack_effect_uniforms("shake", &shake_p, false, false);
+        assert_eq!(u_shake.flags, 1);
+        // At zoom=95, d=100, o_cam.z = -100 - (-95) = -5 (old clamp 85 gave -15).
+        assert!(
+            (u_shake.p4[2] - (-5.0)).abs() < 1e-3,
+            "shake must not clamp zoom to d*0.85, got o_cam.z = {}",
+            u_shake.p4[2]
+        );
+
+        // 2c. transform wrap mapping: 0=tile -> mode 1u, 1=reflect -> mode 2u
+        let tf_tile =
+            EffectParams::new([64.0, 64.0], 0.0, 0.0).with_param("wrap", EffectParamValue::Int(0));
+        let tf_ref =
+            EffectParams::new([64.0, 64.0], 0.0, 0.0).with_param("wrap", EffectParamValue::Int(1));
+        assert_eq!(
+            pack_effect_uniforms("transform", &tf_tile, false, false).mode,
+            1
+        );
+        assert_eq!(
+            pack_effect_uniforms("transform", &tf_ref, false, false).mode,
+            2
+        );
+
+        // 3. Headless GPU compilation + rendering of ALL 16 native FX + upgraded plugins + Wave 2D helpers
+        let ctx = match crate::GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(crate::RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to init GpuContext: {err}"),
+        };
+        let mut registry =
+            EffectRegistry::new(&ctx.device, &ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+
+        // Compile every native FX + helper shader in Naga/wgpu
+        for &(id, _) in NATIVE_FX_EFFECT_SHADERS
+            .iter()
+            .chain(HELPER_EFFECT_SHADERS.iter())
+        {
+            registry
+                .ensure_pipeline(&ctx.device, id, false)
+                .unwrap_or_else(|e| panic!("failed to compile WGSL `{id}`: {e}"));
+        }
+
+        // Build colorful 32x32 test textures (A = gradient/green block, B = shifted pattern, M = luma ramp)
+        let (w, h) = (32u32, 32u32);
+        let mut px_a = vec![0u8; (w * h * 4) as usize];
+        let mut px_b = vec![0u8; (w * h * 4) as usize];
+        let mut px_m = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let green_zone = x < w / 2;
+                px_a[i] = if green_zone {
+                    20
+                } else {
+                    (x * 8).min(255) as u8
+                };
+                px_a[i + 1] = if green_zone {
+                    230
+                } else {
+                    (y * 8).min(255) as u8
+                };
+                px_a[i + 2] = if green_zone { 20 } else { 180 };
+                px_a[i + 3] = 255;
+
+                px_b[i] = ((x + 6) % w * 8).min(255) as u8;
+                px_b[i + 1] = ((y + 4) % h * 8).min(255) as u8;
+                px_b[i + 2] = 90;
+                px_b[i + 3] = 255;
+
+                let ramp = (x * 255 / (w - 1)) as u8;
+                px_m[i] = ramp;
+                px_m[i + 1] = ramp;
+                px_m[i + 2] = ramp;
+                px_m[i + 3] = 255;
+            }
+        }
+        let tex_a = ctx.create_rgba8_texture("w2a-a", w, h, &px_a).expect("a");
+        let tex_b = ctx.create_rgba8_texture("w2a-b", w, h, &px_b).expect("b");
+        let tex_m = ctx.create_rgba8_texture("w2a-m", w, h, &px_m).expect("m");
+        let dst =
+            crate::RenderTarget::new(&ctx, w, h, wgpu::TextureFormat::Rgba8Unorm, Some("dst"))
+                .expect("dst");
+
+        let run_fx = |reg: &mut EffectRegistry,
+                      id: &str,
+                      aux: Option<&wgpu::TextureView>,
+                      aux2: Option<&wgpu::TextureView>,
+                      params: &EffectParams|
+         -> Vec<u8> {
+            let mut enc = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let ran = reg
+                .run_effect(
+                    &ctx.device,
+                    &ctx.queue,
+                    &mut enc,
+                    id,
+                    params,
+                    &EffectTargets {
+                        input: &tex_a.view,
+                        output: &dst.view,
+                        aux,
+                        aux2,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("effect `{id}` failed: {e}"));
+            assert!(ran, "effect `{id}` unexpectedly bypassed");
+            ctx.queue.submit(std::iter::once(enc.finish()));
+            let mut out = Vec::new();
+            crate::readback_rgba8(&ctx, &dst, &mut out).expect("readback");
+            assert_eq!(out.len(), (w * h * 4) as usize, "{id}: bad readback len");
+            out
+        };
+
+        let base_p = EffectParams::new([w as f32, h as f32], 1.25, 37.0);
+
+        // Execute EVERY ONE of the 16 nativeEffects and assert valid functional output
+        for (id, aux, aux2, p) in [
+            (
+                "timedisplacement",
+                Some(&tex_b.view),
+                Some(&tex_m.view),
+                base_p.clone(),
+            ),
+            ("ccwidetime", Some(&tex_b.view), None, base_p.clone()),
+            (
+                "timedifference",
+                Some(&tex_b.view),
+                None,
+                base_p
+                    .clone()
+                    .with_param("absoluteDifference", EffectParamValue::Bool(true)),
+            ),
+            (
+                "colordiffkey",
+                None,
+                None,
+                base_p
+                    .clone()
+                    .with_param("keyColor", EffectParamValue::Vec3([0.0, 1.0, 0.0])),
+            ),
+            (
+                "advspill",
+                None,
+                None,
+                base_p
+                    .clone()
+                    .with_param("keyColor", EffectParamValue::Vec3([0.0, 1.0, 0.0])),
+            ),
+            (
+                "keycleaner",
+                None,
+                None,
+                base_p
+                    .clone()
+                    .with_param("reduceChatter", EffectParamValue::Bool(true)),
+            ),
+            (
+                "linearcolorkey",
+                None,
+                None,
+                base_p
+                    .clone()
+                    .with_param("keyColor", EffectParamValue::Vec3([0.0, 1.0, 0.0])),
+            ),
+            (
+                "radiowaves",
+                None,
+                None,
+                base_p
+                    .clone()
+                    .with_param("polygonSides", EffectParamValue::Int(5))
+                    .with_param("star", EffectParamValue::Bool(true)),
+            ),
+            ("beam", None, None, base_p.clone()),
+            (
+                "numbers",
+                None,
+                None,
+                base_p
+                    .clone()
+                    .with_param("value", EffectParamValue::Float(42.5))
+                    .with_param("decimalPlaces", EffectParamValue::Int(1))
+                    .with_param("size", EffectParamValue::Float(14.0)),
+            ),
+            (
+                "timecode",
+                None,
+                None,
+                base_p
+                    .clone()
+                    .with_param("size", EffectParamValue::Float(12.0))
+                    .with_param("showBox", EffectParamValue::Bool(true)),
+            ),
+            ("ccpageturn", None, None, base_p.clone()),
+            ("cardwipe", None, None, base_p.clone()),
+            (
+                "ccpixelpolly",
+                None,
+                None,
+                base_p
+                    .clone()
+                    .with_param("time", EffectParamValue::Float(0.6))
+                    .with_param("gridSpacing", EffectParamValue::Float(8.0)),
+            ),
+            ("radialshadow", None, None, base_p.clone()),
+            (
+                "layerinputdisplacement",
+                Some(&tex_m.view),
+                None,
+                base_p
+                    .clone()
+                    .with_param("amount", EffectParamValue::Float(0.15)),
+            ),
+        ] {
+            let out = run_fx(&mut registry, id, aux, aux2, &p);
+            assert!(
+                out.iter().any(|&b| b > 0),
+                "native FX `{id}` rendered all-zero output"
+            );
+        }
+
+        // Verify `colordiffkey` keyed out the pure green left half (x=2, y=16 -> lower alpha than right half)
+        let cdk_out = run_fx(
+            &mut registry,
+            "colordiffkey",
+            None,
+            None,
+            &base_p
+                .clone()
+                .with_param("keyColor", EffectParamValue::Vec3([0.0, 1.0, 0.0])),
+        );
+        let left_a = cdk_out[((16 * w + 2) * 4 + 3) as usize];
+        let right_a = cdk_out[((16 * w + 24) * 4 + 3) as usize];
+        assert!(
+            left_a < right_a,
+            "colordiffkey must key green left half ({left_a}) more than right half ({right_a})"
+        );
+
+        // Verify Magic Looks full 29-tool chain execution via `looksInstances` JSON!
+        let all_29_tools = serde_json::json!([
+            {"toolId": "color-contrast", "ccPivot": 0.18, "ccExposure": 0.05},
+            {"toolId": "hsl-colors", "hslRedSat": 0.1, "hslBlueLight": 0.05},
+            {"toolId": "color-ranges", "crStrength": 0.3},
+            {"toolId": "crush", "crGamma": 1.05},
+            {"toolId": "contrast", "ctContrast": 0.1, "ctPivot": 0.5},
+            {"toolId": "color-reversal", "rvStrength": 0.0},
+            {"toolId": "three-strip", "tsStrength": 0.2},
+            {"toolId": "lift-gamma-gain", "lggStrength": 0.25},
+            {"toolId": "ranged-saturation", "rsSatMidtone": 1.1},
+            {"toolId": "warm-cool", "wcWarmCool": 0.15, "wcTint": -0.05},
+            {"toolId": "four-way", "fwStrength": 0.2},
+            {"toolId": "mojo", "mjMojo": 0.2},
+            {"toolId": "auto-shoulder", "asStrength": 0.15},
+            {"toolId": "curves", "curvCurvesJson": "{\"master\":[[0,0],[0.5,0.55],[1,1]]}"},
+            {"toolId": "s-curve", "scvScurveJson": "[[0,0],[0.25,0.22],[0.75,0.78],[1,1]]"},
+            {"toolId": "lut", "lutMode": 1, "lutStrength": 0.25},
+            {"toolId": "lightflex", "lfBoost": 0.3},
+            {"toolId": "deflare", "dfStrength": 0.2},
+            {"toolId": "vignette", "vgStrength": 0.25, "vgRadius": 0.8},
+            {"toolId": "haze-flare", "hfSpillage": 0.1},
+            {"toolId": "pop", "popPop": 0.2},
+            {"toolId": "diffusion", "diffSize": 0.4, "diffGlow": 0.35},
+            {"toolId": "star-filter", "sfSize": 0.3, "sfBoost": 0.4, "sfThreshold": 0.5},
+            {"toolId": "anamorphic-flare", "afSize": 0.3, "afBoost": 0.4, "afThreshold": 0.5},
+            {"toolId": "lens-distortion", "ldDistortion": 0.05, "ldFlatness": 1.0},
+            {"toolId": "shutter-streak", "ssSize": 0.2, "ssBoost": 0.2, "ssFalloff": 0.5},
+            {"toolId": "edge-softness", "esBlurSize": 0.01, "esRadius": 0.6},
+            {"toolId": "chromatic-aberration", "caRedCyan": 0.2, "caBlueYellow": 0.2},
+            {"toolId": "telecine-net", "tnSize": 0.05, "tnStrength": 0.15}
+        ])
+        .to_string();
+        let ml_p = base_p
+            .clone()
+            .with_param("looksInstances", EffectParamValue::String(all_29_tools));
+        let ml_out = run_fx(&mut registry, "looks", None, None, &ml_p);
+        assert!(
+            ml_out.iter().any(|&b| b > 0),
+            "magiclooks 29-tool chain all-zero"
+        );
+
+        // Verify upgraded plugins: vhs (OSD + persistence), jpegdamage (DCT + errors), datamosh (anchor),
+        // tracery (boxes/markers/lines/arrows/callouts), ascii (katakana + sine/noise),
+        // smartmotionblur (quality 0/1/2), echo-legacy (modes 0..3), colorcurves (curves JSON + affectAlpha)
+        let vhs_p = base_p
+            .clone()
+            .with_param("osd", EffectParamValue::Float(1.0))
+            .with_param("tracking", EffectParamValue::Float(0.4))
+            .with_param("persistence", EffectParamValue::Float(0.5));
+        let _ = run_fx(&mut registry, "vhs", Some(&tex_b.view), None, &vhs_p);
+
+        let jd_p = base_p
+            .clone()
+            .with_param("quality", EffectParamValue::Float(0.15))
+            .with_param("errRate", EffectParamValue::Float(2.0))
+            .with_param("highFreq", EffectParamValue::Float(0.5));
+        let _ = run_fx(&mut registry, "jpegdamage", None, None, &jd_p);
+
+        let dm_p = base_p
+            .clone()
+            .with_param("algorithm", EffectParamValue::Float(0.0))
+            .with_param("blockSize", EffectParamValue::Float(8.0));
+        let _ = run_fx(&mut registry, "datamosh", Some(&tex_b.view), None, &dm_p);
+
+        let tr_p = base_p
+            .clone()
+            .with_param("point1Enable", EffectParamValue::Bool(true))
+            .with_param("point2Enable", EffectParamValue::Bool(true))
+            .with_param("arrowEnable", EffectParamValue::Bool(true))
+            .with_param("labelsEnable", EffectParamValue::Bool(true))
+            .with_param("dashEnable", EffectParamValue::Bool(true))
+            .with_param("gridEnable", EffectParamValue::Bool(true));
+        let _ = run_fx(&mut registry, "tracery", None, None, &tr_p);
+
+        let ascii_p = base_p
+            .clone()
+            .with_param("charset", EffectParamValue::Int(4))
+            .with_param("colorMode", EffectParamValue::Int(2))
+            .with_param("sineEnable", EffectParamValue::Bool(true))
+            .with_param("noiseEnable", EffectParamValue::Bool(true))
+            .with_param("glitchEnable", EffectParamValue::Bool(true));
+        let _ = run_fx(&mut registry, "ascii", None, None, &ascii_p);
+
+        for q in [0, 1, 2] {
+            let smb_p = base_p
+                .clone()
+                .with_param("quality", EffectParamValue::Int(q))
+                .with_param("shutterAngle", EffectParamValue::Float(270.0));
+            let _ = run_fx(
+                &mut registry,
+                "smart-motion-blur-lite",
+                Some(&tex_b.view),
+                Some(&tex_m.view),
+                &smb_p,
+            );
+        }
+
+        for m in 0..=3 {
+            let echo_leg = base_p
+                .clone()
+                .with_param("mode", EffectParamValue::Int(m))
+                .with_param("strength", EffectParamValue::Float(0.8))
+                .with_param("threshold", EffectParamValue::Float(0.1))
+                .with_param("wsum", EffectParamValue::Float(2.0))
+                .with_param("finalize", EffectParamValue::Bool(true));
+            let _ = run_fx(
+                &mut registry,
+                "echo-legacy",
+                Some(&tex_b.view),
+                None,
+                &echo_leg,
+            );
+        }
+
+        let cc_json_p = base_p
+            .clone()
+            .with_param(
+                "curves",
+                EffectParamValue::String(
+                    "{\"master\":[[0,0],[0.5,0.75],[1,1]],\"a\":[[0,0],[1,0.5]]}".to_owned(),
+                ),
+            )
+            .with_param("affectAlpha", EffectParamValue::Bool(true));
+        let cc_out = run_fx(&mut registry, "colorcurves", None, None, &cc_json_p);
+        assert!(
+            cc_out[3] < 160,
+            "colorcurves affectAlpha with alpha curve [1->0.5] must halve alpha, got {}",
+            cc_out[3]
+        );
+
+        // Verify Wave 2D helpers: run_frame_mix, run_shutter_accumulate, run_time_displacement_slice, run_wide_time_tap
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        registry
+            .run_frame_mix(
+                &ctx.device,
+                &mut enc,
+                &tex_a.view,
+                &tex_b.view,
+                &dst.view,
+                [w as f32, h as f32],
+                0.5,
+                0,
+            )
+            .expect("run_frame_mix");
+        registry
+            .run_shutter_accumulate(
+                &ctx.device,
+                &mut enc,
+                &tex_a.view,
+                &tex_b.view,
+                &dst.view,
+                [w as f32, h as f32],
+                1.0,
+                1.0,
+                true,
+                true,
+                wgpu::TextureFormat::Rgba8Unorm,
+            )
+            .expect("run_shutter_accumulate");
+        registry
+            .run_time_displacement_slice(
+                &ctx.device,
+                &mut enc,
+                &tex_a.view,
+                &tex_b.view,
+                Some(&tex_m.view),
+                &dst.view,
+                &base_p,
+                1,
+                4,
+            )
+            .expect("run_time_displacement_slice");
+        registry
+            .run_wide_time_tap(
+                &ctx.device,
+                &mut enc,
+                &tex_a.view,
+                &tex_b.view,
+                &dst.view,
+                &base_p,
+                0.5,
+                false,
+                false,
+            )
+            .expect("run_wide_time_tap");
+        ctx.queue.submit(std::iter::once(enc.finish()));
+
+        // Verify bloom brightTexture luma gating runs cleanly on GPU
+        let bloom_p = base_p
+            .clone()
+            .with_param("amount", EffectParamValue::Float(1.0))
+            .with_param("blendThreshold", EffectParamValue::Float(0.4))
+            .with_param("blendSoften", EffectParamValue::Float(0.25));
+        let bloom_out = run_fx(&mut registry, "bloom", None, None, &bloom_p);
+        assert!(bloom_out.iter().any(|&b| b > 0));
     }
 }
