@@ -79,9 +79,16 @@ const FORBIDDEN_IN_CORE: &[&str] = &[
 ];
 
 fn check_layers() -> Result<(), Vec<String>> {
-    // Full resolved metadata (not --no-deps) so transitive dependencies are verified too.
+    // Full resolved metadata with --all-features and --locked so non-default
+    // features and transitive dependencies are checked against the committed lockfile.
     let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1"])
+        .args([
+            "metadata",
+            "--locked",
+            "--all-features",
+            "--format-version",
+            "1",
+        ])
         .output()
         .map_err(|e| vec![format!("failed to execute cargo metadata: {e}")])?;
 
@@ -128,7 +135,8 @@ fn check_layers() -> Result<(), Vec<String>> {
             .or_default()
             .push(pkg.name.clone());
 
-        // 1. Direct dependency checks (including dev-dependencies and xtask bridge guard).
+        // 1. Direct dependency checks (including optional, dev, and xtask bridge guard).
+        let forbid_gui = pkg_layer <= 4 || pkg.name == "zoidcraft-cli";
         for dep in &pkg.dependencies {
             if dep.name == "xtask" {
                 violations.push(format!(
@@ -136,6 +144,12 @@ fn check_layers() -> Result<(), Vec<String>> {
                     pkg.name
                 ));
                 continue;
+            }
+            if forbid_gui && FORBIDDEN_IN_CORE.contains(&dep.name.as_str()) {
+                violations.push(format!(
+                    "forbidden direct GUI/windowing dependency in `{}` (L{}): `{}`",
+                    pkg.name, pkg_layer, dep.name
+                ));
             }
             if let Some(dep_layer) = layer_of(&dep.name) {
                 let allowed = if pkg_layer == 2 && dep_layer == 2 {
@@ -156,7 +170,6 @@ fn check_layers() -> Result<(), Vec<String>> {
         }
 
         // 2. Full transitive dependency walk for all core crates (L0..L4) and headless CLI.
-        let forbid_gui = pkg_layer <= 4 || pkg.name == "zoidcraft-cli";
         if forbid_gui {
             let mut visited: BTreeSet<&str> = BTreeSet::new();
             let mut queue: VecDeque<(&str, Vec<String>)> = VecDeque::new();
