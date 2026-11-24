@@ -516,29 +516,31 @@ fn rw_poly_sd(dp: vec2<f32>, radius: f32, sides: f32, star_k: f32, rot: f32) -> 
 
 fn rw_profile(u_val: f32, kind: i32) -> f32 {
     let c = clamp(u_val, -1.0, 1.0);
+    var out: f32 = 1.0;
     switch (kind) {
         case 1: {
-            return (1.0 - c) * 0.5;
+            out = (1.0 - c) * 0.5;
         }
         case 2: {
-            return (1.0 + c) * 0.5;
+            out = (1.0 + c) * 0.5;
         }
         case 3: {
-            return 1.0 - abs(c);
+            out = 1.0 - abs(c);
         }
         case 4: {
-            return cos(c * (PI * 0.5));
+            out = cos(c * (PI * 0.5));
         }
         case 5: {
-            return select(1.0, 1.0 + c, c < 0.0);
+            out = select(1.0, 1.0 + c, c < 0.0);
         }
         case 6: {
-            return select(1.0, 1.0 - c, c > 0.0);
+            out = select(1.0, 1.0 - c, c > 0.0);
         }
         default: {
-            return 1.0;
+            out = 1.0;
         }
     }
+    return out;
 }
 
 @fragment

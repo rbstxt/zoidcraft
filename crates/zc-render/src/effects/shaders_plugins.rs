@@ -193,98 +193,101 @@ fn vhs_ycbcr2rgb(c: vec3<f32>) -> vec3<f32> {
 }
 
 fn vhs_osd_row(id: u32, row: u32) -> u32 {
+    let r = min(row, 6u);
+    var out: u32 = 0u;
     switch (id) {
         case 1u: {
             // P
             let tbl = array<u32, 7>(31u, 17u, 17u, 31u, 1u, 1u, 1u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 2u: {
             // L
-            return select(31u, 1u, row < 6u);
+            out = select(31u, 1u, row < 6u);
         }
         case 3u: {
             // A
             let tbl = array<u32, 7>(4u, 10u, 17u, 17u, 31u, 17u, 17u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 4u: {
             // Y
             let tbl = array<u32, 7>(17u, 17u, 10u, 4u, 4u, 4u, 4u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 5u: {
             // S
             let tbl = array<u32, 7>(30u, 1u, 1u, 14u, 16u, 16u, 30u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 6u: {
             // -
-            return select(0u, 31u, row == 3u);
+            out = select(0u, 31u, row == 3u);
         }
         case 7u: {
             // :
-            return select(0u, 6u, row == 2u || row == 4u);
+            out = select(0u, 6u, row == 2u || row == 4u);
         }
         case 8u: {
             // Play triangle
             let tbl = array<u32, 7>(1u, 3u, 7u, 31u, 7u, 3u, 1u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 9u: {
             // 0
             let tbl = array<u32, 7>(14u, 17u, 17u, 17u, 17u, 17u, 14u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 10u: {
             // 1
             let tbl = array<u32, 7>(4u, 6u, 4u, 4u, 4u, 4u, 14u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 11u: {
             // 2
             let tbl = array<u32, 7>(14u, 16u, 8u, 4u, 2u, 1u, 31u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 12u: {
             // 3
             let tbl = array<u32, 7>(31u, 16u, 8u, 14u, 16u, 16u, 14u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 13u: {
             // 4
             let tbl = array<u32, 7>(8u, 12u, 10u, 17u, 31u, 8u, 8u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 14u: {
             // 5
             let tbl = array<u32, 7>(31u, 1u, 14u, 16u, 16u, 17u, 14u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 15u: {
             // 6
             let tbl = array<u32, 7>(14u, 1u, 1u, 14u, 17u, 17u, 14u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 16u: {
             // 7
             let tbl = array<u32, 7>(31u, 16u, 8u, 4u, 4u, 4u, 4u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 17u: {
             // 8
             let tbl = array<u32, 7>(14u, 17u, 17u, 14u, 17u, 17u, 14u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         case 18u: {
             // 9
             let tbl = array<u32, 7>(14u, 17u, 17u, 14u, 16u, 16u, 14u);
-            return tbl[min(row, 6u)];
+            out = tbl[r];
         }
         default: {
-            return 0u;
+            out = 0u;
         }
     }
+    return out;
 }
 
 @fragment
@@ -1264,19 +1267,20 @@ fn tr_seg_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 fn tr_marker_cov(p: vec2<f32>, center: vec2<f32>, sz: f32, shape: u32, rot: f32, sides: f32, filled: bool) -> f32 {
     let dp = rot2(p - center, -rot);
     let r = max(sz * 0.5, 1.5);
+    var cov: f32 = 0.0;
     switch (shape) {
         case 1u: {
             // Plus
             let h = max(abs(dp.x) - r, abs(dp.y) - 1.5);
             let v = max(abs(dp.y) - r, abs(dp.x) - 1.5);
-            return clamp(1.0 - min(h, v), 0.0, 1.0);
+            cov = clamp(1.0 - min(h, v), 0.0, 1.0);
         }
         case 2u: {
             // Cross (45-deg X)
             let cr = rot2(dp, PI * 0.25);
             let h = max(abs(cr.x) - r, abs(cr.y) - 1.5);
             let v = max(abs(cr.y) - r, abs(cr.x) - 1.5);
-            return clamp(1.0 - min(h, v), 0.0, 1.0);
+            cov = clamp(1.0 - min(h, v), 0.0, 1.0);
         }
         case 3u: {
             // Regular polygon
@@ -1285,20 +1289,15 @@ fn tr_marker_cov(p: vec2<f32>, center: vec2<f32>, sz: f32, shape: u32, rot: f32,
             let ang = atan2(dp.y, dp.x) + PI;
             let sector = (ang - 2.0 * an * floor(ang / (2.0 * an))) - an;
             let d = length(dp) * cos(sector) - r * cos(an);
-            if (filled) {
-                return clamp(0.5 - d, 0.0, 1.0);
-            }
-            return clamp(1.5 - abs(d), 0.0, 1.0);
+            cov = select(clamp(1.5 - abs(d), 0.0, 1.0), clamp(0.5 - d, 0.0, 1.0), filled);
         }
         default: {
             // Dot / ring
             let d = length(dp) - r;
-            if (filled) {
-                return clamp(0.5 - d, 0.0, 1.0);
-            }
-            return clamp(1.5 - abs(d), 0.0, 1.0);
+            cov = select(clamp(1.5 - abs(d), 0.0, 1.0), clamp(0.5 - d, 0.0, 1.0), filled);
         }
     }
+    return cov;
 }
 
 fn tr_box_and_brackets(p: vec2<f32>, center: vec2<f32>, half_sz: vec2<f32>, line_w: f32, shape: u32) -> vec2<f32> {

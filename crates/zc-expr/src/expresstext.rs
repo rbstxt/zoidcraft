@@ -3155,7 +3155,7 @@ pub fn shatter_glyph_triangles(
         let mut pose = voronoi_chunk_pose(cell.center, center, explode, spin, signs);
 
         if scatter != 0.0 {
-            for ax in 0..3 {
+            for (ax, off) in pose.offset.iter_mut().enumerate() {
                 let jitter = hash_lattice(
                     ci as i32,
                     (params.letter_index as i32).wrapping_mul(73) + 19,
@@ -3163,7 +3163,7 @@ pub fn shatter_glyph_triangles(
                     seed_int,
                 ) * 2.0
                     - 1.0;
-                pose.offset[ax] += jitter * scatter;
+                *off += jitter * scatter;
             }
         }
         if gravity != 0.0 {
