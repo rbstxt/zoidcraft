@@ -1,16 +1,14 @@
-//! L1 Zoidium-compatible toggleable native plugin registry and lifecycle contracts.
+#![forbid(unsafe_code)]
 
-/// Returns the crate identifier for workspace smoke verification.
-pub const fn crate_name() -> &'static str {
-    "zc-plugin"
-}
+//! Clean-room native plugin registry, live toggling, project dependency locks,
+//! and lossless unknown-plugin payload preservation for ZoidCraft.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod catalog;
+pub mod descriptor;
+pub mod persistence;
+pub mod registry;
 
-    #[test]
-    fn smoke_crate_name() {
-        assert_eq!(crate_name(), "zc-plugin");
-    }
-}
+pub use catalog::{EXPERIMENTAL_WARNING, builtin_plugins};
+pub use descriptor::{PluginCategory, PluginDescriptor, PluginKind};
+pub use persistence::{PluginSettingsState, PreservedPluginData};
+pub use registry::{PluginError, PluginRegistry};

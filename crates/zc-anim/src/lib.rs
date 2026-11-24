@@ -1,16 +1,15 @@
-//! L1 keyframes, easing curves, cubic bezier interpolation, and dynamic properties.
+#![forbid(unsafe_code)]
 
-/// Returns the crate identifier for workspace smoke verification.
-pub const fn crate_name() -> &'static str {
-    "zc-anim"
-}
+//! Core animation, easing, keyframe interpolation, and dynamic property tracks for ZoidCraft.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod easing;
+pub mod property;
+pub mod track;
 
-    #[test]
-    fn smoke_crate_name() {
-        assert_eq!(crate_name(), "zc-anim");
-    }
-}
+pub use easing::{
+    BezierSegment, EASING_PLUS_PRESETS, EasingKind, EasingPlusPreset, InterpolationMode,
+    catmull_rom, correct_curve, curve_from_segment, eval_cubic_bezier, eval_easing,
+    eval_segment_bezier, handles_from_curve,
+};
+pub use property::{Animatable, DynamicProperty, FRAME_EPSILON, Keyframe, StaticBehavior};
+pub use track::{AnimValue, DynamicTrack, TrackTypeMismatch};
