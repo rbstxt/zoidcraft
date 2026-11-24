@@ -8,6 +8,7 @@ pub mod gestures;
 pub mod graph_editor;
 pub mod layout;
 pub mod panels;
+pub mod pro_editors;
 pub mod shortcuts;
 pub mod theme;
 pub mod timeline;

@@ -3,6 +3,7 @@
 //! `zc_session::Session`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use egui::{
     Align2, Area, Color32, CornerRadius, CursorIcon, Frame, Id, Key, Mesh, Order, Painter, Pos2,
@@ -13,11 +14,22 @@ use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier
 use zc_color::{BlendMode, Hsv, Rgb, Rgba};
 use zc_plugin::PluginCategory;
 use zc_project::{
-    AssetKind, EffectCategory, GradientStop, Marker, PropertyValue, create_effect_by_id,
+    AssetKind, EffectCategory, GradientStop, LayerKind, LayerMask, Marker, MaskMode,
+    PresetShapeKind, PropertyTrack, PropertyValue, SequenceControlKind, Uuid, create_effect_by_id,
     standard_effect_catalog, zoidium_effect_catalog,
 };
+use zc_render::shape_plus::{
+    ALL_SHAPE_PLUS_KINDS, add_shape_plus_item, default_shape_plus_payload,
+    duplicate_shape_plus_item, import_svg_to_shape_plus, parse_shape_plus_document,
+    remove_shape_plus_item, reorder_shape_plus_item, shape_plus_kind_title,
+};
+use zc_scene::all_particle_sprite_names;
 use zc_session::{Command, Session, SessionClip, SessionObject3D, SessionProperty};
-use zc_shader::translate_glsl_es100;
+use zc_shader::{CompileOptions, fix_property_name, translate_glsl_es100_with_options};
+
+use super::pro_editors::{
+    LooksEditorState, NodeGraphEditorState, NodeGraphTargetKind, show_pro_editor_windows,
+};
 
 use super::controls::{
     ButtonVariant, FloatingWindowManager, FloatingWindowSpec, FuzzyItem, FuzzyPickerEvent,
@@ -34,7 +46,7 @@ use super::theme::{
     BORDER_CONTROL, BORDER_FILTER, BORDER_PANEL, BORDER_ROW_SOFT, Cm3Icon, Cm3Theme, DANGER_TEXT,
     EditorFontChoice, FONT_BADGE, FONT_BANNER, FONT_BODY, FONT_COMPACT, FONT_EASING, FONT_SMALL,
     FONT_TITLE, TEXT_BRIGHT, TEXT_DISABLED, TEXT_EMPTY, TEXT_FAINT, TEXT_MUTED, TEXT_OPTION_DESC,
-    TEXT_PRIMARY, TEXT_STRONG, TOOLBAR_ICON_INACTIVE, ThemeProfileChoice, VOID_BLACK, WARNING_BAR,
+    TEXT_PRIMARY, TEXT_STRONG, TOOLBAR_ICON_INACTIVE, ThemeProfileChoice, WARNING_BAR,
     WARNING_SURFACE, color32_with_alpha, paint_badge, paint_cm3_icon, rgb_to_color32,
 };
 
@@ -301,6 +313,35 @@ impl Default for ExportSettings {
     }
 }
 
+/// Execution state for a queued export job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportJobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed(String),
+    Cancelled,
+}
+
+/// One queued export job shown in the Export tab's multi-job queue.
+#[derive(Debug, Clone)]
+pub struct ExportQueueJob {
+    pub id: u64,
+    pub label: String,
+    pub output_path: PathBuf,
+    pub settings: ExportSettings,
+    pub status: ExportJobStatus,
+}
+
+/// Metadata for a disk autosave recovery `.zcraft` snapshot shown in the Restore tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverySnapshotInfo {
+    pub filename: String,
+    pub timestamp_secs: u64,
+    pub size_bytes: u64,
+    pub path: PathBuf,
+}
+
 /// Live FFmpeg probe & active export job telemetry shown in the Export tab.
 #[derive(Debug, Clone)]
 pub struct ExportStatus {
@@ -310,6 +351,12 @@ pub struct ExportStatus {
     /// Progress fraction in `0.0..=1.0`.
     pub progress: f32,
     pub status_message: String,
+    /// Measured live rendering throughput in frames/second while exporting.
+    pub live_fps: Option<f64>,
+    /// Estimated remaining seconds while exporting.
+    pub eta_secs: Option<f64>,
+    /// Output file or folder from the most recently completed export.
+    pub last_completed_output: Option<PathBuf>,
 }
 
 impl Default for ExportStatus {
@@ -320,6 +367,9 @@ impl Default for ExportStatus {
             exporting: false,
             progress: 0.0,
             status_message: String::new(),
+            live_fps: None,
+            eta_secs: None,
+            last_completed_output: None,
         }
     }
 }
@@ -358,7 +408,13 @@ pub enum PanelAction {
     ImportMedia,
     NewProject,
     StartExport(ExportSettings),
+    AddToExportQueue(ExportSettings),
+    RunExportQueue,
     CancelExport,
+    OpenOutputFolder(PathBuf),
+    SaveRecoverySnapshotNow,
+    RestoreRecoverySnapshot(PathBuf),
+    DeleteRecoverySnapshot(PathBuf),
     EyedropperActivate {
         target_id: String,
         property: String,
@@ -432,7 +488,10 @@ pub struct PanelsState {
     pub collapsed_objects: BTreeSet<String>,
     pub export_settings: ExportSettings,
     pub export_status: ExportStatus,
+    pub export_queue: Vec<ExportQueueJob>,
+    pub export_queue_running: bool,
     pub export_view_mode: Option<ExportMode>,
+    pub recovery_snapshots: Vec<RecoverySnapshotInfo>,
     pub app_settings: AppSettings,
     pub plugin_notice: Option<String>,
     pub floating_windows: FloatingWindowManager,
@@ -440,6 +499,8 @@ pub struct PanelsState {
     pub new_shader_prop_name: String,
     pub new_shader_prop_kind: usize,
     pub pending_project_actions: Vec<ProjectAction>,
+    pub node_graph_editor: NodeGraphEditorState,
+    pub looks_editor: LooksEditorState,
     object_drag: Option<TreeDragState>,
     effect_drag: Option<TreeDragState>,
     rename_state: Option<InlineRenameState>,
@@ -453,6 +514,23 @@ pub struct PanelsState {
     settings_default_fps_buf: String,
     settings_edit_colors: bool,
     seq_control_counter: usize,
+    new_seq_control_kind: usize,
+    new_seq_control_min: String,
+    new_seq_control_max: String,
+    new_seq_control_step: String,
+    particles_tab: usize,
+    particles_sprite_filter: String,
+    shape_plus_selected: Option<String>,
+    shape_plus_collapsed: BTreeSet<String>,
+    shape_plus_add_kind: usize,
+    shape_plus_svg_paste: String,
+    shape_plus_svg_open: bool,
+    shape_plus_svg_error: Option<String>,
+    expanded_masks: BTreeSet<String>,
+    new_comp_name: String,
+    renaming_comp_id: Option<Uuid>,
+    renaming_comp_buf: String,
+    text2d_animator_tab: usize,
     objects_list_open: bool,
     effects_list_open: bool,
     #[allow(dead_code)]
@@ -481,7 +559,10 @@ impl Default for PanelsState {
             collapsed_objects: BTreeSet::new(),
             export_settings: ExportSettings::default(),
             export_status: ExportStatus::default(),
+            export_queue: Vec::new(),
+            export_queue_running: false,
             export_view_mode: None,
+            recovery_snapshots: Vec::new(),
             app_settings: AppSettings::default(),
             plugin_notice: None,
             floating_windows: FloatingWindowManager::default(),
@@ -489,6 +570,8 @@ impl Default for PanelsState {
             new_shader_prop_name: String::from("Amount"),
             new_shader_prop_kind: 0,
             pending_project_actions: Vec::new(),
+            node_graph_editor: NodeGraphEditorState::default(),
+            looks_editor: LooksEditorState::default(),
             object_drag: None,
             effect_drag: None,
             rename_state: None,
@@ -502,6 +585,23 @@ impl Default for PanelsState {
             settings_default_fps_buf: String::from("30"),
             settings_edit_colors: false,
             seq_control_counter: 1,
+            new_seq_control_kind: 0,
+            new_seq_control_min: String::from("0"),
+            new_seq_control_max: String::from("100"),
+            new_seq_control_step: String::from("0.1"),
+            particles_tab: 0,
+            particles_sprite_filter: String::new(),
+            shape_plus_selected: None,
+            shape_plus_collapsed: BTreeSet::new(),
+            shape_plus_add_kind: 1,
+            shape_plus_svg_paste: String::new(),
+            shape_plus_svg_open: false,
+            shape_plus_svg_error: None,
+            expanded_masks: BTreeSet::new(),
+            new_comp_name: String::from("Precomp"),
+            renaming_comp_id: None,
+            renaming_comp_buf: String::new(),
+            text2d_animator_tab: 0,
             objects_list_open: true,
             effects_list_open: true,
             objects_focus_bottom: false,
@@ -965,6 +1065,13 @@ fn show_media_tab(
                         },
                     );
                 });
+
+            // Precomp+ Compositions manager (Main + nested compositions)
+            if session.plugins.is_enabled("precomp-plus")
+                || !session.project.compositions.is_empty()
+            {
+                show_compositions_manager_section(ui, session, theme, state);
+            }
 
             // 100% edge-to-edge 30px #222222 "Project media" bar with borderless "+ Import" inside
             let (bar_rect, _) =
@@ -1722,64 +1829,18 @@ fn show_sequence_tab(
                         actions,
                     );
 
-                    // Controls nested section (Expressions+): clicking + adds a new slider control;
-                    // empty below when no controls exist (no permanent ctl_value input or placeholder)
+                    // Controls nested section (Expressions+): full SequenceControlKind builder
+                    // (Slider, Angle, Checkbox, Color, Point2D, Point3D) + legacy ctl_* compatibility.
                     if session.plugins.is_enabled("expressions-plus") {
-                        let (add_ctl, _) = cm3_collapsible_section_with_action(
+                        show_sequence_controls_section(
                             ui,
-                            Id::unique("seq_expr_controls"),
-                            "Controls",
-                            true,
-                            true,
-                            state.prop_columns.label_ratio,
-                            Some((Cm3Icon::Add, "Add control")),
+                            session,
+                            frame,
+                            viewport_rect,
+                            state,
                             theme,
-                            |ui| {
-                                let ctl_keys: Vec<String> = session
-                                    .document()
-                                    .sequence_properties
-                                    .keys()
-                                    .filter(|k| k.starts_with("ctl_"))
-                                    .cloned()
-                                    .collect();
-                                for key in ctl_keys {
-                                    let display_lbl = key.strip_prefix("ctl_").unwrap_or(&key);
-                                    let label = humanize_prop_label(display_lbl);
-                                    show_session_number_prop(
-                                        ui,
-                                        session,
-                                        "sequence",
-                                        &key,
-                                        &label,
-                                        0.0,
-                                        ScrubConfig::new(-10_000.0, 10_000.0, 0.1, 2),
-                                        frame,
-                                        0.0,
-                                        viewport_rect,
-                                        state,
-                                        theme,
-                                        actions,
-                                    );
-                                }
-                            },
+                            actions,
                         );
-                        if add_ctl {
-                            let existing = &session.document().sequence_properties;
-                            let mut idx = state.seq_control_counter.max(1);
-                            let prop_key = loop {
-                                let candidate = format!("ctl_slider_{idx}");
-                                if !existing.contains_key(&candidate) {
-                                    state.seq_control_counter = idx + 1;
-                                    break candidate;
-                                }
-                                idx += 1;
-                            };
-                            let _ = session.execute(Command::SetPropertyValue {
-                                target_id: "sequence".to_owned(),
-                                property: prop_key,
-                                value: json!(0.0),
-                            });
-                        }
                     }
                 },
             );
@@ -2006,44 +2067,25 @@ fn show_edit_tab(
                                 BG_PANEL,
                             );
 
-                            // Masks header + subtle borderless "+ Add mask" (#000000, 55px total block: 24 + 30 + 1px divider)
-                            let mask_w = ui.available_width();
-                            let (masks_hdr, _) =
-                                ui.allocate_exact_size(Vec2::new(mask_w, 24.0), Sense::hover());
-                            ui.painter().text(
-                                Pos2::new(masks_hdr.left() + 15.0, masks_hdr.top() + 10.5),
-                                Align2::LEFT_CENTER,
-                                "Masks",
-                                theme.font(FONT_BODY),
-                                TEXT_PRIMARY,
+                            // Shape+ Layer Masks (`zoidiumMasks`) full interactive section
+                            show_edit_layer_masks_section(
+                                ui,
+                                session,
+                                &clip_id,
+                                viewport_rect,
+                                state,
+                                theme,
                             );
-                            let (add_mask_rect, add_mask_resp) =
-                                ui.allocate_exact_size(Vec2::new(mask_w, 30.0), Sense::click());
-                            let add_mask_resp =
-                                add_mask_resp.on_hover_cursor(CursorIcon::PointingHand);
-                            let add_mask_color = if add_mask_resp.hovered() {
-                                TEXT_PRIMARY
-                            } else {
-                                VOID_BLACK
-                            };
-                            ui.painter().text(
-                                Pos2::new(add_mask_rect.left() + 25.0, add_mask_rect.top() + 10.0),
-                                Align2::LEFT_CENTER,
-                                "+ Add mask",
-                                theme.font(FONT_EASING),
-                                add_mask_color,
+
+                            // Precomp+ Target Composition selector (when editing a Precomp clip)
+                            show_edit_precomp_target_section(
+                                ui,
+                                session,
+                                &clip_id,
+                                viewport_rect,
+                                state,
+                                theme,
                             );
-                            let (mask_div, _) =
-                                ui.allocate_exact_size(Vec2::new(mask_w, 1.0), Sense::hover());
-                            ui.painter()
-                                .rect_filled(mask_div, CornerRadius::ZERO, BORDER_ROW_SOFT);
-                            if add_mask_resp.clicked() {
-                                let _ = session.execute(Command::AddEffect {
-                                    clip_id: clip_id.clone(),
-                                    kind: "mask".to_owned(),
-                                    name: Some("Mask".to_owned()),
-                                });
-                            }
 
                             // Scene3D / visual layer backdrop & resolution controls (no stopwatch)
                             if clip_snapshot.kind == "scene" {
@@ -2274,6 +2316,16 @@ fn show_edit_tab(
                                     );
                                 }
                                 "shape" | "preset_shape" => {
+                                    if clip_snapshot.kind == "preset_shape" {
+                                        show_preset_shape_kind_row(
+                                            ui,
+                                            session,
+                                            &clip_id,
+                                            viewport_rect,
+                                            state,
+                                            theme,
+                                        );
+                                    }
                                     show_session_color_prop(
                                         ui,
                                         session,
@@ -2527,19 +2579,30 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
             name: "Hemisphere Light".into(),
             desc: "Sky & ground ambient light.".into(),
         },
+        FuzzyItem {
+            id: "ambient_light".into(),
+            category: "More Objects".into(),
+            name: "Ambient Light".into(),
+            desc: "Uniform omnidirectional scene fill light.".into(),
+        },
     ];
 
     if session.plugins.is_enabled("geometry-plus") {
         for (id, name, desc) in [
             (
-                "zoidium:geometry-plus/rounded_box",
+                "zoidium:geometry-plus/rounded-box",
                 "Rounded Box",
                 "Beveled procedural box",
             ),
             (
-                "zoidium:geometry-plus/icosahedron",
-                "Icosahedron",
-                "Low-poly 20-face polyhedron",
+                "zoidium:geometry-plus/polyhedron",
+                "Polyhedron",
+                "Parametric platonic polyhedron",
+            ),
+            (
+                "zoidium:geometry-plus/tetrahedron",
+                "Tetrahedron",
+                "Low-poly 4-face polyhedron",
             ),
             (
                 "zoidium:geometry-plus/octahedron",
@@ -2552,17 +2615,38 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
                 "Low-poly 12-face polyhedron",
             ),
             (
-                "zoidium:geometry-plus/tetrahedron",
-                "Tetrahedron",
-                "Low-poly 4-face polyhedron",
+                "zoidium:geometry-plus/icosahedron",
+                "Icosahedron",
+                "Low-poly 20-face polyhedron",
+            ),
+            (
+                "zoidium:geometry-plus/cone",
+                "Cone",
+                "Procedural cone primitive",
             ),
             (
                 "zoidium:geometry-plus/capsule",
                 "Capsule",
                 "Procedural pill mesh",
             ),
+            ("zoidium:geometry-plus/tube", "Tube", "Swept 3D spline tube"),
             (
-                "zoidium:geometry-plus/torus_knot",
+                "zoidium:geometry-plus/gear",
+                "Gear",
+                "Procedural involute toothed gear",
+            ),
+            (
+                "zoidium:geometry-plus/helix",
+                "Helix",
+                "3D spiral coil mesh",
+            ),
+            (
+                "zoidium:geometry-plus/spline",
+                "Spline",
+                "Smooth 3D control-point curve",
+            ),
+            (
+                "zoidium:geometry-plus/torus-knot",
                 "Torus Knot",
                 "Procedural mathematical knot",
             ),
@@ -2581,7 +2665,7 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
             id: "zoidium:light-plus/light_rig".into(),
             category: "Light+".into(),
             name: "Light+ Rig".into(),
-            desc: "Extended Spot/Point/Directional/Hemi chooser".into(),
+            desc: "Extended Spot/Point/Directional/Hemi/Ambient chooser".into(),
         });
     }
 
@@ -2593,17 +2677,17 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
                 "Procedural child instancer",
             ),
             (
-                "zoidium:repeater/linear_repeater",
+                "zoidium:repeater/linear-repeater",
                 "Linear Repeater",
                 "Linear array instancer",
             ),
             (
-                "zoidium:repeater/random_repeater",
+                "zoidium:repeater/random-repeater",
                 "Random Repeater",
                 "Seeded random instancer",
             ),
             (
-                "zoidium:repeater/echo_repeater",
+                "zoidium:repeater/echo-repeater",
                 "Echo Repeater",
                 "Temporal ghost instancer",
             ),
@@ -2618,9 +2702,19 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
                 "Bend & shear mesh deformer",
             ),
             (
-                "zoidium:repeater/voronoi_fracture",
+                "zoidium:repeater/voronoi-fracture",
                 "Voronoi Fracture",
                 "3D cell fracture deformer",
+            ),
+            (
+                "zoidium:repeater/plain",
+                "Plain Effector",
+                "Falloff-driven transform effector",
+            ),
+            (
+                "zoidium:repeater/delay",
+                "Delay Effector",
+                "Spring & temporal smoothing effector",
             ),
         ] {
             items.push(FuzzyItem {
@@ -2632,9 +2726,128 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
         }
     }
 
+    if session.plugins.is_enabled("text-plus") {
+        for (id, name, desc) in [
+            (
+                "zoidium:text-plus/text-plus",
+                "Text+ Group",
+                "Per-character 3D text animator container",
+            ),
+            (
+                "zoidium:text-plus/gradient-transform",
+                "Gradient Transform",
+                "Linear gradient per-character offset",
+            ),
+            (
+                "zoidium:text-plus/character-shake",
+                "Character Shake",
+                "Procedural per-character shake",
+            ),
+            (
+                "zoidium:text-plus/selected-transform",
+                "Selected Transform",
+                "Index-range character transform",
+            ),
+            (
+                "zoidium:text-plus/selected-shake",
+                "Selected Shake",
+                "Index-range character shake",
+            ),
+            (
+                "zoidium:text-plus/random-scatter",
+                "Random Scatter",
+                "Seeded 3D character scatter",
+            ),
+            (
+                "zoidium:text-plus/character-material",
+                "Character Material",
+                "Per-character material override",
+            ),
+        ] {
+            items.push(FuzzyItem {
+                id: id.into(),
+                category: "Text+".into(),
+                name: name.into(),
+                desc: desc.into(),
+            });
+        }
+    }
+
+    if session.plugins.is_enabled("expresstext-plus") {
+        for (id, name, desc) in [
+            (
+                "zoidium:expresstext-plus/expresstext",
+                "ExpressText+ Container",
+                "Expression-driven kinetic 3D text container",
+            ),
+            (
+                "zoidium:expresstext-plus/shake",
+                "ExpressText Shake",
+                "Per-character expression shake",
+            ),
+            (
+                "zoidium:expresstext-plus/plain",
+                "ExpressText Plain",
+                "Per-character plain effector",
+            ),
+            (
+                "zoidium:expresstext-plus/random",
+                "ExpressText Random",
+                "Seeded random kinetic modifier",
+            ),
+            (
+                "zoidium:expresstext-plus/formula",
+                "ExpressText Formula",
+                "Math expression per-character modifier",
+            ),
+            (
+                "zoidium:expresstext-plus/delay",
+                "ExpressText Delay",
+                "Spring & lag character modifier",
+            ),
+            (
+                "zoidium:expresstext-plus/spline",
+                "ExpressText Spline",
+                "Align characters along a 3D spline",
+            ),
+            (
+                "zoidium:expresstext-plus/orbit",
+                "ExpressText Orbit",
+                "Circular orbital character layout",
+            ),
+            (
+                "zoidium:expresstext-plus/repeater",
+                "ExpressText Repeater",
+                "Repeat text glyph copies",
+            ),
+            (
+                "zoidium:expresstext-plus/twist",
+                "ExpressText Twist",
+                "Twist character orientations",
+            ),
+            (
+                "zoidium:expresstext-plus/wrap",
+                "ExpressText Wrap",
+                "Cylindrical/spherical text wrap",
+            ),
+            (
+                "zoidium:expresstext-plus/voronoi",
+                "ExpressText Voronoi",
+                "Shatter & explode character clusters",
+            ),
+        ] {
+            items.push(FuzzyItem {
+                id: id.into(),
+                category: "ExpressText+".into(),
+                name: name.into(),
+                desc: desc.into(),
+            });
+        }
+    }
+
     if session.plugins.is_enabled("camera-plus") {
         items.push(FuzzyItem {
-            id: "zoidium:camera-plus/camera_plus".into(),
+            id: "zoidium:camera-plus/camera".into(),
             category: "Camera+".into(),
             name: "Camera+".into(),
             desc: "Film gate, DOF, motion blur & vibrate".into(),
@@ -2668,12 +2881,12 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
                 "Procedural point & edge cloud",
             ),
             (
-                "zoidium:trapcode-suite/area_light",
+                "zoidium:trapcode-suite/area-light",
                 "Area Light (LTC)",
                 "Rectangular soft area light",
             ),
             (
-                "zoidium:trapcode-suite/ies_light",
+                "zoidium:trapcode-suite/ies-light",
                 "IES Photometric Light",
                 "LM-63 photometric light",
             ),
@@ -2708,7 +2921,19 @@ fn show_objects_tab(
         return;
     };
     if clip.kind != "scene" {
-        empty_panel_message(ui, "select a 3D scene clip", theme);
+        if show_non_scene_objects_tab(
+            ui,
+            panel_rect,
+            viewport_rect,
+            &clip,
+            session,
+            theme,
+            state,
+            actions,
+        ) {
+            return;
+        }
+        empty_panel_message(ui, "select a 3D scene, Shape+, or Text clip", theme);
         return;
     }
 
@@ -3132,17 +3357,16 @@ fn show_objects_tab(
 }
 
 fn is_container_object(kind: &str) -> bool {
-    matches!(
-        kind,
-        "group"
-            | "zoidium:repeater/repeater"
-            | "zoidium:repeater/linear_repeater"
-            | "zoidium:repeater/random_repeater"
-            | "zoidium:repeater/echo_repeater"
-            | "zoidium:repeater/twist"
-            | "zoidium:repeater/warp"
-            | "zoidium:repeater/voronoi_fracture"
-    )
+    let lower = kind.to_ascii_lowercase();
+    lower == "group"
+        || lower.starts_with("zoidium:repeater/")
+        || lower.starts_with("zoidcraft:repeater/")
+        || lower.starts_with("zoidium:text-plus/")
+        || lower.starts_with("zoidium:text_plus/")
+        || lower.starts_with("zoidcraft:text-plus/")
+        || lower.starts_with("zoidium:expresstext-plus/")
+        || lower.starts_with("zoidium:expresstext_plus/")
+        || lower.starts_with("zoidcraft:expresstext-plus/")
 }
 
 fn flatten_object_tree(
@@ -3561,29 +3785,11 @@ fn show_object_inspector(
                     actions,
                 );
                 if session.plugins.is_enabled("camera-plus") {
-                    show_session_number_prop(
+                    show_camera_plus_controls(
                         ui,
                         session,
                         &obj.id,
-                        "dofFocusDistance",
-                        "DOF focus",
-                        80.0,
-                        ScrubConfig::new(0.1, 5000.0, 1.0, 1),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        &obj.id,
-                        "dofAperture",
-                        "DOF aperture",
-                        2.8,
-                        ScrubConfig::new(0.5, 32.0, 0.1, 2),
+                        clip,
                         local_frame,
                         clip_start,
                         viewport_rect,
@@ -3596,7 +3802,7 @@ fn show_object_inspector(
             }
 
             if is_light {
-                // Light inspector: flat, no Rotation/Scale; conditional by light.kind
+                // Light inspector: flat, no Rotation/Scale; conditional by light.kind (including Ambient)
                 show_session_option_prop(
                     ui,
                     session,
@@ -3616,6 +3822,7 @@ fn show_object_inspector(
                     "point_light" => 1,
                     "directional_light" => 2,
                     "hemisphere_light" => 3,
+                    "ambient_light" => 4,
                     _ => 0,
                 };
                 show_session_option_prop_ex(
@@ -3624,7 +3831,7 @@ fn show_object_inspector(
                     &obj.id,
                     "light.kind",
                     "Light type",
-                    &["Spot", "Point", "Directional", "Hemisphere"],
+                    &["Spot", "Point", "Directional", "Hemisphere", "Ambient"],
                     default_lkind,
                     false,
                     local_frame,
@@ -3639,7 +3846,7 @@ fn show_object_inspector(
                     local_frame,
                     default_lkind,
                 );
-                if lkind != 3 {
+                if lkind != 3 && lkind != 4 {
                     show_session_vec3_prop(
                         ui,
                         session,
@@ -3784,7 +3991,53 @@ fn show_object_inspector(
                         actions,
                     );
                 }
-                if lkind != 3 {
+                if obj.kind.contains("area-light") || obj.kind.contains("area_light") {
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "width",
+                        "Area width",
+                        20.0,
+                        ScrubConfig::new(0.1, 5000.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "height",
+                        "Area height",
+                        12.0,
+                        ScrubConfig::new(0.1, 5000.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                } else if obj.kind.contains("ies-light") || obj.kind.contains("ies_light") {
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "iesProfile",
+                        "IES profile",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                if lkind != 3 && lkind != 4 {
                     show_session_option_prop_ex(
                         ui,
                         session,
@@ -3801,6 +4054,61 @@ fn show_object_inspector(
                         theme,
                         actions,
                     );
+                    let casts = eval_prop_u32(
+                        lookup_session_prop(session, &obj.id, "castShadow").as_ref(),
+                        local_frame,
+                        0,
+                    ) != 0;
+                    if casts {
+                        let cur_sz = eval_prop_u32(
+                            lookup_session_prop(session, &obj.id, "shadowMapSize").as_ref(),
+                            local_frame,
+                            1024,
+                        );
+                        let map_sizes = [512u32, 1024, 2048, 4096];
+                        let mut sz_idx = map_sizes.iter().position(|&s| s == cur_sz).unwrap_or(1);
+                        let sz_changed = panel_property_row(
+                            ui,
+                            "Shadow map size",
+                            true,
+                            state,
+                            theme,
+                            |_| {},
+                            |ui| {
+                                cm3_dropdown(
+                                    ui,
+                                    Id::unique((&obj.id, "shadow_map_size")),
+                                    &mut sz_idx,
+                                    &["512", "1024", "2048", "4096"],
+                                    false,
+                                    viewport_rect,
+                                    theme,
+                                )
+                            },
+                        );
+                        if sz_changed {
+                            let _ = session.execute(Command::SetPropertyValue {
+                                target_id: obj.id.clone(),
+                                property: "shadowMapSize".to_owned(),
+                                value: json!(map_sizes[sz_idx]),
+                            });
+                        }
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            &obj.id,
+                            "shadowBias",
+                            "Shadow bias",
+                            -0.0005,
+                            ScrubConfig::new(-0.05, 0.05, 0.0001, 5),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    }
                 }
                 if session.plugins.is_enabled("constraints") {
                     show_constraint_target_rows(
@@ -4130,14 +4438,11 @@ fn show_object_inspector(
                 );
 
                 if session.plugins.is_enabled("text-plus") {
-                    show_session_number_prop(
+                    show_text3d_plus_controls(
                         ui,
                         session,
+                        &clip.id,
                         &obj.id,
-                        "bevelTension",
-                        "Bevel tension",
-                        0.5,
-                        ScrubConfig::new(0.0, 1.0, 0.05, 2),
                         local_frame,
                         clip_start,
                         viewport_rect,
@@ -4147,44 +4452,10 @@ fn show_object_inspector(
                     );
                 }
             } else if is_particles {
-                show_session_number_prop(
+                show_particles_3d_inspector(
                     ui,
                     session,
                     &obj.id,
-                    "particles.number",
-                    "Number",
-                    100.0,
-                    ScrubConfig::new(1.0, 100_000.0, 1.0, 0),
-                    local_frame,
-                    clip_start,
-                    viewport_rect,
-                    state,
-                    theme,
-                    actions,
-                );
-                show_session_number_prop(
-                    ui,
-                    session,
-                    &obj.id,
-                    "particles.rate",
-                    "Rate",
-                    25.0,
-                    ScrubConfig::new(0.0, 10_000.0, 0.5, 2),
-                    local_frame,
-                    clip_start,
-                    viewport_rect,
-                    state,
-                    theme,
-                    actions,
-                );
-                show_session_number_prop(
-                    ui,
-                    session,
-                    &obj.id,
-                    "particles.lifetime",
-                    "Lifetime",
-                    2.0,
-                    ScrubConfig::new(0.01, 600.0, 0.1, 2),
                     local_frame,
                     clip_start,
                     viewport_rect,
@@ -4193,259 +4464,18 @@ fn show_object_inspector(
                     actions,
                 );
             } else {
-                // Shape / Model / Group geometry properties
-                match obj.kind.as_str() {
-                    "box" | "zoidium:geometry-plus/rounded_box" => {
-                        show_session_vec3_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "box_size",
-                            "Size",
-                            [10.0, 10.0, 10.0],
-                            ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
-                            false,
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    }
-                    "cylinder" => {
-                        show_session_vec3_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "cylinder_size",
-                            "Size",
-                            [10.0, 10.0, 20.0],
-                            ScrubConfig::new(0.0, 10_000.0, 0.5, 2),
-                            false,
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                        show_session_number_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "cylinder_detail",
-                            "Detail",
-                            16.0,
-                            ScrubConfig::new(3.0, 128.0, 1.0, 0),
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                        show_session_option_prop_ex(
-                            ui,
-                            session,
-                            &obj.id,
-                            "cylinder_openEnded",
-                            "Open ended",
-                            &["off", "on"],
-                            1,
-                            false,
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    }
-                    "rectangle" => {
-                        show_session_vec2_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "rect_size",
-                            "Size",
-                            [10.0, 10.0],
-                            ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
-                            false,
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    }
-                    "circle" => {
-                        show_session_number_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "circle_size",
-                            "Radius",
-                            10.0,
-                            ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                        show_session_number_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "circle_detail",
-                            "Detail",
-                            16.0,
-                            ScrubConfig::new(3.0, 128.0, 1.0, 0),
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    }
-                    "sphere" => {
-                        show_session_number_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "sphere_size",
-                            "Radius",
-                            10.0,
-                            ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                        show_session_vec2_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "sphere_detail",
-                            "Detail",
-                            [10.0, 10.0],
-                            ScrubConfig::new(3.0, 128.0, 1.0, 0),
-                            false,
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    }
-                    "donut" => {
-                        show_session_vec2_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "donut_size",
-                            "Size",
-                            [10.0, 10.0],
-                            ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
-                            false,
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                        show_session_vec2_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "donut_detail",
-                            "Detail",
-                            [16.0, 16.0],
-                            ScrubConfig::new(3.0, 128.0, 1.0, 0),
-                            false,
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    }
-                    "wire" => {
-                        show_session_number_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "path_thickness",
-                            "Thickness",
-                            1.0,
-                            ScrubConfig::new(0.01, 500.0, 0.1, 2),
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                        show_session_number_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "path_detail",
-                            "Detail",
-                            16.0,
-                            ScrubConfig::new(2.0, 256.0, 1.0, 0),
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    }
-                    "model" => {
-                        show_session_asset_prop(
-                            ui,
-                            session,
-                            &obj.id,
-                            "customGeometry",
-                            "Model",
-                            false,
-                            local_frame,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    }
-                    "group" => {
-                        show_session_option_prop_ex(
-                            ui,
-                            session,
-                            &obj.id,
-                            "reflectionVisibility",
-                            "Reflection",
-                            &["normal", "reflection only", "both"],
-                            0,
-                            false,
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    }
-                    _ => {}
-                }
+                // Shape / Geometry+ / Repeater & Effector+ / Text+ / ExpressText+ / Flares / Particle Suite
+                show_extended_3d_object_props(
+                    ui,
+                    session,
+                    &obj,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
             }
 
             // Constraints for non-camera/non-light objects
@@ -4465,328 +4495,58 @@ fn show_object_inspector(
             }
 
             // Material section for all mesh/geometry objects (Text3D, Shapes, Models)
-            let is_mesh_object =
-                !is_light && !is_camera && !is_particles && !is_container_object(&obj.kind);
+            let is_mesh_object = !is_light
+                && !is_camera
+                && !is_particles
+                && !is_container_object(&obj.kind)
+                && !obj.kind.contains("optical-flares")
+                && !obj.kind.contains("trapcode-suite");
             if is_mesh_object {
                 state.inspector_root_indent = false;
-                cm3_collapsible_section_with_action(
+                show_material_slot_inspector(
                     ui,
-                    Id::unique(("obj_material", &obj.id)),
+                    session,
+                    &obj.id,
+                    &obj.name,
+                    "material",
                     "Material",
-                    true,
-                    true,
-                    state.prop_columns.label_ratio,
-                    None,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
                     theme,
-                    |ui| {
-                        let mat_options: Vec<&str> = if session.plugins.is_enabled("material-plus")
-                        {
-                            vec![
-                                "single color",
-                                "texture",
-                                "video",
-                                "custom PBR",
-                                "custom shader",
-                                "PBR+ (Material+)",
-                                "Matcap (Material+)",
-                                "Image+ (Material+)",
-                                "Node Material",
-                            ]
-                        } else {
-                            vec![
-                                "single color",
-                                "texture",
-                                "video",
-                                "custom PBR",
-                                "custom shader",
-                            ]
-                        };
-                        show_session_option_prop_ex(
-                            ui,
-                            session,
-                            &obj.id,
-                            "material.type",
-                            "Material",
-                            &mat_options,
-                            0,
-                            false,
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                        let mat_type = eval_prop_u32(
-                            lookup_session_prop(session, &obj.id, "material.type").as_ref(),
-                            local_frame,
-                            0,
-                        );
-                        match mat_type {
-                            0 => {
-                                // Single color: Color + Render side
-                                show_session_color_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.color",
-                                    "Color",
-                                    [1.0, 1.0, 1.0],
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                                show_session_option_prop_ex(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.side",
-                                    "Render side",
-                                    &["front", "back", "double"],
-                                    0,
-                                    false,
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                            }
-                            1 => {
-                                // Texture: Image + Render side
-                                show_session_asset_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.texture",
-                                    "Image",
-                                    false,
-                                    local_frame,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                                show_session_option_prop_ex(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.side",
-                                    "Render side",
-                                    &["front", "back", "double"],
-                                    0,
-                                    false,
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                            }
-                            2 => {
-                                // Video: Video + Color + Opacity
-                                show_session_asset_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.texture",
-                                    "Video",
-                                    false,
-                                    local_frame,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                                show_session_color_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.color",
-                                    "Color",
-                                    [1.0, 1.0, 1.0],
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                                show_session_number_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.opacity",
-                                    "Opacity",
-                                    1.0,
-                                    ScrubConfig::new(0.0, 1.0, 0.05, 2),
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                            }
-                            4 => {
-                                // Custom shader material: Edit shader button
-                                let cur_code = eval_prop_str(
-                                    lookup_session_prop(session, &obj.id, "material.fragShader")
-                                        .as_ref(),
-                                    local_frame,
-                                    DEFAULT_CUSTOM_SHADER_GLSL,
-                                );
-                                cm3_property_row_aligned(
-                                    ui,
-                                    "Fragment shader",
-                                    true,
-                                    state.prop_columns,
-                                    theme,
-                                    |_| {},
-                                    |ui| {
-                                        if cm3_prop_button(
-                                            ui,
-                                            "Edit shader",
-                                            ButtonVariant::Normal,
-                                            false,
-                                            theme,
-                                        )
-                                        .clicked()
-                                        {
-                                            state.shader_editor = Some(ShaderEditorTarget {
-                                                effect_id: obj.id.clone(),
-                                                property: "material.fragShader".to_owned(),
-                                                effect_name: obj.name.clone(),
-                                                code: cur_code.clone(),
-                                                font_px: 14.0,
-                                                error_message: None,
-                                            });
-                                            let spec = FloatingWindowSpec::new(
-                                                "shader_editor",
-                                                "Shader Editor",
-                                            )
-                                            .with_subtitle(obj.name.clone())
-                                            .with_default_size(Vec2::new(560.0, 440.0));
-                                            state
-                                                .floating_windows
-                                                .open_or_focus(&spec, viewport_rect);
-                                        }
-                                    },
-                                );
-                            }
-                            _ => {
-                                // Custom PBR & Material+ modes
-                                show_session_color_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.color",
-                                    "Color",
-                                    [1.0, 1.0, 1.0],
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                                show_session_color_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.emissive",
-                                    "Emissive",
-                                    [0.0, 0.0, 0.0],
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                                show_session_number_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.roughness",
-                                    "Roughness",
-                                    0.5,
-                                    ScrubConfig::new(0.0, 1.0, 0.05, 2),
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                                show_session_number_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.metalness",
-                                    "Metalness",
-                                    0.5,
-                                    ScrubConfig::new(0.0, 1.0, 0.05, 2),
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                                show_session_asset_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.texture",
-                                    "Texture",
-                                    false,
-                                    local_frame,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                                show_session_number_prop(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.opacity",
-                                    "Opacity",
-                                    1.0,
-                                    ScrubConfig::new(0.0, 1.0, 0.05, 2),
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                                show_session_option_prop_ex(
-                                    ui,
-                                    session,
-                                    &obj.id,
-                                    "material.side",
-                                    "Render side",
-                                    &["front", "back", "double"],
-                                    0,
-                                    false,
-                                    local_frame,
-                                    clip_start,
-                                    viewport_rect,
-                                    state,
-                                    theme,
-                                    actions,
-                                );
-                            }
-                        }
-                    },
+                    actions,
                 );
+                if is_text && session.plugins.is_enabled("text-plus") {
+                    show_material_slot_inspector(
+                        ui,
+                        session,
+                        &obj.id,
+                        &format!("{} (Front)", obj.name),
+                        "frontMaterial",
+                        "Front Material",
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_material_slot_inspector(
+                        ui,
+                        session,
+                        &obj.id,
+                        &format!("{} (Side)", obj.name),
+                        "sideMaterial",
+                        "Side Material",
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
             }
         });
 }
@@ -4879,14 +4639,46 @@ fn show_constraint_target_rows(
         }
     }
     if track_idx > 0 {
+        show_session_option_prop_ex(
+            ui,
+            session,
+            obj_id,
+            "constraint.trackTo.trackAxis",
+            "Track axis",
+            &["-Z", "+Z", "+Y", "-Y", "+X", "-X"],
+            0,
+            false,
+            local_frame,
+            clip_start,
+            viewport_rect,
+            state,
+            theme,
+            actions,
+        );
+        show_session_option_prop_ex(
+            ui,
+            session,
+            obj_id,
+            "constraint.trackTo.upAxis",
+            "Up axis",
+            &["+Y", "+Z", "+X", "-Y", "-Z", "-X"],
+            0,
+            false,
+            local_frame,
+            clip_start,
+            viewport_rect,
+            state,
+            theme,
+            actions,
+        );
         show_session_number_prop(
             ui,
             session,
             obj_id,
             "constraint.trackTo.influence",
-            "Track influence",
+            "Track weight %",
             1.0,
-            ScrubConfig::new(0.0, 1.0, 0.05, 2),
+            ScrubConfig::new(0.0, 100.0, 1.0, 1).with_scale_factor(0.01),
             local_frame,
             clip_start,
             viewport_rect,
@@ -4962,6 +4754,121 @@ fn show_constraint_target_rows(
         if started_tx && session.history.is_in_transaction() {
             let _ = session.commit_transaction(true);
         }
+    }
+    if follow_idx > 0 {
+        show_session_option_prop_ex(
+            ui,
+            session,
+            obj_id,
+            "constraint.follow.space",
+            "Follow space",
+            &["World", "Local"],
+            0,
+            false,
+            local_frame,
+            clip_start,
+            viewport_rect,
+            state,
+            theme,
+            actions,
+        );
+        show_session_option_prop_ex(
+            ui,
+            session,
+            obj_id,
+            "constraint.follow.followPosition",
+            "Follow pos",
+            &["off", "on"],
+            1,
+            false,
+            local_frame,
+            clip_start,
+            viewport_rect,
+            state,
+            theme,
+            actions,
+        );
+        show_session_option_prop_ex(
+            ui,
+            session,
+            obj_id,
+            "constraint.follow.followRotation",
+            "Follow rot",
+            &["off", "on"],
+            1,
+            false,
+            local_frame,
+            clip_start,
+            viewport_rect,
+            state,
+            theme,
+            actions,
+        );
+        show_session_option_prop_ex(
+            ui,
+            session,
+            obj_id,
+            "constraint.follow.followScale",
+            "Follow scale",
+            &["off", "on"],
+            0,
+            false,
+            local_frame,
+            clip_start,
+            viewport_rect,
+            state,
+            theme,
+            actions,
+        );
+        show_session_vec3_prop(
+            ui,
+            session,
+            obj_id,
+            "constraint.follow.positionOffset",
+            "Pos offset",
+            [0.0, 0.0, 0.0],
+            ScrubConfig::new(-100_000.0, 100_000.0, 1.0, 2),
+            false,
+            local_frame,
+            clip_start,
+            viewport_rect,
+            state,
+            theme,
+            actions,
+        );
+        show_session_vec3_prop(
+            ui,
+            session,
+            obj_id,
+            "constraint.follow.rotationOffset",
+            "Rot offset",
+            [0.0, 0.0, 0.0],
+            ScrubConfig::new(-36_000.0, 36_000.0, 1.0, 1)
+                .with_scale_factor(std::f64::consts::PI / 180.0),
+            false,
+            local_frame,
+            clip_start,
+            viewport_rect,
+            state,
+            theme,
+            actions,
+        );
+        show_session_vec3_prop(
+            ui,
+            session,
+            obj_id,
+            "constraint.follow.scaleOffset",
+            "Scale offset",
+            [1.0, 1.0, 1.0],
+            ScrubConfig::new(-1000.0, 1000.0, 0.05, 3),
+            true,
+            local_frame,
+            clip_start,
+            viewport_rect,
+            state,
+            theme,
+            actions,
+        );
     }
 }
 
@@ -5236,7 +5143,8 @@ fn build_effect_picker_items(session: &Session) -> Vec<FuzzyItem> {
         });
     }
 
-    // Zoidium plugin effects gated dynamically by enabled plugins
+    // Zoidium plugin effects gated dynamically by enabled plugins (covers all 36 catalog effects,
+    // including smart-motion-blur-lite and layerinput without duplicate aliases).
     for desc in zoidium_effect_catalog() {
         let allowed = desc
             .plugin_id
@@ -5254,26 +5162,6 @@ fn build_effect_picker_items(session: &Session) -> Vec<FuzzyItem> {
                 desc: format!("from {plugin_label}"),
             });
         }
-    }
-
-    // Lightweight motion blur plugin effect when enabled
-    if session.plugins.is_enabled("smart-motion-blur-lite") {
-        items.push(FuzzyItem {
-            id: "zoidium:smart-motion-blur-lite/zsmb".into(),
-            category: "Plugin: Blur & Sharpen".into(),
-            name: "Smart Motion Blur Lite".into(),
-            desc: "Single-neighbor optical-flow motion blur".into(),
-        });
-    }
-
-    // Layer Input experimental effect when enabled
-    if session.plugins.is_enabled("layer-input") {
-        items.push(FuzzyItem {
-            id: "zoidium:layer-input/layer_input".into(),
-            category: "Experimental".into(),
-            name: "Layer Input".into(),
-            desc: "Cross-track texture composite".into(),
-        });
     }
 
     items
@@ -5877,7 +5765,7 @@ fn show_effect_inspector(
                     |ui| {
                         let prop_kinds: &[&str] = if shader_plus {
                             &[
-                                "Number",
+                                "Slider",
                                 "Vector2",
                                 "Vector3",
                                 "Color (RGB)",
@@ -5885,9 +5773,18 @@ fn show_effect_inspector(
                                 "Toggle",
                                 "Angle (deg)",
                                 "Seed",
+                                "Dropdown",
+                                "StaticDropdown",
+                                "Gradient",
+                                "Curve",
+                                "Palette",
+                                "Text",
+                                "Path",
+                                "TimeSample",
+                                "LayerSource",
                             ]
                         } else {
-                            &["Number", "Vector2", "Vector3", "Color (RGB)"]
+                            &["Slider", "Vector2", "Vector3", "Color (RGB)"]
                         };
                         if state.new_shader_prop_kind >= prop_kinds.len() {
                             state.new_shader_prop_kind = 0;
@@ -5930,33 +5827,48 @@ fn show_effect_inspector(
                                         "add uniform property",
                                         theme,
                                     ) {
-                                        let name = state.new_shader_prop_name.trim();
-                                        if !name.is_empty() {
-                                            let prop_key = if name.starts_with("u_") {
-                                                name.to_owned()
-                                            } else {
-                                                format!("u_{name}")
-                                            };
-                                            let kind_idx = state.new_shader_prop_kind;
-                                            let default_val = match kind_idx {
-                                                1 => json!([0.0, 0.0]),
-                                                2 => json!([0.0, 0.0, 0.0]),
-                                                3 => json!([1.0, 1.0, 1.0]),
-                                                4 => json!([1.0, 1.0, 1.0, 1.0]),
-                                                5 => json!(true),
-                                                6 => json!(0.0),
-                                                7 => json!(1),
-                                                _ => json!(0.5),
-                                            };
-                                            state.shader_prop_kinds.insert(
-                                                (fx.id.clone(), prop_key.clone()),
-                                                kind_idx,
-                                            );
-                                            let _ = session.execute(Command::SetPropertyValue {
-                                                target_id: fx.id.clone(),
-                                                property: prop_key,
-                                                value: default_val,
-                                            });
+                                        let raw_name = state.new_shader_prop_name.trim();
+                                        if !raw_name.is_empty() {
+                                            let prop_key = fix_property_name(raw_name);
+                                            if !prop_key.is_empty()
+                                                && prop_key != "enabled"
+                                                && prop_key != "fragShader"
+                                            {
+                                                let kind_idx = state.new_shader_prop_kind;
+                                                let default_val = match kind_idx {
+                                                    1 => json!([0.0, 0.0]),
+                                                    2 => json!([0.0, 0.0, 0.0]),
+                                                    3 => json!([1.0, 1.0, 1.0]),
+                                                    4 => json!([1.0, 1.0, 1.0, 1.0]),
+                                                    5 => json!(true),
+                                                    6 => json!(0.0),
+                                                    7 => json!(1),
+                                                    8 | 9 => json!(0),
+                                                    10 => json!([
+                                                        {"pos": 0.0, "color": [0.0, 0.0, 0.0], "opacity": 1.0},
+                                                        {"pos": 1.0, "color": [1.0, 1.0, 1.0], "opacity": 1.0}
+                                                    ]),
+                                                    11 => json!({
+                                                        "master": [[0.0, 0.0], [1.0, 1.0]],
+                                                        "rgb": [[0.0, 0.0], [1.0, 1.0]]
+                                                    }),
+                                                    12 => json!([[1.0, 0.3, 0.3], [0.3, 0.9, 0.5], [0.2, 0.5, 1.0]]),
+                                                    13 => json!("Shader Text"),
+                                                    14 => json!([[0.0, 0.0], [1.0, 1.0]]),
+                                                    15 => json!(0.0),
+                                                    16 => json!(""),
+                                                    _ => json!(0.5),
+                                                };
+                                                state.shader_prop_kinds.insert(
+                                                    (fx.id.clone(), prop_key.clone()),
+                                                    kind_idx,
+                                                );
+                                                let _ = session.execute(Command::SetPropertyValue {
+                                                    target_id: fx.id.clone(),
+                                                    property: prop_key,
+                                                    value: default_val,
+                                                });
+                                            }
                                         }
                                     }
                                 });
@@ -5965,7 +5877,12 @@ fn show_effect_inspector(
                         let custom_keys: Vec<(String, Value)> = fx
                             .properties
                             .iter()
-                            .filter(|(k, _)| k.starts_with("u_"))
+                            .filter(|(k, _)| {
+                                !matches!(
+                                    k.as_str(),
+                                    "enabled" | "fragShader" | "vertShader" | "name"
+                                )
+                            })
                             .filter_map(|(k, p)| {
                                 let val = p
                                     .keyframes
@@ -6125,6 +6042,7 @@ fn template_option_labels(effect_kind: &str, key: &str) -> &'static [&'static st
         ("duplicate", "repeat") => &["tile", "reflect"],
         ("timeoffset", "units") => &["frames", "seconds"],
         ("timeremap", "frameBlending") => &["off", "mix", "optical flow"],
+        ("transform", "wrap") => &["tile", "reflect"],
         (_, "wrap") => &["clamp", "tile", "reflect"],
         (_, "mask") => &["result", "mask"],
         (_, "gradientType") => &["linear", "radial", "angular", "reflected", "diamond"],
@@ -6672,22 +6590,50 @@ fn render_template_param(
                 "magiclooks" => "Open Color Looks Editor",
                 _ => "Edit JSON",
             };
-            panel_property_row(
+            let clicked = panel_property_row(
                 ui,
                 lbl,
                 true,
                 state,
                 theme,
                 |_| {},
-                |ui| {
-                    if cm3_prop_button(ui, btn_label, ButtonVariant::Normal, false, theme).clicked()
-                    {
+                |ui| cm3_prop_button(ui, btn_label, ButtonVariant::Primary, false, theme).clicked(),
+            );
+            if clicked {
+                let cur_val = lookup_session_prop(session, target_id, key)
+                    .and_then(|p| eval_prop_value(Some(&p), local_frame));
+                match effect_kind {
+                    "nodeeffect" => {
+                        state.node_graph_editor.open_for_target(
+                            NodeGraphTargetKind::NodeEffect,
+                            target_id,
+                            key,
+                            "Node Effect",
+                            cur_val.as_ref(),
+                        );
+                        let spec =
+                            FloatingWindowSpec::new("pro_node_graph_editor", "Node Graph Editor")
+                                .with_default_size(Vec2::new(980.0, 620.0));
+                        state.floating_windows.open_or_focus(&spec, viewport_rect);
+                    }
+                    "magiclooks" => {
+                        state.looks_editor.open_for_effect(
+                            target_id,
+                            "Color Looks",
+                            cur_val.as_ref(),
+                        );
+                        let spec =
+                            FloatingWindowSpec::new("pro_color_looks_editor", "Color Looks Setup")
+                                .with_default_size(Vec2::new(920.0, 580.0));
+                        state.floating_windows.open_or_focus(&spec, viewport_rect);
+                    }
+                    _ => {
                         actions.push(PanelAction::StatusMessage(format!(
-                            "{btn_label}: configured via effect properties"
+                            "{btn_label}: inspect via effect properties"
                         )));
                     }
-                },
-            );
+                }
+            }
         }
     }
 }
@@ -7449,10 +7395,17 @@ fn show_export_tab(
                             ui.painter().text(
                                 bar_rect.center(),
                                 Align2::CENTER_CENTER,
-                                format!("{:.0}%", p * 100.0),
+                                format_export_progress_label(&state.export_status),
                                 theme.font(FONT_SMALL),
                                 TEXT_BRIGHT,
                             );
+                            if !state.export_status.status_message.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(&state.export_status.status_message)
+                                        .font(theme.font(FONT_SMALL))
+                                        .color(TEXT_MUTED),
+                                );
+                            }
                             if cm3_prop_button(
                                 ui,
                                 "Cancel export",
@@ -7464,6 +7417,31 @@ fn show_export_tab(
                             {
                                 actions.push(PanelAction::CancelExport);
                             }
+                        });
+                } else if let Some(completed_path) =
+                    state.export_status.last_completed_output.clone()
+                {
+                    Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            if cm3_prop_button(
+                                ui,
+                                "Open Output Folder",
+                                ButtonVariant::Normal,
+                                true,
+                                theme,
+                            )
+                            .clicked()
+                            {
+                                actions.push(PanelAction::OpenOutputFolder(completed_path));
+                            }
+                        });
+                }
+                if !state.export_queue.is_empty() {
+                    Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(8, 8))
+                        .show(ui, |ui| {
+                            show_export_queue_section(ui, theme, state, actions);
                         });
                 }
                 return;
@@ -7955,7 +7933,7 @@ fn show_export_tab(
                         ui.painter().text(
                             bar_rect.center(),
                             Align2::CENTER_CENTER,
-                            format!("{:.0}%", p * 100.0),
+                            format_export_progress_label(&state.export_status),
                             theme.font(FONT_SMALL),
                             TEXT_BRIGHT,
                         );
@@ -8009,6 +7987,22 @@ fn show_export_tab(
                                 actions
                                     .push(PanelAction::StartExport(state.export_settings.clone()));
                             }
+                            if is_device {
+                                ui.add_space(4.0);
+                                if cm3_prop_button(
+                                    ui,
+                                    "Add to Queue",
+                                    ButtonVariant::Normal,
+                                    true,
+                                    theme,
+                                )
+                                .clicked()
+                                {
+                                    actions.push(PanelAction::AddToExportQueue(
+                                        state.export_settings.clone(),
+                                    ));
+                                }
+                            }
                         } else {
                             let (btn_rect, resp) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), 28.0),
@@ -8032,9 +8026,209 @@ fn show_export_tab(
                             resp.on_hover_cursor(CursorIcon::NotAllowed)
                                 .on_hover_text("FFmpeg is not available; install FFmpeg or export PNG Sequence, WAV Audio, or Single Frame.");
                         }
+
+                        if let Some(completed_path) =
+                            state.export_status.last_completed_output.clone()
+                        {
+                            ui.add_space(4.0);
+                            if cm3_prop_button(
+                                ui,
+                                "Open Output Folder",
+                                ButtonVariant::Normal,
+                                true,
+                                theme,
+                            )
+                            .clicked()
+                            {
+                                actions.push(PanelAction::OpenOutputFolder(completed_path));
+                            }
+                        }
+                    }
+
+                    if !state.export_queue.is_empty() {
+                        ui.add_space(10.0);
+                        show_export_queue_section(ui, theme, state, actions);
                     }
                 });
         });
+}
+
+fn format_export_progress_label(status: &ExportStatus) -> String {
+    let pct = status.progress.clamp(0.0, 1.0) * 100.0;
+    match (status.live_fps, status.eta_secs) {
+        (Some(fps), Some(eta)) if fps.is_finite() && eta.is_finite() => {
+            format!("{pct:.0}% · {fps:.1} fps · ETA {}", format_eta_clock(eta))
+        }
+        (Some(fps), None) if fps.is_finite() => format!("{pct:.0}% · {fps:.1} fps"),
+        _ => format!("{pct:.0}%"),
+    }
+}
+
+fn format_eta_clock(secs: f64) -> String {
+    let total = secs.max(0.0).round() as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+fn show_export_queue_section(
+    ui: &mut Ui,
+    theme: &Cm3Theme,
+    state: &mut PanelsState,
+    actions: &mut Vec<PanelAction>,
+) {
+    let queued_count = state
+        .export_queue
+        .iter()
+        .filter(|j| j.status == ExportJobStatus::Queued)
+        .count();
+    let finished_count = state
+        .export_queue
+        .iter()
+        .filter(|j| {
+            matches!(
+                j.status,
+                ExportJobStatus::Completed
+                    | ExportJobStatus::Failed(_)
+                    | ExportJobStatus::Cancelled
+            )
+        })
+        .count();
+
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("Export Queue ({})", state.export_queue.len()))
+                .font(theme.font(FONT_BODY))
+                .color(TEXT_STRONG),
+        );
+    });
+    ui.add_space(4.0);
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if queued_count > 0
+            && !state.export_status.exporting
+            && cm3_prop_button(ui, "Run Queue", ButtonVariant::Primary, false, theme).clicked()
+        {
+            actions.push(PanelAction::RunExportQueue);
+        }
+        if finished_count > 0
+            && cm3_prop_button(ui, "Clear Finished", ButtonVariant::Normal, false, theme).clicked()
+        {
+            state
+                .export_queue
+                .retain(|j| matches!(j.status, ExportJobStatus::Queued | ExportJobStatus::Running));
+        }
+    });
+    ui.add_space(6.0);
+
+    let mut swap_pair: Option<(usize, usize)> = None;
+    let mut remove_idx: Option<usize> = None;
+    let total_jobs = state.export_queue.len();
+
+    for (idx, job) in state.export_queue.iter().enumerate() {
+        let is_running = job.status == ExportJobStatus::Running;
+        let (status_label, status_color) = match &job.status {
+            ExportJobStatus::Queued => ("Queued", TEXT_MUTED),
+            ExportJobStatus::Running => ("Running", theme.value()),
+            ExportJobStatus::Completed => ("Done", Color32::from_rgb(76, 198, 122)),
+            ExportJobStatus::Failed(_) => ("Failed", DANGER_TEXT),
+            ExportJobStatus::Cancelled => ("Cancelled", TEXT_MUTED),
+        };
+        let filename = job
+            .output_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("output");
+
+        Frame::NONE
+            .fill(BG_TITLE)
+            .stroke(Stroke::new(
+                1.0,
+                if is_running {
+                    theme.accent()
+                } else {
+                    BORDER_ROW_SOFT
+                },
+            ))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&job.label)
+                            .font(theme.font(FONT_SMALL))
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(status_label)
+                                .font(theme.font(FONT_COMPACT))
+                                .color(status_color),
+                        );
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(filename)
+                        .font(theme.font(FONT_COMPACT))
+                        .color(TEXT_MUTED),
+                );
+                if let ExportJobStatus::Failed(err) = &job.status {
+                    ui.label(
+                        egui::RichText::new(err)
+                            .font(theme.font(FONT_COMPACT))
+                            .color(DANGER_TEXT),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if !is_running {
+                        if idx > 0
+                            && state.export_queue[idx - 1].status != ExportJobStatus::Running
+                            && cm3_prop_button(ui, "↑", ButtonVariant::Normal, false, theme)
+                                .clicked()
+                        {
+                            swap_pair = Some((idx, idx - 1));
+                        }
+                        if idx + 1 < total_jobs
+                            && state.export_queue[idx + 1].status != ExportJobStatus::Running
+                            && cm3_prop_button(ui, "↓", ButtonVariant::Normal, false, theme)
+                                .clicked()
+                        {
+                            swap_pair = Some((idx, idx + 1));
+                        }
+                        if cm3_prop_button(ui, "Remove", ButtonVariant::Danger, false, theme)
+                            .clicked()
+                        {
+                            remove_idx = Some(idx);
+                        }
+                    }
+                    if job.status == ExportJobStatus::Completed
+                        && cm3_prop_button(ui, "Open Folder", ButtonVariant::Normal, false, theme)
+                            .clicked()
+                    {
+                        actions.push(PanelAction::OpenOutputFolder(job.output_path.clone()));
+                    }
+                });
+            });
+        ui.add_space(4.0);
+    }
+
+    if let Some((a, b)) = swap_pair {
+        state.export_queue.swap(a, b);
+    }
+    if let Some(idx) = remove_idx
+        && idx < state.export_queue.len()
+        && state.export_queue[idx].status != ExportJobStatus::Running
+    {
+        state.export_queue.remove(idx);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8142,8 +8336,122 @@ fn show_restore_tab(
                     {
                         actions.push(PanelAction::NewProject);
                     }
+
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Disk autosave snapshots")
+                            .font(theme.font(FONT_BODY))
+                            .color(TEXT_STRONG),
+                    );
+                    if cm3_prop_button(
+                        ui,
+                        "Save Recovery Snapshot Now",
+                        ButtonVariant::Primary,
+                        true,
+                        theme,
+                    )
+                    .clicked()
+                    {
+                        actions.push(PanelAction::SaveRecoverySnapshotNow);
+                    }
+
+                    if state.recovery_snapshots.is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "No disk recovery snapshots yet. Modified projects autosave every 60 seconds.",
+                                )
+                                .font(theme.font(FONT_SMALL))
+                                .color(TEXT_OPTION_DESC),
+                            )
+                            .wrap(),
+                        );
+                    } else {
+                        for snap in &state.recovery_snapshots {
+                            let ts_str = format_unix_timestamp_utc(snap.timestamp_secs);
+                            let size_str = format_snapshot_bytes(snap.size_bytes);
+                            Frame::NONE
+                                .fill(BG_TITLE)
+                                .stroke(Stroke::new(1.0, BORDER_ROW_SOFT))
+                                .inner_margin(egui::Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.spacing_mut().item_spacing.y = 4.0;
+                                    ui.label(
+                                        egui::RichText::new(&snap.filename)
+                                            .font(theme.font(FONT_SMALL))
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!("{ts_str} · {size_str}"))
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_MUTED),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        if cm3_prop_button(
+                                            ui,
+                                            "Restore",
+                                            ButtonVariant::Primary,
+                                            false,
+                                            theme,
+                                        )
+                                        .clicked()
+                                        {
+                                            actions.push(PanelAction::RestoreRecoverySnapshot(
+                                                snap.path.clone(),
+                                            ));
+                                        }
+                                        if cm3_prop_button(
+                                            ui,
+                                            "Delete",
+                                            ButtonVariant::Danger,
+                                            false,
+                                            theme,
+                                        )
+                                        .clicked()
+                                        {
+                                            actions.push(PanelAction::DeleteRecoverySnapshot(
+                                                snap.path.clone(),
+                                            ));
+                                        }
+                                    });
+                                });
+                        }
+                    }
                 });
         });
+}
+
+fn format_snapshot_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_unix_timestamp_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+    let second = rem % 60;
+
+    // Howard Hinnant's civil-from-days algorithm (UTC, proleptic Gregorian).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02} UTC")
 }
 
 // ---------------------------------------------------------------------------
@@ -8237,6 +8545,39 @@ fn show_assets_tab(
                 ),
                 bar_rect.right_bottom(),
             );
+            let purge_rect = Rect::from_min_max(
+                Pos2::new(
+                    (imp_rect.left() - 96.0).max(bar_rect.left() + 92.0),
+                    bar_rect.top(),
+                ),
+                Pos2::new(imp_rect.left() - 4.0, bar_rect.bottom()),
+            );
+            let purge_resp = ui
+                .interact(purge_rect, Id::unique("assets_purge_btn"), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Remove assets not referenced by any clip, object, or effect");
+            ui.painter().text(
+                Pos2::new(purge_rect.right() - 4.0, bar_rect.center().y),
+                Align2::RIGHT_CENTER,
+                "Purge Unused",
+                theme.font(FONT_COMPACT),
+                if purge_resp.hovered() {
+                    DANGER_TEXT
+                } else {
+                    TEXT_MUTED
+                },
+            );
+            if purge_resp.clicked()
+                && let Ok(res) = session.execute(Command::PurgeUnusedAssets)
+            {
+                let removed = res
+                    .get("removed_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                actions.push(PanelAction::StatusMessage(format!(
+                    "Purged {removed} unused asset(s)"
+                )));
+            }
             let imp_resp = ui
                 .interact(imp_rect, Id::unique("assets_import_btn"), Sense::click())
                 .on_hover_cursor(CursorIcon::PointingHand);
@@ -8255,18 +8596,21 @@ fn show_assets_tab(
                 actions.push(PanelAction::ImportMedia);
             }
 
-            let project_assets: Vec<(String, String, &'static str, u64, bool)> = session
+            let asset_usage = compute_asset_usage_counts(session);
+            let project_assets: Vec<(String, String, &'static str, u64, bool, usize)> = session
                 .project
                 .assets
                 .values()
                 .filter(|a| q.is_empty() || a.filename.to_ascii_lowercase().contains(&q))
                 .map(|a| {
+                    let count = asset_usage.get(&a.id).copied().unwrap_or(0);
                     (
                         a.id.clone(),
                         a.filename.clone(),
                         clip_kind_for_asset(a.kind, &a.filename),
                         a.size,
                         a.missing,
+                        count,
                     )
                 })
                 .collect();
@@ -8282,9 +8626,12 @@ fn show_assets_tab(
                         );
                     });
             } else {
-                for (aid, fname, clip_kind, size, missing) in project_assets {
-                    let (row_rect, resp) = ui
-                        .allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
+                for (aid, fname, clip_kind, size, missing, use_count) in project_assets {
+                    let row_h = if missing { 44.0 } else { 36.0 };
+                    let (row_rect, resp) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), row_h),
+                        Sense::click(),
+                    );
                     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
                     if resp.hovered() {
                         ui.painter()
@@ -8294,28 +8641,91 @@ fn show_assets_tab(
                         [row_rect.left_bottom(), row_rect.right_bottom()],
                         Stroke::new(1.0, BORDER_ROW_SOFT),
                     );
-                    let meta = if missing {
-                        "missing".to_owned()
-                    } else if size > 0 {
-                        format!("{clip_kind} · {} KiB", size.div_ceil(1024))
+                    let usage_badge = if use_count == 0 {
+                        "unused".to_owned()
                     } else {
-                        clip_kind.to_owned()
+                        format!("used {use_count}×")
+                    };
+                    let meta = if missing {
+                        format!("MISSING · {usage_badge}")
+                    } else if size > 0 {
+                        format!("{clip_kind} · {} KiB · {usage_badge}", size.div_ceil(1024))
+                    } else {
+                        format!("{clip_kind} · {usage_badge}")
                     };
                     ui.painter().text(
-                        Pos2::new(row_rect.left() + 10.0, row_rect.center().y),
+                        Pos2::new(row_rect.left() + 10.0, row_rect.top() + 13.0),
                         Align2::LEFT_CENTER,
                         &fname,
                         theme.font(FONT_SMALL),
                         if missing { DANGER_TEXT } else { TEXT_PRIMARY },
                     );
                     ui.painter().text(
-                        Pos2::new(row_rect.right() - 10.0, row_rect.center().y),
-                        Align2::RIGHT_CENTER,
+                        Pos2::new(row_rect.left() + 10.0, row_rect.top() + 27.0),
+                        Align2::LEFT_CENTER,
                         meta,
                         theme.font(FONT_COMPACT),
-                        TEXT_MUTED,
+                        if missing { DANGER_TEXT } else { TEXT_MUTED },
                     );
-                    if resp.clicked() {
+                    let mut relinked = false;
+                    if missing {
+                        let relink_rect = Rect::from_min_size(
+                            Pos2::new(row_rect.right() - 72.0, row_rect.center().y - 11.0),
+                            Vec2::new(64.0, 22.0),
+                        );
+                        let relink_resp = ui
+                            .interact(
+                                relink_rect,
+                                Id::unique(("asset_relink", &aid)),
+                                Sense::click(),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand);
+                        ui.painter().rect_filled(
+                            relink_rect,
+                            CornerRadius::same(2),
+                            if relink_resp.hovered() {
+                                theme.accent()
+                            } else {
+                                BG_BUTTON
+                            },
+                        );
+                        ui.painter().rect_stroke(
+                            relink_rect,
+                            CornerRadius::same(2),
+                            Stroke::new(1.0, BORDER_CONTROL),
+                            StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            relink_rect.center(),
+                            Align2::CENTER_CENTER,
+                            "Relink...",
+                            theme.font(FONT_COMPACT),
+                            TEXT_BRIGHT,
+                        );
+                        if relink_resp.clicked() {
+                            relinked = true;
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_title(format!("Relink missing asset: {fname}"))
+                                .pick_file()
+                                && let Ok(bytes) = std::fs::read(&path)
+                            {
+                                let new_name = path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(&fname)
+                                    .to_owned();
+                                let _ = session.execute(Command::RelinkAsset {
+                                    asset_id: aid.clone(),
+                                    filename: new_name.clone(),
+                                    bytes,
+                                });
+                                actions.push(PanelAction::StatusMessage(format!(
+                                    "Relinked asset `{new_name}`"
+                                )));
+                            }
+                        }
+                    }
+                    if !relinked && resp.clicked() {
                         add_clip_with_asset(session, clip_kind, &fname, Some(&aid));
                     }
                 }
@@ -10347,6 +10757,17 @@ fn show_inspector_floating_windows(
                         {
                             editor.font_px = (editor.font_px + 2.0).clamp(10.0, 24.0);
                         }
+                        egui::ComboBox::from_id_salt(Id::unique("shader_starter_templates"))
+                            .selected_text("Templates")
+                            .width(116.0)
+                            .show_ui(ui, |ui| {
+                                for (name, src) in SHADER_PLUS_STARTER_TEMPLATES {
+                                    if ui.selectable_label(false, *name).clicked() {
+                                        editor.code = (*src).to_owned();
+                                        editor.error_message = None;
+                                    }
+                                }
+                            });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if cm3_prop_button(
                                 ui,
@@ -10400,7 +10821,18 @@ fn show_inspector_floating_windows(
             );
 
             if apply_code {
-                match translate_glsl_es100(&editor.code) {
+                let mut compile_opts = CompileOptions::default();
+                for ((fx_id, prop_key), &kind_idx) in &state.shader_prop_kinds {
+                    if fx_id == &editor.effect_id && kind_idx == 9 {
+                        let v = eval_prop_u32(
+                            lookup_session_prop(session, &editor.effect_id, prop_key).as_ref(),
+                            session.playback.current_frame,
+                            0,
+                        );
+                        compile_opts.defines.insert(prop_key.clone(), v.to_string());
+                    }
+                }
+                match translate_glsl_es100_with_options(&editor.code, &compile_opts) {
                     Ok(_) => {
                         match session.execute(Command::SetPropertyValue {
                             target_id: editor.effect_id.clone(),
@@ -10432,11 +10864,17 @@ fn show_inspector_floating_windows(
         } else {
             let spec = FloatingWindowSpec::new("expression_editor", "Expression Editor")
                 .with_subtitle(expr.property.clone())
-                .with_default_size(Vec2::new(420.0, 240.0));
+                .with_default_size(Vec2::new(480.0, 310.0));
             let is_focused =
                 state.floating_windows.focused_id.as_deref() == Some("expression_editor");
             let mut commit_expr = false;
             let mut clear_expr = false;
+            let live_diag = evaluate_expression_live_preview(
+                session,
+                &expr.target_id,
+                &expr.property,
+                &expr.code,
+            );
             let ev = cm3_floating_window(
                 ctx,
                 &mut state.floating_windows,
@@ -10444,13 +10882,51 @@ fn show_inspector_floating_windows(
                 viewport_rect,
                 theme,
                 |ui| {
+                    // Quick snippet insertion bar
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(
+                            egui::RichText::new("Snippets:")
+                                .font(theme.font(FONT_COMPACT))
+                                .color(TEXT_MUTED),
+                        );
+                        for (lbl, snippet) in [
+                            ("sin/time", "Math.sin(time * 2.0) * 0.5 + 0.5"),
+                            ("wiggle", "wiggle(2, 15)"),
+                            ("loopOut", "loopOut(\"cycle\")"),
+                            ("smoothstep", "smooth(0, 2, time)"),
+                            ("control(...)", "control(\"Slider 1\")"),
+                            ("audioLevel", "audioLevel(0, 1) * 100"),
+                        ] {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(lbl)
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_PRIMARY),
+                                    )
+                                    .fill(BG_BUTTON)
+                                    .stroke(Stroke::new(1.0, BORDER_CONTROL)),
+                                )
+                                .clicked()
+                            {
+                                if expr.code.trim().is_empty() {
+                                    expr.code = snippet.to_owned();
+                                } else {
+                                    expr.code.push_str(snippet);
+                                }
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+
                     if let Some(err) = &expr.error_message {
                         warning_banner(ui, err, theme);
                         ui.add_space(4.0);
                     }
                     ui.add(
                         TextEdit::multiline(&mut expr.code)
-                            .font(theme.font(FONT_SMALL))
+                            .font(egui::FontId::monospace(12.5))
                             .text_color(theme.value())
                             .desired_width(ui.available_width())
                             .desired_rows(6)
@@ -10462,6 +10938,27 @@ fn show_inspector_floating_windows(
                         })
                     {
                         commit_expr = true;
+                    }
+                    ui.add_space(4.0);
+                    // Live zc_expr syntax & runtime diagnostic readout
+                    match &live_diag {
+                        Ok(val_str) => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Live @ frame {:.1}: {val_str}",
+                                    session.playback.current_frame
+                                ))
+                                .font(theme.font(FONT_SMALL))
+                                .color(Color32::from_rgb(76, 198, 122)),
+                            );
+                        }
+                        Err(diag) => {
+                            ui.label(
+                                egui::RichText::new(format!("Diagnostic: {diag}"))
+                                    .font(theme.font(FONT_SMALL))
+                                    .color(DANGER_TEXT),
+                            );
+                        }
                     }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -10515,6 +11012,17 @@ fn show_inspector_floating_windows(
             }
         }
     }
+
+    // 3. Pro Interactive Editor Windows (Node Graph Editor & Color Looks Setup)
+    show_pro_editor_windows(
+        ctx,
+        viewport_rect,
+        &mut state.floating_windows,
+        &mut state.node_graph_editor,
+        &mut state.looks_editor,
+        session,
+        theme,
+    );
 }
 
 fn target_exists_in_session(session: &Session, target_id: &str) -> bool {
@@ -12309,14 +12817,27 @@ fn show_session_curve_prop(
     }
 
     let (ch_key, _, ch_color) = CHANNELS[ui_st.channel_idx];
-    let mut pts: Vec<[f64; 2]> = curve_val
-        .get(ch_key)
-        .and_then(Value::as_array)
+    let ch_aliases: &[&str] = match ch_key {
+        "rgb" => &["master", "rgb", "luma"],
+        "r" => &["r", "red"],
+        "g" => &["g", "green"],
+        "b" => &["b", "blue"],
+        "a" => &["a", "alpha"],
+        _ => &[ch_key],
+    };
+    let mut pts: Vec<[f64; 2]> = ch_aliases
+        .iter()
+        .find_map(|k| curve_val.get(*k).and_then(Value::as_array))
         .map(|arr| {
             arr.iter()
                 .filter_map(|p| {
-                    let a = p.as_array()?;
-                    Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?])
+                    if let Some(a) = p.as_array() {
+                        Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?])
+                    } else if let Some(obj) = p.as_object() {
+                        Some([obj.get("x")?.as_f64()?, obj.get("y")?.as_f64()?])
+                    } else {
+                        None
+                    }
                 })
                 .collect()
         })
@@ -12547,6 +13068,9 @@ fn show_session_curve_prop(
     if changed {
         if let Some(obj) = curve_val.as_object_mut() {
             obj.insert(ch_key.to_owned(), json!(pts));
+            if ch_key == "rgb" {
+                obj.insert("master".to_owned(), json!(pts));
+            }
         }
         let exec_curve = |session: &mut Session| {
             let _ = session.execute(Command::SetPropertyValue {
@@ -13093,6 +13617,6466 @@ fn _keep_rgb_import_used(c: Rgb) -> Color32 {
     rgb_to_color32(c)
 }
 
+// ===========================================================================
+// Wave 4B Professional Inspector & Builder Modules
+// ===========================================================================
+
+const SHADER_PLUS_STARTER_TEMPLATES: &[(&str, &str)] = &[
+    (
+        "Chromatic Pulse",
+        r#"precision highp float;
+uniform sampler2D tDiffuse;
+uniform vec2 resolution;
+uniform float time;
+varying vec2 vUv;
+varying vec2 vUvScaled;
+
+void main() {
+    float shift = 0.004 * sin(time * 3.0);
+    float r = texture2D(tDiffuse, vUvScaled + vec2(shift, 0.0)).r;
+    float g = texture2D(tDiffuse, vUvScaled).g;
+    float b = texture2D(tDiffuse, vUvScaled - vec2(shift, 0.0)).b;
+    float a = texture2D(tDiffuse, vUvScaled).a;
+    gl_FragColor = vec4(r, g, b, a);
+}
+"#,
+    ),
+    (
+        "Procedural Plasma",
+        r#"precision highp float;
+uniform sampler2D tDiffuse;
+uniform vec2 resolution;
+uniform float time;
+varying vec2 vUv;
+varying vec2 vUvScaled;
+
+void main() {
+    vec4 src = texture2D(tDiffuse, vUvScaled);
+    vec2 p = vUv * 6.0;
+    float v = sin(p.x + time) + sin(p.y - time * 1.2) + sin((p.x + p.y) * 0.7 + time);
+    vec3 col = 0.5 + 0.5 * cos(v + vec3(0.0, 2.0, 4.0));
+    gl_FragColor = vec4(mix(src.rgb, col, 0.45), src.a);
+}
+"#,
+    ),
+    (
+        "CRT Scanlines",
+        r#"precision highp float;
+uniform sampler2D tDiffuse;
+uniform vec2 resolution;
+varying vec2 vUv;
+varying vec2 vUvScaled;
+
+void main() {
+    vec4 src = texture2D(tDiffuse, vUvScaled);
+    float line = 0.85 + 0.15 * sin(vUv.y * resolution.y * 1.5);
+    gl_FragColor = vec4(src.rgb * line, src.a);
+}
+"#,
+    ),
+    (
+        "Radial Vignette",
+        r#"precision highp float;
+uniform sampler2D tDiffuse;
+uniform vec2 resolution;
+varying vec2 vUv;
+varying vec2 vUvScaled;
+
+void main() {
+    vec4 src = texture2D(tDiffuse, vUvScaled);
+    float d = length(vUv - vec2(0.5, 0.5)) * 1.414;
+    float vig = smoothstep(1.0, 0.35, d);
+    gl_FragColor = vec4(src.rgb * vig, src.a);
+}
+"#,
+    ),
+];
+
+fn find_project_video_clip<'a>(
+    session: &'a Session,
+    clip_id: &str,
+) -> Option<&'a zc_project::VideoClip> {
+    let cid = Uuid::parse_str(clip_id).ok()?;
+    for vt in &session.active_sequence().video_tracks {
+        if let Some(vc) = vt.clips.iter().find(|c| c.id == cid) {
+            return Some(vc);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// 1. Precomp+ Compositions Manager (Media Tab)
+// ---------------------------------------------------------------------------
+
+fn show_compositions_manager_section(
+    ui: &mut Ui,
+    session: &mut Session,
+    theme: &Cm3Theme,
+    state: &mut PanelsState,
+) {
+    let active_comp = session.document().active_composition_id;
+    let mut comps: Vec<(Uuid, String, [u32; 2], u32)> = session
+        .project
+        .compositions
+        .iter()
+        .map(|(id, seq)| (*id, seq.name.clone(), seq.resolution, seq.fps))
+        .collect();
+    comps.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let (add_comp, _) = cm3_collapsible_section_with_action(
+        ui,
+        Id::unique("media_compositions_section"),
+        "Compositions",
+        true,
+        false,
+        state.prop_columns.label_ratio,
+        Some((Cm3Icon::Add, "New composition")),
+        theme,
+        |ui| {
+            Frame::NONE
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    // Breadcrumb / Back to Main + Pre-compose Selected actions
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if active_comp.is_some()
+                            && cm3_prop_button(
+                                ui,
+                                "← Back to Main",
+                                ButtonVariant::Primary,
+                                false,
+                                theme,
+                            )
+                            .clicked()
+                        {
+                            let _ =
+                                session.execute(Command::SetActiveComposition { comp_id: None });
+                        }
+                        let selected_clip_uuids: Vec<Uuid> = session
+                            .selection
+                            .clip_ids
+                            .iter()
+                            .filter_map(|s| Uuid::parse_str(s).ok())
+                            .collect();
+                        if cm3_prop_button(
+                            ui,
+                            "Pre-compose Selected",
+                            ButtonVariant::Normal,
+                            selected_clip_uuids.is_empty(),
+                            theme,
+                        )
+                        .clicked()
+                        {
+                            let name =
+                                format!("Precomp {}", session.project.compositions.len() + 1);
+                            let _ = session.execute(Command::PrecomposeClips {
+                                clip_ids: selected_clip_uuids,
+                                name,
+                            });
+                        }
+                    });
+
+                    // Main composition row
+                    let main_active = active_comp.is_none();
+                    ui.horizontal(|ui| {
+                        let lbl = format!(
+                            "Main ({}×{} @ {}fps)",
+                            session.project.sequence.resolution[0],
+                            session.project.sequence.resolution[1],
+                            session.project.sequence.fps
+                        );
+                        if ui
+                            .selectable_label(
+                                main_active,
+                                egui::RichText::new(lbl).font(theme.font(FONT_SMALL)).color(
+                                    if main_active {
+                                        TEXT_BRIGHT
+                                    } else {
+                                        TEXT_PRIMARY
+                                    },
+                                ),
+                            )
+                            .clicked()
+                            && !main_active
+                        {
+                            let _ =
+                                session.execute(Command::SetActiveComposition { comp_id: None });
+                        }
+                    });
+
+                    // Nested compositions
+                    for (cid, cname, cres, cfps) in &comps {
+                        let is_active = active_comp == Some(*cid);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            if state.renaming_comp_id == Some(*cid) {
+                                let resp = ui.add(
+                                    TextEdit::singleline(&mut state.renaming_comp_buf)
+                                        .desired_width(110.0)
+                                        .font(theme.font(FONT_SMALL)),
+                                );
+                                if ui.small_button("OK").clicked()
+                                    || (resp.lost_focus()
+                                        && ui.input(|i| i.key_pressed(Key::Enter)))
+                                {
+                                    let trimmed = state.renaming_comp_buf.trim().to_owned();
+                                    if !trimmed.is_empty() {
+                                        let _ = session.execute(Command::RenameComposition {
+                                            comp_id: *cid,
+                                            name: trimmed,
+                                        });
+                                    }
+                                    state.renaming_comp_id = None;
+                                }
+                            } else {
+                                let lbl = format!("{cname} ({}×{} @ {cfps})", cres[0], cres[1]);
+                                if ui
+                                    .selectable_label(
+                                        is_active,
+                                        egui::RichText::new(lbl)
+                                            .font(theme.font(FONT_SMALL))
+                                            .color(if is_active {
+                                                TEXT_BRIGHT
+                                            } else {
+                                                TEXT_PRIMARY
+                                            }),
+                                    )
+                                    .clicked()
+                                {
+                                    let _ = session.execute(Command::SetActiveComposition {
+                                        comp_id: Some(*cid),
+                                    });
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("Delete comp")
+                                            .clicked()
+                                        {
+                                            let _ = session.execute(Command::DeleteComposition {
+                                                comp_id: *cid,
+                                            });
+                                        }
+                                        if ui
+                                            .small_button("D")
+                                            .on_hover_text("Duplicate comp")
+                                            .clicked()
+                                        {
+                                            let _ =
+                                                session.execute(Command::DuplicateComposition {
+                                                    comp_id: *cid,
+                                                });
+                                        }
+                                        if ui
+                                            .small_button("✎")
+                                            .on_hover_text("Rename comp")
+                                            .clicked()
+                                        {
+                                            state.renaming_comp_id = Some(*cid);
+                                            state.renaming_comp_buf = cname.clone();
+                                        }
+                                    },
+                                );
+                            }
+                        });
+                    }
+                });
+        },
+    );
+    if add_comp {
+        let idx = session.project.compositions.len() + 1;
+        let name = format!("{} {idx}", state.new_comp_name.trim());
+        let res = session.project.sequence.resolution;
+        let fps = session.project.sequence.fps;
+        let len = (session.project.sequence.length_frames.round() as u32).max(150);
+        let _ = session.execute(Command::CreateComposition {
+            name,
+            resolution: res,
+            fps,
+            length_frames: len,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Expressions+ Sequence Controls Builder (Sequence Tab)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn show_sequence_controls_section(
+    ui: &mut Ui,
+    session: &mut Session,
+    frame: f64,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+    actions: &mut Vec<PanelAction>,
+) {
+    const KIND_LABELS: &[&str] = &["Slider", "Angle", "Checkbox", "Color", "Point2D", "Point3D"];
+    const KINDS: [SequenceControlKind; 6] = [
+        SequenceControlKind::Slider,
+        SequenceControlKind::Angle,
+        SequenceControlKind::Checkbox,
+        SequenceControlKind::Color,
+        SequenceControlKind::Point2D,
+        SequenceControlKind::Point3D,
+    ];
+
+    let (add_quick, _) = cm3_collapsible_section_with_action(
+        ui,
+        Id::unique("seq_expr_controls"),
+        "Controls",
+        true,
+        true,
+        state.prop_columns.label_ratio,
+        Some((Cm3Icon::Add, "Add sequence control")),
+        theme,
+        |ui| {
+            // Builder row for all 6 SequenceControlKind types + min/max/step
+            Frame::NONE
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.add(
+                            TextEdit::singleline(&mut state.new_seq_control_name)
+                                .hint_text("Control name")
+                                .font(theme.font(FONT_SMALL))
+                                .desired_width(92.0),
+                        );
+                        cm3_dropdown(
+                            ui,
+                            Id::unique("seq_new_ctl_kind"),
+                            &mut state.new_seq_control_kind,
+                            KIND_LABELS,
+                            false,
+                            viewport_rect,
+                            theme,
+                        );
+                        if cm3_icon_button(
+                            ui,
+                            Cm3Icon::Add,
+                            16.0,
+                            TEXT_PRIMARY,
+                            "Add typed sequence control",
+                            theme,
+                        ) {
+                            let kind = KINDS[state.new_seq_control_kind.min(KINDS.len() - 1)];
+                            let name = if state.new_seq_control_name.trim().is_empty() {
+                                let n = format!(
+                                    "{} {}",
+                                    KIND_LABELS[state.new_seq_control_kind.min(5)],
+                                    state.seq_control_counter
+                                );
+                                state.seq_control_counter += 1;
+                                n
+                            } else {
+                                state.new_seq_control_name.trim().to_owned()
+                            };
+                            let default_val = match kind {
+                                SequenceControlKind::Slider | SequenceControlKind::Angle => {
+                                    PropertyValue::Number(0.0)
+                                }
+                                SequenceControlKind::Checkbox => PropertyValue::Bool(false),
+                                SequenceControlKind::Color => PropertyValue::Color([1.0, 1.0, 1.0]),
+                                SequenceControlKind::Point2D => PropertyValue::Vec2([0.0, 0.0]),
+                                SequenceControlKind::Point3D => {
+                                    PropertyValue::Vec3([0.0, 0.0, 0.0])
+                                }
+                            };
+                            let min = state.new_seq_control_min.trim().parse::<f64>().ok();
+                            let max = state.new_seq_control_max.trim().parse::<f64>().ok();
+                            let step = state.new_seq_control_step.trim().parse::<f64>().ok();
+                            let _ = session.execute(Command::AddSequenceControl {
+                                name,
+                                kind,
+                                value: default_val,
+                                min,
+                                max,
+                                step,
+                            });
+                        }
+                    });
+                    if state.new_seq_control_kind <= 1 {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(
+                                egui::RichText::new("Min")
+                                    .font(theme.font(FONT_COMPACT))
+                                    .color(TEXT_MUTED),
+                            );
+                            ui.add(
+                                TextEdit::singleline(&mut state.new_seq_control_min)
+                                    .font(theme.font(FONT_COMPACT))
+                                    .desired_width(40.0),
+                            );
+                            ui.label(
+                                egui::RichText::new("Max")
+                                    .font(theme.font(FONT_COMPACT))
+                                    .color(TEXT_MUTED),
+                            );
+                            ui.add(
+                                TextEdit::singleline(&mut state.new_seq_control_max)
+                                    .font(theme.font(FONT_COMPACT))
+                                    .desired_width(40.0),
+                            );
+                            ui.label(
+                                egui::RichText::new("Step")
+                                    .font(theme.font(FONT_COMPACT))
+                                    .color(TEXT_MUTED),
+                            );
+                            ui.add(
+                                TextEdit::singleline(&mut state.new_seq_control_step)
+                                    .font(theme.font(FONT_COMPACT))
+                                    .desired_width(36.0),
+                            );
+                        });
+                    }
+                });
+
+            // Render project SequenceControl items
+            let controls = session.active_sequence().controls.clone();
+            let count = controls.len();
+            for (idx, ctl) in controls.into_iter().enumerate() {
+                let min_v = ctl.preserved.get("min").and_then(Value::as_f64);
+                let max_v = ctl.preserved.get("max").and_then(Value::as_f64);
+                let step_v = ctl.preserved.get("step").and_then(Value::as_f64);
+                let mut name_buf = ctl.name.clone();
+                let mut updated_val: Option<PropertyValue> = None;
+                let mut name_changed = false;
+
+                Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(6, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            if ui
+                                .add(
+                                    TextEdit::singleline(&mut name_buf)
+                                        .font(theme.font(FONT_SMALL))
+                                        .desired_width(96.0),
+                                )
+                                .lost_focus()
+                                && name_buf.trim() != ctl.name
+                                && !name_buf.trim().is_empty()
+                            {
+                                name_changed = true;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("×")
+                                        .on_hover_text("Delete control")
+                                        .clicked()
+                                    {
+                                        let _ = session.execute(Command::DeleteSequenceControl {
+                                            control_id: ctl.id.clone(),
+                                        });
+                                    }
+                                    if idx + 1 < count
+                                        && ui.small_button("↓").on_hover_text("Move down").clicked()
+                                    {
+                                        let _ = session.execute(Command::ReorderSequenceControl {
+                                            control_id: ctl.id.clone(),
+                                            to_index: idx + 1,
+                                        });
+                                    }
+                                    if idx > 0
+                                        && ui.small_button("↑").on_hover_text("Move up").clicked()
+                                    {
+                                        let _ = session.execute(Command::ReorderSequenceControl {
+                                            control_id: ctl.id.clone(),
+                                            to_index: idx - 1,
+                                        });
+                                    }
+                                },
+                            );
+                        });
+                        // Typed value editor
+                        match ctl.kind {
+                            SequenceControlKind::Slider | SequenceControlKind::Angle => {
+                                let mut v = ctl.track.value.as_f64().unwrap_or(0.0);
+                                let lo =
+                                    min_v.unwrap_or(if ctl.kind == SequenceControlKind::Angle {
+                                        -360.0
+                                    } else {
+                                        -10_000.0
+                                    });
+                                let hi =
+                                    max_v.unwrap_or(if ctl.kind == SequenceControlKind::Angle {
+                                        360.0
+                                    } else {
+                                        10_000.0
+                                    });
+                                let st = step_v.unwrap_or(0.1);
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut v)
+                                            .range(lo..=hi)
+                                            .speed(st)
+                                            .suffix(if ctl.kind == SequenceControlKind::Angle {
+                                                "°"
+                                            } else {
+                                                ""
+                                            }),
+                                    )
+                                    .changed()
+                                {
+                                    updated_val = Some(PropertyValue::Number(v));
+                                }
+                            }
+                            SequenceControlKind::Checkbox => {
+                                let mut b = match &ctl.track.value {
+                                    PropertyValue::Bool(v) => *v,
+                                    PropertyValue::Number(n) => *n >= 0.5,
+                                    _ => false,
+                                };
+                                if ui.checkbox(&mut b, "Enabled").changed() {
+                                    updated_val = Some(PropertyValue::Bool(b));
+                                }
+                            }
+                            SequenceControlKind::Color => {
+                                let c = ctl.track.value.as_vec3().unwrap_or([1.0, 1.0, 1.0]);
+                                let mut rgb = [c[0] as f32, c[1] as f32, c[2] as f32];
+                                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                    updated_val = Some(PropertyValue::Color([
+                                        f64::from(rgb[0]),
+                                        f64::from(rgb[1]),
+                                        f64::from(rgb[2]),
+                                    ]));
+                                }
+                            }
+                            SequenceControlKind::Point2D => {
+                                let mut p = ctl.track.value.as_vec2().unwrap_or([0.0, 0.0]);
+                                ui.horizontal(|ui| {
+                                    let cx = ui.add(
+                                        egui::DragValue::new(&mut p[0]).speed(1.0).prefix("X "),
+                                    );
+                                    let cy = ui.add(
+                                        egui::DragValue::new(&mut p[1]).speed(1.0).prefix("Y "),
+                                    );
+                                    if cx.changed() || cy.changed() {
+                                        updated_val = Some(PropertyValue::Vec2(p));
+                                    }
+                                });
+                            }
+                            SequenceControlKind::Point3D => {
+                                let mut p = ctl.track.value.as_vec3().unwrap_or([0.0, 0.0, 0.0]);
+                                ui.horizontal(|ui| {
+                                    let cx = ui.add(
+                                        egui::DragValue::new(&mut p[0]).speed(1.0).prefix("X "),
+                                    );
+                                    let cy = ui.add(
+                                        egui::DragValue::new(&mut p[1]).speed(1.0).prefix("Y "),
+                                    );
+                                    let cz = ui.add(
+                                        egui::DragValue::new(&mut p[2]).speed(1.0).prefix("Z "),
+                                    );
+                                    if cx.changed() || cy.changed() || cz.changed() {
+                                        updated_val = Some(PropertyValue::Vec3(p));
+                                    }
+                                });
+                            }
+                        }
+                    });
+
+                if name_changed || updated_val.is_some() {
+                    let _ = session.execute(Command::UpdateSequenceControl {
+                        control_id: ctl.id,
+                        name: name_buf.trim().to_owned(),
+                        value: updated_val.unwrap_or(ctl.track.value),
+                        min: min_v,
+                        max: max_v,
+                        step: step_v,
+                    });
+                }
+            }
+
+            // Legacy ctl_* sequence_properties compatibility
+            let ctl_keys: Vec<String> = session
+                .document()
+                .sequence_properties
+                .keys()
+                .filter(|k| k.starts_with("ctl_"))
+                .cloned()
+                .collect();
+            for key in ctl_keys {
+                let display_lbl = key.strip_prefix("ctl_").unwrap_or(&key);
+                let label = humanize_prop_label(display_lbl);
+                show_session_number_prop(
+                    ui,
+                    session,
+                    "sequence",
+                    &key,
+                    &label,
+                    0.0,
+                    ScrubConfig::new(-10_000.0, 10_000.0, 0.1, 2),
+                    frame,
+                    0.0,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            }
+        },
+    );
+
+    if add_quick {
+        let name = format!("Slider {}", state.seq_control_counter);
+        state.seq_control_counter += 1;
+        let _ = session.execute(Command::AddSequenceControl {
+            name,
+            kind: SequenceControlKind::Slider,
+            value: PropertyValue::Number(0.0),
+            min: Some(0.0),
+            max: Some(100.0),
+            step: Some(0.1),
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Shape+ Layer Masks (`zoidiumMasks`) & Precomp+ Target Picker (Edit Tab)
+// ---------------------------------------------------------------------------
+
+fn default_layer_mask(index: usize) -> LayerMask {
+    let default_rect_path = json!([
+        -200.0, -120.0, 0.0, 0.0, 0.0, 0.0, 200.0, -120.0, 0.0, 0.0, 0.0, 0.0, 200.0, 120.0, 0.0,
+        0.0, 0.0, 0.0, -200.0, 120.0, 0.0, 0.0, 0.0, 0.0
+    ]);
+    let palette = ["#58a6ff", "#f78166", "#56d364", "#d2a8ff", "#e3b341"];
+    LayerMask {
+        id: format!("mask_{index}"),
+        name: format!("Mask {index}"),
+        enabled: true,
+        mode: MaskMode::Add,
+        invert: false,
+        feather: 0.0,
+        expansion: 0.0,
+        opacity: 1.0,
+        closed: true,
+        locked: false,
+        outline_color: palette[(index.saturating_sub(1)) % palette.len()].to_owned(),
+        vertex_ids: vec![
+            "v1".to_owned(),
+            "v2".to_owned(),
+            "v3".to_owned(),
+            "v4".to_owned(),
+        ],
+        vertex_modes: BTreeMap::new(),
+        path: PropertyTrack::constant(PropertyValue::Json(default_rect_path)),
+        preserved: BTreeMap::new(),
+    }
+}
+
+fn show_edit_layer_masks_section(
+    ui: &mut Ui,
+    session: &mut Session,
+    clip_id: &str,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+) {
+    let clip_uuid = Uuid::parse_str(clip_id).ok();
+    let layer_id = find_project_video_clip(session, clip_id).map(|vc| vc.layer.id);
+    let masks: Vec<LayerMask> = layer_id
+        .and_then(|lid| session.active_sequence().layer_masks.get(&lid).cloned())
+        .unwrap_or_default();
+
+    let mask_w = ui.available_width();
+    let (masks_hdr, _) = ui.allocate_exact_size(Vec2::new(mask_w, 24.0), Sense::hover());
+    ui.painter().text(
+        Pos2::new(masks_hdr.left() + 15.0, masks_hdr.top() + 10.5),
+        Align2::LEFT_CENTER,
+        format!("Masks ({})", masks.len()),
+        theme.font(FONT_BODY),
+        TEXT_PRIMARY,
+    );
+
+    let (add_mask_rect, add_mask_resp) =
+        ui.allocate_exact_size(Vec2::new(mask_w, 26.0), Sense::click());
+    let add_mask_resp = add_mask_resp.on_hover_cursor(CursorIcon::PointingHand);
+    ui.painter().text(
+        Pos2::new(add_mask_rect.left() + 25.0, add_mask_rect.center().y),
+        Align2::LEFT_CENTER,
+        "+ Add mask",
+        theme.font(FONT_EASING),
+        if add_mask_resp.hovered() {
+            TEXT_BRIGHT
+        } else {
+            theme.value()
+        },
+    );
+    if add_mask_resp.clicked()
+        && let Some(cid) = clip_uuid
+    {
+        let new_mask = default_layer_mask(masks.len() + 1);
+        let new_id = new_mask.id.clone();
+        if session
+            .execute(Command::AddLayerMask {
+                clip_id: cid,
+                mask: new_mask,
+            })
+            .is_ok()
+        {
+            state.expanded_masks.insert(new_id);
+        }
+    }
+
+    // Expandable mask cards
+    let total = masks.len();
+    for (idx, mut mask) in masks.into_iter().enumerate() {
+        let Some(cid) = clip_uuid else {
+            break;
+        };
+        let expanded = state.expanded_masks.contains(&mask.id);
+        let mut changed = false;
+
+        Frame::NONE
+            .fill(BG_SUNKEN)
+            .stroke(Stroke::new(1.0, BORDER_ROW_SOFT))
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if ui.small_button(if expanded { "▾" } else { "▸" }).clicked() {
+                        if expanded {
+                            state.expanded_masks.remove(&mask.id);
+                        } else {
+                            state.expanded_masks.insert(mask.id.clone());
+                        }
+                    }
+                    if ui
+                        .checkbox(&mut mask.enabled, "")
+                        .on_hover_text("Toggle mask visibility")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    let mut name_buf = mask.name.clone();
+                    if ui
+                        .add(
+                            TextEdit::singleline(&mut name_buf)
+                                .font(theme.font(FONT_SMALL))
+                                .desired_width(84.0),
+                        )
+                        .lost_focus()
+                        && !name_buf.trim().is_empty()
+                        && name_buf.trim() != mask.name
+                    {
+                        mask.name = name_buf.trim().to_owned();
+                        changed = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Delete mask").clicked() {
+                            let _ = session.execute(Command::RemoveLayerMask {
+                                clip_id: cid,
+                                mask_id: mask.id.clone(),
+                            });
+                        }
+                        if ui
+                            .small_button("D")
+                            .on_hover_text("Duplicate mask")
+                            .clicked()
+                        {
+                            let _ = session.execute(Command::DuplicateLayerMask {
+                                clip_id: cid,
+                                mask_id: mask.id.clone(),
+                            });
+                        }
+                        if idx + 1 < total
+                            && ui.small_button("↓").on_hover_text("Move down").clicked()
+                        {
+                            let _ = session.execute(Command::ReorderLayerMask {
+                                clip_id: cid,
+                                mask_id: mask.id.clone(),
+                                to_index: idx + 1,
+                            });
+                        }
+                        if idx > 0 && ui.small_button("↑").on_hover_text("Move up").clicked() {
+                            let _ = session.execute(Command::ReorderLayerMask {
+                                clip_id: cid,
+                                mask_id: mask.id.clone(),
+                                to_index: idx - 1,
+                            });
+                        }
+                    });
+                });
+
+                if expanded {
+                    ui.add_space(4.0);
+                    let mut mode_idx = match mask.mode {
+                        MaskMode::Add => 0,
+                        MaskMode::Subtract => 1,
+                        MaskMode::Intersect => 2,
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Mode")
+                                .font(theme.font(FONT_COMPACT))
+                                .color(TEXT_MUTED),
+                        );
+                        if cm3_dropdown(
+                            ui,
+                            Id::unique(("mask_mode", &mask.id)),
+                            &mut mode_idx,
+                            &["Add", "Subtract", "Intersect"],
+                            false,
+                            viewport_rect,
+                            theme,
+                        ) {
+                            mask.mode = match mode_idx {
+                                1 => MaskMode::Subtract,
+                                2 => MaskMode::Intersect,
+                                _ => MaskMode::Add,
+                            };
+                            changed = true;
+                        }
+                        if ui.checkbox(&mut mask.invert, "Invert").changed() {
+                            changed = true;
+                        }
+                        if ui.checkbox(&mut mask.locked, "Lock").changed() {
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Feather")
+                                .font(theme.font(FONT_COMPACT))
+                                .color(TEXT_MUTED),
+                        );
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut mask.feather)
+                                    .range(0.0..=500.0)
+                                    .speed(0.5),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.label(
+                            egui::RichText::new("Expand")
+                                .font(theme.font(FONT_COMPACT))
+                                .color(TEXT_MUTED),
+                        );
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut mask.expansion)
+                                    .range(-500.0..=500.0)
+                                    .speed(0.5),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Opacity")
+                                .font(theme.font(FONT_COMPACT))
+                                .color(TEXT_MUTED),
+                        );
+                        if ui
+                            .add(egui::Slider::new(&mut mask.opacity, 0.0..=1.0).max_decimals(2))
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        let mut hex = parse_hex_rgb_f32(&mask.outline_color);
+                        if ui.color_edit_button_rgb(&mut hex).changed() {
+                            mask.outline_color = format!(
+                                "#{:02x}{:02x}{:02x}",
+                                (hex[0] * 255.0).round() as u8,
+                                (hex[1] * 255.0).round() as u8,
+                                (hex[2] * 255.0).round() as u8,
+                            );
+                            changed = true;
+                        }
+                    });
+                }
+            });
+
+        if changed {
+            let mask_id = mask.id.clone();
+            let _ = session.execute(Command::UpdateLayerMask {
+                clip_id: cid,
+                mask_id,
+                mask,
+            });
+        }
+    }
+
+    let (mask_div, _) = ui.allocate_exact_size(Vec2::new(mask_w, 1.0), Sense::hover());
+    ui.painter()
+        .rect_filled(mask_div, CornerRadius::ZERO, BORDER_ROW_SOFT);
+}
+
+fn parse_hex_rgb_f32(hex: &str) -> [f32; 3] {
+    let s = hex.trim().trim_start_matches('#');
+    if s.len() == 6
+        && let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&s[0..2], 16),
+            u8::from_str_radix(&s[2..4], 16),
+            u8::from_str_radix(&s[4..6], 16),
+        )
+    {
+        return [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
+    }
+    [0.34, 0.65, 1.0]
+}
+
+fn show_edit_precomp_target_section(
+    ui: &mut Ui,
+    session: &mut Session,
+    clip_id: &str,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+) {
+    let Some(vc) = find_project_video_clip(session, clip_id) else {
+        return;
+    };
+    let LayerKind::PrecompRef { composition_id } = vc.layer.kind else {
+        return;
+    };
+    let Some(cid) = Uuid::parse_str(clip_id).ok() else {
+        return;
+    };
+    let mut comps: Vec<(Uuid, String)> = session
+        .project
+        .compositions
+        .iter()
+        .map(|(id, s)| (*id, s.name.clone()))
+        .collect();
+    comps.sort_by(|a, b| a.1.cmp(&b.1));
+    if comps.is_empty() {
+        return;
+    }
+    let labels: Vec<&str> = comps.iter().map(|(_, n)| n.as_str()).collect();
+    let mut sel_idx = comps
+        .iter()
+        .position(|(id, _)| *id == composition_id)
+        .unwrap_or(0);
+    let changed = cm3_property_row_aligned(
+        ui,
+        "Target comp",
+        true,
+        state.prop_columns,
+        theme,
+        |_| {},
+        |ui| {
+            ui.horizontal(|ui| {
+                let c = cm3_dropdown(
+                    ui,
+                    Id::unique(("precomp_target_dd", clip_id)),
+                    &mut sel_idx,
+                    &labels,
+                    false,
+                    viewport_rect,
+                    theme,
+                );
+                if ui.small_button("Open").clicked() {
+                    let _ = session.execute(Command::SetActiveComposition {
+                        comp_id: Some(composition_id),
+                    });
+                }
+                c
+            })
+            .inner
+        },
+    );
+    if changed {
+        let _ = session.execute(Command::SetPrecompClipTarget {
+            clip_id: cid,
+            composition_id: comps[sel_idx].0,
+        });
+    }
+}
+
+fn show_preset_shape_kind_row(
+    ui: &mut Ui,
+    session: &mut Session,
+    clip_id: &str,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+) {
+    let Some(cid) = Uuid::parse_str(clip_id).ok() else {
+        return;
+    };
+    let cur = find_project_video_clip(session, clip_id)
+        .and_then(|vc| match vc.layer.kind {
+            LayerKind::PresetShape2D { preset, .. } => Some(preset),
+            _ => None,
+        })
+        .unwrap_or(PresetShapeKind::Ellipse);
+    let mut idx = match cur {
+        PresetShapeKind::Ellipse => 0,
+        PresetShapeKind::Rectangle => 1,
+    };
+    let changed = cm3_property_row_aligned(
+        ui,
+        "Shape kind",
+        true,
+        state.prop_columns,
+        theme,
+        |_| {},
+        |ui| {
+            cm3_dropdown(
+                ui,
+                Id::unique(("preset_shape_kind", clip_id)),
+                &mut idx,
+                &["Ellipse", "Rectangle"],
+                false,
+                viewport_rect,
+                theme,
+            )
+        },
+    );
+    if changed {
+        let shape_kind = if idx == 1 {
+            PresetShapeKind::Rectangle
+        } else {
+            PresetShapeKind::Ellipse
+        };
+        let _ = session.execute(Command::SetPresetShapeKind {
+            clip_id: cid,
+            shape_kind,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Non-3D Objects Tab (Shape+ 21-Kind Tree + SVG, PresetShape2D, Text2D + Text+ 2D)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn show_non_scene_objects_tab(
+    ui: &mut Ui,
+    panel_rect: Rect,
+    viewport_rect: Rect,
+    clip: &SessionClip,
+    session: &mut Session,
+    theme: &Cm3Theme,
+    state: &mut PanelsState,
+    actions: &mut Vec<PanelAction>,
+) -> bool {
+    let is_shape_plus = clip.kind == "zoidium:shape-plus/shape-layer"
+        || find_project_video_clip(session, &clip.id).is_some_and(|vc| {
+            matches!(
+                &vc.layer.kind,
+                LayerKind::Plugin { plugin_type, .. }
+                    if plugin_type == "zoidium:shape-plus/shape-layer"
+            )
+        });
+    if is_shape_plus {
+        show_shape_plus_objects_tab(ui, panel_rect, viewport_rect, clip, session, theme, state);
+        return true;
+    }
+
+    if clip.kind == "text" || clip.kind == "text_2d" {
+        show_text2d_objects_tab(
+            ui,
+            panel_rect,
+            viewport_rect,
+            clip,
+            session,
+            theme,
+            state,
+            actions,
+        );
+        return true;
+    }
+
+    if clip.kind == "preset_shape" || clip.kind == "shape" {
+        ScrollArea::vertical()
+            .id_salt("preset_shape_objects_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                panel_top_header(ui, &clip.name, theme);
+                let local_frame = session.playback.current_frame - clip.start;
+                if clip.kind == "preset_shape" {
+                    show_preset_shape_kind_row(ui, session, &clip.id, viewport_rect, state, theme);
+                }
+                show_session_color_prop(
+                    ui,
+                    session,
+                    &clip.id,
+                    "fillColor",
+                    "Fill color",
+                    [1.0, 1.0, 1.0],
+                    local_frame,
+                    clip.start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_color_prop(
+                    ui,
+                    session,
+                    &clip.id,
+                    "strokeColor",
+                    "Stroke color",
+                    [0.0, 0.0, 0.0],
+                    local_frame,
+                    clip.start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    &clip.id,
+                    "strokeWidth",
+                    "Stroke width",
+                    0.0,
+                    ScrubConfig::new(0.0, 200.0, 1.0, 1),
+                    local_frame,
+                    clip.start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            });
+        return true;
+    }
+
+    false
+}
+
+fn show_shape_plus_objects_tab(
+    ui: &mut Ui,
+    panel_rect: Rect,
+    viewport_rect: Rect,
+    clip: &SessionClip,
+    session: &mut Session,
+    theme: &Cm3Theme,
+    state: &mut PanelsState,
+) {
+    let Some(cid) = Uuid::parse_str(&clip.id).ok() else {
+        empty_panel_message(ui, "invalid Shape+ clip id", theme);
+        return;
+    };
+    let mut payload = find_project_video_clip(session, &clip.id)
+        .and_then(|vc| match &vc.layer.kind {
+            LayerKind::Plugin { payload, .. } => Some(payload.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(default_shape_plus_payload);
+
+    let (top_rect, bot_rect) = begin_split_panel(
+        ui,
+        Id::unique("shape_plus_split"),
+        panel_rect,
+        &mut state.objects_split,
+    );
+    ui.painter()
+        .rect_filled(top_rect, CornerRadius::ZERO, BG_PANEL);
+    ui.painter()
+        .rect_filled(bot_rect, CornerRadius::ZERO, BG_PANEL);
+
+    let mut payload_dirty = false;
+
+    // Top Pane: Contents Tree + Add (all 21 kinds) + Import SVG
+    show_split_pane(
+        ui,
+        Id::unique("shape_plus_split_p0"),
+        top_rect.shrink(2.0),
+        |ui, _| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    egui::RichText::new("Shape+ Contents")
+                        .font(theme.font(FONT_TITLE))
+                        .color(TEXT_STRONG),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Paste SVG").clicked() {
+                        state.shape_plus_svg_open = !state.shape_plus_svg_open;
+                    }
+                    if ui.small_button("Import SVG...").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("SVG Vector", &["svg"])
+                            .pick_file()
+                    {
+                        match std::fs::read_to_string(&path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|txt| import_svg_to_shape_plus(&txt))
+                        {
+                            Ok(imported) => {
+                                payload = imported;
+                                payload_dirty = true;
+                                state.shape_plus_svg_error = None;
+                            }
+                            Err(err) => {
+                                state.shape_plus_svg_error = Some(err);
+                            }
+                        }
+                    }
+                });
+            });
+
+            if state.shape_plus_svg_open {
+                ui.add_space(4.0);
+                ui.add(
+                    TextEdit::multiline(&mut state.shape_plus_svg_paste)
+                        .hint_text("<svg>...</svg>")
+                        .desired_rows(3)
+                        .desired_width(ui.available_width())
+                        .font(egui::FontId::monospace(11.0)),
+                );
+                ui.horizontal(|ui| {
+                    if cm3_prop_button(
+                        ui,
+                        "Import Pasted SVG",
+                        ButtonVariant::Primary,
+                        false,
+                        theme,
+                    )
+                    .clicked()
+                    {
+                        match import_svg_to_shape_plus(&state.shape_plus_svg_paste) {
+                            Ok(imported) => {
+                                payload = imported;
+                                payload_dirty = true;
+                                state.shape_plus_svg_open = false;
+                                state.shape_plus_svg_error = None;
+                            }
+                            Err(err) => state.shape_plus_svg_error = Some(err),
+                        }
+                    }
+                    if let Some(err) = &state.shape_plus_svg_error {
+                        ui.label(
+                            egui::RichText::new(err)
+                                .font(theme.font(FONT_COMPACT))
+                                .color(DANGER_TEXT),
+                        );
+                    }
+                });
+            }
+
+            // + Add Item (all 21 Shape+ kinds)
+            ui.add_space(4.0);
+            let kind_labels: Vec<&str> = ALL_SHAPE_PLUS_KINDS
+                .iter()
+                .map(|k| shape_plus_kind_title(k).unwrap_or(*k))
+                .collect();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                cm3_dropdown(
+                    ui,
+                    Id::unique("shape_plus_add_kind_dd"),
+                    &mut state.shape_plus_add_kind,
+                    &kind_labels,
+                    false,
+                    viewport_rect,
+                    theme,
+                );
+                if cm3_prop_button(ui, "+ Add", ButtonVariant::Primary, false, theme).clicked() {
+                    let kind = ALL_SHAPE_PLUS_KINDS[state
+                        .shape_plus_add_kind
+                        .min(ALL_SHAPE_PLUS_KINDS.len() - 1)];
+                    let parent_group = state.shape_plus_selected.as_deref().and_then(|sid| {
+                        find_shape_item_kind(&payload, sid)
+                            .filter(|k| *k == "group")
+                            .map(|_| sid)
+                    });
+                    if let Ok(new_id) = add_shape_plus_item(&mut payload, parent_group, kind) {
+                        state.shape_plus_selected = Some(new_id);
+                        payload_dirty = true;
+                    }
+                }
+            });
+
+            ui.separator();
+
+            // Render hierarchical Shape+ Contents tree
+            let doc = parse_shape_plus_document(&payload);
+            let mut tree_action: Option<(String, &'static str, usize)> = None;
+            ScrollArea::vertical()
+                .id_salt("shape_plus_tree_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    fn draw_items(
+                        ui: &mut Ui,
+                        items: &[zc_render::shape_plus::ShapePlusItem],
+                        depth: usize,
+                        state: &mut PanelsState,
+                        theme: &Cm3Theme,
+                        action: &mut Option<(String, &'static str, usize)>,
+                    ) {
+                        let count = items.len();
+                        for (idx, item) in items.iter().enumerate() {
+                            let is_sel =
+                                state.shape_plus_selected.as_deref() == Some(item.id.as_str());
+                            let enabled = item
+                                .properties
+                                .get("enabled")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(1.0)
+                                >= 0.5;
+                            let name = item
+                                .properties
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_else(|| {
+                                    shape_plus_kind_title(&item.kind).unwrap_or(&item.kind)
+                                });
+                            ui.horizontal(|ui| {
+                                ui.add_space((depth as f32) * 14.0);
+                                if item.kind == "group" {
+                                    let collapsed = state.shape_plus_collapsed.contains(&item.id);
+                                    if ui.small_button(if collapsed { "▸" } else { "▾" }).clicked()
+                                    {
+                                        if collapsed {
+                                            state.shape_plus_collapsed.remove(&item.id);
+                                        } else {
+                                            state.shape_plus_collapsed.insert(item.id.clone());
+                                        }
+                                    }
+                                }
+                                if ui
+                                    .small_button(if enabled { "👁" } else { "—" })
+                                    .on_hover_text("Toggle visibility")
+                                    .clicked()
+                                {
+                                    *action = Some((item.id.clone(), "toggle", idx));
+                                }
+                                if ui
+                                    .selectable_label(
+                                        is_sel,
+                                        egui::RichText::new(name)
+                                            .font(theme.font(FONT_SMALL))
+                                            .color(if !enabled {
+                                                TEXT_DISABLED
+                                            } else if is_sel {
+                                                TEXT_BRIGHT
+                                            } else {
+                                                TEXT_PRIMARY
+                                            }),
+                                    )
+                                    .clicked()
+                                {
+                                    state.shape_plus_selected = Some(item.id.clone());
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("×").on_hover_text("Delete").clicked() {
+                                            *action = Some((item.id.clone(), "del", idx));
+                                        }
+                                        if ui.small_button("D").on_hover_text("Duplicate").clicked()
+                                        {
+                                            *action = Some((item.id.clone(), "dup", idx));
+                                        }
+                                        if idx + 1 < count
+                                            && ui.small_button("↓").on_hover_text("Down").clicked()
+                                        {
+                                            *action = Some((item.id.clone(), "down", idx + 1));
+                                        }
+                                        if idx > 0
+                                            && ui.small_button("↑").on_hover_text("Up").clicked()
+                                        {
+                                            *action = Some((item.id.clone(), "up", idx - 1));
+                                        }
+                                    },
+                                );
+                            });
+                            if item.kind == "group"
+                                && !state.shape_plus_collapsed.contains(&item.id)
+                            {
+                                draw_items(ui, &item.contents, depth + 1, state, theme, action);
+                            }
+                        }
+                    }
+                    draw_items(ui, &doc.contents, 0, state, theme, &mut tree_action);
+                });
+
+            if let Some((item_id, op, target_idx)) = tree_action {
+                match op {
+                    "del" => {
+                        if remove_shape_plus_item(&mut payload, &item_id).unwrap_or(false) {
+                            if state.shape_plus_selected.as_deref() == Some(item_id.as_str()) {
+                                state.shape_plus_selected = None;
+                            }
+                            payload_dirty = true;
+                        }
+                    }
+                    "dup" => {
+                        if let Ok(Some(new_id)) = duplicate_shape_plus_item(&mut payload, &item_id)
+                        {
+                            state.shape_plus_selected = Some(new_id);
+                            payload_dirty = true;
+                        }
+                    }
+                    "up" | "down" => {
+                        if reorder_shape_plus_item(&mut payload, &item_id, target_idx)
+                            .unwrap_or(false)
+                        {
+                            payload_dirty = true;
+                        }
+                    }
+                    "toggle" => {
+                        if let Some(item_obj) = find_shape_item_mut(&mut payload, &item_id)
+                            && let Some(props) = item_obj
+                                .get_mut("properties")
+                                .and_then(Value::as_object_mut)
+                        {
+                            let cur = props.get("enabled").and_then(Value::as_f64).unwrap_or(1.0);
+                            props.insert(
+                                "enabled".to_owned(),
+                                json!(if cur >= 0.5 { 0 } else { 1 }),
+                            );
+                            payload_dirty = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        },
+    );
+    paint_crisp_panel_border(ui.painter(), top_rect, BORDER_PANEL);
+
+    // Bottom Pane: Selected Shape+ Item Property Inspector
+    show_split_pane(
+        ui,
+        Id::unique("shape_plus_split_p1"),
+        bot_rect.shrink(4.0),
+        |ui, _| {
+            let Some(sel_id) = state.shape_plus_selected.clone() else {
+                empty_panel_message(ui, "select a Shape+ item", theme);
+                return;
+            };
+            let Some(item_obj) = find_shape_item_mut(&mut payload, &sel_id) else {
+                empty_panel_message(ui, "select a Shape+ item", theme);
+                return;
+            };
+            let kind = item_obj
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} Properties",
+                    shape_plus_kind_title(&kind).unwrap_or(&kind)
+                ))
+                .font(theme.font(FONT_TITLE))
+                .color(TEXT_STRONG),
+            );
+            ui.separator();
+
+            ScrollArea::vertical()
+                .id_salt("shape_plus_item_inspector")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let Some(props) = item_obj
+                        .get_mut("properties")
+                        .and_then(Value::as_object_mut)
+                    else {
+                        return;
+                    };
+                    let keys: Vec<String> = props.keys().cloned().collect();
+                    for key in keys {
+                        if key == "enabled" || key == "path" {
+                            continue;
+                        }
+                        let Some(val) = props.get(&key).cloned() else {
+                            continue;
+                        };
+                        let label = humanize_prop_label(&key);
+                        match val {
+                            Value::String(mut s) => {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&label)
+                                            .font(theme.font(FONT_SMALL))
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    if ui
+                                        .add(
+                                            TextEdit::singleline(&mut s)
+                                                .font(theme.font(FONT_SMALL))
+                                                .desired_width(130.0),
+                                        )
+                                        .changed()
+                                    {
+                                        props.insert(key, json!(s));
+                                        payload_dirty = true;
+                                    }
+                                });
+                            }
+                            Value::Number(n) => {
+                                let mut v = n.as_f64().unwrap_or(0.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&label)
+                                            .font(theme.font(FONT_SMALL))
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    if ui.add(egui::DragValue::new(&mut v).speed(0.5)).changed() {
+                                        props.insert(key, json!(v));
+                                        payload_dirty = true;
+                                    }
+                                });
+                            }
+                            Value::Array(arr) if arr.len() == 2 => {
+                                let mut x = arr[0].as_f64().unwrap_or(0.0);
+                                let mut y = arr[1].as_f64().unwrap_or(0.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&label)
+                                            .font(theme.font(FONT_SMALL))
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    let cx = ui.add(egui::DragValue::new(&mut x).speed(1.0));
+                                    let cy = ui.add(egui::DragValue::new(&mut y).speed(1.0));
+                                    if cx.changed() || cy.changed() {
+                                        props.insert(key, json!([x, y]));
+                                        payload_dirty = true;
+                                    }
+                                });
+                            }
+                            Value::Array(arr) if arr.len() == 3 => {
+                                let mut rgb = [
+                                    arr[0].as_f64().unwrap_or(1.0) as f32,
+                                    arr[1].as_f64().unwrap_or(1.0) as f32,
+                                    arr[2].as_f64().unwrap_or(1.0) as f32,
+                                ];
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&label)
+                                            .font(theme.font(FONT_SMALL))
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                        props.insert(
+                                            key,
+                                            json!([
+                                                f64::from(rgb[0]),
+                                                f64::from(rgb[1]),
+                                                f64::from(rgb[2])
+                                            ]),
+                                        );
+                                        payload_dirty = true;
+                                    }
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+        },
+    );
+    paint_crisp_panel_border(ui.painter(), bot_rect, BORDER_PANEL);
+
+    if payload_dirty {
+        let _ = session.execute(Command::UpdateShapePlusPayload {
+            clip_id: cid,
+            payload,
+        });
+    }
+}
+
+fn find_shape_item_kind<'a>(payload: &'a Value, id: &str) -> Option<&'a str> {
+    fn rec<'a>(arr: &'a [Value], id: &str) -> Option<&'a str> {
+        for item in arr {
+            if item.get("id").and_then(Value::as_str) == Some(id) {
+                return item.get("kind").and_then(Value::as_str);
+            }
+            if let Some(children) = item.get("contents").and_then(Value::as_array)
+                && let Some(found) = rec(children, id)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    payload
+        .get("contents")
+        .and_then(Value::as_array)
+        .and_then(|c| rec(c, id))
+}
+
+fn find_shape_item_mut<'a>(payload: &'a mut Value, id: &str) -> Option<&'a mut Value> {
+    fn rec<'a>(arr: &'a mut [Value], id: &str) -> Option<&'a mut Value> {
+        for item in arr {
+            if item.get("id").and_then(Value::as_str) == Some(id) {
+                return Some(item);
+            }
+            if let Some(children) = item.get_mut("contents").and_then(Value::as_array_mut)
+                && let Some(found) = rec(children, id)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    payload
+        .get_mut("contents")
+        .and_then(Value::as_array_mut)
+        .and_then(|c| rec(c, id))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_text2d_objects_tab(
+    ui: &mut Ui,
+    _panel_rect: Rect,
+    viewport_rect: Rect,
+    clip: &SessionClip,
+    session: &mut Session,
+    theme: &Cm3Theme,
+    state: &mut PanelsState,
+    actions: &mut Vec<PanelAction>,
+) {
+    let local_frame = session.playback.current_frame - clip.start;
+    let cid = Uuid::parse_str(&clip.id).ok();
+
+    ScrollArea::vertical()
+        .id_salt("text2d_objects_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            panel_top_header(ui, &clip.name, theme);
+            show_session_text_prop(
+                ui,
+                session,
+                &clip.id,
+                "text",
+                "Text",
+                "Text",
+                local_frame,
+                state,
+                theme,
+            );
+            show_session_asset_prop(
+                ui,
+                session,
+                &clip.id,
+                "font",
+                "Font",
+                false,
+                local_frame,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &clip.id,
+                "fontSize",
+                "Font size",
+                72.0,
+                ScrubConfig::new(4.0, 1000.0, 1.0, 0),
+                local_frame,
+                clip.start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_color_prop(
+                ui,
+                session,
+                &clip.id,
+                "color",
+                "Fill color",
+                [1.0, 1.0, 1.0],
+                local_frame,
+                clip.start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_color_prop(
+                ui,
+                session,
+                &clip.id,
+                "strokeColor",
+                "Stroke color",
+                [0.0, 0.0, 0.0],
+                local_frame,
+                clip.start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &clip.id,
+                "strokeWidth",
+                "Stroke width",
+                0.0,
+                ScrubConfig::new(0.0, 100.0, 0.5, 1),
+                local_frame,
+                clip.start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                &clip.id,
+                "align",
+                "Alignment",
+                &["Left", "Center", "Right"],
+                1,
+                false,
+                local_frame,
+                clip.start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+
+            // Text+ 2D 3-Stack Character Animators (`zoidiumTextPlus2D`)
+            if let Some(clip_uuid) = cid {
+                cm3_collapsible_section(
+                    ui,
+                    Id::unique(("text2d_plus_animators", &clip.id)),
+                    "Text+ 2D Character Animators",
+                    true,
+                    theme,
+                    |ui| {
+                        let mut root = find_project_video_clip(session, &clip.id)
+                            .and_then(|vc| vc.layer.preserved.get("zoidiumTextPlus2D").cloned())
+                            .filter(Value::is_object)
+                            .unwrap_or_else(|| {
+                                json!({
+                                    "characterProperties": { "mode": 0 },
+                                    "extraCharacterProperties": [{ "mode": 0 }, { "mode": 0 }]
+                                })
+                            });
+
+                        // 3-Stack tabs: Character | Character 2 | Character 3
+                        ui.horizontal(|ui| {
+                            for (idx, lbl) in ["Character", "Character 2", "Character 3"]
+                                .iter()
+                                .enumerate()
+                            {
+                                if ui
+                                    .selectable_label(state.text2d_animator_tab == idx, *lbl)
+                                    .clicked()
+                                {
+                                    state.text2d_animator_tab = idx;
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+
+                        let slot_obj = match state.text2d_animator_tab {
+                            0 => root.as_object_mut().and_then(|o| {
+                                o.entry("characterProperties")
+                                    .or_insert_with(|| json!({ "mode": 0 }))
+                                    .as_object_mut()
+                            }),
+                            n => {
+                                let extra_idx = n - 1;
+                                root.as_object_mut().and_then(|o| {
+                                    let arr = o
+                                        .entry("extraCharacterProperties")
+                                        .or_insert_with(|| json!([{ "mode": 0 }, { "mode": 0 }]))
+                                        .as_array_mut()?;
+                                    while arr.len() <= extra_idx {
+                                        arr.push(json!({ "mode": 0 }));
+                                    }
+                                    arr[extra_idx].as_object_mut()
+                                })
+                            }
+                        };
+
+                        let mut dirty = false;
+                        if let Some(slot) = slot_obj {
+                            const MODES: &[&str] = &[
+                                "None",
+                                "Character Transform",
+                                "Gradient Transform",
+                                "Character Shake",
+                                "Selected Transform",
+                                "Selected Shake",
+                                "Random Scatter",
+                            ];
+                            let mut mode =
+                                slot.get("mode").and_then(Value::as_u64).unwrap_or(0).min(6)
+                                    as usize;
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Mode")
+                                        .font(theme.font(FONT_SMALL))
+                                        .color(TEXT_PRIMARY),
+                                );
+                                if cm3_dropdown(
+                                    ui,
+                                    Id::unique((
+                                        "text2d_anim_mode",
+                                        &clip.id,
+                                        state.text2d_animator_tab,
+                                    )),
+                                    &mut mode,
+                                    MODES,
+                                    false,
+                                    viewport_rect,
+                                    theme,
+                                ) {
+                                    slot.insert("mode".to_owned(), json!(mode));
+                                    dirty = true;
+                                }
+                            });
+                            if mode > 0 {
+                                for (k, lbl, def, speed) in [
+                                    ("offsetX", "Offset X", 0.0, 1.0),
+                                    ("offsetY", "Offset Y", 0.0, 1.0),
+                                    ("scaleX", "Scale X", 1.0, 0.02),
+                                    ("scaleY", "Scale Y", 1.0, 0.02),
+                                    ("rotation", "Rotation", 0.0, 1.0),
+                                    ("opacity", "Opacity", 1.0, 0.01),
+                                    ("delay", "Char Delay", 0.0, 0.05),
+                                    ("amount", "Amount / Amp", 1.0, 0.05),
+                                    ("speed", "Frequency", 1.0, 0.05),
+                                    ("seed", "Seed", 1.0, 1.0),
+                                ] {
+                                    let mut v = slot.get(k).and_then(Value::as_f64).unwrap_or(def);
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(lbl)
+                                                .font(theme.font(FONT_COMPACT))
+                                                .color(TEXT_MUTED),
+                                        );
+                                        if ui
+                                            .add(egui::DragValue::new(&mut v).speed(speed))
+                                            .changed()
+                                        {
+                                            slot.insert(k.to_owned(), json!(v));
+                                            dirty = true;
+                                        }
+                                    });
+                                }
+                            }
+                        }
+
+                        if dirty {
+                            let _ = session.execute(Command::UpdateLayerPreserved {
+                                clip_id: clip_uuid,
+                                key: "zoidiumTextPlus2D".to_owned(),
+                                value: Some(root),
+                            });
+                        }
+                    },
+                );
+            }
+        });
+}
+
+// ---------------------------------------------------------------------------
+// 5. Camera+ Optics, DOF Focus Linker, Motion Blur & 11-Key Vibrate
+// ---------------------------------------------------------------------------
+
+const CAMERA_FILM_GATE_PRESETS: &[(&str, f64)] = &[
+    ("36mm Full Frame", 36.0),
+    ("24.89mm Super 35", 24.89),
+    ("22.3mm APS-C (Canon)", 22.3),
+    ("23.6mm APS-C (Super)", 23.6),
+    ("17.3mm Micro 4/3", 17.3),
+    ("35mm Academy Cinema", 21.95),
+    ("70mm Large Format", 70.0),
+    ("12.52mm Super 16", 12.52),
+    ("13.2mm 1-inch", 13.2),
+    ("8.8mm 2/3-inch", 8.8),
+    ("6.4mm 1/2-inch", 6.4),
+    ("4.8mm 1/3-inch", 4.8),
+];
+
+#[allow(clippy::too_many_arguments)]
+fn show_camera_plus_controls(
+    ui: &mut Ui,
+    session: &mut Session,
+    obj_id: &str,
+    clip: &SessionClip,
+    local_frame: f64,
+    clip_start: f64,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+    actions: &mut Vec<PanelAction>,
+) {
+    show_session_option_prop_ex(
+        ui,
+        session,
+        obj_id,
+        "active",
+        "Active camera",
+        &["off", "on"],
+        1,
+        false,
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "zoom",
+        "Zoom",
+        1.0,
+        ScrubConfig::new(0.05, 50.0, 0.05, 2),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "focalLength",
+        "Focal length (mm)",
+        35.0,
+        ScrubConfig::new(4.0, 600.0, 0.5, 1),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+
+    // 12 Film Gate presets dropdown + numeric scrub
+    let cur_gate = eval_prop_f64(
+        lookup_session_prop(session, obj_id, "filmGate").as_ref(),
+        local_frame,
+        36.0,
+    );
+    let gate_labels: Vec<&str> = CAMERA_FILM_GATE_PRESETS.iter().map(|(l, _)| *l).collect();
+    let mut gate_idx = CAMERA_FILM_GATE_PRESETS
+        .iter()
+        .enumerate()
+        .min_by(|a, b| {
+            (a.1.1 - cur_gate)
+                .abs()
+                .total_cmp(&(b.1.1 - cur_gate).abs())
+        })
+        .map_or(0, |(i, _)| i);
+    let gate_changed = panel_property_row(
+        ui,
+        "Film gate preset",
+        true,
+        state,
+        theme,
+        |_| {},
+        |ui| {
+            cm3_dropdown(
+                ui,
+                Id::unique((obj_id, "cam_film_gate_preset")),
+                &mut gate_idx,
+                &gate_labels,
+                false,
+                viewport_rect,
+                theme,
+            )
+        },
+    );
+    if gate_changed {
+        let _ = session.execute(Command::SetPropertyValue {
+            target_id: obj_id.to_owned(),
+            property: "filmGate".to_owned(),
+            value: json!(CAMERA_FILM_GATE_PRESETS[gate_idx].1),
+        });
+    }
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "filmGate",
+        "Film gate (mm)",
+        36.0,
+        ScrubConfig::new(2.0, 120.0, 0.1, 2),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "filmOffsetX",
+        "Film offset X",
+        0.0,
+        ScrubConfig::new(-100.0, 100.0, 0.1, 2),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "filmOffsetY",
+        "Film offset Y",
+        0.0,
+        ScrubConfig::new(-100.0, 100.0, 0.1, 2),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+
+    // Per-camera Motion Blur
+    show_session_option_prop_ex(
+        ui,
+        session,
+        obj_id,
+        "motionBlur.enabled",
+        "Camera motion blur",
+        &["off", "on"],
+        0,
+        false,
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "motionBlur.samples",
+        "MB samples",
+        8.0,
+        ScrubConfig::new(1.0, 64.0, 1.0, 0),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "motionBlur.shutter",
+        "MB shutter",
+        0.5,
+        ScrubConfig::new(0.0, 2.0, 0.05, 2),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+
+    // Depth of Field + Focus Distance Linker
+    show_session_option_prop_ex(
+        ui,
+        session,
+        obj_id,
+        "dofEnabled",
+        "Depth of field",
+        &["off", "on"],
+        0,
+        false,
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "dofFocusDistance",
+        "DOF focus dist",
+        80.0,
+        ScrubConfig::new(0.1, 10_000.0, 1.0, 1),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+
+    // Focus Distance Linker: compute Euclidean distance to any 3D object in the scene
+    let focus_targets: Vec<(String, String, [f64; 3])> = clip
+        .objects_3d
+        .iter()
+        .filter(|o| o.id != obj_id)
+        .map(|o| {
+            let p = eval_prop_vec3(o.properties.get("position"), local_frame, [0.0, 0.0, 0.0]);
+            (o.id.clone(), o.name.clone(), p)
+        })
+        .collect();
+    if !focus_targets.is_empty() {
+        let mut labels: Vec<String> = vec!["Pick target to focus...".to_owned()];
+        for (_, n, _) in &focus_targets {
+            labels.push(n.clone());
+        }
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let mut pick_idx = 0usize;
+        let picked = panel_property_row(
+            ui,
+            "Focus linker",
+            true,
+            state,
+            theme,
+            |_| {},
+            |ui| {
+                cm3_dropdown(
+                    ui,
+                    Id::unique((obj_id, "dof_focus_linker")),
+                    &mut pick_idx,
+                    &label_refs,
+                    false,
+                    viewport_rect,
+                    theme,
+                )
+            },
+        );
+        if picked && pick_idx > 0 {
+            let cam_pos = eval_prop_vec3(
+                lookup_session_prop(session, obj_id, "position").as_ref(),
+                local_frame,
+                [0.0, 0.0, 80.0],
+            );
+            let tgt_pos = focus_targets[pick_idx - 1].2;
+            let dx = cam_pos[0] - tgt_pos[0];
+            let dy = cam_pos[1] - tgt_pos[1];
+            let dz = cam_pos[2] - tgt_pos[2];
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.1);
+            let _ = session.execute(Command::SetPropertyValue {
+                target_id: obj_id.to_owned(),
+                property: "dofFocusDistance".to_owned(),
+                value: json!((dist * 10.0).round() / 10.0),
+            });
+        }
+    }
+
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "dofAperture",
+        "DOF aperture",
+        2.8,
+        ScrubConfig::new(0.0, 40.0, 0.1, 2),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "dofFocusAreaWidth",
+        "Focus band width",
+        10.0,
+        ScrubConfig::new(0.0, 2000.0, 0.5, 1),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "dofNearBlur",
+        "Near blur",
+        1.0,
+        ScrubConfig::new(0.0, 10.0, 0.05, 2),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "dofFarBlur",
+        "Far blur",
+        1.0,
+        ScrubConfig::new(0.0, 10.0, 0.05, 2),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+
+    // Collapsible Camera Vibrate (all 11 vibrate.* keys)
+    state.inspector_root_indent = false;
+    cm3_collapsible_section(
+        ui,
+        Id::unique((obj_id, "camera_vibrate_section")),
+        "Camera Vibrate",
+        false,
+        theme,
+        |ui| {
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "vibrate.enabled",
+                "Enabled",
+                &["off", "on"],
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "vibrate.seed",
+                "Seed",
+                1.0,
+                ScrubConfig::new(0.0, 100_000.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "vibrate.enablePosition",
+                "Enable position",
+                &["off", "on"],
+                1,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec3_prop(
+                ui,
+                session,
+                obj_id,
+                "vibrate.positionAmplitude",
+                "Pos amplitude",
+                [1.0, 1.0, 1.0],
+                ScrubConfig::new(0.0, 1000.0, 0.1, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "vibrate.enableRotation",
+                "Enable rotation",
+                &["off", "on"],
+                1,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec3_prop(
+                ui,
+                session,
+                obj_id,
+                "vibrate.rotationAmplitude",
+                "Rot amplitude",
+                [2.0, 2.0, 2.0],
+                ScrubConfig::new(0.0, 360.0, 0.1, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "vibrate.frequency",
+                "Master frequency",
+                2.0,
+                ScrubConfig::new(0.0, 60.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "vibrate.positionFrequency",
+                "Pos frequency",
+                2.0,
+                ScrubConfig::new(0.0, 60.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "vibrate.rotationFrequency",
+                "Rot frequency",
+                2.0,
+                ScrubConfig::new(0.0, 60.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "vibrate.regularPulse",
+                "Regular pulse",
+                &["off", "on"],
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "vibrate.relative",
+                "Relative",
+                &["off", "on"],
+                1,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Text3D Text+ 9 Properties & Split Into Letters
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn show_text3d_plus_controls(
+    ui: &mut Ui,
+    session: &mut Session,
+    clip_id: &str,
+    obj_id: &str,
+    local_frame: f64,
+    clip_start: f64,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+    actions: &mut Vec<PanelAction>,
+) {
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "bevelTension",
+        "Bevel tension",
+        0.5,
+        ScrubConfig::new(0.0, 1.0, 0.05, 2),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_option_prop_ex(
+        ui,
+        session,
+        obj_id,
+        "bevelSide",
+        "Bevel side",
+        &["Both", "Front", "Back"],
+        0,
+        false,
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "bevelDetail",
+        "Bevel detail",
+        3.0,
+        ScrubConfig::new(1.0, 32.0, 1.0, 0),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_option_prop_ex(
+        ui,
+        session,
+        obj_id,
+        "bevelProfile",
+        "Bevel profile",
+        &["Linear", "Convex", "Concave", "Step"],
+        0,
+        false,
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "spacing",
+        "Letter spacing",
+        0.0,
+        ScrubConfig::new(-200.0, 200.0, 0.25, 2),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_option_prop_ex(
+        ui,
+        session,
+        obj_id,
+        "kerning",
+        "Kerning",
+        &["off", "on"],
+        1,
+        false,
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_option_prop_ex(
+        ui,
+        session,
+        obj_id,
+        "textScaleMode",
+        "Scale mode",
+        &["Height", "Width", "Uniform"],
+        0,
+        false,
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "characterIndexOffset",
+        "Char index offset",
+        0.0,
+        ScrubConfig::new(-1000.0, 1000.0, 1.0, 0),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+    show_session_number_prop(
+        ui,
+        session,
+        obj_id,
+        "characterCountOverride",
+        "Char count override",
+        0.0,
+        ScrubConfig::new(0.0, 1000.0, 1.0, 0),
+        local_frame,
+        clip_start,
+        viewport_rect,
+        state,
+        theme,
+        actions,
+    );
+
+    panel_property_row(
+        ui,
+        "Split letters",
+        true,
+        state,
+        theme,
+        |_| {},
+        |ui| {
+            if cm3_prop_button(
+                ui,
+                "Split into Letters",
+                ButtonVariant::Normal,
+                false,
+                theme,
+            )
+            .clicked()
+                && let (Ok(cid), Ok(oid)) = (Uuid::parse_str(clip_id), Uuid::parse_str(obj_id))
+            {
+                let _ = session.execute(Command::SplitText3DIntoLetters {
+                    clip_id: cid,
+                    object_id: oid,
+                });
+            }
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Full 5-Tab 3D Particles Inspector + 54-Sprite Picker + Over-Life Stops
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn show_particles_3d_inspector(
+    ui: &mut Ui,
+    session: &mut Session,
+    obj_id: &str,
+    local_frame: f64,
+    clip_start: f64,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+    actions: &mut Vec<PanelAction>,
+) {
+    const TABS: [&str; 5] = ["Emitter", "Position", "Motion", "Rotation", "Appearance"];
+    Frame::NONE
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for (i, lbl) in TABS.iter().enumerate() {
+                    if ui
+                        .selectable_label(state.particles_tab == i, *lbl)
+                        .clicked()
+                    {
+                        state.particles_tab = i;
+                    }
+                }
+            });
+        });
+
+    match state.particles_tab {
+        0 => {
+            // Emitter
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.time",
+                "Time",
+                0.0,
+                ScrubConfig::new(-1000.0, 10_000.0, 0.05, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.number",
+                "Max count",
+                100.0,
+                ScrubConfig::new(1.0, 100_000.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.rate",
+                "Emission rate",
+                25.0,
+                ScrubConfig::new(0.0, 10_000.0, 0.5, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.lifetime",
+                "Lifetime (s)",
+                2.0,
+                ScrubConfig::new(0.01, 600.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        1 => {
+            // Position
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "particles.pdist",
+                "Distribution",
+                &["Box", "Sphere", "Disc"],
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec3_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.ipos",
+                "Init position",
+                [0.0, 0.0, 0.0],
+                ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec3_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.pspread",
+                "Position spread",
+                [10.0, 10.0, 10.0],
+                ScrubConfig::new(0.0, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.iradius",
+                "Init radius",
+                5.0,
+                ScrubConfig::new(0.0, 10_000.0, 0.25, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.rspread",
+                "Radius spread",
+                2.0,
+                ScrubConfig::new(0.0, 10_000.0, 0.25, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        2 => {
+            // Motion
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "particles.vdist",
+                "Vel distribution",
+                &["Box", "Sphere", "Radial"],
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec3_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.ivel",
+                "Init velocity",
+                [0.0, 10.0, 0.0],
+                ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec3_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.vspread",
+                "Velocity spread",
+                [5.0, 5.0, 5.0],
+                ScrubConfig::new(0.0, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.irvel",
+                "Radial velocity",
+                0.0,
+                ScrubConfig::new(-10_000.0, 10_000.0, 0.25, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.rvspread",
+                "Radial spread",
+                0.0,
+                ScrubConfig::new(0.0, 10_000.0, 0.25, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec3_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.accel",
+                "Acceleration",
+                [0.0, -9.8, 0.0],
+                ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        3 => {
+            // Rotation
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.iang",
+                "Init angle",
+                0.0,
+                ScrubConfig::new(-3600.0, 3600.0, 1.0, 1),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.aspread",
+                "Angle spread",
+                0.0,
+                ScrubConfig::new(0.0, 360.0, 1.0, 1),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.angvel",
+                "Angular vel",
+                0.0,
+                ScrubConfig::new(-3600.0, 3600.0, 1.0, 1),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.avspread",
+                "Ang vel spread",
+                0.0,
+                ScrubConfig::new(0.0, 3600.0, 1.0, 1),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        _ => {
+            // Appearance: Blending, Texture, Searchable 54-Sprite Picker, Color-over-Life, Size-over-Life
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "particles.blending",
+                "Blending",
+                &["Normal", "Additive", "Subtractive", "Multiply"],
+                1,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_asset_prop(
+                ui,
+                session,
+                obj_id,
+                "particles.texture",
+                "Custom texture",
+                false,
+                local_frame,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+
+            // Searchable 54-sprite picker from zc_scene::all_particle_sprite_names()
+            let cur_sprite = eval_prop_str(
+                lookup_session_prop(session, obj_id, "particles.spritePreset").as_ref(),
+                local_frame,
+                "soft_glow",
+            );
+            cm3_collapsible_section(
+                ui,
+                Id::unique((obj_id, "particles_sprite_picker")),
+                &format!("Built-in Sprites ({})", all_particle_sprite_names().len()),
+                true,
+                theme,
+                |ui| {
+                    Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .show(ui, |ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut state.particles_sprite_filter)
+                                    .hint_text("Filter 54 sprites...")
+                                    .font(theme.font(FONT_SMALL))
+                                    .desired_width(ui.available_width()),
+                            );
+                            ui.add_space(4.0);
+                            let q = state.particles_sprite_filter.trim().to_ascii_lowercase();
+                            ScrollArea::vertical()
+                                .id_salt("particles_sprite_grid")
+                                .max_height(130.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing = Vec2::splat(3.0);
+                                        for &sp in all_particle_sprite_names() {
+                                            if !q.is_empty()
+                                                && !sp.to_ascii_lowercase().contains(&q)
+                                            {
+                                                continue;
+                                            }
+                                            let active = sp == cur_sprite;
+                                            if ui
+                                                .selectable_label(
+                                                    active,
+                                                    egui::RichText::new(sp)
+                                                        .font(theme.font(FONT_COMPACT)),
+                                                )
+                                                .clicked()
+                                            {
+                                                let _ =
+                                                    session.execute(Command::SetPropertyValue {
+                                                        target_id: obj_id.to_owned(),
+                                                        property: "particles.spritePreset"
+                                                            .to_owned(),
+                                                        value: json!(sp),
+                                                    });
+                                            }
+                                        }
+                                    });
+                                });
+                        });
+                },
+            );
+
+            // Color-over-Life stop editor (`particles.color` JSON)
+            show_particle_color_over_life_editor(ui, session, obj_id, local_frame, theme);
+            // Size-over-Life stop editor (`particles.size` JSON)
+            show_particle_size_over_life_editor(ui, session, obj_id, local_frame, theme);
+        }
+    }
+}
+
+fn show_particle_color_over_life_editor(
+    ui: &mut Ui,
+    session: &mut Session,
+    obj_id: &str,
+    local_frame: f64,
+    theme: &Cm3Theme,
+) {
+    let raw = eval_prop_str(
+        lookup_session_prop(session, obj_id, "particles.color").as_ref(),
+        local_frame,
+        "",
+    );
+    let mut stops: Vec<(f64, [f32; 4])> = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|item| {
+                    let t = item
+                        .get("t")
+                        .or_else(|| item.get("pos"))
+                        .and_then(Value::as_f64)?;
+                    let c = item.get("color").and_then(Value::as_array)?;
+                    Some((
+                        t,
+                        [
+                            c.first()?.as_f64()? as f32,
+                            c.get(1)?.as_f64()? as f32,
+                            c.get(2)?.as_f64()? as f32,
+                            c.get(3).and_then(Value::as_f64).unwrap_or(1.0) as f32,
+                        ],
+                    ))
+                })
+                .collect()
+        })
+        .filter(|v: &Vec<_>| v.len() >= 2)
+        .unwrap_or_else(|| vec![(0.0, [1.0, 0.9, 0.6, 1.0]), (1.0, [1.0, 0.3, 0.1, 0.0])]);
+
+    cm3_collapsible_section(
+        ui,
+        Id::unique((obj_id, "particles_color_life")),
+        "Color over Life",
+        false,
+        theme,
+        |ui| {
+            let mut dirty = false;
+            let mut remove_idx = None;
+            let stops_len = stops.len();
+            Frame::NONE
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    for (si, (t, rgba)) in stops.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.color_edit_button_rgba_unmultiplied(rgba).changed() {
+                                dirty = true;
+                            }
+                            if ui
+                                .add(egui::DragValue::new(t).range(0.0..=1.0).speed(0.01))
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                            if stops_len > 2 && ui.small_button("×").clicked() {
+                                remove_idx = Some(si);
+                            }
+                        });
+                    }
+                    if let Some(ri) = remove_idx {
+                        stops.remove(ri);
+                        dirty = true;
+                    }
+                    if ui.small_button("+ Add Color Stop").clicked() {
+                        stops.push((0.5, [1.0, 1.0, 1.0, 1.0]));
+                        dirty = true;
+                    }
+                });
+            if dirty {
+                stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let encoded = Value::Array(
+                    stops
+                        .into_iter()
+                        .map(|(t, c)| {
+                            json!({
+                                "t": t,
+                                "color": [f64::from(c[0]), f64::from(c[1]), f64::from(c[2]), f64::from(c[3])]
+                            })
+                        })
+                        .collect(),
+                )
+                .to_string();
+                let _ = session.execute(Command::SetPropertyValue {
+                    target_id: obj_id.to_owned(),
+                    property: "particles.color".to_owned(),
+                    value: json!(encoded),
+                });
+            }
+        },
+    );
+}
+
+fn show_particle_size_over_life_editor(
+    ui: &mut Ui,
+    session: &mut Session,
+    obj_id: &str,
+    local_frame: f64,
+    theme: &Cm3Theme,
+) {
+    let raw = eval_prop_str(
+        lookup_session_prop(session, obj_id, "particles.size").as_ref(),
+        local_frame,
+        "",
+    );
+    let mut stops: Vec<(f64, f64)> = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|item| {
+                    let t = item
+                        .get("t")
+                        .or_else(|| item.get("pos"))
+                        .and_then(Value::as_f64)?;
+                    let s = item
+                        .get("size")
+                        .or_else(|| item.get("value"))
+                        .and_then(Value::as_f64)?;
+                    Some((t, s))
+                })
+                .collect()
+        })
+        .filter(|v: &Vec<_>| v.len() >= 2)
+        .unwrap_or_else(|| vec![(0.0, 1.0), (1.0, 0.0)]);
+
+    cm3_collapsible_section(
+        ui,
+        Id::unique((obj_id, "particles_size_life")),
+        "Size over Life",
+        false,
+        theme,
+        |ui| {
+            let mut dirty = false;
+            let mut remove_idx = None;
+            let stops_len = stops.len();
+            Frame::NONE
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    for (si, (t, sz)) in stops.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::DragValue::new(t)
+                                        .range(0.0..=1.0)
+                                        .speed(0.01)
+                                        .prefix("t "),
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                            if ui
+                                .add(
+                                    egui::DragValue::new(sz)
+                                        .range(0.0..=100.0)
+                                        .speed(0.05)
+                                        .prefix("sz "),
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                            if stops_len > 2 && ui.small_button("×").clicked() {
+                                remove_idx = Some(si);
+                            }
+                        });
+                    }
+                    if let Some(ri) = remove_idx {
+                        stops.remove(ri);
+                        dirty = true;
+                    }
+                    if ui.small_button("+ Add Size Stop").clicked() {
+                        stops.push((0.5, 1.0));
+                        dirty = true;
+                    }
+                });
+            if dirty {
+                stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let encoded = Value::Array(
+                    stops
+                        .into_iter()
+                        .map(|(t, s)| json!({ "t": t, "size": s }))
+                        .collect(),
+                )
+                .to_string();
+                let _ = session.execute(Command::SetPropertyValue {
+                    target_id: obj_id.to_owned(),
+                    property: "particles.size".to_owned(),
+                    value: json!(encoded),
+                });
+            }
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Extended 3D Object Inspectors (Geometry+ 8/8, Repeaters & 10-Key Field,
+//    Optical Flare, Particle & Light Suite, Text+, ExpressText+)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn show_extended_3d_object_props(
+    ui: &mut Ui,
+    session: &mut Session,
+    obj: &SessionObject3D,
+    local_frame: f64,
+    clip_start: f64,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+    actions: &mut Vec<PanelAction>,
+) {
+    let kind_norm = obj.kind.replace('_', "-");
+    match kind_norm.as_str() {
+        "box" => {
+            show_session_vec3_prop(
+                ui,
+                session,
+                &obj.id,
+                "box_size",
+                "Size",
+                [10.0, 10.0, 10.0],
+                ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "cylinder" => {
+            show_session_vec3_prop(
+                ui,
+                session,
+                &obj.id,
+                "cylinder_size",
+                "Size",
+                [10.0, 10.0, 20.0],
+                ScrubConfig::new(0.0, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "cylinder_detail",
+                "Detail",
+                16.0,
+                ScrubConfig::new(3.0, 128.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                &obj.id,
+                "cylinder_openEnded",
+                "Open ended",
+                &["off", "on"],
+                1,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "rectangle" => {
+            show_session_vec2_prop(
+                ui,
+                session,
+                &obj.id,
+                "rect_size",
+                "Size",
+                [10.0, 10.0],
+                ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "circle" => {
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "circle_size",
+                "Radius",
+                10.0,
+                ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "circle_detail",
+                "Detail",
+                16.0,
+                ScrubConfig::new(3.0, 128.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "sphere" => {
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "sphere_size",
+                "Radius",
+                10.0,
+                ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec2_prop(
+                ui,
+                session,
+                &obj.id,
+                "sphere_detail",
+                "Detail",
+                [10.0, 10.0],
+                ScrubConfig::new(3.0, 128.0, 1.0, 0),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "donut" => {
+            show_session_vec2_prop(
+                ui,
+                session,
+                &obj.id,
+                "donut_size",
+                "Size",
+                [10.0, 10.0],
+                ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec2_prop(
+                ui,
+                session,
+                &obj.id,
+                "donut_detail",
+                "Detail",
+                [16.0, 16.0],
+                ScrubConfig::new(3.0, 128.0, 1.0, 0),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "wire" => {
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "path_thickness",
+                "Thickness",
+                1.0,
+                ScrubConfig::new(0.01, 500.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "path_detail",
+                "Detail",
+                16.0,
+                ScrubConfig::new(2.0, 256.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                &obj.id,
+                "path_closed",
+                "Closed loop",
+                &["off", "on"],
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "model" => {
+            show_session_asset_prop(
+                ui,
+                session,
+                &obj.id,
+                "customGeometry",
+                "Model",
+                false,
+                local_frame,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "group" => {
+            show_session_option_prop_ex(
+                ui,
+                session,
+                &obj.id,
+                "reflectionVisibility",
+                "Reflection",
+                &["normal", "reflection only", "both"],
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        // --- Geometry+ 8/8 ---
+        "zoidium:geometry-plus/rounded-box" => {
+            show_session_vec3_prop(
+                ui,
+                session,
+                &obj.id,
+                "box_size",
+                "Size",
+                [10.0, 10.0, 10.0],
+                ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "bevelRadius",
+                "Bevel radius",
+                1.5,
+                ScrubConfig::new(0.0, 500.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "segments",
+                "Bevel segments",
+                4.0,
+                ScrubConfig::new(1.0, 32.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "zoidium:geometry-plus/polyhedron"
+        | "zoidium:geometry-plus/tetrahedron"
+        | "zoidium:geometry-plus/octahedron"
+        | "zoidium:geometry-plus/dodecahedron"
+        | "zoidium:geometry-plus/icosahedron" => {
+            show_session_option_prop_ex(
+                ui,
+                session,
+                &obj.id,
+                "polyKind",
+                "Polyhedron",
+                &["Tetrahedron", "Octahedron", "Dodecahedron", "Icosahedron"],
+                3,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "radius",
+                "Radius",
+                10.0,
+                ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "detail",
+                "Subdivisions",
+                0.0,
+                ScrubConfig::new(0.0, 5.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "zoidium:geometry-plus/cone" => {
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "radius",
+                "Radius",
+                10.0,
+                ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "height",
+                "Height",
+                20.0,
+                ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "radialSegments",
+                "Segments",
+                32.0,
+                ScrubConfig::new(3.0, 128.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                &obj.id,
+                "openEnded",
+                "Open ended",
+                &["off", "on"],
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "zoidium:geometry-plus/capsule" => {
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "radius",
+                "Radius",
+                5.0,
+                ScrubConfig::new(0.01, 5000.0, 0.25, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "length",
+                "Length",
+                12.0,
+                ScrubConfig::new(0.0, 10_000.0, 0.5, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "capSegments",
+                "Cap segments",
+                8.0,
+                ScrubConfig::new(2.0, 64.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "radialSegments",
+                "Radial segs",
+                16.0,
+                ScrubConfig::new(4.0, 128.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "zoidium:geometry-plus/tube" | "zoidium:geometry-plus/spline" => {
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "radius",
+                "Tube radius",
+                1.5,
+                ScrubConfig::new(0.01, 1000.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "tubularSegments",
+                "Path segs",
+                48.0,
+                ScrubConfig::new(4.0, 256.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "radialSegments",
+                "Radial segs",
+                12.0,
+                ScrubConfig::new(3.0, 64.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                &obj.id,
+                "closed",
+                "Closed loop",
+                &["off", "on"],
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "zoidium:geometry-plus/gear" => {
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "teeth",
+                "Teeth",
+                12.0,
+                ScrubConfig::new(4.0, 128.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "outerRadius",
+                "Outer radius",
+                12.0,
+                ScrubConfig::new(0.5, 5000.0, 0.25, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "innerRadius",
+                "Inner radius",
+                4.0,
+                ScrubConfig::new(0.0, 5000.0, 0.25, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "depth",
+                "Thickness",
+                3.0,
+                ScrubConfig::new(0.1, 1000.0, 0.2, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "toothDepth",
+                "Tooth depth",
+                2.0,
+                ScrubConfig::new(0.1, 500.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "zoidium:geometry-plus/helix" => {
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "radius",
+                "Coil radius",
+                8.0,
+                ScrubConfig::new(0.1, 5000.0, 0.25, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "tubeRadius",
+                "Tube radius",
+                1.0,
+                ScrubConfig::new(0.05, 500.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "turns",
+                "Turns",
+                4.0,
+                ScrubConfig::new(0.25, 64.0, 0.25, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "height",
+                "Height",
+                24.0,
+                ScrubConfig::new(0.1, 5000.0, 0.5, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "segments",
+                "Segments",
+                64.0,
+                ScrubConfig::new(8.0, 512.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        "zoidium:geometry-plus/torus-knot" => {
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "radius",
+                "Radius",
+                10.0,
+                ScrubConfig::new(0.1, 5000.0, 0.5, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "tube",
+                "Tube radius",
+                2.5,
+                ScrubConfig::new(0.05, 1000.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "p",
+                "P windings",
+                2.0,
+                ScrubConfig::new(1.0, 20.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "q",
+                "Q windings",
+                3.0,
+                ScrubConfig::new(1.0, 20.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "tubularSegments",
+                "Tubular segs",
+                64.0,
+                ScrubConfig::new(8.0, 512.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "radialSegments",
+                "Radial segs",
+                12.0,
+                ScrubConfig::new(3.0, 64.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        // --- Repeaters & Effector+ (All 9 Classes + 10-Key Falloff Field) ---
+        k if k.starts_with("zoidium:repeater/") || k.starts_with("zoidcraft:repeater/") => {
+            let sub = k.rsplit('/').next().unwrap_or("");
+            match sub {
+                "repeater" | "linear-repeater" | "random-repeater" | "echo-repeater" => {
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "count",
+                        "Copies",
+                        5.0,
+                        ScrubConfig::new(1.0, 500.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "offsetPosition",
+                        "Step pos",
+                        [12.0, 0.0, 0.0],
+                        ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "offsetRotation",
+                        "Step rot",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-3600.0, 3600.0, 1.0, 1),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "offsetScale",
+                        "Step scale",
+                        [1.0, 1.0, 1.0],
+                        ScrubConfig::new(-10.0, 10.0, 0.02, 2),
+                        true,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    if sub == "random-repeater" {
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            &obj.id,
+                            "seed",
+                            "Seed",
+                            1.0,
+                            ScrubConfig::new(0.0, 100_000.0, 1.0, 0),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_vec3_prop(
+                            ui,
+                            session,
+                            &obj.id,
+                            "spread",
+                            "Spread",
+                            [25.0, 25.0, 25.0],
+                            ScrubConfig::new(0.0, 10_000.0, 0.5, 2),
+                            false,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    } else if sub == "echo-repeater" {
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            &obj.id,
+                            "frameOffset",
+                            "Frame lag",
+                            -2.0,
+                            ScrubConfig::new(-300.0, 300.0, 0.5, 1),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            &obj.id,
+                            "decay",
+                            "Opacity decay",
+                            0.8,
+                            ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    }
+                }
+                "twist" => {
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "angle",
+                        "Twist angle",
+                        90.0,
+                        ScrubConfig::new(-3600.0, 3600.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "axis",
+                        "Axis",
+                        &["X", "Y", "Z"],
+                        1,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "strength",
+                        "Strength",
+                        1.0,
+                        ScrubConfig::new(0.0, 5.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "warp" => {
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "mode",
+                        "Warp mode",
+                        &["Bend", "Bulge", "Shear", "Taper"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "strength",
+                        "Strength",
+                        1.0,
+                        ScrubConfig::new(-10.0, 10.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "curvature",
+                        "Curvature",
+                        0.5,
+                        ScrubConfig::new(-10.0, 10.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "voronoi-fracture" => {
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "cellCount",
+                        "Cell count",
+                        16.0,
+                        ScrubConfig::new(2.0, 256.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "explode",
+                        "Explode",
+                        0.0,
+                        ScrubConfig::new(-500.0, 500.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "spin",
+                        "Cell spin",
+                        0.0,
+                        ScrubConfig::new(-3600.0, 3600.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "seed",
+                        "Seed",
+                        1.0,
+                        ScrubConfig::new(0.0, 100_000.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "plain" => {
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "strength",
+                        "Strength",
+                        1.0,
+                        ScrubConfig::new(-5.0, 5.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "effectorPosition",
+                        "Offset pos",
+                        [0.0, 10.0, 0.0],
+                        ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "effectorRotation",
+                        "Offset rot",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-3600.0, 3600.0, 1.0, 1),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "effectorScale",
+                        "Offset scale",
+                        [1.0, 1.0, 1.0],
+                        ScrubConfig::new(-10.0, 10.0, 0.02, 2),
+                        true,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "delay" => {
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "mode",
+                        "Mode",
+                        &["Blend", "Spring", "Even"],
+                        1,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "strength",
+                        "Strength",
+                        0.65,
+                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "damping",
+                        "Damping",
+                        0.4,
+                        ScrubConfig::new(0.0, 2.0, 0.02, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                _ => {}
+            }
+            // Collapsible Falloff Field (all 10 field* keys)
+            show_falloff_field_section(
+                ui,
+                session,
+                &obj.id,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        // --- Optical Flares ---
+        k if k.contains("optical-flares") => {
+            show_session_color_prop(
+                ui,
+                session,
+                &obj.id,
+                "flareColor",
+                "Flare color",
+                [1.0, 0.85, 0.65],
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "brightness",
+                "Brightness",
+                1.2,
+                ScrubConfig::new(0.0, 10.0, 0.05, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "size",
+                "Size",
+                1.0,
+                ScrubConfig::new(0.05, 10.0, 0.05, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "anamorphic",
+                "Anamorphic",
+                0.5,
+                ScrubConfig::new(0.0, 2.0, 0.02, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "ghosts",
+                "Ghosts",
+                6.0,
+                ScrubConfig::new(0.0, 24.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "starburstRays",
+                "Starburst rays",
+                8.0,
+                ScrubConfig::new(0.0, 32.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "ringIntensity",
+                "Ring intensity",
+                0.4,
+                ScrubConfig::new(0.0, 2.0, 0.02, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                &obj.id,
+                "occlusion",
+                "Depth occlusion",
+                &["off", "on"],
+                1,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "angle",
+                "Rotation",
+                0.0,
+                ScrubConfig::new(-360.0, 360.0, 1.0, 1),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        }
+        // --- Particle & Light Suite (Particular / Form / Plexus) ---
+        k if k.contains("trapcode-suite") => {
+            show_session_color_prop(
+                ui,
+                session,
+                &obj.id,
+                "color",
+                "Color",
+                [0.4, 0.85, 1.0],
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "count",
+                "Particle count",
+                500.0,
+                ScrubConfig::new(1.0, 50_000.0, 5.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "size",
+                "Point size",
+                3.0,
+                ScrubConfig::new(0.1, 100.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "turbulence",
+                "Turbulence",
+                0.35,
+                ScrubConfig::new(0.0, 10.0, 0.05, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "speed",
+                "Sim speed",
+                1.0,
+                ScrubConfig::new(-10.0, 10.0, 0.05, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "seed",
+                "Seed",
+                1.0,
+                ScrubConfig::new(0.0, 100_000.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            if k.ends_with("plexus") {
+                show_session_number_prop(
+                    ui,
+                    session,
+                    &obj.id,
+                    "maxDistance",
+                    "Link distance",
+                    18.0,
+                    ScrubConfig::new(0.1, 500.0, 0.5, 1),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    &obj.id,
+                    "lineOpacity",
+                    "Line opacity",
+                    0.5,
+                    ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            }
+        }
+        // --- Text+ & ExpressText+ Modifier Containers ---
+        k if k.contains("text-plus") || k.contains("expresstext-plus") => {
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "strength",
+                "Strength",
+                1.0,
+                ScrubConfig::new(-5.0, 5.0, 0.05, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "delay",
+                "Char delay",
+                0.0,
+                ScrubConfig::new(-10.0, 10.0, 0.05, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "seed",
+                "Seed",
+                1.0,
+                ScrubConfig::new(0.0, 100_000.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            if k.ends_with("formula") {
+                show_session_text_prop(
+                    ui,
+                    session,
+                    &obj.id,
+                    "formula",
+                    "Formula",
+                    "Math.sin(t + i * 0.5)",
+                    local_frame,
+                    state,
+                    theme,
+                );
+            }
+            if k.contains("selected") {
+                show_session_number_prop(
+                    ui,
+                    session,
+                    &obj.id,
+                    "startIndex",
+                    "Start index",
+                    0.0,
+                    ScrubConfig::new(0.0, 500.0, 1.0, 0),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    &obj.id,
+                    "endIndex",
+                    "End index",
+                    10.0,
+                    ScrubConfig::new(0.0, 500.0, 1.0, 0),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_falloff_field_section(
+    ui: &mut Ui,
+    session: &mut Session,
+    obj_id: &str,
+    local_frame: f64,
+    clip_start: f64,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+    actions: &mut Vec<PanelAction>,
+) {
+    state.inspector_root_indent = false;
+    cm3_collapsible_section(
+        ui,
+        Id::unique((obj_id, "falloff_field_section")),
+        "Falloff Field",
+        false,
+        theme,
+        |ui| {
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "field",
+                "Field shape",
+                &["None", "Sphere", "Box", "Linear", "Cylinder", "Noise"],
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec3_prop(
+                ui,
+                session,
+                obj_id,
+                "fieldPosition",
+                "Field pos",
+                [0.0, 0.0, 0.0],
+                ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec3_prop(
+                ui,
+                session,
+                obj_id,
+                "fieldRotation",
+                "Field rot",
+                [0.0, 0.0, 0.0],
+                ScrubConfig::new(-3600.0, 3600.0, 1.0, 1),
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_vec3_prop(
+                ui,
+                session,
+                obj_id,
+                "fieldScale",
+                "Field scale",
+                [20.0, 20.0, 20.0],
+                ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
+                true,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "fieldFalloff",
+                "Falloff",
+                0.5,
+                ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "fieldCurve",
+                "Curve",
+                &["Linear", "Smooth", "Ease In", "Ease Out", "Step"],
+                1,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                "fieldInvert",
+                "Invert field",
+                &["off", "on"],
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "fieldSweep",
+                "Sweep",
+                1.0,
+                ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "fieldNoiseScale",
+                "Noise scale",
+                1.0,
+                ScrubConfig::new(0.01, 100.0, 0.1, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                obj_id,
+                "fieldNoiseEvolution",
+                "Noise evolution",
+                0.0,
+                ScrubConfig::new(-1000.0, 1000.0, 0.05, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. Complete Reusable Material Slot Inspector (All 9 Modes + 7 PBR+ Surface Sections + NodeMaterial)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn show_material_slot_inspector(
+    ui: &mut Ui,
+    session: &mut Session,
+    obj_id: &str,
+    obj_name: &str,
+    prefix: &str,
+    section_title: &str,
+    local_frame: f64,
+    clip_start: f64,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+    actions: &mut Vec<PanelAction>,
+) {
+    let k = |sub: &str| format!("{prefix}.{sub}");
+    cm3_collapsible_section_with_action(
+        ui,
+        Id::unique(("obj_mat_slot", obj_id, prefix)),
+        section_title,
+        prefix == "material",
+        true,
+        state.prop_columns.label_ratio,
+        None,
+        theme,
+        |ui| {
+            let mat_options: Vec<&str> = if session.plugins.is_enabled("material-plus") {
+                vec![
+                    "single color",
+                    "texture",
+                    "video",
+                    "custom PBR",
+                    "custom shader",
+                    "PBR+ (Material+)",
+                    "Matcap (Material+)",
+                    "Image+ (Material+)",
+                    "Node Material",
+                ]
+            } else {
+                vec![
+                    "single color",
+                    "texture",
+                    "video",
+                    "custom PBR",
+                    "custom shader",
+                ]
+            };
+            let type_key = k("type");
+            show_session_option_prop_ex(
+                ui,
+                session,
+                obj_id,
+                &type_key,
+                "Material",
+                &mat_options,
+                0,
+                false,
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            let mat_type = eval_prop_u32(
+                lookup_session_prop(session, obj_id, &type_key).as_ref(),
+                local_frame,
+                0,
+            );
+            match mat_type {
+                0 => {
+                    show_session_color_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("color"),
+                        "Color",
+                        [1.0, 1.0, 1.0],
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("side"),
+                        "Render side",
+                        &["front", "back", "double"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                1 => {
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("texture"),
+                        "Image",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("side"),
+                        "Render side",
+                        &["front", "back", "double"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                2 => {
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("texture"),
+                        "Video",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_color_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("color"),
+                        "Color",
+                        [1.0, 1.0, 1.0],
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("opacity"),
+                        "Opacity",
+                        1.0,
+                        ScrubConfig::new(0.0, 1.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                3 => {
+                    // Custom PBR + UV Normalized / Wrap / Repeat / Offset / NormalMap / Reflection
+                    show_session_color_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("color"),
+                        "Color",
+                        [1.0, 1.0, 1.0],
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_color_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("emissive"),
+                        "Emissive",
+                        [0.0, 0.0, 0.0],
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("roughness"),
+                        "Roughness",
+                        0.5,
+                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("metalness"),
+                        "Metalness",
+                        0.5,
+                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("texture"),
+                        "Albedo map",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("normalMap"),
+                        "Normal map",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec2_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("normalScale"),
+                        "Normal scale",
+                        [1.0, 1.0],
+                        ScrubConfig::new(-10.0, 10.0, 0.05, 2),
+                        true,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("uvNormalized"),
+                        "UV normalized",
+                        &["off", "on"],
+                        1,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("wrap"),
+                        "UV wrap",
+                        &["Clamp", "Repeat", "Mirrored"],
+                        1,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec2_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("repeat"),
+                        "UV repeat",
+                        [1.0, 1.0],
+                        ScrubConfig::new(-100.0, 100.0, 0.05, 2),
+                        true,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec2_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("offset"),
+                        "UV offset",
+                        [0.0, 0.0],
+                        ScrubConfig::new(-100.0, 100.0, 0.02, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("rotation"),
+                        "UV rotation",
+                        0.0,
+                        ScrubConfig::new(-360.0, 360.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("reflection"),
+                        "Reflection",
+                        0.0,
+                        ScrubConfig::new(0.0, 2.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("opacity"),
+                        "Opacity",
+                        1.0,
+                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("side"),
+                        "Render side",
+                        &["front", "back", "double"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                4 => {
+                    let frag_key = k("fragShader");
+                    let cur_code = eval_prop_str(
+                        lookup_session_prop(session, obj_id, &frag_key).as_ref(),
+                        local_frame,
+                        DEFAULT_CUSTOM_SHADER_GLSL,
+                    );
+                    cm3_property_row_aligned(
+                        ui,
+                        "Fragment shader",
+                        true,
+                        state.prop_columns,
+                        theme,
+                        |_| {},
+                        |ui| {
+                            if cm3_prop_button(
+                                ui,
+                                "Edit shader",
+                                ButtonVariant::Normal,
+                                false,
+                                theme,
+                            )
+                            .clicked()
+                            {
+                                state.shader_editor = Some(ShaderEditorTarget {
+                                    effect_id: obj_id.to_owned(),
+                                    property: frag_key.clone(),
+                                    effect_name: obj_name.to_owned(),
+                                    code: cur_code.clone(),
+                                    font_px: 14.0,
+                                    error_message: None,
+                                });
+                                let spec =
+                                    FloatingWindowSpec::new("shader_editor", "Shader Editor")
+                                        .with_subtitle(obj_name.to_owned())
+                                        .with_default_size(Vec2::new(560.0, 440.0));
+                                state.floating_windows.open_or_focus(&spec, viewport_rect);
+                            }
+                        },
+                    );
+                }
+                5 => {
+                    // PBR+ (Material+): All Maps + AO + All 7 Surface Sections
+                    show_session_color_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("color"),
+                        "Base color",
+                        [1.0, 1.0, 1.0],
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("texture"),
+                        "Base color map",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_color_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("emissive"),
+                        "Emissive",
+                        [0.0, 0.0, 0.0],
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("emissiveIntensity"),
+                        "Emissive int",
+                        1.0,
+                        ScrubConfig::new(0.0, 20.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("emissiveMap"),
+                        "Emissive map",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("roughness"),
+                        "Roughness",
+                        0.5,
+                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("roughnessMap"),
+                        "Roughness map",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("metalness"),
+                        "Metalness",
+                        0.0,
+                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("metalnessMap"),
+                        "Metalness map",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("normalMap"),
+                        "Normal map",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("alphaMap"),
+                        "Alpha map",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("alphaTest"),
+                        "Alpha cutoff",
+                        0.0,
+                        ScrubConfig::new(0.0, 1.0, 0.01, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("opacity"),
+                        "Opacity",
+                        1.0,
+                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("side"),
+                        "Render side",
+                        &["front", "back", "double"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+
+                    // 7 PBR+ Surface Sections
+                    cm3_collapsible_section(
+                        ui,
+                        Id::unique((obj_id, prefix, "surf_ao")),
+                        "Surface: Ambient Occlusion",
+                        false,
+                        theme,
+                        |ui| {
+                            show_session_asset_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("aoTexture"),
+                                "AO map",
+                                false,
+                                local_frame,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_number_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("aoIntensity"),
+                                "AO intensity",
+                                1.0,
+                                ScrubConfig::new(0.0, 4.0, 0.05, 2),
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                        },
+                    );
+                    cm3_collapsible_section(
+                        ui,
+                        Id::unique((obj_id, prefix, "surf_cel")),
+                        "Surface: Cel Shading",
+                        false,
+                        theme,
+                        |ui| {
+                            show_session_option_prop_ex(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("celEnabled"),
+                                "Enable cel",
+                                &["off", "on"],
+                                0,
+                                false,
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_number_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("celBands"),
+                                "Bands",
+                                3.0,
+                                ScrubConfig::new(2.0, 16.0, 1.0, 0),
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_number_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("celSmoothness"),
+                                "Smoothness",
+                                0.05,
+                                ScrubConfig::new(0.0, 1.0, 0.01, 2),
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                        },
+                    );
+                    cm3_collapsible_section(
+                        ui,
+                        Id::unique((obj_id, prefix, "surf_fresnel")),
+                        "Surface: Fresnel Rim",
+                        false,
+                        theme,
+                        |ui| {
+                            show_session_option_prop_ex(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("fresnelEnabled"),
+                                "Enable fresnel",
+                                &["off", "on"],
+                                0,
+                                false,
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_color_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("fresnelColor"),
+                                "Rim color",
+                                [1.0, 1.0, 1.0],
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_number_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("fresnelPower"),
+                                "Power",
+                                3.0,
+                                ScrubConfig::new(0.2, 16.0, 0.1, 2),
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_number_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("fresnelIntensity"),
+                                "Intensity",
+                                1.0,
+                                ScrubConfig::new(0.0, 5.0, 0.05, 2),
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                        },
+                    );
+                    cm3_collapsible_section(
+                        ui,
+                        Id::unique((obj_id, prefix, "surf_ramp")),
+                        "Surface: Color Ramp",
+                        false,
+                        theme,
+                        |ui| {
+                            show_session_option_prop_ex(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("rampEnabled"),
+                                "Enable ramp",
+                                &["off", "on"],
+                                0,
+                                false,
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_color_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("rampColorA"),
+                                "Low color",
+                                [0.1, 0.15, 0.25],
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_color_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("rampColorB"),
+                                "High color",
+                                [1.0, 0.9, 0.7],
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_number_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("rampMix"),
+                                "Mix",
+                                0.5,
+                                ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                        },
+                    );
+                    cm3_collapsible_section(
+                        ui,
+                        Id::unique((obj_id, prefix, "surf_bump")),
+                        "Surface: 3D Bump Noise",
+                        false,
+                        theme,
+                        |ui| {
+                            show_session_option_prop_ex(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("bumpNoiseEnabled"),
+                                "Enable bump",
+                                &["off", "on"],
+                                0,
+                                false,
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_number_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("bumpNoiseScale"),
+                                "Scale",
+                                4.0,
+                                ScrubConfig::new(0.1, 100.0, 0.2, 2),
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_number_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("bumpNoiseStrength"),
+                                "Strength",
+                                0.3,
+                                ScrubConfig::new(0.0, 4.0, 0.05, 2),
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                        },
+                    );
+                    cm3_collapsible_section(
+                        ui,
+                        Id::unique((obj_id, prefix, "surf_uv")),
+                        "Surface: UV Projection",
+                        false,
+                        theme,
+                        |ui| {
+                            show_session_option_prop_ex(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("uvProjection"),
+                                "Projection",
+                                &["UV", "Triplanar", "Box", "Spherical"],
+                                0,
+                                false,
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_vec2_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("repeat"),
+                                "UV repeat",
+                                [1.0, 1.0],
+                                ScrubConfig::new(-100.0, 100.0, 0.05, 2),
+                                true,
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_vec2_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("offset"),
+                                "UV offset",
+                                [0.0, 0.0],
+                                ScrubConfig::new(-100.0, 100.0, 0.02, 2),
+                                false,
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                        },
+                    );
+                    cm3_collapsible_section(
+                        ui,
+                        Id::unique((obj_id, prefix, "surf_env")),
+                        "Surface: Env Reflection",
+                        false,
+                        theme,
+                        |ui| {
+                            show_session_number_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("reflection"),
+                                "Env intensity",
+                                0.0,
+                                ScrubConfig::new(0.0, 4.0, 0.05, 2),
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_number_prop(
+                                ui,
+                                session,
+                                obj_id,
+                                &k("reflectionIntensity"),
+                                "Reflectivity",
+                                1.0,
+                                ScrubConfig::new(0.0, 4.0, 0.05, 2),
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                        },
+                    );
+                }
+                6 => {
+                    // Matcap
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("texture"),
+                        "Matcap image",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_color_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("color"),
+                        "Tint color",
+                        [1.0, 1.0, 1.0],
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("brightness"),
+                        "Brightness",
+                        1.0,
+                        ScrubConfig::new(0.0, 4.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("opacity"),
+                        "Opacity",
+                        1.0,
+                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("side"),
+                        "Render side",
+                        &["front", "back", "double"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                7 => {
+                    // Image+
+                    show_session_asset_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("texture"),
+                        "Image",
+                        false,
+                        local_frame,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("wrap"),
+                        "UV wrap",
+                        &["Clamp", "Repeat", "Mirrored"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec2_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("repeat"),
+                        "Repeat",
+                        [1.0, 1.0],
+                        ScrubConfig::new(-100.0, 100.0, 0.05, 2),
+                        true,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec2_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("offset"),
+                        "Offset",
+                        [0.0, 0.0],
+                        ScrubConfig::new(-100.0, 100.0, 0.02, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("rotation"),
+                        "Rotation",
+                        0.0,
+                        ScrubConfig::new(-360.0, 360.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("opacity"),
+                        "Opacity",
+                        1.0,
+                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        obj_id,
+                        &k("side"),
+                        "Render side",
+                        &["front", "back", "double"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                8 => {
+                    // NodeMaterial -> Opens real interactive Node Graph Editor!
+                    let res_key = k("bakeResolution");
+                    let cur_res = eval_prop_u32(
+                        lookup_session_prop(session, obj_id, &res_key).as_ref(),
+                        local_frame,
+                        512,
+                    );
+                    let res_opts = [256u32, 512, 1024, 2048];
+                    let mut res_idx = res_opts.iter().position(|&r| r == cur_res).unwrap_or(1);
+                    if panel_property_row(
+                        ui,
+                        "Bake resolution",
+                        true,
+                        state,
+                        theme,
+                        |_| {},
+                        |ui| {
+                            cm3_dropdown(
+                                ui,
+                                Id::unique((obj_id, prefix, "node_mat_res")),
+                                &mut res_idx,
+                                &["256×256", "512×512", "1024×1024", "2048×2048"],
+                                false,
+                                viewport_rect,
+                                theme,
+                            )
+                        },
+                    ) {
+                        let _ = session.execute(Command::SetPropertyValue {
+                            target_id: obj_id.to_owned(),
+                            property: res_key,
+                            value: json!(res_opts[res_idx]),
+                        });
+                    }
+                    let graph_key = k("graph");
+                    let open_node_mat = panel_property_row(
+                        ui,
+                        "Node graph",
+                        true,
+                        state,
+                        theme,
+                        |_| {},
+                        |ui| {
+                            cm3_prop_button(
+                                ui,
+                                "Open Node Material Editor",
+                                ButtonVariant::Primary,
+                                false,
+                                theme,
+                            )
+                            .clicked()
+                        },
+                    );
+                    if open_node_mat {
+                        let cur_graph = lookup_session_prop(session, obj_id, &graph_key)
+                            .and_then(|p| eval_prop_value(Some(&p), local_frame));
+                        state.node_graph_editor.open_for_target(
+                            NodeGraphTargetKind::NodeMaterial,
+                            obj_id,
+                            &graph_key,
+                            obj_name,
+                            cur_graph.as_ref(),
+                        );
+                        let spec =
+                            FloatingWindowSpec::new("pro_node_graph_editor", "Node Graph Editor")
+                                .with_default_size(Vec2::new(980.0, 620.0));
+                        state.floating_windows.open_or_focus(&spec, viewport_rect);
+                    }
+                }
+                _ => {}
+            }
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Asset Usage Count Scanner & Live Expression Diagnostics
+// ---------------------------------------------------------------------------
+
+fn compute_asset_usage_counts(session: &Session) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let known: BTreeSet<String> = session.project.assets.keys().cloned().collect();
+    if known.is_empty() {
+        return counts;
+    }
+    fn scan_json(val: &Value, known: &BTreeSet<String>, counts: &mut BTreeMap<String, usize>) {
+        match val {
+            Value::String(s) => {
+                if known.contains(s) {
+                    *counts.entry(s.clone()).or_insert(0) += 1;
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    scan_json(v, known, counts);
+                }
+            }
+            Value::Object(map) => {
+                for v in map.values() {
+                    scan_json(v, known, counts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Scan active session document (clips, objects_3d, effects)
+    for track in session
+        .document()
+        .video_tracks
+        .iter()
+        .chain(session.document().audio_tracks.iter())
+    {
+        for clip in &track.clips {
+            for prop in clip.properties.values() {
+                scan_json(&prop.default_value, &known, &mut counts);
+            }
+            for obj in &clip.objects_3d {
+                for prop in obj.properties.values() {
+                    scan_json(&prop.default_value, &known, &mut counts);
+                }
+            }
+            for fx in &clip.effects {
+                for prop in fx.properties.values() {
+                    scan_json(&prop.default_value, &known, &mut counts);
+                }
+            }
+        }
+    }
+    // Also scan project audio clips & compositions media fields
+    for seq in
+        std::iter::once(&session.project.sequence).chain(session.project.compositions.values())
+    {
+        for at in &seq.audio_tracks {
+            for ac in &at.clips {
+                if let Some(m) = &ac.media
+                    && known.contains(m)
+                {
+                    *counts.entry(m.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+fn evaluate_expression_live_preview(
+    session: &Session,
+    target_id: &str,
+    property: &str,
+    code: &str,
+) -> Result<String, String> {
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        return Err("Expression is empty".to_owned());
+    }
+    let mode = if session.plugins.is_enabled("expressions-plus") {
+        zc_expr::ExprMode::ExpressionsPlus
+    } else {
+        zc_expr::ExprMode::VanillaCm3
+    };
+    let compiled = zc_expr::compile(trimmed, mode).map_err(|e| e.to_string())?;
+    let fps = session.document().fps.max(1.0);
+    let frame = session.playback.current_frame;
+    let cur_val = lookup_session_prop(session, target_id, property)
+        .and_then(|p| eval_prop_value(Some(&p), frame))
+        .map(|v| json_to_expr_value(&v))
+        .unwrap_or(zc_expr::Value::Number(0.0));
+    let mut ctx = zc_expr::BasicContext {
+        frame,
+        time: Some(frame / fps),
+        fps,
+        value: cur_val,
+        properties: BTreeMap::new(),
+    };
+    for ctl in &session.active_sequence().controls {
+        if let Some(n) = ctl.track.value.as_f64() {
+            ctx.properties
+                .insert(ctl.name.clone(), zc_expr::Value::Number(n));
+        }
+    }
+    let cfg = zc_expr::EvalConfig {
+        mode,
+        max_steps: 200_000,
+        max_recursion: 64,
+    };
+    let out = compiled.evaluate(&ctx, &cfg).map_err(|e| e.to_string())?;
+    Ok(format_expr_value(&out))
+}
+
+fn json_to_expr_value(v: &Value) -> zc_expr::Value {
+    match v {
+        Value::Bool(b) => zc_expr::Value::Bool(*b),
+        Value::Number(n) => zc_expr::Value::Number(n.as_f64().unwrap_or(0.0)),
+        Value::String(s) => zc_expr::Value::String(s.clone()),
+        Value::Array(arr) => zc_expr::Value::Array(arr.iter().map(json_to_expr_value).collect()),
+        _ => zc_expr::Value::Number(0.0),
+    }
+}
+
+fn format_expr_value(v: &zc_expr::Value) -> String {
+    match v {
+        zc_expr::Value::Number(n) => {
+            if (n.fract()).abs() < 1e-6 {
+                format!("{}", n.round() as i64)
+            } else {
+                format!("{n:.4}")
+            }
+        }
+        zc_expr::Value::Bool(b) => b.to_string(),
+        zc_expr::Value::String(s) => format!("\"{s}\""),
+        zc_expr::Value::Array(arr) => {
+            let parts: Vec<String> = arr.iter().map(format_expr_value).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        zc_expr::Value::Null => "null".to_owned(),
+        zc_expr::Value::Undefined => "undefined".to_owned(),
+        zc_expr::Value::Object(_) => "[Object]".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13488,6 +20472,10 @@ mod tests {
     fn transform_wrap_has_all_three_modes_and_objects_picker_matches_zoidium() {
         assert_eq!(
             template_option_labels("transform", "wrap"),
+            &["tile", "reflect"]
+        );
+        assert_eq!(
+            template_option_labels("shake", "wrap"),
             &["clamp", "tile", "reflect"]
         );
 
@@ -13503,6 +20491,96 @@ mod tests {
                 .iter()
                 .all(|i| i.id != "zoidium:geometry-plus/superquadric")
         );
+    }
+
+    #[test]
+    fn wave4b_pickers_containers_and_live_expr_diagnostics() {
+        let mut session = Session::new();
+        for pid in [
+            "geometry-plus",
+            "repeater",
+            "camera-plus",
+            "text-plus",
+            "expresstext-plus",
+            "optical-flares",
+            "trapcode-suite",
+            "smart-motion-blur-lite",
+            "layer-input",
+        ] {
+            let _ = session.execute(Command::EnablePlugin {
+                plugin_id: pid.to_owned(),
+            });
+        }
+
+        // Container check covers group, repeaters, text-plus, expresstext-plus
+        assert!(is_container_object("group"));
+        assert!(is_container_object("zoidium:repeater/linear-repeater"));
+        assert!(is_container_object("zoidium:repeater/plain"));
+        assert!(is_container_object("zoidium:text-plus/text-plus"));
+        assert!(is_container_object("zoidium:expresstext-plus/expresstext"));
+
+        // Object picker uses canonical hyphenated IDs and zero third-party brands
+        let obj_items = build_object_picker_items(&session);
+        for req_id in [
+            "ambient_light",
+            "zoidium:geometry-plus/rounded-box",
+            "zoidium:geometry-plus/gear",
+            "zoidium:geometry-plus/helix",
+            "zoidium:geometry-plus/spline",
+            "zoidium:repeater/plain",
+            "zoidium:repeater/delay",
+            "zoidium:repeater/voronoi-fracture",
+            "zoidium:camera-plus/camera",
+            "zoidium:text-plus/text-plus",
+            "zoidium:expresstext-plus/expresstext",
+            "zoidium:trapcode-suite/area-light",
+        ] {
+            assert!(
+                obj_items.iter().any(|i| i.id == req_id),
+                "missing object picker item `{req_id}`"
+            );
+        }
+        let forbidden = [
+            "trapcode",
+            "magic bullet",
+            "red giant",
+            "maxon",
+            "videocopilot",
+        ];
+        for item in &obj_items {
+            let txt = format!("{} {} {}", item.category, item.name, item.desc).to_ascii_lowercase();
+            for bad in forbidden {
+                assert!(!txt.contains(bad), "forbidden brand `{bad}` in `{txt}`");
+            }
+        }
+
+        // Effect picker has no duplicate smart-motion-blur-lite/zsmb or layer-input/layer_input
+        let fx_items = build_effect_picker_items(&session);
+        assert!(
+            fx_items
+                .iter()
+                .all(|i| i.id != "zoidium:smart-motion-blur-lite/zsmb")
+        );
+        assert!(
+            fx_items
+                .iter()
+                .all(|i| i.id != "zoidium:layer-input/layer_input")
+        );
+
+        // Live expression diagnostics
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let ok = evaluate_expression_live_preview(&session, &clip_id, "opacity", "1 + 2 * 3");
+        assert_eq!(ok.as_deref(), Ok("7"));
+        let err = evaluate_expression_live_preview(&session, &clip_id, "opacity", "1 + *");
+        assert!(err.is_err());
+
+        // All 4 Shader+ starter templates compile via translate_glsl_es100_with_options
+        for (name, src) in SHADER_PLUS_STARTER_TEMPLATES {
+            assert!(
+                translate_glsl_es100_with_options(src, &CompileOptions::default()).is_ok(),
+                "starter template `{name}` failed GLSL translation"
+            );
+        }
     }
 
     #[test]

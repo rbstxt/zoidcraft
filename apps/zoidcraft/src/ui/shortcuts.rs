@@ -5,11 +5,12 @@
 use std::collections::BTreeSet;
 
 use egui::{Context, Key, Modifiers};
+use zc_project::Uuid;
 use zc_session::{Command, Session};
 
 use super::graph_editor::{GraphDragState, GraphEditorState};
 use super::timeline::TimelineViewState;
-use super::viewport::{ViewportDragState, ViewportState};
+use super::viewport::{Gizmo3DMode, ViewportDragState, ViewportState};
 
 /// Actions returned by [`dispatch_shortcuts`] that require host-shell coordination
 /// (native file dialogs, floating window visibility, status toast reporting).
@@ -120,6 +121,24 @@ pub fn dispatch_shortcuts(
                     }
                     Key::D => {
                         p.d.get_or_insert(m);
+                    }
+                    Key::V => {
+                        p.v.get_or_insert(m);
+                    }
+                    Key::P => {
+                        p.p.get_or_insert(m);
+                    }
+                    Key::Q => {
+                        p.q.get_or_insert(m);
+                    }
+                    Key::W => {
+                        p.w.get_or_insert(m);
+                    }
+                    Key::E => {
+                        p.e.get_or_insert(m);
+                    }
+                    Key::R => {
+                        p.r.get_or_insert(m);
                     }
                     Key::Delete => {
                         p.delete.get_or_insert(m);
@@ -253,6 +272,27 @@ pub fn dispatch_shortcuts(
         duplicate_selected(session, &mut outcome);
         return outcome;
     }
+    if let Some(m) = pressed.c
+        && cmd_shift(m)
+    {
+        precompose_selected_clips(session, &mut outcome);
+        return outcome;
+    }
+    let graph_focused = graph_editor.open && graph_editor.window_focused;
+    if !graph_focused
+        && let Some(m) = pressed.c
+        && cmd_only(m)
+    {
+        copy_selected_clips(session, timeline, &mut outcome);
+        return outcome;
+    }
+    if !graph_focused
+        && let Some(m) = pressed.v
+        && cmd_only(m)
+    {
+        paste_clipboard_clips(session, timeline, &mut outcome);
+        return outcome;
+    }
     if let Some(m) = pressed.num0
         && cmd_only(m)
     {
@@ -371,7 +411,70 @@ pub fn dispatch_shortcuts(
         return outcome;
     }
 
-    // --- Viewport Mode Toggles ---
+    // --- Viewport Mode Toggles & Pro Tools ---
+    if let Some(m) = pressed.v
+        && no_mods(m)
+    {
+        viewport.active_draw_tool = None;
+        outcome.mark_handled(Key::V);
+        return outcome;
+    }
+    if let Some(m) = pressed.p
+        && no_mods(m)
+    {
+        viewport.active_draw_tool = Some(0);
+        outcome.mark_handled(Key::P);
+        return outcome;
+    }
+    if let Some(m) = pressed.q
+        && no_mods(m)
+    {
+        viewport.active_draw_tool = if viewport.active_draw_tool == Some(2) {
+            Some(1)
+        } else {
+            Some(2)
+        };
+        outcome.mark_handled(Key::Q);
+        return outcome;
+    }
+    if let Some(m) = pressed.w
+        && no_mods(m)
+    {
+        viewport.gizmo_3d_mode = Gizmo3DMode::Translate;
+        outcome.mark_handled(Key::W);
+        return outcome;
+    }
+    if let Some(m) = pressed.e
+        && no_mods(m)
+    {
+        viewport.gizmo_3d_mode = Gizmo3DMode::Rotate;
+        outcome.mark_handled(Key::E);
+        return outcome;
+    }
+    if let Some(m) = pressed.r
+        && no_mods(m)
+    {
+        viewport.gizmo_3d_mode = Gizmo3DMode::Scale;
+        outcome.mark_handled(Key::R);
+        return outcome;
+    }
+    if let Some(m) = pressed.m
+        && no_mods(m)
+    {
+        let frame = session.playback.current_frame.round().max(0.0);
+        let name = format!("Marker {}", session.active_sequence().markers.len() + 1);
+        exec(
+            session,
+            Command::AddMarker {
+                frame,
+                name,
+                color: None,
+            },
+            Key::M,
+            &mut outcome,
+        );
+        return outcome;
+    }
     if let Some(m) = pressed.c
         && no_mods(m)
     {
@@ -758,6 +861,74 @@ fn delete_selected(session: &mut Session, key: Key, outcome: &mut ShortcutOutcom
     }
 }
 
+fn copy_selected_clips(
+    session: &mut Session,
+    timeline: &mut TimelineViewState,
+    outcome: &mut ShortcutOutcome,
+) {
+    let sel_uuids: Vec<Uuid> = session
+        .selection
+        .clip_ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect();
+    if sel_uuids.is_empty() {
+        return;
+    }
+    match session.copy_clips(&sel_uuids) {
+        Ok(snaps) => {
+            timeline.clip_clipboard = snaps;
+            outcome.mark_handled(Key::C);
+        }
+        Err(err) => {
+            outcome.last_error = Some(err.to_string());
+            outcome.mark_handled(Key::C);
+        }
+    }
+}
+
+fn paste_clipboard_clips(
+    session: &mut Session,
+    timeline: &TimelineViewState,
+    outcome: &mut ShortcutOutcome,
+) {
+    if timeline.clip_clipboard.is_empty() {
+        return;
+    }
+    let target_frame = session.playback.current_frame.round().max(0.0);
+    exec(
+        session,
+        Command::PasteClips {
+            clips: timeline.clip_clipboard.clone(),
+            target_frame,
+        },
+        Key::V,
+        outcome,
+    );
+}
+
+fn precompose_selected_clips(session: &mut Session, outcome: &mut ShortcutOutcome) {
+    let sel_uuids: Vec<Uuid> = session
+        .selection
+        .clip_ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect();
+    if sel_uuids.is_empty() {
+        return;
+    }
+    let name = format!("Precomp {}", session.project.compositions.len() + 1);
+    exec(
+        session,
+        Command::PrecomposeClips {
+            clip_ids: sel_uuids,
+            name,
+        },
+        Key::C,
+        outcome,
+    );
+}
+
 fn snap_paused_playhead_to_integer(session: &mut Session) {
     let max_frame = (session.document().sequence_length - 1.0).max(0.0);
     session.playback.current_frame = session.playback.current_frame.round().clamp(0.0, max_frame);
@@ -791,6 +962,12 @@ struct PressedSnapshot {
     n: Option<Modifiers>,
     g: Option<Modifiers>,
     d: Option<Modifiers>,
+    v: Option<Modifiers>,
+    p: Option<Modifiers>,
+    q: Option<Modifiers>,
+    w: Option<Modifiers>,
+    e: Option<Modifiers>,
+    r: Option<Modifiers>,
     delete: Option<Modifiers>,
     backspace: Option<Modifiers>,
     minus: Option<Modifiers>,
@@ -1226,5 +1403,163 @@ mod tests {
         );
         assert!(!out.handled_any);
         assert!(!session.playback.is_playing());
+    }
+
+    #[test]
+    fn pro_shortcuts_dispatch_draw_tools_gizmo_modes_marker_and_clip_copy_paste() {
+        let ctx = Context::default();
+        let mut session = Session::new();
+        let mut timeline = TimelineViewState::new();
+        let mut graph = GraphEditorState::new();
+        let mut viewport = ViewportState::new();
+
+        // P -> Pen tool (Some(0))
+        let out_p = run_key_event(
+            &ctx,
+            Key::P,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert!(out_p.handled_any);
+        assert_eq!(viewport.active_draw_tool, Some(0));
+
+        // Q -> Freehand/Quick Shape (Some(2)), repeat Q -> Vertex/Path Edit (Some(1))
+        let _ = run_key_event(
+            &ctx,
+            Key::Q,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert_eq!(viewport.active_draw_tool, Some(2));
+        let _ = run_key_event(
+            &ctx,
+            Key::Q,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert_eq!(viewport.active_draw_tool, Some(1));
+
+        // V -> Select/Transform tool (None)
+        let _ = run_key_event(
+            &ctx,
+            Key::V,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert_eq!(viewport.active_draw_tool, None);
+
+        // W / E / R -> 3D gizmo modes Translate / Rotate / Scale
+        let _ = run_key_event(
+            &ctx,
+            Key::E,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert_eq!(viewport.gizmo_3d_mode, Gizmo3DMode::Rotate);
+        let _ = run_key_event(
+            &ctx,
+            Key::R,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert_eq!(viewport.gizmo_3d_mode, Gizmo3DMode::Scale);
+        let _ = run_key_event(
+            &ctx,
+            Key::W,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert_eq!(viewport.gizmo_3d_mode, Gizmo3DMode::Translate);
+
+        // M -> AddMarker at current playhead frame
+        session.playback.current_frame = 42.0;
+        let markers_before = session.active_sequence().markers.len();
+        let out_m = run_key_event(
+            &ctx,
+            Key::M,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert!(out_m.handled_any);
+        assert_eq!(session.active_sequence().markers.len(), markers_before + 1);
+        assert!((session.active_sequence().markers.last().unwrap().frame - 42.0).abs() < 1e-6);
+
+        // Cmd+C / Cmd+V -> Copy and Paste clips at playhead (when Graph Editor is NOT focused)
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session.selection.select_clip(clip_id, Some("scene"), false);
+        let clips_before = session.document().video_tracks[0].clips.len();
+
+        // While Graph Editor IS open and focused, Cmd+C must NOT copy clips.
+        graph.open = true;
+        graph.window_focused = true;
+        let out_c_blocked = run_key_event(
+            &ctx,
+            Key::C,
+            Modifiers::COMMAND,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert!(!out_c_blocked.handled_any);
+        assert!(timeline.clip_clipboard.is_empty());
+
+        // Unfocus Graph Editor -> Cmd+C copies selected clip, Cmd+V pastes at playhead.
+        graph.window_focused = false;
+        let out_copy = run_key_event(
+            &ctx,
+            Key::C,
+            Modifiers::COMMAND,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert!(out_copy.handled_any);
+        assert_eq!(timeline.clip_clipboard.len(), 1);
+
+        session.playback.current_frame = 400.0;
+        let out_paste = run_key_event(
+            &ctx,
+            Key::V,
+            Modifiers::COMMAND,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert!(out_paste.handled_any);
+        assert!(out_paste.last_error.is_none());
+        let total_clips_after: usize = session
+            .document()
+            .video_tracks
+            .iter()
+            .map(|t| t.clips.len())
+            .sum();
+        assert_eq!(total_clips_after, clips_before + 1);
     }
 }
