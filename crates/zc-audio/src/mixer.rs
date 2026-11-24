@@ -1,6 +1,7 @@
 //! Deterministic offline stereo audio mixer implementing the exact CM3
 //! gain and equal-power pan law (Spec 03 §1.4 & Spec 04 §4.2).
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
 
@@ -159,15 +160,16 @@ pub fn mix_offline_stereo(
 
 /// Fallible version of [`mix_offline_stereo_animated`] that rejects excessive sample counts
 /// instead of silently truncating or OOM-aborting.
-pub fn try_mix_offline_stereo_animated<F>(
+pub fn try_mix_offline_stereo_animated<B, F>(
     total_frames: f64,
     fps: f64,
     sample_rate: u32,
     clips: &[AudioClipScheduleItem],
-    buffers: &HashMap<String, AudioBuffer>,
+    buffers: &HashMap<String, B>,
     eval_clip: F,
 ) -> Result<Vec<[f32; 2]>, AudioError>
 where
+    B: Borrow<AudioBuffer>,
     F: Fn(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
 {
     let total_samples = try_offline_total_samples(total_frames, fps, sample_rate)?;
@@ -186,30 +188,32 @@ where
 /// `eval_clip(clip_index, clip, local_frame)` evaluates animated `time(f)`, `volume(f)`,
 /// and `pan(f)` for each active output sample.
 #[must_use]
-pub fn mix_offline_stereo_animated<F>(
+pub fn mix_offline_stereo_animated<B, F>(
     total_frames: f64,
     fps: f64,
     sample_rate: u32,
     clips: &[AudioClipScheduleItem],
-    buffers: &HashMap<String, AudioBuffer>,
+    buffers: &HashMap<String, B>,
     eval_clip: F,
 ) -> Vec<[f32; 2]>
 where
+    B: Borrow<AudioBuffer>,
     F: Fn(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
 {
     let total_samples = offline_total_samples(total_frames, fps, sample_rate);
     mix_offline_stereo_animated_inner(total_samples, fps, sample_rate, clips, buffers, eval_clip)
 }
 
-fn mix_offline_stereo_animated_inner<F>(
+fn mix_offline_stereo_animated_inner<B, F>(
     total_samples: usize,
     fps: f64,
     sample_rate: u32,
     clips: &[AudioClipScheduleItem],
-    buffers: &HashMap<String, AudioBuffer>,
+    buffers: &HashMap<String, B>,
     eval_clip: F,
 ) -> Vec<[f32; 2]>
 where
+    B: Borrow<AudioBuffer>,
     F: Fn(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
 {
     let mut output = vec![[0.0_f32; 2]; total_samples];
@@ -234,9 +238,10 @@ where
             continue;
         }
 
-        let Some(raw_buf) = buffers.get(&clip.buffer_id) else {
+        let Some(raw_entry) = buffers.get(&clip.buffer_id) else {
             continue;
         };
+        let raw_buf: &AudioBuffer = raw_entry.borrow();
         if raw_buf.frame_count() == 0 || raw_buf.sample_rate == 0 || raw_buf.channels == 0 {
             continue;
         }

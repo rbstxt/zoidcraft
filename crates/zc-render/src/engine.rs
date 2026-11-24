@@ -137,6 +137,24 @@ impl EffectSelfTestReport {
     }
 }
 
+/// Optional interactive viewport overrides for desktop Editing Camera & selection overlays.
+#[derive(Debug, Clone, Default)]
+pub struct RenderOverrides {
+    /// When set, the matching `VideoClip` (by UUID) renders using `editing_camera` and
+    /// displays the CM3 editing grid + selection AABB wireframe.
+    pub editing_camera_clip_id: Option<Uuid>,
+    /// Interactive Editing Camera overriding the active 3D scene camera.
+    pub editing_camera: Option<CameraParams>,
+    /// Selected 3D object UUIDs whose combined world AABB is drawn as a wireframe when
+    /// Editing Camera is active.
+    pub selected_object_ids: Vec<Uuid>,
+}
+
+struct Scene3DOverride<'a> {
+    editing_camera: CameraParams,
+    selected_object_ids: &'a [Uuid],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MeshCacheKey {
     object_id: Uuid,
@@ -145,7 +163,6 @@ struct MeshCacheKey {
 
 struct CachedGpuMesh {
     mesh: Arc<GpuMesh>,
-    #[allow(dead_code)]
     bounds: Aabb3,
     last_used: u64,
 }
@@ -275,6 +292,16 @@ impl ProjectRenderEngine {
         self.output_target.as_ref()
     }
 
+    /// Blits the most recently rendered output target directly into `dst` on the GPU.
+    pub fn blit_output_to(&mut self, dst: &RenderTarget) -> bool {
+        if let Some(src) = self.output_target.as_ref() {
+            self.compositor.blit(&self.ctx, &src.view, dst);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns the number of GPU meshes currently cached.
     #[must_use]
     pub fn cached_mesh_count(&self) -> usize {
@@ -307,6 +334,20 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<&wgpu::TextureView, RenderError> {
+        self.render_frame_to_texture_with_overrides(project, plugins, frame, width, height, None)
+    }
+
+    /// Renders `project` at `frame` with optional interactive viewport [`RenderOverrides`]
+    /// (Editing Camera + selection AABB wireframe) and returns a zero-copy `&wgpu::TextureView`.
+    pub fn render_frame_to_texture_with_overrides(
+        &mut self,
+        project: &Project,
+        plugins: &PluginRegistry,
+        frame: f64,
+        width: u32,
+        height: u32,
+        overrides: Option<&RenderOverrides>,
+    ) -> Result<&wgpu::TextureView, RenderError> {
         self.ctx
             .validate_dimensions(width, height, wgpu::TextureFormat::Rgba8Unorm)?;
 
@@ -326,6 +367,7 @@ impl ProjectRenderEngine {
             height,
             &mut visited_comps,
             0,
+            overrides,
         )?;
 
         self.targets.trim_unused();
@@ -550,6 +592,7 @@ impl ProjectRenderEngine {
         height: u32,
         visited_comps: &mut Vec<Uuid>,
         comp_depth: usize,
+        overrides: Option<&RenderOverrides>,
     ) -> Result<RenderTarget, RenderError> {
         let fps = f64::from(sequence.fps.max(1));
         let empty_props = BTreeMap::new();
@@ -564,7 +607,8 @@ impl ProjectRenderEngine {
             parent_props: &empty_props,
         };
 
-        if sequence.motion_blur.enabled {
+        let editing_active = overrides.is_some_and(|o| o.editing_camera.is_some());
+        if sequence.motion_blur.enabled && !editing_active {
             let samples = eval_f64(&sequence.motion_blur.samples, &base_env)
                 .round()
                 .clamp(1.0, 64.0) as u32;
@@ -588,6 +632,7 @@ impl ProjectRenderEngine {
                         height,
                         visited_comps,
                         comp_depth,
+                        overrides,
                     )?;
                     self.compositor.accumulate_motion_blur_sample(
                         &self.ctx,
@@ -619,6 +664,7 @@ impl ProjectRenderEngine {
             height,
             visited_comps,
             comp_depth,
+            overrides,
         )
     }
 
@@ -633,6 +679,7 @@ impl ProjectRenderEngine {
         height: u32,
         visited_comps: &mut Vec<Uuid>,
         comp_depth: usize,
+        overrides: Option<&RenderOverrides>,
     ) -> Result<RenderTarget, RenderError> {
         let fps = f64::from(sequence.fps.max(1));
         let controls = evaluate_sequence_controls(sequence, frame, fps, project, plugins);
@@ -686,6 +733,17 @@ impl ProjectRenderEngine {
                     parent_props: &empty_props,
                 };
 
+                let scene_override = overrides.and_then(|ov| {
+                    let cam = ov.editing_camera?;
+                    let clip_matches = ov
+                        .editing_camera_clip_id
+                        .is_none_or(|target_id| target_id == clip.id);
+                    clip_matches.then_some(Scene3DOverride {
+                        editing_camera: cam,
+                        selected_object_ids: &ov.selected_object_ids,
+                    })
+                });
+
                 canvas = self.render_and_composite_layer(
                     canvas,
                     &clip.layer,
@@ -694,6 +752,7 @@ impl ProjectRenderEngine {
                     height,
                     visited_comps,
                     comp_depth,
+                    scene_override.as_ref(),
                 )?;
             }
         }
@@ -711,6 +770,7 @@ impl ProjectRenderEngine {
         height: u32,
         visited_comps: &mut Vec<Uuid>,
         comp_depth: usize,
+        scene_override: Option<&Scene3DOverride<'_>>,
     ) -> Result<RenderTarget, RenderError> {
         let opacity = eval_f32(&layer.opacity, env).clamp(0.0, 1.0);
         let blend_mode = BlendMode::from_token(&layer.blending).unwrap_or(BlendMode::SrcOver);
@@ -726,6 +786,7 @@ impl ProjectRenderEngine {
             height,
             visited_comps,
             comp_depth,
+            scene_override,
         )?
         else {
             return Ok(backdrop);
@@ -773,13 +834,21 @@ impl ProjectRenderEngine {
         height: u32,
         visited_comps: &mut Vec<Uuid>,
         comp_depth: usize,
+        scene_override: Option<&Scene3DOverride<'_>>,
     ) -> Result<Option<RenderTarget>, RenderError> {
         match &layer.kind {
             LayerKind::Scene3D {
                 objects,
                 shadow_mode,
             } => {
-                let target = self.render_scene_3d(objects, *shadow_mode, env, width, height)?;
+                let target = self.render_scene_3d(
+                    objects,
+                    *shadow_mode,
+                    env,
+                    width,
+                    height,
+                    scene_override,
+                )?;
                 Ok(Some(target))
             }
             LayerKind::Adjustment => {
@@ -863,6 +932,7 @@ impl ProjectRenderEngine {
                         height,
                         visited_comps,
                         comp_depth + 1,
+                        None,
                     )?;
                 }
                 Ok(Some(nested))
@@ -898,6 +968,7 @@ impl ProjectRenderEngine {
                     height,
                     visited_comps,
                     comp_depth + 1,
+                    None,
                 );
                 visited_comps.pop();
                 result.map(Some)
@@ -944,14 +1015,47 @@ impl ProjectRenderEngine {
         env: &EvalEnv<'_>,
         width: u32,
         height: u32,
+        scene_override: Option<&Scene3DOverride<'_>>,
     ) -> Result<RenderTarget, RenderError> {
-        let mut collected = CollectedScene3D::default();
+        let mut collected = CollectedScene3D {
+            viewport_dims: [width.max(1) as f32, height.max(1) as f32],
+            ..CollectedScene3D::default()
+        };
         self.collect_scene_objects(objects, Mat4::IDENTITY, env, &mut collected);
 
-        let camera = match collected.camera {
-            Some(cam) => cam,
-            None => default_scene_camera(width, height),
+        let camera = match scene_override {
+            Some(ov) => ov.editing_camera,
+            None => match collected.camera {
+                Some(cam) => cam,
+                None => default_scene_camera(width, height),
+            },
         };
+
+        let mut selection_aabb: Option<([f32; 3], [f32; 3])> = None;
+        if let Some(ov) = scene_override
+            && !ov.selected_object_ids.is_empty()
+        {
+            for spec in &collected.meshes {
+                if ov.selected_object_ids.contains(&spec.object_id) {
+                    let (bmin, bmax) = spec.world_aabb;
+                    selection_aabb = Some(match selection_aabb {
+                        None => (bmin, bmax),
+                        Some((cmin, cmax)) => (
+                            [
+                                cmin[0].min(bmin[0]),
+                                cmin[1].min(bmin[1]),
+                                cmin[2].min(bmin[2]),
+                            ],
+                            [
+                                cmax[0].max(bmax[0]),
+                                cmax[1].max(bmax[1]),
+                                cmax[2].max(bmax[2]),
+                            ],
+                        ),
+                    });
+                }
+            }
+        }
 
         let meshes_draw: Vec<MeshDrawCall<'_>> = collected
             .meshes
@@ -1001,8 +1105,8 @@ impl ProjectRenderEngine {
                 meshes: &meshes_draw,
                 particles: &particle_draws,
                 compat_mode,
-                editing_camera: false,
-                selection_aabb: None,
+                editing_camera: scene_override.is_some(),
+                selection_aabb,
             },
         );
         self.targets.release(depth);
@@ -1087,9 +1191,11 @@ impl ProjectRenderEngine {
                     }
                 }
                 Object3DKind::Shape3D(shape) => {
-                    if let Some(mesh) = self.ensure_shape_mesh(obj, shape, env) {
+                    if let Some((mesh, bounds)) = self.ensure_shape_mesh(obj, shape, env) {
                         let mat_eval = self.evaluate_material(obj.material.as_ref(), env);
                         out.meshes.push(PreparedMeshSpec {
+                            object_id: obj.id,
+                            world_aabb: transform_aabb_world(bounds, world),
                             mesh,
                             model: world.to_cols_array_2d(),
                             normal_matrix: compute_normal_matrix(world),
@@ -1103,9 +1209,11 @@ impl ProjectRenderEngine {
                     }
                 }
                 Object3DKind::Text3D(text_data) => {
-                    if let Some(mesh) = self.ensure_text3d_mesh(obj, text_data, env) {
+                    if let Some((mesh, bounds)) = self.ensure_text3d_mesh(obj, text_data, env) {
                         let mat_eval = self.evaluate_material(obj.material.as_ref(), env);
                         out.meshes.push(PreparedMeshSpec {
+                            object_id: obj.id,
+                            world_aabb: transform_aabb_world(bounds, world),
                             mesh,
                             model: world.to_cols_array_2d(),
                             normal_matrix: compute_normal_matrix(world),
@@ -1119,9 +1227,11 @@ impl ProjectRenderEngine {
                     }
                 }
                 Object3DKind::Model(model_data) => {
-                    if let Some(mesh) = self.ensure_model_mesh(obj, model_data, env) {
+                    if let Some((mesh, bounds)) = self.ensure_model_mesh(obj, model_data, env) {
                         let mat_eval = self.evaluate_material(obj.material.as_ref(), env);
                         out.meshes.push(PreparedMeshSpec {
+                            object_id: obj.id,
+                            world_aabb: transform_aabb_world(bounds, world),
                             mesh,
                             model: world.to_cols_array_2d(),
                             normal_matrix: compute_normal_matrix(world),
@@ -1244,7 +1354,7 @@ impl ProjectRenderEngine {
         obj: &Object3D,
         shape: &Shape3DKind,
         env: &EvalEnv<'_>,
-    ) -> Option<Arc<GpuMesh>> {
+    ) -> Option<(Arc<GpuMesh>, Aabb3)> {
         let content_hash = hash_shape_and_effectors(shape, obj, env);
         let key = MeshCacheKey {
             object_id: obj.id,
@@ -1371,7 +1481,7 @@ impl ProjectRenderEngine {
         obj: &Object3D,
         data: &zc_project::Text3DData,
         env: &EvalEnv<'_>,
-    ) -> Option<Arc<GpuMesh>> {
+    ) -> Option<(Arc<GpuMesh>, Aabb3)> {
         let content_hash = hash_text3d_and_effectors(data, obj, env);
         let key = MeshCacheKey {
             object_id: obj.id,
@@ -1420,7 +1530,7 @@ impl ProjectRenderEngine {
         obj: &Object3D,
         data: &zc_project::ModelData,
         env: &EvalEnv<'_>,
-    ) -> Option<Arc<GpuMesh>> {
+    ) -> Option<(Arc<GpuMesh>, Aabb3)> {
         let asset_bytes_hash = data
             .asset_id
             .as_deref()
@@ -1453,11 +1563,11 @@ impl ProjectRenderEngine {
         Some(self.insert_cached_mesh(key, &mesh, "zc-model3d-mesh"))
     }
 
-    fn touch_cached_mesh(&mut self, key: MeshCacheKey) -> Option<Arc<GpuMesh>> {
+    fn touch_cached_mesh(&mut self, key: MeshCacheKey) -> Option<(Arc<GpuMesh>, Aabb3)> {
         if let Some(entry) = self.mesh_cache.get_mut(&key) {
             self.cache_tick = self.cache_tick.wrapping_add(1);
             entry.last_used = self.cache_tick;
-            Some(Arc::clone(&entry.mesh))
+            Some((Arc::clone(&entry.mesh), entry.bounds))
         } else {
             None
         }
@@ -1468,7 +1578,7 @@ impl ProjectRenderEngine {
         key: MeshCacheKey,
         mesh: &MeshData,
         label: &str,
-    ) -> Arc<GpuMesh> {
+    ) -> (Arc<GpuMesh>, Aabb3) {
         self.cache_tick = self.cache_tick.wrapping_add(1);
         let tick = self.cache_tick;
         while self.mesh_cache.len() >= MAX_CACHED_MESHES {
@@ -1507,7 +1617,7 @@ impl ProjectRenderEngine {
                 last_used: tick,
             },
         );
-        gpu_mesh
+        (gpu_mesh, mesh.bounds)
     }
 
     fn evaluate_material(
@@ -1868,7 +1978,7 @@ impl ProjectRenderEngine {
         };
 
         let draw = [MeshDrawCall {
-            mesh: cached_mesh.as_ref(),
+            mesh: cached_mesh.0.as_ref(),
             model: mat4_identity(),
             normal_matrix: mat4_identity(),
             material: MaterialParams {
@@ -2612,6 +2722,8 @@ impl ProjectRenderEngine {
 // ---------------------------------------------------------------------------
 
 struct PreparedMeshSpec {
+    object_id: Uuid,
+    world_aabb: ([f32; 3], [f32; 3]),
     mesh: Arc<GpuMesh>,
     model: [[f32; 4]; 4],
     normal_matrix: [[f32; 4]; 4],
@@ -2621,6 +2733,28 @@ struct PreparedMeshSpec {
     matcap: Option<Arc<RenderTarget>>,
     cast_shadow: bool,
     receive_shadow: bool,
+}
+
+fn transform_aabb_world(bounds: Aabb3, world: Mat4) -> ([f32; 3], [f32; 3]) {
+    if !bounds.min.x.is_finite() || !bounds.max.x.is_finite() {
+        let p = world.w_axis.truncate().to_array();
+        return (p, p);
+    }
+    let xs = [bounds.min.x, bounds.max.x];
+    let ys = [bounds.min.y, bounds.max.y];
+    let zs = [bounds.min.z, bounds.max.z];
+    let mut wmin = Vec3::splat(f32::INFINITY);
+    let mut wmax = Vec3::splat(f32::NEG_INFINITY);
+    for &x in &xs {
+        for &y in &ys {
+            for &z in &zs {
+                let p = world.transform_point3(Vec3::new(x, y, z));
+                wmin = wmin.min(p);
+                wmax = wmax.max(p);
+            }
+        }
+    }
+    (wmin.to_array(), wmax.to_array())
 }
 
 struct PreparedParticlesSpec {
@@ -3023,12 +3157,14 @@ fn eval_track_keyframes_only(track: &PropertyTrack, frame: f64) -> PropertyValue
         return k0.value.clone();
     }
 
-    let tween_code = if k0.tween != 0 {
-        k0.tween as u16
-    } else if k0.is_bezier {
-        (1u16 << 8) | u16::from(k0.easing_index.max(1))
+    // Spec 02 §1.5 & zc-anim parity: incoming segment `[k0, k1]` is controlled by `k1`'s tween,
+    // using `k0.control_points[1]` (`out_tangent`) and `k1.control_points[0]` (`in_tangent`).
+    let tween_code = if k1.tween != 0 {
+        k1.tween as u16
+    } else if k1.is_bezier {
+        (1u16 << 8) | u16::from(k1.easing_index.max(1))
     } else {
-        u16::from(k0.easing_index)
+        u16::from(k1.easing_index)
     };
     let (mode, easing) = InterpolationMode::from_cm3_tween_code(tween_code);
     if mode == InterpolationMode::Discrete {
@@ -4229,5 +4365,52 @@ mod tests {
         let _ = engine
             .render_frame_rgba8(&deep_proj, &plugins, 0.0, 16, 16)
             .expect("deep Composite + EffectGroup must respect recursion caps");
+    }
+
+    #[test]
+    fn bezier_keyframe_segment_evaluates_persisted_control_points() {
+        let project = Project::new_cm3_default();
+        let plugins = PluginRegistry::new();
+        let controls = BTreeMap::new();
+        let parent_props = BTreeMap::new();
+        let bezier_tween = (1u32 << 8) | 1;
+        let track = PropertyTrack {
+            animated: true,
+            expression: None,
+            static_behavior: ProjectStaticBehavior::Constant,
+            value: PropertyValue::Number(0.0),
+            keyframes: vec![
+                PropertyKeyframe::from_cm3_tween(
+                    0.0,
+                    PropertyValue::Number(0.0),
+                    1,
+                    [[-5.0, 0.0], [1.0, 1.0]],
+                    false,
+                ),
+                PropertyKeyframe::from_cm3_tween(
+                    30.0,
+                    PropertyValue::Number(1.0),
+                    bezier_tween,
+                    [[-1.0, 0.0], [5.0, 0.0]],
+                    false,
+                ),
+            ],
+            channels: Vec::new(),
+        };
+        let env = EvalEnv {
+            frame: 15.0,
+            time: 0.5,
+            fps: 30.0,
+            project: &project,
+            plugins: &plugins,
+            controls: &controls,
+            parent_props: &parent_props,
+        };
+        let val = eval_f64(&track, &env);
+        // With aggressive ease-out handles (out=[1,1], in=[-1,0]), midpoint value is far above linear 0.5.
+        assert!(
+            val > 0.75,
+            "expected Bezier segment to evaluate persisted control points (>0.75), got {val}"
+        );
     }
 }
