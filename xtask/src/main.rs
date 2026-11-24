@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::{Command, ExitCode};
 
 use serde::Deserialize;
@@ -7,6 +7,7 @@ use serde::Deserialize;
 struct Metadata {
     packages: Vec<Package>,
     workspace_members: Vec<String>,
+    resolve: Option<Resolve>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -19,12 +20,33 @@ struct Package {
 #[derive(Debug, Deserialize)]
 struct Dependency {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Resolve {
+    nodes: Vec<ResolveNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveNode {
+    id: String,
+    deps: Vec<NodeDep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeDep {
+    pkg: String,
+    dep_kinds: Vec<DepKindInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepKindInfo {
     kind: Option<String>,
 }
 
 /// Strictly enforced downward-only layer table inspired by ArtCraft / EffectCraft.
-/// Crates may only depend on workspace crates in strictly lower layers,
-/// and core crates (L0..L4) may never depend on UI/windowing/OS-dialog crates.
+/// Core crates (L0..L4) and the headless CLI may never depend (directly OR transitively)
+/// on GUI/windowing/OS-dialog crates.
 fn layer_of(name: &str) -> Option<u8> {
     match name {
         // L0: math, time, color primitives
@@ -39,7 +61,6 @@ fn layer_of(name: &str) -> Option<u8> {
         "zc-session" => Some(4),
         // L5: end-user applications
         "zoidcraft" | "zoidcraft-cli" => Some(5),
-        "xtask" => None,
         _ => None,
     }
 }
@@ -49,14 +70,18 @@ const FORBIDDEN_IN_CORE: &[&str] = &[
     "eframe",
     "egui-wgpu",
     "egui_wgpu",
+    "egui-winit",
+    "epaint",
     "winit",
     "rfd",
     "muda",
+    "accesskit",
 ];
 
 fn check_layers() -> Result<(), Vec<String>> {
+    // Full resolved metadata (not --no-deps) so transitive dependencies are verified too.
     let output = Command::new("cargo")
-        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .args(["metadata", "--format-version", "1"])
         .output()
         .map_err(|e| vec![format!("failed to execute cargo metadata: {e}")])?;
 
@@ -68,7 +93,19 @@ fn check_layers() -> Result<(), Vec<String>> {
     let meta: Metadata = serde_json::from_slice(&output.stdout)
         .map_err(|e| vec![format!("failed to parse cargo metadata: {e}")])?;
 
+    let resolve = meta
+        .resolve
+        .ok_or_else(|| vec!["cargo metadata returned no resolve graph".to_string()])?;
+
     let ws_ids: BTreeSet<&str> = meta.workspace_members.iter().map(String::as_str).collect();
+    let id_to_name: BTreeMap<&str, &str> = meta
+        .packages
+        .iter()
+        .map(|p| (p.id.as_str(), p.name.as_str()))
+        .collect();
+    let node_map: BTreeMap<&str, &ResolveNode> =
+        resolve.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+
     let mut violations = Vec::new();
     let mut seen_layers: BTreeMap<u8, Vec<String>> = BTreeMap::new();
 
@@ -76,13 +113,14 @@ fn check_layers() -> Result<(), Vec<String>> {
         if !ws_ids.contains(pkg.id.as_str()) {
             continue;
         }
+        if pkg.name == "xtask" {
+            continue;
+        }
         let Some(pkg_layer) = layer_of(&pkg.name) else {
-            if pkg.name != "xtask" {
-                violations.push(format!(
-                    "workspace crate `{}` is not registered in xtask layer table",
-                    pkg.name
-                ));
-            }
+            violations.push(format!(
+                "workspace crate `{}` is not registered in xtask layer table",
+                pkg.name
+            ));
             continue;
         };
         seen_layers
@@ -90,33 +128,19 @@ fn check_layers() -> Result<(), Vec<String>> {
             .or_default()
             .push(pkg.name.clone());
 
+        // 1. Direct dependency checks (including dev-dependencies and xtask bridge guard).
         for dep in &pkg.dependencies {
-            // Dev-dependencies are excluded from runtime layer direction only if explicitly needed,
-            // but UI crates are forbidden in core crates even as dev-dependencies.
-            let is_dev = dep.kind.as_deref() == Some("dev");
-
-            if pkg_layer <= 4 && FORBIDDEN_IN_CORE.contains(&dep.name.as_str()) {
+            if dep.name == "xtask" {
                 violations.push(format!(
-                    "core crate `{}` (L{}) must not depend on UI/windowing crate `{}`",
-                    pkg.name, pkg_layer, dep.name
+                    "workspace crate `{}` must not depend on `xtask`",
+                    pkg.name
                 ));
+                continue;
             }
-
-            if pkg.name == "zoidcraft-cli" && FORBIDDEN_IN_CORE.contains(&dep.name.as_str()) {
-                violations.push(format!(
-                    "headless CLI `{}` must not depend on GUI crate `{}`",
-                    pkg.name, dep.name
-                ));
-            }
-
-            if !is_dev && let Some(dep_layer) = layer_of(&dep.name) {
-                // Allow same-layer only within L2 where scene/project/shader share clean data models?
-                // Keep it strict: strictly downward (dep_layer < pkg_layer),
-                // except L2 (zc-project may depend on nothing in L2; zc-scene & zc-shader may depend on zc-project).
+            if let Some(dep_layer) = layer_of(&dep.name) {
                 let allowed = if pkg_layer == 2 && dep_layer == 2 {
                     dep.name == "zc-project" && pkg.name != "zc-project"
                 } else if pkg_layer == 3 && dep_layer == 3 {
-                    // zc-export may depend on zc-render and zc-audio
                     pkg.name == "zc-export" && matches!(dep.name.as_str(), "zc-render" | "zc-audio")
                 } else {
                     dep_layer < pkg_layer
@@ -130,10 +154,53 @@ fn check_layers() -> Result<(), Vec<String>> {
                 }
             }
         }
+
+        // 2. Full transitive dependency walk for all core crates (L0..L4) and headless CLI.
+        let forbid_gui = pkg_layer <= 4 || pkg.name == "zoidcraft-cli";
+        if forbid_gui {
+            let mut visited: BTreeSet<&str> = BTreeSet::new();
+            let mut queue: VecDeque<(&str, Vec<String>)> = VecDeque::new();
+            visited.insert(pkg.id.as_str());
+            queue.push_back((pkg.id.as_str(), vec![pkg.name.clone()]));
+
+            while let Some((cur_id, path)) = queue.pop_front() {
+                let Some(node) = node_map.get(cur_id) else {
+                    continue;
+                };
+                for dep in &node.deps {
+                    // Only follow runtime/build dependencies for non-root nodes; for root check all kinds including dev.
+                    let is_root = cur_id == pkg.id.as_str();
+                    let is_dev_only = !dep.dep_kinds.is_empty()
+                        && dep
+                            .dep_kinds
+                            .iter()
+                            .all(|k| k.kind.as_deref() == Some("dev"));
+                    if !is_root && is_dev_only {
+                        continue;
+                    }
+                    let dep_name = id_to_name.get(dep.pkg.as_str()).copied().unwrap_or("?");
+                    if FORBIDDEN_IN_CORE.contains(&dep_name) {
+                        let mut chain = path.clone();
+                        chain.push(dep_name.to_string());
+                        violations.push(format!(
+                            "forbidden GUI/windowing dependency in `{}` (L{}): {}",
+                            pkg.name,
+                            pkg_layer,
+                            chain.join(" -> ")
+                        ));
+                    }
+                    if visited.insert(dep.pkg.as_str()) {
+                        let mut next_path = path.clone();
+                        next_path.push(dep_name.to_string());
+                        queue.push_back((dep.pkg.as_str(), next_path));
+                    }
+                }
+            }
+        }
     }
 
     if violations.is_empty() {
-        println!("Layer check PASSED:");
+        println!("Layer & transitive dependency check PASSED:");
         for (layer, mut crates) in seen_layers {
             crates.sort();
             println!("  L{layer}: {}", crates.join(", "));
@@ -158,9 +225,11 @@ fn main() -> ExitCode {
             }
         },
         _ => {
-            eprintln!("Usage: cargo run -p xtask -- <command>");
+            eprintln!("Usage: cargo xtask <command>");
             eprintln!("Commands:");
-            eprintln!("  layers    Verify strict Engine-First crate layer boundaries");
+            eprintln!(
+                "  layers    Verify strict Engine-First crate layer & transitive GUI boundaries"
+            );
             ExitCode::FAILURE
         }
     }

@@ -4,11 +4,9 @@ on:
   push:
     tags:
       - "v*"
+  # Manual dispatch builds artifacts for the selected ref; GitHub Release creation
+  # runs only when triggered on a v* tag ref.
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag (e.g. v0.1.0)"
-        required: false
 
 permissions:
   contents: write
@@ -24,7 +22,7 @@ jobs:
       matrix:
         include:
           - name: macOS-arm64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             ext: ""
             archive: tar.gz
@@ -61,7 +59,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} --bin zoidcraft --bin zoidcraft-cli
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin zoidcraft --bin zoidcraft-cli
       - name: Package tar.gz (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
