@@ -8,7 +8,10 @@ impl eframe::App for ZoidCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("ZoidCraft");
-            ui.label(format!("Session crate ready: {}", zc_session::crate_name()));
+            ui.label(format!(
+                "Commands registered: {}",
+                zc_session::CommandRegistry::new_default().len()
+            ));
         });
     }
 }

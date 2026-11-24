@@ -24,9 +24,11 @@ fn main() {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Commands::Info) {
         Commands::Info => {
+            let session = zc_session::Session::new();
             println!(
-                "zoidcraft-cli ready (session: {}, render: {}, export: {})",
-                zc_session::crate_name(),
+                "zoidcraft-cli ready (commands: {}, plugins: {}, render: {}, export: {})",
+                session.registry.len(),
+                session.plugins.len(),
                 zc_render::crate_name(),
                 zc_export::crate_name(),
             );
