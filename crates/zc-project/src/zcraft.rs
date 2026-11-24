@@ -288,12 +288,6 @@ fn append_tar_file<W: Write>(
     Ok(())
 }
 
-fn tar_padded_entry_size(data_len: u64) -> u64 {
-    // 512-byte header (or up to 2048 bytes with GNU longname) + 512-byte-aligned payload.
-    let blocks = data_len.div_ceil(512);
-    512u64.saturating_add(blocks.saturating_mul(512))
-}
-
 /// Serializes `project` into an in-memory `.zcraft` (gzip + TAR) archive byte vector.
 ///
 /// Validates all reader security bounds (JSON entry size, JSON nesting depth, entry count,
@@ -366,12 +360,18 @@ fn save_zcraft_to_bytes_with_limits(
         .filter(|s| !s.is_empty())
         .map_or_else(|| now_utc.clone(), ToOwned::to_owned);
 
+    let saved_features: BTreeMap<String, Vec<String>> = project
+        .preserved
+        .get("manifest_plugin_features")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
     let required_plugins: Vec<ManifestPluginRequirement> = project
         .plugin_requirements
         .iter()
         .map(|id| ManifestPluginRequirement {
             id: id.clone(),
-            features: Vec::new(),
+            features: saved_features.get(id).cloned().unwrap_or_default(),
         })
         .collect();
 
@@ -396,31 +396,67 @@ fn save_zcraft_to_bytes_with_limits(
     }
     check_json_depth(&manifest_json, max_json_depth)?;
 
-    // Check total uncompressed TAR stream size before writing (entries + 1024-byte TAR EOF trailer).
-    let mut uncompressed_tar_bytes = 1024u64
-        .saturating_add(tar_padded_entry_size(manifest_json.len() as u64))
-        .saturating_add(tar_padded_entry_size(project_json.len() as u64));
-    for (_, bytes) in &embedded_assets {
-        uncompressed_tar_bytes =
-            uncompressed_tar_bytes.saturating_add(tar_padded_entry_size(bytes.len() as u64));
+    // Measure exact uncompressed TAR bytes written (including GNU long-name records,
+    // padding, and EOF trailer) so the limit matches `LimitedReader` byte-for-byte.
+    struct LimitedWriter<W> {
+        inner: W,
+        written: u64,
+        limit: u64,
+        exceeded: bool,
     }
-    if uncompressed_tar_bytes > max_uncompressed {
+
+    impl<W: Write> Write for LimitedWriter<W> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let next = self.written.saturating_add(buf.len() as u64);
+            if next > self.limit {
+                self.exceeded = true;
+                return Err(io::Error::other("archive uncompressed size limit exceeded"));
+            }
+            let n = self.inner.write(buf)?;
+            self.written = self.written.saturating_add(n as u64);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let limited_writer = LimitedWriter {
+        inner: encoder,
+        written: 0,
+        limit: max_uncompressed,
+        exceeded: false,
+    };
+    let mut builder = tar::Builder::new(limited_writer);
+
+    let write_res: Result<(), ProjectError> = (|| {
+        append_tar_file(&mut builder, "manifest.json", &manifest_json)?;
+        append_tar_file(&mut builder, "project.json", &project_json)?;
+        for (entry_path, bytes) in embedded_assets {
+            append_tar_file(&mut builder, &entry_path, bytes)?;
+        }
+        builder.finish()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        if builder.get_ref().exceeded {
+            return Err(ProjectError::ArchiveTooLarge {
+                limit_bytes: max_uncompressed,
+            });
+        }
+        return Err(err);
+    }
+
+    let limited = builder.into_inner()?;
+    if limited.exceeded || limited.written > max_uncompressed {
         return Err(ProjectError::ArchiveTooLarge {
             limit_bytes: max_uncompressed,
         });
     }
-
-    let encoder = GzEncoder::new(Vec::new(), Compression::default());
-    let mut builder = tar::Builder::new(encoder);
-
-    append_tar_file(&mut builder, "manifest.json", &manifest_json)?;
-    append_tar_file(&mut builder, "project.json", &project_json)?;
-    for (entry_path, bytes) in embedded_assets {
-        append_tar_file(&mut builder, &entry_path, bytes)?;
-    }
-
-    let encoder = builder.into_inner()?;
-    let compressed = encoder.finish()?;
+    let compressed = limited.inner.finish()?;
     Ok(compressed)
 }
 
@@ -564,6 +600,33 @@ fn load_zcraft_with_limits(
     let mut project: Project = serde_json::from_slice(&project_bytes)?;
 
     if let Some(ref meta_doc) = meta {
+        if !meta_doc.created_utc.is_empty() {
+            project.preserved.insert(
+                "created_utc".to_owned(),
+                serde_json::Value::String(meta_doc.created_utc.clone()),
+            );
+        }
+        let mut features_map: BTreeMap<String, Vec<String>> = project
+            .preserved
+            .get("manifest_plugin_features")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        for req in &meta_doc.required_plugins {
+            if !req.id.is_empty() {
+                project.plugin_requirements.insert(req.id.clone());
+                if !req.features.is_empty() {
+                    features_map.insert(req.id.clone(), req.features.clone());
+                }
+            }
+        }
+        if !features_map.is_empty()
+            && let Ok(val) = serde_json::to_value(&features_map)
+        {
+            project
+                .preserved
+                .insert("manifest_plugin_features".to_owned(), val);
+        }
+
         for (asset_id, data) in &asset_blobs {
             let entry_key = format!("assets/{asset_id}");
             if let Some(expected) = meta_doc.integrity.get(&entry_key) {
@@ -843,5 +906,96 @@ mod tests {
         // Existing readable archive on disk remains untouched and readable.
         let reloaded = load_zcraft(&archive_path).expect("original archive intact");
         assert_eq!(reloaded.name, "SafeOriginal");
+
+        // Manifest metadata (created_utc + plugin features) survives open -> save -> open.
+        let mut custom_manifest = serde_json::json!({
+            "format": "zoidcraft",
+            "schema_version": 1,
+            "app_version": "0.1.0",
+            "project_name": "FeatureTest",
+            "created_utc": "2025-01-02T03:04:05Z",
+            "modified_utc": "2025-01-02T03:04:05Z",
+            "required_plugins": [
+                { "id": "expressions-plus", "features": ["expressions", "sequence-controls"] }
+            ],
+            "missing_assets": [],
+            "integrity": {}
+        });
+        let p_json = serde_json::to_vec(&Project::new_cm3_default()).expect("project json");
+        custom_manifest["integrity"]["project.json"] = serde_json::json!({
+            "size": p_json.len(),
+            "sha256": sha256_hex(&p_json)
+        });
+        let m_json = serde_json::to_vec(&custom_manifest).expect("manifest json");
+        let tgz = build_raw_tgz(&[
+            ("manifest.json", tar::EntryType::Regular, &m_json),
+            ("project.json", tar::EntryType::Regular, &p_json),
+        ]);
+        let opened = load_zcraft_from_bytes(&tgz).expect("load spec03 manifest");
+        assert!(opened.plugin_requirements.contains("expressions-plus"));
+        let resaved = save_zcraft_to_bytes(&opened).expect("resave");
+        let mut tar2 = tar::Archive::new(GzDecoder::new(resaved.as_slice()));
+        let mut resaved_manifest: Option<serde_json::Value> = None;
+        for e in tar2.entries().expect("entries") {
+            let mut e = e.expect("entry");
+            if e.path().expect("path").to_string_lossy() == "manifest.json" {
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf).expect("read");
+                resaved_manifest = Some(serde_json::from_slice(&buf).expect("parse"));
+            }
+        }
+        let rm = resaved_manifest.expect("manifest preserved");
+        assert_eq!(rm["created_utc"], "2025-01-02T03:04:05Z");
+        assert_eq!(rm["required_plugins"][0]["id"], "expressions-plus");
+        assert_eq!(
+            rm["required_plugins"][0]["features"],
+            serde_json::json!(["expressions", "sequence-controls"])
+        );
+
+        // Long asset path triggering GNU @LongLink header obeys exact uncompressed TAR limit.
+        let mut long_proj = Project::new_cm3_default();
+        let long_key = "a".repeat(140);
+        long_proj.assets.insert(
+            long_key.clone(),
+            AssetRecord {
+                id: long_key,
+                kind: AssetKind::Misc,
+                source: AssetSource::File,
+                filename: "long.bin".to_owned(),
+                url: None,
+                external: false,
+                bytes: Some(vec![7u8; 512]),
+                missing: false,
+                sha256: sha256_hex(&[7u8; 512]),
+                size: 512,
+                preserved: BTreeMap::new(),
+            },
+        );
+        let full_bytes = save_zcraft_to_bytes(&long_proj).expect("save long path");
+        let mut raw_tar = Vec::new();
+        GzDecoder::new(full_bytes.as_slice())
+            .read_to_end(&mut raw_tar)
+            .expect("gunzip");
+        // Exact limit succeeds, limit - 1 fails with ArchiveTooLarge.
+        assert!(
+            save_zcraft_to_bytes_with_limits(
+                &long_proj,
+                raw_tar.len() as u64,
+                MAX_JSON_ENTRY_BYTES,
+                MAX_ARCHIVE_ENTRIES,
+                MAX_JSON_NESTING_DEPTH,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            save_zcraft_to_bytes_with_limits(
+                &long_proj,
+                raw_tar.len() as u64 - 1,
+                MAX_JSON_ENTRY_BYTES,
+                MAX_ARCHIVE_ENTRIES,
+                MAX_JSON_NESTING_DEPTH,
+            ),
+            Err(ProjectError::ArchiveTooLarge { .. })
+        ));
     }
 }

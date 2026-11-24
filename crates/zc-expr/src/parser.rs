@@ -250,6 +250,13 @@ impl Parser {
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, ExprError> {
+        self.enter_depth()?;
+        let res = self.parse_pattern_inner();
+        self.leave_depth();
+        res
+    }
+
+    fn parse_pattern_inner(&mut self) -> Result<Pattern, ExprError> {
         match self.peek_kind() {
             TokenKind::Ident(_) => {
                 let Token {

@@ -358,6 +358,8 @@ pub struct SessionClip {
     pub time_animated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_length: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_clip_id: Option<String>,
     pub properties: BTreeMap<String, SessionProperty>,
     pub objects_3d: Vec<SessionObject3D>,
     pub effects: Vec<SessionEffect>,
@@ -483,6 +485,71 @@ fn prop_value_to_json(v: &zc_project::PropertyValue) -> Value {
     }
 }
 
+fn json_to_prop_value_with_template(
+    v: &Value,
+    template: Option<&zc_project::PropertyValue>,
+) -> zc_project::PropertyValue {
+    if let Some(tpl) = template {
+        match tpl {
+            zc_project::PropertyValue::Option(_) => {
+                if let Some(n) = v.as_f64() {
+                    return zc_project::PropertyValue::Option(n.round().max(0.0) as u32);
+                }
+                if let Some(b) = v.as_bool() {
+                    return zc_project::PropertyValue::Option(u32::from(b));
+                }
+            }
+            zc_project::PropertyValue::Color(_) => {
+                if let Some(arr) = v.as_array()
+                    && arr.len() == 3
+                    && let (Some(a), Some(b), Some(c)) =
+                        (arr[0].as_f64(), arr[1].as_f64(), arr[2].as_f64())
+                {
+                    return zc_project::PropertyValue::Color([a, b, c]);
+                }
+            }
+            zc_project::PropertyValue::ColorRgba(_) => {
+                if let Some(arr) = v.as_array()
+                    && arr.len() == 4
+                    && let (Some(a), Some(b), Some(c), Some(d)) = (
+                        arr[0].as_f64(),
+                        arr[1].as_f64(),
+                        arr[2].as_f64(),
+                        arr[3].as_f64(),
+                    )
+                {
+                    return zc_project::PropertyValue::ColorRgba([a, b, c, d]);
+                }
+            }
+            zc_project::PropertyValue::Asset(_) => {
+                return zc_project::PropertyValue::Asset(v.as_str().map(ToOwned::to_owned));
+            }
+            zc_project::PropertyValue::List(_) => {
+                if let Some(s) = v.as_str() {
+                    return zc_project::PropertyValue::List(s.to_owned());
+                }
+            }
+            zc_project::PropertyValue::Shader(_) => {
+                if let Some(s) = v.as_str() {
+                    return zc_project::PropertyValue::Shader(s.to_owned());
+                }
+            }
+            zc_project::PropertyValue::Curve(_) => {
+                return zc_project::PropertyValue::Curve(v.clone());
+            }
+            zc_project::PropertyValue::Gradient(_) => {
+                if let Ok(stops) =
+                    serde_json::from_value::<Vec<zc_project::GradientStop>>(v.clone())
+                {
+                    return zc_project::PropertyValue::Gradient(stops);
+                }
+            }
+            _ => {}
+        }
+    }
+    json_to_prop_value(v)
+}
+
 fn json_to_prop_value(v: &Value) -> zc_project::PropertyValue {
     if let Some(b) = v.as_bool() {
         return zc_project::PropertyValue::Bool(b);
@@ -541,27 +608,37 @@ fn session_property_to_track(
     prop: &SessionProperty,
     fallback: Option<&zc_project::PropertyTrack>,
 ) -> zc_project::PropertyTrack {
-    let value = prop
-        .keyframes
-        .first()
-        .map(|k| json_to_prop_value(&k.value))
-        .unwrap_or_else(|| json_to_prop_value(&prop.default_value));
+    if let Some(prev) = fallback
+        && property_track_to_session(prev) == *prop
+    {
+        return prev.clone();
+    }
+
+    let val_template = fallback.map(|t| &t.value);
+    let value = if prop.animated {
+        json_to_prop_value_with_template(&prop.default_value, val_template)
+    } else {
+        prop.keyframes
+            .first()
+            .map(|k| json_to_prop_value_with_template(&k.value, val_template))
+            .unwrap_or_else(|| json_to_prop_value_with_template(&prop.default_value, val_template))
+    };
     let keyframes = prop
         .keyframes
         .iter()
         .map(|kf| {
-            let (cp, cont) = fallback
-                .and_then(|t| {
-                    t.keyframes
-                        .iter()
-                        .find(|existing| (existing.frame - kf.frame).abs() < 1e-6)
-                })
-                .map_or(([[-10.0, 0.0], [10.0, 0.0]], true), |existing| {
-                    (existing.control_points, existing.continuous_tangent)
-                });
+            let existing_kf = fallback.and_then(|t| {
+                t.keyframes
+                    .iter()
+                    .find(|existing| (existing.frame - kf.frame).abs() < 1e-6)
+            });
+            let kf_template = existing_kf.map(|k| &k.value).or(val_template);
+            let (cp, cont) = existing_kf.map_or(([[-10.0, 0.0], [10.0, 0.0]], true), |existing| {
+                (existing.control_points, existing.continuous_tangent)
+            });
             zc_project::PropertyKeyframe::from_cm3_tween(
                 kf.frame,
-                json_to_prop_value(&kf.value),
+                json_to_prop_value_with_template(&kf.value, kf_template),
                 u32::from(kf.tween),
                 cp,
                 cont,
@@ -764,6 +841,7 @@ impl SessionDocument {
                     time_end,
                     time_animated,
                     media_length: None,
+                    source_clip_id: None,
                     properties,
                     objects_3d,
                     effects,
@@ -808,6 +886,7 @@ impl SessionDocument {
                     time_end,
                     time_animated,
                     media_length: None,
+                    source_clip_id: None,
                     properties,
                     objects_3d: Vec::new(),
                     effects: Vec::new(),
@@ -983,6 +1062,12 @@ pub struct SessionSnapshot {
     pub project: zc_project::Project,
     pub document: SessionDocument,
     pub selection: SelectionState,
+    /// Content-addressed SHA-256 blob references (`asset_key -> content_sha256`) for
+    /// assets whose binary buffers were deduplicated out of `project.assets` into
+    /// `Session.asset_blobs`. Assets absent from this map had `bytes == None` at
+    /// snapshot time and remain `None` on restore.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    asset_blob_refs: BTreeMap<String, String>,
 }
 
 impl ByteSized for SessionSnapshot {
@@ -997,10 +1082,16 @@ impl ByteSized for SessionSnapshot {
             .fold(0usize, usize::saturating_add);
         let doc_bytes = serde_json::to_vec(&self.document).map_or(0, |b| b.len());
         let sel_bytes = serde_json::to_vec(&self.selection).map_or(0, |b| b.len());
+        let ref_bytes = self
+            .asset_blob_refs
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .fold(0usize, usize::saturating_add);
         project_json_bytes
             .saturating_add(asset_blob_bytes)
             .saturating_add(doc_bytes)
             .saturating_add(sel_bytes)
+            .saturating_add(ref_bytes)
     }
 }
 
@@ -1048,9 +1139,12 @@ impl Session {
     pub fn from_project(project: zc_project::Project, plugins: zc_plugin::PluginRegistry) -> Self {
         let document = SessionDocument::from_project(&project);
         let mut asset_blobs = BTreeMap::new();
-        for (key, rec) in &project.assets {
+        for rec in project.assets.values() {
             if let Some(bytes) = rec.bytes.as_ref() {
-                asset_blobs.insert(key.clone(), Arc::new(bytes.clone()));
+                let digest = zc_project::sha256_hex(bytes);
+                asset_blobs
+                    .entry(digest)
+                    .or_insert_with(|| Arc::new(bytes.clone()));
             }
         }
         Self {
@@ -1090,33 +1184,45 @@ impl Session {
             project: self.project.clone(),
             document: self.document.clone(),
             selection: self.selection.clone(),
+            asset_blob_refs: BTreeMap::new(),
         }
     }
 
-    /// Captures a lightweight undo snapshot for history storage: any embedded asset binary
-    /// buffers are deduplicated into `self.asset_blobs` and stripped from the snapshot clone
-    /// so repeated edits never duplicate megabytes of media in undo memory.
+    /// Captures a lightweight undo snapshot for history storage without copying embedded
+    /// media buffers on each edit: temporarily moves raw asset `Vec<u8>` buffers out of
+    /// `self.project.assets`, interns them by content SHA-256 in `self.asset_blobs` (only
+    /// when not already cached), clones the byte-free metadata `Project`, and moves the
+    /// live buffers back into `self.project.assets`.
     fn capture_history_snapshot(&mut self) -> SessionSnapshot {
-        for (key, rec) in &self.project.assets {
-            if let Some(bytes) = rec.bytes.as_ref() {
-                let needs_update = match self.asset_blobs.get(key) {
-                    Some(existing) => existing.as_slice() != bytes.as_slice(),
-                    None => true,
-                };
-                if needs_update {
+        let mut taken: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut asset_blob_refs: BTreeMap<String, String> = BTreeMap::new();
+
+        for (key, rec) in &mut self.project.assets {
+            if let Some(bytes) = rec.bytes.take() {
+                let digest = zc_project::sha256_hex(&bytes);
+                if !self.asset_blobs.contains_key(&digest) {
                     self.asset_blobs
-                        .insert(key.clone(), Arc::new(bytes.clone()));
+                        .insert(digest.clone(), Arc::new(bytes.clone()));
                 }
+                asset_blob_refs.insert(key.clone(), digest);
+                taken.push((key.clone(), bytes));
             }
         }
-        let mut lightweight_project = self.project.clone();
-        for rec in lightweight_project.assets.values_mut() {
-            rec.bytes = None;
+
+        // All `rec.bytes` are currently `None`, so cloning `self.project` copies zero media bytes.
+        let lightweight_project = self.project.clone();
+
+        for (key, bytes) in taken {
+            if let Some(rec) = self.project.assets.get_mut(&key) {
+                rec.bytes = Some(bytes);
+            }
         }
+
         SessionSnapshot {
             project: lightweight_project,
             document: self.document.clone(),
             selection: self.selection.clone(),
+            asset_blob_refs,
         }
     }
 
@@ -1235,9 +1341,12 @@ impl Session {
     }
 
     fn restore_snapshot(&mut self, mut snapshot: SessionSnapshot) {
-        for (key, rec) in &mut snapshot.project.assets {
-            if rec.bytes.is_none()
-                && let Some(blob) = self.asset_blobs.get(key)
+        // Rehydrate ONLY assets explicitly recorded in `asset_blob_refs` (preserving
+        // exact content-addressed versions and leaving originally-`None` assets as `None`).
+        for (asset_key, blob_digest) in &snapshot.asset_blob_refs {
+            if let Some(rec) = snapshot.project.assets.get_mut(asset_key)
+                && rec.bytes.is_none()
+                && let Some(blob) = self.asset_blobs.get(blob_digest)
             {
                 rec.bytes = Some((**blob).clone());
             }
@@ -1245,7 +1354,6 @@ impl Session {
         self.project = snapshot.project;
         self.document = snapshot.document;
         self.selection = snapshot.selection;
-        self.sync_document_to_project();
         let max_frame = (self.document.sequence_length - 1.0).max(0.0);
         self.playback.current_frame = self.playback.current_frame.clamp(0.0, max_frame);
         self.playback.bump_epoch();
@@ -1262,7 +1370,8 @@ impl Session {
         let fps_u32 = self.project.sequence.fps.max(1);
         let resolution = self.document.resolution;
 
-        // Index existing tracks and clips by UUID string so preserved metadata survives sync.
+        // Index existing tracks and clips by UUID string so preserved metadata and
+        // source-clip templates (for Split / Duplicate / Overwrite straddle splits) survive sync.
         let mut existing_vtracks: BTreeMap<String, zc_project::VideoTrack> = self
             .project
             .sequence
@@ -1276,9 +1385,11 @@ impl Session {
                 existing_vclips.insert(vc.id.to_string(), vc);
             }
         }
+        let vclip_templates = existing_vclips.clone();
 
         let mut synced_vtracks = Vec::with_capacity(self.document.video_tracks.len());
-        for strack in &self.document.video_tracks {
+        let mut live_clip_ids: BTreeSet<zc_project::Uuid> = BTreeSet::new();
+        for strack in &mut self.document.video_tracks {
             let mut vt =
                 existing_vtracks
                     .remove(&strack.id)
@@ -1298,14 +1409,24 @@ impl Session {
             vt.locked = strack.locked;
             vt.clips = strack
                 .clips
-                .iter()
+                .iter_mut()
                 .map(|sclip| {
-                    sync_video_clip_from_session(
-                        sclip,
-                        existing_vclips.remove(&sclip.id),
-                        resolution,
-                        fps_u32,
-                    )
+                    let base = existing_vclips.remove(&sclip.id).or_else(|| {
+                        sclip
+                            .source_clip_id
+                            .as_deref()
+                            .and_then(|src_id| vclip_templates.get(src_id))
+                            .map(|tpl| {
+                                let mut cloned = tpl.clone();
+                                cloned.id = parse_uuid_or_new(&sclip.id);
+                                cloned.link = None;
+                                cloned
+                            })
+                    });
+                    sclip.source_clip_id = None;
+                    let synced = sync_video_clip_from_session(sclip, base, resolution, fps_u32);
+                    live_clip_ids.insert(synced.id);
+                    synced
                 })
                 .collect();
             synced_vtracks.push(vt);
@@ -1325,9 +1446,10 @@ impl Session {
                 existing_aclips.insert(ac.id.to_string(), ac);
             }
         }
+        let aclip_templates = existing_aclips.clone();
 
         let mut synced_atracks = Vec::with_capacity(self.document.audio_tracks.len());
-        for strack in &self.document.audio_tracks {
+        for strack in &mut self.document.audio_tracks {
             let mut at =
                 existing_atracks
                     .remove(&strack.id)
@@ -1345,14 +1467,35 @@ impl Session {
             at.solo = strack.solo;
             at.clips = strack
                 .clips
-                .iter()
+                .iter_mut()
                 .map(|sclip| {
-                    sync_audio_clip_from_session(sclip, existing_aclips.remove(&sclip.id), fps_u32)
+                    let base = existing_aclips.remove(&sclip.id).or_else(|| {
+                        sclip
+                            .source_clip_id
+                            .as_deref()
+                            .and_then(|src_id| aclip_templates.get(src_id))
+                            .map(|tpl| {
+                                let mut cloned = tpl.clone();
+                                cloned.id = parse_uuid_or_new(&sclip.id);
+                                cloned.link = None;
+                                cloned
+                            })
+                    });
+                    sclip.source_clip_id = None;
+                    let synced = sync_audio_clip_from_session(sclip, base, fps_u32);
+                    live_clip_ids.insert(synced.id);
+                    synced
                 })
                 .collect();
             synced_atracks.push(at);
         }
         self.project.sequence.audio_tracks = synced_atracks;
+
+        // Prune stale clip UUIDs (e.g. engulfed or deleted clips) from clip_links.
+        self.project.sequence.clip_links.retain(|_, members| {
+            members.retain(|id| live_clip_ids.contains(id));
+            !members.is_empty()
+        });
 
         for dep in self.document.collect_plugin_dependencies() {
             self.project.plugin_requirements.insert(dep);
@@ -1412,6 +1555,7 @@ impl Session {
             if other_start < placed_start && other_end > placed_end {
                 let mut right_rem = other.clone();
                 let right_id = self.alloc_uuid_id();
+                right_rem.source_clip_id = Some(other.id.clone());
                 right_rem.id = right_id;
                 let cut_right = placed_end - other_start;
                 right_rem.start = placed_end;
@@ -1452,18 +1596,14 @@ impl Session {
             }
 
             // Right neighbor partially overlapped on its left edge (other_start >= placed_start && other_end > placed_end).
+            // Spec 02 §2.5 Step B.2: advance non-animated `timeStart` by `(placed_end - other.start) / fps`.
             let cut = placed_end - other_start;
             let new_len = other_end - placed_end;
             if new_len < 1e-6 {
                 removed_for_selection.push(other);
             } else {
                 if !other.time_animated {
-                    let old_rate = if other.length > 0.0 {
-                        (other.time_end - other.time_start) / other.length
-                    } else {
-                        1.0 / fps
-                    };
-                    other.time_start += cut * old_rate;
+                    other.time_start += cut / fps;
                 }
                 other.start = placed_end;
                 other.length = new_len;
@@ -1793,6 +1933,7 @@ impl Session {
                     time_end: length / fps,
                     time_animated: false,
                     media_length: None,
+                    source_clip_id: None,
                     properties: BTreeMap::new(),
                     objects_3d: Vec::new(),
                     effects: Vec::new(),
@@ -2044,6 +2185,7 @@ impl Session {
                 let orig_start = orig.start;
                 let orig_length = orig.length;
                 let right_clip_id = self.alloc_uuid_id();
+                right_clip.source_clip_id = Some(right_clip.id.clone());
                 right_clip.id = right_clip_id.clone();
                 right_clip.start = orig_start + local_offset;
                 right_clip.length = orig_length - local_offset;
@@ -2097,6 +2239,7 @@ impl Session {
 
                 let mut cloned = track.clips[clip_idx].clone();
                 let new_clip_id = self.alloc_uuid_id();
+                cloned.source_clip_id = Some(cloned.id.clone());
                 cloned.id = new_clip_id.clone();
                 cloned.start += cloned.length;
                 self.remap_cloned_clip_children(&mut cloned);
@@ -3582,5 +3725,180 @@ mod tests {
         assert!((clips[1].start - 10.0).abs() < 1e-9);
         assert!((clips[1].length - 5.0).abs() < 1e-9);
         assert!(clips[0].start + clips[0].length <= clips[1].start + 1e-9);
+    }
+
+    #[test]
+    fn round2_typed_properties_cloned_clip_payloads_asset_versions_and_clip_links() {
+        let mut project = zc_project::Project::new_cm3_default();
+        // Add an Image clip with an effect carrying Color and Asset properties + a linked Audio clip.
+        let img_clip_id = zc_project::Uuid::new_v4();
+        let mut img_layer = zc_project::Layer::new(
+            "Logo",
+            zc_project::LayerKind::Image {
+                image: Some("logo-sha".to_string()),
+            },
+            [1920, 1080],
+        );
+        let mut fx = zc_project::create_effect_by_id("coloroverlay").expect("coloroverlay");
+        fx.params.insert(
+            "asset_ref".to_string(),
+            zc_project::PropertyTrack {
+                animated: false,
+                expression: None,
+                static_behavior: zc_project::StaticBehavior::Constant,
+                value: zc_project::PropertyValue::Asset(Some("lut-sha".to_string())),
+                keyframes: Vec::new(),
+                channels: Vec::new(),
+            },
+        );
+        img_layer.effects.push(fx);
+        let img_clip = zc_project::VideoClip {
+            id: img_clip_id,
+            name: "Logo".to_string(),
+            start: 0.0,
+            length: 60.0,
+            link: Some(1),
+            media: Some("media-v".to_string()),
+            time_curve: zc_project::PropertyTrack::linear_time_curve(60.0, 30),
+            layer: img_layer,
+            preserved: BTreeMap::new(),
+        };
+        project.sequence.video_tracks[0].clips = vec![img_clip];
+
+        let audio_clip_id = zc_project::Uuid::new_v4();
+        project.sequence.audio_tracks.push(zc_project::AudioTrack {
+            id: zc_project::Uuid::new_v4(),
+            name: "A1".to_string(),
+            enabled: true,
+            muted: false,
+            solo: false,
+            clips: vec![zc_project::AudioClip {
+                id: audio_clip_id,
+                name: "Music".to_string(),
+                start: 0.0,
+                length: 60.0,
+                link: Some(1),
+                media: Some("song-asset".to_string()),
+                time_curve: zc_project::PropertyTrack::linear_time_curve(60.0, 30),
+                audio: zc_project::AudioClipData::default(),
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        });
+        project
+            .sequence
+            .clip_links
+            .insert(1, vec![img_clip_id, audio_clip_id]);
+
+        // Add one asset with bytes and one missing asset with bytes == None.
+        let k_present =
+            project.insert_binary_asset(zc_project::AssetKind::Image, "v1.png", vec![1u8, 2, 3, 4]);
+        project.assets.insert(
+            "missing-key".to_string(),
+            zc_project::AssetRecord {
+                id: "missing-key".to_string(),
+                kind: zc_project::AssetKind::Image,
+                source: zc_project::AssetSource::File,
+                filename: "gone.png".to_string(),
+                url: None,
+                external: false,
+                bytes: None,
+                missing: true,
+                sha256: String::new(),
+                size: 0,
+                preserved: BTreeMap::new(),
+            },
+        );
+
+        let mut session = Session::from_project(project, zc_plugin::PluginRegistry::new());
+
+        // 1. Unrelated edit must NOT corrupt Option/Color/Asset PropertyValue variants.
+        session
+            .execute(Command::SetProjectName {
+                name: "Typed".to_string(),
+            })
+            .expect("rename");
+        let fx_after = &session.project.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects[0];
+        assert!(matches!(
+            fx_after.enabled.value,
+            zc_project::PropertyValue::Option(_)
+        ));
+        assert!(matches!(
+            fx_after.params["color"].value,
+            zc_project::PropertyValue::Color(_)
+        ));
+        assert_eq!(
+            fx_after.params["asset_ref"].value,
+            zc_project::PropertyValue::Asset(Some("lut-sha".to_string()))
+        );
+
+        // 2. Split image clip -> right half MUST retain LayerKind::Image { image: Some("logo-sha") }.
+        session
+            .execute(Command::SplitClip {
+                clip_id: img_clip_id.to_string(),
+                at_frame: 30.0,
+            })
+            .expect("split image clip");
+        assert_eq!(session.project.sequence.video_tracks[0].clips.len(), 2);
+        assert!(matches!(
+            &session.project.sequence.video_tracks[0].clips[1].layer.kind,
+            zc_project::LayerKind::Image { image: Some(id) } if id == "logo-sha"
+        ));
+
+        // 3. Duplicate audio clip -> duplicate MUST retain `media: Some("song-asset")`.
+        session
+            .execute(Command::DuplicateClip {
+                clip_id: audio_clip_id.to_string(),
+            })
+            .expect("duplicate audio clip");
+        assert_eq!(
+            session.project.sequence.audio_tracks[0].clips[1]
+                .media
+                .as_deref(),
+            Some("song-asset")
+        );
+
+        // 4. Engulf original image clip via AddClip -> stale UUID is pruned from sequence.clip_links.
+        let vtrack_id = session.document().video_tracks[0].id.clone();
+        session
+            .execute(Command::AddClip {
+                track_id: vtrack_id,
+                kind: "video".to_string(),
+                name: Some("Cover".to_string()),
+                start: 0.0,
+                length: 30.0,
+            })
+            .expect("engulf left half");
+        assert!(
+            !session.project.sequence.clip_links[&1].contains(&img_clip_id),
+            "engulfed clip UUID must be pruned from clip_links"
+        );
+
+        // 5. Mutating bytes under an existing asset key + Undo restores exact original bytes
+        //    while leaving originally-None assets as None.
+        session
+            .execute(Command::SetProjectName {
+                name: "BeforeBlobReplace".to_string(),
+            })
+            .expect("edit 1");
+        session.project.assets.get_mut(&k_present).unwrap().bytes = Some(vec![9u8, 9, 9]);
+        session
+            .execute(Command::SetProjectName {
+                name: "AfterBlobReplace".to_string(),
+            })
+            .expect("edit 2");
+        session.execute(Command::Undo).expect("undo edit 2");
+        assert_eq!(
+            session.project.assets[&k_present].bytes.as_deref(),
+            Some(&[9u8, 9, 9][..])
+        );
+        session.execute(Command::Undo).expect("undo edit 1");
+        assert_eq!(
+            session.project.assets[&k_present].bytes.as_deref(),
+            Some(&[1u8, 2, 3, 4][..])
+        );
+        assert!(session.project.assets["missing-key"].bytes.is_none());
     }
 }

@@ -1460,6 +1460,13 @@ mod tests {
             Err(ExprError::RecursionLimitExceeded { .. })
         ));
 
+        // Deep nested destructuring patterns must hit RecursionLimitExceeded cleanly.
+        let deep_destructure = format!("let {}x{} = 1", "[".repeat(200), "]".repeat(200));
+        assert!(matches!(
+            compile(&deep_destructure, ExprMode::ExpressionsPlus),
+            Err(ExprError::RecursionLimitExceeded { .. })
+        ));
+
         // Self-referential array stringification and join must terminate cleanly (ECMAScript yields "").
         let cyclic_str = eval_plus("let a = [1]; a.push(a); String(a)");
         assert_eq!(cyclic_str, Value::String("1,".to_string()));

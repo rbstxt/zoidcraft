@@ -530,7 +530,7 @@ fn collect_hoisted_decls(
         match stmt {
             Stmt::VarDecl { decls, .. } => {
                 for d in decls {
-                    collect_pattern_names(&d.pattern, out);
+                    collect_pattern_names(&d.pattern, out, next)?;
                 }
             }
             Stmt::FunctionDecl(f) => {
@@ -553,20 +553,20 @@ fn collect_hoisted_decls(
             Stmt::For(f) => {
                 if let Some(ForInit::VarDecl { decls, .. }) = &f.init {
                     for d in decls {
-                        collect_pattern_names(&d.pattern, out);
+                        collect_pattern_names(&d.pattern, out, next)?;
                     }
                 }
                 collect_hoisted_decls(std::slice::from_ref(&f.body), out, next)?;
             }
             Stmt::ForOf(f) => {
                 if f.kind.is_some() {
-                    collect_pattern_names(&f.target, out);
+                    collect_pattern_names(&f.target, out, next)?;
                 }
                 collect_hoisted_decls(std::slice::from_ref(&f.body), out, next)?;
             }
             Stmt::ForIn(f) => {
                 if f.kind.is_some() {
-                    collect_pattern_names(&f.target, out);
+                    collect_pattern_names(&f.target, out, next)?;
                 }
                 collect_hoisted_decls(std::slice::from_ref(&f.body), out, next)?;
             }
@@ -595,7 +595,12 @@ fn collect_hoisted_decls(
     Ok(())
 }
 
-fn collect_pattern_names(pattern: &Pattern, out: &mut BTreeSet<String>) {
+fn collect_pattern_names(
+    pattern: &Pattern,
+    out: &mut BTreeSet<String>,
+    depth: usize,
+) -> Result<(), ExprError> {
+    let next = check_validation_depth(depth)?;
     match pattern {
         Pattern::Ident(name) => {
             out.insert(name.clone());
@@ -605,7 +610,7 @@ fn collect_pattern_names(pattern: &Pattern, out: &mut BTreeSet<String>) {
                 match elem {
                     ArrayPatternElem::Hole => {}
                     ArrayPatternElem::Binding { pattern, .. } => {
-                        collect_pattern_names(pattern, out);
+                        collect_pattern_names(pattern, out, next)?;
                     }
                     ArrayPatternElem::Rest(name) => {
                         out.insert(name.clone());
@@ -617,7 +622,7 @@ fn collect_pattern_names(pattern: &Pattern, out: &mut BTreeSet<String>) {
             for prop in props {
                 match prop {
                     ObjectPatternProp::Prop { pattern, .. } => {
-                        collect_pattern_names(pattern, out);
+                        collect_pattern_names(pattern, out, next)?;
                     }
                     ObjectPatternProp::Rest(name) => {
                         out.insert(name.clone());
@@ -626,6 +631,7 @@ fn collect_pattern_names(pattern: &Pattern, out: &mut BTreeSet<String>) {
             }
         }
     }
+    Ok(())
 }
 
 fn validate_pattern(
@@ -719,7 +725,7 @@ fn validate_stmt(
             inner_locals.insert(f.name.clone());
             for p in &f.params {
                 validate_pattern(&p.pattern, mode, &inner_locals, next)?;
-                collect_pattern_names(&p.pattern, &mut inner_locals);
+                collect_pattern_names(&p.pattern, &mut inner_locals, next)?;
                 if let Some(d) = &p.default {
                     validate_expr(d, mode, &inner_locals, next)?;
                 }
@@ -830,7 +836,7 @@ fn validate_stmt(
                 let mut catch_locals = locals.clone();
                 if let Some(p) = &t.catch_param {
                     validate_pattern(p, mode, &catch_locals, next)?;
-                    collect_pattern_names(p, &mut catch_locals);
+                    collect_pattern_names(p, &mut catch_locals, next)?;
                 }
                 for s in cb {
                     validate_stmt(s, mode, &catch_locals, in_loop, in_switch, next)?;
@@ -1019,7 +1025,7 @@ fn validate_expr(
             }
             for p in &f.params {
                 validate_pattern(&p.pattern, mode, &inner_locals, next)?;
-                collect_pattern_names(&p.pattern, &mut inner_locals);
+                collect_pattern_names(&p.pattern, &mut inner_locals, next)?;
                 if let Some(d) = &p.default {
                     validate_expr(d, mode, &inner_locals, next)?;
                 }

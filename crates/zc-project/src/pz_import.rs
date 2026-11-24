@@ -331,37 +331,9 @@ fn remap_opt_key(slot: &mut Option<String>, remap: &BTreeMap<String, String>) {
     }
 }
 
-fn remap_json_value(val: &mut Value, remap: &BTreeMap<String, String>) {
-    match val {
-        Value::String(s) => {
-            if let Some(new_key) = remap.get(s.as_str()) {
-                *s = new_key.clone();
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                remap_json_value(item, remap);
-            }
-        }
-        Value::Object(map) => {
-            for child in map.values_mut() {
-                remap_json_value(child, remap);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn remap_property_value(val: &mut PropertyValue, remap: &BTreeMap<String, String>) {
-    match val {
-        PropertyValue::Asset(slot) => remap_opt_key(slot, remap),
-        PropertyValue::Text(s) | PropertyValue::List(s) | PropertyValue::Shader(s) => {
-            if let Some(new_key) = remap.get(s.as_str()) {
-                *s = new_key.clone();
-            }
-        }
-        PropertyValue::Curve(v) | PropertyValue::Json(v) => remap_json_value(v, remap),
-        _ => {}
+    if let PropertyValue::Asset(slot) = val {
+        remap_opt_key(slot, remap);
     }
 }
 
@@ -377,7 +349,9 @@ fn remap_property_track(track: &mut PropertyTrack, remap: &BTreeMap<String, Stri
 
 fn remap_material(mat: &mut MaterialSpec, remap: &BTreeMap<String, String>) {
     match mat {
-        MaterialSpec::SingleColor { .. } => {}
+        MaterialSpec::SingleColor { .. }
+        | MaterialSpec::NodeMaterial { .. }
+        | MaterialSpec::Unknown { .. } => {}
         MaterialSpec::Texture(m) => remap_opt_key(&mut m.texture, remap),
         MaterialSpec::Video(m) => remap_opt_key(&mut m.video, remap),
         MaterialSpec::CustomPbr(m) => {
@@ -401,8 +375,6 @@ fn remap_material(mat: &mut MaterialSpec, remap: &BTreeMap<String, String>) {
         }
         MaterialSpec::Matcap(m) => remap_opt_key(&mut m.texture, remap),
         MaterialSpec::ImagePlus(m) => remap_opt_key(&mut m.texture, remap),
-        MaterialSpec::NodeMaterial { graph, .. } => remap_json_value(graph, remap),
-        MaterialSpec::Unknown { payload, .. } => remap_json_value(payload, remap),
     }
 }
 
@@ -432,11 +404,7 @@ fn remap_object_3d(obj: &mut Object3D, remap: &BTreeMap<String, String>) {
         }
         Object3DKind::Particles(p) => remap_opt_key(&mut p.texture, remap),
         Object3DKind::Model(m) => remap_opt_key(&mut m.asset_id, remap),
-        Object3DKind::Dummy { payload, .. } => remap_json_value(payload, remap),
         _ => {}
-    }
-    for v in obj.preserved.values_mut() {
-        remap_json_value(v, remap);
     }
 }
 
@@ -465,9 +433,6 @@ fn remap_effect(fx: &mut EffectInstance, remap: &BTreeMap<String, String>) {
         }
         EffectKind::Standard(_) | EffectKind::Plugin { .. } => {}
     }
-    for v in fx.preserved.values_mut() {
-        remap_json_value(v, remap);
-    }
 }
 
 fn remap_layer(layer: &mut Layer, remap: &BTreeMap<String, String>) {
@@ -485,14 +450,10 @@ fn remap_layer(layer: &mut Layer, remap: &BTreeMap<String, String>) {
                 remap_object_3d(obj, remap);
             }
         }
-        LayerKind::Plugin { payload, .. } => remap_json_value(payload, remap),
         _ => {}
     }
     for fx in &mut layer.effects {
         remap_effect(fx, remap);
-    }
-    for v in layer.preserved.values_mut() {
-        remap_json_value(v, remap);
     }
 }
 
