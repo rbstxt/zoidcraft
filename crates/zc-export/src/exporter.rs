@@ -15,7 +15,8 @@ use image::{ExtendedColorType, ImageEncoder};
 use crate::ExportError;
 use crate::ffmpeg::{
     BoundedStderrBuffer, MAX_STDERR_BYTES, build_ffmpeg_os_args_with_output,
-    configure_process_group, kill_process_tree_and_reap, resolve_ffmpeg_binary,
+    configure_process_group, kill_process_tree_and_reap, kill_process_tree_by_pid,
+    resolve_ffmpeg_binary,
 };
 use crate::padding::pad_rgba_frame_into;
 use crate::settings::{
@@ -27,17 +28,21 @@ use crate::temp_audio::{TempFileGuard, unique_sibling_temp_path, write_temp_ster
 /// to kill a stalled child while guaranteeing the child is always reaped (`wait()`) on
 /// drop/error/cancel/panic (zero zombies, zero leaked descriptors).
 struct SharedChildGuard {
+    pid: u32,
     child: Arc<Mutex<Option<Child>>>,
 }
 
 impl SharedChildGuard {
     fn new(child: Child) -> Self {
+        let pid = child.id();
         Self {
+            pid,
             child: Arc::new(Mutex::new(Some(child))),
         }
     }
 
-    /// Terminates the entire process tree (wrapper + descendants) and reaps the child immediately.
+    /// Terminates the entire process tree (wrapper + descendants) and reaps the child if still present.
+    /// Still terminates the process group by `pid` even if the wrapper has already exited and been reaped.
     fn kill_and_reap(&self) {
         let mut guard = self
             .child
@@ -45,6 +50,8 @@ impl SharedChildGuard {
             .unwrap_or_else(|poison| poison.into_inner());
         if let Some(mut child) = guard.take() {
             kill_process_tree_and_reap(&mut child);
+        } else {
+            kill_process_tree_by_pid(self.pid);
         }
     }
 
@@ -212,11 +219,7 @@ where
     }
 
     fs::create_dir_all(&settings.output_path)?;
-    for file_name in &staged_names {
-        let src = staging_dir.path().join(file_name);
-        let dst = settings.output_path.join(file_name);
-        publish_temp_output(&src, &dst)?;
-    }
+    publish_staged_png_directory(staging_dir.path(), &settings.output_path, &staged_names)?;
 
     Ok(ExportReport {
         frames_exported: total_frames,
@@ -225,6 +228,72 @@ where
         audio_samples_written: 0,
         output_path: settings.output_path.clone(),
     })
+}
+
+/// Publishes every staged PNG frame into `dst_dir` with full rollback if any move fails,
+/// preserving pre-existing frames in `dst_dir` intact on failure.
+fn publish_staged_png_directory(
+    staging_dir: &Path,
+    dst_dir: &Path,
+    staged_names: &[String],
+) -> Result<(), ExportError> {
+    let backup_dir = TempDirGuard::new(unique_sibling_temp_path(dst_dir));
+    fs::create_dir_all(backup_dir.path())?;
+
+    let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let mut published: Vec<std::path::PathBuf> = Vec::new();
+
+    for file_name in staged_names {
+        let src = staging_dir.join(file_name);
+        let dst = dst_dir.join(file_name);
+
+        let step_result: Result<(), std::io::Error> = (|| {
+            if fs::symlink_metadata(&dst).is_ok() {
+                if fs::symlink_metadata(&dst)?.is_dir() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::IsADirectory,
+                        format!("destination frame path {} is a directory", dst.display()),
+                    ));
+                }
+                let backup = backup_dir.path().join(file_name);
+                fs::rename(&dst, &backup)?;
+                backups.push((dst.clone(), backup));
+            }
+            fs::rename(&src, &dst)?;
+            published.push(dst.clone());
+            Ok(())
+        })();
+
+        if let Err(err) = step_result {
+            let mut rollback_errors = Vec::new();
+            for placed in published.iter().rev() {
+                if let Err(rm_err) = fs::remove_file(placed) {
+                    rollback_errors.push(format!("remove {}: {rm_err}", placed.display()));
+                }
+            }
+            for (orig_dst, backup_path) in backups.iter().rev() {
+                if let Err(rb_err) = fs::rename(backup_path, orig_dst) {
+                    rollback_errors.push(format!(
+                        "restore {} from {}: {rb_err}",
+                        orig_dst.display(),
+                        backup_path.display()
+                    ));
+                }
+            }
+            if rollback_errors.is_empty() {
+                return Err(ExportError::Io(err));
+            }
+            return Err(ExportError::Io(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to publish PNG sequence frame ({err}); rollback errors: {}",
+                    rollback_errors.join("; ")
+                ),
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn export_ffmpeg<F, P>(
@@ -367,6 +436,9 @@ where
     let child_guard = SharedChildGuard::new(child);
     let mut raw_frame = vec![0_u8; raw_bytes];
 
+    let mut writer_finished = false;
+    let mut stderr_finished = false;
+
     let result = (|| -> Result<(), ExportError> {
         let mut frame_tx_opt = Some(frame_tx);
         let mut writer_outcome: Option<WriterOutcome> = None;
@@ -411,6 +483,7 @@ where
                     Ok(buf) => break buf,
                     Err(RecvTimeoutError::Timeout) => {
                         if let Ok(outcome) = writer_done_rx.try_recv() {
+                            writer_finished = true;
                             drop(frame_tx_opt.take());
                             match outcome {
                                 WriterOutcome::Io(err) => {
@@ -492,15 +565,20 @@ where
                 }
                 match writer_done_rx.recv_timeout(Duration::from_millis(10)) {
                     Ok(WriterOutcome::Io(err)) => {
+                        writer_finished = true;
                         child_guard.kill_and_reap();
                         return Err(ExportError::Io(err));
                     }
                     Ok(other) => {
+                        writer_finished = true;
                         writer_outcome = Some(other);
                         break;
                     }
                     Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        writer_finished = true;
+                        break;
+                    }
                 }
             }
         }
@@ -512,19 +590,35 @@ where
 
         let status = child_guard.wait_cancellable(cancel)?;
         let stderr_text = {
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
             loop {
                 if cancel.load(Ordering::Acquire) {
+                    child_guard.kill_and_reap();
                     return Err(ExportError::Cancelled);
                 }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    break String::new();
+                    // A descendant may still hold stderr open after the wrapper exited;
+                    // terminate the entire process group so pipes close promptly.
+                    child_guard.kill_and_reap();
+                    match stderr_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(text) => {
+                            stderr_finished = true;
+                            break text;
+                        }
+                        Err(_) => break String::new(),
+                    }
                 }
                 match stderr_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
-                    Ok(text) => break text,
+                    Ok(text) => {
+                        stderr_finished = true;
+                        break text;
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break String::new(),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        stderr_finished = true;
+                        break String::new();
+                    }
                 }
             }
         };
@@ -559,15 +653,30 @@ where
         Ok(())
     })();
 
-    // Ensure the process tree is terminated/reaped on any error/cancel path so both pipe
-    // worker threads unblock and join cleanly without leaking threads or descriptors.
-    if result.is_err() {
+    // Ensure the entire process group (even if wrapper already exited) is terminated on error/cancel
+    // or whenever a pipe worker is still open, then join ONLY workers that completed within the
+    // bounded grace window so a detached descendant outside our process group can never hang export.
+    if result.is_err() || !writer_finished || !stderr_finished {
         child_guard.kill_and_reap();
     }
-    let _ = writer_done_rx.recv_timeout(Duration::from_millis(500));
-    let _ = stderr_rx.recv_timeout(Duration::from_millis(500));
-    let _ = writer_handle.join();
-    let _ = stderr_handle.join();
+    if !writer_finished {
+        match writer_done_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(_) | Err(RecvTimeoutError::Disconnected) => writer_finished = true,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    if !stderr_finished {
+        match stderr_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(_) | Err(RecvTimeoutError::Disconnected) => stderr_finished = true,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    if writer_finished {
+        let _ = writer_handle.join();
+    }
+    if stderr_finished {
+        let _ = stderr_handle.join();
+    }
 
     // Explicitly keep `temp_audio_guard` alive until FFmpeg has completely exited, then drop it.
     drop(temp_audio_guard);

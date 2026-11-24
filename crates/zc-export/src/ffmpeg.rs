@@ -31,9 +31,8 @@ pub(crate) fn configure_process_group(cmd: &mut Command) {
     }
 }
 
-/// Terminates the entire process tree rooted at `child` (wrapper + descendants) and reaps `child`.
-pub(crate) fn kill_process_tree_and_reap(child: &mut Child) {
-    let pid = child.id();
+/// Terminates every process in the Unix process group (or Windows process tree) rooted at `pid`.
+pub(crate) fn kill_process_tree_by_pid(pid: u32) {
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
@@ -52,6 +51,15 @@ pub(crate) fn kill_process_tree_and_reap(child: &mut Child) {
             .stderr(Stdio::null())
             .status();
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Terminates the entire process tree rooted at `child` (wrapper + descendants) and reaps `child`.
+pub(crate) fn kill_process_tree_and_reap(child: &mut Child) {
+    kill_process_tree_by_pid(child.id());
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -88,6 +96,7 @@ pub(crate) fn probe_ffmpeg_with_timeout(
         }
     })?;
 
+    let child_pid = child.id();
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
@@ -116,10 +125,14 @@ pub(crate) fn probe_ffmpeg_with_timeout(
             None => {
                 if Instant::now() >= deadline {
                     kill_process_tree_and_reap(&mut child);
-                    let _ = out_rx.recv_timeout(Duration::from_millis(200));
-                    let _ = err_rx.recv_timeout(Duration::from_millis(200));
-                    let _ = out_handle.join();
-                    let _ = err_handle.join();
+                    // Only join pipe readers if they actually finish within the grace window
+                    // so a detached descendant that escaped the process group cannot hang probe.
+                    if out_rx.recv_timeout(Duration::from_millis(200)).is_ok() {
+                        let _ = out_handle.join();
+                    }
+                    if err_rx.recv_timeout(Duration::from_millis(200)).is_ok() {
+                        let _ = err_handle.join();
+                    }
                     return Err(ExportError::FfmpegFailed {
                         exit_code: None,
                         stderr: format!(
@@ -133,14 +146,33 @@ pub(crate) fn probe_ffmpeg_with_timeout(
         }
     };
 
-    let stdout = out_rx
-        .recv_timeout(Duration::from_millis(500))
-        .unwrap_or_default();
-    let stderr = err_rx
-        .recv_timeout(Duration::from_millis(500))
-        .unwrap_or_default();
-    let _ = out_handle.join();
-    let _ = err_handle.join();
+    // Wait up to the remaining deadline for stdout/stderr EOF. If a descendant is still
+    // holding a pipe open after the wrapper exited, terminate the process group first.
+    let mut stdout_opt = out_rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok();
+    let mut stderr_opt = err_rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok();
+
+    if stdout_opt.is_none() || stderr_opt.is_none() {
+        kill_process_tree_by_pid(child_pid);
+        if stdout_opt.is_none() {
+            stdout_opt = out_rx.recv_timeout(Duration::from_millis(200)).ok();
+        }
+        if stderr_opt.is_none() {
+            stderr_opt = err_rx.recv_timeout(Duration::from_millis(200)).ok();
+        }
+    }
+    if stdout_opt.is_some() {
+        let _ = out_handle.join();
+    }
+    if stderr_opt.is_some() {
+        let _ = err_handle.join();
+    }
+
+    let stdout = stdout_opt.unwrap_or_default();
+    let stderr = stderr_opt.unwrap_or_default();
 
     if !status.success() {
         return Err(ExportError::FfmpegFailed {

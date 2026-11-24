@@ -852,6 +852,26 @@ fn parse_audio_track(val: &Value, index: usize, fps: u32) -> AudioTrack {
     }
 }
 
+fn rebase_time_curve_for_clipped_prefix(
+    time_curve: &mut PropertyTrack,
+    clipped_frames: f64,
+    fps: u32,
+) {
+    if !clipped_frames.is_finite() || clipped_frames <= 0.0 {
+        return;
+    }
+    let dt_sec = clipped_frames / f64::from(fps.max(1));
+    if let PropertyValue::Number(v) = &mut time_curve.value {
+        *v += dt_sec;
+    }
+    for kf in &mut time_curve.keyframes {
+        kf.frame = (kf.frame - clipped_frames).max(0.0);
+        if let PropertyValue::Number(v) = &mut kf.value {
+            *v += dt_sec;
+        }
+    }
+}
+
 fn parse_video_clip(
     val: &Value,
     seq_res: [u32; 2],
@@ -894,6 +914,9 @@ fn parse_video_clip(
         || PropertyTrack::linear_time_curve(length, fps),
         |v| parse_property_track(v, PropertyValue::Number(0.0)),
     );
+    if raw_start < 0.0 {
+        rebase_time_curve_for_clipped_prefix(&mut time_curve, -raw_start, fps);
+    }
     time_curve.static_behavior = StaticBehavior::Linear;
 
     let layer = obj.and_then(|o| o.get("object")).map_or_else(
@@ -959,6 +982,9 @@ fn parse_audio_clip(val: &Value, fps: u32) -> AudioClip {
         || PropertyTrack::linear_time_curve(length, fps),
         |v| parse_property_track(v, PropertyValue::Number(0.0)),
     );
+    if raw_start < 0.0 {
+        rebase_time_curve_for_clipped_prefix(&mut time_curve, -raw_start, fps);
+    }
     time_curve.static_behavior = StaticBehavior::Linear;
 
     let mut audio = AudioClipData::default();

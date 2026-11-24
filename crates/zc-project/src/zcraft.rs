@@ -331,12 +331,21 @@ fn save_zcraft_to_bytes_with_limits(
         },
     );
 
+    let max_retained_assets = max_uncompressed.min(MAX_RETAINED_ASSET_BYTES);
     let mut missing_assets = Vec::new();
     let mut embedded_assets: Vec<(String, &[u8])> = Vec::new();
+    let mut total_embedded_asset_bytes = 0_u64;
     for (asset_key, record) in &project.assets {
         if let Some(bytes) = record.bytes.as_deref() {
             let entry_path = format!("assets/{asset_key}");
             validate_archive_path(&entry_path, false)?;
+            total_embedded_asset_bytes =
+                total_embedded_asset_bytes.saturating_add(bytes.len() as u64);
+            if total_embedded_asset_bytes > max_retained_assets {
+                return Err(ProjectError::ArchiveTooLarge {
+                    limit_bytes: max_retained_assets,
+                });
+            }
             integrity.insert(
                 entry_path.clone(),
                 IntegrityEntry {

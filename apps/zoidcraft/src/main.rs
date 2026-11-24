@@ -24,7 +24,7 @@ use egui::{Align2, Area, Color32, CornerRadius, Frame, Id, Key, Order, Pos2, Rec
 use serde_json::{Value, json};
 use zc_anim::{InterpolationMode, eval_easing};
 use zc_audio::{
-    AudioBuffer, AudioClipScheduleItem, AudioOutputHandle, ClipAudioSampleParams,
+    AudioBuffer, AudioClipScheduleItem, AudioMixWindow, AudioOutputHandle, ClipAudioSampleParams,
     MasterPlaybackClock, STANDARD_SAMPLE_RATE, WaveformPeaks, decode_audio_bytes,
     effective_playback_rate, try_mix_offline_stereo_animated,
 };
@@ -58,6 +58,9 @@ use ui::viewport::{EditorCameraState, ViewportState, show_viewport};
 
 const TOAST_LIFETIME: Duration = Duration::from_secs(4);
 const CLEAR_BG_RGBA: [f32; 4] = [29.0 / 255.0, 29.0 / 255.0, 29.0 / 255.0, 1.0];
+/// Maximum live audio playback mix window duration in seconds (60s = 2.88M stereo frames at 48 kHz,
+/// well inside `zc-audio`'s 32 Mi sample cap even for multi-hour timelines).
+const LIVE_AUDIO_WINDOW_SECS: f64 = 60.0;
 
 // ---------------------------------------------------------------------------
 // Dirty-Tracking Render Key
@@ -359,6 +362,9 @@ struct ZoidCraftApp {
     audio_output: Option<AudioOutputHandle>,
     /// Fingerprint of the timeline audio mix currently loaded into `audio_output`.
     audio_mix_hash: u64,
+    /// Inclusive start and exclusive end frames currently mixed inside `audio_output`.
+    audio_window_start: u32,
+    audio_window_end: u32,
     /// Last mix fingerprint for which opening `audio_output` was attempted (avoids retry storms on headless devices).
     audio_stream_attempted_hash: u64,
     last_audio_epoch: u64,
@@ -447,6 +453,8 @@ impl ZoidCraftApp {
             audio_clock,
             audio_output: None,
             audio_mix_hash: 0,
+            audio_window_start: 0,
+            audio_window_end: 0,
             audio_stream_attempted_hash: 0,
             last_audio_epoch: init_epoch,
             last_audio_playing: false,
@@ -521,6 +529,8 @@ impl ZoidCraftApp {
         self.audio_clock.pause();
         self.audio_output = None;
         self.audio_mix_hash = 0;
+        self.audio_window_start = 0;
+        self.audio_window_end = 0;
         self.audio_stream_attempted_hash = 0;
         self.last_audio_playing = false;
         self.last_audio_speed = 0.0;
@@ -554,35 +564,68 @@ impl ZoidCraftApp {
         let speed = self.session.playback.speed;
         let epoch = self.session.playback.epoch_id;
 
-        // Lazily build and attach the CPAL live audio output stream when playing with audio clips.
+        // Lazily build and attach a bounded 60-second CPAL live audio window anchored around the
+        // current playhead so arbitrarily long timelines (12+ min) play audio cleanly without
+        // hitting the mixer's sample cap or freezing the UI thread.
         if is_playing {
             let mix_hash = compute_audio_mix_hash(&self.session, &self.decoded_audio, fps, seq_len);
             if mix_hash == 0 {
                 if self.audio_output.is_some() {
                     self.reset_live_audio_output();
                 }
-            } else if self.audio_mix_hash != mix_hash
-                && (self.audio_output.is_some() || self.audio_stream_attempted_hash != mix_hash)
-            {
-                self.audio_output = None;
-                self.audio_stream_attempted_hash = mix_hash;
-                let end_frame = seq_len.ceil().max(1.0) as u32;
-                if let Ok(Some(mix)) = mix_sequence_audio_stereo(
-                    &self.session,
-                    &self.decoded_audio,
-                    STANDARD_SAMPLE_RATE,
-                    fps,
-                    0,
-                    end_frame,
-                ) {
-                    self.audio_clock
-                        .seek_preserving_playback(self.session.playback.current_frame);
-                    self.audio_clock.set_speed(speed);
-                    if let Some(handle) =
-                        self.audio_clock.try_start_audio_output(Some(Arc::new(mix)))
-                    {
-                        self.audio_output = Some(handle);
-                        self.audio_mix_hash = mix_hash;
+            } else {
+                let cur_f = self.session.playback.current_frame.max(0.0);
+                let total_u32 = seq_len.ceil().max(1.0) as u32;
+                let window_frames = (LIVE_AUDIO_WINDOW_SECS * fps).round().max(1.0) as u32;
+                let outside_window = self.audio_window_end <= self.audio_window_start
+                    || cur_f < f64::from(self.audio_window_start)
+                    || cur_f >= f64::from(self.audio_window_end);
+                let needs_mix = self.audio_mix_hash != mix_hash || outside_window;
+
+                if needs_mix
+                    && (self.audio_output.is_some()
+                        || self.audio_stream_attempted_hash != mix_hash
+                        || outside_window)
+                {
+                    let (win_start, win_end) =
+                        compute_live_audio_window(cur_f, speed, total_u32, window_frames);
+                    self.audio_output = None;
+                    self.audio_stream_attempted_hash = mix_hash;
+                    self.audio_window_start = win_start;
+                    self.audio_window_end = win_end;
+                    match mix_sequence_audio_stereo(
+                        &self.session,
+                        &self.decoded_audio,
+                        STANDARD_SAMPLE_RATE,
+                        fps,
+                        win_start,
+                        win_end,
+                    ) {
+                        Ok(maybe_mix) => {
+                            let window = maybe_mix.map(|samples| AudioMixWindow {
+                                origin_frame: f64::from(win_start),
+                                samples: Arc::new(samples),
+                            });
+                            self.audio_clock
+                                .seek_preserving_playback(self.session.playback.current_frame);
+                            self.audio_clock.set_speed(speed);
+                            match self.audio_clock.start_audio_output_windowed(window) {
+                                Ok(handle) => {
+                                    self.audio_output = Some(handle);
+                                    self.audio_mix_hash = mix_hash;
+                                }
+                                Err(err) => {
+                                    tracing::warn!("live audio output unavailable: {err}");
+                                    self.show_toast(format!(
+                                        "Audio output unavailable ({err}); playing silently"
+                                    ));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!("failed to mix live playback audio: {err}");
+                            self.show_toast(format!("Audio playback failed: {err}"));
+                        }
                     }
                 }
             }
@@ -899,10 +942,15 @@ impl ZoidCraftApp {
         for dep in self.session.active_plugin_dependencies() {
             project_to_save.plugin_requirements.insert(dep);
         }
+        let mut omitted_embedded_count = 0usize;
         if !include_assets {
             for rec in project_to_save.assets.values_mut() {
+                if rec.bytes.is_some() {
+                    omitted_embedded_count += 1;
+                }
                 rec.bytes = None;
                 rec.external = true;
+                rec.missing = rec.url.is_none();
             }
         }
 
@@ -916,12 +964,16 @@ impl ZoidCraftApp {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("project.zcraft");
-                let suffix = if include_assets {
-                    ""
+                let msg = if include_assets {
+                    format!("Saved {name}")
+                } else if omitted_embedded_count > 0 {
+                    format!(
+                        "Saved {name} without assets ({omitted_embedded_count} embedded asset(s) omitted; current project intact)"
+                    )
                 } else {
-                    " (without assets)"
+                    format!("Saved {name} (without assets)")
                 };
-                self.show_toast(format!("Saved {name}{suffix}"));
+                self.show_toast(msg);
                 true
             }
             Err(err) => {
@@ -979,11 +1031,6 @@ impl ZoidCraftApp {
             None
         };
 
-        let source_url = fs::canonicalize(&path)
-            .unwrap_or_else(|_| path.clone())
-            .to_string_lossy()
-            .into_owned();
-
         let tx_started = self
             .session
             .begin_transaction(format!("Import {filename}"))
@@ -993,9 +1040,6 @@ impl ZoidCraftApp {
             .session
             .project
             .insert_binary_asset(kind, filename.clone(), bytes);
-        if let Some(rec) = self.session.project.assets.get_mut(&asset_id) {
-            rec.url = Some(source_url);
-        }
         self.session.project.media.push(MediaItem {
             id: Uuid::new_v4(),
             name: filename.clone(),
@@ -1071,13 +1115,13 @@ impl ZoidCraftApp {
                     let Some(rec) = self.session.project.assets.get(asset_key) else {
                         continue;
                     };
-                    let Some(bytes) = resolve_asset_bytes(rec) else {
+                    let Some(bytes) = rec.bytes.as_deref() else {
                         continue;
                     };
                     let ext = Path::new(&rec.filename)
                         .extension()
                         .and_then(|e| e.to_str());
-                    if let Ok(buf) = decode_audio_bytes(&bytes, ext) {
+                    if let Ok(buf) = decode_audio_bytes(bytes, ext) {
                         let peaks = WaveformPeaks::from_audio_buffer(&buf);
                         self.asset_waveform_peaks.insert(
                             asset_key.to_owned(),
@@ -2082,18 +2126,29 @@ fn collect_in_range_audio_arcs(
     selected
 }
 
-fn resolve_asset_bytes(rec: &zc_project::AssetRecord) -> Option<std::borrow::Cow<'_, [u8]>> {
-    if let Some(bytes) = rec.bytes.as_deref() {
-        return Some(std::borrow::Cow::Borrowed(bytes));
+/// Computes a bounded `[start_frame, end_frame)` live audio mix window covering `current_frame`
+/// without exceeding `window_frames`, supporting both forward and reverse playback on long timelines.
+fn compute_live_audio_window(
+    current_frame: f64,
+    speed: f64,
+    total_frames: u32,
+    window_frames: u32,
+) -> (u32, u32) {
+    let total = total_frames.max(1);
+    let span = window_frames.max(1);
+    if total <= span {
+        return (0, total);
     }
-    let raw_url = rec.url.as_deref()?;
-    let path_str = raw_url.strip_prefix("file://").unwrap_or(raw_url);
-    let path = Path::new(path_str);
-    let meta = fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > 256 * 1024 * 1024 {
-        return None;
+    let cur = (current_frame.floor().max(0.0) as u32).min(total.saturating_sub(1));
+    if speed < 0.0 {
+        let end = cur.saturating_add(1).min(total);
+        let start = end.saturating_sub(span);
+        (start, end.max(start + 1))
+    } else {
+        let start = cur;
+        let end = start.saturating_add(span).min(total);
+        (start, end.max(start + 1))
     }
-    fs::read(path).ok().map(std::borrow::Cow::Owned)
 }
 
 fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
@@ -2173,7 +2228,8 @@ fn compute_audio_mix_hash(
                     .project
                     .assets
                     .get(asset_id)
-                    .is_some_and(|r| r.bytes.is_some() || r.url.is_some());
+                    .and_then(|r| r.bytes.as_ref())
+                    .is_some();
             if !has_audio {
                 continue;
             }
@@ -2278,13 +2334,13 @@ fn mix_sequence_audio_stereo(
                     let Some(rec) = session.project.assets.get(asset_id) else {
                         continue;
                     };
-                    let Some(bytes) = resolve_asset_bytes(rec) else {
+                    let Some(bytes) = rec.bytes.as_deref() else {
                         continue;
                     };
                     let ext = Path::new(&rec.filename)
                         .extension()
                         .and_then(|e| e.to_str());
-                    let decoded = decode_audio_bytes(&bytes, ext).map_err(|err| {
+                    let decoded = decode_audio_bytes(bytes, ext).map_err(|err| {
                         format!("failed to decode audio asset `{asset_id}`: {err}")
                     })?;
                     buffers.insert(asset_id.clone(), Arc::new(decoded));
@@ -2629,5 +2685,22 @@ mod tests {
         session.execute(Command::Undo).expect("undo media import");
         assert!(!session.is_dirty());
         assert!(!session.project.assets.contains_key(&asset_id));
+    }
+
+    #[test]
+    fn live_audio_window_bounds_long_timelines_within_mixer_cap() {
+        // 12-minute 60fps timeline = 43,200 frames (exceeds 32 Mi full-sequence mix cap at 48 kHz).
+        let total_frames = 12 * 60 * 60;
+        let window_frames = (LIVE_AUDIO_WINDOW_SECS * 60.0) as u32;
+        let (start, end) = compute_live_audio_window(0.0, 1.0, total_frames, window_frames);
+        assert_eq!((start, end), (0, window_frames));
+
+        let (start2, end2) = compute_live_audio_window(10_000.0, 1.0, total_frames, window_frames);
+        assert_eq!((start2, end2), (10_000, 10_000 + window_frames));
+
+        // Reverse playback anchors window ending at current frame.
+        let (rstart, rend) = compute_live_audio_window(10_000.0, -1.0, total_frames, window_frames);
+        assert_eq!(rend, 10_001);
+        assert_eq!(rend - rstart, window_frames);
     }
 }

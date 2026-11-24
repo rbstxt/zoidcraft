@@ -401,3 +401,83 @@ fn stalled_ffmpeg_probe_times_out_cleanly() {
         "probe took too long: {elapsed:?}"
     );
 }
+
+#[test]
+fn png_sequence_failed_publish_rolls_back_replaced_frames() {
+    let root = TempDirGuard::new("png-rollback");
+    let out_dir = root.path().join("seq_target");
+    fs::create_dir_all(&out_dir).expect("create out_dir");
+
+    // Pre-populate frame 1 with good data and sabotage frame 2 with a directory so
+    // publishing frame 2 fails after frame 1 has already been moved into place.
+    let frame1 = out_dir.join("frame_000001.png");
+    let original_frame1 = b"PREVIOUS-GOOD-FRAME-1".to_vec();
+    fs::write(&frame1, &original_frame1).expect("write frame 1");
+    let blocking_dir = out_dir.join("frame_000002.png");
+    fs::create_dir_all(&blocking_dir).expect("create blocking dir");
+
+    let settings = ExportSettings {
+        width: 16,
+        height: 16,
+        fps: 30.0,
+        start_frame: 0,
+        end_frame: 2,
+        container: ExportContainer::PngSequence,
+        video_codec: VideoCodec::H264,
+        audio_codec: AudioCodec::None,
+        quality: QualityMode::Crf(18),
+        audio_bitrate_kbps: 192,
+        sample_rate: 48_000,
+        transparent_alpha: true,
+        output_path: out_dir.clone(),
+        ffmpeg_binary: None,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let err = export_video(
+        &settings,
+        None,
+        &cancel,
+        |frame_idx: u32, buf: &mut Vec<u8>| {
+            fill_gradient(buf, 16, 16, frame_idx);
+            Ok(())
+        },
+    )
+    .expect_err("publishing over a directory at frame 2 must fail");
+    assert!(matches!(err, ExportError::Io(_)));
+
+    assert_eq!(
+        fs::read(&frame1).expect("frame 1 must be rolled back to its original bytes"),
+        original_frame1
+    );
+    assert!(blocking_dir.is_dir(), "blocking dir must remain untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_leaving_descendant_holding_pipes_does_not_hang_probe_or_export() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDirGuard::new("wrapper-descendant");
+    let probe_wrapper = root.path().join("probe_descendant.sh");
+    // Wrapper prints version, spawns a long-lived sleeper inheriting stdout/stderr, and exits 0.
+    fs::write(
+        &probe_wrapper,
+        "#!/bin/sh\necho 'ffmpeg version 9.9.9-test'\n(sleep 30) &\nexit 0\n",
+    )
+    .expect("write probe wrapper");
+    let mut perms = fs::metadata(&probe_wrapper).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&probe_wrapper, perms).expect("chmod");
+
+    let start = std::time::Instant::now();
+    let res = probe_ffmpeg(Some(&probe_wrapper));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(6),
+        "probe hung waiting on descendant pipe: {elapsed:?}"
+    );
+    assert!(
+        res.is_ok(),
+        "probe should succeed cleanly after terminating descendant: {res:?}"
+    );
+}

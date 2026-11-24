@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
+use std::rc::Rc;
 
 use crate::ast::{
     ArrayElem, ArrayPatternElem, AssignOp, AssignTarget, BinaryOp, CallArg, ChainOp, Expr, ForInit,
@@ -24,15 +25,15 @@ use crate::{
 const MAX_EXPORT_DEPTH: usize = 128;
 /// Maximum byte length of any single runtime string in an expression evaluation (4 MiB).
 const MAX_STRING_BYTES: usize = 4 * 1024 * 1024;
-/// Maximum cumulative heap budget (strings + array elements) per expression evaluation (16 MiB).
-const MAX_HEAP_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum element count of any single runtime array.
+/// Maximum cumulative heap budget (strings + array/object entries) per expression evaluation (64 MiB).
+const MAX_HEAP_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum element count of any single runtime array or object key list.
 const MAX_ARRAY_LEN: usize = 65_536;
 /// Maximum aggregate nodes expanded when converting an expression result to [`Value`].
 const MAX_EXPORT_NODES: usize = 65_536;
 /// Maximum aggregate string/container bytes materialized when converting an expression result.
 const MAX_EXPORT_BYTES: usize = 16 * 1024 * 1024;
-/// Estimated heap overhead per array element for allocation budgeting.
+/// Estimated heap overhead per array/object element for allocation budgeting.
 const ARRAY_ELEM_BUDGET_BYTES: usize = 32;
 
 /// Evaluates a parsed [`Program`] against `ctx` using `config`.
@@ -89,7 +90,7 @@ enum RuntimeValue {
     Null,
     Bool(bool),
     Number(f64),
-    String(String),
+    String(Rc<str>),
     Array(usize),
     Object(usize),
     Closure(usize),
@@ -185,6 +186,11 @@ impl<'a> Evaluator<'a> {
             )));
         }
         self.charge_alloc_bytes(byte_len)
+    }
+
+    fn alloc_string(&mut self, s: String) -> Result<RuntimeValue, ExprError> {
+        self.check_string_alloc(s.len())?;
+        Ok(RuntimeValue::String(Rc::from(s)))
     }
 
     fn check_array_alloc(&mut self, elem_count: usize) -> Result<(), ExprError> {
@@ -295,7 +301,7 @@ impl<'a> Evaluator<'a> {
             Value::Null => RuntimeValue::Null,
             Value::Bool(b) => RuntimeValue::Bool(b),
             Value::Number(n) => RuntimeValue::Number(n),
-            Value::String(s) => RuntimeValue::String(s),
+            Value::String(s) => RuntimeValue::String(Rc::from(s)),
             Value::Array(items) => {
                 let converted: Vec<RuntimeValue> =
                     items.into_iter().map(|v| self.intern_value(v)).collect();
@@ -357,7 +363,7 @@ impl<'a> Evaluator<'a> {
                         "returned value exceeds {MAX_EXPORT_BYTES} byte budget"
                     )));
                 }
-                Ok(Value::String(s.clone()))
+                Ok(Value::String(s.to_string()))
             }
             RuntimeValue::Array(id) => {
                 let len = self.arrays[*id].len();
@@ -476,7 +482,7 @@ impl<'a> Evaluator<'a> {
             RuntimeValue::Null => "null".to_string(),
             RuntimeValue::Bool(b) => b.to_string(),
             RuntimeValue::Number(n) => format_js_number(n),
-            RuntimeValue::String(s) => s,
+            RuntimeValue::String(s) => s.to_string(),
             RuntimeValue::Array(id) => self.join_array_to_string(id, ",")?,
             RuntimeValue::Object(_) | RuntimeValue::Namespace(_) | RuntimeValue::Handle(_) => {
                 "[object Object]".to_string()
@@ -711,7 +717,7 @@ impl<'a> Evaluator<'a> {
                     RuntimeValue::Array(id) => self.arrays[id].clone(),
                     RuntimeValue::String(s) => s
                         .chars()
-                        .map(|c| RuntimeValue::String(c.to_string()))
+                        .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
                         .collect(),
                     _ => {
                         return Err(ExprError::TypeError(
@@ -1043,7 +1049,7 @@ impl<'a> Evaluator<'a> {
             RuntimeValue::Array(id) => self.arrays[id].clone(),
             RuntimeValue::String(s) => s
                 .chars()
-                .map(|c| RuntimeValue::String(c.to_string()))
+                .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
                 .collect(),
             _ => {
                 return Err(ExprError::TypeError(
@@ -1106,7 +1112,7 @@ impl<'a> Evaluator<'a> {
                 Some(VarKind::Let | VarKind::Const) => self.push_env(Some(env)),
                 _ => env,
             };
-            let kv = RuntimeValue::String(key);
+            let kv = RuntimeValue::String(Rc::from(key));
             match for_in.kind {
                 Some(kind) => self.bind_pattern(&for_in.target, kv, iter_env, kind)?,
                 None => {
@@ -1154,8 +1160,10 @@ impl<'a> Evaluator<'a> {
                     let catch_env = self.push_env(Some(env));
                     if let Some(pat) = &try_stmt.catch_param {
                         let mut err_obj = BTreeMap::new();
-                        err_obj
-                            .insert("message".to_string(), RuntimeValue::String(err.to_string()));
+                        err_obj.insert(
+                            "message".to_string(),
+                            RuntimeValue::String(Rc::from(err.to_string())),
+                        );
                         let err_val = self.alloc_object(err_obj);
                         self.bind_pattern(pat, err_val, catch_env, VarKind::Let)?;
                     }
@@ -1190,7 +1198,7 @@ impl<'a> Evaluator<'a> {
                 Literal::Null => RuntimeValue::Null,
                 Literal::Bool(b) => RuntimeValue::Bool(*b),
                 Literal::Number(n) => RuntimeValue::Number(*n),
-                Literal::String(s) => RuntimeValue::String(s.clone()),
+                Literal::String(s) => RuntimeValue::String(Rc::from(s.as_str())),
             }),
             Expr::Ident(name) => self.resolve_ident(name, env),
             Expr::Template(parts) => {
@@ -1214,7 +1222,7 @@ impl<'a> Evaluator<'a> {
                     self.charge_alloc_bytes(piece.len())?;
                     out.push_str(&piece);
                 }
-                Ok(RuntimeValue::String(out))
+                Ok(RuntimeValue::String(Rc::from(out)))
             }
             Expr::Array(elems) => {
                 let mut items = Vec::with_capacity(elems.len());
@@ -1241,7 +1249,11 @@ impl<'a> Evaluator<'a> {
                                                 "array length overflow".to_string(),
                                             )
                                         })?;
-                                    self.check_array_alloc(next_len)?;
+                                    if next_len > MAX_ARRAY_LEN {
+                                        return Err(ExprError::RangeError(format!(
+                                            "array length {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                                        )));
+                                    }
                                     let spread_items = self.arrays[id].clone();
                                     items.extend(spread_items);
                                 }
@@ -1253,10 +1265,16 @@ impl<'a> Evaluator<'a> {
                                                 "array length overflow".to_string(),
                                             )
                                         })?;
-                                    self.check_array_alloc(next_len)?;
-                                    items.extend(
-                                        s.chars().map(|c| RuntimeValue::String(c.to_string())),
-                                    );
+                                    if next_len > MAX_ARRAY_LEN {
+                                        return Err(ExprError::RangeError(format!(
+                                            "array length {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                                        )));
+                                    }
+                                    self.check_string_alloc(s.len())?;
+                                    items
+                                        .extend(s.chars().map(|c| {
+                                            RuntimeValue::String(Rc::from(c.to_string()))
+                                        }));
                                 }
                                 _ => {
                                     return Err(ExprError::TypeError(
@@ -1489,10 +1507,10 @@ impl<'a> Evaluator<'a> {
                         Err(ExprError::ReferenceError(_)) => RuntimeValue::Undefined,
                         Err(e) => return Err(e),
                     };
-                    return Ok(RuntimeValue::String(self.typeof_value(&val)?.to_string()));
+                    return Ok(RuntimeValue::String(Rc::from(self.typeof_value(&val)?)));
                 }
                 let val = self.eval_expr(expr, env)?;
-                Ok(RuntimeValue::String(self.typeof_value(&val)?.to_string()))
+                Ok(RuntimeValue::String(Rc::from(self.typeof_value(&val)?)))
             }
             UnaryOp::Delete => match expr {
                 Expr::Member { object, prop } => {
@@ -1728,7 +1746,7 @@ impl<'a> Evaluator<'a> {
                     let mut combined = String::with_capacity(total);
                     combined.push_str(&ls);
                     combined.push_str(&rs);
-                    return Ok(RuntimeValue::String(combined));
+                    return Ok(RuntimeValue::String(Rc::from(combined)));
                 }
                 // Vector arithmetic (component-wise + scalar broadcast).
                 if let Some(res) = self.try_vector_arith(&left, &right, BinaryOp::Add)? {
@@ -1973,7 +1991,7 @@ impl<'a> Evaluator<'a> {
                     return Ok(s
                         .chars()
                         .nth(idx)
-                        .map(|c| RuntimeValue::String(c.to_string()))
+                        .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
                         .unwrap_or(RuntimeValue::Undefined));
                 }
                 Ok(RuntimeValue::Undefined)
@@ -2027,7 +2045,7 @@ impl<'a> Evaluator<'a> {
                         return Ok(s
                             .chars()
                             .nth(n as usize)
-                            .map(|c| RuntimeValue::String(c.to_string()))
+                            .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
                             .unwrap_or(RuntimeValue::Undefined));
                     }
                     return Ok(RuntimeValue::Undefined);
@@ -2069,7 +2087,7 @@ impl<'a> Evaluator<'a> {
                 "name" => Ok(self
                     .ctx
                     .handle_name(id)
-                    .map(RuntimeValue::String)
+                    .map(|s| RuntimeValue::String(Rc::from(s)))
                     .unwrap_or(RuntimeValue::Undefined)),
                 "parent" => match self.ctx.parent_of(id, 1)? {
                     Some(p) => Ok(RuntimeValue::Handle(p)),
@@ -2089,7 +2107,7 @@ impl<'a> Evaluator<'a> {
                 "name" => Ok(self
                     .ctx
                     .handle_name(id)
-                    .map(RuntimeValue::String)
+                    .map(|s| RuntimeValue::String(Rc::from(s)))
                     .unwrap_or(RuntimeValue::Undefined)),
                 "parent" => match self.ctx.parent_of(id, 1)? {
                     Some(p) => Ok(RuntimeValue::Handle(p)),
@@ -2182,7 +2200,10 @@ impl<'a> Evaluator<'a> {
                     match v {
                         RuntimeValue::Array(id) => out.extend(self.arrays[id].clone()),
                         RuntimeValue::String(s) => {
-                            out.extend(s.chars().map(|c| RuntimeValue::String(c.to_string())));
+                            out.extend(
+                                s.chars()
+                                    .map(|c| RuntimeValue::String(Rc::from(c.to_string()))),
+                            );
                         }
                         _ => {
                             return Err(ExprError::TypeError(
@@ -2298,7 +2319,7 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => String::new(),
                 };
-                Ok(RuntimeValue::String(s))
+                self.alloc_string(s)
             }
             RuntimeValue::Namespace(NamespaceKind::Boolean) => {
                 let b = match args.first() {
@@ -2441,11 +2462,18 @@ impl<'a> Evaluator<'a> {
                     };
                     let src = self.deref_property_handle(src.clone())?;
                     let items = match src {
-                        RuntimeValue::Array(id) => self.arrays[id].clone(),
-                        RuntimeValue::String(s) => s
-                            .chars()
-                            .map(|c| RuntimeValue::String(c.to_string()))
-                            .collect(),
+                        RuntimeValue::Array(id) => {
+                            self.check_array_alloc(self.arrays[id].len())?;
+                            self.arrays[id].clone()
+                        }
+                        RuntimeValue::String(s) => {
+                            let count = s.chars().count();
+                            self.check_array_alloc(count)?;
+                            self.check_string_alloc(s.len())?;
+                            s.chars()
+                                .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
+                                .collect()
+                        }
                         _ => Vec::new(),
                     };
                     Ok(self.alloc_array(items))
@@ -2500,6 +2528,7 @@ impl<'a> Evaluator<'a> {
             },
             NamespaceKind::String => match method {
                 "fromCharCode" => {
+                    self.check_string_alloc(args.len().saturating_mul(4))?;
                     let mut out = String::new();
                     for a in &args {
                         let code = to_u32(self.runtime_to_number(a)?) & 0xFFFF;
@@ -2507,7 +2536,7 @@ impl<'a> Evaluator<'a> {
                             out.push(ch);
                         }
                     }
-                    Ok(RuntimeValue::String(out))
+                    Ok(RuntimeValue::String(Rc::from(out)))
                 }
                 _ => Err(ExprError::TypeError(format!(
                     "String.{method} is not a function"
@@ -2520,14 +2549,23 @@ impl<'a> Evaluator<'a> {
                     };
                     let v = self.deref_property_handle(v.clone())?;
                     let keys: Vec<RuntimeValue> = match v {
-                        RuntimeValue::Object(id) => self.objects[id]
-                            .keys()
-                            .cloned()
-                            .map(RuntimeValue::String)
-                            .collect(),
-                        RuntimeValue::Array(id) => (0..self.arrays[id].len())
-                            .map(|i| RuntimeValue::String(i.to_string()))
-                            .collect(),
+                        RuntimeValue::Object(id) => {
+                            self.check_array_alloc(self.objects[id].len())?;
+                            let key_bytes: usize = self.objects[id].keys().map(String::len).sum();
+                            self.charge_alloc_bytes(key_bytes)?;
+                            self.objects[id]
+                                .keys()
+                                .map(|k| RuntimeValue::String(Rc::from(k.as_str())))
+                                .collect()
+                        }
+                        RuntimeValue::Array(id) => {
+                            let n = self.arrays[id].len();
+                            self.check_array_alloc(n)?;
+                            self.charge_alloc_bytes(n.saturating_mul(8))?;
+                            (0..n)
+                                .map(|i| RuntimeValue::String(Rc::from(i.to_string())))
+                                .collect()
+                        }
                         _ => Vec::new(),
                     };
                     Ok(self.alloc_array(keys))
@@ -2538,8 +2576,14 @@ impl<'a> Evaluator<'a> {
                     };
                     let v = self.deref_property_handle(v.clone())?;
                     let vals: Vec<RuntimeValue> = match v {
-                        RuntimeValue::Object(id) => self.objects[id].values().cloned().collect(),
-                        RuntimeValue::Array(id) => self.arrays[id].clone(),
+                        RuntimeValue::Object(id) => {
+                            self.check_array_alloc(self.objects[id].len())?;
+                            self.objects[id].values().cloned().collect()
+                        }
+                        RuntimeValue::Array(id) => {
+                            self.check_array_alloc(self.arrays[id].len())?;
+                            self.arrays[id].clone()
+                        }
                         _ => Vec::new(),
                     };
                     Ok(self.alloc_array(vals))
@@ -2550,20 +2594,30 @@ impl<'a> Evaluator<'a> {
                     };
                     let v = self.deref_property_handle(v.clone())?;
                     let pairs: Vec<(String, RuntimeValue)> = match v {
-                        RuntimeValue::Object(id) => self.objects[id]
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        RuntimeValue::Array(id) => self.arrays[id]
-                            .iter()
-                            .enumerate()
-                            .map(|(i, v)| (i.to_string(), v.clone()))
-                            .collect(),
+                        RuntimeValue::Object(id) => {
+                            let n = self.objects[id].len();
+                            self.check_array_alloc(n)?;
+                            self.charge_alloc_bytes(n.saturating_mul(2 * ARRAY_ELEM_BUDGET_BYTES))?;
+                            self.objects[id]
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect()
+                        }
+                        RuntimeValue::Array(id) => {
+                            let n = self.arrays[id].len();
+                            self.check_array_alloc(n)?;
+                            self.charge_alloc_bytes(n.saturating_mul(2 * ARRAY_ELEM_BUDGET_BYTES))?;
+                            self.arrays[id]
+                                .iter()
+                                .enumerate()
+                                .map(|(i, v)| (i.to_string(), v.clone()))
+                                .collect()
+                        }
                         _ => Vec::new(),
                     };
                     let mut out = Vec::with_capacity(pairs.len());
                     for (k, val) in pairs {
-                        out.push(self.alloc_array(vec![RuntimeValue::String(k), val]));
+                        out.push(self.alloc_array(vec![RuntimeValue::String(Rc::from(k)), val]));
                     }
                     Ok(self.alloc_array(out))
                 }
@@ -2581,6 +2635,14 @@ impl<'a> Evaluator<'a> {
                     for src in args.iter().skip(1) {
                         let d = self.deref_property_handle(src.clone())?;
                         if let RuntimeValue::Object(sid) = d {
+                            let add_len = self.objects[sid].len();
+                            let next_len = self.objects[tid].len().saturating_add(add_len);
+                            if next_len > MAX_ARRAY_LEN {
+                                return Err(ExprError::RangeError(format!(
+                                    "object property count {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                                )));
+                            }
+                            self.check_array_alloc(add_len)?;
                             let entries = self.objects[sid].clone();
                             self.objects[tid].extend(entries);
                         }
@@ -2600,7 +2662,8 @@ impl<'a> Evaluator<'a> {
                     if matches!(val, Value::Undefined) {
                         return Ok(RuntimeValue::Undefined);
                     }
-                    Ok(RuntimeValue::String(json_stringify(&val)?))
+                    let json = json_stringify(&val)?;
+                    self.alloc_string(json)
                 }
                 "parse" => {
                     let s = match args.first() {
@@ -2943,7 +3006,9 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => ",".to_string(),
                 };
-                Ok(RuntimeValue::String(self.join_array_to_string(id, &sep)?))
+                Ok(RuntimeValue::String(Rc::from(
+                    self.join_array_to_string(id, &sep)?,
+                )))
             }
             "indexOf" => {
                 let needle = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
@@ -2968,6 +3033,7 @@ impl<'a> Evaluator<'a> {
             "map" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
                 let items = self.arrays[id].clone();
+                self.check_array_alloc(items.len())?;
                 let mut out = Vec::with_capacity(items.len());
                 for (i, item) in items.into_iter().enumerate() {
                     let res = self.call_runtime_value(
@@ -2999,6 +3065,7 @@ impl<'a> Evaluator<'a> {
                         out.push(item);
                     }
                 }
+                self.check_array_alloc(out.len())?;
                 Ok(self.alloc_array(out))
             }
             "reduce" => {
@@ -3128,11 +3195,29 @@ impl<'a> Evaluator<'a> {
         let chars: Vec<char> = s.chars().collect();
         let len = chars.len() as isize;
         match method {
-            "toLowerCase" => Ok(RuntimeValue::String(s.to_lowercase())),
-            "toUpperCase" => Ok(RuntimeValue::String(s.to_uppercase())),
-            "trim" => Ok(RuntimeValue::String(s.trim().to_string())),
-            "trimStart" => Ok(RuntimeValue::String(s.trim_start().to_string())),
-            "trimEnd" => Ok(RuntimeValue::String(s.trim_end().to_string())),
+            "toLowerCase" => {
+                self.check_string_alloc(s.len())?;
+                Ok(RuntimeValue::String(Rc::from(s.to_lowercase())))
+            }
+            "toUpperCase" => {
+                self.check_string_alloc(s.len())?;
+                Ok(RuntimeValue::String(Rc::from(s.to_uppercase())))
+            }
+            "trim" => {
+                let t = s.trim();
+                self.check_string_alloc(t.len())?;
+                Ok(RuntimeValue::String(Rc::from(t)))
+            }
+            "trimStart" => {
+                let t = s.trim_start();
+                self.check_string_alloc(t.len())?;
+                Ok(RuntimeValue::String(Rc::from(t)))
+            }
+            "trimEnd" => {
+                let t = s.trim_end();
+                self.check_string_alloc(t.len())?;
+                Ok(RuntimeValue::String(Rc::from(t)))
+            }
             "slice" => {
                 let start = match args.first() {
                     Some(v) => normalize_slice_index(self.runtime_to_number(v)?, len),
@@ -3144,12 +3229,14 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => len as usize,
                 };
-                let out: String = if start < end {
-                    chars[start..end].iter().collect()
+                if start < end {
+                    let byte_est: usize = chars[start..end].iter().map(|c| c.len_utf8()).sum();
+                    self.check_string_alloc(byte_est)?;
+                    let out: String = chars[start..end].iter().collect();
+                    Ok(RuntimeValue::String(Rc::from(out)))
                 } else {
-                    String::new()
-                };
-                Ok(RuntimeValue::String(out))
+                    Ok(RuntimeValue::String(Rc::from("")))
+                }
             }
             "substring" => {
                 let a = match args.first() {
@@ -3163,7 +3250,10 @@ impl<'a> Evaluator<'a> {
                     _ => len as usize,
                 };
                 let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                Ok(RuntimeValue::String(chars[lo..hi].iter().collect()))
+                let byte_est: usize = chars[lo..hi].iter().map(|c| c.len_utf8()).sum();
+                self.check_string_alloc(byte_est)?;
+                let out: String = chars[lo..hi].iter().collect();
+                Ok(RuntimeValue::String(Rc::from(out)))
             }
             "indexOf" => {
                 let pat = match args.first() {
@@ -3204,7 +3294,7 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => {
                         self.check_string_alloc(s.len())?;
-                        return Ok(self.alloc_array(vec![RuntimeValue::String(s.to_string())]));
+                        return Ok(self.alloc_array(vec![RuntimeValue::String(Rc::from(s))]));
                     }
                 };
                 let part_count = if sep.is_empty() {
@@ -3217,11 +3307,11 @@ impl<'a> Evaluator<'a> {
                 let parts: Vec<RuntimeValue> = if sep.is_empty() {
                     chars
                         .into_iter()
-                        .map(|c| RuntimeValue::String(c.to_string()))
+                        .map(|c| RuntimeValue::String(Rc::from(c.to_string())))
                         .collect()
                 } else {
                     s.split(&sep)
-                        .map(|part| RuntimeValue::String(part.to_string()))
+                        .map(|part| RuntimeValue::String(Rc::from(part)))
                         .collect()
                 };
                 Ok(self.alloc_array(parts))
@@ -3241,7 +3331,7 @@ impl<'a> Evaluator<'a> {
                     .checked_add(to.len())
                     .ok_or_else(|| ExprError::RangeError("replace string overflow".to_string()))?;
                 self.check_string_alloc(est)?;
-                Ok(RuntimeValue::String(s.replacen(&from, &to, 1)))
+                Ok(RuntimeValue::String(Rc::from(s.replacen(&from, &to, 1))))
             }
             "replaceAll" => {
                 let from = match args.first() {
@@ -3269,7 +3359,7 @@ impl<'a> Evaluator<'a> {
                         ExprError::RangeError("replaceAll string overflow".to_string())
                     })?;
                 self.check_string_alloc(est)?;
-                Ok(RuntimeValue::String(s.replace(&from, &to)))
+                Ok(RuntimeValue::String(Rc::from(s.replace(&from, &to))))
             }
             "charAt" => {
                 let idx = match args.first() {
@@ -3281,7 +3371,7 @@ impl<'a> Evaluator<'a> {
                 } else {
                     String::new()
                 };
-                Ok(RuntimeValue::String(out))
+                Ok(RuntimeValue::String(Rc::from(out)))
             }
             "charCodeAt" => {
                 let idx = match args.first() {
@@ -3308,7 +3398,7 @@ impl<'a> Evaluator<'a> {
                     ExprError::RangeError("string repeat length overflow".to_string())
                 })?;
                 self.check_string_alloc(total_bytes)?;
-                Ok(RuntimeValue::String(s.repeat(count_usize)))
+                Ok(RuntimeValue::String(Rc::from(s.repeat(count_usize))))
             }
             _ => Err(ExprError::TypeError(format!(
                 "String.prototype.{method} is not a function"
@@ -3334,9 +3424,9 @@ impl<'a> Evaluator<'a> {
                     ));
                 }
                 let prec = digits as usize;
-                Ok(RuntimeValue::String(format!("{n:.prec$}")))
+                self.alloc_string(format!("{n:.prec$}"))
             }
-            "toString" => Ok(RuntimeValue::String(format_js_number(n))),
+            "toString" => Ok(RuntimeValue::String(Rc::from(format_js_number(n)))),
             _ => Err(ExprError::TypeError(format!(
                 "Number.prototype.{method} is not a function"
             ))),
