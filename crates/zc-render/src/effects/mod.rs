@@ -2755,24 +2755,18 @@ mod tests {
 
     #[test]
     fn validate_all_56_wgsl_shaders_in_headless_wgpu() {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })) {
-                Ok(a) => a,
-                Err(_) => return, // Headless CI without GPU adapter: skip GPU compilation check.
-            };
-        let (device, queue) =
-            match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
-                Ok(dq) => dq,
-                Err(_) => return,
-            };
+        let ctx = match crate::GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(crate::RenderError::NoAdapter(msg)) if !crate::require_gpu_in_tests() => {
+                eprintln!("skipping GPU shader validation test (no adapter): {msg}");
+                return;
+            }
+            Err(err) => panic!("failed to initialize headless GpuContext: {err}"),
+        };
+        let device = &ctx.device;
+        let queue = &ctx.queue;
 
-        let mut registry = EffectRegistry::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut registry = EffectRegistry::new(device, queue, wgpu::TextureFormat::Rgba8Unorm);
         assert_eq!(registry.compiled_pipeline_count(), 0);
 
         for &(id, _) in STANDARD_EFFECT_SHADERS
@@ -2780,7 +2774,7 @@ mod tests {
             .chain(PLUGIN_EFFECT_SHADERS.iter())
         {
             registry
-                .ensure_pipeline(&device, id, false)
+                .ensure_pipeline(device, id, false)
                 .unwrap_or_else(|e| panic!("failed to compile WGSL shader `{id}`: {e}"));
         }
         assert_eq!(registry.compiled_pipeline_count(), 56);
@@ -2833,7 +2827,7 @@ mod tests {
             );
             let wgsl = build_effect_wgsl(&body);
             registry
-                .run_custom_wgsl(&device, &mut encoder, &wgsl, &uniforms, &targets)
+                .run_custom_wgsl(device, &mut encoder, &wgsl, &uniforms, &targets)
                 .expect("custom WGSL compile must succeed");
         }
         assert_eq!(registry.custom_pipeline_count(), MAX_CUSTOM_PIPELINES);

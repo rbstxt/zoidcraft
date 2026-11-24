@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const MAX_INCLUDE_DEPTH: usize = 8;
+/// Maximum uniform array element count allowed in a custom shader UBO.
+const MAX_UNIFORM_ARRAY_LEN: u32 = 1024;
+/// Maximum custom shader uniform block byte size (matches WebGPU minimum 64 KiB UBO binding limit).
+const MAX_UNIFORM_BUFFER_BYTES: u32 = 65_536;
 
 const INCLUDE_GRADIENT: &str = r#"
 float zGradientUv(float t, float repetitions) {
@@ -353,7 +357,7 @@ pub fn translate_glsl_es100_with_options(
     reject_unsupported_features(&tokens)?;
 
     let extracted = extract_declarations(&tokens, &int_defines)?;
-    let uniform_layout = build_uniform_layout(&extracted.uniforms);
+    let uniform_layout = build_uniform_layout(&extracted.uniforms)?;
     let texture_bindings = build_texture_bindings(&extracted.samplers);
 
     let uniform_map: HashMap<&str, &UniformDecl> = extracted
@@ -1272,14 +1276,22 @@ fn parse_uniform_decl(
     ))
 }
 
-fn build_uniform_layout(decls: &[UniformDecl]) -> UniformBlockLayout {
+fn checked_align_up(value: u32, alignment: u32) -> Option<u32> {
+    if alignment <= 1 {
+        Some(value)
+    } else {
+        value.div_ceil(alignment).checked_mul(alignment)
+    }
+}
+
+fn build_uniform_layout(decls: &[UniformDecl]) -> Result<UniformBlockLayout, ShaderError> {
     if decls.is_empty() {
-        return UniformBlockLayout {
+        return Ok(UniformBlockLayout {
             set: 0,
             binding: 0,
             fields: Vec::new(),
             byte_size: 0,
-        };
+        });
     }
 
     let mut fields = Vec::with_capacity(decls.len());
@@ -1287,9 +1299,37 @@ fn build_uniform_layout(decls: &[UniformDecl]) -> UniformBlockLayout {
 
     for decl in decls {
         if let Some(len) = decl.array_len {
+            if len == 0 || len > MAX_UNIFORM_ARRAY_LEN {
+                return Err(ShaderError::InvalidUniformDeclaration(format!(
+                    "uniform array `{}` length {len} exceeds allowed range 1..={MAX_UNIFORM_ARRAY_LEN}",
+                    decl.name
+                )));
+            }
             let stride = decl.ty.array_stride();
-            let offset = align_up(cursor, 16);
-            let size = stride * len;
+            let offset = checked_align_up(cursor, 16).ok_or_else(|| {
+                ShaderError::InvalidUniformDeclaration(format!(
+                    "uniform layout offset overflow at `{}`",
+                    decl.name
+                ))
+            })?;
+            let size = stride.checked_mul(len).ok_or_else(|| {
+                ShaderError::InvalidUniformDeclaration(format!(
+                    "uniform array `{}` byte size overflow",
+                    decl.name
+                ))
+            })?;
+            cursor = offset.checked_add(size).ok_or_else(|| {
+                ShaderError::InvalidUniformDeclaration(format!(
+                    "uniform layout size overflow at `{}`",
+                    decl.name
+                ))
+            })?;
+            if cursor > MAX_UNIFORM_BUFFER_BYTES {
+                return Err(ShaderError::InvalidUniformDeclaration(format!(
+                    "uniform block size exceeds {MAX_UNIFORM_BUFFER_BYTES} bytes at `{}`",
+                    decl.name
+                )));
+            }
             fields.push(UniformField {
                 name: decl.name.clone(),
                 ty: decl.ty,
@@ -1298,11 +1338,27 @@ fn build_uniform_layout(decls: &[UniformDecl]) -> UniformBlockLayout {
                 size,
                 array_stride: stride,
             });
-            cursor = offset + size;
         } else {
             let align = decl.ty.base_alignment();
             let size = decl.ty.byte_size();
-            let offset = align_up(cursor, align);
+            let offset = checked_align_up(cursor, align).ok_or_else(|| {
+                ShaderError::InvalidUniformDeclaration(format!(
+                    "uniform layout offset overflow at `{}`",
+                    decl.name
+                ))
+            })?;
+            cursor = offset.checked_add(size).ok_or_else(|| {
+                ShaderError::InvalidUniformDeclaration(format!(
+                    "uniform layout size overflow at `{}`",
+                    decl.name
+                ))
+            })?;
+            if cursor > MAX_UNIFORM_BUFFER_BYTES {
+                return Err(ShaderError::InvalidUniformDeclaration(format!(
+                    "uniform block size exceeds {MAX_UNIFORM_BUFFER_BYTES} bytes at `{}`",
+                    decl.name
+                )));
+            }
             fields.push(UniformField {
                 name: decl.name.clone(),
                 ty: decl.ty,
@@ -1311,16 +1367,24 @@ fn build_uniform_layout(decls: &[UniformDecl]) -> UniformBlockLayout {
                 size,
                 array_stride: 0,
             });
-            cursor = offset + size;
         }
     }
 
-    UniformBlockLayout {
+    let byte_size = checked_align_up(cursor, 16).ok_or_else(|| {
+        ShaderError::InvalidUniformDeclaration("uniform block aligned size overflow".to_string())
+    })?;
+    if byte_size > MAX_UNIFORM_BUFFER_BYTES {
+        return Err(ShaderError::InvalidUniformDeclaration(format!(
+            "uniform block size {byte_size} exceeds {MAX_UNIFORM_BUFFER_BYTES} bytes"
+        )));
+    }
+
+    Ok(UniformBlockLayout {
         set: 0,
         binding: 0,
         fields,
-        byte_size: align_up(cursor, 16),
-    }
+        byte_size,
+    })
 }
 
 fn build_texture_bindings(samplers: &[String]) -> Vec<TextureBinding> {
@@ -1746,11 +1810,8 @@ fn rewrite_slice(
                     && let Some(tex_ident) = first_single_ident(&raw_args[0])
                     && samplers.contains(tex_ident)
                 {
-                    let fn_name = if name == "texture2DProj" {
-                        "textureProj"
-                    } else {
-                        "texture"
-                    };
+                    let is_proj = name == "texture2DProj";
+                    let fn_name = if is_proj { "textureProj" } else { "texture" };
                     out.push(Token::Ident(fn_name.to_string()));
                     out.push(Token::Punct("(".to_string()));
                     out.push(Token::Ident("sampler2D".to_string()));
@@ -1759,11 +1820,24 @@ fn rewrite_slice(
                     out.push(Token::Punct(",".to_string()));
                     out.push(Token::Ident(format!("{tex_ident}_sampler")));
                     out.push(Token::Punct(")".to_string()));
-                    for arg in &raw_args[1..] {
+                    for (arg_idx, arg) in raw_args[1..].iter().enumerate() {
                         out.push(Token::Punct(",".to_string()));
                         let rewritten_arg =
                             rewrite_slice(arg, uniforms, samplers, scopes, user_types);
-                        out.extend(rewritten_arg);
+                        if arg_idx == 0 {
+                            // Convert logical CM3 bottom-left UV to WebGPU top-left texture UV at the sampling boundary.
+                            let helper = if is_proj {
+                                "_zc_flip_uv_proj"
+                            } else {
+                                "_zc_flip_uv"
+                            };
+                            out.push(Token::Ident(helper.to_string()));
+                            out.push(Token::Punct("(".to_string()));
+                            out.extend(rewritten_arg);
+                            out.push(Token::Punct(")".to_string()));
+                        } else {
+                            out.extend(rewritten_arg);
+                        }
                     }
                     out.push(Token::Punct(")".to_string()));
                     i = after_call;
@@ -2026,6 +2100,13 @@ fn assemble_glsl450(
                 tb.group, tb.sampler_binding, tb.name
             ));
         }
+        src.push_str("vec2 _zc_flip_uv(vec2 uv) { return vec2(uv.x, 1.0 - uv.y); }\n");
+        src.push_str(
+            "vec3 _zc_flip_uv_proj(vec3 uvw) { return vec3(uvw.x, uvw.z - uvw.y, uvw.z); }\n",
+        );
+        src.push_str(
+            "vec4 _zc_flip_uv_proj(vec4 uvw) { return vec4(uvw.x, uvw.w - uvw.y, uvw.z, uvw.w); }\n",
+        );
     }
 
     src.push('\n');

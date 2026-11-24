@@ -365,6 +365,32 @@ impl RenderEngine {
     }
 }
 
+/// Converts premultiplied RGBA8 pixel data (the renderer's internal format) to
+/// straight-alpha RGBA8 suitable for PNG export and standard image viewers.
+#[must_use]
+pub fn unpremultiply_rgba8(premul: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(premul.len());
+    for px in premul.as_chunks::<4>().0 {
+        let a = u16::from(px[3]);
+        if a == 0 {
+            out.extend_from_slice(&[0, 0, 0, 0]);
+        } else if a == 255 {
+            out.extend_from_slice(px);
+        } else {
+            let r = ((u16::from(px[0]) * 255 + (a / 2)) / a).min(255) as u8;
+            let g = ((u16::from(px[1]) * 255 + (a / 2)) / a).min(255) as u8;
+            let b = ((u16::from(px[2]) * 255 + (a / 2)) / a).min(255) as u8;
+            out.extend_from_slice(&[r, g, b, px[3]]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn require_gpu_in_tests() -> bool {
+    std::env::var("ZOIDCRAFT_REQUIRE_GPU").as_deref() == Ok("1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,9 +481,13 @@ mod tests {
 
     #[test]
     fn target_pool_reuses_trims_and_enforces_budget() {
-        let Ok(ctx) = GpuContext::new_headless() else {
-            // Gracefully skip on headless VMs without GPU or software fallback adapter.
-            return;
+        let ctx = match GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(RenderError::NoAdapter(msg)) if !crate::require_gpu_in_tests() => {
+                eprintln!("skipping target_pool GPU test (no adapter): {msg}");
+                return;
+            }
+            Err(err) => panic!("failed to initialize headless GpuContext: {err}"),
         };
 
         let mut pool = TargetPool::new(64 * 64 * 4 * 2); // budget for 2 targets of 64x64 RGBA8
@@ -502,9 +532,13 @@ mod tests {
 
     #[test]
     fn headless_render_lit_3d_box_and_composite_blend_modes() {
-        let Ok(mut engine) = RenderEngine::new_headless() else {
-            // Gracefully skip if no headless adapter is available in sandboxed CI.
-            return;
+        let mut engine = match RenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(msg)) if !crate::require_gpu_in_tests() => {
+                eprintln!("skipping GPU test (no adapter): {msg}");
+                return;
+            }
+            Err(err) => panic!("failed to initialize headless RenderEngine: {err}"),
         };
 
         engine.begin_frame();

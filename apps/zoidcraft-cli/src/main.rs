@@ -306,11 +306,12 @@ fn cmd_render(
 
     let mut engine = ProjectRenderEngine::new_headless()
         .map_err(|e| format!("failed to initialize headless GPU renderer: {e}"))?;
-    let rgba = engine
+    let premul_rgba = engine
         .render_frame_rgba8(&project, &plugins, frame, width, height)
         .map_err(|e| format!("render failed at frame {frame}: {e}"))?;
+    let straight_rgba = zc_render::unpremultiply_rgba8(&premul_rgba);
 
-    let img = RgbaImage::from_raw(width, height, rgba)
+    let img = RgbaImage::from_raw(width, height, straight_rgba)
         .ok_or_else(|| format!("rendered pixel buffer size mismatch for {width}x{height}"))?;
 
     if let Some(parent) = out.parent()

@@ -116,6 +116,30 @@ impl GpuContext {
         &self.queue
     }
 
+    /// Validates 2D texture dimensions against `width > 0`, `height > 0`, the device's
+    /// `max_texture_dimension_2d`, and overflow-safe row/total byte counts.
+    pub fn validate_dimensions(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Result<usize, RenderError> {
+        let max_dim = self.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max_dim || height > max_dim {
+            return Err(RenderError::InvalidDimensions { width, height });
+        }
+        let bpp = bytes_per_pixel(format);
+        let bpp_u32 =
+            u32::try_from(bpp).map_err(|_| RenderError::InvalidDimensions { width, height })?;
+        width
+            .checked_mul(bpp_u32)
+            .ok_or(RenderError::InvalidDimensions { width, height })?;
+        (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(bpp))
+            .ok_or(RenderError::InvalidDimensions { width, height })
+    }
+
     /// Allocates an `Rgba8Unorm` texture and uploads tightly packed RGBA8 pixels.
     pub fn create_rgba8_texture(
         &self,
@@ -124,10 +148,7 @@ impl GpuContext {
         height: u32,
         rgba: &[u8],
     ) -> Result<RenderTarget, RenderError> {
-        let expected = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or(RenderError::InvalidDimensions { width, height })?;
+        let expected = self.validate_dimensions(width, height, wgpu::TextureFormat::Rgba8Unorm)?;
         if rgba.len() != expected {
             return Err(RenderError::InvalidBufferSize {
                 expected,
@@ -186,9 +207,7 @@ impl RenderTarget {
         format: wgpu::TextureFormat,
         label: Option<&str>,
     ) -> Result<Self, RenderError> {
-        if width == 0 || height == 0 {
-            return Err(RenderError::InvalidDimensions { width, height });
-        }
+        ctx.validate_dimensions(width, height, format)?;
 
         let is_depth = matches!(
             format,

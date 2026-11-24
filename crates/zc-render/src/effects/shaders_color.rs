@@ -286,7 +286,7 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let wrapped = fract(uv_ov);
     let in_bounds = uv_ov.x >= 0.0 && uv_ov.x <= 1.0 && uv_ov.y >= 0.0 && uv_ov.y <= 1.0;
     let sample_uv = select(clamp(uv_ov, vec2<f32>(0.0), vec2<f32>(1.0)), wrapped, repeat_on);
-    let raw_ov = select(sample_aux(sample_uv), sample_aux_repeat(sample_uv), repeat_on);
+    let raw_ov = sample_aux(sample_uv);
     let ov = select(vec4<f32>(0.0), raw_ov, repeat_on || in_bounds);
     let ov_rgb = unpremultiply(ov);
     let bg_rgb = unpremultiply(bg);

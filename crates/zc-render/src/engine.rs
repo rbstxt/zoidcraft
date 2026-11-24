@@ -63,11 +63,16 @@ pub const MAX_CACHED_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Maximum nested Precomp+ / Composite recursion depth.
 const MAX_COMPOSITION_DEPTH: usize = 16;
+const MAX_EFFECT_GROUP_DEPTH: usize = 16;
+const MAX_CUBE_LUT_3D_SIZE: u32 = 128;
+const MAX_CUBE_LUT_1D_SIZE: usize = 65_536;
 
 /// Fullscreen triangle vertex shader feeding `zc-shader` custom GLSL ES 1.00 fragment shaders.
 ///
-/// Outputs `@location(0) vUv` and `@location(1) vUvScaled` in `[0, 1]^2` with top-left `(0, 0)`
-/// aligned to WebGPU render targets so `texture2D(tDiffuse, vUvScaled)` copies upright.
+/// Outputs `@location(0) vUv` and `@location(1) vUvScaled` in `[0, 1]^2` with bottom-left `(0, 0)`
+/// and top-right `(1, 1)` matching ClipMaker 3 / WebGL 1 (Spec 04 §1.2). Texture sampling flips Y
+/// at the `texture2D` boundary inside `zc-shader` so both procedural `vUv` math and `tDiffuse`
+/// lookups match CM3 upright.
 const CUSTOM_SHADER_VS_WGSL: &str = r#"
 struct CustomVsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -88,11 +93,10 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> CustomVsOut {
         vec2<f32>(0.0, 2.0),
     );
     let c_uv = uv[idx];
-    let tex_uv = vec2<f32>(c_uv.x, 1.0 - c_uv.y);
     var out_v: CustomVsOut;
     out_v.clip_pos = vec4<f32>(pos[idx], 0.0, 1.0);
-    out_v.v_uv = tex_uv;
-    out_v.v_uv_scaled = tex_uv;
+    out_v.v_uv = c_uv;
+    out_v.v_uv_scaled = c_uv;
     return out_v;
 }
 "#;
@@ -140,7 +144,7 @@ struct MeshCacheKey {
 }
 
 struct CachedGpuMesh {
-    mesh: GpuMesh,
+    mesh: Arc<GpuMesh>,
     #[allow(dead_code)]
     bounds: Aabb3,
     last_used: u64,
@@ -153,7 +157,7 @@ struct TextureCacheKey {
 }
 
 struct CachedGpuTexture {
-    target: RenderTarget,
+    target: Arc<RenderTarget>,
     bytes: usize,
     last_used: u64,
 }
@@ -303,9 +307,8 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<&wgpu::TextureView, RenderError> {
-        if width == 0 || height == 0 {
-            return Err(RenderError::InvalidDimensions { width, height });
-        }
+        self.ctx
+            .validate_dimensions(width, height, wgpu::TextureFormat::Rgba8Unorm)?;
 
         self.targets.begin_frame();
         if let Some(prev) = self.output_target.take() {
@@ -322,6 +325,7 @@ impl ProjectRenderEngine {
             width,
             height,
             &mut visited_comps,
+            0,
         )?;
 
         self.targets.trim_unused();
@@ -380,9 +384,9 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<EffectSelfTestReport, RenderError> {
-        if width == 0 || height == 0 {
-            return Err(RenderError::InvalidDimensions { width, height });
-        }
+        let expected_bytes =
+            self.ctx
+                .validate_dimensions(width, height, wgpu::TextureFormat::Rgba8Unorm)?;
 
         let synthetic_rgba = generate_synthetic_test_frame(width, height);
         let src_target = self.ctx.create_rgba8_texture(
@@ -401,7 +405,6 @@ impl ProjectRenderEngine {
         let mut standard_passed = 0usize;
         let mut plugin_passed = 0usize;
         let mut readback_buf = Vec::new();
-        let expected_bytes = (width as usize) * (height as usize) * 4;
 
         let all_effects: Vec<(&str, bool)> = STANDARD_EFFECT_SHADERS
             .iter()
@@ -547,6 +550,7 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
         visited_comps: &mut Vec<Uuid>,
+        comp_depth: usize,
     ) -> Result<RenderTarget, RenderError> {
         let fps = f64::from(sequence.fps.max(1));
         let empty_props = BTreeMap::new();
@@ -584,6 +588,7 @@ impl ProjectRenderEngine {
                         width,
                         height,
                         visited_comps,
+                        comp_depth,
                     )?;
                     self.compositor.accumulate_motion_blur_sample(
                         &self.ctx,
@@ -614,6 +619,7 @@ impl ProjectRenderEngine {
             width,
             height,
             visited_comps,
+            comp_depth,
         )
     }
 
@@ -627,6 +633,7 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
         visited_comps: &mut Vec<Uuid>,
+        comp_depth: usize,
     ) -> Result<RenderTarget, RenderError> {
         let fps = f64::from(sequence.fps.max(1));
         let controls = evaluate_sequence_controls(sequence, frame, fps, project, plugins);
@@ -687,6 +694,7 @@ impl ProjectRenderEngine {
                     width,
                     height,
                     visited_comps,
+                    comp_depth,
                 )?;
             }
         }
@@ -694,6 +702,7 @@ impl ProjectRenderEngine {
         Ok(canvas)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_and_composite_layer(
         &mut self,
         backdrop: RenderTarget,
@@ -702,6 +711,7 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
         visited_comps: &mut Vec<Uuid>,
+        comp_depth: usize,
     ) -> Result<RenderTarget, RenderError> {
         let opacity = eval_f32(&layer.opacity, env).clamp(0.0, 1.0);
         let blend_mode = BlendMode::from_token(&layer.blending).unwrap_or(BlendMode::SrcOver);
@@ -709,8 +719,15 @@ impl ProjectRenderEngine {
             return Ok(backdrop);
         }
 
-        let Some(mut layer_target) =
-            self.render_layer_content(&backdrop, layer, env, width, height, visited_comps)?
+        let Some(mut layer_target) = self.render_layer_content(
+            &backdrop,
+            layer,
+            env,
+            width,
+            height,
+            visited_comps,
+            comp_depth,
+        )?
         else {
             return Ok(backdrop);
         };
@@ -747,6 +764,7 @@ impl ProjectRenderEngine {
         Ok(composited)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_layer_content(
         &mut self,
         backdrop: &RenderTarget,
@@ -755,6 +773,7 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
         visited_comps: &mut Vec<Uuid>,
+        comp_depth: usize,
     ) -> Result<Option<RenderTarget>, RenderError> {
         match &layer.kind {
             LayerKind::Scene3D {
@@ -793,10 +812,9 @@ impl ProjectRenderEngine {
                     wgpu::TextureFormat::Rgba8Unorm,
                 )?;
                 if let Some(asset_id) = image.as_deref()
-                    && let Some(tex_key) = self.ensure_image_asset_texture(env.project, asset_id)
-                    && let Some(cached) = self.texture_cache.get(&tex_key)
+                    && let Some(tex) = self.ensure_image_asset_texture(env.project, asset_id)
                 {
-                    self.compositor.blit(&self.ctx, &cached.target.view, &dst);
+                    self.compositor.blit(&self.ctx, &tex.view, &dst);
                 } else {
                     self.compositor
                         .clear_target(&self.ctx, &dst, wgpu::Color::TRANSPARENT);
@@ -811,10 +829,9 @@ impl ProjectRenderEngine {
                     wgpu::TextureFormat::Rgba8Unorm,
                 )?;
                 if let Some(asset_id) = media.as_deref()
-                    && let Some(tex_key) = self.ensure_image_asset_texture(env.project, asset_id)
-                    && let Some(cached) = self.texture_cache.get(&tex_key)
+                    && let Some(tex) = self.ensure_image_asset_texture(env.project, asset_id)
                 {
-                    self.compositor.blit(&self.ctx, &cached.target.view, &dst);
+                    self.compositor.blit(&self.ctx, &tex.view, &dst);
                 } else {
                     self.compositor
                         .clear_target(&self.ctx, &dst, wgpu::Color::TRANSPARENT);
@@ -822,7 +839,11 @@ impl ProjectRenderEngine {
                 Ok(Some(dst))
             }
             LayerKind::Composite { layers } => {
-                if visited_comps.len() >= MAX_COMPOSITION_DEPTH {
+                if comp_depth >= MAX_COMPOSITION_DEPTH {
+                    warn!(
+                        depth = comp_depth,
+                        "skipping Composite layer exceeding max composition depth"
+                    );
                     return Ok(None);
                 }
                 let mut nested = self.targets.acquire(
@@ -842,6 +863,7 @@ impl ProjectRenderEngine {
                         width,
                         height,
                         visited_comps,
+                        comp_depth + 1,
                     )?;
                 }
                 Ok(Some(nested))
@@ -852,11 +874,13 @@ impl ProjectRenderEngine {
                 {
                     return Ok(None);
                 }
-                if visited_comps.len() >= MAX_COMPOSITION_DEPTH
+                if comp_depth >= MAX_COMPOSITION_DEPTH
+                    || visited_comps.len() >= MAX_COMPOSITION_DEPTH
                     || visited_comps.contains(composition_id)
                 {
                     warn!(
                         comp_id = %composition_id,
+                        depth = comp_depth,
                         "skipping recursive PrecompRef composition"
                     );
                     return Ok(None);
@@ -874,6 +898,7 @@ impl ProjectRenderEngine {
                     width,
                     height,
                     visited_comps,
+                    comp_depth + 1,
                 );
                 visited_comps.pop();
                 result.map(Some)
@@ -932,34 +957,16 @@ impl ProjectRenderEngine {
         let meshes_draw: Vec<MeshDrawCall<'_>> = collected
             .meshes
             .iter()
-            .filter_map(|spec| {
-                let cached = self.mesh_cache.get(&spec.mesh_key)?;
-                let albedo_view = spec
-                    .albedo_key
-                    .as_ref()
-                    .and_then(|k| self.texture_cache.get(k))
-                    .map(|t| &t.target.view);
-                let normal_view = spec
-                    .normal_key
-                    .as_ref()
-                    .and_then(|k| self.texture_cache.get(k))
-                    .map(|t| &t.target.view);
-                let matcap_view = spec
-                    .matcap_key
-                    .as_ref()
-                    .and_then(|k| self.texture_cache.get(k))
-                    .map(|t| &t.target.view);
-                Some(MeshDrawCall {
-                    mesh: &cached.mesh,
-                    model: spec.model,
-                    normal_matrix: spec.normal_matrix,
-                    material: spec.material,
-                    albedo_view,
-                    normal_view,
-                    matcap_view,
-                    cast_shadow: spec.cast_shadow,
-                    receive_shadow: spec.receive_shadow,
-                })
+            .map(|spec| MeshDrawCall {
+                mesh: spec.mesh.as_ref(),
+                model: spec.model,
+                normal_matrix: spec.normal_matrix,
+                material: spec.material,
+                albedo_view: spec.albedo.as_deref().map(|t| &t.view),
+                normal_view: spec.normal.as_deref().map(|t| &t.view),
+                matcap_view: spec.matcap.as_deref().map(|t| &t.view),
+                cast_shadow: spec.cast_shadow,
+                receive_shadow: spec.receive_shadow,
             })
             .collect();
 
@@ -968,11 +975,7 @@ impl ProjectRenderEngine {
             .iter()
             .map(|p| ParticleDrawCall {
                 instances: &p.instances,
-                sprite_view: p
-                    .sprite_key
-                    .as_ref()
-                    .and_then(|k| self.texture_cache.get(k))
-                    .map(|t| &t.target.view),
+                sprite_view: p.sprite.as_deref().map(|t| &t.view),
                 blend: p.blend,
             })
             .collect();
@@ -1085,48 +1088,48 @@ impl ProjectRenderEngine {
                     }
                 }
                 Object3DKind::Shape3D(shape) => {
-                    if let Some(mesh_key) = self.ensure_shape_mesh(obj, shape, env) {
+                    if let Some(mesh) = self.ensure_shape_mesh(obj, shape, env) {
                         let mat_eval = self.evaluate_material(obj.material.as_ref(), env);
                         out.meshes.push(PreparedMeshSpec {
-                            mesh_key,
+                            mesh,
                             model: world.to_cols_array_2d(),
                             normal_matrix: compute_normal_matrix(world),
                             material: mat_eval.params,
-                            albedo_key: mat_eval.albedo_key,
-                            normal_key: mat_eval.normal_key,
-                            matcap_key: mat_eval.matcap_key,
+                            albedo: mat_eval.albedo,
+                            normal: mat_eval.normal,
+                            matcap: mat_eval.matcap,
                             cast_shadow: true,
                             receive_shadow: true,
                         });
                     }
                 }
                 Object3DKind::Text3D(text_data) => {
-                    if let Some(mesh_key) = self.ensure_text3d_mesh(obj, text_data, env) {
+                    if let Some(mesh) = self.ensure_text3d_mesh(obj, text_data, env) {
                         let mat_eval = self.evaluate_material(obj.material.as_ref(), env);
                         out.meshes.push(PreparedMeshSpec {
-                            mesh_key,
+                            mesh,
                             model: world.to_cols_array_2d(),
                             normal_matrix: compute_normal_matrix(world),
                             material: mat_eval.params,
-                            albedo_key: mat_eval.albedo_key,
-                            normal_key: mat_eval.normal_key,
-                            matcap_key: mat_eval.matcap_key,
+                            albedo: mat_eval.albedo,
+                            normal: mat_eval.normal,
+                            matcap: mat_eval.matcap,
                             cast_shadow: true,
                             receive_shadow: true,
                         });
                     }
                 }
                 Object3DKind::Model(model_data) => {
-                    if let Some(mesh_key) = self.ensure_model_mesh(obj, model_data, env) {
+                    if let Some(mesh) = self.ensure_model_mesh(obj, model_data, env) {
                         let mat_eval = self.evaluate_material(obj.material.as_ref(), env);
                         out.meshes.push(PreparedMeshSpec {
-                            mesh_key,
+                            mesh,
                             model: world.to_cols_array_2d(),
                             normal_matrix: compute_normal_matrix(world),
                             material: mat_eval.params,
-                            albedo_key: mat_eval.albedo_key,
-                            normal_key: mat_eval.normal_key,
-                            matcap_key: mat_eval.matcap_key,
+                            albedo: mat_eval.albedo,
+                            normal: mat_eval.normal,
+                            matcap: mat_eval.matcap,
                             cast_shadow: true,
                             receive_shadow: true,
                         });
@@ -1217,13 +1220,13 @@ impl ProjectRenderEngine {
                         });
                     }
                     if !instances.is_empty() {
-                        let sprite_key = pdata
+                        let sprite = pdata
                             .texture
                             .as_deref()
                             .and_then(|id| self.ensure_image_asset_texture(env.project, id));
                         out.particles.push(PreparedParticlesSpec {
                             instances,
-                            sprite_key,
+                            sprite,
                             blend: if pdata.blending == 1 {
                                 ParticleBlend::Additive
                             } else {
@@ -1242,14 +1245,14 @@ impl ProjectRenderEngine {
         obj: &Object3D,
         shape: &Shape3DKind,
         env: &EvalEnv<'_>,
-    ) -> Option<MeshCacheKey> {
+    ) -> Option<Arc<GpuMesh>> {
         let content_hash = hash_shape_and_effectors(shape, obj, env);
         let key = MeshCacheKey {
             object_id: obj.id,
             content_hash,
         };
-        if self.touch_cached_mesh(key) {
-            return Some(key);
+        if let Some(cached) = self.touch_cached_mesh(key) {
+            return Some(cached);
         }
 
         let mut mesh = match shape {
@@ -1361,8 +1364,7 @@ impl ProjectRenderEngine {
         if mesh.indices.is_empty() {
             return None;
         }
-        self.insert_cached_mesh(key, &mesh, "zc-shape3d-mesh");
-        Some(key)
+        Some(self.insert_cached_mesh(key, &mesh, "zc-shape3d-mesh"))
     }
 
     fn ensure_text3d_mesh(
@@ -1370,14 +1372,14 @@ impl ProjectRenderEngine {
         obj: &Object3D,
         data: &zc_project::Text3DData,
         env: &EvalEnv<'_>,
-    ) -> Option<MeshCacheKey> {
+    ) -> Option<Arc<GpuMesh>> {
         let content_hash = hash_text3d_and_effectors(data, obj, env);
         let key = MeshCacheKey {
             object_id: obj.id,
             content_hash,
         };
-        if self.touch_cached_mesh(key) {
-            return Some(key);
+        if let Some(cached) = self.touch_cached_mesh(key) {
+            return Some(cached);
         }
 
         let params = Text3DParams {
@@ -1411,8 +1413,7 @@ impl ProjectRenderEngine {
         if mesh.indices.is_empty() {
             return None;
         }
-        self.insert_cached_mesh(key, &mesh, "zc-text3d-mesh");
-        Some(key)
+        Some(self.insert_cached_mesh(key, &mesh, "zc-text3d-mesh"))
     }
 
     fn ensure_model_mesh(
@@ -1420,7 +1421,7 @@ impl ProjectRenderEngine {
         obj: &Object3D,
         data: &zc_project::ModelData,
         env: &EvalEnv<'_>,
-    ) -> Option<MeshCacheKey> {
+    ) -> Option<Arc<GpuMesh>> {
         let asset_bytes_hash = data
             .asset_id
             .as_deref()
@@ -1437,8 +1438,8 @@ impl ProjectRenderEngine {
             object_id: obj.id,
             content_hash: h,
         };
-        if self.touch_cached_mesh(key) {
-            return Some(key);
+        if let Some(cached) = self.touch_cached_mesh(key) {
+            return Some(cached);
         }
 
         let mut mesh = data
@@ -1450,21 +1451,25 @@ impl ProjectRenderEngine {
         if mesh.indices.is_empty() {
             return None;
         }
-        self.insert_cached_mesh(key, &mesh, "zc-model3d-mesh");
-        Some(key)
+        Some(self.insert_cached_mesh(key, &mesh, "zc-model3d-mesh"))
     }
 
-    fn touch_cached_mesh(&mut self, key: MeshCacheKey) -> bool {
+    fn touch_cached_mesh(&mut self, key: MeshCacheKey) -> Option<Arc<GpuMesh>> {
         if let Some(entry) = self.mesh_cache.get_mut(&key) {
             self.cache_tick = self.cache_tick.wrapping_add(1);
             entry.last_used = self.cache_tick;
-            true
+            Some(Arc::clone(&entry.mesh))
         } else {
-            false
+            None
         }
     }
 
-    fn insert_cached_mesh(&mut self, key: MeshCacheKey, mesh: &MeshData, label: &str) {
+    fn insert_cached_mesh(
+        &mut self,
+        key: MeshCacheKey,
+        mesh: &MeshData,
+        label: &str,
+    ) -> Arc<GpuMesh> {
         self.cache_tick = self.cache_tick.wrapping_add(1);
         let tick = self.cache_tick;
         while self.mesh_cache.len() >= MAX_CACHED_MESHES {
@@ -1489,15 +1494,21 @@ impl ProjectRenderEngine {
                 material_slot: v.material_slot,
             })
             .collect();
-        let gpu_mesh = GpuMesh::from_slices(&self.ctx, &gpu_verts, &mesh.indices, Some(label));
+        let gpu_mesh = Arc::new(GpuMesh::from_slices(
+            &self.ctx,
+            &gpu_verts,
+            &mesh.indices,
+            Some(label),
+        ));
         self.mesh_cache.insert(
             key,
             CachedGpuMesh {
-                mesh: gpu_mesh,
+                mesh: Arc::clone(&gpu_mesh),
                 bounds: mesh.bounds,
                 last_used: tick,
             },
         );
+        gpu_mesh
     }
 
     fn evaluate_material(
@@ -1508,9 +1519,9 @@ impl ProjectRenderEngine {
         let Some(spec) = spec else {
             return EvaluatedMaterial {
                 params: MaterialParams::default(),
-                albedo_key: None,
-                normal_key: None,
-                matcap_key: None,
+                albedo: None,
+                normal: None,
+                matcap: None,
             };
         };
 
@@ -1523,12 +1534,12 @@ impl ProjectRenderEngine {
                     blend: MaterialBlend::Opaque,
                     ..Default::default()
                 },
-                albedo_key: None,
-                normal_key: None,
-                matcap_key: None,
+                albedo: None,
+                normal: None,
+                matcap: None,
             },
             MaterialSpec::Texture(m) => {
-                let albedo_key = m
+                let albedo = m
                     .texture
                     .as_deref()
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id));
@@ -1544,14 +1555,14 @@ impl ProjectRenderEngine {
                         uv_rotation: eval_f32(&m.rotation, env),
                         ..Default::default()
                     },
-                    albedo_key,
-                    normal_key: None,
-                    matcap_key: None,
+                    albedo,
+                    normal: None,
+                    matcap: None,
                 }
             }
             MaterialSpec::Video(m) => {
                 let opacity = eval_f32(&m.opacity, env).clamp(0.0, 1.0);
-                let albedo_key = m
+                let albedo = m
                     .video
                     .as_deref()
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id));
@@ -1563,18 +1574,18 @@ impl ProjectRenderEngine {
                         blend: map_material_blend(m.blending, m.transparent, opacity),
                         ..Default::default()
                     },
-                    albedo_key,
-                    normal_key: None,
-                    matcap_key: None,
+                    albedo,
+                    normal: None,
+                    matcap: None,
                 }
             }
             MaterialSpec::CustomPbr(m) => {
                 let opacity = eval_f32(&m.opacity, env).clamp(0.0, 1.0);
-                let albedo_key = m
+                let albedo = m
                     .texture
                     .as_deref()
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id));
-                let normal_key = m
+                let normal = m
                     .normal_map
                     .as_deref()
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id));
@@ -1595,18 +1606,18 @@ impl ProjectRenderEngine {
                         uv_rotation: eval_f32(&m.rotation, env),
                         ..Default::default()
                     },
-                    albedo_key,
-                    normal_key,
-                    matcap_key: None,
+                    albedo,
+                    normal,
+                    matcap: None,
                 }
             }
             MaterialSpec::PbrPlus(m) => {
                 let opacity = eval_f32(&m.opacity, env).clamp(0.0, 1.0);
-                let albedo_key = m
+                let albedo = m
                     .base_color_map
                     .as_deref()
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id));
-                let normal_key = m
+                let normal = m
                     .normal_map
                     .as_deref()
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id));
@@ -1627,16 +1638,16 @@ impl ProjectRenderEngine {
                         uv_rotation: eval_f32(&m.rotation, env),
                         ..Default::default()
                     },
-                    albedo_key,
-                    normal_key,
-                    matcap_key: None,
+                    albedo,
+                    normal,
+                    matcap: None,
                 }
             }
             MaterialSpec::Matcap(m) => {
                 let opacity = eval_f32(&m.opacity, env).clamp(0.0, 1.0);
                 let brightness = eval_f32(&m.brightness, env).max(0.0);
                 let col = eval_color_rgb(&m.color, env, [1.0, 1.0, 1.0]);
-                let matcap_key = m
+                let matcap = m
                     .texture
                     .as_deref()
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id));
@@ -1653,14 +1664,14 @@ impl ProjectRenderEngine {
                         blend: map_material_blend(m.blending, m.transparent, opacity),
                         ..Default::default()
                     },
-                    albedo_key: None,
-                    normal_key: None,
-                    matcap_key,
+                    albedo: None,
+                    normal: None,
+                    matcap,
                 }
             }
             MaterialSpec::ImagePlus(m) => {
                 let opacity = eval_f32(&m.opacity, env).clamp(0.0, 1.0);
-                let albedo_key = m
+                let albedo = m
                     .texture
                     .as_deref()
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id));
@@ -1677,18 +1688,18 @@ impl ProjectRenderEngine {
                         uv_rotation: eval_f32(&m.rotation, env),
                         ..Default::default()
                     },
-                    albedo_key,
-                    normal_key: None,
-                    matcap_key: None,
+                    albedo,
+                    normal: None,
+                    matcap: None,
                 }
             }
             MaterialSpec::CustomShader { .. }
             | MaterialSpec::NodeMaterial { .. }
             | MaterialSpec::Unknown { .. } => EvaluatedMaterial {
                 params: MaterialParams::default(),
-                albedo_key: None,
-                normal_key: None,
-                matcap_key: None,
+                albedo: None,
+                normal: None,
+                matcap: None,
             },
         }
     }
@@ -1723,23 +1734,20 @@ impl ProjectRenderEngine {
             asset_key: format!("layer:{layer_id}"),
             content_hash: h,
         };
-        if !self.touch_cached_texture(&key) {
+        let tex = if let Some(cached) = self.touch_cached_texture(&key) {
+            cached
+        } else {
             let rgba = rasterize_preset_shape(preset, &style, width, height);
-            let tex = self
-                .ctx
-                .create_rgba8_texture("zc-preset-shape-2d", width, height, &rgba)?;
-            self.insert_cached_texture(key.clone(), tex);
-        }
+            let created =
+                self.ctx
+                    .create_rgba8_texture("zc-preset-shape-2d", width, height, &rgba)?;
+            self.insert_cached_texture(key, created)
+        };
 
         let dst =
             self.targets
                 .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
-        if let Some(cached) = self.texture_cache.get(&key) {
-            self.compositor.blit(&self.ctx, &cached.target.view, &dst);
-        } else {
-            self.compositor
-                .clear_target(&self.ctx, &dst, wgpu::Color::TRANSPARENT);
-        }
+        self.compositor.blit(&self.ctx, &tex.view, &dst);
         Ok(dst)
     }
 
@@ -1762,23 +1770,20 @@ impl ProjectRenderEngine {
             asset_key: format!("shape2d:{layer_id}"),
             content_hash: h,
         };
-        if !self.touch_cached_texture(&key) {
+        let tex = if let Some(cached) = self.touch_cached_texture(&key) {
+            cached
+        } else {
             let rgba = rasterize_shape_nodes(shapes, &style, env, width, height);
-            let tex = self
+            let created = self
                 .ctx
                 .create_rgba8_texture("zc-shape-2d", width, height, &rgba)?;
-            self.insert_cached_texture(key.clone(), tex);
-        }
+            self.insert_cached_texture(key, created)
+        };
 
         let dst =
             self.targets
                 .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
-        if let Some(cached) = self.texture_cache.get(&key) {
-            self.compositor.blit(&self.ctx, &cached.target.view, &dst);
-        } else {
-            self.compositor
-                .clear_target(&self.ctx, &dst, wgpu::Color::TRANSPARENT);
-        }
+        self.compositor.blit(&self.ctx, &tex.view, &dst);
         Ok(dst)
     }
 
@@ -1809,7 +1814,9 @@ impl ProjectRenderEngine {
             content_hash: h,
         };
 
-        if !self.touch_cached_mesh(mesh_key) {
+        let mesh_opt = if let Some(cached) = self.touch_cached_mesh(mesh_key) {
+            Some(cached)
+        } else {
             let params = Text3DParams {
                 text: text.to_owned(),
                 height: px_size,
@@ -1830,15 +1837,17 @@ impl ProjectRenderEngine {
                 .and_then(|bytes| build_text3d_mesh(bytes, &params).ok())
                 .filter(|m| !m.indices.is_empty())
                 .unwrap_or_else(|| build_fallback_text_mesh(&params));
-            if !mesh.indices.is_empty() {
-                self.insert_cached_mesh(mesh_key, &mesh, "zc-text2d-mesh");
+            if mesh.indices.is_empty() {
+                None
+            } else {
+                Some(self.insert_cached_mesh(mesh_key, &mesh, "zc-text2d-mesh"))
             }
-        }
+        };
 
         let color =
             self.targets
                 .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
-        let Some(cached_mesh) = self.mesh_cache.get(&mesh_key) else {
+        let Some(cached_mesh) = mesh_opt else {
             self.compositor
                 .clear_target(&self.ctx, &color, wgpu::Color::TRANSPARENT);
             return Ok(color);
@@ -1860,7 +1869,7 @@ impl ProjectRenderEngine {
         };
 
         let draw = [MeshDrawCall {
-            mesh: &cached_mesh.mesh,
+            mesh: cached_mesh.as_ref(),
             model: mat4_identity(),
             normal_matrix: mat4_identity(),
             material: MaterialParams {
@@ -1914,7 +1923,7 @@ impl ProjectRenderEngine {
         &mut self,
         project: &Project,
         asset_id: &str,
-    ) -> Option<TextureCacheKey> {
+    ) -> Option<Arc<RenderTarget>> {
         let record = project.assets.get(asset_id)?;
         let bytes = record.bytes.as_deref()?;
         let content_hash = if !record.sha256.is_empty() {
@@ -1926,8 +1935,8 @@ impl ProjectRenderEngine {
             asset_key: asset_id.to_owned(),
             content_hash,
         };
-        if self.touch_cached_texture(&key) {
-            return Some(key);
+        if let Some(cached) = self.touch_cached_texture(&key) {
+            return Some(cached);
         }
 
         let img = match image::load_from_memory(bytes) {
@@ -1954,21 +1963,24 @@ impl ProjectRenderEngine {
             .ctx
             .create_rgba8_texture("zc-asset-image", w, h, &premul)
             .ok()?;
-        self.insert_cached_texture(key.clone(), target);
-        Some(key)
+        Some(self.insert_cached_texture(key, target))
     }
 
-    fn touch_cached_texture(&mut self, key: &TextureCacheKey) -> bool {
+    fn touch_cached_texture(&mut self, key: &TextureCacheKey) -> Option<Arc<RenderTarget>> {
         if let Some(entry) = self.texture_cache.get_mut(key) {
             self.cache_tick = self.cache_tick.wrapping_add(1);
             entry.last_used = self.cache_tick;
-            true
+            Some(Arc::clone(&entry.target))
         } else {
-            false
+            None
         }
     }
 
-    fn insert_cached_texture(&mut self, key: TextureCacheKey, target: RenderTarget) {
+    fn insert_cached_texture(
+        &mut self,
+        key: TextureCacheKey,
+        target: RenderTarget,
+    ) -> Arc<RenderTarget> {
         let bytes = target.byte_size();
         self.cache_tick = self.cache_tick.wrapping_add(1);
         let tick = self.cache_tick;
@@ -1994,15 +2006,17 @@ impl ProjectRenderEngine {
             }
         }
 
+        let target = Arc::new(target);
         self.texture_cache_bytes = self.texture_cache_bytes.saturating_add(bytes);
         self.texture_cache.insert(
             key,
             CachedGpuTexture {
-                target,
+                target: Arc::clone(&target),
                 bytes,
                 last_used: tick,
             },
         );
+        target
     }
 
     // -----------------------------------------------------------------------
@@ -2011,15 +2025,25 @@ impl ProjectRenderEngine {
 
     fn apply_project_effect_stack(
         &mut self,
+        source: RenderTarget,
+        effects: &[EffectInstance],
+        env: &EvalEnv<'_>,
+    ) -> Result<RenderTarget, RenderError> {
+        self.apply_project_effect_stack_depth(source, effects, env, 0)
+    }
+
+    fn apply_project_effect_stack_depth(
+        &mut self,
         mut source: RenderTarget,
         effects: &[EffectInstance],
         env: &EvalEnv<'_>,
+        group_depth: usize,
     ) -> Result<RenderTarget, RenderError> {
         for fx in effects {
             if !eval_bool(&fx.enabled, env, true) {
                 continue;
             }
-            source = self.apply_single_effect(source, fx, env)?;
+            source = self.apply_single_effect(source, fx, env, group_depth)?;
         }
         Ok(source)
     }
@@ -2029,12 +2053,20 @@ impl ProjectRenderEngine {
         source: RenderTarget,
         fx: &EffectInstance,
         env: &EvalEnv<'_>,
+        group_depth: usize,
     ) -> Result<RenderTarget, RenderError> {
         match &fx.kind {
             EffectKind::EffectGroup {
                 custom_properties,
                 children,
             } => {
+                if group_depth >= MAX_EFFECT_GROUP_DEPTH {
+                    warn!(
+                        depth = group_depth,
+                        "skipping EffectGroup exceeding max nesting depth"
+                    );
+                    return Ok(source);
+                }
                 let mut group_props = env.parent_props.clone();
                 for cp in custom_properties {
                     let val = eval_property_track(&cp.track, env);
@@ -2049,7 +2081,7 @@ impl ProjectRenderEngine {
                     controls: env.controls,
                     parent_props: &group_props,
                 };
-                self.apply_project_effect_stack(source, children, &child_env)
+                self.apply_project_effect_stack_depth(source, children, &child_env, group_depth + 1)
             }
             EffectKind::Standard(effect_id) => {
                 self.apply_builtin_effect(source, effect_id, &fx.params, env)
@@ -2092,7 +2124,7 @@ impl ProjectRenderEngine {
             env.time as f32,
             env.frame as f32,
         );
-        let mut aux_key: Option<TextureCacheKey> = None;
+        let mut aux_tex: Option<Arc<RenderTarget>> = None;
 
         for (name, track) in param_tracks {
             let val = eval_property_track(track, env);
@@ -2143,8 +2175,8 @@ impl ProjectRenderEngine {
                         {
                             reg_params.set("lut", lut_val);
                         }
-                    } else if aux_key.is_none() {
-                        aux_key = self.ensure_image_asset_texture(env.project, &asset_id);
+                    } else if aux_tex.is_none() {
+                        aux_tex = self.ensure_image_asset_texture(env.project, &asset_id);
                     }
                 }
                 PropertyValue::Asset(None) | PropertyValue::Json(_) => {}
@@ -2154,10 +2186,7 @@ impl ProjectRenderEngine {
         let dst =
             self.targets
                 .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
-        let aux_view = aux_key
-            .as_ref()
-            .and_then(|k| self.texture_cache.get(k))
-            .map(|t| &t.target.view);
+        let aux_view = aux_tex.as_deref().map(|t| &t.view);
 
         let mut encoder = self
             .ctx
@@ -2217,11 +2246,37 @@ impl ProjectRenderEngine {
         if let Some(entry) = self.custom_pipelines.get_mut(&shader_hash) {
             entry.last_used = tick;
         } else {
-            let compiled = zc_shader::translate_glsl_es100_with_options(
+            let compiled = match zc_shader::translate_glsl_es100_with_options(
                 frag_shader,
                 &CompileOptions::default(),
-            )
-            .map_err(|err| RenderError::Shader(err.to_string()))?;
+            ) {
+                Ok(c) => c,
+                Err(err) => {
+                    self.targets.release(source);
+                    return Err(RenderError::Shader(err.to_string()));
+                }
+            };
+
+            let limits = self.ctx.device.limits();
+            if u64::from(compiled.uniform_layout.byte_size) > limits.max_uniform_buffer_binding_size
+            {
+                self.targets.release(source);
+                return Err(RenderError::Shader(format!(
+                    "custom shader UBO size {} exceeds device limit {}",
+                    compiled.uniform_layout.byte_size, limits.max_uniform_buffer_binding_size
+                )));
+            }
+            let tex_count = compiled.texture_bindings.len() as u32;
+            if tex_count > limits.max_sampled_textures_per_shader_stage
+                || tex_count > limits.max_samplers_per_shader_stage
+            {
+                self.targets.release(source);
+                return Err(RenderError::Shader(format!(
+                    "custom shader texture/sampler count {tex_count} exceeds device stage limits ({}/{})",
+                    limits.max_sampled_textures_per_shader_stage,
+                    limits.max_samplers_per_shader_stage
+                )));
+            }
 
             let mut layout_entries = Vec::new();
             if compiled.uniform_layout.byte_size > 0 {
@@ -2257,6 +2312,19 @@ impl ProjectRenderEngine {
                 });
             }
 
+            if (layout_entries.len() as u32) > limits.max_bindings_per_bind_group {
+                self.targets.release(source);
+                return Err(RenderError::Shader(format!(
+                    "custom shader binding count {} exceeds device limit {}",
+                    layout_entries.len(),
+                    limits.max_bindings_per_bind_group
+                )));
+            }
+
+            let scope = self
+                .ctx
+                .device
+                .push_error_scope(wgpu::ErrorFilter::Validation);
             let bind_group_layout =
                 self.ctx
                     .device
@@ -2307,6 +2375,12 @@ impl ProjectRenderEngine {
                         multiview_mask: None,
                         cache: None,
                     });
+            if let Some(err) = pollster::block_on(scope.pop()) {
+                self.targets.release(source);
+                return Err(RenderError::Shader(format!(
+                    "GPU validation error compiling custom shader: {err}"
+                )));
+            }
 
             while self.custom_pipelines.len() >= MAX_CUSTOM_PIPELINES {
                 let Some(&oldest) = self
@@ -2340,7 +2414,7 @@ impl ProjectRenderEngine {
         uniform_values.insert("time".to_owned(), UniformValue::Float(env.time as f32));
         uniform_values.insert("frame".to_owned(), UniformValue::Float(env.frame as f32));
 
-        let mut extra_textures: HashMap<String, TextureCacheKey> = HashMap::new();
+        let mut extra_textures: HashMap<String, Arc<RenderTarget>> = HashMap::new();
         for cp in custom_properties {
             let val = eval_property_track(&cp.track, env);
             match val {
@@ -2372,20 +2446,26 @@ impl ProjectRenderEngine {
                     );
                 }
                 PropertyValue::Asset(Some(asset_id)) => {
-                    if let Some(tex_key) = self.ensure_image_asset_texture(env.project, &asset_id) {
-                        extra_textures.insert(cp.name.clone(), tex_key);
+                    if let Some(tex) = self.ensure_image_asset_texture(env.project, &asset_id) {
+                        extra_textures.insert(cp.name.clone(), tex);
                     }
                 }
                 _ => {}
             }
         }
 
-        let dst = self.targets.acquire(
+        let dst = match self.targets.acquire(
             &self.ctx,
             source.width,
             source.height,
             wgpu::TextureFormat::Rgba8Unorm,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(err) => {
+                self.targets.release(source);
+                return Err(err);
+            }
+        };
 
         let cached = &self.custom_pipelines[&shader_hash];
         let ubo_opt = if cached.compiled.uniform_layout.byte_size > 0 {
@@ -2415,8 +2495,7 @@ impl ProjectRenderEngine {
             } else {
                 extra_textures
                     .get(&tb.name)
-                    .and_then(|k| self.texture_cache.get(k))
-                    .map_or(&self.fallback_transparent.view, |t| &t.target.view)
+                    .map_or(&self.fallback_transparent.view, |t| &t.view)
             };
             bg_entries.push(wgpu::BindGroupEntry {
                 binding: tb.texture_binding,
@@ -2479,28 +2558,28 @@ impl ProjectRenderEngine {
 // ---------------------------------------------------------------------------
 
 struct PreparedMeshSpec {
-    mesh_key: MeshCacheKey,
+    mesh: Arc<GpuMesh>,
     model: [[f32; 4]; 4],
     normal_matrix: [[f32; 4]; 4],
     material: MaterialParams,
-    albedo_key: Option<TextureCacheKey>,
-    normal_key: Option<TextureCacheKey>,
-    matcap_key: Option<TextureCacheKey>,
+    albedo: Option<Arc<RenderTarget>>,
+    normal: Option<Arc<RenderTarget>>,
+    matcap: Option<Arc<RenderTarget>>,
     cast_shadow: bool,
     receive_shadow: bool,
 }
 
 struct PreparedParticlesSpec {
     instances: Vec<RenderParticleInstance>,
-    sprite_key: Option<TextureCacheKey>,
+    sprite: Option<Arc<RenderTarget>>,
     blend: ParticleBlend,
 }
 
 struct EvaluatedMaterial {
     params: MaterialParams,
-    albedo_key: Option<TextureCacheKey>,
-    normal_key: Option<TextureCacheKey>,
-    matcap_key: Option<TextureCacheKey>,
+    albedo: Option<Arc<RenderTarget>>,
+    normal: Option<Arc<RenderTarget>>,
+    matcap: Option<Arc<RenderTarget>>,
 }
 
 struct CollectedScene3D {
@@ -3528,12 +3607,17 @@ fn parse_cube_lut_bytes(bytes: &[u8]) -> Option<RegParamValue> {
         }
     }
 
-    if let Some(n) = size_3d
-        && n >= 2
-        && triplets.len() >= (n as usize) * (n as usize) * (n as usize)
-    {
-        let total = (n as usize) * (n as usize) * (n as usize);
-        let mut data = Vec::with_capacity(total * 4);
+    if let Some(n) = size_3d {
+        if !(2..=MAX_CUBE_LUT_3D_SIZE).contains(&n) {
+            return None;
+        }
+        let n_usize = n as usize;
+        let total = n_usize.checked_mul(n_usize)?.checked_mul(n_usize)?;
+        let byte_len = total.checked_mul(4)?;
+        if triplets.len() < total {
+            return None;
+        }
+        let mut data = Vec::with_capacity(byte_len);
         for rgb in triplets.into_iter().take(total) {
             data.push((rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8);
             data.push((rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8);
@@ -3544,7 +3628,7 @@ fn parse_cube_lut_bytes(bytes: &[u8]) -> Option<RegParamValue> {
     }
 
     let len = size_1d.unwrap_or(triplets.len());
-    if len >= 2 && triplets.len() >= len {
+    if (2..=MAX_CUBE_LUT_1D_SIZE).contains(&len) && triplets.len() >= len {
         let entries: Vec<[u8; 4]> = triplets
             .into_iter()
             .take(len)
@@ -3870,8 +3954,13 @@ mod tests {
 
     #[test]
     fn headless_project_engine_renders_default_scene_and_selftest_effects() {
-        let Ok(mut engine) = ProjectRenderEngine::new_headless() else {
-            return;
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(msg)) if !crate::require_gpu_in_tests() => {
+                eprintln!("skipping project engine GPU test (no adapter): {msg}");
+                return;
+            }
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
         };
         let report = engine
             .selftest_all_effects(64, 64)
@@ -3887,5 +3976,195 @@ mod tests {
             report.plugin_total,
             report.default_scene_non_black_pixels,
         );
+    }
+
+    #[test]
+    fn malformed_cube_lut_and_unpremultiply_are_safe() {
+        assert!(parse_cube_lut_bytes(b"LUT_3D_SIZE 4096\n0 0 0\n").is_none());
+        assert!(parse_cube_lut_bytes(b"LUT_3D_SIZE 4294967295\n0 0 0\n").is_none());
+        assert!(parse_cube_lut_bytes(b"LUT_3D_SIZE 1\n0 0 0\n").is_none());
+
+        // Straight alpha recovery on translucent premultiplied pixels.
+        let straight =
+            crate::unpremultiply_rgba8(&[128, 64, 0, 128, 0, 0, 0, 0, 200, 100, 50, 255]);
+        assert_eq!(
+            straight,
+            vec![255, 128, 0, 128, 0, 0, 0, 0, 200, 100, 50, 255]
+        );
+    }
+
+    #[test]
+    fn gpu_safety_dimensions_custom_shader_uv_and_deep_nesting() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let plugins = PluginRegistry::new();
+
+        // 1. Oversized dimensions return InvalidDimensions before any GPU/CPU allocation.
+        let too_big = engine
+            .ctx
+            .device
+            .limits()
+            .max_texture_dimension_2d
+            .saturating_add(1);
+        assert!(matches!(
+            engine.selftest_all_effects(too_big, 64),
+            Err(RenderError::InvalidDimensions { .. })
+        ));
+        assert!(matches!(
+            engine.render_frame_rgba8(&Project::new_cm3_default(), &plugins, 0.0, too_big, 64),
+            Err(RenderError::InvalidDimensions { .. })
+        ));
+
+        // 2. Hostile custom shaders (huge uniform array, missing vertex varying) return Err(Shader), never panic.
+        let mut bad_shader_proj = Project::new_cm3_default();
+        bad_shader_proj.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .push(EffectInstance {
+                id: Uuid::new_v4(),
+                name: "HugeUniformArray".to_owned(),
+                enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+                kind: EffectKind::CustomShader {
+                    frag_shader: "precision mediump float; uniform vec4 Big[1000000]; void main() { gl_FragColor = Big[0]; }".to_owned(),
+                    custom_properties: Vec::new(),
+                },
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            });
+        assert!(matches!(
+            engine.render_frame_rgba8(&bad_shader_proj, &plugins, 0.0, 32, 32),
+            Err(RenderError::Shader(_))
+        ));
+
+        let mut extra_varying_proj = Project::new_cm3_default();
+        extra_varying_proj.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .push(EffectInstance {
+                id: Uuid::new_v4(),
+                name: "ExtraVarying".to_owned(),
+                enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+                kind: EffectKind::CustomShader {
+                    frag_shader: "precision mediump float; varying vec2 vMissing; void main() { gl_FragColor = vec4(vMissing, 0.0, 1.0); }".to_owned(),
+                    custom_properties: Vec::new(),
+                },
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            });
+        assert!(matches!(
+            engine.render_frame_rgba8(&extra_varying_proj, &plugins, 0.0, 32, 32),
+            Err(RenderError::Shader(_))
+        ));
+
+        // 3. CM3 bottom-left vUv convention: top row must have vUv.y ~ 1.0, bottom row ~ 0.0,
+        // and a second pass sampling texture2D(tDiffuse, vUvScaled) must preserve upright orientation.
+        let mut uv_proj = Project::new_cm3_default();
+        uv_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Generator;
+        uv_proj.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .push(EffectInstance {
+                id: Uuid::new_v4(),
+                name: "PaintUv".to_owned(),
+                enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+                kind: EffectKind::CustomShader {
+                    frag_shader: "precision mediump float; varying vec2 vUv; void main() { gl_FragColor = vec4(vUv.x, vUv.y, 0.0, 1.0); }".to_owned(),
+                    custom_properties: Vec::new(),
+                },
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            });
+        uv_proj.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .push(EffectInstance {
+                id: Uuid::new_v4(),
+                name: "CopyDiffuse".to_owned(),
+                enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+                kind: EffectKind::CustomShader {
+                    frag_shader: "precision mediump float; varying vec2 vUvScaled; uniform sampler2D tDiffuse; void main() { gl_FragColor = texture2D(tDiffuse, vUvScaled); }".to_owned(),
+                    custom_properties: Vec::new(),
+                },
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            });
+        let uv_pixels = engine
+            .render_frame_rgba8(&uv_proj, &plugins, 0.0, 16, 16)
+            .expect("custom shader UV test must render");
+        // Row 0 in top-down readback is the TOP of the image -> CM3 vUv.y near 1.0 (green > 220).
+        let top_g = uv_pixels[(8 * 4) + 1];
+        // Row 15 in top-down readback is the BOTTOM of the image -> CM3 vUv.y near 0.0 (green < 35).
+        let bottom_g = uv_pixels[((15 * 16 + 8) * 4) + 1];
+        assert!(
+            top_g > 220 && bottom_g < 35,
+            "expected CM3 bottom-left UV orientation preserved upright, got top_g={top_g}, bottom_g={bottom_g}"
+        );
+
+        // 4. Deep Composite and EffectGroup nesting completes cleanly without stack overflow.
+        let mut deep_layer = Layer {
+            id: Uuid::new_v4(),
+            name: "Leaf".to_owned(),
+            kind: LayerKind::Generator,
+            position: PropertyTrack::vec2([0.0, 0.0]),
+            scale: PropertyTrack::vec2([1.0, 1.0]),
+            rotation: PropertyTrack::number(0.0),
+            anchor: PropertyTrack::vec2([0.0, 0.0]),
+            opacity: PropertyTrack::number(1.0),
+            blending: "BLEND_SRC_OVER".to_owned(),
+            effects: Vec::new(),
+            resolution: [16, 16],
+            preserved: BTreeMap::new(),
+        };
+        for _ in 0..24 {
+            deep_layer = Layer {
+                id: Uuid::new_v4(),
+                name: "NestedComposite".to_owned(),
+                kind: LayerKind::Composite {
+                    layers: vec![deep_layer],
+                },
+                position: PropertyTrack::vec2([0.0, 0.0]),
+                scale: PropertyTrack::vec2([1.0, 1.0]),
+                rotation: PropertyTrack::number(0.0),
+                anchor: PropertyTrack::vec2([0.0, 0.0]),
+                opacity: PropertyTrack::number(1.0),
+                blending: "BLEND_SRC_OVER".to_owned(),
+                effects: Vec::new(),
+                resolution: [16, 16],
+                preserved: BTreeMap::new(),
+            };
+        }
+        let mut deep_fx = EffectInstance {
+            id: Uuid::new_v4(),
+            name: "LeafGroup".to_owned(),
+            enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+            kind: EffectKind::EffectGroup {
+                custom_properties: Vec::new(),
+                children: Vec::new(),
+            },
+            params: BTreeMap::new(),
+            preserved: BTreeMap::new(),
+        };
+        for _ in 0..24 {
+            deep_fx = EffectInstance {
+                id: Uuid::new_v4(),
+                name: "NestedGroup".to_owned(),
+                enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+                kind: EffectKind::EffectGroup {
+                    custom_properties: Vec::new(),
+                    children: vec![deep_fx],
+                },
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            };
+        }
+        deep_layer.effects.push(deep_fx);
+        let mut deep_proj = Project::new_cm3_default();
+        deep_proj.sequence.video_tracks[0].clips[0].layer = deep_layer;
+        let _ = engine
+            .render_frame_rgba8(&deep_proj, &plugins, 0.0, 16, 16)
+            .expect("deep Composite + EffectGroup must respect recursion caps");
     }
 }
