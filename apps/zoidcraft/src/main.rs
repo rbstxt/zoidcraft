@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -45,7 +45,7 @@ use ui::graph_editor::{GraphEditorState, show_graph_editor_window};
 use ui::layout::{Cm3Workspace, UiAction};
 use ui::panels::{
     ExportAudioCodec, ExportCm3Preset, ExportContainer as UiExportContainer, ExportMode,
-    ExportRateControl, ExportSettings as UiExportSettings, ExportVideoCodec,
+    ExportRateControl, ExportSettings as UiExportSettings, ExportStatus, ExportVideoCodec,
 };
 use ui::shortcuts::dispatch_shortcuts;
 use ui::theme::{
@@ -331,6 +331,13 @@ impl Drop for ActiveExportJob {
 // Top-Level ZoidCraft Desktop Application
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingUnsavedAction {
+    NewProject,
+    OpenProject,
+    CloseWindow,
+}
+
 struct ZoidCraftApp {
     session: Session,
     theme: Cm3Theme,
@@ -341,9 +348,14 @@ struct ZoidCraftApp {
     viewport: ViewportState,
     renderer: Option<ViewportGpuPresenter>,
     current_file: Option<PathBuf>,
+    /// Decoded audio buffers keyed by project `asset_id` (shared across split/duplicated clips).
     decoded_audio: HashMap<String, AudioBuffer>,
+    /// Precomputed waveform peaks keyed by project `asset_id`.
+    asset_waveform_peaks: HashMap<String, AudioWaveformPeaks>,
     active_export: Option<ActiveExportJob>,
     pending_eyedropper: Option<(String, String)>,
+    pending_unsaved_dialog: Option<PendingUnsavedAction>,
+    allow_close_now: bool,
     last_canvas_rect: Option<Rect>,
     force_single_render: bool,
     last_tick: Instant,
@@ -410,8 +422,11 @@ impl ZoidCraftApp {
             renderer,
             current_file: None,
             decoded_audio: HashMap::new(),
+            asset_waveform_peaks: HashMap::new(),
             active_export: None,
             pending_eyedropper: None,
+            pending_unsaved_dialog: None,
+            allow_close_now: false,
             last_canvas_rect: None,
             force_single_render: true,
             last_tick: Instant::now(),
@@ -469,32 +484,15 @@ impl ZoidCraftApp {
     }
 
     fn poll_export_worker(&mut self, ctx: &egui::Context) {
-        let mut finished_result: Option<Result<ExportReport, String>> = None;
-        if let Some(job) = &self.active_export {
-            while let Ok(event) = job.rx.try_recv() {
-                match event {
-                    ExportWorkerEvent::Progress(p) => {
-                        let frac = if p.total_frames > 0 {
-                            (p.completed_frames as f32 / p.total_frames as f32).clamp(0.0, 1.0)
-                        } else {
-                            1.0
-                        };
-                        self.workspace.panels.export_status.exporting = true;
-                        self.workspace.panels.export_status.progress = frac;
-                        self.workspace.panels.export_status.status_message = format!(
-                            "Rendering frame {} / {}",
-                            p.completed_frames, p.total_frames
-                        );
-                    }
-                    ExportWorkerEvent::Finished(res) => {
-                        finished_result = Some(res);
-                    }
-                }
-            }
-            if finished_result.is_none() {
+        let finished_result = if let Some(job) = &self.active_export {
+            let res = poll_export_job(job, &mut self.workspace.panels.export_status);
+            if res.is_none() {
                 ctx.request_repaint_after(Duration::from_millis(33));
             }
-        }
+            res
+        } else {
+            None
+        };
 
         if let Some(res) = finished_result {
             if let Some(mut job) = self.active_export.take()
@@ -580,8 +578,17 @@ impl ZoidCraftApp {
     }
 
     fn handle_new_project(&mut self) {
+        if self.session.is_dirty() {
+            self.pending_unsaved_dialog = Some(PendingUnsavedAction::NewProject);
+            return;
+        }
+        self.perform_new_project();
+    }
+
+    fn perform_new_project(&mut self) {
         self.cancel_active_export();
         let _ = self.session.execute(Command::NewProject);
+        self.session.mark_saved();
         if let Some(first_clip) = self
             .session
             .document()
@@ -595,6 +602,7 @@ impl ZoidCraftApp {
         }
         self.current_file = None;
         self.decoded_audio.clear();
+        self.asset_waveform_peaks.clear();
         self.timeline.audio_peaks.clear();
         self.viewport.camera.reset();
         sync_export_settings_from_session(
@@ -608,6 +616,14 @@ impl ZoidCraftApp {
     }
 
     fn handle_open_project(&mut self) {
+        if self.session.is_dirty() {
+            self.pending_unsaved_dialog = Some(PendingUnsavedAction::OpenProject);
+            return;
+        }
+        self.perform_open_project();
+    }
+
+    fn perform_open_project(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("ZoidCraft / Panzoid Projects", &["zcraft", "pz"])
             .pick_file()
@@ -699,7 +715,7 @@ impl ZoidCraftApp {
         }
     }
 
-    fn handle_save_project(&mut self, include_assets: bool) {
+    fn handle_save_project(&mut self, include_assets: bool) -> bool {
         let target_path = if include_assets && let Some(existing) = self.current_file.clone() {
             existing
         } else {
@@ -712,7 +728,7 @@ impl ZoidCraftApp {
                 .set_file_name(default_name)
                 .save_file()
             else {
-                return;
+                return false;
             };
             chosen
         };
@@ -744,8 +760,12 @@ impl ZoidCraftApp {
                     " (without assets)"
                 };
                 self.show_toast(format!("Saved {name}{suffix}"));
+                true
             }
-            Err(err) => self.show_toast(format!("Failed to save project: {err}")),
+            Err(err) => {
+                self.show_toast(format!("Failed to save project: {err}"));
+                false
+            }
         }
     }
 
@@ -840,15 +860,17 @@ impl ZoidCraftApp {
                         ac.media = Some(asset_id.clone());
                     }
                 }
-                self.timeline.audio_peaks.insert(
-                    clip_id.to_owned(),
-                    AudioWaveformPeaks {
-                        points_per_sec: f64::from(peaks.points_per_sec()),
-                        min_buf: peaks.min_peaks().to_vec(),
-                        max_buf: peaks.max_peaks().to_vec(),
-                    },
-                );
-                self.decoded_audio.insert(clip_id.to_owned(), audio_buf);
+                let ui_peaks = AudioWaveformPeaks {
+                    points_per_sec: f64::from(peaks.points_per_sec()),
+                    min_buf: peaks.min_peaks().to_vec(),
+                    max_buf: peaks.max_peaks().to_vec(),
+                };
+                self.asset_waveform_peaks
+                    .insert(asset_id.clone(), ui_peaks.clone());
+                self.timeline
+                    .audio_peaks
+                    .insert(clip_id.to_owned(), ui_peaks);
+                self.decoded_audio.insert(asset_id, audio_buf);
             }
         }
 
@@ -857,33 +879,59 @@ impl ZoidCraftApp {
 
     fn rebuild_audio_caches(&mut self) {
         self.decoded_audio.clear();
+        self.asset_waveform_peaks.clear();
         self.timeline.audio_peaks.clear();
         for at in &self.session.project.sequence.audio_tracks {
             for ac in &at.clips {
                 let Some(asset_key) = ac.media.as_deref() else {
                     continue;
                 };
-                let Some(rec) = self.session.project.assets.get(asset_key) else {
-                    continue;
-                };
-                let Some(bytes) = rec.bytes.as_deref() else {
-                    continue;
-                };
-                let ext = Path::new(&rec.filename)
-                    .extension()
-                    .and_then(|e| e.to_str());
-                if let Ok(buf) = decode_audio_bytes(bytes, ext) {
-                    let peaks = WaveformPeaks::from_audio_buffer(&buf);
-                    let cid = ac.id.to_string();
-                    self.timeline.audio_peaks.insert(
-                        cid.clone(),
-                        AudioWaveformPeaks {
-                            points_per_sec: f64::from(peaks.points_per_sec()),
-                            min_buf: peaks.min_peaks().to_vec(),
-                            max_buf: peaks.max_peaks().to_vec(),
-                        },
-                    );
-                    self.decoded_audio.insert(cid, buf);
+                if !self.decoded_audio.contains_key(asset_key) {
+                    let Some(rec) = self.session.project.assets.get(asset_key) else {
+                        continue;
+                    };
+                    let Some(bytes) = rec.bytes.as_deref() else {
+                        continue;
+                    };
+                    let ext = Path::new(&rec.filename)
+                        .extension()
+                        .and_then(|e| e.to_str());
+                    if let Ok(buf) = decode_audio_bytes(bytes, ext) {
+                        let peaks = WaveformPeaks::from_audio_buffer(&buf);
+                        self.asset_waveform_peaks.insert(
+                            asset_key.to_owned(),
+                            AudioWaveformPeaks {
+                                points_per_sec: f64::from(peaks.points_per_sec()),
+                                min_buf: peaks.min_peaks().to_vec(),
+                                max_buf: peaks.max_peaks().to_vec(),
+                            },
+                        );
+                        self.decoded_audio.insert(asset_key.to_owned(), buf);
+                    }
+                }
+                if let Some(ui_peaks) = self.asset_waveform_peaks.get(asset_key) {
+                    self.timeline
+                        .audio_peaks
+                        .insert(ac.id.to_string(), ui_peaks.clone());
+                }
+            }
+        }
+    }
+
+    /// Ensures newly split, duplicated, or undone/redone audio clips inherit waveform peaks
+    /// from their shared content-addressed `asset_id` without re-decoding audio bytes.
+    fn sync_timeline_audio_peaks(&mut self) {
+        if self.asset_waveform_peaks.is_empty() {
+            return;
+        }
+        for at in &self.session.project.sequence.audio_tracks {
+            for ac in &at.clips {
+                let cid = ac.id.to_string();
+                if !self.timeline.audio_peaks.contains_key(&cid)
+                    && let Some(asset_key) = ac.media.as_deref()
+                    && let Some(peaks) = self.asset_waveform_peaks.get(asset_key)
+                {
+                    self.timeline.audio_peaks.insert(cid, peaks.clone());
                 }
             }
         }
@@ -1129,6 +1177,98 @@ impl ZoidCraftApp {
         }
     }
 
+    fn show_unsaved_changes_modal(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_unsaved_dialog else {
+            return;
+        };
+
+        let action_label = match pending {
+            PendingUnsavedAction::NewProject => "creating a new project",
+            PendingUnsavedAction::OpenProject => "opening another project",
+            PendingUnsavedAction::CloseWindow => "closing ZoidCraft",
+        };
+
+        let mut choice: Option<u8> = None;
+        Area::new(Id::unique("zc_unsaved_backdrop"))
+            .order(Order::Foreground)
+            .fixed_pos(Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.input(|i| i.viewport_rect());
+                let _ = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter().rect_filled(
+                    screen,
+                    CornerRadius::ZERO,
+                    Color32::from_black_alpha(150),
+                );
+            });
+
+        egui::Window::new("Unsaved Changes")
+            .id(Id::unique("zc_unsaved_changes_modal"))
+            .order(Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                Frame::NONE
+                    .fill(BG_PANEL)
+                    .stroke(Stroke::new(1.0, self.theme.accent()))
+                    .inner_margin(egui::Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Save changes to '{}' before {action_label}?",
+                        self.session.document().project_name
+                    ))
+                    .font(self.theme.font(FONT_SMALL))
+                    .color(TEXT_BRIGHT),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        choice = Some(1);
+                    }
+                    if ui.button("Don't Save").clicked() {
+                        choice = Some(2);
+                    }
+                    if ui.button("Cancel").clicked() || ctx.input(|i| i.key_pressed(Key::Escape)) {
+                        choice = Some(0);
+                    }
+                });
+            });
+
+        match choice {
+            Some(0) => {
+                self.pending_unsaved_dialog = None;
+            }
+            Some(1) => {
+                if self.handle_save_project(true) {
+                    self.pending_unsaved_dialog = None;
+                    match pending {
+                        PendingUnsavedAction::NewProject => self.perform_new_project(),
+                        PendingUnsavedAction::OpenProject => self.perform_open_project(),
+                        PendingUnsavedAction::CloseWindow => {
+                            self.allow_close_now = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+            }
+            Some(2) => {
+                self.pending_unsaved_dialog = None;
+                match pending {
+                    PendingUnsavedAction::NewProject => self.perform_new_project(),
+                    PendingUnsavedAction::OpenProject => self.perform_open_project(),
+                    PendingUnsavedAction::CloseWindow => {
+                        self.allow_close_now = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn show_status_overlays(&mut self, ctx: &egui::Context) {
         // Eyedropper active banner.
         if self.pending_eyedropper.is_some() {
@@ -1222,13 +1362,23 @@ impl eframe::App for ZoidCraftApp {
             self.session.history.set_limits(undo_entries, undo_bytes);
         }
 
-        // 2. Real-time playback tick, audio meter decay, and export worker polling.
+        // 2. Real-time playback tick, audio peak sync, close guard, and export worker polling.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.session.is_dirty()
+            && !self.allow_close_now
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_unsaved_dialog = Some(PendingUnsavedAction::CloseWindow);
+        }
+        self.sync_timeline_audio_peaks();
         self.tick_playback_and_meter(&ctx);
         self.poll_export_worker(&ctx);
         self.handle_eyedropper_click(&ctx);
 
         // 3. Dispatch full CM3 shortcuts (avoiding double-fire with layout.rs by consuming handled keys).
-        if self.workspace.panels.floating_windows.focused_id.is_none() {
+        if self.workspace.panels.floating_windows.focused_id.is_none()
+            && self.pending_unsaved_dialog.is_none()
+        {
             let shortcut_outcome = dispatch_shortcuts(
                 &ctx,
                 &mut self.session,
@@ -1246,7 +1396,7 @@ impl eframe::App for ZoidCraftApp {
                 self.handle_open_project();
             }
             if shortcut_outcome.save_project_requested {
-                self.handle_save_project(!shortcut_outcome.save_without_assets);
+                let _ = self.handle_save_project(!shortcut_outcome.save_without_assets);
             }
             if let Some(err) = shortcut_outcome.last_error {
                 self.show_toast(err);
@@ -1303,7 +1453,7 @@ impl eframe::App for ZoidCraftApp {
                 UiAction::NewProject => self.handle_new_project(),
                 UiAction::OpenProject => self.handle_open_project(),
                 UiAction::SaveProject { include_assets } => {
-                    self.handle_save_project(include_assets);
+                    let _ = self.handle_save_project(include_assets);
                 }
                 UiAction::ImportMedia => self.handle_import_media(),
                 UiAction::OpenGraphEditor => self.graph_editor.open = !self.graph_editor.open,
@@ -1347,6 +1497,7 @@ impl eframe::App for ZoidCraftApp {
             );
         }
 
+        self.show_unsaved_changes_modal(&ctx);
         self.show_status_overlays(&ctx);
         self.update_window_title(&ctx);
     }
@@ -1448,6 +1599,11 @@ fn fnv_mix_props(hash: &mut u64, props: &BTreeMap<String, SessionProperty>) {
         for kf in &p.keyframes {
             fnv_mix_f64(hash, kf.frame);
             fnv_mix(hash, &kf.tween.to_le_bytes());
+            fnv_mix_f64(hash, kf.control_points[0][0]);
+            fnv_mix_f64(hash, kf.control_points[0][1]);
+            fnv_mix_f64(hash, kf.control_points[1][0]);
+            fnv_mix_f64(hash, kf.control_points[1][1]);
+            fnv_mix(hash, &[u8::from(kf.continuous_tangent)]);
             fnv_mix_value(hash, &kf.value);
         }
     }
@@ -1632,9 +1788,58 @@ fn convert_export_settings(
     }
 }
 
+fn poll_export_job(
+    job: &ActiveExportJob,
+    status: &mut ExportStatus,
+) -> Option<Result<ExportReport, String>> {
+    let mut finished_result: Option<Result<ExportReport, String>> = None;
+    let mut disconnected = false;
+    loop {
+        match job.rx.try_recv() {
+            Ok(ExportWorkerEvent::Progress(p)) => {
+                let frac = if p.total_frames > 0 {
+                    (p.completed_frames as f32 / p.total_frames as f32).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                status.exporting = true;
+                status.progress = frac;
+                status.status_message = format!(
+                    "Rendering frame {} / {}",
+                    p.completed_frames, p.total_frames
+                );
+            }
+            Ok(ExportWorkerEvent::Finished(res)) => {
+                finished_result = Some(res);
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+    if finished_result.is_none() && disconnected {
+        finished_result = Some(Err("export worker terminated unexpectedly".to_owned()));
+    }
+    finished_result
+}
+
+fn collect_clip_audio_assets(project: &Project) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for at in &project.sequence.audio_tracks {
+        for ac in &at.clips {
+            if let Some(asset_id) = ac.media.as_deref() {
+                map.insert(ac.id.to_string(), asset_id.to_owned());
+            }
+        }
+    }
+    map
+}
+
 fn build_offline_export_audio(
     session: &Session,
-    buffers: &HashMap<String, AudioBuffer>,
+    cached_buffers: &HashMap<String, AudioBuffer>,
     settings: &CoreExportSettings,
     seq_fps: f64,
     start_seq_frame: u32,
@@ -1642,10 +1847,14 @@ fn build_offline_export_audio(
 ) -> Result<Option<Vec<[f32; 2]>>, String> {
     if settings.container == CoreExportContainer::PngSequence
         || settings.audio_codec == AudioCodec::None
-        || buffers.is_empty()
     {
         return Ok(None);
     }
+    let clip_assets = collect_clip_audio_assets(&session.project);
+    if clip_assets.is_empty() && cached_buffers.is_empty() {
+        return Ok(None);
+    }
+    let mut buffers = cached_buffers.clone();
     let doc = session.document();
     let any_solo = doc.audio_tracks.iter().any(|t| t.enabled && t.solo);
     let mut items = Vec::new();
@@ -1669,8 +1878,22 @@ fn build_offline_export_audio(
             {
                 continue;
             }
-            if !buffers.contains_key(&clip.id) {
+            let Some(asset_id) = clip_assets.get(&clip.id) else {
                 continue;
+            };
+            if !buffers.contains_key(asset_id) {
+                let Some(rec) = session.project.assets.get(asset_id) else {
+                    continue;
+                };
+                let Some(bytes) = rec.bytes.as_deref() else {
+                    continue;
+                };
+                let ext = Path::new(&rec.filename)
+                    .extension()
+                    .and_then(|e| e.to_str());
+                let decoded = decode_audio_bytes(bytes, ext)
+                    .map_err(|err| format!("failed to decode audio asset `{asset_id}`: {err}"))?;
+                buffers.insert(asset_id.clone(), decoded);
             }
             let rate =
                 effective_playback_rate(clip.time_start, clip.time_end, clip.length, seq_fps);
@@ -1683,7 +1906,7 @@ fn build_offline_export_audio(
                 playback_rate: rate,
                 volume,
                 pan,
-                buffer_id: clip.id.clone(),
+                buffer_id: asset_id.clone(),
             });
             clip_props.push(&clip.properties);
         }
@@ -1699,7 +1922,7 @@ fn build_offline_export_audio(
         seq_fps,
         sr,
         &items,
-        buffers,
+        &buffers,
         |clip_idx, clip, local_frame| {
             let props = clip_props[clip_idx];
             let media_time_sec =
@@ -1724,6 +1947,7 @@ fn sample_live_audio_meter(
     if buffers.is_empty() {
         return (0.0, 0.0);
     }
+    let clip_assets = collect_clip_audio_assets(&session.project);
     let doc = session.document();
     let any_solo = doc.audio_tracks.iter().any(|t| t.enabled && t.solo);
     let mut sum_sq = 0.0_f64;
@@ -1743,7 +1967,10 @@ fn sample_live_audio_meter(
             if frame < clip.start || frame >= clip.start + clip.length {
                 continue;
             }
-            let Some(buf) = buffers.get(&clip.id) else {
+            let Some(asset_id) = clip_assets.get(&clip.id) else {
+                continue;
+            };
+            let Some(buf) = buffers.get(asset_id) else {
                 continue;
             };
             let local_f = frame - clip.start;
@@ -1818,4 +2045,141 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(ZoidCraftApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_and_duplicated_audio_clips_resolve_shared_asset_audio() {
+        let mut session = Session::new();
+        let track_id = session
+            .execute(Command::AddAudioTrack {
+                name: Some("Audio 1".to_owned()),
+            })
+            .expect("add audio track")["track_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Synthesize a 1-second 440Hz sine WAV at 48kHz and embed as a project asset.
+        let sr = STANDARD_SAMPLE_RATE;
+        let samples: Vec<[f32; 2]> = (0..sr)
+            .map(|i| {
+                let s = (2.0 * std::f32::consts::PI * 440.0 * (i as f32) / (sr as f32)).sin() * 0.5;
+                [s, s]
+            })
+            .collect();
+        let wav_bytes = zc_audio::encode_wav_pcm16_stereo(&samples, sr);
+        let asset_id = session.project.insert_binary_asset(
+            AssetKind::Av,
+            "tone.wav".to_owned(),
+            wav_bytes.clone(),
+        );
+        let decoded = decode_audio_bytes(&wav_bytes, Some("wav")).expect("decode wav");
+        let mut cache = HashMap::new();
+        cache.insert(asset_id.clone(), decoded);
+
+        let clip_id = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "audio".to_owned(),
+                name: Some("tone.wav".to_owned()),
+                start: 0.0,
+                length: 30.0,
+            })
+            .expect("add audio clip")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session.project.sequence.audio_tracks[0].clips[0].media = Some(asset_id);
+
+        // Split at frame 15 -> right half gets a brand new clip_id; then duplicate right half.
+        let split_res = session
+            .execute(Command::SplitClip {
+                clip_id,
+                at_frame: 15.0,
+            })
+            .expect("split audio clip");
+        let right_id = split_res["right_clip_id"].as_str().unwrap().to_owned();
+        let dup_res = session
+            .execute(Command::DuplicateClip { clip_id: right_id })
+            .expect("duplicate right half");
+        let dup_id = dup_res["clip_id"].as_str().unwrap().to_owned();
+        // Move duplicate to frame 30..45 so all 3 clips occupy [0, 45).
+        let audio_track_id = session.document().audio_tracks[0].id.clone();
+        session
+            .execute(Command::MoveClip {
+                clip_id: dup_id,
+                target_track_id: Some(audio_track_id),
+                start: 30.0,
+            })
+            .expect("move duplicate audio clip");
+
+        let settings = CoreExportSettings {
+            width: 320,
+            height: 180,
+            fps: 30.0,
+            start_frame: 0,
+            end_frame: 45,
+            container: CoreExportContainer::Mp4,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Aac,
+            quality: QualityMode::Crf(23),
+            audio_bitrate_kbps: 128,
+            sample_rate: sr,
+            transparent_alpha: false,
+            output_path: PathBuf::from("out.mp4"),
+            ffmpeg_binary: None,
+        };
+
+        // Mix frames [15, 45) — covers ONLY the split right half and the duplicated clip!
+        let mixed = build_offline_export_audio(&session, &cache, &settings, 30.0, 15, 45)
+            .expect("audio mix succeeds")
+            .expect("split + duplicated clips must produce non-empty audio");
+        assert_eq!(mixed.len(), sr as usize);
+        let first_half_peak = mixed[..sr as usize / 2]
+            .iter()
+            .map(|p| p[0].abs())
+            .fold(0.0_f32, f32::max);
+        let second_half_peak = mixed[sr as usize / 2..]
+            .iter()
+            .map(|p| p[0].abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            first_half_peak > 0.1,
+            "split right half must not be silent (peak={first_half_peak})"
+        );
+        assert!(
+            second_half_peak > 0.1,
+            "duplicated clip must not be silent (peak={second_half_peak})"
+        );
+    }
+
+    #[test]
+    fn disconnected_export_worker_reports_error_and_unblocks_session() {
+        let (tx, rx) = mpsc::channel::<ExportWorkerEvent>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = thread::spawn(move || {
+            let _tx = tx;
+            // Simulate abrupt worker exit/panic without sending ExportWorkerEvent::Finished.
+        });
+        let _ = handle.join();
+
+        let job = ActiveExportJob {
+            cancel,
+            rx,
+            handle: None,
+        };
+        let mut status = ExportStatus {
+            exporting: true,
+            ..ExportStatus::default()
+        };
+        let res = poll_export_job(&job, &mut status);
+        assert!(
+            matches!(res, Some(Err(ref msg)) if msg.contains("terminated unexpectedly")),
+            "expected disconnected worker error, got {res:?}"
+        );
+    }
 }

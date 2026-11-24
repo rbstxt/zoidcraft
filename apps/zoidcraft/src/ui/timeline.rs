@@ -2251,7 +2251,9 @@ fn process_active_drag_state(
             } else if drag.moved
                 && (drag.preview_delta_frames.abs() > 1e-6 || drag.preview_track_delta != 0)
             {
-                // Commit single undo transaction with overlap clamping/rejection.
+                // Validate every target clip position against non-selected clips AND pairwise
+                // within the selected group, then commit atomically so moving adjacent selected
+                // clips never trims or deletes another clip in the selection.
                 let mut moves = Vec::new();
                 let mut all_valid = true;
                 {
@@ -2259,6 +2261,7 @@ fn process_active_drag_state(
                         TrackKind::Video => &session.document().video_tracks,
                         TrackKind::Audio => &session.document().audio_tracks,
                     };
+                    let mut placed_on_track: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
                     for c in &drag.clips {
                         let dest_ti = (c.orig_track_index as isize + drag.preview_track_delta)
                             .clamp(0, tracks_slice.len().saturating_sub(1) as isize)
@@ -2275,6 +2278,16 @@ fn process_active_drag_state(
                             c.length,
                             &exclude,
                         ) {
+                            let valid_end = valid_start + c.length;
+                            let entry = placed_on_track.entry(dest_track.id.clone()).or_default();
+                            if entry
+                                .iter()
+                                .any(|&(s, e)| valid_start < e - 1e-6 && s < valid_end - 1e-6)
+                            {
+                                all_valid = false;
+                                break;
+                            }
+                            entry.push((valid_start, valid_end));
                             moves.push((c.clip_id.clone(), dest_track.id.clone(), valid_start));
                         } else {
                             all_valid = false;
@@ -2282,25 +2295,8 @@ fn process_active_drag_state(
                         }
                     }
                 }
-                if all_valid && !moves.is_empty() && session.begin_transaction("Move Clips").is_ok()
-                {
-                    let mut any_ok = false;
-                    for (clip_id, dest_track_id, start) in moves {
-                        if session
-                            .execute(Command::MoveClip {
-                                clip_id,
-                                target_track_id: Some(dest_track_id),
-                                start,
-                            })
-                            .is_ok()
-                        {
-                            any_ok = true;
-                        }
-                    }
-                    let _ = session.commit_transaction(any_ok);
-                    if any_ok {
-                        action.clips_modified = true;
-                    }
+                if all_valid && !moves.is_empty() && session.move_clips_atomic(&moves).is_ok() {
+                    action.clips_modified = true;
                 }
             }
         }

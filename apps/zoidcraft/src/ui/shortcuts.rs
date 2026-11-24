@@ -84,7 +84,7 @@ pub fn dispatch_shortcuts(
     // --- Escape: cancel active drag / rename or request closing focused overlay ---
     if pressed.escape && no_mods(modifiers) {
         let cancelled = timeline.cancel_active_interaction(session)
-            || graph_editor.cancel_active_interaction()
+            || graph_editor.cancel_active_interaction(session)
             || viewport.cancel_active_interaction(session);
         if !cancelled && graph_editor.open {
             graph_editor.open = false;

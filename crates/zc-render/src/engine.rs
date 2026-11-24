@@ -3157,12 +3157,14 @@ fn eval_track_keyframes_only(track: &PropertyTrack, frame: f64) -> PropertyValue
         return k0.value.clone();
     }
 
-    let tween_code = if k0.tween != 0 {
-        k0.tween as u16
-    } else if k0.is_bezier {
-        (1u16 << 8) | u16::from(k0.easing_index.max(1))
+    // Spec 02 §1.5 & zc-anim parity: incoming segment `[k0, k1]` is controlled by `k1`'s tween,
+    // using `k0.control_points[1]` (`out_tangent`) and `k1.control_points[0]` (`in_tangent`).
+    let tween_code = if k1.tween != 0 {
+        k1.tween as u16
+    } else if k1.is_bezier {
+        (1u16 << 8) | u16::from(k1.easing_index.max(1))
     } else {
-        u16::from(k0.easing_index)
+        u16::from(k1.easing_index)
     };
     let (mode, easing) = InterpolationMode::from_cm3_tween_code(tween_code);
     if mode == InterpolationMode::Discrete {
@@ -4363,5 +4365,52 @@ mod tests {
         let _ = engine
             .render_frame_rgba8(&deep_proj, &plugins, 0.0, 16, 16)
             .expect("deep Composite + EffectGroup must respect recursion caps");
+    }
+
+    #[test]
+    fn bezier_keyframe_segment_evaluates_persisted_control_points() {
+        let project = Project::new_cm3_default();
+        let plugins = PluginRegistry::new();
+        let controls = BTreeMap::new();
+        let parent_props = BTreeMap::new();
+        let bezier_tween = (1u32 << 8) | 1;
+        let track = PropertyTrack {
+            animated: true,
+            expression: None,
+            static_behavior: ProjectStaticBehavior::Constant,
+            value: PropertyValue::Number(0.0),
+            keyframes: vec![
+                PropertyKeyframe::from_cm3_tween(
+                    0.0,
+                    PropertyValue::Number(0.0),
+                    1,
+                    [[-5.0, 0.0], [1.0, 1.0]],
+                    false,
+                ),
+                PropertyKeyframe::from_cm3_tween(
+                    30.0,
+                    PropertyValue::Number(1.0),
+                    bezier_tween,
+                    [[-1.0, 0.0], [5.0, 0.0]],
+                    false,
+                ),
+            ],
+            channels: Vec::new(),
+        };
+        let env = EvalEnv {
+            frame: 15.0,
+            time: 0.5,
+            fps: 30.0,
+            project: &project,
+            plugins: &plugins,
+            controls: &controls,
+            parent_props: &parent_props,
+        };
+        let val = eval_f64(&track, &env);
+        // With aggressive ease-out handles (out=[1,1], in=[-1,0]), midpoint value is far above linear 0.5.
+        assert!(
+            val > 0.75,
+            "expected Bezier segment to evaluate persisted control points (>0.75), got {val}"
+        );
     }
 }

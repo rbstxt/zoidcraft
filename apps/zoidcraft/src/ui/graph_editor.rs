@@ -218,12 +218,17 @@ impl GraphEditorState {
     }
 
     /// Cancels any active drag or open popup. Returns `true` if something was cancelled.
-    pub fn cancel_active_interaction(&mut self) -> bool {
+    pub fn cancel_active_interaction(&mut self, session: &mut Session) -> bool {
         if self.show_all_easings_popup {
             self.show_all_easings_popup = false;
             return true;
         }
         if !matches!(self.drag_state, GraphDragState::None) {
+            if matches!(self.drag_state, GraphDragState::DraggingHandle { .. })
+                && session.history.is_in_transaction()
+            {
+                let _ = session.cancel_transaction();
+            }
             self.drag_state = GraphDragState::None;
             self.snap_guide_frame = None;
             return true;
@@ -306,6 +311,8 @@ pub struct CurveKeyframe {
     pub value: f64,
     pub full_value: Value,
     pub tween: u16,
+    pub control_points: [[f64; 2]; 2],
+    pub continuous_tangent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -536,6 +543,8 @@ fn expand_single_property(
                         value: v,
                         full_value: k.value.clone(),
                         tween: k.tween,
+                        control_points: k.control_points,
+                        continuous_tangent: k.continuous_tangent,
                     })
                 })
                 .collect();
@@ -573,6 +582,8 @@ fn expand_single_property(
                                 value: v,
                                 full_value: k.value.clone(),
                                 tween: k.tween,
+                                control_points: k.control_points,
+                                continuous_tangent: k.continuous_tangent,
                             })
                     })
                     .collect();
@@ -647,6 +658,9 @@ pub fn show_graph_editor_panel(
     let graph_plus = session.plugins.is_enabled("graph-plus");
     let easing_plus = session.plugins.is_enabled("easing-plus");
     let tracks = collect_curve_tracks(session, state);
+    if !matches!(state.drag_state, GraphDragState::DraggingHandle { .. }) {
+        sync_handles_from_tracks(&mut state.handles, &tracks);
+    }
 
     let full_rect = ui.available_rect_before_wrap();
     ui.painter()
@@ -668,10 +682,10 @@ pub fn show_graph_editor_panel(
             toggle_bezier_on_selected(session, state, &tracks, &mut action);
         }
         if toolbar_chip(ui, "Link/Break", false, palette) {
-            toggle_continuous_on_selected(state);
+            toggle_continuous_on_selected(session, state, &mut action);
         }
         if toolbar_chip(ui, "Flat", false, palette) {
-            reset_handles_on_selected(state);
+            reset_handles_on_selected(session, state, &mut action);
         }
         ui.separator();
         if toolbar_chip(ui, "Fit (F)", false, palette) {
@@ -1101,6 +1115,7 @@ fn show_curve_canvas(
         if let Some((key_id, is_out, prev_f, next_f, abs_f, val)) =
             hit_test_bezier_handle(state, tracks, rect, pos)
         {
+            let _ = session.begin_transaction("Edit Bezier Handles");
             state.drag_state = GraphDragState::DraggingHandle {
                 key: key_id,
                 is_out,
@@ -1286,6 +1301,8 @@ fn paint_curve_track(
                 value: k.value + if sel { drag_dv } else { 0.0 },
                 full_value: k.full_value.clone(),
                 tween: k.tween,
+                control_points: k.control_points,
+                continuous_tangent: k.continuous_tangent,
             }
         })
         .collect();
@@ -1691,22 +1708,41 @@ fn process_graph_drag(
                     raw_dx.clamp(min_dx, 0.0)
                 };
 
-                let entry = state.handles.entry(key.clone()).or_default();
-                if modifiers.alt {
-                    entry.continuous = false;
-                }
-                if is_out {
-                    entry.out_tangent = [clamped_dx, raw_dy];
-                    if entry.continuous {
-                        let min_in = -(key.local_frame() - prev_local_frame).max(0.0);
-                        entry.in_tangent = [(-clamped_dx).clamp(min_in, 0.0), -raw_dy];
+                let updated_pair = {
+                    let entry = state.handles.entry(key.clone()).or_default();
+                    if modifiers.alt {
+                        entry.continuous = false;
                     }
-                } else {
-                    entry.in_tangent = [clamped_dx, raw_dy];
-                    if entry.continuous {
-                        let max_out = (next_local_frame - key.local_frame()).max(0.0);
-                        entry.out_tangent = [(-clamped_dx).clamp(0.0, max_out), -raw_dy];
+                    if is_out {
+                        entry.out_tangent = [clamped_dx, raw_dy];
+                        if entry.continuous {
+                            let min_in = -(key.local_frame() - prev_local_frame).max(0.0);
+                            entry.in_tangent = [(-clamped_dx).clamp(min_in, 0.0), -raw_dy];
+                        }
+                    } else {
+                        entry.in_tangent = [clamped_dx, raw_dy];
+                        if entry.continuous {
+                            let max_out = (next_local_frame - key.local_frame()).max(0.0);
+                            entry.out_tangent = [(-clamped_dx).clamp(0.0, max_out), -raw_dy];
+                        }
                     }
+                    *entry
+                };
+
+                // Persist tangent handles directly to Session / Project so rendering,
+                // export, undo/redo, and save/reload immediately reflect the edited curve.
+                if session
+                    .set_keyframe_bezier_handles(
+                        &key.target_id,
+                        &key.property,
+                        key.local_frame(),
+                        [updated_pair.in_tangent, updated_pair.out_tangent],
+                        updated_pair.continuous,
+                        None,
+                    )
+                    .is_ok()
+                {
+                    action.curves_modified = true;
                 }
 
                 // Auto-enable Bezier interpolation bit on the segment if not yet Bezier.
@@ -1723,6 +1759,8 @@ fn process_graph_drag(
                     key_abs_frame,
                     key_value,
                 };
+            } else if session.history.is_in_transaction() {
+                let _ = session.commit_transaction(true);
             }
         }
         GraphDragState::Marquee {
@@ -2135,18 +2173,98 @@ fn toggle_bezier_on_selected(
     }
 }
 
-fn toggle_continuous_on_selected(state: &mut GraphEditorState) {
-    for kid in &state.selected_keys {
-        let entry = state.handles.entry(kid.clone()).or_default();
-        entry.continuous = !entry.continuous;
+fn sync_handles_from_tracks(
+    handles: &mut BTreeMap<GraphKeyId, BezierHandlePair>,
+    tracks: &[CurveTrack],
+) {
+    for track in tracks {
+        for kf in &track.keyframes {
+            let kid = GraphKeyId::new(
+                &track.target_id,
+                &track.property,
+                track.channel_index,
+                kf.local_frame,
+            );
+            handles.insert(
+                kid,
+                BezierHandlePair {
+                    in_tangent: kf.control_points[0],
+                    out_tangent: kf.control_points[1],
+                    continuous: kf.continuous_tangent,
+                },
+            );
+        }
     }
 }
 
-fn reset_handles_on_selected(state: &mut GraphEditorState) {
-    for kid in &state.selected_keys {
-        state
-            .handles
-            .insert(kid.clone(), BezierHandlePair::default());
+fn toggle_continuous_on_selected(
+    session: &mut Session,
+    state: &mut GraphEditorState,
+    action: &mut GraphEditorAction,
+) {
+    if state.selected_keys.is_empty() {
+        return;
+    }
+    if session
+        .begin_transaction("Toggle Tangent Continuity")
+        .is_ok()
+    {
+        let mut changed = false;
+        for kid in &state.selected_keys {
+            let entry = state.handles.entry(kid.clone()).or_default();
+            entry.continuous = !entry.continuous;
+            if session
+                .set_keyframe_bezier_handles(
+                    &kid.target_id,
+                    &kid.property,
+                    kid.local_frame(),
+                    [entry.in_tangent, entry.out_tangent],
+                    entry.continuous,
+                    None,
+                )
+                .is_ok()
+            {
+                changed = true;
+            }
+        }
+        let _ = session.commit_transaction(changed);
+        if changed {
+            action.curves_modified = true;
+        }
+    }
+}
+
+fn reset_handles_on_selected(
+    session: &mut Session,
+    state: &mut GraphEditorState,
+    action: &mut GraphEditorAction,
+) {
+    if state.selected_keys.is_empty() {
+        return;
+    }
+    if session.begin_transaction("Flatten Bezier Handles").is_ok() {
+        let mut changed = false;
+        let flat = BezierHandlePair::default();
+        for kid in &state.selected_keys {
+            state.handles.insert(kid.clone(), flat);
+            if session
+                .set_keyframe_bezier_handles(
+                    &kid.target_id,
+                    &kid.property,
+                    kid.local_frame(),
+                    [flat.in_tangent, flat.out_tangent],
+                    flat.continuous,
+                    None,
+                )
+                .is_ok()
+            {
+                changed = true;
+            }
+        }
+        let _ = session.commit_transaction(changed);
+        if changed {
+            action.curves_modified = true;
+        }
     }
 }
 
@@ -2187,20 +2305,50 @@ fn apply_easing_plus_curve_to_selection(
                 track.channel_index,
                 k0.local_frame,
             );
-            state.handles.entry(id0).or_default().out_tangent = out_h;
-            state.handles.entry(kid.clone()).or_default().in_tangent = in_h;
+            let h0 = {
+                let e = state.handles.entry(id0).or_insert(BezierHandlePair {
+                    in_tangent: k0.control_points[0],
+                    out_tangent: k0.control_points[1],
+                    continuous: k0.continuous_tangent,
+                });
+                e.out_tangent = out_h;
+                *e
+            };
+            let h1 = {
+                let e = state
+                    .handles
+                    .entry(kid.clone())
+                    .or_insert(BezierHandlePair {
+                        in_tangent: k1.control_points[0],
+                        out_tangent: k1.control_points[1],
+                        continuous: k1.continuous_tangent,
+                    });
+                e.in_tangent = in_h;
+                *e
+            };
 
             let bezier_tween = InterpolationMode::Bezier.to_cm3_tween_code(EasingKind::Linear);
-            if session
-                .execute(Command::SetKeyframe {
-                    target_id: track.target_id.clone(),
-                    property: track.property.clone(),
-                    frame: k1.local_frame,
-                    value: k1.full_value.clone(),
-                    tween: Some(bezier_tween),
-                })
-                .is_ok()
-            {
+            let ok0 = session
+                .set_keyframe_bezier_handles(
+                    &track.target_id,
+                    &track.property,
+                    k0.local_frame,
+                    [h0.in_tangent, h0.out_tangent],
+                    h0.continuous,
+                    None,
+                )
+                .is_ok();
+            let ok1 = session
+                .set_keyframe_bezier_handles(
+                    &track.target_id,
+                    &track.property,
+                    k1.local_frame,
+                    [h1.in_tangent, h1.out_tangent],
+                    h1.continuous,
+                    Some(bezier_tween),
+                )
+                .is_ok();
+            if ok0 || ok1 {
                 changed = true;
             }
         }

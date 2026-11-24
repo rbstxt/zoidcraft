@@ -1323,6 +1323,240 @@ impl Session {
         Ok(())
     }
 
+    /// Atomically moves a group of clips to `(clip_id, target_track_id, start)` in a single
+    /// validated step so moving adjacent selected clips never trims or deletes another clip in
+    /// the selection.
+    pub fn move_clips_atomic(
+        &mut self,
+        moves: &[(String, String, f64)],
+    ) -> Result<(), SessionError> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+
+        struct ValidatedMove {
+            clip_id: String,
+            kind: TrackKind,
+            dest_track_idx: usize,
+            start: f64,
+            length: f64,
+        }
+
+        let mut seen_ids = BTreeSet::new();
+        let mut validated = Vec::with_capacity(moves.len());
+
+        for (clip_id, dest_track_id, start) in moves {
+            if !start.is_finite() || *start < 0.0 {
+                return Err(SessionError::InvalidArgument(
+                    "clip start must be finite and >= 0".to_string(),
+                ));
+            }
+            if !seen_ids.insert(clip_id.clone()) {
+                return Err(SessionError::InvalidArgument(format!(
+                    "duplicate clip '{clip_id}' in group move"
+                )));
+            }
+            let (src_kind, src_track_idx, src_clip_idx) = self
+                .document
+                .find_clip_location(clip_id)
+                .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
+            let (src_locked, src_track_id, clip_len) = match src_kind {
+                TrackKind::Video => {
+                    let t = &self.document.video_tracks[src_track_idx];
+                    (t.locked, t.id.clone(), t.clips[src_clip_idx].length)
+                }
+                TrackKind::Audio => {
+                    let t = &self.document.audio_tracks[src_track_idx];
+                    (t.locked, t.id.clone(), t.clips[src_clip_idx].length)
+                }
+            };
+            if src_locked {
+                return Err(SessionError::TrackLocked(src_track_id));
+            }
+            let (dest_kind, dest_track_idx) = if let Some(idx) = self
+                .document
+                .video_tracks
+                .iter()
+                .position(|t| t.id == *dest_track_id)
+            {
+                if self.document.video_tracks[idx].locked {
+                    return Err(SessionError::TrackLocked(dest_track_id.clone()));
+                }
+                (TrackKind::Video, idx)
+            } else if let Some(idx) = self
+                .document
+                .audio_tracks
+                .iter()
+                .position(|t| t.id == *dest_track_id)
+            {
+                if self.document.audio_tracks[idx].locked {
+                    return Err(SessionError::TrackLocked(dest_track_id.clone()));
+                }
+                (TrackKind::Audio, idx)
+            } else {
+                return Err(SessionError::NotFound(format!("track '{dest_track_id}'")));
+            };
+            if dest_kind != src_kind {
+                return Err(SessionError::InvalidOperation(
+                    "cannot move a clip across video and audio track domains".to_string(),
+                ));
+            }
+
+            validated.push(ValidatedMove {
+                clip_id: clip_id.clone(),
+                kind: dest_kind,
+                dest_track_idx,
+                start: *start,
+                length: clip_len,
+            });
+        }
+
+        // Reject any pairwise overlap among the moved clips landing on the same destination track.
+        for i in 0..validated.len() {
+            for j in (i + 1)..validated.len() {
+                let a = &validated[i];
+                let b = &validated[j];
+                if a.kind == b.kind && a.dest_track_idx == b.dest_track_idx {
+                    let a_end = a.start + a.length;
+                    let b_end = b.start + b.length;
+                    if a.start < b_end - 1e-6 && b.start < a_end - 1e-6 {
+                        return Err(SessionError::InvalidOperation(
+                            "selected clips overlap at target positions".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let before = if !self.history.is_in_transaction() {
+            Some(self.capture_history_snapshot())
+        } else {
+            None
+        };
+
+        // Remove all moved clips from their source tracks before reinserting any of them.
+        let mut extracted: Vec<(ValidatedMove, SessionClip)> = Vec::with_capacity(validated.len());
+        for m in validated {
+            let (src_kind, src_track_idx, src_clip_idx) = self
+                .document
+                .find_clip_location(&m.clip_id)
+                .ok_or_else(|| SessionError::NotFound(format!("clip '{}'", m.clip_id)))?;
+            let mut clip = match src_kind {
+                TrackKind::Video => self.document.video_tracks[src_track_idx]
+                    .clips
+                    .remove(src_clip_idx),
+                TrackKind::Audio => self.document.audio_tracks[src_track_idx]
+                    .clips
+                    .remove(src_clip_idx),
+            };
+            clip.start = m.start;
+            extracted.push((m, clip));
+        }
+
+        let mut affected_tracks: BTreeMap<(u8, usize), BTreeSet<String>> = BTreeMap::new();
+        for (m, clip) in extracted {
+            let kind_tag = match m.kind {
+                TrackKind::Video => {
+                    self.document.video_tracks[m.dest_track_idx]
+                        .clips
+                        .push(clip);
+                    0_u8
+                }
+                TrackKind::Audio => {
+                    self.document.audio_tracks[m.dest_track_idx]
+                        .clips
+                        .push(clip);
+                    1_u8
+                }
+            };
+            affected_tracks
+                .entry((kind_tag, m.dest_track_idx))
+                .or_default()
+                .insert(m.clip_id);
+        }
+
+        for ((kind_tag, track_idx), moved_ids) in affected_tracks {
+            let kind = if kind_tag == 0 {
+                TrackKind::Video
+            } else {
+                TrackKind::Audio
+            };
+            self.resolve_track_overlaps_for_group(kind, track_idx, &moved_ids);
+        }
+
+        self.document.recompute_sequence_length_if_extended();
+        self.sync_document_to_project();
+        self.playback.bump_epoch();
+        if let Some(before_snap) = before {
+            self.history.push("Move Clips", before_snap);
+        }
+        Ok(())
+    }
+
+    /// Persists Bezier tangent handles (`[in_tangent, out_tangent]`), continuity flag, and
+    /// optional CM3 tween code onto an existing keyframe, syncing directly to `self.project`.
+    pub fn set_keyframe_bezier_handles(
+        &mut self,
+        target_id: &str,
+        property: &str,
+        frame: f64,
+        control_points: [[f64; 2]; 2],
+        continuous_tangent: bool,
+        tween: Option<u16>,
+    ) -> Result<(), SessionError> {
+        if !frame.is_finite() || !control_points.iter().flatten().all(|v| v.is_finite()) {
+            return Err(SessionError::InvalidArgument(
+                "keyframe frame and Bezier control points must be finite".to_string(),
+            ));
+        }
+
+        // Verify target/property/keyframe exist before capturing undo snapshot.
+        {
+            let props = self.document.find_property_map_mut(target_id)?;
+            let entry = props.get(property).ok_or_else(|| {
+                SessionError::NotFound(format!("property '{property}' on target '{target_id}'"))
+            })?;
+            if !entry
+                .keyframes
+                .iter()
+                .any(|kf| (kf.frame - frame).abs() < 1e-6)
+            {
+                return Err(SessionError::NotFound(format!(
+                    "keyframe at frame {frame} on '{target_id}.{property}'"
+                )));
+            }
+        }
+
+        let before = if !self.history.is_in_transaction() {
+            Some(self.capture_history_snapshot())
+        } else {
+            None
+        };
+
+        let props = self.document.find_property_map_mut(target_id)?;
+        let entry = props.get_mut(property).ok_or_else(|| {
+            SessionError::NotFound(format!("property '{property}' on target '{target_id}'"))
+        })?;
+        if let Some(kf) = entry
+            .keyframes
+            .iter_mut()
+            .find(|kf| (kf.frame - frame).abs() < 1e-6)
+        {
+            kf.control_points = control_points;
+            kf.continuous_tangent = continuous_tangent;
+            if let Some(t) = tween {
+                kf.tween = t;
+            }
+        }
+
+        self.sync_document_to_project();
+        self.playback.bump_epoch();
+        if let Some(before_snap) = before {
+            self.history.push("Edit Bezier Handles", before_snap);
+        }
+        Ok(())
+    }
+
     /// Collects all plugin IDs currently referenced by the active project/session document.
     #[must_use]
     pub fn active_plugin_dependencies(&self) -> BTreeSet<String> {
@@ -1582,18 +1816,21 @@ impl Session {
     /// removes engulfed neighbors, and left-trims partially overlapped right neighbors
     /// (updating both keyframes and non-animated media-time endpoints).
     fn resolve_track_overlaps(&mut self, kind: TrackKind, track_idx: usize, placed_clip_id: &str) {
-        let fps = self.document.fps.max(1.0);
+        let mut group = BTreeSet::new();
+        group.insert(placed_clip_id.to_string());
+        self.resolve_track_overlaps_for_group(kind, track_idx, &group);
+    }
 
-        let (placed_start, placed_end) = {
-            let track = match kind {
-                TrackKind::Video => &self.document.video_tracks[track_idx],
-                TrackKind::Audio => &self.document.audio_tracks[track_idx],
-            };
-            let Some(placed) = track.clips.iter().find(|c| c.id == placed_clip_id) else {
-                return;
-            };
-            (placed.start, placed.start + placed.length)
-        };
+    /// Enforces strict non-overlap on `track` around a set of atomically placed `placed_ids`,
+    /// preserving every clip in `placed_ids` intact while trimming/splitting/removing only
+    /// non-group neighbors that overlap any placed clip's interval.
+    fn resolve_track_overlaps_for_group(
+        &mut self,
+        kind: TrackKind,
+        track_idx: usize,
+        placed_ids: &BTreeSet<String>,
+    ) {
+        let fps = self.document.fps.max(1.0);
 
         let existing_clips = {
             let track = match kind {
@@ -1603,95 +1840,115 @@ impl Session {
             std::mem::take(&mut track.clips)
         };
 
-        let mut kept: Vec<SessionClip> = Vec::with_capacity(existing_clips.len() + 1);
+        let mut placed_clips: Vec<SessionClip> = Vec::new();
+        let mut candidates: Vec<SessionClip> = Vec::new();
+        for clip in existing_clips {
+            if placed_ids.contains(&clip.id) {
+                placed_clips.push(clip);
+            } else {
+                candidates.push(clip);
+            }
+        }
+        if placed_clips.is_empty() {
+            candidates.sort_by(|a, b| a.start.total_cmp(&b.start));
+            match kind {
+                TrackKind::Video => self.document.video_tracks[track_idx].clips = candidates,
+                TrackKind::Audio => self.document.audio_tracks[track_idx].clips = candidates,
+            }
+            return;
+        }
+        placed_clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+
         let mut removed_for_selection: Vec<SessionClip> = Vec::new();
+        for placed in &placed_clips {
+            let placed_start = placed.start;
+            let placed_end = placed.start + placed.length;
+            let mut next_candidates: Vec<SessionClip> = Vec::with_capacity(candidates.len() + 1);
 
-        for mut other in existing_clips {
-            if other.id == placed_clip_id {
-                kept.push(other);
-                continue;
-            }
-            let other_start = other.start;
-            let other_end = other.start + other.length;
+            for mut other in candidates {
+                let other_start = other.start;
+                let other_end = other.start + other.length;
 
-            // Completely disjoint: no overlap.
-            if other_end <= placed_start || other_start >= placed_end {
-                kept.push(other);
-                continue;
-            }
-
-            // Completely engulfed by placed clip.
-            if other_start >= placed_start && other_end <= placed_end {
-                removed_for_selection.push(other);
-                continue;
-            }
-
-            // Straddle split: other starts strictly before placed_start and ends strictly after placed_end.
-            if other_start < placed_start && other_end > placed_end {
-                let mut right_rem = other.clone();
-                let right_id = self.alloc_uuid_id();
-                right_rem.source_clip_id = Some(other.id.clone());
-                right_rem.id = right_id;
-                let cut_right = placed_end - other_start;
-                right_rem.start = placed_end;
-                right_rem.length = other_end - placed_end;
-                right_rem.shift_all_keyframes(-cut_right);
-                if !right_rem.time_animated {
-                    right_rem.time_start = other.eval_time_at(cut_right);
-                    right_rem.sync_time_property();
+                // Completely disjoint: no overlap.
+                if other_end <= placed_start || other_start >= placed_end {
+                    next_candidates.push(other);
+                    continue;
                 }
-                self.remap_cloned_clip_children(&mut right_rem);
 
-                let new_left_len = placed_start - other_start;
-                if !other.time_animated {
-                    other.time_end = other.eval_time_at(new_left_len);
+                // Completely engulfed by placed clip.
+                if other_start >= placed_start && other_end <= placed_end {
+                    removed_for_selection.push(other);
+                    continue;
                 }
-                other.length = new_left_len;
-                other.sync_time_property();
 
-                kept.push(other);
-                kept.push(right_rem);
-                continue;
-            }
+                // Straddle split: other starts strictly before placed_start and ends strictly after placed_end.
+                if other_start < placed_start && other_end > placed_end {
+                    let mut right_rem = other.clone();
+                    let right_id = self.alloc_uuid_id();
+                    right_rem.source_clip_id = Some(other.id.clone());
+                    right_rem.id = right_id;
+                    let cut_right = placed_end - other_start;
+                    right_rem.start = placed_end;
+                    right_rem.length = other_end - placed_end;
+                    right_rem.shift_all_keyframes(-cut_right);
+                    if !right_rem.time_animated {
+                        right_rem.time_start = other.eval_time_at(cut_right);
+                        right_rem.sync_time_property();
+                    }
+                    self.remap_cloned_clip_children(&mut right_rem);
 
-            // Left neighbor partially overlapped on its right edge.
-            if other_start < placed_start {
-                let new_len = placed_start - other_start;
+                    let new_left_len = placed_start - other_start;
+                    if !other.time_animated {
+                        other.time_end = other.eval_time_at(new_left_len);
+                    }
+                    other.length = new_left_len;
+                    other.sync_time_property();
+
+                    next_candidates.push(other);
+                    next_candidates.push(right_rem);
+                    continue;
+                }
+
+                // Left neighbor partially overlapped on its right edge.
+                if other_start < placed_start {
+                    let new_len = placed_start - other_start;
+                    if new_len < 1e-6 {
+                        removed_for_selection.push(other);
+                    } else {
+                        if !other.time_animated {
+                            other.time_end = other.eval_time_at(new_len);
+                        }
+                        other.length = new_len;
+                        other.sync_time_property();
+                        next_candidates.push(other);
+                    }
+                    continue;
+                }
+
+                // Right neighbor partially overlapped on its left edge.
+                let cut = placed_end - other_start;
+                let new_len = other_end - placed_end;
                 if new_len < 1e-6 {
                     removed_for_selection.push(other);
                 } else {
                     if !other.time_animated {
-                        other.time_end = other.eval_time_at(new_len);
+                        other.time_start += cut / fps;
                     }
+                    other.start = placed_end;
                     other.length = new_len;
+                    other.shift_all_keyframes(-cut);
                     other.sync_time_property();
-                    kept.push(other);
+                    next_candidates.push(other);
                 }
-                continue;
             }
-
-            // Right neighbor partially overlapped on its left edge (other_start >= placed_start && other_end > placed_end).
-            // Spec 02 §2.5 Step B.2: advance non-animated `timeStart` by `(placed_end - other.start) / fps`.
-            let cut = placed_end - other_start;
-            let new_len = other_end - placed_end;
-            if new_len < 1e-6 {
-                removed_for_selection.push(other);
-            } else {
-                if !other.time_animated {
-                    other.time_start += cut / fps;
-                }
-                other.start = placed_end;
-                other.length = new_len;
-                other.shift_all_keyframes(-cut);
-                other.sync_time_property();
-                kept.push(other);
-            }
+            candidates = next_candidates;
         }
 
-        kept.sort_by(|a, b| a.start.total_cmp(&b.start));
+        candidates.extend(placed_clips);
+        candidates.sort_by(|a, b| a.start.total_cmp(&b.start));
         match kind {
-            TrackKind::Video => self.document.video_tracks[track_idx].clips = kept,
-            TrackKind::Audio => self.document.audio_tracks[track_idx].clips = kept,
+            TrackKind::Video => self.document.video_tracks[track_idx].clips = candidates,
+            TrackKind::Audio => self.document.audio_tracks[track_idx].clips = candidates,
         }
         for removed in &removed_for_selection {
             self.prune_clip_selection(removed);
@@ -4093,5 +4350,127 @@ mod tests {
         );
         assert_eq!(shifted_kf.control_points, custom_handles);
         assert!(!shifted_kf.continuous_tangent);
+    }
+
+    #[test]
+    fn move_clips_atomic_preserves_adjacent_clips_without_trimming() {
+        let mut session = Session::new();
+        let track_id = session.document().video_tracks[0].id.clone();
+        // Replace default clip with two adjacent clips: [0, 10) and [10, 20).
+        let default_clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        session
+            .execute(Command::DeleteClip {
+                clip_id: default_clip_id,
+            })
+            .expect("delete default clip");
+        let c1 = session
+            .execute(Command::AddClip {
+                track_id: track_id.clone(),
+                kind: "scene".to_string(),
+                name: Some("Clip A".to_string()),
+                start: 0.0,
+                length: 10.0,
+            })
+            .expect("add clip A")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let c2 = session
+            .execute(Command::AddClip {
+                track_id: track_id.clone(),
+                kind: "scene".to_string(),
+                name: Some("Clip B".to_string()),
+                start: 10.0,
+                length: 10.0,
+            })
+            .expect("add clip B")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Moving both right by +5 frames must produce exact [5, 15) and [15, 25) with zero trimming.
+        session
+            .move_clips_atomic(&[
+                (c1.clone(), track_id.clone(), 5.0),
+                (c2.clone(), track_id.clone(), 15.0),
+            ])
+            .expect("atomic group move");
+        let clips = &session.document().video_tracks[0].clips;
+        assert_eq!(clips.len(), 2);
+        assert!((clips[0].start - 5.0).abs() < 1e-9);
+        assert!((clips[0].length - 10.0).abs() < 1e-9);
+        assert!((clips[1].start - 15.0).abs() < 1e-9);
+        assert!((clips[1].length - 10.0).abs() < 1e-9);
+
+        // Overlapping targets inside the selected group must be rejected atomically without mutating state.
+        let err = session.move_clips_atomic(&[
+            (c1.clone(), track_id.clone(), 10.0),
+            (c2.clone(), track_id.clone(), 15.0),
+        ]);
+        assert!(err.is_err());
+        let clips_after_err = &session.document().video_tracks[0].clips;
+        assert!((clips_after_err[0].start - 5.0).abs() < 1e-9);
+        assert!((clips_after_err[1].start - 15.0).abs() < 1e-9);
+
+        // Single Undo restores [0, 10) and [10, 20).
+        session.execute(Command::Undo).expect("undo group move");
+        let clips_undone = &session.document().video_tracks[0].clips;
+        assert!((clips_undone[0].start - 0.0).abs() < 1e-9);
+        assert!((clips_undone[1].start - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_keyframe_bezier_handles_persists_to_project_and_undoes_cleanly() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: "opacity".to_string(),
+                frame: 0.0,
+                value: json!(0.0),
+                tween: Some(1),
+            })
+            .expect("kf0");
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: "opacity".to_string(),
+                frame: 30.0,
+                value: json!(1.0),
+                tween: Some(1),
+            })
+            .expect("kf1");
+
+        let handles_0 = [[-5.0, 0.0], [2.0, 0.9]];
+        let handles_1 = [[-2.0, -0.1], [5.0, 0.0]];
+        let bezier_tween = (1u16 << 8) | 1;
+        session
+            .set_keyframe_bezier_handles(&clip_id, "opacity", 0.0, handles_0, false, None)
+            .expect("set kf0 handles");
+        session
+            .set_keyframe_bezier_handles(
+                &clip_id,
+                "opacity",
+                30.0,
+                handles_1,
+                false,
+                Some(bezier_tween),
+            )
+            .expect("set kf1 handles");
+
+        let proj_track = &session.project.sequence.video_tracks[0].clips[0]
+            .layer
+            .opacity;
+        assert_eq!(proj_track.keyframes[0].control_points, handles_0);
+        assert!(!proj_track.keyframes[0].continuous_tangent);
+        assert_eq!(proj_track.keyframes[1].control_points, handles_1);
+        assert!(proj_track.keyframes[1].is_bezier);
+
+        session.execute(Command::Undo).expect("undo kf1 handles");
+        let proj_track_after = &session.project.sequence.video_tracks[0].clips[0]
+            .layer
+            .opacity;
+        assert!(!proj_track_after.keyframes[1].is_bezier);
     }
 }
