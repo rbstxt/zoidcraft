@@ -4112,6 +4112,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "rfd",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "wgpu",
@@ -4119,12 +4120,14 @@ dependencies = [
  "zc-audio",
  "zc-color",
  "zc-export",
+ "zc-expr",
  "zc-geom",
  "zc-plugin",
  "zc-project",
  "zc-render",
  "zc-scene",
  "zc-session",
+ "zc-shader",
  "zc-time",
 ]
 
