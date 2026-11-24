@@ -678,57 +678,68 @@ fn render_callback_frames<T, F>(
     // Read the current submitted sample cursor BEFORE filling, then advance it AFTER
     // filling the buffer so the visual playhead never jumps ahead of an unfilled buffer.
     let start_hw = shared.hardware_sample_count.load(Ordering::Acquire);
-    // Latch the exact submission cursor where this epoch first starts rendering so an
-    // in-flight callback racing a seek/resume can never cause the new epoch to skip a buffer.
-    let epoch_anchor = if shared.callback_latched_epoch.load(Ordering::Relaxed) != snap.epoch_id {
-        shared
-            .callback_epoch_start_sample
-            .store(start_hw, Ordering::Release);
-        shared
-            .callback_latched_epoch
-            .store(snap.epoch_id, Ordering::Release);
-        start_hw
-    } else {
-        shared.callback_epoch_start_sample.load(Ordering::Relaxed)
-    };
 
-    if snap.speed == 0.0 || mix.is_none() || snap.fps <= 0.0 {
+    if snap.speed == 0.0 || snap.fps <= 0.0 {
+        // Paused or seqlock-contention fallback (`speed == 0.0`): emit silence without
+        // latching `callback_latched_epoch` so the first active callback for a newly
+        // committed epoch still starts at its exact anchor frame with zero skipped samples.
         for slot in output.iter_mut() {
             *slot = convert(0.0);
         }
     } else {
-        let mix_slice = mix.map(Vec::as_slice).unwrap_or(&[]);
-        let mix_len = mix_slice.len();
+        // Latch the exact submission cursor where this active epoch first starts rendering
+        // so an in-flight callback racing a seek/resume can never skip a buffer.
+        let epoch_anchor = if shared.callback_latched_epoch.load(Ordering::Relaxed) != snap.epoch_id
+        {
+            shared
+                .callback_epoch_start_sample
+                .store(start_hw, Ordering::Release);
+            shared
+                .callback_latched_epoch
+                .store(snap.epoch_id, Ordering::Release);
+            start_hw
+        } else {
+            shared.callback_epoch_start_sample.load(Ordering::Relaxed)
+        };
 
-        for (i, frame_chunk) in output.chunks_exact_mut(channels).enumerate() {
-            let hw = start_hw.saturating_add(i as u64);
-            let (exact_frame, hit_stop) =
-                ClockShared::evaluate_at_sample_from(&snap, hw, epoch_anchor);
-            let sample_pair = if hit_stop || mix_len == 0 {
-                [0.0_f32, 0.0_f32]
-            } else {
-                let timeline_sec = exact_frame / snap.fps;
-                let pos = timeline_sec * mix_sample_rate;
-                if pos >= 0.0 && (pos.floor() as usize) < mix_len {
-                    let idx0 = pos.floor() as usize;
-                    let idx1 = (idx0 + 1).min(mix_len - 1);
-                    let frac = (pos - idx0 as f64) as f32;
-                    let a = mix_slice[idx0];
-                    let b = mix_slice[idx1];
-                    [a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac]
+        if let Some(mix_vec) = mix {
+            let mix_slice = mix_vec.as_slice();
+            let mix_len = mix_slice.len();
+
+            for (i, frame_chunk) in output.chunks_exact_mut(channels).enumerate() {
+                let hw = start_hw.saturating_add(i as u64);
+                let (exact_frame, hit_stop) =
+                    ClockShared::evaluate_at_sample_from(&snap, hw, epoch_anchor);
+                let sample_pair = if hit_stop || mix_len == 0 {
+                    [0.0_f32, 0.0_f32]
                 } else {
-                    [0.0, 0.0]
-                }
-            };
-
-            for (ch_idx, slot) in frame_chunk.iter_mut().enumerate() {
-                let val = match (channels, ch_idx) {
-                    (1, _) => 0.5 * (sample_pair[0] + sample_pair[1]),
-                    (_, 0) => sample_pair[0],
-                    (_, 1) => sample_pair[1],
-                    _ => 0.0,
+                    let timeline_sec = exact_frame / snap.fps;
+                    let pos = timeline_sec * mix_sample_rate;
+                    if pos >= 0.0 && (pos.floor() as usize) < mix_len {
+                        let idx0 = pos.floor() as usize;
+                        let idx1 = (idx0 + 1).min(mix_len - 1);
+                        let frac = (pos - idx0 as f64) as f32;
+                        let a = mix_slice[idx0];
+                        let b = mix_slice[idx1];
+                        [a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac]
+                    } else {
+                        [0.0, 0.0]
+                    }
                 };
-                *slot = convert(val);
+
+                for (ch_idx, slot) in frame_chunk.iter_mut().enumerate() {
+                    let val = match (channels, ch_idx) {
+                        (1, _) => 0.5 * (sample_pair[0] + sample_pair[1]),
+                        (_, 0) => sample_pair[0],
+                        (_, 1) => sample_pair[1],
+                        _ => 0.0,
+                    };
+                    *slot = convert(val);
+                }
+            }
+        } else {
+            for slot in output.iter_mut() {
+                *slot = convert(0.0);
             }
         }
     }
@@ -896,6 +907,88 @@ mod tests {
             out[0]
         );
         // Visual playhead stays at 30.0 while that 512-sample buffer is queued at the DAC.
+        assert!((clock.exact_frame() - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn seqlock_contention_fallback_does_not_latch_new_epoch() {
+        let clock = MasterPlaybackClock::new(30.0, 300.0);
+        clock.set_hardware_clock_mode(true, STANDARD_SAMPLE_RATE);
+        clock.play();
+
+        let mix: Vec<[f32; 2]> = (0..96_000)
+            .map(|i| {
+                let v = (i as f32) / 100_000.0;
+                [v, v]
+            })
+            .collect();
+
+        // Render one normal callback on the initial playing epoch.
+        let mut out = vec![0.0_f32; 512 * 2];
+        render_callback_frames(
+            &clock.shared,
+            Some(&mix),
+            f64::from(STANDARD_SAMPLE_RATE),
+            2,
+            None,
+            &mut out,
+            |s| s,
+        );
+        let prev_epoch = clock.epoch();
+
+        // Seek to frame 30 (1.0s = sample 48_000), then simulate the seqlock still being
+        // held odd by the writer when the audio callback runs and hits the fallback path.
+        let new_epoch = clock.seek_preserving_playback(30.0);
+        assert_ne!(new_epoch, prev_epoch);
+        let prev_seq = clock.shared.seq.load(Ordering::Acquire);
+        clock
+            .shared
+            .seq
+            .store(prev_seq.wrapping_add(1), Ordering::Release);
+
+        let mut fallback_out = vec![1.0_f32; 512 * 2];
+        render_callback_frames(
+            &clock.shared,
+            Some(&mix),
+            f64::from(STANDARD_SAMPLE_RATE),
+            2,
+            None,
+            &mut fallback_out,
+            |s| s,
+        );
+        // Fallback callback must emit silence and MUST NOT latch `new_epoch`.
+        assert!(fallback_out.iter().all(|&s| s == 0.0));
+        assert_eq!(
+            clock.shared.callback_latched_epoch.load(Ordering::Acquire),
+            prev_epoch
+        );
+
+        // Writer completes the seqlock update (even).
+        clock
+            .shared
+            .seq
+            .store(prev_seq.wrapping_add(2), Ordering::Release);
+
+        // Next callback renders `new_epoch` starting at exact sample 48_000 (0.48), NOT 48_512.
+        let mut active_out = vec![0.0_f32; 512 * 2];
+        render_callback_frames(
+            &clock.shared,
+            Some(&mix),
+            f64::from(STANDARD_SAMPLE_RATE),
+            2,
+            None,
+            &mut active_out,
+            |s| s,
+        );
+        assert_eq!(
+            clock.shared.callback_latched_epoch.load(Ordering::Acquire),
+            new_epoch
+        );
+        assert!(
+            (active_out[0] - 0.48).abs() < 1e-5,
+            "expected first active sample at exact seek target 0.48, got {}",
+            active_out[0]
+        );
         assert!((clock.exact_frame() - 30.0).abs() < 1e-6);
     }
 }
