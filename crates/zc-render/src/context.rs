@@ -140,6 +140,34 @@ impl GpuContext {
             .ok_or(RenderError::InvalidDimensions { width, height })
     }
 
+    /// Validates RGBA8 texture dimensions AND the row-padded staging buffer size against
+    /// both `max_texture_dimension_2d` and `max_buffer_size` before rendering or allocating.
+    ///
+    /// Returns `(padded_bytes_per_row, staging_buffer_size, tightly_packed_byte_len)`.
+    pub fn validate_rgba8_readback_dimensions(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<(u32, u64, usize), RenderError> {
+        let packed_bytes =
+            self.validate_dimensions(width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+        let unpadded_bytes_per_row = width
+            .checked_mul(4)
+            .ok_or(RenderError::InvalidDimensions { width, height })?;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row
+            .div_ceil(align)
+            .checked_mul(align)
+            .ok_or(RenderError::InvalidDimensions { width, height })?;
+        let staging_size = u64::from(padded_bytes_per_row)
+            .checked_mul(u64::from(height))
+            .ok_or(RenderError::InvalidDimensions { width, height })?;
+        if staging_size > self.device.limits().max_buffer_size {
+            return Err(RenderError::InvalidDimensions { width, height });
+        }
+        Ok((padded_bytes_per_row, staging_size, packed_bytes))
+    }
+
     /// Allocates an `Rgba8Unorm` texture and uploads tightly packed RGBA8 pixels.
     pub fn create_rgba8_texture(
         &self,
@@ -474,30 +502,14 @@ pub fn readback_rgba8(
     target: &RenderTarget,
     out: &mut Vec<u8>,
 ) -> Result<(), RenderError> {
-    if target.width == 0 || target.height == 0 {
-        return Err(RenderError::InvalidDimensions {
-            width: target.width,
-            height: target.height,
-        });
-    }
+    let (padded_bytes_per_row, staging_size, _) =
+        ctx.validate_rgba8_readback_dimensions(target.width, target.height)?;
 
     let swap_rb = match target.format {
         wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => false,
         wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => true,
         other => return Err(RenderError::UnsupportedFormat(other)),
     };
-
-    let unpadded_bytes_per_row =
-        target
-            .width
-            .checked_mul(4)
-            .ok_or(RenderError::InvalidDimensions {
-                width: target.width,
-                height: target.height,
-            })?;
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
-    let staging_size = u64::from(padded_bytes_per_row) * u64::from(target.height);
 
     let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("zc-render rgba8 readback staging"),
@@ -550,7 +562,7 @@ pub fn readback_rgba8(
         .map_err(|e| RenderError::BufferMap(e.to_string()))?
         .map_err(|e| RenderError::BufferMap(e.to_string()))?;
 
-    let row_len = unpadded_bytes_per_row as usize;
+    let row_len = (target.width as usize) * 4;
     let padded_stride = padded_bytes_per_row as usize;
     let total_len = row_len * (target.height as usize);
     out.clear();

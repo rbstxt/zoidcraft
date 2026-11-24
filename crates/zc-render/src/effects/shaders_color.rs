@@ -283,10 +283,12 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     }
     let uv_ov = inv_affine_aspect(in_v.v_uv, u.p0.xy, u.p0.zw, u.p1.x, u.resolution);
     let repeat_on = (u.flags & 1u) != 0u;
-    let wrapped = fract(uv_ov);
     let in_bounds = uv_ov.x >= 0.0 && uv_ov.x <= 1.0 && uv_ov.y >= 0.0 && uv_ov.y <= 1.0;
-    let sample_uv = select(clamp(uv_ov, vec2<f32>(0.0), vec2<f32>(1.0)), wrapped, repeat_on);
-    let raw_ov = sample_aux(sample_uv);
+    let tex_sz = max(vec2<f32>(textureDimensions(t_aux, 0)), vec2<f32>(1.0));
+    let half_px = vec2<f32>(0.5) / tex_sz;
+    let clamped_uv = clamp(uv_ov, half_px, vec2<f32>(1.0) - half_px);
+    let sample_uv = select(clamped_uv, uv_ov, repeat_on);
+    let raw_ov = sample_aux_repeat(sample_uv);
     let ov = select(vec4<f32>(0.0), raw_ov, repeat_on || in_bounds);
     let ov_rgb = unpremultiply(ov);
     let bg_rgb = unpremultiply(bg);

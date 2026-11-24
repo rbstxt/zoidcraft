@@ -343,6 +343,7 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, RenderError> {
+        let _ = self.ctx.validate_rgba8_readback_dimensions(width, height)?;
         let _ = self.render_frame_to_texture(project, plugins, frame, width, height)?;
         let Some(target) = self.output_target.as_ref() else {
             return Err(RenderError::Effect(
@@ -384,9 +385,7 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<EffectSelfTestReport, RenderError> {
-        let expected_bytes =
-            self.ctx
-                .validate_dimensions(width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+        let (_, _, expected_bytes) = self.ctx.validate_rgba8_readback_dimensions(width, height)?;
 
         let synthetic_rgba = generate_synthetic_test_frame(width, height);
         let src_target = self.ctx.create_rgba8_texture(
@@ -1939,7 +1938,57 @@ impl ProjectRenderEngine {
             return Some(cached);
         }
 
-        let img = match image::load_from_memory(bytes) {
+        let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
+        let dim_reader =
+            match image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format() {
+                Ok(reader) => reader,
+                Err(err) => {
+                    warn!(asset_id, error = %err, "failed to inspect image asset format");
+                    return None;
+                }
+            };
+        let (header_w, header_h) = match dim_reader.into_dimensions() {
+            Ok(dims) => dims,
+            Err(err) => {
+                warn!(asset_id, error = %err, "failed to read image asset dimensions");
+                return None;
+            }
+        };
+        if self
+            .ctx
+            .validate_dimensions(header_w, header_h, wgpu::TextureFormat::Rgba8Unorm)
+            .is_err()
+        {
+            warn!(
+                asset_id,
+                width = header_w,
+                height = header_h,
+                max_dim,
+                "rejecting image asset exceeding GPU texture dimension limits before decode"
+            );
+            return None;
+        }
+
+        let mut decode_reader =
+            match image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format() {
+                Ok(reader) => reader,
+                Err(err) => {
+                    warn!(asset_id, error = %err, "failed to prepare image asset decoder");
+                    return None;
+                }
+            };
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(max_dim);
+        limits.max_image_height = Some(max_dim);
+        limits.max_alloc = Some(
+            u64::from(header_w)
+                .saturating_mul(u64::from(header_h))
+                .saturating_mul(16)
+                .clamp(1024 * 1024, 256 * 1024 * 1024),
+        );
+        decode_reader.limits(limits);
+
+        let img = match decode_reader.decode() {
             Ok(img) => img.to_rgba8(),
             Err(err) => {
                 warn!(asset_id, error = %err, "failed to decode image asset");
@@ -1947,7 +1996,11 @@ impl ProjectRenderEngine {
             }
         };
         let (w, h) = img.dimensions();
-        if w == 0 || h == 0 {
+        if self
+            .ctx
+            .validate_dimensions(w, h, wgpu::TextureFormat::Rgba8Unorm)
+            .is_err()
+        {
             return None;
         }
         // Premultiply RGB by alpha to preserve the renderer's premultiplied-alpha invariant.
@@ -2169,9 +2222,10 @@ impl ProjectRenderEngine {
                 }
                 PropertyValue::Asset(Some(asset_id)) => {
                     if effect_id == "cubelut" {
+                        let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
                         if let Some(record) = env.project.assets.get(&asset_id)
                             && let Some(bytes) = record.bytes.as_deref()
-                            && let Some(lut_val) = parse_cube_lut_bytes(bytes)
+                            && let Some(lut_val) = parse_cube_lut_bytes(bytes, max_dim)
                         {
                             reg_params.set("lut", lut_val);
                         }
@@ -3579,7 +3633,7 @@ fn bake_color_curves_lut_rgba8(curve_json: &serde_json::Value) -> Vec<[u8; 4]> {
     lut
 }
 
-fn parse_cube_lut_bytes(bytes: &[u8]) -> Option<RegParamValue> {
+fn parse_cube_lut_bytes(bytes: &[u8], max_texture_dim: u32) -> Option<RegParamValue> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut size_1d: Option<usize> = None;
     let mut size_3d: Option<u32> = None;
@@ -3611,6 +3665,10 @@ fn parse_cube_lut_bytes(bytes: &[u8]) -> Option<RegParamValue> {
         if !(2..=MAX_CUBE_LUT_3D_SIZE).contains(&n) {
             return None;
         }
+        let unwrapped_w = n.checked_mul(n)?;
+        if unwrapped_w > max_texture_dim || n > max_texture_dim {
+            return None;
+        }
         let n_usize = n as usize;
         let total = n_usize.checked_mul(n_usize)?.checked_mul(n_usize)?;
         let byte_len = total.checked_mul(4)?;
@@ -3627,8 +3685,9 @@ fn parse_cube_lut_bytes(bytes: &[u8]) -> Option<RegParamValue> {
         return Some(RegParamValue::Lut3D { size: n, data });
     }
 
+    let max_1d = MAX_CUBE_LUT_1D_SIZE.min(max_texture_dim as usize);
     let len = size_1d.unwrap_or(triplets.len());
-    if (2..=MAX_CUBE_LUT_1D_SIZE).contains(&len) && triplets.len() >= len {
+    if (2..=max_1d).contains(&len) && triplets.len() >= len {
         let entries: Vec<[u8; 4]> = triplets
             .into_iter()
             .take(len)
@@ -3980,9 +4039,13 @@ mod tests {
 
     #[test]
     fn malformed_cube_lut_and_unpremultiply_are_safe() {
-        assert!(parse_cube_lut_bytes(b"LUT_3D_SIZE 4096\n0 0 0\n").is_none());
-        assert!(parse_cube_lut_bytes(b"LUT_3D_SIZE 4294967295\n0 0 0\n").is_none());
-        assert!(parse_cube_lut_bytes(b"LUT_3D_SIZE 1\n0 0 0\n").is_none());
+        assert!(parse_cube_lut_bytes(b"LUT_3D_SIZE 4096\n0 0 0\n", 8192).is_none());
+        assert!(parse_cube_lut_bytes(b"LUT_3D_SIZE 4294967295\n0 0 0\n", 8192).is_none());
+        assert!(parse_cube_lut_bytes(b"LUT_3D_SIZE 1\n0 0 0\n", 8192).is_none());
+        // 128^3 unwrapped is 16384x128 which exceeds an 8192 max_texture_dimension_2d limit.
+        assert!(parse_cube_lut_bytes(b"LUT_3D_SIZE 128\n0 0 0\n", 8192).is_none());
+        // 1D LUT exceeding max_texture_dimension_2d is rejected.
+        assert!(parse_cube_lut_bytes(b"LUT_1D_SIZE 16384\n0 0 0\n", 8192).is_none());
 
         // Straight alpha recovery on translucent premultiplied pixels.
         let straight =

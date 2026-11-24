@@ -2217,10 +2217,15 @@ impl EffectRegistry {
             "cubelut" | "colorcurves" => "lut",
             _ => return None,
         };
+        let max_dim = device.limits().max_texture_dimension_2d;
         match params.values.get(key) {
             Some(EffectParamValue::Lut1D(entries)) if !entries.is_empty() => {
-                let width = entries.len() as u32;
-                let mut raw = Vec::with_capacity(entries.len() * 4);
+                let width = u32::try_from(entries.len()).ok()?;
+                if width > max_dim {
+                    return None;
+                }
+                let raw_bytes = entries.len().checked_mul(4)?;
+                let mut raw = Vec::with_capacity(raw_bytes);
                 for px in entries {
                     raw.extend_from_slice(px);
                 }
@@ -2235,9 +2240,14 @@ impl EffectRegistry {
             }
             Some(EffectParamValue::Lut3D { size, data }) if *size >= 2 => {
                 let n = *size;
-                let width = n * n;
+                let width = n.checked_mul(n)?;
                 let height = n;
-                let expected = (width as usize) * (height as usize) * 4;
+                if width > max_dim || height > max_dim {
+                    return None;
+                }
+                let expected = (width as usize)
+                    .checked_mul(height as usize)?
+                    .checked_mul(4)?;
                 if data.len() < expected {
                     return None;
                 }
