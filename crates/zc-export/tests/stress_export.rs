@@ -481,11 +481,15 @@ fn wrapper_leaving_descendant_holding_pipes_does_not_hang_probe_or_export() {
         "probe should succeed cleanly after terminating descendant: {res:?}"
     );
 
-    // Export wrapper spawns a descendant that holds stdin open without reading, then exits 0
-    // immediately while frames are larger than the OS pipe buffer (256x256x4 = 256 KiB).
+    // Export wrapper saves original stdin to fd 3 (preventing noninteractive sh from redirecting
+    // background stdin to /dev/null) and keeps both stdin and stderr open in a long-lived
+    // descendant before exiting 0 immediately while frames exceed the OS socket/pipe buffer.
     let export_wrapper = root.path().join("export_stdin_descendant.sh");
-    fs::write(&export_wrapper, "#!/bin/sh\n(sleep 20 <&0) &\nexit 0\n")
-        .expect("write export wrapper");
+    fs::write(
+        &export_wrapper,
+        "#!/bin/sh\nexec 3<&0\n(sleep 6 <&3) &\nexit 0\n",
+    )
+    .expect("write export wrapper");
     let mut eperms = fs::metadata(&export_wrapper).expect("meta").permissions();
     eperms.set_mode(0o755);
     fs::set_permissions(&export_wrapper, eperms).expect("chmod");

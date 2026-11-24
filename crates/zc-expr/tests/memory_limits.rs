@@ -367,4 +367,27 @@ fn rejects_string_repeat_concat_array_and_dag_export_memory_bombs() {
         "cyclic object rejection took too long: {:?}",
         cyc_t0.elapsed()
     );
+
+    // 21. Recursive array call spreads must charge argument buffer allocations against the 64 MiB budget.
+    let err = eval(
+        r#"var a = Array(65535); function sink() { return arguments_ignored(); } function descend(n) { if (n <= 0) return 0; return sink(...a, descend(n - 1)); } descend(64)"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("recursive 65,535-element array spread must exceed 64 MiB heap budget");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for recursive array call spread bomb, got {err:?}"
+    );
+
+    // 22. Lexical `for (let <long_ident> = ...)` cloning must charge identifier byte lengths.
+    let long_ident = "a".repeat(64 * 1024);
+    let long_ident_expr = format!("var i = 0; for (let {long_ident} = 0; i < 2000; i++) {{}} i");
+    let err = eval(&long_ident_expr, &ctx, &cfg).expect_err(
+        "cloning 64 KiB lexical loop identifier 2000 times must exceed 64 MiB heap budget",
+    );
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for lexical loop identifier bomb, got {err:?}"
+    );
 }

@@ -1251,7 +1251,12 @@ impl<'a> Evaluator<'a> {
 
     fn clone_lexical_env(&mut self, src_env: usize, parent: usize) -> Result<usize, ExprError> {
         let count = self.envs[src_env].bindings.len();
-        self.charge_alloc_bytes(64_usize.saturating_add(count.saturating_mul(64)))?;
+        let name_bytes: usize = self.envs[src_env].bindings.keys().map(String::len).sum();
+        self.charge_alloc_bytes(
+            64_usize
+                .saturating_add(count.saturating_mul(64))
+                .saturating_add(name_bytes),
+        )?;
         let cloned_bindings: BTreeMap<String, Binding> = self.envs[src_env]
             .bindings
             .iter()
@@ -2547,6 +2552,7 @@ impl<'a> Evaluator<'a> {
                                     "call argument count {next_len} exceeds {MAX_ARRAY_LEN} limit"
                                 )));
                             }
+                            self.check_array_alloc(add)?;
                             self.charge_work(add)?;
                             out.extend_from_slice(&self.arrays[id]);
                         }

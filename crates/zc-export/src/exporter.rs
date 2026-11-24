@@ -1,7 +1,7 @@
 //! Deadlock-free, zero-leak FFmpeg video exporter and direct PNG sequence exporter.
 
 use std::fs::{self, File};
-use std::io::{BufWriter, ErrorKind, Write};
+use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,8 +14,9 @@ use image::{ExtendedColorType, ImageEncoder};
 
 use crate::ExportError;
 use crate::ffmpeg::{
-    BoundedStderrBuffer, MAX_STDERR_BYTES, build_ffmpeg_os_args_with_output,
-    configure_process_group, kill_process_tree_and_reap, resolve_ffmpeg_binary,
+    BoundedStderrBuffer, MAX_STDERR_BYTES, abort_and_join_worker, build_ffmpeg_os_args_with_output,
+    cancel_thread_sync_io, configure_process_group, kill_process_tree_and_reap,
+    resolve_ffmpeg_binary,
 };
 use crate::padding::pad_rgba_frame_into;
 use crate::settings::{
@@ -376,19 +377,26 @@ where
 
     let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
     let mut cmd = Command::new(bin);
-    cmd.args(&args).stdout(Stdio::null()).stderr(Stdio::piped());
+    cmd.args(&args).stdout(Stdio::null());
 
-    // On Unix, connect FFmpeg's stdin via a SOCK_STREAM UnixStream pair with a bounded
-    // write timeout so the writer thread can always interrupt a blocked write and release
-    // its descriptor and frame buffer if FFmpeg exits early while a descendant holds stdin.
+    // On Unix, connect FFmpeg's stdin and stderr via SOCK_STREAM UnixStream pairs with bounded
+    // 50 ms timeouts and drop `cmd` immediately after spawn (closing parent copies of child fds)
+    // so both worker threads can always interrupt blocked I/O, release descriptors/buffers, and join.
     #[cfg(unix)]
-    let (mut child, stdin_writer): (Child, Box<dyn Write + Send>) = {
+    let (child, stdin_writer, stderr_reader): (
+        Child,
+        Box<dyn Write + Send>,
+        Box<dyn Read + Send>,
+    ) = {
         use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
 
-        let (read_sock, write_sock) = UnixStream::pair()?;
-        write_sock.set_write_timeout(Some(Duration::from_millis(50)))?;
-        cmd.stdin(Stdio::from(OwnedFd::from(read_sock)));
+        let (stdin_read, stdin_write) = UnixStream::pair()?;
+        let (stderr_read, stderr_write) = UnixStream::pair()?;
+        stdin_write.set_write_timeout(Some(Duration::from_millis(50)))?;
+        stderr_read.set_read_timeout(Some(Duration::from_millis(50)))?;
+        cmd.stdin(Stdio::from(OwnedFd::from(stdin_read)))
+            .stderr(Stdio::from(OwnedFd::from(stderr_write)));
         configure_process_group(&mut cmd);
 
         let child = cmd.spawn().map_err(|err| {
@@ -398,12 +406,17 @@ where
                 ExportError::Io(err)
             }
         })?;
-        (child, Box::new(write_sock))
+        drop(cmd);
+        (child, Box::new(stdin_write), Box::new(stderr_read))
     };
 
     #[cfg(not(unix))]
-    let (mut child, stdin_writer): (Child, Box<dyn Write + Send>) = {
-        cmd.stdin(Stdio::piped());
+    let (child, stdin_writer, stderr_reader): (
+        Child,
+        Box<dyn Write + Send>,
+        Box<dyn Read + Send>,
+    ) = {
+        cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
         configure_process_group(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|err| {
@@ -413,25 +426,26 @@ where
                 ExportError::Io(err)
             }
         })?;
+        drop(cmd);
         let stdin = child.stdin.take().ok_or_else(|| {
             ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdin"))
         })?;
-        (child, Box::new(stdin))
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr"))
+        })?;
+        (child, Box::new(stdin), Box::new(stderr))
     };
-
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr")))?;
 
     let total_frames = settings.total_frames();
 
-    // Stage B: Stream frames to FFmpeg over a dedicated stdin writer thread and drain stderr
-    // on a dedicated reader thread.
+    // Stage B: Stream frames to FFmpeg over a dedicated interruptible stdin writer thread and
+    // drain stderr on a dedicated interruptible reader thread.
+    let stderr_abort = Arc::new(AtomicBool::new(false));
+    let stderr_abort_clone = Arc::clone(&stderr_abort);
     let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
     let stderr_handle = std::thread::spawn(move || {
         let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
-        ring.drain_reader(stderr);
+        ring.drain_reader_interruptible(stderr_reader, &stderr_abort_clone);
         let _ = stderr_tx.send(ring.into_string_lossy());
     });
 
@@ -491,6 +505,12 @@ where
                         break;
                     }
                     Err(err) => {
+                        if writer_abort_clone.load(Ordering::Acquire)
+                            || cancel_writer.load(Ordering::Acquire)
+                        {
+                            aborted = true;
+                            break;
+                        }
                         drop(stdin_pipe);
                         let _ = writer_done_tx.send(WriterOutcome::Io(err));
                         return;
@@ -702,12 +722,25 @@ where
                                 *child_exited_at.get_or_insert_with(std::time::Instant::now);
                             if exited_at.elapsed() >= CHILD_EXIT_WRITER_GRACE {
                                 writer_abort.store(true, Ordering::Release);
-                                // Give the interruptible Unix writer a short window to release its fd/buffer.
-                                if let Ok(outcome) =
-                                    writer_done_rx.recv_timeout(Duration::from_millis(150))
-                                {
-                                    writer_finished = true;
-                                    writer_outcome = Some(outcome);
+                                cancel_thread_sync_io(&writer_handle);
+                                // Give the interruptible writer a short window to release its fd/buffer.
+                                let abort_deadline =
+                                    std::time::Instant::now() + Duration::from_millis(150);
+                                while std::time::Instant::now() < abort_deadline {
+                                    match writer_done_rx.recv_timeout(Duration::from_millis(10)) {
+                                        Ok(outcome) => {
+                                            writer_finished = true;
+                                            writer_outcome = Some(outcome);
+                                            break;
+                                        }
+                                        Err(RecvTimeoutError::Disconnected) => {
+                                            writer_finished = true;
+                                            break;
+                                        }
+                                        Err(RecvTimeoutError::Timeout) => {
+                                            cancel_thread_sync_io(&writer_handle);
+                                        }
+                                    }
                                 }
                                 break;
                             }
@@ -732,13 +765,36 @@ where
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
             loop {
                 if cancel.load(Ordering::Acquire) {
+                    stderr_abort.store(true, Ordering::Release);
+                    cancel_thread_sync_io(&stderr_handle);
                     child_guard.kill_and_reap();
                     return Err(ExportError::Cancelled);
                 }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    // Child was already reaped; stop waiting on stderr without signaling a reaped PGID.
-                    break String::new();
+                    // Child was already reaped; interrupt the stderr worker cleanly without signaling
+                    // a reaped PGID so its thread and descriptor are released and joined.
+                    stderr_abort.store(true, Ordering::Release);
+                    cancel_thread_sync_io(&stderr_handle);
+                    let abort_deadline = std::time::Instant::now() + Duration::from_millis(150);
+                    let mut captured = String::new();
+                    while std::time::Instant::now() < abort_deadline {
+                        match stderr_rx.recv_timeout(Duration::from_millis(10)) {
+                            Ok(text) => {
+                                stderr_finished = true;
+                                captured = text;
+                                break;
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                stderr_finished = true;
+                                break;
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                cancel_thread_sync_io(&stderr_handle);
+                            }
+                        }
+                    }
+                    break captured;
                 }
                 match stderr_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
                     Ok(text) => {
@@ -784,28 +840,31 @@ where
         Ok(())
     })();
 
-    // Signal writer abort and kill the process tree ONLY if the child is still live (unreaped).
+    // Signal worker aborts and kill the process tree ONLY if the child is still live (unreaped).
     if result.is_err() || !writer_finished || !stderr_finished {
         writer_abort.store(true, Ordering::Release);
+        stderr_abort.store(true, Ordering::Release);
         child_guard.kill_and_reap();
-    }
-    if !writer_finished {
-        match writer_done_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(_) | Err(RecvTimeoutError::Disconnected) => writer_finished = true,
-            Err(RecvTimeoutError::Timeout) => {}
-        }
-    }
-    if !stderr_finished {
-        match stderr_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(_) | Err(RecvTimeoutError::Disconnected) => stderr_finished = true,
-            Err(RecvTimeoutError::Timeout) => {}
-        }
     }
     if writer_finished {
         let _ = writer_handle.join();
+    } else {
+        let _ = abort_and_join_worker(
+            &writer_abort,
+            &writer_done_rx,
+            writer_handle,
+            Duration::from_millis(500),
+        );
     }
     if stderr_finished {
         let _ = stderr_handle.join();
+    } else {
+        let _ = abort_and_join_worker(
+            &stderr_abort,
+            &stderr_rx,
+            stderr_handle,
+            Duration::from_millis(500),
+        );
     }
 
     // Explicitly keep `temp_audio_guard` alive until FFmpeg has completely exited, then drop it.

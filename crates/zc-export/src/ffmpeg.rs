@@ -2,9 +2,11 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -67,6 +69,70 @@ pub(crate) fn kill_process_tree_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Cancels any pending synchronous OS I/O on a worker thread on Windows so blocked pipe
+/// readers/writers wake up with `ERROR_OPERATION_ABORTED`, release their handles/buffers,
+/// and join cleanly without signaling any reaped child PID.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn cancel_thread_sync_io<T>(handle: &std::thread::JoinHandle<T>) {
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CancelSynchronousIo(h_thread: *mut core::ffi::c_void) -> i32;
+    }
+
+    let raw = handle.as_raw_handle();
+    // SAFETY: `handle` is a live `JoinHandle` whose OS thread handle remains valid while
+    // `handle` is alive. `CancelSynchronousIo` is thread-safe and cancels only pending
+    // synchronous I/O on that thread (returning 0 / ERROR_NOT_FOUND when idle).
+    let _ = unsafe { CancelSynchronousIo(raw) };
+}
+
+/// No-op on non-Windows platforms, where Unix pipes/sockets use bounded read/write timeouts.
+#[cfg(not(windows))]
+pub(crate) fn cancel_thread_sync_io<T>(_handle: &std::thread::JoinHandle<T>) {}
+
+/// Cooperatively aborts a worker thread and waits up to `timeout` for its completion channel,
+/// retrying Windows synchronous I/O cancellation every 10 ms so the worker always releases its
+/// descriptor/buffers and joins cleanly.
+pub(crate) fn abort_and_join_worker<T, R>(
+    abort: &AtomicBool,
+    rx: &mpsc::Receiver<R>,
+    handle: std::thread::JoinHandle<T>,
+    timeout: Duration,
+) -> Option<R> {
+    abort.store(true, Ordering::Release);
+    cancel_thread_sync_io(&handle);
+    let deadline = Instant::now() + timeout;
+    let mut received: Option<R> = None;
+    let mut finished = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(val) => {
+                received = Some(val);
+                finished = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                finished = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cancel_thread_sync_io(&handle);
+            }
+        }
+    }
+    if finished {
+        let _ = handle.join();
+    }
+    received
+}
+
 /// Resolves the FFmpeg executable path (`binary` if supplied, otherwise `"ffmpeg"` on `PATH`).
 #[must_use]
 pub fn resolve_ffmpeg_binary(binary: Option<&Path>) -> &Path {
@@ -85,38 +151,78 @@ pub(crate) fn probe_ffmpeg_with_timeout(
 ) -> Result<String, ExportError> {
     let bin = resolve_ffmpeg_binary(binary);
     let mut cmd = Command::new(bin);
-    cmd.arg("-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_process_group(&mut cmd);
+    cmd.arg("-version").stdin(Stdio::null());
 
-    let mut child = cmd.spawn().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            ExportError::FfmpegNotFound(bin.display().to_string())
-        } else {
-            ExportError::Io(err)
-        }
-    })?;
+    #[cfg(unix)]
+    let (mut child, stdout_reader, stderr_reader): (
+        Child,
+        Box<dyn Read + Send>,
+        Box<dyn Read + Send>,
+    ) = {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
 
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
+        let (out_read, out_write) = UnixStream::pair()?;
+        let (err_read, err_write) = UnixStream::pair()?;
+        out_read.set_read_timeout(Some(Duration::from_millis(50)))?;
+        err_read.set_read_timeout(Some(Duration::from_millis(50)))?;
+        cmd.stdout(Stdio::from(OwnedFd::from(out_write)))
+            .stderr(Stdio::from(OwnedFd::from(err_write)));
+        configure_process_group(&mut cmd);
+
+        let child = cmd.spawn().map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                ExportError::FfmpegNotFound(bin.display().to_string())
+            } else {
+                ExportError::Io(err)
+            }
+        })?;
+        drop(cmd);
+        (child, Box::new(out_read), Box::new(err_read))
+    };
+
+    #[cfg(not(unix))]
+    let (mut child, stdout_reader, stderr_reader): (
+        Child,
+        Box<dyn Read + Send>,
+        Box<dyn Read + Send>,
+    ) =
+        {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            configure_process_group(&mut cmd);
+
+            let mut child = cmd.spawn().map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    ExportError::FfmpegNotFound(bin.display().to_string())
+                } else {
+                    ExportError::Io(err)
+                }
+            })?;
+            drop(cmd);
+            let out = child.stdout.take().ok_or_else(|| {
+                ExportError::Io(std::io::Error::other("failed to capture stdout"))
+            })?;
+            let err = child.stderr.take().ok_or_else(|| {
+                ExportError::Io(std::io::Error::other("failed to capture stderr"))
+            })?;
+            (child, Box::new(out), Box::new(err))
+        };
+
+    let io_abort = Arc::new(AtomicBool::new(false));
+    let out_abort = Arc::clone(&io_abort);
+    let err_abort = Arc::clone(&io_abort);
 
     let (out_tx, out_rx) = mpsc::channel::<String>();
     let out_handle = std::thread::spawn(move || {
         let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
-        if let Some(pipe) = stdout_pipe {
-            ring.drain_reader(pipe);
-        }
+        ring.drain_reader_interruptible(stdout_reader, &out_abort);
         let _ = out_tx.send(ring.into_string_lossy());
     });
 
     let (err_tx, err_rx) = mpsc::channel::<String>();
     let err_handle = std::thread::spawn(move || {
         let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
-        if let Some(pipe) = stderr_pipe {
-            ring.drain_reader(pipe);
-        }
+        ring.drain_reader_interruptible(stderr_reader, &err_abort);
         let _ = err_tx.send(ring.into_string_lossy());
     });
 
@@ -127,14 +233,18 @@ pub(crate) fn probe_ffmpeg_with_timeout(
             None => {
                 if Instant::now() >= deadline {
                     kill_process_tree_and_reap(&mut child);
-                    // Only join pipe readers if they actually finish within the grace window
-                    // so a detached descendant that escaped the process group cannot hang probe.
-                    if out_rx.recv_timeout(Duration::from_millis(200)).is_ok() {
-                        let _ = out_handle.join();
-                    }
-                    if err_rx.recv_timeout(Duration::from_millis(200)).is_ok() {
-                        let _ = err_handle.join();
-                    }
+                    let _ = abort_and_join_worker(
+                        &io_abort,
+                        &out_rx,
+                        out_handle,
+                        Duration::from_millis(250),
+                    );
+                    let _ = abort_and_join_worker(
+                        &io_abort,
+                        &err_rx,
+                        err_handle,
+                        Duration::from_millis(250),
+                    );
                     return Err(ExportError::FfmpegFailed {
                         exit_code: None,
                         stderr: format!(
@@ -148,29 +258,30 @@ pub(crate) fn probe_ffmpeg_with_timeout(
         }
     };
 
-    // Wait up to a bounded grace window (capped by the overall deadline) for stdout/stderr EOF.
-    // Once the child has been reaped, never signal its numeric PID/PGID (preventing PID/PGID reuse
-    // hazards); simply detach any pipe reader thread that outlives the bounded wait.
+    // Wait up to a bounded grace window for normal EOF, then interrupt and join both workers
+    // cleanly without signaling any reaped numeric PID/PGID.
     let pipe_grace = deadline
         .saturating_duration_since(Instant::now())
         .min(Duration::from_millis(500));
-    let stdout_opt = out_rx.recv_timeout(pipe_grace).ok();
-    let stderr_opt = err_rx
-        .recv_timeout(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(200)),
-        )
-        .ok();
-    if stdout_opt.is_some() {
-        let _ = out_handle.join();
-    }
-    if stderr_opt.is_some() {
-        let _ = err_handle.join();
-    }
-
-    let stdout = stdout_opt.unwrap_or_default();
-    let stderr = stderr_opt.unwrap_or_default();
+    let stdout = match out_rx.recv_timeout(pipe_grace) {
+        Ok(text) => {
+            let _ = out_handle.join();
+            text
+        }
+        Err(_) => abort_and_join_worker(&io_abort, &out_rx, out_handle, Duration::from_millis(250))
+            .unwrap_or_default(),
+    };
+    let err_grace = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_millis(200));
+    let stderr = match err_rx.recv_timeout(err_grace) {
+        Ok(text) => {
+            let _ = err_handle.join();
+            text
+        }
+        Err(_) => abort_and_join_worker(&io_abort, &err_rx, err_handle, Duration::from_millis(250))
+            .unwrap_or_default(),
+    };
 
     if !status.success() {
         return Err(ExportError::FfmpegFailed {
@@ -491,13 +602,32 @@ impl BoundedStderrBuffer {
     }
 
     /// Drains an entire [`Read`] stream into this bounded buffer.
-    pub fn drain_reader<R: Read>(&mut self, mut reader: R) {
+    pub fn drain_reader<R: Read>(&mut self, reader: R) {
+        let never_abort = AtomicBool::new(false);
+        self.drain_reader_interruptible(reader, &never_abort);
+    }
+
+    /// Drains a [`Read`] stream into this bounded buffer, stopping cleanly when `abort` is set
+    /// and a bounded read timeout (`WouldBlock`/`TimedOut`) or OS I/O cancellation occurs.
+    pub fn drain_reader_interruptible<R: Read>(&mut self, mut reader: R, abort: &AtomicBool) {
         let mut chunk = [0_u8; 4_096];
         loop {
+            if abort.load(Ordering::Acquire) {
+                break;
+            }
             match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => self.push_bytes(&chunk[..n]),
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                    ) =>
+                {
+                    if abort.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
