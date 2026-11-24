@@ -1923,16 +1923,19 @@ fn waveform_peak_slice_for_column(
     width: i32,
 ) -> (usize, usize) {
     let w_f = f64::from(width.max(1));
-    let media_start = clip.time_start.max(0.0);
-    let media_span = if clip.time_end > clip.time_start {
-        clip.time_end - clip.time_start
+    let (media_start, media_end) = if (clip.time_end - clip.time_start).abs() > 1e-9 {
+        (clip.time_start.max(0.0), clip.time_end.max(0.0))
     } else {
-        (clip.length / fps.max(1.0)).max(0.0)
+        let start = clip.time_start.max(0.0);
+        (start, start + (clip.length / fps.max(1.0)).max(0.0))
     };
-    let t0 = media_start + media_span * (f64::from(x.max(0)) / w_f);
-    let t1 = media_start + media_span * (f64::from(x.max(0) + 1) / w_f);
-    let idx0 = (t0 * points_per_sec).floor().max(0.0) as usize;
-    let idx1 = (t1 * points_per_sec).ceil().max(0.0) as usize;
+    let u0 = f64::from(x.max(0)) / w_f;
+    let u1 = f64::from(x.max(0) + 1) / w_f;
+    let a = media_start + (media_end - media_start) * u0;
+    let b = media_start + (media_end - media_start) * u1;
+    let (t_lo, t_hi) = if a <= b { (a, b) } else { (b, a) };
+    let idx0 = (t_lo * points_per_sec).floor().max(0.0) as usize;
+    let idx1 = (t_hi * points_per_sec).ceil().max(0.0) as usize;
     let count = idx1.saturating_sub(idx0).max(1);
     (idx0, count)
 }
@@ -3033,5 +3036,26 @@ mod tests {
         assert!(count >= 1);
         assert_eq!(peaks.max_buf[idx], 120);
         assert_eq!(peaks.min_buf[idx], -120);
+
+        // Reversed clip playing from 1.0s down to 0.5s must index descending within [0.5s, 1.0s],
+        // never past the 1.0s asset end.
+        let mut reverse_clip = right_split_clip;
+        reverse_clip.time_start = 1.0;
+        reverse_clip.time_end = 0.5;
+        let (rev_first_idx, rev_first_count) =
+            waveform_peak_slice_for_column(&reverse_clip, 30.0, peaks.points_per_sec, 0, 50);
+        let (rev_last_idx, _) =
+            waveform_peak_slice_for_column(&reverse_clip, 30.0, peaks.points_per_sec, 49, 50);
+        assert_eq!(
+            rev_first_idx, 99,
+            "reverse clip column 0 must sample [0.99s, 1.0s]"
+        );
+        assert_eq!(rev_first_count, 1);
+        assert_eq!(peaks.max_buf[rev_first_idx], 120);
+        assert_eq!(
+            rev_last_idx, 50,
+            "reverse clip final column must sample [0.50s, 0.51s]"
+        );
+        assert_eq!(peaks.max_buf[rev_last_idx], 120);
     }
 }
