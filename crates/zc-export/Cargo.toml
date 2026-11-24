@@ -13,5 +13,6 @@ zc-time = { workspace = true }
 zc-project = { workspace = true }
 zc-render = { workspace = true }
 zc-audio = { workspace = true }
+image = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

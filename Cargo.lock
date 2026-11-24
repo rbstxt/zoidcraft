@@ -3945,6 +3945,7 @@ dependencies = [
 name = "zc-export"
 version = "0.1.0"
 dependencies = [
+ "image",
  "thiserror 2.0.21",
  "tracing",
  "zc-audio",
@@ -4136,6 +4137,8 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "zc-anim",
+ "zc-audio",
  "zc-export",
  "zc-plugin",
  "zc-project",
