@@ -603,13 +603,15 @@ fn json_to_prop_value_with_kind(
                     return zc_project::PropertyValue::Gradient(stops);
                 }
             }
+            SessionValueKind::Json => {
+                return zc_project::PropertyValue::Json(v.clone());
+            }
             SessionValueKind::Number
             | SessionValueKind::Vec2
             | SessionValueKind::Vec3
             | SessionValueKind::Vec4
             | SessionValueKind::Text
-            | SessionValueKind::Bool
-            | SessionValueKind::Json => {}
+            | SessionValueKind::Bool => {}
         }
     }
     json_to_prop_value(v)
