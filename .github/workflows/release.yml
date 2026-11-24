@@ -70,11 +70,10 @@ jobs:
           cp "target/${{ matrix.target }}/release/zoidcraft-cli" "$STAGE/"
           cp LICENSE README.md THIRD_PARTY_LICENSES.md "$STAGE/"
           tar -czf "${STAGE}.tar.gz" "$STAGE"
-          tar -tzf "${STAGE}.tar.gz" | grep -q "${STAGE}/zoidcraft$"
-          tar -tzf "${STAGE}.tar.gz" | grep -q "${STAGE}/zoidcraft-cli$"
-          tar -tzf "${STAGE}.tar.gz" | grep -q "${STAGE}/LICENSE$"
-          tar -tzf "${STAGE}.tar.gz" | grep -q "${STAGE}/README.md$"
-          tar -tzf "${STAGE}.tar.gz" | grep -q "${STAGE}/THIRD_PARTY_LICENSES.md$"
+          ENTRIES="$(tar -tzf "${STAGE}.tar.gz")"
+          for req in zoidcraft zoidcraft-cli LICENSE README.md THIRD_PARTY_LICENSES.md; do
+            printf '%s\n' "$ENTRIES" | grep -qx "${STAGE}/${req}"
+          done
       - name: Package zip (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
