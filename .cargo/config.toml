@@ -1,0 +1,9 @@
+[build]
+# Use 4 of 8 cores (~50% CPU) for fast builds without saturating the machine.
+jobs = 4
+
+[alias]
+xtask = "run --package xtask --"
+
+[net]
+git-fetch-with-cli = true

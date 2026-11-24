@@ -1,0 +1,22 @@
+[package]
+name = "zc-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zc-time = { workspace = true }
+zc-anim = { workspace = true }
+zc-plugin = { workspace = true }
+zc-project = { workspace = true }
+zc-scene = { workspace = true }
+zc-render = { workspace = true }
+zc-audio = { workspace = true }
+zc-export = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

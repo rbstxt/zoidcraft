@@ -1,0 +1,20 @@
+[package]
+name = "zc-scene"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zc-time = { workspace = true }
+zc-geom = { workspace = true }
+zc-color = { workspace = true }
+zc-anim = { workspace = true }
+zc-project = { workspace = true }
+ttf-parser = { workspace = true }
+lyon_tessellation = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
