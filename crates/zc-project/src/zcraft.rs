@@ -614,14 +614,16 @@ fn load_zcraft_with_limits(
         for req in &meta_doc.required_plugins {
             if !req.id.is_empty() {
                 project.plugin_requirements.insert(req.id.clone());
-                if !req.features.is_empty() {
+                if req.features.is_empty() {
+                    features_map.remove(&req.id);
+                } else {
                     features_map.insert(req.id.clone(), req.features.clone());
                 }
             }
         }
-        if !features_map.is_empty()
-            && let Ok(val) = serde_json::to_value(&features_map)
-        {
+        if features_map.is_empty() {
+            project.preserved.remove("manifest_plugin_features");
+        } else if let Ok(val) = serde_json::to_value(&features_map) {
             project
                 .preserved
                 .insert("manifest_plugin_features".to_owned(), val);
@@ -950,6 +952,48 @@ mod tests {
         assert_eq!(
             rm["required_plugins"][0]["features"],
             serde_json::json!(["expressions", "sequence-controls"])
+        );
+
+        // If manifest later clears features to [], stale features in project.json are cleared on resave.
+        let mut stale_project = opened.clone();
+        stale_project.preserved.insert(
+            "manifest_plugin_features".to_owned(),
+            serde_json::json!({ "expressions-plus": ["stale-feature"] }),
+        );
+        let p_stale_json = serde_json::to_vec(&stale_project).expect("stale project json");
+        let empty_feat_manifest = serde_json::json!({
+            "format": "zoidcraft",
+            "schema_version": 1,
+            "app_version": "0.1.0",
+            "project_name": "EmptyFeat",
+            "created_utc": "2025-01-02T03:04:05Z",
+            "modified_utc": "2025-01-02T03:04:05Z",
+            "required_plugins": [{ "id": "expressions-plus", "features": [] }],
+            "missing_assets": [],
+            "integrity": {
+                "project.json": { "size": p_stale_json.len(), "sha256": sha256_hex(&p_stale_json) }
+            }
+        });
+        let m_empty_json = serde_json::to_vec(&empty_feat_manifest).expect("empty manifest");
+        let tgz_empty = build_raw_tgz(&[
+            ("manifest.json", tar::EntryType::Regular, &m_empty_json),
+            ("project.json", tar::EntryType::Regular, &p_stale_json),
+        ]);
+        let opened_empty = load_zcraft_from_bytes(&tgz_empty).expect("load empty features");
+        let resaved_empty = save_zcraft_to_bytes(&opened_empty).expect("resave empty features");
+        let mut tar3 = tar::Archive::new(GzDecoder::new(resaved_empty.as_slice()));
+        let mut rm3: Option<serde_json::Value> = None;
+        for e in tar3.entries().expect("entries") {
+            let mut e = e.expect("entry");
+            if e.path().expect("path").to_string_lossy() == "manifest.json" {
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf).expect("read");
+                rm3 = Some(serde_json::from_slice(&buf).expect("parse"));
+            }
+        }
+        assert_eq!(
+            rm3.expect("manifest")["required_plugins"][0]["features"],
+            serde_json::json!([])
         );
 
         // Long asset path triggering GNU @LongLink header obeys exact uncompressed TAR limit.

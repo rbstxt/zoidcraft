@@ -274,11 +274,80 @@ pub enum TrackKind {
     Audio,
 }
 
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_control_points() -> [[f64; 2]; 2] {
+    [[-10.0, 0.0], [10.0, 0.0]]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionValueKind {
+    Number,
+    Vec2,
+    Vec3,
+    Vec4,
+    Color,
+    ColorRgba,
+    Gradient,
+    Option,
+    Text,
+    Asset,
+    List,
+    Curve,
+    Shader,
+    Bool,
+    Json,
+}
+
+impl SessionValueKind {
+    fn from_prop_value(v: &zc_project::PropertyValue) -> Self {
+        match v {
+            zc_project::PropertyValue::Number(_) => Self::Number,
+            zc_project::PropertyValue::Vec2(_) => Self::Vec2,
+            zc_project::PropertyValue::Vec3(_) => Self::Vec3,
+            zc_project::PropertyValue::Vec4(_) => Self::Vec4,
+            zc_project::PropertyValue::Color(_) => Self::Color,
+            zc_project::PropertyValue::ColorRgba(_) => Self::ColorRgba,
+            zc_project::PropertyValue::Gradient(_) => Self::Gradient,
+            zc_project::PropertyValue::Option(_) => Self::Option,
+            zc_project::PropertyValue::Text(_) => Self::Text,
+            zc_project::PropertyValue::Asset(_) => Self::Asset,
+            zc_project::PropertyValue::List(_) => Self::List,
+            zc_project::PropertyValue::Curve(_) => Self::Curve,
+            zc_project::PropertyValue::Shader(_) => Self::Shader,
+            zc_project::PropertyValue::Bool(_) => Self::Bool,
+            zc_project::PropertyValue::Json(_) => Self::Json,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionKeyframe {
     pub frame: f64,
     pub value: Value,
     pub tween: u16,
+    #[serde(default = "default_control_points")]
+    pub control_points: [[f64; 2]; 2],
+    #[serde(default = "default_true")]
+    pub continuous_tangent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_kind: Option<SessionValueKind>,
+}
+
+impl SessionKeyframe {
+    fn new(frame: f64, value: Value, tween: u16) -> Self {
+        Self {
+            frame,
+            value,
+            tween,
+            control_points: default_control_points(),
+            continuous_tangent: true,
+            value_kind: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -295,11 +364,7 @@ impl SessionProperty {
             animated: false,
             expression: None,
             default_value: value.clone(),
-            keyframes: vec![SessionKeyframe {
-                frame: 0.0,
-                value,
-                tween: 1,
-            }],
+            keyframes: vec![SessionKeyframe::new(0.0, value, 1)],
         }
     }
 
@@ -318,11 +383,7 @@ impl SessionProperty {
     fn reset(&mut self) {
         self.animated = false;
         self.expression = None;
-        self.keyframes = vec![SessionKeyframe {
-            frame: 0.0,
-            value: self.default_value.clone(),
-            tween: 1,
-        }];
+        self.keyframes = vec![SessionKeyframe::new(0.0, self.default_value.clone(), 1)];
     }
 }
 
@@ -332,6 +393,8 @@ pub struct SessionObject3D {
     pub parent_id: Option<String>,
     pub kind: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     pub properties: BTreeMap<String, SessionProperty>,
 }
 
@@ -340,6 +403,8 @@ pub struct SessionEffect {
     pub id: String,
     pub kind: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     pub properties: BTreeMap<String, SessionProperty>,
 }
 
@@ -388,16 +453,8 @@ impl SessionClip {
                     .and_then(|p| p.expression.clone()),
                 default_value: json!(0.0),
                 keyframes: vec![
-                    SessionKeyframe {
-                        frame: 0.0,
-                        value: json!(self.time_start),
-                        tween: 1,
-                    },
-                    SessionKeyframe {
-                        frame: self.length,
-                        value: json!(self.time_end),
-                        tween: 1,
-                    },
+                    SessionKeyframe::new(0.0, json!(self.time_start), 1),
+                    SessionKeyframe::new(self.length, json!(self.time_end), 1),
                 ],
             },
         );
@@ -485,13 +542,15 @@ fn prop_value_to_json(v: &zc_project::PropertyValue) -> Value {
     }
 }
 
-fn json_to_prop_value_with_template(
+fn json_to_prop_value_with_kind(
     v: &Value,
+    kind: Option<SessionValueKind>,
     template: Option<&zc_project::PropertyValue>,
 ) -> zc_project::PropertyValue {
-    if let Some(tpl) = template {
-        match tpl {
-            zc_project::PropertyValue::Option(_) => {
+    let resolved_kind = kind.or_else(|| template.map(SessionValueKind::from_prop_value));
+    if let Some(k) = resolved_kind {
+        match k {
+            SessionValueKind::Option => {
                 if let Some(n) = v.as_f64() {
                     return zc_project::PropertyValue::Option(n.round().max(0.0) as u32);
                 }
@@ -499,7 +558,7 @@ fn json_to_prop_value_with_template(
                     return zc_project::PropertyValue::Option(u32::from(b));
                 }
             }
-            zc_project::PropertyValue::Color(_) => {
+            SessionValueKind::Color => {
                 if let Some(arr) = v.as_array()
                     && arr.len() == 3
                     && let (Some(a), Some(b), Some(c)) =
@@ -508,7 +567,7 @@ fn json_to_prop_value_with_template(
                     return zc_project::PropertyValue::Color([a, b, c]);
                 }
             }
-            zc_project::PropertyValue::ColorRgba(_) => {
+            SessionValueKind::ColorRgba => {
                 if let Some(arr) = v.as_array()
                     && arr.len() == 4
                     && let (Some(a), Some(b), Some(c), Some(d)) = (
@@ -521,30 +580,36 @@ fn json_to_prop_value_with_template(
                     return zc_project::PropertyValue::ColorRgba([a, b, c, d]);
                 }
             }
-            zc_project::PropertyValue::Asset(_) => {
+            SessionValueKind::Asset => {
                 return zc_project::PropertyValue::Asset(v.as_str().map(ToOwned::to_owned));
             }
-            zc_project::PropertyValue::List(_) => {
+            SessionValueKind::List => {
                 if let Some(s) = v.as_str() {
                     return zc_project::PropertyValue::List(s.to_owned());
                 }
             }
-            zc_project::PropertyValue::Shader(_) => {
+            SessionValueKind::Shader => {
                 if let Some(s) = v.as_str() {
                     return zc_project::PropertyValue::Shader(s.to_owned());
                 }
             }
-            zc_project::PropertyValue::Curve(_) => {
+            SessionValueKind::Curve => {
                 return zc_project::PropertyValue::Curve(v.clone());
             }
-            zc_project::PropertyValue::Gradient(_) => {
+            SessionValueKind::Gradient => {
                 if let Ok(stops) =
                     serde_json::from_value::<Vec<zc_project::GradientStop>>(v.clone())
                 {
                     return zc_project::PropertyValue::Gradient(stops);
                 }
             }
-            _ => {}
+            SessionValueKind::Number
+            | SessionValueKind::Vec2
+            | SessionValueKind::Vec3
+            | SessionValueKind::Vec4
+            | SessionValueKind::Text
+            | SessionValueKind::Bool
+            | SessionValueKind::Json => {}
         }
     }
     json_to_prop_value(v)
@@ -579,11 +644,15 @@ fn json_to_prop_value(v: &Value) -> zc_project::PropertyValue {
 
 fn property_track_to_session(track: &zc_project::PropertyTrack) -> SessionProperty {
     let default_value = prop_value_to_json(&track.value);
+    let default_kind = SessionValueKind::from_prop_value(&track.value);
     let keyframes = if track.keyframes.is_empty() {
         vec![SessionKeyframe {
             frame: 0.0,
             value: default_value.clone(),
             tween: 1,
+            control_points: default_control_points(),
+            continuous_tangent: true,
+            value_kind: Some(default_kind),
         }]
     } else {
         track
@@ -593,6 +662,9 @@ fn property_track_to_session(track: &zc_project::PropertyTrack) -> SessionProper
                 frame: kf.frame,
                 value: prop_value_to_json(&kf.value),
                 tween: kf.tween as u16,
+                control_points: kf.control_points,
+                continuous_tangent: kf.continuous_tangent,
+                value_kind: Some(SessionValueKind::from_prop_value(&kf.value)),
             })
             .collect()
     };
@@ -616,12 +688,14 @@ fn session_property_to_track(
 
     let val_template = fallback.map(|t| &t.value);
     let value = if prop.animated {
-        json_to_prop_value_with_template(&prop.default_value, val_template)
+        json_to_prop_value_with_kind(&prop.default_value, None, val_template)
     } else {
         prop.keyframes
             .first()
-            .map(|k| json_to_prop_value_with_template(&k.value, val_template))
-            .unwrap_or_else(|| json_to_prop_value_with_template(&prop.default_value, val_template))
+            .map(|k| json_to_prop_value_with_kind(&k.value, k.value_kind, val_template))
+            .unwrap_or_else(|| {
+                json_to_prop_value_with_kind(&prop.default_value, None, val_template)
+            })
     };
     let keyframes = prop
         .keyframes
@@ -633,15 +707,12 @@ fn session_property_to_track(
                     .find(|existing| (existing.frame - kf.frame).abs() < 1e-6)
             });
             let kf_template = existing_kf.map(|k| &k.value).or(val_template);
-            let (cp, cont) = existing_kf.map_or(([[-10.0, 0.0], [10.0, 0.0]], true), |existing| {
-                (existing.control_points, existing.continuous_tangent)
-            });
             zc_project::PropertyKeyframe::from_cm3_tween(
                 kf.frame,
-                json_to_prop_value_with_template(&kf.value, kf_template),
+                json_to_prop_value_with_kind(&kf.value, kf.value_kind, kf_template),
                 u32::from(kf.tween),
-                cp,
-                cont,
+                kf.control_points,
+                kf.continuous_tangent,
             )
         })
         .collect();
@@ -725,6 +796,7 @@ fn flatten_objects_3d(
             parent_id: parent_id.clone(),
             kind: object_3d_kind_to_str(&obj.kind),
             name: obj.name.clone(),
+            source_id: None,
             properties,
         });
         if let zc_project::Object3DKind::Group { children, .. } = &obj.kind {
@@ -758,6 +830,7 @@ fn effect_to_session(fx: &zc_project::EffectInstance) -> SessionEffect {
         id: fx.id.to_string(),
         kind: effect_kind_to_session_id(&fx.kind),
         name: fx.name.clone(),
+        source_id: None,
         properties,
     }
 }
@@ -1626,8 +1699,10 @@ impl Session {
     fn remap_cloned_clip_children(&mut self, clip: &mut SessionClip) {
         let mut obj_remap = BTreeMap::new();
         for obj in &mut clip.objects_3d {
+            let old_id = obj.id.clone();
             let new_id = self.alloc_uuid_id();
-            obj_remap.insert(obj.id.clone(), new_id.clone());
+            obj_remap.insert(old_id.clone(), new_id.clone());
+            obj.source_id = Some(old_id);
             obj.id = new_id;
         }
         for obj in &mut clip.objects_3d {
@@ -1638,6 +1713,8 @@ impl Session {
             }
         }
         for fx in &mut clip.effects {
+            let old_id = fx.id.clone();
+            fx.source_id = Some(old_id);
             fx.id = self.alloc_uuid_id();
         }
     }
@@ -2323,6 +2400,7 @@ impl Session {
                     parent_id: parent_id.clone(),
                     kind: kind.clone(),
                     name: obj_name.clone(),
+                    source_id: None,
                     properties,
                 });
                 Ok(json!({
@@ -2395,6 +2473,7 @@ impl Session {
                     })?;
 
                 let mut cloned = clip.objects_3d[pos].clone();
+                cloned.source_id = Some(cloned.id.clone());
                 cloned.id = new_obj_id.clone();
                 clip.objects_3d.insert(pos + 1, cloned);
                 Ok(json!({
@@ -2496,6 +2575,7 @@ impl Session {
                     id: new_fx_id.clone(),
                     kind: kind.clone(),
                     name: fx_name.clone(),
+                    source_id: None,
                     properties,
                 });
                 Ok(json!({
@@ -2546,6 +2626,7 @@ impl Session {
                         SessionError::NotFound(format!("effect '{effect_id}' in clip '{clip_id}'"))
                     })?;
                 let mut cloned = clip.effects[pos].clone();
+                cloned.source_id = Some(cloned.id.clone());
                 cloned.id = new_fx_id.clone();
                 clip.effects.insert(pos + 1, cloned);
                 Ok(json!({
@@ -2593,11 +2674,9 @@ impl Session {
                     .entry(property.clone())
                     .or_insert_with(|| SessionProperty::static_value(value.clone()));
                 if entry.keyframes.is_empty() {
-                    entry.keyframes.push(SessionKeyframe {
-                        frame: 0.0,
-                        value: value.clone(),
-                        tween: 1,
-                    });
+                    entry
+                        .keyframes
+                        .push(SessionKeyframe::new(0.0, value.clone(), 1));
                 } else {
                     entry.keyframes[0].value = value.clone();
                 }
@@ -2628,23 +2707,22 @@ impl Session {
                         .keyframes
                         .first()
                         .map_or_else(|| entry.default_value.clone(), |k| k.value.clone());
+                    let collapsed_kind = entry.keyframes.first().and_then(|k| k.value_kind);
                     entry.animated = false;
                     entry.expression = None;
-                    entry.keyframes = vec![SessionKeyframe {
-                        frame: 0.0,
-                        value: collapsed_val,
-                        tween: 1,
-                    }];
+                    let mut kf = SessionKeyframe::new(0.0, collapsed_val, 1);
+                    kf.value_kind = collapsed_kind;
+                    entry.keyframes = vec![kf];
                 } else {
                     entry.animated = true;
                     if entry.keyframes.len() == 1 {
                         entry.keyframes[0].frame = frame;
                     } else if entry.keyframes.is_empty() {
-                        entry.keyframes.push(SessionKeyframe {
+                        entry.keyframes.push(SessionKeyframe::new(
                             frame,
-                            value: entry.default_value.clone(),
-                            tween: 1,
-                        });
+                            entry.default_value.clone(),
+                            1,
+                        ));
                     }
                 }
                 Ok(json!({
@@ -2672,6 +2750,7 @@ impl Session {
                     .or_insert_with(|| SessionProperty::static_value(value.clone()));
                 entry.animated = true;
                 let resolved_tween = tween.unwrap_or(1);
+                let inherited_kind = entry.keyframes.first().and_then(|k| k.value_kind);
 
                 if let Some(existing) = entry
                     .keyframes
@@ -2683,11 +2762,9 @@ impl Session {
                         existing.tween = t;
                     }
                 } else {
-                    entry.keyframes.push(SessionKeyframe {
-                        frame,
-                        value: value.clone(),
-                        tween: resolved_tween,
-                    });
+                    let mut kf = SessionKeyframe::new(frame, value.clone(), resolved_tween);
+                    kf.value_kind = inherited_kind;
+                    entry.keyframes.push(kf);
                     entry.keyframes.sort_by(|a, b| a.frame.total_cmp(&b.frame));
                 }
                 Ok(json!({
@@ -2969,6 +3046,7 @@ fn rebuild_object_tree(
     flat: &[SessionObject3D],
     parent_id: Option<&str>,
     existing: &mut BTreeMap<String, zc_project::Object3D>,
+    templates: &BTreeMap<String, zc_project::Object3D>,
     depth: usize,
 ) -> Vec<zc_project::Object3D> {
     if depth > 64 {
@@ -2977,8 +3055,18 @@ fn rebuild_object_tree(
     let mut out = Vec::new();
     for sobj in flat {
         if sobj.parent_id.as_deref() == parent_id {
-            let children = rebuild_object_tree(flat, Some(&sobj.id), existing, depth + 1);
-            let prev = existing.remove(&sobj.id);
+            let children =
+                rebuild_object_tree(flat, Some(&sobj.id), existing, templates, depth + 1);
+            let prev = existing.remove(&sobj.id).or_else(|| {
+                sobj.source_id
+                    .as_deref()
+                    .and_then(|src_id| templates.get(src_id))
+                    .map(|tpl| {
+                        let mut cloned = tpl.clone();
+                        cloned.id = parse_uuid_or_new(&sobj.id);
+                        cloned
+                    })
+            });
             out.push(build_object_3d_from_session(sobj, prev, children));
         }
     }
@@ -3028,7 +3116,7 @@ fn sync_effect_from_session(
 }
 
 fn sync_video_clip_from_session(
-    sclip: &SessionClip,
+    sclip: &mut SessionClip,
     existing: Option<zc_project::VideoClip>,
     resolution: [u32; 2],
     fps: u32,
@@ -3120,7 +3208,17 @@ fn sync_video_clip_from_session(
     if let zc_project::LayerKind::Scene3D { objects, .. } = &mut vc.layer.kind {
         let mut existing_objs = BTreeMap::new();
         collect_existing_objects(std::mem::take(objects), &mut existing_objs);
-        *objects = rebuild_object_tree(&sclip.objects_3d, None, &mut existing_objs, 0);
+        let obj_templates = existing_objs.clone();
+        *objects = rebuild_object_tree(
+            &sclip.objects_3d,
+            None,
+            &mut existing_objs,
+            &obj_templates,
+            0,
+        );
+        for sobj in &mut sclip.objects_3d {
+            sobj.source_id = None;
+        }
     }
 
     let mut existing_fx: BTreeMap<String, zc_project::EffectInstance> = vc
@@ -3129,10 +3227,24 @@ fn sync_video_clip_from_session(
         .drain(..)
         .map(|fx| (fx.id.to_string(), fx))
         .collect();
+    let fx_templates = existing_fx.clone();
     vc.layer.effects = sclip
         .effects
-        .iter()
-        .map(|sfx| sync_effect_from_session(sfx, existing_fx.remove(&sfx.id)))
+        .iter_mut()
+        .map(|sfx| {
+            let base = existing_fx.remove(&sfx.id).or_else(|| {
+                sfx.source_id
+                    .as_deref()
+                    .and_then(|src_id| fx_templates.get(src_id))
+                    .map(|tpl| {
+                        let mut cloned = tpl.clone();
+                        cloned.id = parse_uuid_or_new(&sfx.id);
+                        cloned
+                    })
+            });
+            sfx.source_id = None;
+            sync_effect_from_session(sfx, base)
+        })
         .collect();
 
     vc
@@ -3900,5 +4012,84 @@ mod tests {
             Some(&[1u8, 2, 3, 4][..])
         );
         assert!(session.project.assets["missing-key"].bytes.is_none());
+    }
+
+    #[test]
+    fn round3_cloned_child_payloads_and_shifted_keyframe_types_and_bezier_handles_survive() {
+        let mut project = zc_project::Project::new_cm3_default();
+        // Attach a custom GLSL shader effect AND a 3D object with custom material + preserved
+        // + a shifted Color keyframe with custom Bezier handles on a Vec3-base track.
+        let clip_id = project.sequence.video_tracks[0].clips[0].id;
+        let custom_handles = [[-4.5, 1.25], [7.25, -2.5]];
+        let mut custom_fx = zc_project::create_custom_shader(
+            "MyShader",
+            "void main() { gl_FragColor = vec4(1.0); }",
+        );
+        custom_fx.params.insert(
+            "tint".to_string(),
+            zc_project::PropertyTrack {
+                animated: true,
+                expression: None,
+                static_behavior: zc_project::StaticBehavior::Constant,
+                value: zc_project::PropertyValue::Vec3([0.0, 0.0, 0.0]),
+                keyframes: vec![zc_project::PropertyKeyframe::from_cm3_tween(
+                    40.0,
+                    zc_project::PropertyValue::Color([0.2, 0.4, 0.8]),
+                    257,
+                    custom_handles,
+                    false,
+                )],
+                channels: Vec::new(),
+            },
+        );
+        project.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .push(custom_fx);
+
+        if let zc_project::LayerKind::Scene3D {
+            ref mut objects, ..
+        } = project.sequence.video_tracks[0].clips[0].layer.kind
+        {
+            objects[0]
+                .preserved
+                .insert("customTag".to_string(), json!("keep-on-clone"));
+        }
+
+        let mut session = Session::from_project(project, zc_plugin::PluginRegistry::new());
+        // Split at frame 30 -> right half clones 3D objects & custom shader effect with new IDs
+        // AND shifts the keyframe from frame 40 to frame 10.
+        session
+            .execute(Command::SplitClip {
+                clip_id: clip_id.to_string(),
+                at_frame: 30.0,
+            })
+            .expect("split scene clip");
+
+        let right_clip = &session.project.sequence.video_tracks[0].clips[1];
+        // Cloned 3D object keeps preserved metadata & material.
+        if let zc_project::LayerKind::Scene3D { ref objects, .. } = right_clip.layer.kind {
+            assert_eq!(
+                objects[0].preserved.get("customTag"),
+                Some(&json!("keep-on-clone"))
+            );
+        } else {
+            panic!("expected Scene3D on right half");
+        }
+
+        // Cloned custom shader effect keeps frag_shader AND shifted keyframe keeps Color type + Bezier handles.
+        let right_fx = &right_clip.layer.effects[0];
+        assert!(matches!(
+            &right_fx.kind,
+            zc_project::EffectKind::CustomShader { frag_shader, .. } if frag_shader.contains("gl_FragColor")
+        ));
+        let shifted_kf = &right_fx.params["tint"].keyframes[0];
+        assert!((shifted_kf.frame - 10.0).abs() < 1e-9);
+        assert_eq!(
+            shifted_kf.value,
+            zc_project::PropertyValue::Color([0.2, 0.4, 0.8])
+        );
+        assert_eq!(shifted_kf.control_points, custom_handles);
+        assert!(!shifted_kf.continuous_tangent);
     }
 }
