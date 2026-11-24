@@ -1,10 +1,16 @@
 //! Deterministic offline stereo audio mixer implementing the exact CM3
 //! gain and equal-power pan law (Spec 03 §1.4 & Spec 04 §4.2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::f32::consts::FRAC_PI_2;
 
-use crate::decode::{AudioBuffer, resample_stereo};
+use crate::AudioError;
+use crate::decode::{AudioBuffer, MAX_AUDIO_SAMPLE_RATE, MIN_AUDIO_SAMPLE_RATE, resample_stereo};
+
+/// Maximum stereo sample frames produced in one offline mix buffer (32M frames = 256 MiB).
+pub const MAX_OFFLINE_MIX_SAMPLES: usize = 32 * 1024 * 1024;
+/// Maximum total stereo frames kept simultaneously in the mixer's resampled cache (16M frames = 128 MiB).
+const MAX_RESAMPLED_CACHE_FRAMES: usize = 16 * 1024 * 1024;
 
 /// Scheduled audio clip on a timeline track for offline mixing.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,20 +96,40 @@ pub fn apply_gain_and_pan(sample: [f32; 2], volume: f32, pan: f32) -> [f32; 2] {
     }
 }
 
-/// Computes the exact offline output sample count: `floor((total_frames / fps) * sample_rate)`.
-#[must_use]
-pub fn offline_total_samples(total_frames: f64, fps: f64, sample_rate: u32) -> usize {
+/// Computes the exact offline output sample count: `floor((total_frames / fps) * sample_rate)`,
+/// returning `Err` if parameters are invalid or exceed [`MAX_OFFLINE_MIX_SAMPLES`].
+pub fn try_offline_total_samples(
+    total_frames: f64,
+    fps: f64,
+    sample_rate: u32,
+) -> Result<usize, AudioError> {
     if !total_frames.is_finite()
         || !fps.is_finite()
-        || total_frames <= 0.0
+        || total_frames < 0.0
         || fps <= 0.0
-        || sample_rate == 0
+        || !(MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE).contains(&sample_rate)
     {
-        return 0;
+        return Err(AudioError::InvalidFormat(format!(
+            "invalid offline mix parameters: total_frames={total_frames}, fps={fps}, sample_rate={sample_rate}"
+        )));
     }
-    ((total_frames / fps) * f64::from(sample_rate))
-        .floor()
-        .max(0.0) as usize
+    if total_frames == 0.0 {
+        return Ok(0);
+    }
+    let raw = ((total_frames / fps) * f64::from(sample_rate)).floor();
+    if !raw.is_finite() || raw < 0.0 || raw > MAX_OFFLINE_MIX_SAMPLES as f64 {
+        return Err(AudioError::InvalidFormat(format!(
+            "offline mix sample count ({raw}) exceeds memory cap ({MAX_OFFLINE_MIX_SAMPLES})"
+        )));
+    }
+    Ok(raw as usize)
+}
+
+/// Computes the exact offline output sample count: `floor((total_frames / fps) * sample_rate)`,
+/// returning `0` if invalid or above [`MAX_OFFLINE_MIX_SAMPLES`].
+#[must_use]
+pub fn offline_total_samples(total_frames: f64, fps: f64, sample_rate: u32) -> usize {
+    try_offline_total_samples(total_frames, fps, sample_rate).unwrap_or(0)
 }
 
 /// Mixes static [`AudioClipScheduleItem`] entries into a deterministic stereo output buffer
@@ -133,6 +159,30 @@ pub fn mix_offline_stereo(
     )
 }
 
+/// Fallible version of [`mix_offline_stereo_animated`] that rejects excessive sample counts
+/// instead of silently truncating or OOM-aborting.
+pub fn try_mix_offline_stereo_animated<F>(
+    total_frames: f64,
+    fps: f64,
+    sample_rate: u32,
+    clips: &[AudioClipScheduleItem],
+    buffers: &HashMap<String, AudioBuffer>,
+    eval_clip: F,
+) -> Result<Vec<[f32; 2]>, AudioError>
+where
+    F: Fn(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
+{
+    let total_samples = try_offline_total_samples(total_frames, fps, sample_rate)?;
+    Ok(mix_offline_stereo_animated_inner(
+        total_samples,
+        fps,
+        sample_rate,
+        clips,
+        buffers,
+        eval_clip,
+    ))
+}
+
 /// Mixes scheduled audio clips using a per-sample animated parameter callback.
 ///
 /// `eval_clip(clip_index, clip, local_frame)` evaluates animated `time(f)`, `volume(f)`,
@@ -150,14 +200,32 @@ where
     F: Fn(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
 {
     let total_samples = offline_total_samples(total_frames, fps, sample_rate);
+    mix_offline_stereo_animated_inner(total_samples, fps, sample_rate, clips, buffers, eval_clip)
+}
+
+fn mix_offline_stereo_animated_inner<F>(
+    total_samples: usize,
+    fps: f64,
+    sample_rate: u32,
+    clips: &[AudioClipScheduleItem],
+    buffers: &HashMap<String, AudioBuffer>,
+    eval_clip: F,
+) -> Vec<[f32; 2]>
+where
+    F: Fn(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
+{
     let mut output = vec![[0.0_f32; 2]; total_samples];
     if total_samples == 0 || clips.is_empty() {
         return output;
     }
 
-    // Cache stereo buffers resampled to the target sample rate once per referenced buffer_id.
+    // Bounded FIFO cache of resampled stereo buffers so multi-asset projects never double-allocate
+    // unbounded memory; native stereo buffers already at `sample_rate` are sampled directly zero-copy.
     let mut resampled_cache: HashMap<&str, Vec<[f32; 2]>> = HashMap::new();
+    let mut resampled_order: VecDeque<&str> = VecDeque::new();
+    let mut resampled_cached_frames: usize = 0;
     let sr_f64 = f64::from(sample_rate);
+    let total_sec = total_samples as f64 / sr_f64;
 
     for (clip_idx, clip) in clips.iter().enumerate() {
         if !clip.clip_start_frame.is_finite()
@@ -167,56 +235,85 @@ where
             continue;
         }
 
-        let Some(src_stereo) = resampled_cache
-            .entry(clip.buffer_id.as_str())
-            .or_insert_with(|| {
-                buffers
-                    .get(&clip.buffer_id)
-                    .map(|buf| resample_stereo(buf, sample_rate))
-                    .unwrap_or_default()
-            })
-            .as_slice()
-            .into()
-        else {
-            continue;
-        };
-
-        if src_stereo.is_empty() {
+        let start_sec = clip.clip_start_frame / fps;
+        let end_sec = (clip.clip_start_frame + clip.clip_length_frames) / fps;
+        if end_sec <= 0.0 || start_sec >= total_sec {
             continue;
         }
 
-        let start_sec = clip.clip_start_frame / fps;
-        let end_sec = (clip.clip_start_frame + clip.clip_length_frames) / fps;
-        if end_sec <= 0.0 {
+        let Some(raw_buf) = buffers.get(&clip.buffer_id) else {
+            continue;
+        };
+        if raw_buf.frame_count() == 0 {
             continue;
         }
 
         let start_sample = (start_sec * sr_f64).floor().max(0.0) as usize;
         let end_sample = ((end_sec * sr_f64).ceil().max(0.0) as usize).min(total_samples);
+        if start_sample >= end_sample {
+            continue;
+        }
 
-        for (sample_idx, out_frame) in output
-            .iter_mut()
-            .enumerate()
-            .take(end_sample)
-            .skip(start_sample)
-        {
-            let timeline_sec = sample_idx as f64 / sr_f64;
-            let timeline_frame = timeline_sec * fps;
-            let local_frame = timeline_frame - clip.clip_start_frame;
-
-            if local_frame < 0.0 || local_frame >= clip.clip_length_frames {
+        let native_stereo_ready = raw_buf.sample_rate == sample_rate && raw_buf.channels == 2;
+        if !native_stereo_ready && !resampled_cache.contains_key(clip.buffer_id.as_str()) {
+            let resampled = resample_stereo(raw_buf, sample_rate);
+            let new_frames = resampled.len();
+            while resampled_cached_frames.saturating_add(new_frames) > MAX_RESAMPLED_CACHE_FRAMES
+                && let Some(oldest_key) = resampled_order.pop_front()
+            {
+                if let Some(evicted) = resampled_cache.remove(oldest_key) {
+                    resampled_cached_frames = resampled_cached_frames.saturating_sub(evicted.len());
+                }
+            }
+            if new_frames <= MAX_RESAMPLED_CACHE_FRAMES {
+                resampled_cached_frames = resampled_cached_frames.saturating_add(new_frames);
+                resampled_order.push_back(clip.buffer_id.as_str());
+                resampled_cache.insert(clip.buffer_id.as_str(), resampled);
+            } else {
+                // Single buffer larger than cache cap: sample directly without retaining in cache.
+                mix_clip_into_output(
+                    &mut output,
+                    start_sample,
+                    end_sample,
+                    sr_f64,
+                    fps,
+                    clip_idx,
+                    clip,
+                    &eval_clip,
+                    |pos| sample_stereo_linear(&resampled, pos),
+                );
                 continue;
             }
+        }
 
-            let params = eval_clip(clip_idx, clip, local_frame);
-            if !params.media_time_sec.is_finite() || params.media_time_sec < 0.0 {
+        if native_stereo_ready {
+            let interleaved = &raw_buf.samples_interleaved_f32;
+            mix_clip_into_output(
+                &mut output,
+                start_sample,
+                end_sample,
+                sr_f64,
+                fps,
+                clip_idx,
+                clip,
+                &eval_clip,
+                |pos| sample_interleaved_stereo_linear(interleaved, pos),
+            );
+        } else if let Some(src_stereo) = resampled_cache.get(clip.buffer_id.as_str()) {
+            if src_stereo.is_empty() {
                 continue;
             }
-
-            let src_sample = sample_stereo_linear(src_stereo, params.media_time_sec * sr_f64);
-            let mixed = apply_gain_and_pan(src_sample, params.volume, params.pan);
-            out_frame[0] += mixed[0];
-            out_frame[1] += mixed[1];
+            mix_clip_into_output(
+                &mut output,
+                start_sample,
+                end_sample,
+                sr_f64,
+                fps,
+                clip_idx,
+                clip,
+                &eval_clip,
+                |pos| sample_stereo_linear(src_stereo, pos),
+            );
         }
     }
 
@@ -226,6 +323,66 @@ where
     }
 
     output
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mix_clip_into_output<F, S>(
+    output: &mut [[f32; 2]],
+    start_sample: usize,
+    end_sample: usize,
+    sr_f64: f64,
+    fps: f64,
+    clip_idx: usize,
+    clip: &AudioClipScheduleItem,
+    eval_clip: &F,
+    sample_at: S,
+) where
+    F: Fn(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
+    S: Fn(f64) -> [f32; 2],
+{
+    for (sample_idx, out_frame) in output
+        .iter_mut()
+        .enumerate()
+        .take(end_sample)
+        .skip(start_sample)
+    {
+        let timeline_sec = sample_idx as f64 / sr_f64;
+        let timeline_frame = timeline_sec * fps;
+        let local_frame = timeline_frame - clip.clip_start_frame;
+
+        if local_frame < 0.0 || local_frame >= clip.clip_length_frames {
+            continue;
+        }
+
+        let params = eval_clip(clip_idx, clip, local_frame);
+        if !params.media_time_sec.is_finite() || params.media_time_sec < 0.0 {
+            continue;
+        }
+
+        let src_sample = sample_at(params.media_time_sec * sr_f64);
+        let mixed = apply_gain_and_pan(src_sample, params.volume, params.pan);
+        out_frame[0] += mixed[0];
+        out_frame[1] += mixed[1];
+    }
+}
+
+#[inline]
+fn sample_interleaved_stereo_linear(interleaved: &[f32], sample_pos: f64) -> [f32; 2] {
+    let frames = interleaved.len() / 2;
+    if !sample_pos.is_finite() || sample_pos < 0.0 || frames == 0 {
+        return [0.0, 0.0];
+    }
+    let idx0 = sample_pos.floor() as usize;
+    if idx0 >= frames {
+        return [0.0, 0.0];
+    }
+    let idx1 = (idx0 + 1).min(frames - 1);
+    let frac = (sample_pos - idx0 as f64).clamp(0.0, 1.0) as f32;
+    let a0 = interleaved[idx0 * 2];
+    let a1 = interleaved[idx0 * 2 + 1];
+    let b0 = interleaved[idx1 * 2];
+    let b1 = interleaved[idx1 * 2 + 1];
+    [a0 + (b0 - a0) * frac, a1 + (b1 - a1) * frac]
 }
 
 #[inline]

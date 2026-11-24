@@ -5,6 +5,21 @@ use std::path::PathBuf;
 use crate::ExportError;
 use crate::padding::even_padded_dimensions;
 
+/// Maximum single-axis export resolution in pixels (8K UHD per Spec 04 §4.1).
+pub const MAX_EXPORT_DIMENSION: u32 = 7_680;
+/// Maximum raw RGBA8 frame buffer byte size (`7680 * 7680 * 4` = 235 MiB, capped at 256 MiB).
+pub const MAX_EXPORT_FRAME_BYTES: usize = 256 * 1024 * 1024;
+/// Minimum allowed export frame rate in fps (Spec 04 §4.1).
+pub const MIN_EXPORT_FPS: f64 = 1.0;
+/// Maximum allowed export frame rate in fps (Spec 04 §4.1).
+pub const MAX_EXPORT_FPS: f64 = 240.0;
+/// Maximum frames allowed in a single export job (5 hours at 60 fps).
+pub const MAX_EXPORT_FRAMES: u32 = 1_080_000;
+/// Minimum supported audio export sample rate in Hz.
+pub const MIN_EXPORT_SAMPLE_RATE: u32 = 8_000;
+/// Maximum supported audio export sample rate in Hz.
+pub const MAX_EXPORT_SAMPLE_RATE: u32 = 192_000;
+
 /// Output container format for an export job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportContainer {
@@ -119,22 +134,46 @@ impl ExportSettings {
         }
     }
 
-    /// Validates settings for internal consistency and container/codec compatibility.
+    /// Validates settings for internal consistency, resource bounds, and container/codec compatibility.
     pub fn validate(&self) -> Result<(), ExportError> {
-        if self.width == 0 || self.height == 0 {
-            return Err(ExportError::InvalidSettings(
-                "width and height must be non-zero".to_string(),
-            ));
+        if self.width == 0
+            || self.height == 0
+            || self.width > MAX_EXPORT_DIMENSION
+            || self.height > MAX_EXPORT_DIMENSION
+        {
+            return Err(ExportError::InvalidSettings(format!(
+                "width ({}) and height ({}) must be in 1..={MAX_EXPORT_DIMENSION}",
+                self.width, self.height
+            )));
         }
-        if !self.fps.is_finite() || self.fps <= 0.0 {
-            return Err(ExportError::InvalidSettings(
-                "fps must be finite and greater than zero".to_string(),
-            ));
+        let (enc_w, enc_h) = self.padded_dimensions();
+        let padded_bytes = (enc_w as usize)
+            .checked_mul(enc_h as usize)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| {
+                ExportError::InvalidSettings("export frame byte size overflow".to_string())
+            })?;
+        if padded_bytes > MAX_EXPORT_FRAME_BYTES {
+            return Err(ExportError::InvalidSettings(format!(
+                "export frame size ({padded_bytes} bytes) exceeds limit ({MAX_EXPORT_FRAME_BYTES} bytes)"
+            )));
+        }
+        if !self.fps.is_finite() || self.fps < MIN_EXPORT_FPS || self.fps > MAX_EXPORT_FPS {
+            return Err(ExportError::InvalidSettings(format!(
+                "fps ({}) must be finite and in {MIN_EXPORT_FPS}..={MAX_EXPORT_FPS}",
+                self.fps
+            )));
         }
         if self.end_frame <= self.start_frame {
             return Err(ExportError::InvalidSettings(format!(
                 "end_frame ({}) must be greater than start_frame ({})",
                 self.end_frame, self.start_frame
+            )));
+        }
+        let total_frames = self.total_frames();
+        if total_frames > MAX_EXPORT_FRAMES {
+            return Err(ExportError::InvalidSettings(format!(
+                "total export frames ({total_frames}) exceeds limit ({MAX_EXPORT_FRAMES})"
             )));
         }
         if self.output_path.as_os_str().is_empty() {
@@ -155,10 +194,13 @@ impl ExportSettings {
             ));
         }
 
-        if self.audio_codec != AudioCodec::None && self.sample_rate == 0 {
-            return Err(ExportError::InvalidSettings(
-                "sample_rate must be greater than zero when audio is enabled".to_string(),
-            ));
+        if self.audio_codec != AudioCodec::None
+            && !(MIN_EXPORT_SAMPLE_RATE..=MAX_EXPORT_SAMPLE_RATE).contains(&self.sample_rate)
+        {
+            return Err(ExportError::InvalidSettings(format!(
+                "sample_rate ({}) must be in {MIN_EXPORT_SAMPLE_RATE}..={MAX_EXPORT_SAMPLE_RATE} Hz when audio is enabled",
+                self.sample_rate
+            )));
         }
 
         if matches!(self.audio_codec, AudioCodec::Aac | AudioCodec::Opus)

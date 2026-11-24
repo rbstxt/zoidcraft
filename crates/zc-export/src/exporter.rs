@@ -3,53 +3,81 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder};
 
 use crate::ExportError;
 use crate::ffmpeg::{
-    BoundedStderrBuffer, MAX_STDERR_BYTES, build_ffmpeg_args, resolve_ffmpeg_binary,
+    BoundedStderrBuffer, MAX_STDERR_BYTES, build_ffmpeg_args_with_output, resolve_ffmpeg_binary,
 };
 use crate::padding::pad_rgba_frame_into;
 use crate::settings::{
     AudioCodec, ExportContainer, ExportProgress, ExportReport, ExportSettings, FrameProvider,
 };
-use crate::temp_audio::write_temp_stereo_wav_f32;
+use crate::temp_audio::{TempFileGuard, unique_sibling_temp_path, write_temp_stereo_wav_f32};
 
-/// RAII child process guard that kills and reaps (`wait()`) an unfinished child on drop,
-/// guaranteeing zero zombie processes and zero leaked file descriptors even on error/cancel/panic.
-struct ChildCleanupGuard {
-    child: Option<Child>,
+/// Shared handle to a spawned FFmpeg child process that allows a cancel-watcher thread
+/// to kill a stalled child while guaranteeing the child is always reaped (`wait()`) on
+/// drop/error/cancel/panic (zero zombies, zero leaked descriptors).
+struct SharedChildGuard {
+    child: Arc<Mutex<Option<Child>>>,
 }
 
-impl ChildCleanupGuard {
+impl SharedChildGuard {
     fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+        Self {
+            child: Arc::new(Mutex::new(Some(child))),
+        }
+    }
+
+    fn handle(&self) -> Arc<Mutex<Option<Child>>> {
+        Arc::clone(&self.child)
     }
 
     /// Terminates and reaps the child immediately if still running.
-    fn kill_and_reap(&mut self) {
-        if let Some(mut child) = self.child.take() {
+    fn kill_and_reap(&self) {
+        let mut guard = self
+            .child
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(mut child) = guard.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
 
-    /// Waits cleanly for normal child exit, disarming the kill-on-drop guard.
-    fn wait(mut self) -> Result<std::process::ExitStatus, std::io::Error> {
-        let mut child = self
-            .child
-            .take()
-            .expect("ChildCleanupGuard::wait called only once");
-        child.wait()
+    /// Waits cooperatively for child exit while polling `cancel` every 10 ms so
+    /// cancellation immediately kills and reaps a stalled muxing process.
+    fn wait_cancellable(&self, cancel: &AtomicBool) -> Result<ExitStatus, ExportError> {
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                self.kill_and_reap();
+                return Err(ExportError::Cancelled);
+            }
+            {
+                let mut guard = self
+                    .child
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let Some(child) = guard.as_mut() else {
+                    return Err(ExportError::Cancelled);
+                };
+                if let Some(status) = child.try_wait()? {
+                    let _ = guard.take();
+                    return Ok(status);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
-impl Drop for ChildCleanupGuard {
+impl Drop for SharedChildGuard {
     fn drop(&mut self) {
         self.kill_and_reap();
     }
@@ -187,12 +215,22 @@ where
         return Err(ExportError::Cancelled);
     }
 
-    let args = build_ffmpeg_args(settings, temp_audio_guard.as_ref().map(|g| g.path()))?;
     if let Some(parent) = settings.output_path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
     }
+
+    // Encode to a unique sibling temporary file and publish atomically only on success,
+    // so a failed or cancelled export never deletes or corrupts an existing destination.
+    let temp_output_path = unique_sibling_temp_path(&settings.output_path);
+    let mut temp_output_guard = TempFileGuard::new(temp_output_path.clone());
+
+    let args = build_ffmpeg_args_with_output(
+        settings,
+        temp_audio_guard.as_ref().map(|g| g.path()),
+        temp_output_guard.path(),
+    )?;
 
     let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
     let mut child = Command::new(bin)
@@ -220,9 +258,11 @@ where
 
     let total_frames = settings.total_frames();
 
-    // Stage B: Stream frames over stdin while draining stderr concurrently on a scoped thread.
-    // Drop order on return OR panic: `stdin` drops first -> `child_guard` kills & reaps FFmpeg
-    // (closing FFmpeg's stderr pipe) -> `scope` joins `stderr_thread` cleanly with zero deadlock.
+    let watcher_done = AtomicBool::new(false);
+
+    // Stage B: Stream frames over stdin while concurrently draining stderr and watching `cancel`.
+    // If `cancel` becomes true during a blocked `stdin.write_all` or final mux wait, the watcher
+    // kills FFmpeg immediately, closing its pipe endpoints and unblocking the writer without deadlock.
     let result = std::thread::scope(|scope| -> Result<(), ExportError> {
         let stderr_handle = scope.spawn(move || {
             let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
@@ -230,7 +270,32 @@ where
             ring.into_string_lossy()
         });
 
-        let mut child_guard = ChildCleanupGuard::new(child);
+        let child_guard = SharedChildGuard::new(child);
+        let child_for_watcher = child_guard.handle();
+        let watcher_done_ref = &watcher_done;
+        let _cancel_watcher = scope.spawn(move || {
+            while !watcher_done_ref.load(Ordering::Acquire) {
+                if cancel.load(Ordering::Acquire) {
+                    let mut guard = child_for_watcher
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    if let Some(ch) = guard.as_mut() {
+                        let _ = ch.kill();
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        struct WatcherStop<'a>(&'a AtomicBool);
+        impl Drop for WatcherStop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _stop_watcher = WatcherStop(&watcher_done);
+
         let mut stdin_opt = Some(stdin);
 
         let mut raw_frame = vec![0_u8; raw_bytes];
@@ -246,21 +311,18 @@ where
             if cancel.load(Ordering::Acquire) {
                 drop(stdin_opt.take());
                 child_guard.kill_and_reap();
-                cleanup_partial_output(&settings.output_path);
                 return Err(ExportError::Cancelled);
             }
 
             if let Err(err) = frame_provider.render_frame(frame_index, &mut raw_frame) {
                 drop(stdin_opt.take());
                 child_guard.kill_and_reap();
-                cleanup_partial_output(&settings.output_path);
                 return Err(err);
             }
 
             if raw_frame.len() != raw_bytes {
                 drop(stdin_opt.take());
                 child_guard.kill_and_reap();
-                cleanup_partial_output(&settings.output_path);
                 return Err(ExportError::InvalidFrameSize {
                     frame_index,
                     expected: raw_bytes,
@@ -271,7 +333,6 @@ where
             if cancel.load(Ordering::Acquire) {
                 drop(stdin_opt.take());
                 child_guard.kill_and_reap();
-                cleanup_partial_output(&settings.output_path);
                 return Err(ExportError::Cancelled);
             }
 
@@ -291,13 +352,17 @@ where
             if let Some(pipe) = stdin_opt.as_mut()
                 && let Err(err) = pipe.write_all(payload)
             {
+                if cancel.load(Ordering::Acquire) {
+                    drop(stdin_opt.take());
+                    child_guard.kill_and_reap();
+                    return Err(ExportError::Cancelled);
+                }
                 if err.kind() == ErrorKind::BrokenPipe {
                     broken_pipe = true;
                     break;
                 }
                 drop(stdin_opt.take());
                 child_guard.kill_and_reap();
-                cleanup_partial_output(&settings.output_path);
                 return Err(ExportError::Io(err));
             }
 
@@ -317,20 +382,18 @@ where
 
         if cancel.load(Ordering::Acquire) {
             child_guard.kill_and_reap();
-            cleanup_partial_output(&settings.output_path);
             return Err(ExportError::Cancelled);
         }
 
-        let status = child_guard.wait()?;
+        let status = child_guard.wait_cancellable(cancel)?;
+        watcher_done.store(true, Ordering::Release);
         let stderr_text = stderr_handle.join().unwrap_or_default();
 
         if cancel.load(Ordering::Acquire) {
-            cleanup_partial_output(&settings.output_path);
             return Err(ExportError::Cancelled);
         }
 
         if !status.success() {
-            cleanup_partial_output(&settings.output_path);
             return Err(ExportError::FfmpegFailed {
                 exit_code: status.code(),
                 stderr: stderr_text,
@@ -345,6 +408,10 @@ where
 
     result?;
 
+    // Publish the finished temporary file to `settings.output_path` atomically.
+    publish_temp_output(temp_output_guard.path(), &settings.output_path)?;
+    temp_output_guard.disarm();
+
     Ok(ExportReport {
         frames_exported: total_frames,
         output_width: enc_w,
@@ -354,22 +421,31 @@ where
     })
 }
 
+fn publish_temp_output(src: &Path, dst: &Path) -> Result<(), ExportError> {
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if cfg!(windows)
+                && matches!(
+                    err.kind(),
+                    ErrorKind::AlreadyExists | ErrorKind::PermissionDenied
+                ) =>
+        {
+            if dst.exists() {
+                fs::remove_file(dst)?;
+            }
+            fs::rename(src, dst)?;
+            Ok(())
+        }
+        Err(err) => Err(ExportError::Io(err)),
+    }
+}
+
 fn checked_rgba_len(width: u32, height: u32) -> Result<usize, ExportError> {
     (width as usize)
         .checked_mul(height as usize)
         .and_then(|px| px.checked_mul(4))
         .ok_or_else(|| ExportError::InvalidSettings("frame dimensions overflow RGBA size".into()))
-}
-
-fn cleanup_partial_output(path: &Path) {
-    if let Err(err) = fs::remove_file(path)
-        && err.kind() != ErrorKind::NotFound
-    {
-        tracing::warn!(
-            "failed to remove partial export output {}: {err}",
-            path.display()
-        );
-    }
 }
 
 #[cfg(test)]
@@ -664,6 +740,67 @@ mod tests {
                 text.contains("height=92"),
                 "expected padded height=92: {text}"
             );
+        }
+    }
+
+    #[test]
+    fn failed_or_cancelled_export_preserves_existing_destination_and_explicit_muxer_works() {
+        let existing_dest = unique_test_path("existing_dest_no_ext");
+        let _guard = TempFileGuard::new(existing_dest.clone());
+        let sentinel = b"PRESERVE-EXISTING-DESTINATION";
+        fs::write(&existing_dest, sentinel).expect("write sentinel");
+
+        let settings = ExportSettings {
+            width: 64,
+            height: 64,
+            fps: 30.0,
+            start_frame: 0,
+            end_frame: 5,
+            container: ExportContainer::Mp4,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::None,
+            quality: QualityMode::Crf(23),
+            audio_bitrate_kbps: 0,
+            sample_rate: 48_000,
+            transparent_alpha: false,
+            output_path: existing_dest.clone(),
+            ffmpeg_binary: None,
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let err = export_video(&settings, None, &cancel, |_idx: u32, _buf: &mut Vec<u8>| {
+            Err(ExportError::Render("simulated frame failure".to_string()))
+        })
+        .expect_err("simulated render failure must fail export");
+        assert!(matches!(err, ExportError::Render(_)));
+        assert_eq!(
+            fs::read(&existing_dest).expect("existing destination must remain intact"),
+            sentinel
+        );
+
+        // Bounds validation rejects huge dimensions and tiny fps before any allocation.
+        let mut huge = settings.clone();
+        huge.width = 20_000;
+        assert!(matches!(
+            huge.validate(),
+            Err(ExportError::InvalidSettings(_))
+        ));
+        let mut tiny_fps = settings.clone();
+        tiny_fps.fps = 1e-9;
+        assert!(matches!(
+            tiny_fps.validate(),
+            Err(ExportError::InvalidSettings(_))
+        ));
+
+        // Extensionless destination succeeds because explicit `-f mp4` muxer is passed.
+        if probe_ffmpeg(None).is_ok() {
+            let report = export_video(&settings, None, &cancel, |idx: u32, buf: &mut Vec<u8>| {
+                fill_synthetic_rgba(idx, 64, 64, buf);
+                Ok(())
+            })
+            .expect("extensionless MP4 export must succeed with explicit muxer");
+            assert_eq!(report.frames_exported, 5);
+            assert_ne!(fs::read(&existing_dest).expect("read new mp4"), sentinel);
         }
     }
 }

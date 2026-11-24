@@ -51,6 +51,9 @@ struct ClockShared {
     anchor_exact_frame_bits: AtomicU64,
     anchor_sample_count: AtomicU64,
     hardware_sample_count: AtomicU64,
+    /// Queued hardware output latency in samples derived from CPAL's `OutputCallbackInfo`
+    /// playback timestamp (so the visual playhead tracks audible output rather than leading it).
+    output_latency_samples: AtomicU64,
     speed_bits: AtomicU64,
     fps_bits: AtomicU64,
     total_frames_bits: AtomicU64,
@@ -81,6 +84,7 @@ impl ClockShared {
             anchor_exact_frame_bits: AtomicU64::new(0.0_f64.to_bits()),
             anchor_sample_count: AtomicU64::new(0),
             hardware_sample_count: AtomicU64::new(0),
+            output_latency_samples: AtomicU64::new(0),
             speed_bits: AtomicU64::new(0.0_f64.to_bits()),
             fps_bits: AtomicU64::new(clean_fps.to_bits()),
             total_frames_bits: AtomicU64::new(clean_total.to_bits()),
@@ -141,6 +145,15 @@ impl ClockShared {
         apply_bounds(raw_frame, snap.total_frames, snap.loop_enabled)
     }
 
+    /// Returns the estimated currently audible hardware sample count (submitted samples minus
+    /// the device's queued playback latency reported by CPAL).
+    #[inline]
+    fn audible_sample_count(&self) -> u64 {
+        let written = self.hardware_sample_count.load(Ordering::Acquire);
+        let latency = self.output_latency_samples.load(Ordering::Acquire);
+        written.saturating_sub(latency)
+    }
+
     /// Computes current exact frame (using hardware counter if active, else monotonic wall clock).
     fn current_exact_frame_and_stop_flag(&self) -> (f64, bool, PlaybackSnapshot) {
         let snap = self.read_snapshot();
@@ -149,7 +162,7 @@ impl ClockShared {
         }
 
         let raw_frame = if snap.hardware_clock_active {
-            let hw = self.hardware_sample_count.load(Ordering::Acquire);
+            let hw = self.audible_sample_count();
             let elapsed_samples = hw.saturating_sub(snap.anchor_sample_count) as f64;
             let elapsed_sec = elapsed_samples / f64::from(snap.sample_rate);
             snap.anchor_exact_frame + elapsed_sec * snap.fps * snap.speed
@@ -176,7 +189,7 @@ impl ClockShared {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        let hw_now = self.hardware_sample_count.load(Ordering::Acquire);
+        let hw_now = self.audible_sample_count();
         let mut snap = self.read_snapshot_relaxed();
         mutate(&mut snap, hw_now);
 
@@ -529,12 +542,13 @@ impl MasterPlaybackClock {
         let stream_result = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
                 config,
-                move |data: &mut [f32], _| {
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     render_callback_frames(
                         &shared_cb,
                         stereo_mix_48k.as_deref(),
                         mix_sr,
                         ch_usize,
+                        Some(info),
                         data,
                         |s| s,
                     );
@@ -544,12 +558,13 @@ impl MasterPlaybackClock {
             ),
             SampleFormat::I16 => device.build_output_stream(
                 config,
-                move |data: &mut [i16], _| {
+                move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
                     render_callback_frames(
                         &shared_cb,
                         stereo_mix_48k.as_deref(),
                         mix_sr,
                         ch_usize,
+                        Some(info),
                         data,
                         |s| (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16,
                     );
@@ -559,12 +574,13 @@ impl MasterPlaybackClock {
             ),
             SampleFormat::U16 => device.build_output_stream(
                 config,
-                move |data: &mut [u16], _| {
+                move |data: &mut [u16], info: &cpal::OutputCallbackInfo| {
                     render_callback_frames(
                         &shared_cb,
                         stereo_mix_48k.as_deref(),
                         mix_sr,
                         ch_usize,
+                        Some(info),
                         data,
                         |s| ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * f32::from(u16::MAX)).round() as u16,
                     );
@@ -608,6 +624,7 @@ fn render_callback_frames<T, F>(
     mix: Option<&Vec<[f32; 2]>>,
     mix_sample_rate: f64,
     channels: usize,
+    info: Option<&cpal::OutputCallbackInfo>,
     output: &mut [T],
     convert: F,
 ) where
@@ -616,52 +633,73 @@ fn render_callback_frames<T, F>(
     if channels == 0 || output.is_empty() {
         return;
     }
-    let frame_count = output.len() / channels;
-    let start_hw = shared
-        .hardware_sample_count
-        .fetch_add(frame_count as u64, Ordering::AcqRel);
+    let frame_count = (output.len() / channels) as u64;
     let snap = shared.read_snapshot();
+    // Read the current submitted sample cursor BEFORE filling, then advance it AFTER
+    // filling the buffer so the visual playhead never jumps ahead of an unfilled buffer.
+    let start_hw = shared.hardware_sample_count.load(Ordering::Acquire);
 
     if snap.speed == 0.0 || mix.is_none() || snap.fps <= 0.0 {
         for slot in output.iter_mut() {
             *slot = convert(0.0);
         }
-        return;
-    }
+    } else {
+        let mix_slice = mix.map(Vec::as_slice).unwrap_or(&[]);
+        let mix_len = mix_slice.len();
 
-    let mix_slice = mix.map(Vec::as_slice).unwrap_or(&[]);
-    let mix_len = mix_slice.len();
-
-    for (i, frame_chunk) in output.chunks_exact_mut(channels).enumerate() {
-        let hw = start_hw.saturating_add(i as u64);
-        let (exact_frame, hit_stop) = ClockShared::evaluate_at_sample(&snap, hw);
-        let sample_pair = if hit_stop || mix_len == 0 {
-            [0.0_f32, 0.0_f32]
-        } else {
-            let timeline_sec = exact_frame / snap.fps;
-            let pos = timeline_sec * mix_sample_rate;
-            if pos >= 0.0 && (pos.floor() as usize) < mix_len {
-                let idx0 = pos.floor() as usize;
-                let idx1 = (idx0 + 1).min(mix_len - 1);
-                let frac = (pos - idx0 as f64) as f32;
-                let a = mix_slice[idx0];
-                let b = mix_slice[idx1];
-                [a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac]
+        for (i, frame_chunk) in output.chunks_exact_mut(channels).enumerate() {
+            let hw = start_hw.saturating_add(i as u64);
+            let (exact_frame, hit_stop) = ClockShared::evaluate_at_sample(&snap, hw);
+            let sample_pair = if hit_stop || mix_len == 0 {
+                [0.0_f32, 0.0_f32]
             } else {
-                [0.0, 0.0]
-            }
-        };
-
-        for (ch_idx, slot) in frame_chunk.iter_mut().enumerate() {
-            let val = match (channels, ch_idx) {
-                (1, _) => 0.5 * (sample_pair[0] + sample_pair[1]),
-                (_, 0) => sample_pair[0],
-                (_, 1) => sample_pair[1],
-                _ => 0.0,
+                let timeline_sec = exact_frame / snap.fps;
+                let pos = timeline_sec * mix_sample_rate;
+                if pos >= 0.0 && (pos.floor() as usize) < mix_len {
+                    let idx0 = pos.floor() as usize;
+                    let idx1 = (idx0 + 1).min(mix_len - 1);
+                    let frac = (pos - idx0 as f64) as f32;
+                    let a = mix_slice[idx0];
+                    let b = mix_slice[idx1];
+                    [a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac]
+                } else {
+                    [0.0, 0.0]
+                }
             };
-            *slot = convert(val);
+
+            for (ch_idx, slot) in frame_chunk.iter_mut().enumerate() {
+                let val = match (channels, ch_idx) {
+                    (1, _) => 0.5 * (sample_pair[0] + sample_pair[1]),
+                    (_, 0) => sample_pair[0],
+                    (_, 1) => sample_pair[1],
+                    _ => 0.0,
+                };
+                *slot = convert(val);
+            }
         }
     }
+
+    // Derive queued hardware output latency from CPAL's playback timestamp relative to the
+    // callback time; clamp to at least one buffer period (and <= 2s) so video tracks audible
+    // output rather than leading by the queued ring buffer.
+    let reported_delay_samples = info.map_or(0, |cb| {
+        let d = cb
+            .timestamp()
+            .playback
+            .saturating_duration_since(cb.timestamp().callback);
+        (d.as_secs_f64() * f64::from(snap.sample_rate))
+            .round()
+            .max(0.0) as u64
+    });
+    let max_reasonable_latency = u64::from(snap.sample_rate).saturating_mul(2);
+    let min_latency = frame_count.min(max_reasonable_latency);
+    let latency_samples = reported_delay_samples.clamp(min_latency, max_reasonable_latency);
+    shared
+        .output_latency_samples
+        .store(latency_samples, Ordering::Release);
+    shared
+        .hardware_sample_count
+        .fetch_add(frame_count, Ordering::Release);
 }
 
 /// RAII handle owning a live `cpal` output stream attached to a [`MasterPlaybackClock`].

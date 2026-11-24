@@ -11,17 +11,19 @@ use crate::ExportError;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// RAII guard that deletes its backing file on [`Drop`], even across errors or panics.
+/// RAII guard that deletes its backing file on [`Drop`], even across errors or panics,
+/// unless explicitly disarmed after atomic publication.
 #[derive(Debug)]
 pub struct TempFileGuard {
     path: PathBuf,
+    armed: bool,
 }
 
 impl TempFileGuard {
     /// Creates a guard tracking `path` for automatic deletion on drop.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, armed: true }
     }
 
     /// Returns the path of the managed temporary file.
@@ -29,10 +31,18 @@ impl TempFileGuard {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Disarms automatic deletion (used after atomically publishing the file to its final path).
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         if let Err(err) = fs::remove_file(&self.path)
             && err.kind() != std::io::ErrorKind::NotFound
         {
@@ -41,6 +51,26 @@ impl Drop for TempFileGuard {
                 self.path.display()
             );
         }
+    }
+}
+
+/// Allocates a unique sibling temporary path in the same directory as `dest` so
+/// FFmpeg never clobbers an existing destination file prior to successful muxing.
+pub(crate) fn unique_sibling_temp_path(dest: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let seq = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stem = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("export");
+    let file_name = format!(".{stem}.zoidcraft_tmp_{pid}_{seq}_{nanos}");
+    match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(file_name),
+        _ => PathBuf::from(file_name),
     }
 }
 

@@ -16,7 +16,7 @@ use image::RgbaImage;
 use zc_anim::{DynamicProperty, InterpolationMode, Keyframe, StaticBehavior};
 use zc_audio::{
     AudioBuffer, AudioClipScheduleItem, ClipAudioSampleParams, STANDARD_SAMPLE_RATE,
-    decode_audio_bytes, mix_offline_stereo_animated,
+    decode_audio_bytes, try_mix_offline_stereo_animated,
 };
 use zc_export::{
     AudioCodec, ExportContainer, ExportError, ExportSettings, QualityMode, VideoCodec,
@@ -564,11 +564,46 @@ fn eval_scalar_track(track: &PropertyTrack, frame: f64, default: f64) -> f64 {
     prop.evaluate(frame)
 }
 
+fn project_has_active_audio_in_range(
+    project: &Project,
+    start_seq_frame: f64,
+    end_seq_frame: f64,
+) -> bool {
+    let seq = &project.sequence;
+    let any_solo = seq
+        .audio_tracks
+        .iter()
+        .any(|t| t.enabled && !t.muted && t.solo);
+    for track in &seq.audio_tracks {
+        if !track.enabled || track.muted || (any_solo && !track.solo) {
+            continue;
+        }
+        for clip in &track.clips {
+            if clip.length <= 0.0
+                || clip.start + clip.length <= start_seq_frame
+                || clip.start >= end_seq_frame
+            {
+                continue;
+            }
+            if let Some(asset_id) = clip.media.as_deref()
+                && project
+                    .assets
+                    .get(asset_id)
+                    .and_then(|r| r.bytes.as_deref())
+                    .is_some()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn mix_project_audio(
     project: &Project,
-    start_frame: u32,
-    end_frame: u32,
-    fps: f64,
+    start_seq_frame: u32,
+    end_seq_frame: u32,
+    seq_fps: f64,
     sample_rate: u32,
 ) -> Result<Option<Vec<[f32; 2]>>, String> {
     let seq = &project.sequence;
@@ -576,6 +611,8 @@ fn mix_project_audio(
         .audio_tracks
         .iter()
         .any(|t| t.enabled && !t.muted && t.solo);
+    let range_start = f64::from(start_seq_frame);
+    let range_end = f64::from(end_seq_frame);
     let mut buffers: HashMap<String, AudioBuffer> = HashMap::new();
     let mut scheduled: Vec<AudioClipScheduleItem> = Vec::new();
     let mut source_clips: Vec<&zc_project::AudioClip> = Vec::new();
@@ -585,7 +622,11 @@ fn mix_project_audio(
             continue;
         }
         for clip in &track.clips {
-            if clip.length <= 0.0 {
+            // Skip clips outside the exported sequence range BEFORE decoding audio bytes.
+            if clip.length <= 0.0
+                || clip.start + clip.length <= range_start
+                || clip.start >= range_end
+            {
                 continue;
             }
             let Some(asset_id) = clip.media.as_deref() else {
@@ -606,11 +647,12 @@ fn mix_project_audio(
                 buffers.insert(asset_id.to_owned(), decoded);
             }
 
+            // Spec 03 §1.4 & Spec 04 §4.2: effective playback rate is evaluated against `seq_fps`.
             let t0 = eval_scalar_track(&clip.time_curve, 0.0, 0.0);
-            let t1 = eval_scalar_track(&clip.time_curve, clip.length, clip.length / fps);
-            let rate = zc_audio::effective_playback_rate(t0, t1, clip.length, fps);
+            let t1 = eval_scalar_track(&clip.time_curve, clip.length, clip.length / seq_fps);
+            let rate = zc_audio::effective_playback_rate(t0, t1, clip.length, seq_fps);
             scheduled.push(AudioClipScheduleItem {
-                clip_start_frame: clip.start - f64::from(start_frame),
+                clip_start_frame: clip.start - range_start,
                 clip_length_frames: clip.length,
                 media_start_sec: t0,
                 playback_rate: rate,
@@ -626,22 +668,23 @@ fn mix_project_audio(
         return Ok(None);
     }
 
-    let total_frames = f64::from(end_frame.saturating_sub(start_frame));
-    let mixed = mix_offline_stereo_animated(
-        total_frames,
-        fps,
+    let total_seq_frames = f64::from(end_seq_frame.saturating_sub(start_seq_frame));
+    let mixed = try_mix_offline_stereo_animated(
+        total_seq_frames,
+        seq_fps,
         sample_rate,
         &scheduled,
         &buffers,
-        |idx, _item, local_frame| {
+        |idx, item, local_frame| {
             let clip = source_clips[idx];
             ClipAudioSampleParams {
-                media_time_sec: eval_scalar_track(&clip.time_curve, local_frame, local_frame / fps),
+                media_time_sec: item.media_start_sec + (local_frame / seq_fps) * item.playback_rate,
                 volume: eval_scalar_track(&clip.audio.volume, local_frame, 1.0) as f32,
                 pan: eval_scalar_track(&clip.audio.pan, local_frame, 0.0) as f32,
             }
         },
-    );
+    )
+    .map_err(|e| format!("failed to mix project audio: {e}"))?;
     Ok(Some(mixed))
 }
 
@@ -656,12 +699,13 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
 
     let width = args.width.unwrap_or(project.sequence.resolution[0]).max(1);
     let height = args.height.unwrap_or(project.sequence.resolution[1]).max(1);
-    let fps = args.fps.unwrap_or(f64::from(project.sequence.fps.max(1)));
+    let seq_fps = f64::from(project.sequence.fps.max(1));
+    let export_fps = args.fps.unwrap_or(seq_fps);
     let default_end = project.sequence.length_frames.round().max(1.0) as u32;
-    let end_frame = args.end_frame.unwrap_or(default_end);
-    if end_frame <= args.start_frame {
+    let end_seq_frame = args.end_frame.unwrap_or(default_end);
+    if end_seq_frame <= args.start_frame {
         return Err(format!(
-            "end_frame ({end_frame}) must be greater than start_frame ({})",
+            "end_frame ({end_seq_frame}) must be greater than start_frame ({})",
             args.start_frame
         ));
     }
@@ -669,19 +713,41 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
     let container = parse_container(args.format, args.out)?;
     let video_codec = parse_video_codec(args.video_codec, container)?;
     let sample_rate = STANDARD_SAMPLE_RATE;
-    let mixed_audio = mix_project_audio(&project, args.start_frame, end_frame, fps, sample_rate)?;
-    let audio_codec = parse_audio_codec(args.audio_codec, container, mixed_audio.is_some())?;
+    let has_active_audio = project_has_active_audio_in_range(
+        &project,
+        f64::from(args.start_frame),
+        f64::from(end_seq_frame),
+    );
+    let audio_codec = parse_audio_codec(args.audio_codec, container, has_active_audio)?;
     let quality = match args.bitrate_kbps {
         Some(kbps) => QualityMode::BitrateKbps(kbps),
         None => QualityMode::Crf(args.crf),
     };
 
+    // Spec 04 §4.1: frameAdvance = seqRate / exportRate so changing export FPS preserves
+    // real-time playback speed instead of speeding up or slowing down the scene.
+    if !export_fps.is_finite() || export_fps <= 0.0 {
+        return Err(format!("invalid export fps: {export_fps}"));
+    }
+    let duration_sec = f64::from(end_seq_frame - args.start_frame) / seq_fps;
+    let export_frames_f64 = (duration_sec * export_fps).round();
+    if !export_frames_f64.is_finite()
+        || export_frames_f64 < 1.0
+        || export_frames_f64 > f64::from(u32::MAX)
+    {
+        return Err(format!(
+            "export frame count out of range for duration {duration_sec}s at {export_fps} fps"
+        ));
+    }
+    let export_frame_count = export_frames_f64 as u32;
+    let frame_advance = seq_fps / export_fps;
+
     let settings = ExportSettings {
         width,
         height,
-        fps,
-        start_frame: args.start_frame,
-        end_frame,
+        fps: export_fps,
+        start_frame: 0,
+        end_frame: export_frame_count,
         container,
         video_codec,
         audio_codec,
@@ -692,27 +758,40 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
         output_path: args.out.to_path_buf(),
         ffmpeg_binary: args.ffmpeg,
     };
+    // Validate ALL settings (dimensions, fps bounds, frame count, container/codec compatibility)
+    // BEFORE decoding or allocating audio buffers.
     settings
         .validate()
         .map_err(|e| format!("invalid export settings: {e}"))?;
+
+    let mixed_audio = if matches!(container, ExportContainer::PngSequence)
+        || matches!(audio_codec, AudioCodec::None)
+    {
+        None
+    } else {
+        mix_project_audio(
+            &project,
+            args.start_frame,
+            end_seq_frame,
+            seq_fps,
+            sample_rate,
+        )?
+    };
 
     let plugins = build_plugins_for_project(&project);
     let mut engine = ProjectRenderEngine::new_headless()
         .map_err(|e| format!("failed to initialize headless GPU renderer: {e}"))?;
     let cancel = Arc::new(AtomicBool::new(false));
-    let audio_slice = if matches!(audio_codec, AudioCodec::None) {
-        None
-    } else {
-        mixed_audio.as_deref()
-    };
+    let start_seq = f64::from(args.start_frame);
 
     let report = export_video_with_progress(
         &settings,
-        audio_slice,
+        mixed_audio.as_deref(),
         &cancel,
-        |frame_idx: u32, rgba_out: &mut Vec<u8>| {
+        |output_frame_idx: u32, rgba_out: &mut Vec<u8>| {
+            let scene_frame = start_seq + f64::from(output_frame_idx) * frame_advance;
             let premul = engine
-                .render_frame_rgba8(&project, &plugins, f64::from(frame_idx), width, height)
+                .render_frame_rgba8(&project, &plugins, scene_frame, width, height)
                 .map_err(|e| ExportError::Render(e.to_string()))?;
             let straight = zc_render::unpremultiply_rgba8(&premul);
             rgba_out.clear();

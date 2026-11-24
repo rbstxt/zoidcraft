@@ -71,6 +71,16 @@ pub fn build_ffmpeg_args(
     settings: &ExportSettings,
     temp_audio_wav: Option<&Path>,
 ) -> Result<Vec<String>, ExportError> {
+    build_ffmpeg_args_with_output(settings, temp_audio_wav, &settings.output_path)
+}
+
+/// Builds deterministic FFmpeg CLI arguments targeting an explicit `output_path` (such as a
+/// sibling staging file) with an explicit `-f <muxer>` container flag.
+pub(crate) fn build_ffmpeg_args_with_output(
+    settings: &ExportSettings,
+    temp_audio_wav: Option<&Path>,
+    output_path: &Path,
+) -> Result<Vec<String>, ExportError> {
     settings.validate()?;
     if matches!(settings.container, ExportContainer::PngSequence) {
         return Err(ExportError::InvalidSettings(
@@ -260,11 +270,25 @@ pub fn build_ffmpeg_args(
         args.push("-an".into());
     }
 
-    if matches!(settings.container, ExportContainer::Mp4) {
-        args.extend(["-movflags".into(), "+faststart".into()]);
+    match settings.container {
+        ExportContainer::Mp4 => {
+            args.extend([
+                "-movflags".into(),
+                "+faststart".into(),
+                "-f".into(),
+                "mp4".into(),
+            ]);
+        }
+        ExportContainer::Webm => {
+            args.extend(["-f".into(), "webm".into()]);
+        }
+        ExportContainer::Mkv => {
+            args.extend(["-f".into(), "matroska".into()]);
+        }
+        ExportContainer::PngSequence => {}
     }
 
-    args.push(settings.output_path.to_string_lossy().into_owned());
+    args.push(output_path.to_string_lossy().into_owned());
     Ok(args)
 }
 

@@ -14,6 +14,16 @@ use crate::AudioError;
 
 /// Standard internal mixing and export sample rate (48,000 Hz).
 pub const STANDARD_SAMPLE_RATE: u32 = 48_000;
+/// Minimum accepted audio stream sample rate in Hz.
+pub const MIN_AUDIO_SAMPLE_RATE: u32 = 8_000;
+/// Maximum accepted audio stream sample rate in Hz.
+pub const MAX_AUDIO_SAMPLE_RATE: u32 = 384_000;
+/// Maximum accepted channel count per decoded audio asset.
+pub const MAX_AUDIO_CHANNELS: u16 = 32;
+/// Maximum interleaved f32 samples decoded from a single asset (64M samples = 256 MiB).
+pub const MAX_DECODED_AUDIO_SAMPLES: usize = 64 * 1024 * 1024;
+/// Maximum stereo frames allocated by a single resampling call (32M stereo frames = 256 MiB).
+pub const MAX_RESAMPLED_STEREO_FRAMES: usize = 32 * 1024 * 1024;
 
 /// Decoded audio buffer storing interleaved 32-bit float PCM samples in `[-1.0, 1.0]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -132,10 +142,13 @@ pub fn decode_audio_bytes(bytes: &[u8], hint_ext: Option<&str>) -> Result<AudioB
                     AudioError::InvalidFormat(format!("unsupported channel count: {pkt_ch_count}"))
                 })?;
 
-                if pkt_rate == 0 || pkt_channels == 0 {
-                    return Err(AudioError::InvalidFormat(
-                        "decoded packet has zero sample rate or zero channels".to_string(),
-                    ));
+                if !(MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE).contains(&pkt_rate)
+                    || pkt_channels == 0
+                    || pkt_channels > MAX_AUDIO_CHANNELS
+                {
+                    return Err(AudioError::InvalidFormat(format!(
+                        "unsupported audio stream format: {pkt_rate} Hz / {pkt_channels} ch"
+                    )));
                 }
 
                 match (sample_rate, channels) {
@@ -155,6 +168,17 @@ pub fn decode_audio_bytes(bytes: &[u8], hint_ext: Option<&str>) -> Result<AudioB
 
                 let count = decoded.samples_interleaved();
                 if count > 0 {
+                    let next_len = samples_interleaved_f32
+                        .len()
+                        .checked_add(count)
+                        .ok_or_else(|| {
+                            AudioError::Decode("decoded audio sample count overflow".to_string())
+                        })?;
+                    if next_len > MAX_DECODED_AUDIO_SAMPLES {
+                        return Err(AudioError::Decode(format!(
+                            "decoded audio exceeds 256 MiB memory budget ({MAX_DECODED_AUDIO_SAMPLES} samples)"
+                        )));
+                    }
                     scratch.resize(count, 0.0);
                     decoded.copy_to_slice_interleaved(&mut scratch);
                     samples_interleaved_f32.extend_from_slice(&scratch);
@@ -193,17 +217,25 @@ pub fn resample_stereo_48k(buffer: &AudioBuffer) -> Vec<[f32; 2]> {
 }
 
 /// Converts and linearly resamples an [`AudioBuffer`] to stereo at `target_sample_rate`.
+///
+/// Rejects out-of-range sample rates and caps output allocations to
+/// [`MAX_RESAMPLED_STEREO_FRAMES`] (256 MiB) so malformed metadata cannot exhaust memory.
 #[must_use]
 pub fn resample_stereo(buffer: &AudioBuffer, target_sample_rate: u32) -> Vec<[f32; 2]> {
     let in_frames = buffer.frame_count();
-    if in_frames == 0 || buffer.sample_rate == 0 || buffer.channels == 0 || target_sample_rate == 0
+    if in_frames == 0
+        || !(MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE).contains(&buffer.sample_rate)
+        || !(MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE).contains(&target_sample_rate)
+        || buffer.channels == 0
+        || buffer.channels > MAX_AUDIO_CHANNELS
     {
         return Vec::new();
     }
 
     if buffer.sample_rate == target_sample_rate {
-        let mut out = Vec::with_capacity(in_frames);
-        for frame_idx in 0..in_frames {
+        let capped = in_frames.min(MAX_RESAMPLED_STEREO_FRAMES);
+        let mut out = Vec::with_capacity(capped);
+        for frame_idx in 0..capped {
             out.push(read_stereo_frame(buffer, frame_idx));
         }
         return out;
@@ -211,7 +243,13 @@ pub fn resample_stereo(buffer: &AudioBuffer, target_sample_rate: u32) -> Vec<[f3
 
     let out_frames_f64 =
         (in_frames as f64) * (f64::from(target_sample_rate) / f64::from(buffer.sample_rate));
-    let out_frames = out_frames_f64.round().max(1.0) as usize;
+    if !out_frames_f64.is_finite()
+        || out_frames_f64 <= 0.0
+        || out_frames_f64 > MAX_RESAMPLED_STEREO_FRAMES as f64
+    {
+        return Vec::new();
+    }
+    let out_frames = (out_frames_f64.round().max(1.0) as usize).min(MAX_RESAMPLED_STEREO_FRAMES);
     let ratio = f64::from(buffer.sample_rate) / f64::from(target_sample_rate);
     let last_frame = in_frames - 1;
 

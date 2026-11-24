@@ -16,8 +16,9 @@ pub use decode::{
 };
 pub use meter::{AudioMeterState, METER_ANALYSIS_WINDOW, METER_MIN_PX};
 pub use mixer::{
-    AudioClipScheduleItem, AudioClipTrackItem, ClipAudioSampleParams, apply_gain_and_pan,
-    effective_playback_rate, mix_offline_stereo, mix_offline_stereo_animated,
+    AudioClipScheduleItem, AudioClipTrackItem, ClipAudioSampleParams, MAX_OFFLINE_MIX_SAMPLES,
+    apply_gain_and_pan, effective_playback_rate, mix_offline_stereo, mix_offline_stereo_animated,
+    try_mix_offline_stereo_animated, try_offline_total_samples,
 };
 pub use waveform::{DEFAULT_POINTS_PER_SEC, WaveformColumn, WaveformPeaks};
 
