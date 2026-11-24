@@ -78,7 +78,15 @@ pub struct SceneLight {
     pub intensity: f32,
     /// Spot cone outer angle in degrees (Spec 03 §3.6).
     pub angle_deg: f32,
+    /// Cutoff distance (`0.0` = infinite, Spec 03 §3.6).
+    pub distance: f32,
+    /// Distance attenuation decay exponent (Spec 03 §3.6).
+    pub decay: f32,
+    /// Spot cone penumbra fraction `[0, 1]` (Spec 03 §3.6).
+    pub penumbra: f32,
     pub cast_shadow: bool,
+    /// Additional shadow receiver depth bias.
+    pub shadow_bias: f32,
 }
 
 impl Default for SceneLight {
@@ -91,7 +99,11 @@ impl Default for SceneLight {
             target: [0.0, 0.0, 0.0],
             intensity: 1.0,
             angle_deg: 60.0,
+            distance: 0.0,
+            decay: 1.0,
+            penumbra: 0.5,
             cast_shadow: true,
+            shadow_bias: 0.0,
         }
     }
 }
@@ -310,8 +322,9 @@ pub struct Scene3DPassInput<'a> {
     pub meshes: &'a [MeshDrawCall<'a>],
     pub particles: &'a [ParticleDrawCall<'a>],
     pub compat_mode: CompatMode,
-    /// When `true`, draws the XZ ground grid, RGB origin axes, and optional
-    /// selection wireframe AABB. MUST remain `false` for preview/export.
+    /// When `true`, draws the Zoidium XZ ground grid (`200x200`, 10 divisions),
+    /// optional selection wireframe AABB, and any extra editor helper wireframes.
+    /// MUST remain `false` for preview/export.
     pub editing_camera: bool,
     /// Optional world-space selection bounding box `(min, max)` shown only when
     /// `editing_camera == true`.
@@ -330,9 +343,11 @@ struct ShadowUniforms {
 struct LightGpu {
     color_intensity: [f32; 4],
     ground_kind: [f32; 4],
-    position_pad: [f32; 4],
+    /// `xyz = position`, `w = cutoff distance` (`0.0` = infinite).
+    position_distance: [f32; 4],
     direction_cos_outer: [f32; 4],
-    cos_inner_pad: [f32; 4],
+    /// `x = cos(inner_angle)`, `y = decay`, `z = penumbra`, `w = 0.0`.
+    cos_inner_decay_penumbra: [f32; 4],
 }
 
 #[repr(C)]
@@ -343,8 +358,16 @@ struct SceneUniforms {
     light_view_proj: [[f32; 4]; 4],
     camera_pos_light_count: [f32; 4],
     shadow_params: [f32; 4],
+    shadow_light_index: u32,
+    _shadow_pad: [u32; 3],
     lights: [LightGpu; MAX_SCENE_LIGHTS],
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<LightGpu>() == 80);
+    assert!(std::mem::size_of::<SceneUniforms>() == 880);
+    assert!(std::mem::size_of::<ObjectUniforms>() == 240);
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -360,11 +383,12 @@ struct ObjectUniforms {
     flags: [u32; 4],
 }
 
+/// Colored 3D wireframe line vertex used for editor grid, AABB, CameraHelper, and LightHelper overlays.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct LineVertex {
-    position: [f32; 3],
-    color: [f32; 4],
+pub struct LineVertex {
+    pub position: [f32; 3],
+    pub color: [f32; 4],
 }
 
 impl LineVertex {
@@ -425,6 +449,7 @@ pub struct Scene3DRenderer {
     shadow_initialized: bool,
     shadow_sampler: wgpu::Sampler,
     linear_sampler: wgpu::Sampler,
+    clamp_sampler: wgpu::Sampler,
     fallback_white: RenderTarget,
     fallback_normal: RenderTarget,
     fallback_particle: RenderTarget,
@@ -492,6 +517,15 @@ impl Scene3DRenderer {
             ..Default::default()
         });
 
+        let clamp_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("zc-render linear clamp sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let fallback_white =
             ctx.create_rgba8_texture("zc-render fallback white", 1, 1, &[255, 255, 255, 255])?;
         let fallback_normal =
@@ -522,6 +556,7 @@ impl Scene3DRenderer {
             shadow_initialized: false,
             shadow_sampler,
             linear_sampler,
+            clamp_sampler,
             fallback_white,
             fallback_normal,
             fallback_particle,
@@ -539,15 +574,36 @@ impl Scene3DRenderer {
         depth_target: &RenderTarget,
         input: &Scene3DPassInput<'_>,
     ) -> Result<(), RenderError> {
+        self.render_with_extra_lines(ctx, color_target, depth_target, input, &[])
+    }
+
+    /// Renders a 3D scene into premultiplied RGBA `color_target` with
+    /// `Depth32Float` `depth_target`, plus optional editor helper wireframe lines
+    /// drawn strictly when `input.editing_camera == true`.
+    pub fn render_with_extra_lines(
+        &mut self,
+        ctx: &GpuContext,
+        color_target: &RenderTarget,
+        depth_target: &RenderTarget,
+        input: &Scene3DPassInput<'_>,
+        extra_lines: &[LineVertex],
+    ) -> Result<(), RenderError> {
         if depth_target.format != wgpu::TextureFormat::Depth32Float {
             return Err(RenderError::UnsupportedFormat(depth_target.format));
+        }
+        if color_target.width != depth_target.width || color_target.height != depth_target.height {
+            return Err(RenderError::InvalidDimensions {
+                width: depth_target.width,
+                height: depth_target.height,
+            });
         }
 
         // Pre-warm all needed pipelines before encoding commands.
         for draw in input.meshes {
+            let neg_scale = mat4_upper3x3_det(draw.model) < 0.0;
             let key = MeshPipelineKey {
                 format: color_target.format,
-                side: draw.material.side,
+                side: effective_cull_side(draw.material.side, neg_scale),
                 blend: draw.material.blend,
             };
             self.ensure_mesh_pipeline(ctx, key);
@@ -564,13 +620,17 @@ impl Scene3DRenderer {
         }
 
         // Determine shadow caster light and its view-projection matrix.
-        let shadow_light =
-            input.lights.iter().take(MAX_SCENE_LIGHTS).find(|l| {
+        let shadow_light = input
+            .lights
+            .iter()
+            .take(MAX_SCENE_LIGHTS)
+            .enumerate()
+            .find(|(_, l)| {
                 l.cast_shadow && matches!(l.kind, LightKind::Directional | LightKind::Spot)
             });
-        let (has_shadow, light_view_proj) = match shadow_light {
-            Some(light) => (true, compute_light_view_proj(light)),
-            None => (false, mat4_identity()),
+        let (has_shadow, shadow_light_index, light_view_proj) = match shadow_light {
+            Some((idx, light)) => (true, idx as u32, compute_light_view_proj(light)),
+            None => (false, 0xFFFF_FFFFu32, mat4_identity()),
         };
 
         let mut encoder = ctx
@@ -650,6 +710,7 @@ impl Scene3DRenderer {
             input.lights,
             light_view_proj,
             has_shadow,
+            shadow_light_index,
             input.compat_mode,
         );
         let scene_ubo = create_uniform_buffer(
@@ -665,6 +726,7 @@ impl Scene3DRenderer {
             scene_bg: wgpu::BindGroup,
             obj_bg: wgpu::BindGroup,
             _obj_ubo: wgpu::Buffer,
+            view_z: f32,
         }
 
         let mut prepared_meshes = Vec::with_capacity(input.meshes.len());
@@ -672,9 +734,10 @@ impl Scene3DRenderer {
             if draw.mesh.index_count == 0 {
                 continue;
             }
+            let neg_scale = mat4_upper3x3_det(draw.model) < 0.0;
             let key = MeshPipelineKey {
                 format: color_target.format,
-                side: draw.material.side,
+                side: effective_cull_side(draw.material.side, neg_scale),
                 blend: draw.material.blend,
             };
             let pipeline = &self.mesh_pipelines[&key];
@@ -700,7 +763,7 @@ impl Scene3DRenderer {
                 ],
             });
 
-            let obj_u = build_object_uniforms(draw);
+            let obj_u = build_object_uniforms(draw, neg_scale);
             let obj_ubo =
                 create_uniform_buffer(ctx, "zc-render object ubo", bytemuck::bytes_of(&obj_u));
 
@@ -735,14 +798,34 @@ impl Scene3DRenderer {
                 ],
             });
 
+            let world_origin = [draw.model[3][0], draw.model[3][1], draw.model[3][2]];
+            let view_z = view_space_z(&input.camera.view, world_origin);
+
             prepared_meshes.push(PreparedMeshDraw {
                 key,
                 mesh: draw.mesh,
                 scene_bg,
                 obj_bg,
                 _obj_ubo: obj_ubo,
+                view_z,
             });
         }
+
+        let mut opaque_mesh_order = Vec::with_capacity(prepared_meshes.len());
+        let mut transparent_mesh_order = Vec::new();
+        for (idx, item) in prepared_meshes.iter().enumerate() {
+            if item.key.blend == MaterialBlend::Opaque {
+                opaque_mesh_order.push(idx);
+            } else {
+                transparent_mesh_order.push(idx);
+            }
+        }
+        // Sort transparent 3D draws back-to-front (more negative view_z = farther in RH view space).
+        transparent_mesh_order.sort_by(|&a, &b| {
+            prepared_meshes[a]
+                .view_z
+                .total_cmp(&prepared_meshes[b].view_z)
+        });
 
         // Prepare editing-camera overlay resources (only when editing_camera == true).
         let editor_lines_res = if input.editing_camera {
@@ -775,7 +858,33 @@ impl Scene3DRenderer {
                 (buf, verts.len() as u32)
             });
 
-            Some((lines_ubo, lines_bg, aabb_buf))
+            let extra_buf = if !extra_lines.is_empty() {
+                let max_buf = ctx.device.limits().max_buffer_size;
+                let max_verts = (max_buf / (size_of::<LineVertex>() as u64).max(1))
+                    .min(u32::MAX as u64) as usize;
+                let capped_lines = if extra_lines.len() > max_verts {
+                    &extra_lines[..max_verts & !1usize]
+                } else {
+                    extra_lines
+                };
+                if capped_lines.is_empty() {
+                    None
+                } else {
+                    let bytes = bytemuck::cast_slice(capped_lines);
+                    let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("zc-render editor helper lines vertices"),
+                        size: bytes.len() as u64,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    ctx.queue.write_buffer(&buf, 0, bytes);
+                    Some((buf, capped_lines.len() as u32))
+                }
+            } else {
+                None
+            };
+
+            Some((lines_ubo, lines_bg, aabb_buf, extra_buf))
         } else {
             None
         };
@@ -787,14 +896,17 @@ impl Scene3DRenderer {
             instance_buf: wgpu::Buffer,
             instance_count: u32,
             _ubo: wgpu::Buffer,
+            view_z: f32,
         }
 
         let mut prepared_particles = Vec::new();
         if !input.particles.is_empty() {
-            // Camera right & up axes in world space are rows 0 and 1 of the view matrix.
+            // Camera right & up axes in world space are normalized rows 0 and 1 of the view matrix.
             let v = input.camera.view;
-            let cam_right = [v[0][0], v[1][0], v[2][0], 0.0];
-            let cam_up = [v[0][1], v[1][1], v[2][1], 0.0];
+            let right3 = vec3_normalize_or_zero([v[0][0], v[1][0], v[2][0]]);
+            let up3 = vec3_normalize_or_zero([v[0][1], v[1][1], v[2][1]]);
+            let cam_right = [right3[0], right3[1], right3[2], 0.0];
+            let cam_up = [up3[0], up3[1], up3[2], 0.0];
             let pu = ParticleUniforms {
                 view_proj: input.camera.view_proj,
                 cam_right,
@@ -828,12 +940,46 @@ impl Scene3DRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                            resource: wgpu::BindingResource::Sampler(&self.clamp_sampler),
                         },
                     ],
                 });
 
-                let ibytes = bytemuck::cast_slice(pdraw.instances);
+                // Sort Normal-blended particle instances back-to-front by view-space depth.
+                let sorted_instances;
+                let upload_instances: &[ParticleInstance] =
+                    if pdraw.blend == ParticleBlend::Normal && pdraw.instances.len() > 1 {
+                        let mut v_inst = pdraw.instances.to_vec();
+                        v_inst.sort_by(|a, b| {
+                            let za = view_space_z(&input.camera.view, a.position);
+                            let zb = view_space_z(&input.camera.view, b.position);
+                            za.total_cmp(&zb)
+                        });
+                        sorted_instances = v_inst;
+                        &sorted_instances
+                    } else {
+                        pdraw.instances
+                    };
+
+                let avg_z = upload_instances
+                    .iter()
+                    .map(|inst| view_space_z(&input.camera.view, inst.position))
+                    .sum::<f32>()
+                    / (upload_instances.len() as f32);
+
+                let max_buf = ctx.device.limits().max_buffer_size;
+                let max_instances = (max_buf / (size_of::<ParticleInstance>() as u64).max(1))
+                    .min(u32::MAX as u64) as usize;
+                let capped_instances = if upload_instances.len() > max_instances {
+                    &upload_instances[..max_instances]
+                } else {
+                    upload_instances
+                };
+                if capped_instances.is_empty() {
+                    continue;
+                }
+
+                let ibytes = bytemuck::cast_slice(capped_instances);
                 let instance_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("zc-render particle instances"),
                     size: ibytes.len() as u64,
@@ -846,10 +992,20 @@ impl Scene3DRenderer {
                     key,
                     bg,
                     instance_buf,
-                    instance_count: pdraw.instances.len() as u32,
+                    instance_count: capped_instances.len() as u32,
                     _ubo: ubo,
+                    view_z: avg_z,
                 });
             }
+
+            // Draw Normal-blended particle batches back-to-front, then Additive batches.
+            prepared_particles.sort_by(|a, b| {
+                let a_add = a.key.blend == ParticleBlend::Additive;
+                let b_add = b.key.blend == ParticleBlend::Additive;
+                a_add
+                    .cmp(&b_add)
+                    .then_with(|| a.view_z.total_cmp(&b.view_z))
+            });
         }
 
         // 2. Main 3D color + depth pass (clears to transparent black for premultiplied compositing).
@@ -878,24 +1034,19 @@ impl Scene3DRenderer {
                 multiview_mask: None,
             });
 
-            // Draw opaque meshes first, then transparent meshes.
-            for pass_transparent in [false, true] {
-                for item in &prepared_meshes {
-                    let is_transparent = item.key.blend != MaterialBlend::Opaque;
-                    if is_transparent != pass_transparent {
-                        continue;
-                    }
-                    let pipeline = &self.mesh_pipelines[&item.key];
-                    rpass.set_pipeline(pipeline);
-                    rpass.set_bind_group(0, &item.scene_bg, &[]);
-                    rpass.set_bind_group(1, &item.obj_bg, &[]);
-                    rpass.set_vertex_buffer(0, item.mesh.vertex_buffer.slice(..));
-                    rpass.set_index_buffer(
-                        item.mesh.index_buffer.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    rpass.draw_indexed(0..item.mesh.index_count, 0, 0..1);
-                }
+            // Draw opaque meshes first, then back-to-front sorted transparent meshes.
+            for idx in opaque_mesh_order
+                .iter()
+                .chain(transparent_mesh_order.iter())
+            {
+                let item = &prepared_meshes[*idx];
+                let pipeline = &self.mesh_pipelines[&item.key];
+                rpass.set_pipeline(pipeline);
+                rpass.set_bind_group(0, &item.scene_bg, &[]);
+                rpass.set_bind_group(1, &item.obj_bg, &[]);
+                rpass.set_vertex_buffer(0, item.mesh.vertex_buffer.slice(..));
+                rpass.set_index_buffer(item.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..item.mesh.index_count, 0, 0..1);
             }
 
             // Draw instanced camera-facing particles.
@@ -908,7 +1059,7 @@ impl Scene3DRenderer {
             }
 
             // Draw editing-camera gizmos (strictly gated on editing_camera == true).
-            if let Some((_, ref lines_bg, ref aabb_buf)) = editor_lines_res {
+            if let Some((_, ref lines_bg, ref aabb_buf, ref extra_buf)) = editor_lines_res {
                 let lines_pipeline = &self.lines_pipelines[&color_target.format];
                 rpass.set_pipeline(lines_pipeline);
                 rpass.set_bind_group(0, lines_bg, &[]);
@@ -916,6 +1067,11 @@ impl Scene3DRenderer {
                 rpass.draw(0..self.grid_vertex_count, 0..1);
 
                 if let Some((buf, count)) = aabb_buf {
+                    rpass.set_vertex_buffer(0, buf.slice(..));
+                    rpass.draw(0..*count, 0..1);
+                }
+
+                if let Some((buf, count)) = extra_buf {
                     rpass.set_vertex_buffer(0, buf.slice(..));
                     rpass.draw(0..*count, 0..1);
                 }
@@ -948,7 +1104,7 @@ impl Scene3DRenderer {
                     },
                     alpha: wgpu::BlendComponent {
                         src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        dst_factor: wgpu::BlendFactor::One,
                         operation: wgpu::BlendOperation::Add,
                     },
                 },
@@ -962,7 +1118,7 @@ impl Scene3DRenderer {
                         operation: wgpu::BlendOperation::Add,
                     },
                     alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
+                        src_factor: wgpu::BlendFactor::Dst,
                         dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                         operation: wgpu::BlendOperation::Add,
                     },
@@ -1069,7 +1225,7 @@ impl Scene3DRenderer {
                 },
                 alpha: wgpu::BlendComponent {
                     src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
                     operation: wgpu::BlendOperation::Add,
                 },
             },
@@ -1142,7 +1298,7 @@ fn create_shadow_pipeline(
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -1197,6 +1353,7 @@ fn build_scene_uniforms(
     lights: &[SceneLight],
     light_view_proj: [[f32; 4]; 4],
     has_shadow: bool,
+    shadow_light_index: u32,
     compat_mode: CompatMode,
 ) -> SceneUniforms {
     let count = lights.len().min(MAX_SCENE_LIGHTS);
@@ -1209,8 +1366,22 @@ fn build_scene_uniforms(
             src.target[2] - src.position[2],
         ]);
         let outer_rad = (src.angle_deg.clamp(1.0, 89.5)) * (PI / 180.0);
-        // Spec 03 §3.6: spot light penumbra = 0.5.
-        let inner_rad = outer_rad * 0.5;
+        let distance = if src.distance.is_finite() {
+            src.distance.max(0.0)
+        } else {
+            0.0
+        };
+        let decay = if src.decay.is_finite() {
+            src.decay.max(0.0)
+        } else {
+            1.0
+        };
+        let penumbra = if src.penumbra.is_finite() {
+            src.penumbra.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let inner_rad = outer_rad * (1.0 - penumbra);
 
         *dst = LightGpu {
             color_intensity: [src.color[0], src.color[1], src.color[2], src.intensity],
@@ -1220,14 +1391,28 @@ fn build_scene_uniforms(
                 src.ground_color[2],
                 (src.kind as u32) as f32,
             ],
-            position_pad: [src.position[0], src.position[1], src.position[2], 0.0],
+            position_distance: [src.position[0], src.position[1], src.position[2], distance],
             direction_cos_outer: [dir[0], dir[1], dir[2], outer_rad.cos()],
-            cos_inner_pad: [inner_rad.cos(), 0.0, 0.0, 0.0],
+            cos_inner_decay_penumbra: [inner_rad.cos(), decay, penumbra, 0.0],
         };
     }
 
+    let shadow_light_bias = if has_shadow {
+        lights
+            .get(shadow_light_index as usize)
+            .map(|l| {
+                if l.shadow_bias.is_finite() {
+                    l.shadow_bias
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
     let receiver_bias = match compat_mode {
-        CompatMode::Current => 0.0025,
+        CompatMode::Current => 0.0025 + shadow_light_bias,
         CompatMode::Legacy => 0.0,
     };
 
@@ -1247,11 +1432,13 @@ fn build_scene_uniforms(
             1.0 / (SHADOW_MAP_SIZE as f32),
             0.0,
         ],
+        shadow_light_index,
+        _shadow_pad: [0; 3],
         lights: gpu_lights,
     }
 }
 
-fn build_object_uniforms(draw: &MeshDrawCall<'_>) -> ObjectUniforms {
+fn build_object_uniforms(draw: &MeshDrawCall<'_>, neg_scale: bool) -> ObjectUniforms {
     let m = &draw.material;
     let mut bitflags: u32 = 0;
     if draw.albedo_view.is_some() {
@@ -1268,6 +1455,9 @@ fn build_object_uniforms(draw: &MeshDrawCall<'_>) -> ObjectUniforms {
     }
     if draw.receive_shadow {
         bitflags |= 1 << 4;
+    }
+    if neg_scale {
+        bitflags |= 1 << 5;
     }
 
     ObjectUniforms {
@@ -1317,8 +1507,8 @@ fn compute_light_view_proj(light: &SceneLight) -> [[f32; 4]; 4] {
     let view = mat4_look_at_rh(light.position, light.target, up);
     let proj = match light.kind {
         LightKind::Spot => {
-            let fov = (light.angle_deg.clamp(15.0, 120.0)).to_radians();
-            mat4_perspective_rh(fov, 1.0, 5.0, 1500.0)
+            let fov = (2.0 * light.angle_deg).clamp(1.0, 175.0).to_radians();
+            mat4_perspective_rh(fov, 1.0, 0.5, 1500.0)
         }
         _ => mat4_orthographic_rh(-100.0, 100.0, -100.0, 100.0, 0.5, 1500.0),
     };
@@ -1326,96 +1516,356 @@ fn compute_light_view_proj(light: &SceneLight) -> [[f32; 4]; 4] {
 }
 
 fn build_editor_grid_and_axes() -> Vec<LineVertex> {
-    let mut verts = Vec::new();
-    let extent = 50;
-    let step = 2;
-    let minor_color = [0.35, 0.37, 0.42, 0.35];
-    let major_color = [0.55, 0.58, 0.65, 0.55];
+    // Exact Zoidium 3D editor grid: THREE.GridHelper(200, 10, 0xcccccc, 0x333333).
+    let mut verts = Vec::with_capacity(11 * 4);
+    let half = 100.0_f32;
+    let center_color = [0.8, 0.8, 0.8, 1.0]; // #cccccc
+    let grid_color = [0.2, 0.2, 0.2, 1.0]; // #333333
 
-    let mut i = -extent;
-    while i <= extent {
-        if i != 0 {
-            let color = if i % 10 == 0 {
-                major_color
-            } else {
-                minor_color
-            };
-            let f = i as f32;
-            let e = extent as f32;
-            // Line parallel to Z
-            verts.push(LineVertex {
-                position: [f, 0.0, -e],
-                color,
-            });
-            verts.push(LineVertex {
-                position: [f, 0.0, e],
-                color,
-            });
-            // Line parallel to X
-            verts.push(LineVertex {
-                position: [-e, 0.0, f],
-                color,
-            });
-            verts.push(LineVertex {
-                position: [e, 0.0, f],
-                color,
-            });
-        }
-        i += step;
+    for i in -5..=5 {
+        let k = (i as f32) * 20.0;
+        let color = if i == 0 { center_color } else { grid_color };
+        // Line parallel to X
+        verts.push(LineVertex {
+            position: [-half, 0.0, k],
+            color,
+        });
+        verts.push(LineVertex {
+            position: [half, 0.0, k],
+            color,
+        });
+        // Line parallel to Z
+        verts.push(LineVertex {
+            position: [k, 0.0, -half],
+            color,
+        });
+        verts.push(LineVertex {
+            position: [k, 0.0, half],
+            color,
+        });
     }
 
-    let axis_len = extent as f32;
-    // +X/-X (red)
-    verts.push(LineVertex {
-        position: [-axis_len, 0.0, 0.0],
-        color: [0.6, 0.2, 0.2, 0.45],
-    });
-    verts.push(LineVertex {
-        position: [0.0, 0.0, 0.0],
-        color: [0.6, 0.2, 0.2, 0.45],
-    });
-    verts.push(LineVertex {
-        position: [0.0, 0.0, 0.0],
-        color: [0.95, 0.25, 0.25, 0.95],
-    });
-    verts.push(LineVertex {
-        position: [axis_len, 0.0, 0.0],
-        color: [0.95, 0.25, 0.25, 0.95],
-    });
+    verts
+}
 
-    // +Y (green)
-    verts.push(LineVertex {
-        position: [0.0, 0.0, 0.0],
-        color: [0.25, 0.92, 0.35, 0.95],
-    });
-    verts.push(LineVertex {
-        position: [0.0, axis_len * 0.5, 0.0],
-        color: [0.25, 0.92, 0.35, 0.95],
-    });
+fn push_line_seg(out: &mut Vec<LineVertex>, a: [f32; 3], b: [f32; 3], color: [f32; 4]) {
+    out.push(LineVertex { position: a, color });
+    out.push(LineVertex { position: b, color });
+}
 
-    // +Z/-Z (blue)
-    verts.push(LineVertex {
-        position: [0.0, 0.0, -axis_len],
-        color: [0.2, 0.35, 0.7, 0.45],
-    });
-    verts.push(LineVertex {
-        position: [0.0, 0.0, 0.0],
-        color: [0.2, 0.35, 0.7, 0.45],
-    });
-    verts.push(LineVertex {
-        position: [0.0, 0.0, 0.0],
-        color: [0.28, 0.55, 0.98, 0.95],
-    });
-    verts.push(LineVertex {
-        position: [0.0, 0.0, axis_len],
-        color: [0.28, 0.55, 0.98, 0.95],
-    });
+fn mat4_transform_point(m: [[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * p[0] + m[1][0] * p[1] + m[2][0] * p[2] + m[3][0],
+        m[0][1] * p[0] + m[1][1] * p[1] + m[2][1] * p[2] + m[3][1],
+        m[0][2] * p[0] + m[1][2] * p[1] + m[2][2] * p[2] + m[3][2],
+    ]
+}
+
+fn push_octahedron_wireframe(
+    out: &mut Vec<LineVertex>,
+    center: [f32; 3],
+    r: f32,
+    top_c: [f32; 4],
+    bot_c: [f32; 4],
+) {
+    let px = [center[0] + r, center[1], center[2]];
+    let nx = [center[0] - r, center[1], center[2]];
+    let py = [center[0], center[1] + r, center[2]];
+    let ny = [center[0], center[1] - r, center[2]];
+    let pz = [center[0], center[1], center[2] + r];
+    let nz = [center[0], center[1], center[2] - r];
+
+    // Equator
+    push_line_seg(out, px, pz, top_c);
+    push_line_seg(out, pz, nx, top_c);
+    push_line_seg(out, nx, nz, top_c);
+    push_line_seg(out, nz, px, top_c);
+    // Upper pyramid
+    push_line_seg(out, py, px, top_c);
+    push_line_seg(out, py, nx, top_c);
+    push_line_seg(out, py, pz, top_c);
+    push_line_seg(out, py, nz, top_c);
+    // Lower pyramid
+    push_line_seg(out, ny, px, bot_c);
+    push_line_seg(out, ny, nx, bot_c);
+    push_line_seg(out, ny, pz, bot_c);
+    push_line_seg(out, ny, nz, bot_c);
+}
+
+/// Builds Zoidium / Three.js `CameraHelper`-style frustum wireframe lines in world space.
+///
+/// Pass `fov_deg > 0.0` for a perspective camera (vertical FOV in degrees) or `fov_deg <= 0.0`
+/// for an orthographic camera box. `world` is the column-major object-to-world matrix.
+pub fn build_camera_helper_lines(
+    fov_deg: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+    world: [[f32; 4]; 4],
+) -> Vec<LineVertex> {
+    let aspect = aspect.clamp(0.1, 10.0);
+    let near_d = near.clamp(0.5, 20.0);
+    // Clamp visual far distance so default far=5000 frustums stay readable over the 200x200 grid.
+    let far_d = far.clamp(near_d + 4.0, 50.0);
+
+    let (nh, nw, fh, fw) = if fov_deg > 0.0 {
+        let half_tan = (fov_deg.clamp(1.0, 175.0) * 0.5).to_radians().tan();
+        let nh = near_d * half_tan;
+        let nw = nh * aspect;
+        let fh = far_d * half_tan;
+        let fw = fh * aspect;
+        (nh, nw, fh, fw)
+    } else {
+        let h = 10.0_f32;
+        let w = h * aspect;
+        (h, w, h, w)
+    };
+
+    let xf = |p: [f32; 3]| mat4_transform_point(world, p);
+
+    let origin = xf([0.0, 0.0, 0.0]);
+    let n_bl = xf([-nw, -nh, -near_d]);
+    let n_br = xf([nw, -nh, -near_d]);
+    let n_tr = xf([nw, nh, -near_d]);
+    let n_tl = xf([-nw, nh, -near_d]);
+
+    let f_bl = xf([-fw, -fh, -far_d]);
+    let f_br = xf([fw, -fh, -far_d]);
+    let f_tr = xf([fw, fh, -far_d]);
+    let f_tl = xf([-fw, fh, -far_d]);
+
+    let u_l = xf([-fw * 0.35, fh * 1.08, -far_d]);
+    let u_r = xf([fw * 0.35, fh * 1.08, -far_d]);
+    let u_top = xf([0.0, fh * 1.38, -far_d]);
+    let f_center = xf([0.0, 0.0, -far_d]);
+
+    let frustum_color = [1.0, 0.667, 0.0, 1.0]; // #ffaa00
+    let cone_color = [0.902, 0.722, 0.0, 1.0]; // #e6b800
+    let up_color = [0.0, 0.667, 1.0, 1.0]; // #00aaff
+
+    let mut verts = Vec::with_capacity(40);
+
+    // Near plane rectangle
+    push_line_seg(&mut verts, n_bl, n_br, frustum_color);
+    push_line_seg(&mut verts, n_br, n_tr, frustum_color);
+    push_line_seg(&mut verts, n_tr, n_tl, frustum_color);
+    push_line_seg(&mut verts, n_tl, n_bl, frustum_color);
+
+    // Far plane rectangle
+    push_line_seg(&mut verts, f_bl, f_br, frustum_color);
+    push_line_seg(&mut verts, f_br, f_tr, frustum_color);
+    push_line_seg(&mut verts, f_tr, f_tl, frustum_color);
+    push_line_seg(&mut verts, f_tl, f_bl, frustum_color);
+
+    // Frustum side edges
+    push_line_seg(&mut verts, n_bl, f_bl, frustum_color);
+    push_line_seg(&mut verts, n_br, f_br, frustum_color);
+    push_line_seg(&mut verts, n_tr, f_tr, frustum_color);
+    push_line_seg(&mut verts, n_tl, f_tl, frustum_color);
+
+    // Cone edges from camera eye to near corners
+    push_line_seg(&mut verts, origin, n_bl, cone_color);
+    push_line_seg(&mut verts, origin, n_br, cone_color);
+    push_line_seg(&mut verts, origin, n_tr, cone_color);
+    push_line_seg(&mut verts, origin, n_tl, cone_color);
+
+    // Up-direction indicator triangle
+    push_line_seg(&mut verts, u_l, u_r, up_color);
+    push_line_seg(&mut verts, u_r, u_top, up_color);
+    push_line_seg(&mut verts, u_top, u_l, up_color);
+
+    // Center view axis ray
+    push_line_seg(&mut verts, origin, f_center, cone_color);
+
+    verts
+}
+
+/// Builds Zoidium / Three.js `LightHelper`-style wireframe lines in world space.
+pub fn build_light_helper_lines(
+    kind: LightKind,
+    position: [f32; 3],
+    target: [f32; 3],
+    angle_deg: f32,
+    color: [f32; 3],
+    ground_color: [f32; 3],
+) -> Vec<LineVertex> {
+    let mut verts = Vec::new();
+    let visible_color = {
+        let lum = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
+        if lum < 0.15 {
+            [1.0, 0.85, 0.25, 1.0]
+        } else {
+            [
+                color[0].clamp(0.0, 1.0),
+                color[1].clamp(0.0, 1.0),
+                color[2].clamp(0.0, 1.0),
+                1.0,
+            ]
+        }
+    };
+
+    let add_pt = |a: [f32; 3], b: [f32; 3], s: f32| -> [f32; 3] {
+        [a[0] + b[0] * s, a[1] + b[1] * s, a[2] + b[2] * s]
+    };
+
+    let build_basis = |dir: [f32; 3]| -> ([f32; 3], [f32; 3]) {
+        let up_ref = if dir[1].abs() > 0.98 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let right = vec3_normalize(vec3_cross(dir, up_ref));
+        let up = vec3_normalize(vec3_cross(right, dir));
+        (right, up)
+    };
+
+    match kind {
+        LightKind::Spot => {
+            let delta = [
+                target[0] - position[0],
+                target[1] - position[1],
+                target[2] - position[2],
+            ];
+            let raw_dist = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+            let dir = vec3_normalize(delta);
+            let cone_len = if raw_dist > 1e-3 {
+                raw_dist.clamp(10.0, 60.0)
+            } else {
+                25.0
+            };
+            let cone_radius = cone_len * angle_deg.clamp(1.0, 85.0).to_radians().tan();
+            let (right, up) = build_basis(dir);
+            let base_center = add_pt(position, dir, cone_len);
+
+            push_octahedron_wireframe(&mut verts, position, 1.8, visible_color, visible_color);
+            push_line_seg(&mut verts, position, base_center, [1.0, 0.85, 0.25, 0.8]);
+
+            let segs = 24usize;
+            for i in 0..segs {
+                let a0 = (i as f32) / (segs as f32) * (2.0 * PI);
+                let a1 = ((i + 1) as f32) / (segs as f32) * (2.0 * PI);
+                let p0 = add_pt(
+                    add_pt(base_center, right, cone_radius * a0.cos()),
+                    up,
+                    cone_radius * a0.sin(),
+                );
+                let p1 = add_pt(
+                    add_pt(base_center, right, cone_radius * a1.cos()),
+                    up,
+                    cone_radius * a1.sin(),
+                );
+                push_line_seg(&mut verts, p0, p1, visible_color);
+                if i % 3 == 0 {
+                    push_line_seg(&mut verts, position, p0, visible_color);
+                }
+            }
+        }
+        LightKind::Point => {
+            let r = 3.5_f32;
+            push_octahedron_wireframe(&mut verts, position, r, visible_color, visible_color);
+            let ray = r * 1.85;
+            for axis in [
+                [1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, -1.0],
+            ] {
+                let p0 = add_pt(position, axis, r * 1.15);
+                let p1 = add_pt(position, axis, ray);
+                push_line_seg(&mut verts, p0, p1, visible_color);
+            }
+        }
+        LightKind::Directional => {
+            let delta = [
+                target[0] - position[0],
+                target[1] - position[1],
+                target[2] - position[2],
+            ];
+            let raw_dist = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+            let dir = vec3_normalize(delta);
+            let (right, up) = build_basis(dir);
+            let half = 5.0_f32;
+            let ray_len = if raw_dist > 1e-3 {
+                raw_dist.clamp(12.0, 50.0)
+            } else {
+                25.0
+            };
+
+            let c0 = add_pt(add_pt(position, right, -half), up, -half);
+            let c1 = add_pt(add_pt(position, right, half), up, -half);
+            let c2 = add_pt(add_pt(position, right, half), up, half);
+            let c3 = add_pt(add_pt(position, right, -half), up, half);
+
+            push_line_seg(&mut verts, c0, c1, visible_color);
+            push_line_seg(&mut verts, c1, c2, visible_color);
+            push_line_seg(&mut verts, c2, c3, visible_color);
+            push_line_seg(&mut verts, c3, c0, visible_color);
+
+            for corner in [c0, c1, c2, c3] {
+                push_line_seg(
+                    &mut verts,
+                    corner,
+                    add_pt(corner, dir, ray_len),
+                    visible_color,
+                );
+            }
+            push_line_seg(
+                &mut verts,
+                position,
+                add_pt(position, dir, ray_len),
+                [1.0, 0.85, 0.25, 0.9],
+            );
+        }
+        LightKind::Hemisphere => {
+            let bot_color = {
+                let lum =
+                    0.2126 * ground_color[0] + 0.7152 * ground_color[1] + 0.0722 * ground_color[2];
+                if lum < 0.15 {
+                    [0.55, 0.55, 0.6, 1.0]
+                } else {
+                    [
+                        ground_color[0].clamp(0.0, 1.0),
+                        ground_color[1].clamp(0.0, 1.0),
+                        ground_color[2].clamp(0.0, 1.0),
+                        1.0,
+                    ]
+                }
+            };
+            push_octahedron_wireframe(&mut verts, position, 5.0, visible_color, bot_color);
+        }
+        LightKind::Ambient => {
+            push_octahedron_wireframe(&mut verts, position, 4.0, visible_color, visible_color);
+        }
+    }
 
     verts
 }
 
 fn build_aabb_wireframe(min: [f32; 3], max: [f32; 3]) -> Vec<LineVertex> {
     let c = [1.0, 0.78, 0.2, 0.95];
+    // Slightly inflate the AABB around its center to avoid Z-fighting with coplanar box faces.
+    let center = [
+        0.5 * (min[0] + max[0]),
+        0.5 * (min[1] + max[1]),
+        0.5 * (min[2] + max[2]),
+    ];
+    let half = [
+        (0.5 * (max[0] - min[0])).max(1e-4) * 1.002,
+        (0.5 * (max[1] - min[1])).max(1e-4) * 1.002,
+        (0.5 * (max[2] - min[2])).max(1e-4) * 1.002,
+    ];
+    let min = [
+        center[0] - half[0],
+        center[1] - half[1],
+        center[2] - half[2],
+    ];
+    let max = [
+        center[0] + half[0],
+        center[1] + half[1],
+        center[2] + half[2],
+    ];
     let p = [
         [min[0], min[1], min[2]],
         [max[0], min[1], min[2]],
@@ -1518,7 +1968,8 @@ pub fn create_unit_box_mesh(ctx: &GpuContext) -> GpuMesh {
             ],
         ),
     ];
-    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    // OpenGL bottom-up UVs (v=0 bottom, v=1 top), unified with zc-scene meshes.
+    let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
 
     let mut vertices = Vec::with_capacity(24);
     let mut indices = Vec::with_capacity(36);
@@ -1601,7 +2052,17 @@ pub fn mat4_orthographic_rh(
 /// Right-handed look-at view matrix.
 pub fn mat4_look_at_rh(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
     let f = vec3_normalize([target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]]);
-    let s = vec3_normalize(vec3_cross(f, up));
+    let raw_s = vec3_cross(f, up);
+    let s = if vec3_dot(raw_s, raw_s) > 1e-12 {
+        vec3_normalize(raw_s)
+    } else {
+        let fallback_up = if f[1].abs() > 0.99 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        vec3_normalize(vec3_cross(f, fallback_up))
+    };
     let u = vec3_cross(s, f);
     [
         [s[0], u[0], -f[0], 0.0],
@@ -1630,6 +2091,38 @@ fn vec3_normalize(v: [f32; 3]) -> [f32; 3] {
     } else {
         [v[0] / len, v[1] / len, v[2] / len]
     }
+}
+
+fn vec3_normalize_or_zero(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len <= 1e-6 || !len.is_finite() {
+        [0.0, 0.0, 0.0]
+    } else {
+        [v[0] / len, v[1] / len, v[2] / len]
+    }
+}
+
+fn mat4_upper3x3_det(m: [[f32; 4]; 4]) -> f32 {
+    let c0 = m[0];
+    let c1 = m[1];
+    let c2 = m[2];
+    c0[0] * (c1[1] * c2[2] - c1[2] * c2[1]) - c1[0] * (c0[1] * c2[2] - c0[2] * c2[1])
+        + c2[0] * (c0[1] * c1[2] - c0[2] * c1[1])
+}
+
+fn effective_cull_side(side: CullSide, neg_scale: bool) -> CullSide {
+    if !neg_scale {
+        return side;
+    }
+    match side {
+        CullSide::Front => CullSide::Back,
+        CullSide::Back => CullSide::Front,
+        CullSide::Both => CullSide::Both,
+    }
+}
+
+fn view_space_z(view: &[[f32; 4]; 4], world_pos: [f32; 3]) -> f32 {
+    view[0][2] * world_pos[0] + view[1][2] * world_pos[1] + view[2][2] * world_pos[2] + view[3][2]
 }
 
 const SHADOW_WGSL: &str = r#"
@@ -1661,9 +2154,9 @@ const PI: f32 = 3.14159265359;
 struct LightGpu {
     color_intensity: vec4<f32>,
     ground_kind: vec4<f32>,
-    position_pad: vec4<f32>,
+    position_distance: vec4<f32>,
     direction_cos_outer: vec4<f32>,
-    cos_inner_pad: vec4<f32>,
+    cos_inner_decay_penumbra: vec4<f32>,
 };
 
 struct SceneUniforms {
@@ -1672,6 +2165,10 @@ struct SceneUniforms {
     light_view_proj: mat4x4<f32>,
     camera_pos_light_count: vec4<f32>,
     shadow_params: vec4<f32>,
+    shadow_light_index: u32,
+    _shadow_pad0: u32,
+    _shadow_pad1: u32,
+    _shadow_pad2: u32,
     lights: array<LightGpu, 8>,
 };
 
@@ -1717,7 +2214,9 @@ fn vs_main(v: VertexIn) -> VertexOut {
     let world_pos = u_obj.model * vec4<f32>(v.position, 1.0);
     out.clip_pos = u_scene.view_proj * world_pos;
     out.world_pos = world_pos.xyz;
-    out.world_normal = normalize((u_obj.normal_matrix * vec4<f32>(v.normal, 0.0)).xyz);
+    let n_raw = (u_obj.normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
+    let n_len = length(n_raw);
+    out.world_normal = select(vec3<f32>(0.0, 1.0, 0.0), n_raw / n_len, n_len > 1e-6);
     out.uv = v.uv;
     return out;
 }
@@ -1773,13 +2272,55 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+fn srgb_to_linear_ch(c: f32) -> f32 {
+    let x = max(c, 0.0);
+    if (x <= 0.04045) {
+        return x / 12.92;
+    }
+    return pow((x + 0.055) / 1.055, 2.4);
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        srgb_to_linear_ch(c.r),
+        srgb_to_linear_ch(c.g),
+        srgb_to_linear_ch(c.b),
+    );
+}
+
+fn linear_to_srgb_ch(c: f32) -> f32 {
+    let x = clamp(c, 0.0, 1.0);
+    if (x <= 0.0031308) {
+        return x * 12.92;
+    }
+    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        linear_to_srgb_ch(c.r),
+        linear_to_srgb_ch(c.g),
+        linear_to_srgb_ch(c.b),
+    );
+}
+
+fn safe_normalize(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+    let len = length(v);
+    return select(fallback, v / len, len > 1e-6);
+}
+
 @fragment
 fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
     let uv = transform_uv(fin.uv);
+    // Flip V: zc-scene meshes emit OpenGL bottom-up UVs (v=0 bottom, v=1 top),
+    // while images upload top-down (v=0 top).
+    let sample_uv = vec2<f32>(uv.x, 1.0 - uv.y);
 
     // Unconditional texture & derivative evaluation for uniform control flow.
-    let albedo_sample = textureSample(albedo_tex, mat_sampler, uv);
-    let normal_sample = textureSample(normal_tex, mat_sampler, uv);
+    // Use OpenGL bottom-up `uv` for cotangent derivatives so the bitangent aligns with +Y
+    // (OpenGL / Three.js / glTF normal-map convention).
+    let albedo_sample = textureSample(albedo_tex, mat_sampler, sample_uv);
+    let normal_sample = textureSample(normal_tex, mat_sampler, sample_uv);
     let dpdx_pos = dpdx(fin.world_pos);
     let dpdy_pos = dpdy(fin.world_pos);
     let dpdx_uv = dpdx(uv);
@@ -1789,6 +2330,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     let has_normal = (u_obj.flags.x & 2u) != 0u;
     let has_matcap = (u_obj.flags.x & 4u) != 0u;
     let flat_shading = (u_obj.flags.x & 8u) != 0u;
+    let neg_scale = (u_obj.flags.x & 32u) != 0u;
     let shading_mode = u_obj.flags.y;
 
     let albedo_straight = select(
@@ -1800,13 +2342,15 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     let albedo = u_obj.base_color_opacity.rgb * albedo_straight;
     let final_alpha = clamp(u_obj.base_color_opacity.w * tex_alpha, 0.0, 1.0);
 
-    var n = normalize(fin.world_normal);
-    let flat_cross = cross(dpdx_pos, dpdy_pos);
-    let flat_n = select(n, normalize(flat_cross), length(flat_cross) > 1e-6);
-    n = select(n, flat_n, flat_shading);
-    if (!is_front) {
+    var n = safe_normalize(fin.world_normal, vec3<f32>(0.0, 1.0, 0.0));
+    let effective_front = select(is_front, !is_front, neg_scale);
+    if (!effective_front) {
         n = -n;
     }
+    // WebGPU framebuffer Y increases downward, so cross(dpdy_pos, dpdx_pos) points toward the camera.
+    let flat_cross = cross(dpdy_pos, dpdx_pos);
+    let flat_n = safe_normalize(flat_cross, n);
+    n = select(n, flat_n, flat_shading);
 
     // Perturb normal via cotangent frame when a normal map is bound.
     if (has_normal) {
@@ -1814,57 +2358,89 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
         let det = dpdx_uv.x * dpdy_uv.y - dpdx_uv.y * dpdy_uv.x;
         if (abs(det) > 1e-6) {
             let inv_det = 1.0 / det;
-            let t = normalize((dpdx_pos * dpdy_uv.y - dpdy_pos * dpdx_uv.y) * inv_det);
-            let b = normalize((-dpdx_pos * dpdy_uv.x + dpdy_pos * dpdx_uv.x) * inv_det);
-            n = normalize(t * map_n.x + b * map_n.y + n * map_n.z);
+            let t = safe_normalize((dpdx_pos * dpdy_uv.y - dpdy_pos * dpdx_uv.y) * inv_det, vec3<f32>(1.0, 0.0, 0.0));
+            let b = safe_normalize((-dpdx_pos * dpdy_uv.x + dpdy_pos * dpdx_uv.x) * inv_det, vec3<f32>(0.0, 1.0, 0.0));
+            n = safe_normalize(t * map_n.x + b * map_n.y + n * map_n.z, n);
         }
     }
 
-    let view_n = normalize((u_scene.view * vec4<f32>(n, 0.0)).xyz);
-    let matcap_uv = clamp(vec2<f32>(view_n.x * 0.5 + 0.5, 0.5 - view_n.y * 0.5), vec2<f32>(0.0), vec2<f32>(1.0));
+    let view_n = safe_normalize((u_scene.view * vec4<f32>(n, 0.0)).xyz, vec3<f32>(0.0, 0.0, 1.0));
+    let matcap_dims = max(vec2<f32>(textureDimensions(matcap_tex, 0)), vec2<f32>(1.0));
+    let matcap_half_px = vec2<f32>(0.5) / matcap_dims;
+    let matcap_uv = clamp(
+        vec2<f32>(view_n.x * 0.5 + 0.5, 0.5 - view_n.y * 0.5),
+        matcap_half_px,
+        vec2<f32>(1.0) - matcap_half_px,
+    );
     let matcap_sample = textureSample(matcap_tex, mat_sampler, matcap_uv);
 
-    // Shadow evaluation outside light loop (uniform control flow).
-    let shadow_factor = sample_shadow_pcf(fin.world_pos, 0.5);
+    let light_count = u32(clamp(u_scene.camera_pos_light_count.w, 0.0, 8.0));
+
+    // Shadow evaluation outside light loop (uniform control flow) using the shadow light's real N.L.
+    var shadow_n_dot_l = 0.5;
+    if (u_scene.shadow_light_index < light_count) {
+        let sl = u_scene.lights[u_scene.shadow_light_index];
+        let s_kind = u32(sl.ground_kind.w + 0.5);
+        var s_dir = vec3<f32>(0.0, 1.0, 0.0);
+        if (s_kind == 3u) {
+            s_dir = safe_normalize(-sl.direction_cos_outer.xyz, vec3<f32>(0.0, 1.0, 0.0));
+        } else {
+            let to_sl = sl.position_distance.xyz - fin.world_pos;
+            s_dir = to_sl / max(length(to_sl), 1e-4);
+        }
+        shadow_n_dot_l = max(dot(n, s_dir), 0.0);
+    }
+    let shadow_factor = sample_shadow_pcf(fin.world_pos, shadow_n_dot_l);
 
     if (shading_mode == 0u) {
-        // Basic / Unlit
-        let rgb = max(albedo + u_obj.emissive_pad.rgb, vec3<f32>(0.0));
+        // Basic / Unlit (verbatim sRGB)
+        let rgb = clamp(albedo + u_obj.emissive_pad.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
         return vec4<f32>(rgb * final_alpha, final_alpha);
     }
 
     if (shading_mode == 4u) {
         // Matcap
         let mc = select(vec3<f32>(view_n.z * 0.5 + 0.5), matcap_sample.rgb, has_matcap);
-        let rgb = max(albedo * mc + u_obj.emissive_pad.rgb, vec3<f32>(0.0));
+        let rgb = clamp(albedo * mc + u_obj.emissive_pad.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
         return vec4<f32>(rgb * final_alpha, final_alpha);
     }
 
-    let v_dir = normalize(u_scene.camera_pos_light_count.xyz - fin.world_pos);
+    // Convert sRGB colors to linear before PBR / lit shading.
+    let albedo_lin = srgb_to_linear(u_obj.base_color_opacity.rgb) * srgb_to_linear(albedo_straight);
+    let emissive_lin = srgb_to_linear(u_obj.emissive_pad.rgb);
+    let specular_lin = srgb_to_linear(u_obj.specular_pad.rgb);
+
+    let v_dir = safe_normalize(u_scene.camera_pos_light_count.xyz - fin.world_pos, vec3<f32>(0.0, 0.0, 1.0));
     let n_dot_v = max(dot(n, v_dir), 1e-4);
     let roughness = u_obj.pbr_params.x;
     let metalness = u_obj.pbr_params.y;
     let shininess = u_obj.pbr_params.z;
-    let f0 = mix(vec3<f32>(0.04), albedo, metalness);
+    let f0 = mix(vec3<f32>(0.04), albedo_lin, metalness);
 
-    var lit = u_obj.emissive_pad.rgb;
-    let light_count = u32(clamp(u_scene.camera_pos_light_count.w, 0.0, 8.0));
+    var lit = emissive_lin;
+    var has_ambient = false;
 
     for (var i: u32 = 0u; i < light_count; i = i + 1u) {
         let light = u_scene.lights[i];
         let kind = u32(light.ground_kind.w + 0.5);
-        let l_color = light.color_intensity.rgb * light.color_intensity.w;
+        let l_color = srgb_to_linear(light.color_intensity.rgb) * light.color_intensity.w;
 
         if (kind == 5u) {
             // Ambient
-            lit = lit + albedo * l_color;
+            has_ambient = true;
+            lit = lit + albedo_lin * l_color;
             continue;
         }
         if (kind == 4u) {
             // Hemisphere
+            has_ambient = true;
             let hemi_t = n.y * 0.5 + 0.5;
-            let hemi_col = mix(light.ground_kind.rgb, light.color_intensity.rgb, hemi_t) * light.color_intensity.w;
-            lit = lit + albedo * hemi_col;
+            let hemi_col = mix(
+                srgb_to_linear(light.ground_kind.rgb),
+                srgb_to_linear(light.color_intensity.rgb),
+                hemi_t
+            ) * light.color_intensity.w;
+            lit = lit + albedo_lin * hemi_col;
             continue;
         }
 
@@ -1874,22 +2450,40 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
 
         if (kind == 3u) {
             // Directional: light rays travel along direction_cos_outer.xyz
-            l_dir = normalize(-light.direction_cos_outer.xyz);
-            vis = shadow_factor;
+            l_dir = safe_normalize(-light.direction_cos_outer.xyz, vec3<f32>(0.0, 1.0, 0.0));
+            if (i == u_scene.shadow_light_index) {
+                vis = shadow_factor;
+            }
         } else {
-            let to_light = light.position_pad.xyz - fin.world_pos;
+            let to_light = light.position_distance.xyz - fin.world_pos;
             let dist = max(length(to_light), 1e-4);
             l_dir = to_light / dist;
-            atten = 1.0 / (1.0 + 0.01 * dist + 0.0005 * dist * dist);
+
+            let cutoff_dist = light.position_distance.w;
+            let decay = max(light.cos_inner_decay_penumbra.y, 0.0);
+            if (cutoff_dist > 0.0) {
+                if (dist >= cutoff_dist) {
+                    atten = 0.0;
+                } else if (decay > 0.0) {
+                    let ratio = clamp(1.0 - dist / cutoff_dist, 0.0, 1.0);
+                    atten = pow(ratio, decay);
+                } else {
+                    atten = 1.0;
+                }
+            } else if (decay > 0.0) {
+                atten = 1.0 / (1.0 + 0.01 * decay * dist + 0.0005 * decay * decay * dist * dist);
+            }
 
             if (kind == 1u) {
-                // Spot cone
-                let theta = dot(-l_dir, normalize(light.direction_cos_outer.xyz));
+                // Spot cone with penumbra smoothstep falloff
+                let theta = dot(-l_dir, safe_normalize(light.direction_cos_outer.xyz, vec3<f32>(0.0, -1.0, 0.0)));
                 let cos_outer = light.direction_cos_outer.w;
-                let cos_inner = light.cos_inner_pad.x;
-                let cone = clamp((theta - cos_outer) / max(cos_inner - cos_outer, 1e-4), 0.0, 1.0);
+                let cos_inner = light.cos_inner_decay_penumbra.x;
+                let cone = smoothstep(cos_outer, max(cos_inner, cos_outer + 1e-4), theta);
                 atten = atten * cone;
-                vis = shadow_factor;
+                if (i == u_scene.shadow_light_index) {
+                    vis = shadow_factor;
+                }
             }
         }
 
@@ -1897,7 +2491,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
         if (n_dot_l <= 0.0) {
             continue;
         }
-        let h_dir = normalize(v_dir + l_dir);
+        let h_dir = safe_normalize(v_dir + l_dir, n);
         let n_dot_h = max(dot(n, h_dir), 0.0);
         let radiance = l_color * atten * vis;
 
@@ -1908,19 +2502,29 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
             let f = fresnel_schlick(max(dot(h_dir, v_dir), 0.0), f0);
             let spec = (ndf * g * f) / max(4.0 * n_dot_v * n_dot_l, 1e-4);
             let kd = (vec3<f32>(1.0) - f) * (1.0 - metalness);
-            lit = lit + (kd * albedo / PI + spec) * radiance * n_dot_l;
+            lit = lit + (kd * albedo_lin / PI + spec) * radiance * n_dot_l;
         } else if (shading_mode == 2u) {
             // Blinn-Phong
-            let diff = albedo * n_dot_l;
-            let spec = u_obj.specular_pad.rgb * pow(n_dot_h, shininess);
+            let diff = albedo_lin * n_dot_l;
+            let spec = specular_lin * pow(n_dot_h, shininess);
             lit = lit + (diff + spec) * radiance;
         } else {
             // Lambert
-            lit = lit + albedo * n_dot_l * radiance;
+            lit = lit + albedo_lin * n_dot_l * radiance;
         }
     }
 
-    let rgb = max(lit, vec3<f32>(0.0));
+    if (light_count == 0u) {
+        // Gentle default ambient + headlight fill when no scene lights are present.
+        let head_ndotl = max(dot(n, v_dir), 0.0);
+        lit = lit + albedo_lin * (0.18 + 0.65 * head_ndotl);
+    } else if (!has_ambient) {
+        // Small ambient bounce floor when no ambient/hemisphere light exists
+        // so front faces don't crush to solid black while shadows stay crisp.
+        lit = lit + albedo_lin * 0.08;
+    }
+
+    let rgb = linear_to_srgb(max(lit, vec3<f32>(0.0)));
     return vec4<f32>(rgb * final_alpha, final_alpha);
 }
 "#;
@@ -2018,3 +2622,122 @@ fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
     return tex * fin.color;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mat4_look_at_rh_collinear_up_is_orthonormal() {
+        let view = mat4_look_at_rh([0.0, 10.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let row0 = [view[0][0], view[1][0], view[2][0]];
+        let row1 = [view[0][1], view[1][1], view[2][1]];
+        let row2 = [view[0][2], view[1][2], view[2][2]];
+        for r in [row0, row1, row2] {
+            let len = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+            assert!((len - 1.0).abs() < 1e-5, "expected unit row, got len={len}");
+        }
+        assert!(vec3_dot(row0, row1).abs() < 1e-5);
+        assert!(vec3_dot(row0, row2).abs() < 1e-5);
+        assert!(vec3_dot(row1, row2).abs() < 1e-5);
+        let det = mat4_upper3x3_det(view);
+        assert!(
+            (det - 1.0).abs() < 1e-5,
+            "expected right-handed orthonormal det=+1, got {det}"
+        );
+    }
+
+    #[test]
+    fn build_scene_uniforms_propagates_light_falloff_penumbra_and_bias() {
+        let cam = CameraParams::perspective_look_at(
+            [0.0, 0.0, 5.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            50.0,
+            1.0,
+            0.1,
+            100.0,
+        );
+        let light = SceneLight {
+            kind: LightKind::Spot,
+            distance: 42.0,
+            decay: 2.5,
+            penumbra: 0.25,
+            cast_shadow: true,
+            shadow_bias: 0.001,
+            ..Default::default()
+        };
+        let u_cur = build_scene_uniforms(
+            &cam,
+            &[light],
+            mat4_identity(),
+            true,
+            0,
+            CompatMode::Current,
+        );
+        assert!((u_cur.lights[0].position_distance[3] - 42.0).abs() < 1e-5);
+        assert!((u_cur.lights[0].cos_inner_decay_penumbra[1] - 2.5).abs() < 1e-5);
+        assert!((u_cur.lights[0].cos_inner_decay_penumbra[2] - 0.25).abs() < 1e-5);
+        assert!((u_cur.shadow_params[1] - 0.0035).abs() < 1e-6);
+
+        let u_leg =
+            build_scene_uniforms(&cam, &[light], mat4_identity(), true, 0, CompatMode::Legacy);
+        assert!((u_leg.shadow_params[1] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn render_with_extra_lines_rejects_mismatched_color_depth_dimensions() {
+        let ctx = match GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to init GpuContext: {err}"),
+        };
+        let mut renderer = Scene3DRenderer::new(&ctx).expect("scene3d renderer");
+        let color = RenderTarget::new(
+            &ctx,
+            16,
+            16,
+            wgpu::TextureFormat::Rgba8Unorm,
+            Some("test color"),
+        )
+        .expect("color target");
+        let depth = RenderTarget::new(
+            &ctx,
+            32,
+            16,
+            wgpu::TextureFormat::Depth32Float,
+            Some("test depth"),
+        )
+        .expect("depth target");
+        let cam = CameraParams::perspective_look_at(
+            [0.0, 0.0, 5.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            50.0,
+            1.0,
+            0.1,
+            100.0,
+        );
+        let res = renderer.render(
+            &ctx,
+            &color,
+            &depth,
+            &Scene3DPassInput {
+                camera: cam,
+                lights: &[],
+                meshes: &[],
+                particles: &[],
+                compat_mode: CompatMode::Current,
+                editing_camera: false,
+                selection_aabb: None,
+            },
+        );
+        assert!(matches!(
+            res,
+            Err(RenderError::InvalidDimensions {
+                width: 32,
+                height: 16
+            })
+        ));
+    }
+}

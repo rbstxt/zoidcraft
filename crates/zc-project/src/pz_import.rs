@@ -124,17 +124,17 @@ fn import_pz_from_reader<R: Read>(reader: R) -> Result<PzImportResult, ProjectEr
         match normalized.as_str() {
             "meta" | "meta.json" => {
                 let raw = read_bounded_json_entry(&mut entry, &normalized, MAX_JSON_ENTRY_BYTES)
-                    .map_err(|err| map_limit(err, &exceeded))?;
+                    .map_err(|err| map_limit(err, &exceeded, &raw_exceeded))?;
                 meta_val = Some(serde_json::from_slice(&raw)?);
             }
             "project" | "project.json" => {
                 let raw = read_bounded_json_entry(&mut entry, &normalized, MAX_JSON_ENTRY_BYTES)
-                    .map_err(|err| map_limit(err, &exceeded))?;
+                    .map_err(|err| map_limit(err, &exceeded, &raw_exceeded))?;
                 project_val = Some(serde_json::from_slice(&raw)?);
             }
             "zoidium.json" => {
                 let raw = read_bounded_json_entry(&mut entry, &normalized, MAX_JSON_ENTRY_BYTES)
-                    .map_err(|err| map_limit(err, &exceeded))?;
+                    .map_err(|err| map_limit(err, &exceeded, &raw_exceeded))?;
                 zoidium_val = Some(serde_json::from_slice(&raw)?);
             }
             _ => {
@@ -150,7 +150,7 @@ fn import_pz_from_reader<R: Read>(reader: R) -> Result<PzImportResult, ProjectEr
                 let mut bounded = (&mut entry).take(remaining_budget.saturating_add(1));
                 bounded
                     .read_to_end(&mut data)
-                    .map_err(|err| map_limit(ProjectError::Io(err), &exceeded))?;
+                    .map_err(|err| map_limit(ProjectError::Io(err), &exceeded, &raw_exceeded))?;
                 if (data.len() as u64) > remaining_budget {
                     return Err(ProjectError::ArchiveTooLarge {
                         limit_bytes: MAX_RETAINED_ASSET_BYTES,
@@ -230,8 +230,12 @@ fn import_pz_from_reader<R: Read>(reader: R) -> Result<PzImportResult, ProjectEr
     Ok(PzImportResult { project, warnings })
 }
 
-fn map_limit(err: ProjectError, exceeded: &std::sync::atomic::AtomicBool) -> ProjectError {
-    if exceeded.load(Ordering::SeqCst) {
+fn map_limit(
+    err: ProjectError,
+    exceeded: &std::sync::atomic::AtomicBool,
+    raw_exceeded: &std::sync::atomic::AtomicBool,
+) -> ProjectError {
+    if exceeded.load(Ordering::SeqCst) || raw_exceeded.load(Ordering::SeqCst) {
         ProjectError::ArchiveTooLarge {
             limit_bytes: MAX_UNCOMPRESSED_ARCHIVE_BYTES,
         }
@@ -430,7 +434,12 @@ fn remap_object_3d(obj: &mut Object3D, remap: &BTreeMap<String, String>) {
             remap_opt_key(asset_id, remap);
         }
         Object3DKind::Particles(p) => remap_opt_key(&mut p.texture, remap),
-        Object3DKind::Model(m) => remap_opt_key(&mut m.asset_id, remap),
+        Object3DKind::Model(m) => {
+            remap_opt_key(&mut m.asset_id, remap);
+            for track in m.model_properties.values_mut() {
+                remap_property_track(track, remap);
+            }
+        }
         _ => {}
     }
 }
@@ -605,31 +614,50 @@ fn parse_sequence(
         }
     }
 
-    seq.length_frames = obj.get("length").and_then(Value::as_f64).unwrap_or(0.0);
+    seq.length_frames = obj.get("length").and_then(value_as_f64).unwrap_or(0.0);
 
+    let mut video_clip_index_maps: Vec<Vec<Option<usize>>> = Vec::new();
     // CM3 videoTracks are already bottom-to-top (`0 -> N-1`).
     if let Some(tracks) = obj.get("videoTracks").and_then(Value::as_array) {
         for (idx, track_val) in tracks.iter().enumerate() {
-            seq.video_tracks.push(parse_video_track(
-                track_val,
-                idx,
-                seq.resolution,
-                seq.fps,
-                plugins,
-                warnings,
-            ));
+            let (track, index_map) =
+                parse_video_track(track_val, idx, seq.resolution, seq.fps, plugins, warnings);
+            seq.video_tracks.push(track);
+            video_clip_index_maps.push(index_map);
         }
     }
 
+    let mut audio_clip_index_maps: Vec<Vec<Option<usize>>> = Vec::new();
     if let Some(tracks) = obj.get("audioTracks").and_then(Value::as_array) {
         for (idx, track_val) in tracks.iter().enumerate() {
-            seq.audio_tracks
-                .push(parse_audio_track(track_val, idx, seq.fps));
+            let (track, index_map) = parse_audio_track(track_val, idx, seq.fps, warnings);
+            seq.audio_tracks.push(track);
+            audio_clip_index_maps.push(index_map);
         }
+    }
+
+    if !seq.length_frames.is_finite() || seq.length_frames <= 0.0 {
+        let mut max_end = 0.0_f64;
+        for track in &seq.video_tracks {
+            for clip in &track.clips {
+                max_end = max_end.max(clip.start + clip.length);
+            }
+        }
+        for track in &seq.audio_tracks {
+            for clip in &track.clips {
+                max_end = max_end.max(clip.start + clip.length);
+            }
+        }
+        seq.length_frames = max_end;
     }
 
     if let Some(clip_links_val) = obj.get("clipLinks") {
-        resolve_clip_links(clip_links_val, &mut seq);
+        resolve_clip_links(
+            clip_links_val,
+            &mut seq,
+            &video_clip_index_maps,
+            &audio_clip_index_maps,
+        );
     }
 
     for (k, v) in obj {
@@ -746,18 +774,21 @@ fn parse_video_track(
     fps: u32,
     plugins: &mut BTreeSet<String>,
     warnings: &mut Vec<String>,
-) -> VideoTrack {
+) -> (VideoTrack, Vec<Option<usize>>) {
     let Some(obj) = val.as_object() else {
-        return VideoTrack {
-            id: Uuid::new_v4(),
-            name: format!("Video {}", index + 1),
-            enabled: true,
-            solo: false,
-            locked: false,
-            is_3d: false,
-            clips: Vec::new(),
-            preserved: BTreeMap::new(),
-        };
+        return (
+            VideoTrack {
+                id: Uuid::new_v4(),
+                name: format!("Video {}", index + 1),
+                enabled: true,
+                solo: false,
+                locked: false,
+                is_3d: false,
+                clips: Vec::new(),
+                preserved: BTreeMap::new(),
+            },
+            Vec::new(),
+        );
     };
 
     let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
@@ -774,9 +805,16 @@ fn parse_video_track(
         .unwrap_or_else(|| format!("Video {}", index + 1));
 
     let mut clips = Vec::new();
+    let mut clip_index_map = Vec::new();
     if let Some(arr) = obj.get("clips").and_then(Value::as_array) {
+        clip_index_map.reserve(arr.len());
         for clip_val in arr {
-            clips.push(parse_video_clip(clip_val, seq_res, fps, plugins, warnings));
+            if let Some(clip) = parse_video_clip(clip_val, seq_res, fps, plugins, warnings) {
+                clip_index_map.push(Some(clips.len()));
+                clips.push(clip);
+            } else {
+                clip_index_map.push(None);
+            }
         }
     }
 
@@ -790,34 +828,47 @@ fn parse_video_track(
         }
     }
 
-    VideoTrack {
-        id: Uuid::new_v4(),
-        name,
-        enabled,
-        solo,
-        locked,
-        is_3d,
-        clips,
-        preserved,
-    }
+    (
+        VideoTrack {
+            id: Uuid::new_v4(),
+            name,
+            enabled,
+            solo,
+            locked,
+            is_3d,
+            clips,
+            preserved,
+        },
+        clip_index_map,
+    )
 }
 
-fn parse_audio_track(val: &Value, index: usize, fps: u32) -> AudioTrack {
+fn parse_audio_track(
+    val: &Value,
+    index: usize,
+    fps: u32,
+    warnings: &mut Vec<String>,
+) -> (AudioTrack, Vec<Option<usize>>) {
     let Some(obj) = val.as_object() else {
-        return AudioTrack {
-            id: Uuid::new_v4(),
-            name: format!("Audio {}", index + 1),
-            enabled: true,
-            muted: false,
-            solo: false,
-            clips: Vec::new(),
-            preserved: BTreeMap::new(),
-        };
+        return (
+            AudioTrack {
+                id: Uuid::new_v4(),
+                name: format!("Audio {}", index + 1),
+                enabled: true,
+                muted: false,
+                solo: false,
+                locked: false,
+                clips: Vec::new(),
+                preserved: BTreeMap::new(),
+            },
+            Vec::new(),
+        );
     };
 
     let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
     let muted = obj.get("muted").and_then(Value::as_bool).unwrap_or(false);
     let solo = obj.get("solo").and_then(Value::as_bool).unwrap_or(false);
+    let locked = obj.get("locked").and_then(Value::as_bool).unwrap_or(false);
     let name = obj
         .get("name")
         .and_then(Value::as_str)
@@ -825,9 +876,16 @@ fn parse_audio_track(val: &Value, index: usize, fps: u32) -> AudioTrack {
         .unwrap_or_else(|| format!("Audio {}", index + 1));
 
     let mut clips = Vec::new();
+    let mut clip_index_map = Vec::new();
     if let Some(arr) = obj.get("clips").and_then(Value::as_array) {
+        clip_index_map.reserve(arr.len());
         for clip_val in arr {
-            clips.push(parse_audio_clip(clip_val, fps));
+            if let Some(clip) = parse_audio_clip(clip_val, fps, warnings) {
+                clip_index_map.push(Some(clips.len()));
+                clips.push(clip);
+            } else {
+                clip_index_map.push(None);
+            }
         }
     }
 
@@ -835,32 +893,328 @@ fn parse_audio_track(val: &Value, index: usize, fps: u32) -> AudioTrack {
     for (k, v) in obj {
         if !matches!(
             k.as_str(),
-            "type" | "name" | "enabled" | "muted" | "solo" | "clips"
+            "type" | "name" | "enabled" | "muted" | "solo" | "locked" | "clips"
         ) {
             preserved.insert(k.clone(), v.clone());
         }
     }
 
-    AudioTrack {
-        id: Uuid::new_v4(),
-        name,
-        enabled,
-        muted,
-        solo,
-        clips,
-        preserved,
+    (
+        AudioTrack {
+            id: Uuid::new_v4(),
+            name,
+            enabled,
+            muted,
+            solo,
+            locked,
+            clips,
+            preserved,
+        },
+        clip_index_map,
+    )
+}
+
+fn shift_property_track(track: &mut PropertyTrack, delta: f64) {
+    for kf in &mut track.keyframes {
+        kf.frame += delta;
     }
+    for ch in &mut track.channels {
+        shift_property_track(ch, delta);
+    }
+}
+
+fn shift_custom_properties(props: &mut [CustomProperty], delta: f64) {
+    for cp in props {
+        shift_property_track(&mut cp.track, delta);
+    }
+}
+
+fn shift_material(mat: &mut MaterialSpec, delta: f64) {
+    match mat {
+        MaterialSpec::SingleColor { color, .. } => shift_property_track(color, delta),
+        MaterialSpec::Texture(m) => {
+            shift_property_track(&mut m.repeat, delta);
+            shift_property_track(&mut m.offset, delta);
+            shift_property_track(&mut m.center, delta);
+            shift_property_track(&mut m.rotation, delta);
+        }
+        MaterialSpec::Video(m) => {
+            shift_property_track(&mut m.color, delta);
+            shift_property_track(&mut m.opacity, delta);
+        }
+        MaterialSpec::CustomPbr(m) => {
+            shift_property_track(&mut m.color, delta);
+            shift_property_track(&mut m.emissive, delta);
+            shift_property_track(&mut m.roughness, delta);
+            shift_property_track(&mut m.metalness, delta);
+            shift_property_track(&mut m.opacity, delta);
+            shift_property_track(&mut m.repeat, delta);
+            shift_property_track(&mut m.offset, delta);
+            shift_property_track(&mut m.center, delta);
+            shift_property_track(&mut m.rotation, delta);
+        }
+        MaterialSpec::CustomShader {
+            custom_properties, ..
+        } => shift_custom_properties(custom_properties, delta),
+        MaterialSpec::PbrPlus(m) => {
+            shift_property_track(&mut m.base_color, delta);
+            shift_property_track(&mut m.emissive, delta);
+            shift_property_track(&mut m.roughness, delta);
+            shift_property_track(&mut m.metalness, delta);
+            shift_property_track(&mut m.opacity, delta);
+            shift_property_track(&mut m.repeat, delta);
+            shift_property_track(&mut m.offset, delta);
+            shift_property_track(&mut m.center, delta);
+            shift_property_track(&mut m.rotation, delta);
+        }
+        MaterialSpec::Matcap(m) => {
+            shift_property_track(&mut m.color, delta);
+            shift_property_track(&mut m.brightness, delta);
+            shift_property_track(&mut m.opacity, delta);
+        }
+        MaterialSpec::ImagePlus(m) => {
+            shift_property_track(&mut m.opacity, delta);
+            shift_property_track(&mut m.repeat, delta);
+            shift_property_track(&mut m.offset, delta);
+            shift_property_track(&mut m.center, delta);
+            shift_property_track(&mut m.rotation, delta);
+        }
+        MaterialSpec::NodeMaterial { .. } | MaterialSpec::Unknown { .. } => {}
+    }
+}
+
+fn shift_camera_data(cam: &mut CameraData, delta: f64) {
+    shift_property_track(&mut cam.fov, delta);
+    shift_property_track(&mut cam.zoom, delta);
+    shift_property_track(&mut cam.shake_amplitude, delta);
+    shift_property_track(&mut cam.shake_speed, delta);
+    if let Some(dof) = cam.dof.as_mut() {
+        shift_property_track(&mut dof.focus_distance, delta);
+        shift_property_track(&mut dof.aperture, delta);
+        shift_property_track(&mut dof.focus_area_width, delta);
+        shift_property_track(&mut dof.near_blur, delta);
+        shift_property_track(&mut dof.far_blur, delta);
+    }
+    if let Some(vib) = cam.vibrate.as_mut() {
+        shift_property_track(&mut vib.position_amplitude, delta);
+        shift_property_track(&mut vib.rotation_amplitude, delta);
+        shift_property_track(&mut vib.frequency, delta);
+    }
+}
+
+fn shift_object_3d(obj: &mut Object3D, delta: f64) {
+    shift_property_track(&mut obj.enabled, delta);
+    shift_property_track(&mut obj.position, delta);
+    shift_property_track(&mut obj.rotation, delta);
+    shift_property_track(&mut obj.scale, delta);
+    if let Some(mat) = obj.material.as_mut() {
+        shift_material(mat, delta);
+    }
+    for mat in obj.material_slots.values_mut() {
+        shift_material(mat, delta);
+    }
+    if let Some(track_to) = obj.constraints.track_to.as_mut() {
+        shift_property_track(&mut track_to.influence, delta);
+    }
+    if let Some(follow) = obj.constraints.follow.as_mut() {
+        shift_property_track(&mut follow.position_offset, delta);
+        shift_property_track(&mut follow.rotation_offset, delta);
+        shift_property_track(&mut follow.scale_offset, delta);
+    }
+    match &mut obj.kind {
+        Object3DKind::Group {
+            custom_properties,
+            children,
+            ..
+        } => {
+            shift_custom_properties(custom_properties, delta);
+            for child in children {
+                shift_object_3d(child, delta);
+            }
+        }
+        Object3DKind::Light(l) => {
+            shift_property_track(&mut l.color, delta);
+            shift_property_track(&mut l.ground_color, delta);
+            shift_property_track(&mut l.target, delta);
+            shift_property_track(&mut l.intensity, delta);
+            shift_property_track(&mut l.angle, delta);
+        }
+        Object3DKind::Camera(cam) => shift_camera_data(cam, delta),
+        Object3DKind::Particles(p) => shift_property_track(&mut p.time, delta),
+        Object3DKind::Model(m) => {
+            for track in m.model_properties.values_mut() {
+                shift_property_track(track, delta);
+            }
+        }
+        Object3DKind::Text3D(_) | Object3DKind::Shape3D(_) | Object3DKind::Dummy { .. } => {}
+    }
+}
+
+fn shift_shape_2d(node: &mut Shape2DNode, delta: f64) {
+    shift_property_track(&mut node.position, delta);
+    shift_property_track(&mut node.rotation, delta);
+    shift_property_track(&mut node.scale, delta);
+    for op in &mut node.operations {
+        match op {
+            DrawOp::Fill { color } => shift_property_track(color, delta),
+            DrawOp::Stroke {
+                color,
+                size,
+                opacity,
+            } => {
+                shift_property_track(color, delta);
+                shift_property_track(size, delta);
+                shift_property_track(opacity, delta);
+            }
+        }
+    }
+    if let Shape2DKind::Group { children } = &mut node.kind {
+        for child in children {
+            shift_shape_2d(child, delta);
+        }
+    }
+}
+
+fn shift_effect(fx: &mut EffectInstance, delta: f64) {
+    shift_property_track(&mut fx.enabled, delta);
+    for track in fx.params.values_mut() {
+        shift_property_track(track, delta);
+    }
+    match &mut fx.kind {
+        EffectKind::CustomShader {
+            custom_properties, ..
+        } => shift_custom_properties(custom_properties, delta),
+        EffectKind::EffectGroup {
+            custom_properties,
+            children,
+        } => {
+            shift_custom_properties(custom_properties, delta);
+            for child in children {
+                shift_effect(child, delta);
+            }
+        }
+        EffectKind::Standard(_) | EffectKind::Plugin { .. } => {}
+    }
+}
+
+fn shift_layer(layer: &mut Layer, delta: f64) {
+    shift_property_track(&mut layer.position, delta);
+    shift_property_track(&mut layer.scale, delta);
+    shift_property_track(&mut layer.rotation, delta);
+    shift_property_track(&mut layer.anchor, delta);
+    shift_property_track(&mut layer.opacity, delta);
+    for fx in &mut layer.effects {
+        shift_effect(fx, delta);
+    }
+    match &mut layer.kind {
+        LayerKind::Composite { layers } => {
+            for child in layers {
+                shift_layer(child, delta);
+            }
+        }
+        LayerKind::Scene3D { objects, .. } => {
+            for obj in objects {
+                shift_object_3d(obj, delta);
+            }
+        }
+        LayerKind::Shape2D { shapes }
+        | LayerKind::Text2D { shapes, .. }
+        | LayerKind::PresetShape2D { shapes, .. } => {
+            for shape in shapes {
+                shift_shape_2d(shape, delta);
+            }
+        }
+        LayerKind::CameraLayer { camera } => shift_camera_data(camera, delta),
+        LayerKind::Video { .. }
+        | LayerKind::Adjustment
+        | LayerKind::Image { .. }
+        | LayerKind::Generator
+        | LayerKind::PrecompRef { .. }
+        | LayerKind::Plugin { .. } => {}
+    }
+}
+
+fn shift_audio_clip_data(audio: &mut AudioClipData, delta: f64) {
+    shift_property_track(&mut audio.volume, delta);
+    shift_property_track(&mut audio.pan, delta);
 }
 
 fn rebase_time_curve_for_clipped_prefix(
     time_curve: &mut PropertyTrack,
     clipped_frames: f64,
+    remaining_length: f64,
     fps: u32,
 ) {
     if !clipped_frames.is_finite() || clipped_frames <= 0.0 {
         return;
     }
-    let dt_sec = clipped_frames / f64::from(fps.max(1));
+    let rate = f64::from(fps.max(1));
+    let dt_sec = clipped_frames / rate;
+    if time_curve.keyframes.len() >= 2 {
+        // Sample the curve at `clipped_frames` so shifting local frames left by
+        // `clipped_frames` preserves playback speed instead of double-shifting later keys.
+        let mut sorted = time_curve.keyframes.clone();
+        sorted.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+        let eval_at = |target_f: f64| -> f64 {
+            let first = &sorted[0];
+            let last = &sorted[sorted.len() - 1];
+            let v_first = first.value.as_f64().unwrap_or(0.0);
+            let v_last = last.value.as_f64().unwrap_or(v_first);
+            if target_f <= first.frame {
+                return v_first + (target_f - first.frame) / rate;
+            }
+            if target_f >= last.frame {
+                return v_last + (target_f - last.frame) / rate;
+            }
+            for pair in sorted.windows(2) {
+                let a = &pair[0];
+                let b = &pair[1];
+                if target_f >= a.frame && target_f <= b.frame {
+                    let span = b.frame - a.frame;
+                    let va = a.value.as_f64().unwrap_or(0.0);
+                    let vb = b.value.as_f64().unwrap_or(va);
+                    if span.abs() <= 1e-9 {
+                        return vb;
+                    }
+                    let u = ((target_f - a.frame) / span).clamp(0.0, 1.0);
+                    return va + (vb - va) * u;
+                }
+            }
+            v_first + dt_sec
+        };
+        let t_zero = eval_at(clipped_frames).max(0.0);
+        let mut rebased = Vec::with_capacity(sorted.len());
+        let mut has_zero = false;
+        for mut kf in sorted {
+            let new_f = kf.frame - clipped_frames;
+            if new_f < -1e-6 {
+                continue;
+            }
+            if new_f.abs() <= 1e-6 {
+                kf.frame = 0.0;
+                has_zero = true;
+            } else {
+                kf.frame = new_f;
+            }
+            rebased.push(kf);
+        }
+        if !has_zero {
+            rebased.insert(
+                0,
+                PropertyKeyframe::linear(0.0, PropertyValue::Number(t_zero)),
+            );
+        }
+        if rebased.len() == 1 && remaining_length > 0.0 {
+            rebased.push(PropertyKeyframe::linear(
+                remaining_length,
+                PropertyValue::Number(t_zero + remaining_length / rate),
+            ));
+        }
+        time_curve.value = PropertyValue::Number(t_zero);
+        time_curve.keyframes = rebased;
+        return;
+    }
+
     if let PropertyValue::Number(v) = &mut time_curve.value {
         *v += dt_sec;
     }
@@ -878,23 +1232,28 @@ fn parse_video_clip(
     fps: u32,
     plugins: &mut BTreeSet<String>,
     warnings: &mut Vec<String>,
-) -> VideoClip {
+) -> Option<VideoClip> {
     let obj = val.as_object();
     let raw_start = obj
         .and_then(|o| o.get("start"))
-        .and_then(Value::as_f64)
-        .filter(|v| v.is_finite())
+        .and_then(value_as_f64)
         .unwrap_or(0.0);
     let raw_length = obj
         .and_then(|o| o.get("length"))
-        .and_then(Value::as_f64)
-        .filter(|v| v.is_finite())
+        .and_then(value_as_f64)
         .unwrap_or(0.0);
     let (start, length) = if raw_start < 0.0 {
+        let remaining = raw_length + raw_start;
+        if remaining <= 0.0 {
+            warnings.push(format!(
+                "dropped video clip ending at or before frame 0 (start={raw_start}, length={raw_length})"
+            ));
+            return None;
+        }
         warnings.push(format!(
             "normalized negative video clip start ({raw_start}) to 0.0"
         ));
-        (0.0, (raw_length + raw_start).max(1.0))
+        (0.0, remaining)
     } else {
         (raw_start, raw_length.max(0.0))
     };
@@ -911,20 +1270,30 @@ fn parse_video_clip(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let mut time_curve = props.and_then(|p| p.get("time")).map_or_else(
-        || PropertyTrack::linear_time_curve(length, fps),
+        || PropertyTrack::linear_time_curve(raw_length.max(0.0), fps),
         |v| parse_property_track(v, PropertyValue::Number(0.0)),
     );
     if raw_start < 0.0 {
-        rebase_time_curve_for_clipped_prefix(&mut time_curve, -raw_start, fps);
+        rebase_time_curve_for_clipped_prefix(&mut time_curve, -raw_start, length, fps);
     }
     time_curve.static_behavior = StaticBehavior::Linear;
 
-    let layer = obj.and_then(|o| o.get("object")).map_or_else(
+    let mut layer = obj.and_then(|o| o.get("object")).map_or_else(
         || Layer::new("Layer", LayerKind::Generator, seq_res),
         |layer_val| parse_layer(layer_val, seq_res, media.clone(), plugins, warnings),
     );
+    if raw_start < 0.0 {
+        shift_layer(&mut layer, raw_start);
+    }
 
     let mut preserved = BTreeMap::new();
+    if let Some(p) = props {
+        for (k, v) in p {
+            if !matches!(k.as_str(), "name" | "media" | "time") {
+                preserved.insert(format!("property.{k}"), v.clone());
+            }
+        }
+    }
     if let Some(o) = obj {
         for (k, v) in o {
             if !matches!(
@@ -936,7 +1305,7 @@ fn parse_video_clip(
         }
     }
 
-    VideoClip {
+    Some(VideoClip {
         id: Uuid::new_v4(),
         name,
         start,
@@ -946,23 +1315,31 @@ fn parse_video_clip(
         time_curve,
         layer,
         preserved,
-    }
+    })
 }
 
-fn parse_audio_clip(val: &Value, fps: u32) -> AudioClip {
+fn parse_audio_clip(val: &Value, fps: u32, warnings: &mut Vec<String>) -> Option<AudioClip> {
     let obj = val.as_object();
     let raw_start = obj
         .and_then(|o| o.get("start"))
-        .and_then(Value::as_f64)
-        .filter(|v| v.is_finite())
+        .and_then(value_as_f64)
         .unwrap_or(0.0);
     let raw_length = obj
         .and_then(|o| o.get("length"))
-        .and_then(Value::as_f64)
-        .filter(|v| v.is_finite())
+        .and_then(value_as_f64)
         .unwrap_or(0.0);
     let (start, length) = if raw_start < 0.0 {
-        (0.0, (raw_length + raw_start).max(1.0))
+        let remaining = raw_length + raw_start;
+        if remaining <= 0.0 {
+            warnings.push(format!(
+                "dropped audio clip ending at or before frame 0 (start={raw_start}, length={raw_length})"
+            ));
+            return None;
+        }
+        warnings.push(format!(
+            "normalized negative audio clip start ({raw_start}) to 0.0"
+        ));
+        (0.0, remaining)
     } else {
         (raw_start, raw_length.max(0.0))
     };
@@ -979,11 +1356,11 @@ fn parse_audio_clip(val: &Value, fps: u32) -> AudioClip {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let mut time_curve = props.and_then(|p| p.get("time")).map_or_else(
-        || PropertyTrack::linear_time_curve(length, fps),
+        || PropertyTrack::linear_time_curve(raw_length.max(0.0), fps),
         |v| parse_property_track(v, PropertyValue::Number(0.0)),
     );
     if raw_start < 0.0 {
-        rebase_time_curve_for_clipped_prefix(&mut time_curve, -raw_start, fps);
+        rebase_time_curve_for_clipped_prefix(&mut time_curve, -raw_start, length, fps);
     }
     time_curve.static_behavior = StaticBehavior::Linear;
 
@@ -1008,8 +1385,18 @@ fn parse_audio_clip(val: &Value, fps: u32) -> AudioClip {
             }
         }
     }
+    if raw_start < 0.0 {
+        shift_audio_clip_data(&mut audio, raw_start);
+    }
 
     let mut preserved = BTreeMap::new();
+    if let Some(p) = props {
+        for (k, v) in p {
+            if !matches!(k.as_str(), "name" | "media" | "time") {
+                preserved.insert(format!("property.{k}"), v.clone());
+            }
+        }
+    }
     if let Some(o) = obj {
         for (k, v) in o {
             if !matches!(
@@ -1021,7 +1408,7 @@ fn parse_audio_clip(val: &Value, fps: u32) -> AudioClip {
         }
     }
 
-    AudioClip {
+    Some(AudioClip {
         id: Uuid::new_v4(),
         name,
         start,
@@ -1031,7 +1418,7 @@ fn parse_audio_clip(val: &Value, fps: u32) -> AudioClip {
         time_curve,
         audio,
         preserved,
-    }
+    })
 }
 
 fn parse_layer(
@@ -1205,6 +1592,22 @@ fn parse_layer(
         }
     }
 
+    if let Some(cp) = child_props {
+        for (k, v) in cp {
+            let known_child_key = match &layer.kind {
+                LayerKind::Image { .. } => k == "image",
+                LayerKind::Text2D { .. } => matches!(k.as_str(), "text" | "font" | "size"),
+                LayerKind::PresetShape2D { .. } => k == "preset",
+                _ => false,
+            };
+            if !known_child_key {
+                layer
+                    .preserved
+                    .insert(format!("childProperty.{k}"), v.clone());
+            }
+        }
+    }
+
     if let Some(effects) = obj.get("effects").and_then(Value::as_array) {
         for eff_val in effects {
             layer.effects.push(parse_effect(eff_val, plugins, warnings));
@@ -1284,6 +1687,13 @@ fn parse_shape2d_node(val: &Value) -> Shape2DNode {
     }
 
     let mut preserved = BTreeMap::new();
+    if let Some(p) = props {
+        for (k, v) in p {
+            if !matches!(k.as_str(), "name" | "position" | "rotation" | "scale") {
+                preserved.insert(format!("property.{k}"), v.clone());
+            }
+        }
+    }
     for (k, v) in obj {
         if !matches!(
             k.as_str(),
@@ -1376,10 +1786,8 @@ fn parse_object3d(
                 .and_then(Value::as_object)
             {
                 for (k, v) in mp {
-                    model_props.insert(
-                        k.clone(),
-                        parse_property_track(v, PropertyValue::Number(0.0)),
-                    );
+                    let default_val = infer_default_value(v);
+                    model_props.insert(k.clone(), parse_property_track(v, default_val));
                 }
             }
             (
@@ -1509,6 +1917,8 @@ fn parse_object3d(
             out.zoidium_uv_mode = mode;
         }
         out.material = Some(mat);
+    } else if matches!(out.kind, Object3DKind::Shape3D(_) | Object3DKind::Text3D(_)) {
+        out.material = Some(MaterialSpec::single_color_default());
     }
 
     for (k, v) in obj {
@@ -1920,12 +2330,12 @@ fn parse_constraints(
     plugins: &mut BTreeSet<String>,
 ) -> ObjectConstraints {
     let mut constraints = ObjectConstraints {
-        zoidium_id: prop_str(props, "zoidiumId"),
+        zoidium_id: prop_str(props, "zoidiumId").filter(|s| !s.is_empty()),
         track_to: None,
         follow: None,
     };
 
-    if let Some(target_id) = prop_str(props, "zoidiumTrackTo") {
+    if let Some(target_id) = prop_str(props, "zoidiumTrackTo").filter(|s| !s.is_empty()) {
         plugins.insert("constraints".to_owned());
         constraints.track_to = Some(TrackToConstraint {
             target_id,
@@ -1944,7 +2354,7 @@ fn parse_constraints(
         });
     }
 
-    if let Some(target_id) = prop_str(props, "zoidiumFollow") {
+    if let Some(target_id) = prop_str(props, "zoidiumFollow").filter(|s| !s.is_empty()) {
         plugins.insert("constraints".to_owned());
         constraints.follow = Some(FollowConstraint {
             target_id,
@@ -2137,11 +2547,102 @@ fn parse_material(
                     m.base_color = parse_property_track(v, PropertyValue::Color([1.0, 1.0, 1.0]));
                 }
                 m.base_color_map = p
-                    .get("texture")
+                    .get("baseColorMap")
+                    .or_else(|| p.get("texture"))
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
+                if let Some(v) = p.get("emissive") {
+                    m.emissive = parse_property_track(v, PropertyValue::Color([0.0, 0.0, 0.0]));
+                }
+                m.emissive_map = p
+                    .get("emissiveMap")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                if let Some(v) = p.get("roughness") {
+                    m.roughness = parse_property_track(v, PropertyValue::Number(0.5));
+                }
+                m.roughness_map = p
+                    .get("roughnessMap")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                if let Some(v) = p.get("metalness") {
+                    m.metalness = parse_property_track(v, PropertyValue::Number(0.0));
+                }
+                m.metalness_map = p
+                    .get("metalnessMap")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                m.normal_map = p
+                    .get("normalMap")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                if let Some(ns) = prop_f64(p, "normalScale") {
+                    m.normal_scale = ns;
+                }
+                m.alpha_map = p
+                    .get("alphaMap")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                if let Some(v) = p.get("opacity") {
+                    m.opacity = parse_property_track(v, PropertyValue::Number(1.0));
+                }
+                if let Some(t) = p.get("transparent").and_then(value_as_u32) {
+                    m.transparent = t != 0;
+                }
+                if let Some(b) = p.get("blending").and_then(value_as_u32) {
+                    m.blending = b;
+                }
+                if let Some(s) = p.get("side").and_then(value_as_u32) {
+                    m.side = s;
+                }
+                if let Some(w) = p.get("wrap").and_then(value_as_u32) {
+                    m.wrap = w;
+                }
+                if let Some(v) = p.get("repeat") {
+                    m.repeat = parse_property_track(v, PropertyValue::Vec2([1.0, 1.0]));
+                }
+                if let Some(v) = p.get("offset") {
+                    m.offset = parse_property_track(v, PropertyValue::Vec2([0.0, 0.0]));
+                }
+                if let Some(v) = p.get("center") {
+                    m.center = parse_property_track(v, PropertyValue::Vec2([0.0, 0.0]));
+                }
+                if let Some(v) = p.get("rotation") {
+                    m.rotation = parse_property_track(v, PropertyValue::Number(0.0));
+                }
+                if let Some(ri) = prop_f64(p, "reflectionIntensity") {
+                    m.reflection_intensity = ri;
+                }
                 for (k, v) in p {
-                    m.preserved.insert(k.clone(), v.clone());
+                    if !matches!(
+                        k.as_str(),
+                        "color"
+                            | "baseColor"
+                            | "texture"
+                            | "baseColorMap"
+                            | "emissive"
+                            | "emissiveMap"
+                            | "roughness"
+                            | "roughnessMap"
+                            | "metalness"
+                            | "metalnessMap"
+                            | "normalMap"
+                            | "normalScale"
+                            | "alphaMap"
+                            | "opacity"
+                            | "transparent"
+                            | "blending"
+                            | "side"
+                            | "wrap"
+                            | "repeat"
+                            | "offset"
+                            | "center"
+                            | "rotation"
+                            | "reflectionIntensity"
+                            | "zoidiumUvMode"
+                    ) {
+                        m.preserved.insert(k.clone(), v.clone());
+                    }
                 }
             }
             MaterialSpec::PbrPlus(Box::new(m))
@@ -2163,6 +2664,15 @@ fn parse_material(
                 if let Some(v) = p.get("opacity") {
                     m.opacity = parse_property_track(v, PropertyValue::Number(1.0));
                 }
+                if let Some(t) = p.get("transparent").and_then(value_as_u32) {
+                    m.transparent = t != 0;
+                }
+                if let Some(b) = p.get("blending").and_then(value_as_u32) {
+                    m.blending = b;
+                }
+                if let Some(s) = p.get("side").and_then(value_as_u32) {
+                    m.side = s;
+                }
             }
             MaterialSpec::Matcap(Box::new(m))
         }
@@ -2176,6 +2686,30 @@ fn parse_material(
                     .map(ToOwned::to_owned);
                 if let Some(v) = p.get("opacity") {
                     m.opacity = parse_property_track(v, PropertyValue::Number(1.0));
+                }
+                if let Some(t) = p.get("transparent").and_then(value_as_u32) {
+                    m.transparent = t != 0;
+                }
+                if let Some(b) = p.get("blending").and_then(value_as_u32) {
+                    m.blending = b;
+                }
+                if let Some(w) = p.get("wrap").and_then(value_as_u32) {
+                    m.wrap = w;
+                }
+                if let Some(v) = p.get("repeat") {
+                    m.repeat = parse_property_track(v, PropertyValue::Vec2([1.0, 1.0]));
+                }
+                if let Some(v) = p.get("offset") {
+                    m.offset = parse_property_track(v, PropertyValue::Vec2([0.0, 0.0]));
+                }
+                if let Some(v) = p.get("center") {
+                    m.center = parse_property_track(v, PropertyValue::Vec2([0.0, 0.0]));
+                }
+                if let Some(v) = p.get("rotation") {
+                    m.rotation = parse_property_track(v, PropertyValue::Number(0.0));
+                }
+                if let Some(s) = p.get("side").and_then(value_as_u32) {
+                    m.side = s;
                 }
             }
             MaterialSpec::ImagePlus(Box::new(m))
@@ -2226,7 +2760,8 @@ fn parse_effect(
         }
         Some(1) => {
             let frag_shader = props
-                .and_then(|p| prop_str(p, "fragShader"))
+                .and_then(|p| p.get("fragShader"))
+                .and_then(extract_shader_string)
                 .unwrap_or_default();
             let mut shader = create_custom_shader("Custom Shader", frag_shader.clone());
             let custom_properties = parse_custom_properties(obj.get("customProperties"));
@@ -2241,7 +2776,32 @@ fn parse_effect(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_owned();
-            if let Some(std_eff) = create_standard_effect(&id_str) {
+            if let Some((plugin, bare)) = id_str
+                .strip_prefix("zoidium:")
+                .and_then(|rest| rest.split_once('/'))
+                .filter(|(p, b)| !p.is_empty() && !b.is_empty())
+            {
+                if let Some(zoid_eff) = create_zoidium_effect(bare) {
+                    if let EffectKind::Plugin { ref plugin_id, .. } = zoid_eff.kind {
+                        plugins.insert(plugin_id.clone());
+                    }
+                    zoid_eff
+                } else {
+                    plugins.insert(plugin.to_owned());
+                    warnings.push(format!("preserved unknown plugin effect {id_str:?}"));
+                    EffectInstance {
+                        id: Uuid::new_v4(),
+                        name: bare.to_owned(),
+                        kind: EffectKind::Plugin {
+                            plugin_id: plugin.to_owned(),
+                            effect_id: bare.to_owned(),
+                        },
+                        enabled: PropertyTrack::option(1),
+                        params: BTreeMap::new(),
+                        preserved: BTreeMap::new(),
+                    }
+                }
+            } else if let Some(std_eff) = create_standard_effect(&id_str) {
                 std_eff
             } else if let Some(zoid_eff) = create_zoidium_effect(&id_str) {
                 if let EffectKind::Plugin { ref plugin_id, .. } = zoid_eff.kind {
@@ -2317,6 +2877,21 @@ fn parse_effect(
     instance
 }
 
+fn extract_shader_string(val: &Value) -> Option<String> {
+    if let Some(s) = val.as_str() {
+        return Some(s.to_owned());
+    }
+    let obj = val.as_object()?;
+    if let Some(kfs) = obj.get("keyframes").and_then(Value::as_array) {
+        return kfs
+            .first()
+            .and_then(|kf| kf.get("value"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    obj.get("value").and_then(extract_shader_string)
+}
+
 fn parse_custom_properties(val: Option<&Value>) -> Vec<CustomProperty> {
     let Some(arr) = val.and_then(Value::as_array) else {
         return Vec::new();
@@ -2327,6 +2902,11 @@ fn parse_custom_properties(val: Option<&Value>) -> Vec<CustomProperty> {
             continue;
         };
         let props = obj.get("properties").and_then(Value::as_object);
+        let type_obj = obj.get("type").and_then(Value::as_object);
+        let prop_type = obj
+            .get("type")
+            .and_then(value_as_u32)
+            .or_else(|| type_obj.and_then(|t| t.get("type")).and_then(value_as_u32));
         let name = props
             .and_then(|p| prop_str(p, "name"))
             .or_else(|| {
@@ -2334,27 +2914,49 @@ fn parse_custom_properties(val: Option<&Value>) -> Vec<CustomProperty> {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned)
             })
+            .or_else(|| {
+                type_obj
+                    .and_then(|t| t.get("name"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
             .unwrap_or_else(|| "Property".to_owned());
-        let prop_type = obj.get("type").and_then(value_as_u32);
         let value_node = obj.get("value").unwrap_or(item);
         let default_val = match prop_type {
+            Some(0) => PropertyValue::Number(0.0),
             Some(1) => PropertyValue::Vec2([0.0, 0.0]),
             Some(2) => PropertyValue::Vec3([0.0, 0.0, 0.0]),
             Some(3) => PropertyValue::Vec4([0.0, 0.0, 0.0, 0.0]),
             Some(4) => PropertyValue::Color([1.0, 1.0, 1.0]),
+            Some(5) => PropertyValue::Gradient(GradientStop::white_default()),
             Some(6) => PropertyValue::Option(0),
             Some(7) => PropertyValue::Text(String::new()),
             Some(8) => PropertyValue::Asset(None),
             Some(9) => PropertyValue::List(String::new()),
+            Some(10) => PropertyValue::Curve(Value::Null),
+            Some(11) => PropertyValue::Shader(String::new()),
             _ => infer_default_value(value_node),
         };
-        let track = parse_property_track(value_node, default_val);
+        let mut track = parse_property_track(value_node, default_val);
+        if obj.contains_key("value") {
+            if track.expression.is_none()
+                && let Some(expr) = obj.get("expression").and_then(Value::as_str)
+            {
+                track.expression = Some(expr.to_owned());
+            }
+            if let Some(anim) = obj.get("animated").and_then(Value::as_bool) {
+                track.animated = track.animated || anim;
+            }
+        }
         let mut metadata = BTreeMap::new();
         for (k, v) in obj {
-            if !matches!(
-                k.as_str(),
-                "name" | "type" | "value" | "keyframes" | "animated" | "expression" | "objects"
-            ) {
+            let preserve_type_obj = k == "type" && type_obj.is_some();
+            if preserve_type_obj
+                || !matches!(
+                    k.as_str(),
+                    "name" | "type" | "value" | "keyframes" | "animated" | "expression" | "objects"
+                )
+            {
                 metadata.insert(k.clone(), v.clone());
             }
         }
@@ -2368,7 +2970,12 @@ fn parse_custom_properties(val: Option<&Value>) -> Vec<CustomProperty> {
     out
 }
 
-fn resolve_clip_links(clip_links_val: &Value, seq: &mut Sequence) {
+fn resolve_clip_links(
+    clip_links_val: &Value,
+    seq: &mut Sequence,
+    video_clip_index_maps: &[Vec<Option<usize>>],
+    audio_clip_index_maps: &[Vec<Option<usize>>],
+) {
     let Some(links) = clip_links_val.get("links").and_then(Value::as_object) else {
         return;
     };
@@ -2388,14 +2995,26 @@ fn resolve_clip_links(clip_links_val: &Value, seq: &mut Sequence) {
                 continue;
             }
             let track_kind = parts[1].as_u64().unwrap_or(0);
-            let track_idx = parts[2].as_u64().unwrap_or(usize::MAX as u64) as usize;
-            let clip_idx = parts[3].as_u64().unwrap_or(usize::MAX as u64) as usize;
+            let Some(track_idx) = parts[2].as_u64().and_then(|v| usize::try_from(v).ok()) else {
+                continue;
+            };
+            let Some(raw_clip_idx) = parts[3].as_u64().and_then(|v| usize::try_from(v).ok()) else {
+                continue;
+            };
             match track_kind {
                 1 => {
+                    let Some(kept_clip_idx) = video_clip_index_maps
+                        .get(track_idx)
+                        .and_then(|m| m.get(raw_clip_idx))
+                        .copied()
+                        .flatten()
+                    else {
+                        continue;
+                    };
                     if let Some(clip) = seq
                         .video_tracks
                         .get_mut(track_idx)
-                        .and_then(|t| t.clips.get_mut(clip_idx))
+                        .and_then(|t| t.clips.get_mut(kept_clip_idx))
                     {
                         if clip.link.is_none() {
                             clip.link = Some(link_id);
@@ -2404,10 +3023,18 @@ fn resolve_clip_links(clip_links_val: &Value, seq: &mut Sequence) {
                     }
                 }
                 2 => {
+                    let Some(kept_clip_idx) = audio_clip_index_maps
+                        .get(track_idx)
+                        .and_then(|m| m.get(raw_clip_idx))
+                        .copied()
+                        .flatten()
+                    else {
+                        continue;
+                    };
                     if let Some(clip) = seq
                         .audio_tracks
                         .get_mut(track_idx)
-                        .and_then(|t| t.clips.get_mut(clip_idx))
+                        .and_then(|t| t.clips.get_mut(kept_clip_idx))
                     {
                         if clip.link.is_none() {
                             clip.link = Some(link_id);
@@ -2424,15 +3051,58 @@ fn resolve_clip_links(clip_links_val: &Value, seq: &mut Sequence) {
     }
 }
 
+fn axis_default_component(default_val: &PropertyValue, axis: usize) -> f64 {
+    match default_val {
+        PropertyValue::Vec2(v) => v.get(axis).copied().unwrap_or(0.0),
+        PropertyValue::Vec3(v) | PropertyValue::Color(v) => v.get(axis).copied().unwrap_or(0.0),
+        PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) => v.get(axis).copied().unwrap_or(0.0),
+        PropertyValue::Number(v) if axis == 0 => *v,
+        _ => 0.0,
+    }
+}
+
+fn default_cm3_tween(val: &PropertyValue) -> u32 {
+    match val {
+        PropertyValue::Option(_)
+        | PropertyValue::Text(_)
+        | PropertyValue::Asset(_)
+        | PropertyValue::List(_)
+        | PropertyValue::Gradient(_)
+        | PropertyValue::Curve(_)
+        | PropertyValue::Shader(_)
+        | PropertyValue::Bool(_)
+        | PropertyValue::Json(_) => 0,
+        PropertyValue::Number(_)
+        | PropertyValue::Vec2(_)
+        | PropertyValue::Vec3(_)
+        | PropertyValue::Vec4(_)
+        | PropertyValue::Color(_)
+        | PropertyValue::ColorRgba(_) => 1,
+    }
+}
+
 /// Parses any CM3 property form: static bare value, dynamic keyframe object,
 /// dynamic group `{ objects: [...] }`, or legacy array-keyframed group.
 fn parse_property_track(val: &Value, default_val: PropertyValue) -> PropertyTrack {
+    let is_raw_object_default = matches!(
+        default_val,
+        PropertyValue::Json(_) | PropertyValue::Curve(_)
+    );
+
     if let Some(obj) = val.as_object() {
         // Dynamic Group property: `{ expression?, objects: [ ...scalar channels... ] }`
-        if let Some(channels_arr) = obj.get("objects").and_then(Value::as_array) {
+        if !is_raw_object_default
+            && let Some(channels_arr) = obj.get("objects").and_then(Value::as_array)
+        {
             let channels: Vec<PropertyTrack> = channels_arr
                 .iter()
-                .map(|c| parse_property_track(c, PropertyValue::Number(0.0)))
+                .enumerate()
+                .map(|(axis, c)| {
+                    parse_property_track(
+                        c,
+                        PropertyValue::Number(axis_default_component(&default_val, axis)),
+                    )
+                })
                 .collect();
             let animated = channels.iter().any(|c| c.animated)
                 || obj
@@ -2466,23 +3136,36 @@ fn parse_property_track(val: &Value, default_val: PropertyValue) -> PropertyTrac
                 .map(ToOwned::to_owned);
 
             // Legacy CM3 migration: array-valued keyframes directly on a vector/color group -> split per-axis.
-            if let Some(first_arr) = kfs_arr
-                .first()
-                .and_then(|kf| kf.get("value"))
-                .and_then(Value::as_array)
+            // Never split Gradient/Json/Curve properties whose values are arrays of stop objects.
+            let is_numeric_vector_default = matches!(
+                default_val,
+                PropertyValue::Vec2(_)
+                    | PropertyValue::Vec3(_)
+                    | PropertyValue::Vec4(_)
+                    | PropertyValue::Color(_)
+                    | PropertyValue::ColorRgba(_)
+            );
+            if is_numeric_vector_default
+                && let Some(first_arr) = kfs_arr
+                    .first()
+                    .and_then(|kf| kf.get("value"))
+                    .and_then(Value::as_array)
+                && !first_arr.is_empty()
+                && first_arr.iter().all(|v| v.is_number())
             {
                 let dim = first_arr.len();
                 let mut channels = Vec::with_capacity(dim);
                 for axis in 0..dim {
+                    let axis_default = axis_default_component(&default_val, axis);
                     let mut axis_kfs = Vec::with_capacity(kfs_arr.len());
                     for kf in kfs_arr {
-                        let frame = kf.get("frame").and_then(Value::as_f64).unwrap_or(0.0);
+                        let frame = kf.get("frame").and_then(value_as_f64).unwrap_or(0.0);
                         let axis_num = kf
                             .get("value")
                             .and_then(Value::as_array)
                             .and_then(|a| a.get(axis))
-                            .and_then(Value::as_f64)
-                            .unwrap_or(0.0);
+                            .and_then(value_as_f64)
+                            .unwrap_or(axis_default);
                         let tween = kf.get("tween").and_then(value_as_u32).unwrap_or(1);
                         let cp = parse_control_points(kf.get("controlPoints"));
                         let cont = kf
@@ -2499,7 +3182,7 @@ fn parse_property_track(val: &Value, default_val: PropertyValue) -> PropertyTrac
                     }
                     let first_val = axis_kfs
                         .first()
-                        .map_or(PropertyValue::Number(0.0), |k| k.value.clone());
+                        .map_or(PropertyValue::Number(axis_default), |k| k.value.clone());
                     channels.push(PropertyTrack {
                         animated,
                         expression: None,
@@ -2520,14 +3203,18 @@ fn parse_property_track(val: &Value, default_val: PropertyValue) -> PropertyTrac
                 };
             }
 
+            let default_tween = default_cm3_tween(&default_val);
             let mut keyframes = Vec::with_capacity(kfs_arr.len());
             for kf in kfs_arr {
-                let frame = kf.get("frame").and_then(Value::as_f64).unwrap_or(0.0);
+                let frame = kf.get("frame").and_then(value_as_f64).unwrap_or(0.0);
                 let kf_val = kf.get("value").map_or_else(
                     || default_val.clone(),
                     |v| parse_static_value(v, &default_val),
                 );
-                let tween = kf.get("tween").and_then(value_as_u32).unwrap_or(1);
+                let tween = kf
+                    .get("tween")
+                    .and_then(value_as_u32)
+                    .unwrap_or(default_tween);
                 let cp = parse_control_points(kf.get("controlPoints"));
                 let cont = kf
                     .get("continuousTangent")
@@ -2552,9 +3239,18 @@ fn parse_property_track(val: &Value, default_val: PropertyValue) -> PropertyTrac
             };
         }
 
-        // Custom property wrapper `{ value: ... }`
-        if let Some(inner) = obj.get("value") {
-            return parse_property_track(inner, default_val);
+        // Custom property wrapper `{ value: ..., expression?, animated? }`
+        if !is_raw_object_default && let Some(inner) = obj.get("value") {
+            let mut track = parse_property_track(inner, default_val);
+            if track.expression.is_none()
+                && let Some(expr) = obj.get("expression").and_then(Value::as_str)
+            {
+                track.expression = Some(expr.to_owned());
+            }
+            if let Some(anim) = obj.get("animated").and_then(Value::as_bool) {
+                track.animated = track.animated || anim;
+            }
+            return track;
         }
     }
 
@@ -2581,10 +3277,10 @@ fn combine_channel_values(channels: &[PropertyTrack], template: &PropertyValue) 
 
 fn parse_static_value(val: &Value, template: &PropertyValue) -> PropertyValue {
     match template {
-        PropertyValue::Number(_) => PropertyValue::Number(value_as_f64(val).unwrap_or(0.0)),
-        PropertyValue::Option(_) => {
+        PropertyValue::Number(def) => PropertyValue::Number(value_as_f64(val).unwrap_or(*def)),
+        PropertyValue::Option(def) => {
             // Handles Shader+ stringified `"0"` option quirk.
-            PropertyValue::Option(value_as_u32(val).unwrap_or(0))
+            PropertyValue::Option(value_as_u32(val).unwrap_or(*def))
         }
         PropertyValue::Vec2(def) => {
             PropertyValue::Vec2(value_as_f64_array::<2>(val).unwrap_or(*def))
@@ -2602,23 +3298,45 @@ fn parse_static_value(val: &Value, template: &PropertyValue) -> PropertyValue {
             PropertyValue::ColorRgba(value_as_f64_array::<4>(val).unwrap_or(*def))
         }
         PropertyValue::Gradient(_) => PropertyValue::Gradient(parse_gradient_stops(val)),
-        PropertyValue::Text(_) => PropertyValue::Text(val.as_str().unwrap_or_default().to_owned()),
-        PropertyValue::List(_) => PropertyValue::List(val.as_str().unwrap_or_default().to_owned()),
-        PropertyValue::Asset(_) => PropertyValue::Asset(val.as_str().map(ToOwned::to_owned)),
-        PropertyValue::Shader(_) => {
-            PropertyValue::Shader(val.as_str().unwrap_or_default().to_owned())
+        PropertyValue::Text(def) => {
+            PropertyValue::Text(val.as_str().map_or_else(|| def.clone(), ToOwned::to_owned))
+        }
+        PropertyValue::List(def) => {
+            PropertyValue::List(val.as_str().map_or_else(|| def.clone(), ToOwned::to_owned))
+        }
+        PropertyValue::Asset(def) => {
+            if val.is_null() {
+                PropertyValue::Asset(None)
+            } else {
+                PropertyValue::Asset(val.as_str().map(ToOwned::to_owned).or_else(|| def.clone()))
+            }
+        }
+        PropertyValue::Shader(def) => {
+            PropertyValue::Shader(val.as_str().map_or_else(|| def.clone(), ToOwned::to_owned))
         }
         PropertyValue::Curve(_) => PropertyValue::Curve(val.clone()),
-        PropertyValue::Bool(_) => PropertyValue::Bool(
+        PropertyValue::Bool(def) => PropertyValue::Bool(
             val.as_bool()
-                .unwrap_or_else(|| value_as_u32(val).unwrap_or(0) != 0),
+                .or_else(|| value_as_u32(val).map(|n| n != 0))
+                .unwrap_or(*def),
         ),
         PropertyValue::Json(_) => PropertyValue::Json(val.clone()),
     }
 }
 
+fn is_gradient_stop_array(arr: &[Value]) -> bool {
+    !arr.is_empty()
+        && arr.iter().all(|item| {
+            item.as_object()
+                .is_some_and(|o| o.contains_key("position") && o.contains_key("color"))
+        })
+}
+
 fn infer_default_value(val: &Value) -> PropertyValue {
     if let Some(arr) = val.as_array() {
+        if is_gradient_stop_array(arr) {
+            return PropertyValue::Gradient(GradientStop::white_default());
+        }
         match arr.len() {
             2 if arr.iter().all(Value::is_number) => PropertyValue::Vec2([0.0, 0.0]),
             3 if arr.iter().all(Value::is_number) => PropertyValue::Vec3([0.0, 0.0, 0.0]),
@@ -2639,8 +3357,16 @@ fn infer_default_value(val: &Value) -> PropertyValue {
                 4 => PropertyValue::Vec4([0.0, 0.0, 0.0, 0.0]),
                 _ => PropertyValue::Number(0.0),
             }
-        } else if obj.contains_key("keyframes") {
-            PropertyValue::Number(0.0)
+        } else if let Some(kfs) = obj.get("keyframes").and_then(Value::as_array) {
+            kfs.first()
+                .and_then(|kf| kf.get("value"))
+                .map_or(PropertyValue::Number(0.0), infer_default_value)
+        } else if let Some(inner) = obj.get("value")
+            && obj
+                .keys()
+                .all(|k| matches!(k.as_str(), "value" | "expression" | "animated"))
+        {
+            infer_default_value(inner)
         } else {
             PropertyValue::Json(Value::Null)
         }
@@ -2671,7 +3397,7 @@ fn parse_gradient_stops(val: &Value) -> Vec<GradientStop> {
         let Some(obj) = stop.as_object() else {
             continue;
         };
-        let position = obj.get("position").and_then(Value::as_f64).unwrap_or(0.0);
+        let position = obj.get("position").and_then(value_as_f64).unwrap_or(0.0);
         let color = obj
             .get("color")
             .and_then(Value::as_str)
@@ -2688,9 +3414,9 @@ fn parse_gradient_stops(val: &Value) -> Vec<GradientStop> {
 
 fn value_as_f64(val: &Value) -> Option<f64> {
     if let Some(n) = val.as_f64() {
-        Some(n)
+        n.is_finite().then_some(n)
     } else if let Some(s) = val.as_str() {
-        s.parse::<f64>().ok()
+        s.parse::<f64>().ok().filter(|v| v.is_finite())
     } else {
         val.as_bool().map(|b| if b { 1.0 } else { 0.0 })
     }
@@ -2700,7 +3426,7 @@ fn value_as_u32(val: &Value) -> Option<u32> {
     if let Some(n) = val.as_u64() {
         u32::try_from(n).ok()
     } else if let Some(f) = val.as_f64() {
-        (f >= 0.0).then_some(f.round() as u32)
+        (f.is_finite() && f >= 0.0).then_some(f.round() as u32)
     } else if let Some(s) = val.as_str() {
         s.parse::<u32>().ok()
     } else {
@@ -3131,5 +3857,554 @@ mod tests {
             import_pz_from_bytes(&evil),
             Err(ProjectError::InvalidArchivePath(_))
         ));
+    }
+
+    #[test]
+    fn imports_namespaced_plugin_effects_pbr_plus_defaults_and_preserves_nested_props() {
+        let tex_base = b"BASE";
+        let tex_emissive = b"EMIS";
+        let tex_rough = b"ROUG";
+        let tex_metal = b"METL";
+        let tex_norm = b"NORM";
+        let tex_alpha = b"ALPH";
+        let tex_model = b"MODL";
+
+        let project_json = serde_json::json!({
+            "assets": {
+                "11111111111111111111111111111111": { "type": 0, "source": 1, "external": false, "filename": "base.png" },
+                "22222222222222222222222222222222": { "type": 0, "source": 1, "external": false, "filename": "emis.png" },
+                "33333333333333333333333333333333": { "type": 0, "source": 1, "external": false, "filename": "roug.png" },
+                "44444444444444444444444444444444": { "type": 0, "source": 1, "external": false, "filename": "metl.png" },
+                "55555555555555555555555555555555": { "type": 0, "source": 1, "external": false, "filename": "norm.png" },
+                "66666666666666666666666666666666": { "type": 0, "source": 1, "external": false, "filename": "alph.png" },
+                "77777777777777777777777777777777": { "type": 0, "source": 1, "external": false, "filename": "modl.png" }
+            },
+            "sequence": {
+                "properties": { "name": "EdgeCaseSeq", "rate": 30 },
+                "videoTracks": [{
+                    "type": 0,
+                    "clips": [
+                        {
+                            "start": -30,
+                            "length": 20,
+                            "properties": { "name": "OffTimeline" },
+                            "object": { "type": 5, "properties": {} }
+                        },
+                        {
+                            "start": -10,
+                            "length": 50,
+                            "properties": { "name": "TrimmedClip", "isComp": true, "compLength": 50 },
+                            "object": {
+                                "type": 4,
+                                "properties": {
+                                    "name": "Scene",
+                                    "opacity": {
+                                        "animated": true,
+                                        "keyframes": [
+                                            { "frame": 10, "value": 0.25 },
+                                            { "frame": 30, "value": 1.0 }
+                                        ]
+                                    }
+                                },
+                                "objects": [
+                                    {
+                                        "type": 0,
+                                        "objectType": 1,
+                                        "properties": {
+                                            "name": "DefaultMatBox",
+                                            "zoidiumTrackTo": "",
+                                            "zoidiumFollow": ""
+                                        }
+                                    },
+                                    {
+                                        "type": 0,
+                                        "objectType": 1,
+                                        "properties": { "name": "PbrPlusBox" },
+                                        "material": {
+                                            "type": "zoidium:material-plus/pbr-plus",
+                                            "properties": {
+                                                "baseColor": [0.9, 0.8, 0.7],
+                                                "baseColorMap": "11111111111111111111111111111111",
+                                                "emissive": [0.1, 0.2, 0.3],
+                                                "emissiveMap": "22222222222222222222222222222222",
+                                                "roughness": 0.35,
+                                                "roughnessMap": "33333333333333333333333333333333",
+                                                "metalness": 0.8,
+                                                "metalnessMap": "44444444444444444444444444444444",
+                                                "normalMap": "55555555555555555555555555555555",
+                                                "normalScale": 1.5,
+                                                "alphaMap": "66666666666666666666666666666666",
+                                                "opacity": 0.9,
+                                                "transparent": 1,
+                                                "blending": 2,
+                                                "side": 2,
+                                                "wrap": 0,
+                                                "repeat": [2.0, 3.0],
+                                                "offset": [0.1, 0.2],
+                                                "center": [0.5, 0.5],
+                                                "rotation": 0.75,
+                                                "reflectionIntensity": 0.4,
+                                                "customMatExtra": "kept"
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "type": 0,
+                                        "objectType": 1,
+                                        "properties": { "name": "MatcapBox" },
+                                        "material": {
+                                            "type": "zoidium:material-plus/matcap",
+                                            "properties": { "transparent": 1, "blending": 2, "side": 2 }
+                                        }
+                                    },
+                                    {
+                                        "type": 0,
+                                        "objectType": 1,
+                                        "properties": { "name": "ImagePlusBox" },
+                                        "material": {
+                                            "type": "zoidium:material-plus/image-plus",
+                                            "properties": {
+                                                "transparent": 0,
+                                                "blending": 3,
+                                                "wrap": 2,
+                                                "repeat": [4.0, 5.0],
+                                                "offset": [0.2, 0.3],
+                                                "center": [0.4, 0.6],
+                                                "rotation": 1.25,
+                                                "side": 1
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "type": 2,
+                                        "objectType": 1,
+                                        "properties": {
+                                            "name": "ModelObj",
+                                            "modelProperties": {
+                                                "label": "hello",
+                                                "texAsset": "77777777777777777777777777777777"
+                                            }
+                                        }
+                                    }
+                                ],
+                                "effects": [
+                                    {
+                                        "type": "zoidium:native-fx/echo",
+                                        "properties": { "decay": 0.6 }
+                                    },
+                                    {
+                                        "type": "zoidium:openzoid-legacy/vhs",
+                                        "properties": {}
+                                    },
+                                    {
+                                        "type": "zoidium:future-pack/superfx",
+                                        "properties": { "strength": "NaN" }
+                                    },
+                                    {
+                                        "type": 1,
+                                        "properties": {
+                                            "name": "DynShader",
+                                            "fragShader": {
+                                                "animated": false,
+                                                "keyframes": [{ "frame": 0, "value": "void main(){gl_FragColor=vec4(1.0);}" }]
+                                            }
+                                        },
+                                        "customProperties": [
+                                            {
+                                                "type": { "type": 5, "name": "TintGrad" },
+                                                "value": {
+                                                    "animated": true,
+                                                    "keyframes": [
+                                                        { "frame": 0, "value": [{ "position": 0.0, "color": "rgba(255,0,0,1)" }] }
+                                                    ]
+                                                }
+                                            },
+                                            {
+                                                "name": "MyCurve",
+                                                "type": 10,
+                                                "value": { "objects": [1, 2], "value": 99, "points": [0, 1] }
+                                            },
+                                            {
+                                                "name": "MyShaderProp",
+                                                "type": 11,
+                                                "value": "float f() { return 1.0; }"
+                                            },
+                                            {
+                                                "name": "ExprNum",
+                                                "type": 0,
+                                                "value": { "value": 3.5, "expression": "time * 2.0", "animated": true }
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "start": 10,
+                            "length": 60,
+                            "properties": { "name": "TextLayerClip" },
+                            "object": {
+                                "type": 7,
+                                "properties": {
+                                    "name": "Text2D",
+                                    "scale": { "objects": [{ "keyframes": [] }, { "keyframes": [] }] },
+                                    "blending": null,
+                                    "childProperties": {
+                                        "text": "Hi",
+                                        "zoidiumTextPlus2D": { "tracking": 12 }
+                                    }
+                                },
+                                "objects": [{
+                                    "type": 0,
+                                    "properties": {
+                                        "name": "S",
+                                        "customShapeProp": 7,
+                                        "position": { "animated": true, "keyframes": [{ "frame": 0, "value": [] }] }
+                                    }
+                                }]
+                            }
+                        }
+                    ]
+                }],
+                "audioTracks": [{
+                    "type": 1,
+                    "clips": [
+                        { "start": -20, "length": 10, "properties": { "name": "DroppedAudio" } },
+                        {
+                            "start": -10,
+                            "length": 40,
+                            "properties": {
+                                "name": "TrimmedAudio",
+                                "time": {
+                                    "animated": true,
+                                    "keyframes": [
+                                        { "frame": 0, "value": 0.0 },
+                                        { "frame": 5, "value": 0.5 }
+                                    ]
+                                },
+                                "audioExtra": "yes"
+                            },
+                            "object": {
+                                "properties": {
+                                    "volume": {
+                                        "animated": true,
+                                        "keyframes": [{ "frame": 15, "value": 0.5 }]
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }]
+            }
+        });
+
+        let project_bytes = serde_json::to_vec(&project_json).expect("encode");
+        let archive = build_pz_bytes(&[
+            ("project", &project_bytes),
+            ("11111111111111111111111111111111", tex_base),
+            ("22222222222222222222222222222222", tex_emissive),
+            ("33333333333333333333333333333333", tex_rough),
+            ("44444444444444444444444444444444", tex_metal),
+            ("55555555555555555555555555555555", tex_norm),
+            ("66666666666666666666666666666666", tex_alpha),
+            ("77777777777777777777777777777777", tex_model),
+        ]);
+
+        let imported = import_pz_from_bytes(&archive).expect("import pz");
+        let project = imported.project;
+
+        // Sequence length computed from max clip end (10 + 60 = 70).
+        assert!((project.sequence.length_frames - 70.0).abs() < 1e-9);
+
+        // Off-timeline clips dropped; trimmed clips remain.
+        assert_eq!(project.sequence.video_tracks[0].clips.len(), 2);
+        assert_eq!(project.sequence.audio_tracks[0].clips.len(), 1);
+
+        let vclip = &project.sequence.video_tracks[0].clips[0];
+        assert!((vclip.start - 0.0).abs() < 1e-9);
+        assert!((vclip.length - 40.0).abs() < 1e-9);
+        // Fallback time_curve was built from raw_length=50 then rebased by 10 frames -> [0..40] => [10/30..50/30].
+        assert_eq!(vclip.time_curve.keyframes.len(), 2);
+        assert!((vclip.time_curve.keyframes[0].frame - 0.0).abs() < 1e-9);
+        assert!((vclip.time_curve.keyframes[1].frame - 40.0).abs() < 1e-9);
+        assert!((vclip.time_curve.keyframes[1].value.as_f64().unwrap() - 50.0 / 30.0).abs() < 1e-9);
+        // Layer keyframes shifted by raw_start (-10): 10->0, 30->20.
+        assert!((vclip.layer.opacity.keyframes[0].frame - 0.0).abs() < 1e-9);
+        assert!((vclip.layer.opacity.keyframes[1].frame - 20.0).abs() < 1e-9);
+        // Unknown clip.properties preserved.
+        assert_eq!(
+            vclip.preserved.get("property.isComp"),
+            Some(&Value::Bool(true))
+        );
+
+        // Audio clip: keyframes shifted by -10 (15->5), and time_curve with all keys < 10 gets a tail keyframe.
+        let aclip = &project.sequence.audio_tracks[0].clips[0];
+        assert!((aclip.length - 30.0).abs() < 1e-9);
+        assert_eq!(aclip.time_curve.keyframes.len(), 2);
+        assert!((aclip.time_curve.keyframes[1].frame - 30.0).abs() < 1e-9);
+        assert!((aclip.audio.volume.keyframes[0].frame - 5.0).abs() < 1e-9);
+        assert_eq!(
+            aclip.preserved.get("property.audioExtra"),
+            Some(&Value::from("yes"))
+        );
+
+        // Namespaced plugin effects registered & recognized.
+        assert!(project.plugin_requirements.contains("native-fx"));
+        assert!(project.plugin_requirements.contains("openzoid-legacy"));
+        assert!(project.plugin_requirements.contains("future-pack"));
+        assert!(!project.plugin_requirements.contains("constraints"));
+
+        let fx = &vclip.layer.effects;
+        assert_eq!(
+            fx[0].kind,
+            EffectKind::Plugin {
+                plugin_id: "native-fx".into(),
+                effect_id: "echo".into(),
+            }
+        );
+        assert_eq!(
+            fx[1].kind,
+            EffectKind::Plugin {
+                plugin_id: "openzoid-legacy".into(),
+                effect_id: "vhs".into(),
+            }
+        );
+        assert_eq!(
+            fx[2].kind,
+            EffectKind::Plugin {
+                plugin_id: "future-pack".into(),
+                effect_id: "superfx".into(),
+            }
+        );
+
+        // Dynamic fragShader + custom properties (Gradient, Curve, Shader, {value, expression}).
+        let EffectKind::CustomShader {
+            ref frag_shader,
+            ref custom_properties,
+        } = fx[3].kind
+        else {
+            panic!("expected CustomShader");
+        };
+        assert_eq!(frag_shader, "void main(){gl_FragColor=vec4(1.0);}");
+        assert_eq!(custom_properties[0].name, "TintGrad");
+        assert_eq!(custom_properties[0].prop_type, Some(5));
+        assert!(matches!(
+            custom_properties[0].track.value,
+            PropertyValue::Gradient(_)
+        ));
+        // Non-interpolated types default tween to 0 (Hold).
+        assert_eq!(custom_properties[0].track.keyframes[0].tween, 0);
+        assert_eq!(custom_properties[0].track.keyframes[0].easing_index, 0);
+        // Curve object with "objects" & "value" keys is not mangled.
+        assert_eq!(
+            custom_properties[1].track.value,
+            PropertyValue::Curve(
+                serde_json::json!({ "objects": [1, 2], "value": 99, "points": [0, 1] })
+            )
+        );
+        assert_eq!(
+            custom_properties[2].track.value,
+            PropertyValue::Shader("float f() { return 1.0; }".into())
+        );
+        assert_eq!(custom_properties[3].track.value, PropertyValue::Number(3.5));
+        assert_eq!(
+            custom_properties[3].track.expression.as_deref(),
+            Some("time * 2.0")
+        );
+        assert!(custom_properties[3].track.animated);
+
+        // Scene3D objects: default singlecolor material, full PbrPlus/Matcap/ImagePlus & asset remap, ModelData.
+        let LayerKind::Scene3D { ref objects, .. } = vclip.layer.kind else {
+            panic!("expected Scene3D");
+        };
+        assert!(matches!(
+            objects[0].material,
+            Some(MaterialSpec::SingleColor { side: 2, .. })
+        ));
+        assert!(objects[0].constraints.track_to.is_none());
+        assert!(objects[0].constraints.follow.is_none());
+
+        let Some(MaterialSpec::PbrPlus(ref pbr)) = objects[1].material else {
+            panic!("expected PbrPlus");
+        };
+        assert_eq!(
+            pbr.base_color_map.as_deref(),
+            Some(sha256_hex(tex_base).as_str())
+        );
+        assert_eq!(
+            pbr.emissive_map.as_deref(),
+            Some(sha256_hex(tex_emissive).as_str())
+        );
+        assert_eq!(
+            pbr.roughness_map.as_deref(),
+            Some(sha256_hex(tex_rough).as_str())
+        );
+        assert_eq!(
+            pbr.metalness_map.as_deref(),
+            Some(sha256_hex(tex_metal).as_str())
+        );
+        assert_eq!(
+            pbr.normal_map.as_deref(),
+            Some(sha256_hex(tex_norm).as_str())
+        );
+        assert_eq!(
+            pbr.alpha_map.as_deref(),
+            Some(sha256_hex(tex_alpha).as_str())
+        );
+        assert!((pbr.normal_scale - 1.5).abs() < 1e-9);
+        assert!((pbr.reflection_intensity - 0.4).abs() < 1e-9);
+        assert!(pbr.transparent);
+        assert_eq!(pbr.blending, 2);
+        assert_eq!(pbr.side, 2);
+        assert_eq!(pbr.wrap, 0);
+        assert_eq!(pbr.preserved.len(), 1);
+        assert_eq!(
+            pbr.preserved.get("customMatExtra"),
+            Some(&Value::from("kept"))
+        );
+
+        let Some(MaterialSpec::Matcap(ref mc)) = objects[2].material else {
+            panic!("expected Matcap");
+        };
+        assert!(mc.transparent);
+        assert_eq!(mc.blending, 2);
+        assert_eq!(mc.side, 2);
+
+        let Some(MaterialSpec::ImagePlus(ref ip)) = objects[3].material else {
+            panic!("expected ImagePlus");
+        };
+        assert!(!ip.transparent);
+        assert_eq!(ip.blending, 3);
+        assert_eq!(ip.wrap, 2);
+        assert_eq!(ip.side, 1);
+        assert_eq!(ip.repeat.value, PropertyValue::Vec2([4.0, 5.0]));
+
+        let Object3DKind::Model(ref mdl) = objects[4].kind else {
+            panic!("expected Model");
+        };
+        assert_eq!(
+            mdl.model_properties["label"].value,
+            PropertyValue::Text("hello".into())
+        );
+        // Verify remap_object_3d remaps Asset tracks inside ModelData::model_properties.
+        let mut model_obj = objects[4].clone();
+        if let Object3DKind::Model(ref mut m) = model_obj.kind {
+            m.model_properties.insert(
+                "tex".into(),
+                PropertyTrack::asset(Some("77777777777777777777777777777777".into())),
+            );
+        }
+        let mut remap = BTreeMap::new();
+        remap.insert(
+            "77777777777777777777777777777777".into(),
+            sha256_hex(tex_model),
+        );
+        remap_object_3d(&mut model_obj, &remap);
+        let Object3DKind::Model(ref remapped_mdl) = model_obj.kind else {
+            panic!("expected Model");
+        };
+        assert_eq!(
+            remapped_mdl.model_properties["tex"].value,
+            PropertyValue::Asset(Some(sha256_hex(tex_model)))
+        );
+
+        // Text2D: empty channel defaults preserve scale [1, 1], childProperty preserved, shape.properties preserved,
+        // empty legacy array keyframe doesn't drop keyframes.
+        let text_layer = &project.sequence.video_tracks[0].clips[1].layer;
+        assert_eq!(text_layer.scale.value, PropertyValue::Vec2([1.0, 1.0]));
+        assert_eq!(text_layer.blending, "BLEND_SRC_OVER");
+        assert_eq!(
+            text_layer.preserved.get("childProperty.zoidiumTextPlus2D"),
+            Some(&serde_json::json!({ "tracking": 12 }))
+        );
+        let LayerKind::Text2D { ref shapes, .. } = text_layer.kind else {
+            panic!("expected Text2D");
+        };
+        assert_eq!(
+            shapes[0].preserved.get("property.customShapeProp"),
+            Some(&Value::from(7))
+        );
+        assert_eq!(shapes[0].position.keyframes.len(), 1);
+
+        // Imported project must save & reload cleanly as .zcraft (no NaN, standard/plugin fx serialize).
+        let zcraft_bytes = crate::zcraft::save_zcraft_to_bytes(&project).expect("save zcraft");
+        let reloaded = crate::zcraft::load_zcraft_from_bytes(&zcraft_bytes).expect("load zcraft");
+        assert_eq!(reloaded.sequence.video_tracks[0].clips.len(), 2);
+    }
+
+    #[test]
+    fn clip_links_preserve_targets_when_earlier_clips_are_dropped() {
+        let project_json = serde_json::json!({
+            "sequence": {
+                "properties": { "name": "DroppedLinkSeq", "rate": 30 },
+                "videoTracks": [{
+                    "type": 0,
+                    "clips": [
+                        {
+                            "start": -50.0,
+                            "length": 30.0,
+                            "properties": { "name": "DroppedVideo" },
+                            "object": { "type": 5, "properties": {} }
+                        },
+                        {
+                            "start": 0.0,
+                            "length": 60.0,
+                            "properties": { "name": "KeptVideoA" },
+                            "object": { "type": 5, "properties": {} }
+                        },
+                        {
+                            "start": 60.0,
+                            "length": 60.0,
+                            "properties": { "name": "KeptVideoB" },
+                            "object": { "type": 5, "properties": {} }
+                        }
+                    ]
+                }],
+                "audioTracks": [{
+                    "type": 1,
+                    "clips": [
+                        {
+                            "start": -50.0,
+                            "length": 30.0,
+                            "properties": { "name": "DroppedAudio" }
+                        },
+                        {
+                            "start": 0.0,
+                            "length": 60.0,
+                            "properties": { "name": "KeptAudioA" }
+                        }
+                    ]
+                }],
+                "clipLinks": {
+                    "links": {
+                        "0": { "clips": [[0, 1, 0, 0], [0, 2, 0, 0]] },
+                        "1": { "clips": [[0, 1, 0, 1], [0, 2, 0, 1]] },
+                        "2": { "clips": [[0, 1, 0, 0], [0, 1, 0, 2]] }
+                    }
+                }
+            }
+        });
+
+        let project_bytes = serde_json::to_vec(&project_json).expect("encode json");
+        let archive = build_pz_bytes(&[("project", &project_bytes)]);
+        let imported = import_pz_from_bytes(&archive).expect("import pz");
+        let seq = &imported.project.sequence;
+
+        assert_eq!(seq.video_tracks[0].clips.len(), 2);
+        assert_eq!(seq.audio_tracks[0].clips.len(), 1);
+
+        let kept_video_a = &seq.video_tracks[0].clips[0];
+        let kept_video_b = &seq.video_tracks[0].clips[1];
+        let kept_audio_a = &seq.audio_tracks[0].clips[0];
+        assert_eq!(kept_video_a.name, "KeptVideoA");
+        assert_eq!(kept_video_b.name, "KeptVideoB");
+        assert_eq!(kept_audio_a.name, "KeptAudioA");
+
+        assert!(!seq.clip_links.contains_key(&0));
+        assert_eq!(seq.clip_links[&1], vec![kept_video_a.id, kept_audio_a.id]);
+        assert_eq!(seq.clip_links[&2], vec![kept_video_b.id]);
+        assert_eq!(kept_video_a.link, Some(1));
+        assert_eq!(kept_audio_a.link, Some(1));
+        assert_eq!(kept_video_b.link, Some(2));
     }
 }

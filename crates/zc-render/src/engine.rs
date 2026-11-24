@@ -43,11 +43,15 @@ use crate::effects::{
 };
 use crate::scene3d::{
     CameraParams, CompatMode as RenderCompatMode, CullSide, GpuMesh, LightKind as RenderLightKind,
-    MAX_SCENE_LIGHTS, MaterialBlend, MaterialParams, MeshDrawCall, MeshVertex, ParticleBlend,
-    ParticleDrawCall, ParticleInstance as RenderParticleInstance, Scene3DPassInput,
-    Scene3DRenderer, SceneLight, ShadingModel, mat4_identity, mat4_mul, mat4_orthographic_rh,
-    mat4_perspective_rh,
+    LineVertex, MAX_SCENE_LIGHTS, MaterialBlend, MaterialParams, MeshDrawCall, MeshVertex,
+    ParticleBlend, ParticleDrawCall, ParticleInstance as RenderParticleInstance, Scene3DPassInput,
+    Scene3DRenderer, SceneLight, ShadingModel, build_camera_helper_lines, build_light_helper_lines,
+    mat4_identity, mat4_mul, mat4_orthographic_rh, mat4_perspective_rh,
 };
+
+/// Built-in OFL TrueType fallback font (`Geist-Regular.ttf`) used for 3D Text and 2D Text
+/// when the referenced font preset/asset key is not embedded in `project.assets`.
+static DEFAULT_TTF_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/Geist-Regular.ttf");
 
 /// Alias for [`GpuContext`] exposed alongside [`ProjectRenderEngine`].
 pub type RenderContext = GpuContext;
@@ -171,6 +175,7 @@ struct CachedGpuMesh {
 struct TextureCacheKey {
     asset_key: String,
     content_hash: u64,
+    premultiply: bool,
 }
 
 struct CachedGpuTexture {
@@ -191,10 +196,22 @@ struct EvalEnv<'a> {
     frame: f64,
     time: f64,
     fps: f64,
+    sequence_resolution: [u32; 2],
     project: &'a Project,
     plugins: &'a PluginRegistry,
     controls: &'a BTreeMap<String, ExprValue>,
     parent_props: &'a BTreeMap<String, ExprValue>,
+}
+
+/// Context allowing temporal layer effects (`echo`, `smartmotionblur`) to sample
+/// neighbor frames of the active layer without infinite recursion.
+struct TemporalEffectContext<'a> {
+    backdrop: &'a RenderTarget,
+    layer: &'a Layer,
+    prefix_effects: &'a [EffectInstance],
+    visited_comps: &'a mut Vec<Uuid>,
+    comp_depth: usize,
+    scene_override: Option<&'a Scene3DOverride<'a>>,
 }
 
 /// High-level project rendering engine that evaluates a [`zc_project::Project`]
@@ -398,7 +415,7 @@ impl ProjectRenderEngine {
     }
 
     /// Renders `project` at `frame` with finished-frame LRU caching keyed by
-    /// `(frame.round() as i64, width, height, revision)`.
+    /// `((frame * 1000.0).round() as i64, width, height, revision)`.
     pub fn render_frame_rgba8_cached(
         &mut self,
         project: &Project,
@@ -408,7 +425,7 @@ impl ProjectRenderEngine {
         height: u32,
         revision: u64,
     ) -> Result<Arc<[u8]>, RenderError> {
-        let key = FrameCacheKey::new(frame.round() as i64, width, height, revision);
+        let key = FrameCacheKey::new((frame * 1000.0).round() as i64, width, height, revision);
         if let Some(cached) = self.cache.get(&key) {
             return Ok(cached.pixels);
         }
@@ -559,8 +576,15 @@ impl ProjectRenderEngine {
             self.targets.trim_unused();
         }
 
-        // Verify the default CM3 starter 3D scene ("text") renders non-black pixels.
-        let default_project = Project::new_cm3_default();
+        // Verify a CM3 3D scene ("text" + Spot Light) renders non-black pixels with real TTF outlines.
+        let mut default_project = Project::new_cm3_default();
+        if let Some(track) = default_project.sequence.video_tracks.first_mut()
+            && let Some(clip) = track.clips.first_mut()
+            && let LayerKind::Scene3D { objects, .. } = &mut clip.layer.kind
+        {
+            objects.push(Object3D::new_spot_light());
+            objects.push(Object3D::new_text_3d("text"));
+        }
         let plugins = PluginRegistry::new();
         let scene_pixels =
             self.render_frame_rgba8(&default_project, &plugins, 0.0, width, height)?;
@@ -601,13 +625,15 @@ impl ProjectRenderEngine {
             frame,
             time: frame / fps,
             fps,
+            sequence_resolution: sequence.resolution,
             project,
             plugins,
             controls: &empty_controls,
             parent_props: &empty_props,
         };
 
-        let editing_active = overrides.is_some_and(|o| o.editing_camera.is_some());
+        let editing_active = overrides
+            .is_some_and(|o| o.editing_camera.is_some() && o.editing_camera_clip_id.is_some());
         if sequence.motion_blur.enabled && !editing_active {
             let samples = eval_f64(&sequence.motion_blur.samples, &base_env)
                 .round()
@@ -627,6 +653,7 @@ impl ProjectRenderEngine {
                         project,
                         sequence,
                         plugins,
+                        frame,
                         sub_frame,
                         width,
                         height,
@@ -660,6 +687,7 @@ impl ProjectRenderEngine {
             sequence,
             plugins,
             frame,
+            frame,
             width,
             height,
             visited_comps,
@@ -674,7 +702,8 @@ impl ProjectRenderEngine {
         project: &Project,
         sequence: &Sequence,
         plugins: &PluginRegistry,
-        frame: f64,
+        base_frame: f64,
+        eval_frame: f64,
         width: u32,
         height: u32,
         visited_comps: &mut Vec<Uuid>,
@@ -682,7 +711,7 @@ impl ProjectRenderEngine {
         overrides: Option<&RenderOverrides>,
     ) -> Result<RenderTarget, RenderError> {
         let fps = f64::from(sequence.fps.max(1));
-        let controls = evaluate_sequence_controls(sequence, frame, fps, project, plugins);
+        let controls = evaluate_sequence_controls(sequence, eval_frame, fps, project, plugins);
 
         let mut canvas =
             self.targets
@@ -708,15 +737,20 @@ impl ProjectRenderEngine {
                 continue;
             }
             for clip in &track.clips {
-                if clip.length <= 0.0 || frame < clip.start || frame >= clip.start + clip.length {
+                if clip.length <= 0.0
+                    || base_frame < clip.start
+                    || base_frame >= clip.start + clip.length
+                {
                     continue;
                 }
-                let local_frame = frame - clip.start;
+                let clamped_frame = eval_frame.clamp(clip.start, clip.start + clip.length);
+                let local_frame = clamped_frame - clip.start;
                 let empty_props = BTreeMap::new();
                 let time_env = EvalEnv {
                     frame: local_frame,
                     time: local_frame / fps,
                     fps,
+                    sequence_resolution: sequence.resolution,
                     project,
                     plugins,
                     controls: &controls,
@@ -727,6 +761,7 @@ impl ProjectRenderEngine {
                     frame: local_frame,
                     time: clip_time,
                     fps,
+                    sequence_resolution: sequence.resolution,
                     project,
                     plugins,
                     controls: &controls,
@@ -737,7 +772,7 @@ impl ProjectRenderEngine {
                     let cam = ov.editing_camera?;
                     let clip_matches = ov
                         .editing_camera_clip_id
-                        .is_none_or(|target_id| target_id == clip.id);
+                        .is_some_and(|target_id| target_id == clip.id);
                     clip_matches.then_some(Scene3DOverride {
                         editing_camera: cam,
                         selected_object_ids: &ov.selected_object_ids,
@@ -793,13 +828,81 @@ impl ProjectRenderEngine {
         };
 
         if !layer.effects.is_empty() {
-            layer_target = self.apply_project_effect_stack(layer_target, &layer.effects, env)?;
+            let mut temporal_ctx = TemporalEffectContext {
+                backdrop: &backdrop,
+                layer,
+                prefix_effects: &[],
+                visited_comps,
+                comp_depth,
+                scene_override,
+            };
+            layer_target = self.apply_project_effect_stack_depth(
+                layer_target,
+                &layer.effects,
+                env,
+                0,
+                Some(&mut temporal_ctx),
+            )?;
         }
 
-        let pos = eval_vec2(&layer.position, env);
+        let seq_w = env.sequence_resolution[0].max(1) as f32;
+        let seq_h = env.sequence_resolution[1].max(1) as f32;
+        let scale_x = (width as f32) / seq_w;
+        let scale_y = (height as f32) / seq_h;
+
+        let raw_pos = eval_vec2(&layer.position, env);
+        let pos = [raw_pos[0] * scale_x, raw_pos[1] * scale_y];
         let scale = eval_vec2(&layer.scale, env);
         let rotation = eval_f32(&layer.rotation, env);
-        let anchor = eval_vec2(&layer.anchor, env);
+        let raw_anchor = eval_vec2(&layer.anchor, env);
+        let anchor = [raw_anchor[0] * scale_x, raw_anchor[1] * scale_y];
+
+        let is_identity_transform = pos[0].abs() < 1e-4
+            && pos[1].abs() < 1e-4
+            && (scale[0] - 1.0).abs() < 1e-4
+            && (scale[1] - 1.0).abs() < 1e-4
+            && rotation.abs() < 1e-4
+            && anchor[0].abs() < 1e-4
+            && anchor[1].abs() < 1e-4;
+
+        if matches!(layer.kind, LayerKind::Adjustment)
+            && blend_mode == BlendMode::SrcOver
+            && is_identity_transform
+        {
+            if opacity >= 1.0 - 1e-5 {
+                self.targets.release(backdrop);
+                return Ok(layer_target);
+            }
+            let scaled_bg =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+            self.compositor.composite_layer(
+                &self.ctx,
+                &backdrop,
+                &backdrop,
+                &scaled_bg,
+                LayerTransform2D::default(),
+                1.0 - opacity,
+                BlendMode::Src,
+            );
+            let composited =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+            self.compositor.composite_layer(
+                &self.ctx,
+                &scaled_bg,
+                &layer_target,
+                &composited,
+                LayerTransform2D::default(),
+                opacity,
+                BlendMode::Plus,
+            );
+            self.targets.release(scaled_bg);
+            self.targets.release(backdrop);
+            self.targets.release(layer_target);
+            return Ok(composited);
+        }
+
         let transform = LayerTransform2D {
             position: pos,
             scale,
@@ -841,9 +944,16 @@ impl ProjectRenderEngine {
                 objects,
                 shadow_mode,
             } => {
+                let shadows_enabled = parse_preserved_shadows(layer.preserved.get("shadows"));
+                let scene_bg = layer
+                    .preserved
+                    .get("backgroundColor")
+                    .and_then(parse_json_rgba);
                 let target = self.render_scene_3d(
                     objects,
                     *shadow_mode,
+                    shadows_enabled,
+                    scene_bg,
                     env,
                     width,
                     height,
@@ -880,9 +990,9 @@ impl ProjectRenderEngine {
                     wgpu::TextureFormat::Rgba8Unorm,
                 )?;
                 if let Some(asset_id) = image.as_deref()
-                    && let Some(tex) = self.ensure_image_asset_texture(env.project, asset_id)
+                    && let Some(tex) = self.ensure_image_asset_texture(env.project, asset_id, true)
                 {
-                    self.compositor.blit(&self.ctx, &tex.view, &dst);
+                    self.blit_aspect_fit(&tex, &dst);
                 } else {
                     self.compositor
                         .clear_target(&self.ctx, &dst, wgpu::Color::TRANSPARENT);
@@ -897,9 +1007,9 @@ impl ProjectRenderEngine {
                     wgpu::TextureFormat::Rgba8Unorm,
                 )?;
                 if let Some(asset_id) = media.as_deref()
-                    && let Some(tex) = self.ensure_image_asset_texture(env.project, asset_id)
+                    && let Some(tex) = self.ensure_image_asset_texture(env.project, asset_id, true)
                 {
-                    self.compositor.blit(&self.ctx, &tex.view, &dst);
+                    self.blit_aspect_fit(&tex, &dst);
                 } else {
                     self.compositor
                         .clear_target(&self.ctx, &dst, wgpu::Color::TRANSPARENT);
@@ -938,9 +1048,7 @@ impl ProjectRenderEngine {
                 Ok(Some(nested))
             }
             LayerKind::PrecompRef { composition_id } => {
-                if !env.plugins.is_enabled("precomp-plus")
-                    && !env.project.compositions.contains_key(composition_id)
-                {
+                if !env.plugins.is_enabled("precomp-plus") {
                     return Ok(None);
                 }
                 if comp_depth >= MAX_COMPOSITION_DEPTH
@@ -1008,10 +1116,13 @@ impl ProjectRenderEngine {
     // 3D Scene Evaluation & Rendering
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn render_scene_3d(
         &mut self,
         objects: &[Object3D],
         shadow_mode: ProjectCompatMode,
+        shadows_enabled: bool,
+        scene_bg: Option<[f32; 4]>,
         env: &EvalEnv<'_>,
         width: u32,
         height: u32,
@@ -1023,6 +1134,16 @@ impl ProjectRenderEngine {
         };
         self.collect_scene_objects(objects, Mat4::IDENTITY, env, &mut collected);
 
+        if !shadows_enabled {
+            for light in &mut collected.lights {
+                light.cast_shadow = false;
+            }
+            for spec in &mut collected.meshes {
+                spec.cast_shadow = false;
+                spec.receive_shadow = false;
+            }
+        }
+
         let camera = match scene_override {
             Some(ov) => ov.editing_camera,
             None => match collected.camera {
@@ -1032,6 +1153,7 @@ impl ProjectRenderEngine {
         };
 
         let mut selection_aabb: Option<([f32; 3], [f32; 3])> = None;
+        let mut extra_wireframe_lines: Vec<LineVertex> = Vec::new();
         if let Some(ov) = scene_override
             && !ov.selected_object_ids.is_empty()
         {
@@ -1053,6 +1175,27 @@ impl ProjectRenderEngine {
                             ],
                         ),
                     });
+                }
+            }
+
+            for ch in &collected.camera_helpers {
+                if ov.selected_object_ids.contains(&ch.object_id) {
+                    extra_wireframe_lines.extend(build_camera_helper_lines(
+                        ch.fov_deg, ch.aspect, ch.near, ch.far, ch.world,
+                    ));
+                }
+            }
+
+            for lh in &collected.light_helpers {
+                if ov.selected_object_ids.contains(&lh.object_id) {
+                    extra_wireframe_lines.extend(build_light_helper_lines(
+                        lh.kind,
+                        lh.position,
+                        lh.target,
+                        lh.angle_deg,
+                        lh.color,
+                        lh.ground_color,
+                    ));
                 }
             }
         }
@@ -1095,7 +1238,7 @@ impl ProjectRenderEngine {
             ProjectCompatMode::Legacy => RenderCompatMode::Legacy,
         };
 
-        let render_res = self.scene3d.render(
+        let render_res = self.scene3d.render_with_extra_lines(
             &self.ctx,
             &color,
             &depth,
@@ -1108,11 +1251,54 @@ impl ProjectRenderEngine {
                 editing_camera: scene_override.is_some(),
                 selection_aabb,
             },
+            &extra_wireframe_lines,
         );
         self.targets.release(depth);
 
         match render_res {
-            Ok(()) => Ok(color),
+            Ok(()) => {
+                if let Some([r, g, b, a]) = scene_bg
+                    && a > 1e-6
+                {
+                    let bg_target = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
+                    let a_f64 = f64::from(a.clamp(0.0, 1.0));
+                    self.compositor.clear_target(
+                        &self.ctx,
+                        &bg_target,
+                        wgpu::Color {
+                            r: f64::from(r.clamp(0.0, 1.0)) * a_f64,
+                            g: f64::from(g.clamp(0.0, 1.0)) * a_f64,
+                            b: f64::from(b.clamp(0.0, 1.0)) * a_f64,
+                            a: a_f64,
+                        },
+                    );
+                    let composited = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
+                    self.compositor.composite_layer(
+                        &self.ctx,
+                        &bg_target,
+                        &color,
+                        &composited,
+                        LayerTransform2D::default(),
+                        1.0,
+                        BlendMode::SrcOver,
+                    );
+                    self.targets.release(bg_target);
+                    self.targets.release(color);
+                    Ok(composited)
+                } else {
+                    Ok(color)
+                }
+            }
             Err(err) => {
                 self.targets.release(color);
                 Err(err)
@@ -1134,7 +1320,14 @@ impl ProjectRenderEngine {
 
             let pos = eval_vec3(&obj.position, env);
             let rot = eval_vec3(&obj.rotation, env);
-            let scale = eval_vec3(&obj.scale, env);
+            let mut scale = eval_vec3(&obj.scale, env);
+            if matches!(obj.kind, Object3DKind::Camera(_)) {
+                for s in &mut scale {
+                    if s.abs() < 1e-6 {
+                        *s = 1.0;
+                    }
+                }
+            }
             let local_tf = Transform3D {
                 position: Vec3::from_array(pos),
                 rotation: Vec3::from_array(rot),
@@ -1158,6 +1351,7 @@ impl ProjectRenderEngine {
                         frame: env.frame,
                         time: env.time,
                         fps: env.fps,
+                        sequence_resolution: env.sequence_resolution,
                         project: env.project,
                         plugins: env.plugins,
                         controls: env.controls,
@@ -1169,26 +1363,63 @@ impl ProjectRenderEngine {
                     if out.camera.is_none() {
                         out.camera = Some(build_camera_params(cam, world, env, out.viewport_dims));
                     }
+                    let zoom = eval_f32(&cam.zoom, env).max(1e-4);
+                    let fov_deg = match cam.kind {
+                        CameraKind::Perspective => {
+                            let fov_rad = eval_f32(&cam.fov, env).clamp(1.0, 179.0).to_radians();
+                            let effective_fov = (2.0 * ((fov_rad * 0.5).tan() / zoom).atan())
+                                .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians());
+                            effective_fov.to_degrees()
+                        }
+                        CameraKind::Orthographic => 0.0,
+                    };
+                    let aspect = out.viewport_dims[0].max(1.0) / out.viewport_dims[1].max(1.0);
+                    let near = (cam.near as f32).max(1e-4);
+                    let far = (cam.far as f32).max(near + 1.0);
+                    out.camera_helpers.push(CollectedCameraHelper {
+                        object_id: obj.id,
+                        fov_deg,
+                        aspect,
+                        near,
+                        far,
+                        world: world.to_cols_array_2d(),
+                    });
                 }
                 Object3DKind::Light(light) => {
+                    let color = eval_color_rgb(&light.color, env, [1.0, 1.0, 1.0]);
+                    let ground = eval_color_rgb(&light.ground_color, env, [0.2, 0.2, 0.2]);
+                    let target_local = Vec3::from_array(eval_vec3(&light.target, env));
+                    let target_world = parent_world.transform_point3(target_local);
+                    let intensity = eval_f32(&light.intensity, env);
+                    let angle_deg = eval_f32(&light.angle, env);
+                    let kind = map_light_kind(light.kind);
+                    let position = world.w_axis.truncate().to_array();
+                    let target = target_world.to_array();
                     if out.lights.len() < MAX_SCENE_LIGHTS {
-                        let color = eval_color_rgb(&light.color, env, [1.0, 1.0, 1.0]);
-                        let ground = eval_color_rgb(&light.ground_color, env, [0.2, 0.2, 0.2]);
-                        let target_local = Vec3::from_array(eval_vec3(&light.target, env));
-                        let target_world = parent_world.transform_point3(target_local);
-                        let intensity = eval_f32(&light.intensity, env);
-                        let angle_deg = eval_f32(&light.angle, env);
                         out.lights.push(SceneLight {
-                            kind: map_light_kind(light.kind),
+                            kind,
                             color,
                             ground_color: ground,
-                            position: world.w_axis.truncate().to_array(),
-                            target: target_world.to_array(),
+                            position,
+                            target,
                             intensity,
                             angle_deg,
+                            distance: light.distance as f32,
+                            decay: light.decay as f32,
+                            penumbra: light.penumbra as f32,
                             cast_shadow: light.cast_shadow,
+                            shadow_bias: light.shadow_bias as f32,
                         });
                     }
+                    out.light_helpers.push(CollectedLightHelper {
+                        object_id: obj.id,
+                        kind,
+                        position,
+                        target,
+                        angle_deg,
+                        color,
+                        ground_color: ground,
+                    });
                 }
                 Object3DKind::Shape3D(shape) => {
                     if let Some((mesh, bounds)) = self.ensure_shape_mesh(obj, shape, env) {
@@ -1310,9 +1541,16 @@ impl ProjectRenderEngine {
                             ParticleBlending::Normal
                         },
                         color_gradient: convert_gradient_stops(&pdata.color),
-                        size_gradient: convert_gradient_stops(&pdata.size),
+                        size_gradient: convert_size_gradient_stops(&pdata.size),
                     };
 
+                    let world_scale = (world.x_axis.truncate().length()
+                        + world.y_axis.truncate().length()
+                        + world.z_axis.truncate().length())
+                        / 3.0;
+                    if world_scale <= 1e-6 {
+                        continue;
+                    }
                     let eval_list = evaluate_particles(sim_time, &params);
                     let mut instances = Vec::with_capacity(eval_list.len());
                     for p in eval_list {
@@ -1323,7 +1561,7 @@ impl ProjectRenderEngine {
                         let a = p.color[3].clamp(0.0, 1.0);
                         instances.push(RenderParticleInstance {
                             position: world_p.to_array(),
-                            size: p.size.max(0.05),
+                            size: (p.size * world_scale).max(1e-4),
                             rotation: p.angle,
                             color: [p.color[0] * a, p.color[1] * a, p.color[2] * a, a],
                         });
@@ -1332,7 +1570,7 @@ impl ProjectRenderEngine {
                         let sprite = pdata
                             .texture
                             .as_deref()
-                            .and_then(|id| self.ensure_image_asset_texture(env.project, id));
+                            .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
                         out.particles.push(PreparedParticlesSpec {
                             instances,
                             sprite,
@@ -1516,6 +1754,11 @@ impl ProjectRenderEngine {
             .and_then(|rec| rec.bytes.as_deref())
             .and_then(|bytes| build_text3d_mesh(bytes, &params).ok())
             .filter(|m| !m.indices.is_empty())
+            .or_else(|| {
+                build_text3d_mesh(DEFAULT_TTF_FONT_BYTES, &params)
+                    .ok()
+                    .filter(|m| !m.indices.is_empty())
+            })
             .unwrap_or_else(|| build_fallback_text_mesh(&params));
 
         mesh = apply_object_effectors(mesh, obj, env);
@@ -1535,7 +1778,7 @@ impl ProjectRenderEngine {
             .asset_id
             .as_deref()
             .and_then(|id| env.project.assets.get(id))
-            .map_or(0u64, |r| fnv1a_hash64(r.sha256.as_bytes()));
+            .map_or(0u64, hash_asset_record);
         let mut h = fnv1a_hash64(b"model3d");
         h = hash_u64(h, asset_bytes_hash);
         if let Some(p) = data.preset_type {
@@ -1651,7 +1894,7 @@ impl ProjectRenderEngine {
                 let albedo = m
                     .texture
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::Basic,
@@ -1674,7 +1917,7 @@ impl ProjectRenderEngine {
                 let albedo = m
                     .video
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::Basic,
@@ -1693,11 +1936,11 @@ impl ProjectRenderEngine {
                 let albedo = m
                     .texture
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
                 let normal = m
                     .normal_map
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::StandardPbr,
@@ -1725,11 +1968,11 @@ impl ProjectRenderEngine {
                 let albedo = m
                     .base_color_map
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
                 let normal = m
                     .normal_map
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::StandardPbr,
@@ -1759,7 +2002,7 @@ impl ProjectRenderEngine {
                 let matcap = m
                     .texture
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::Matcap,
@@ -1783,7 +2026,7 @@ impl ProjectRenderEngine {
                 let albedo = m
                     .texture
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::Basic,
@@ -1842,6 +2085,7 @@ impl ProjectRenderEngine {
         let key = TextureCacheKey {
             asset_key: format!("layer:{layer_id}"),
             content_hash: h,
+            premultiply: true,
         };
         let tex = if let Some(cached) = self.touch_cached_texture(&key) {
             cached
@@ -1872,12 +2116,13 @@ impl ProjectRenderEngine {
         let mut h = fnv1a_hash64(b"shape_2d");
         h = hash_u64(h, u64::from(width));
         h = hash_u64(h, u64::from(height));
-        h = hash_u64(h, shapes.len() as u64);
+        h = hash_shape_nodes(h, shapes, env);
         h = hash_shape_style(h, &style);
 
         let key = TextureCacheKey {
             asset_key: format!("shape2d:{layer_id}"),
             content_hash: h,
+            premultiply: true,
         };
         let tex = if let Some(cached) = self.touch_cached_texture(&key) {
             cached
@@ -1910,14 +2155,21 @@ impl ProjectRenderEngine {
     ) -> Result<RenderTarget, RenderError> {
         let style = extract_shape_style(shapes, env);
         let fill = style.fill.unwrap_or([1.0, 1.0, 1.0, 1.0]);
-        let px_size = (size.max(8) as f32).min(height as f32);
+        let seq_h = env.sequence_resolution[1].max(1) as f32;
+        let preview_scale = (height as f32) / seq_h;
+        let px_size = ((size.max(8) as f32) * preview_scale)
+            .max(1.0)
+            .min(height as f32);
 
         let mut h = fnv1a_hash64(b"text_2d");
         h = hash_u64(h, fnv1a_hash64(text.as_bytes()));
         if let Some(f) = font {
             h = hash_u64(h, fnv1a_hash64(f.as_bytes()));
+            if let Some(rec) = env.project.assets.get(f) {
+                h = hash_u64(h, hash_asset_record(rec));
+            }
         }
-        h = hash_u64(h, u64::from(size));
+        h = hash_u64(h, u64::from(px_size.to_bits()));
         let mesh_key = MeshCacheKey {
             object_id: layer_id,
             content_hash: h,
@@ -1945,6 +2197,11 @@ impl ProjectRenderEngine {
                 .and_then(|rec| rec.bytes.as_deref())
                 .and_then(|bytes| build_text3d_mesh(bytes, &params).ok())
                 .filter(|m| !m.indices.is_empty())
+                .or_else(|| {
+                    build_text3d_mesh(DEFAULT_TTF_FONT_BYTES, &params)
+                        .ok()
+                        .filter(|m| !m.indices.is_empty())
+                })
                 .unwrap_or_else(|| build_fallback_text_mesh(&params));
             if mesh.indices.is_empty() {
                 None
@@ -1985,7 +2242,7 @@ impl ProjectRenderEngine {
                 shading: ShadingModel::Basic,
                 base_color: [fill[0], fill[1], fill[2]],
                 opacity: fill[3].clamp(0.0, 1.0),
-                side: CullSide::Both,
+                side: CullSide::Front,
                 blend: if fill[3] < 0.999 {
                     MaterialBlend::Normal
                 } else {
@@ -2028,10 +2285,34 @@ impl ProjectRenderEngine {
     // Decoded Image Texture Cache
     // -----------------------------------------------------------------------
 
+    fn blit_aspect_fit(&mut self, src: &RenderTarget, dst: &RenderTarget) {
+        let src_w = src.width.max(1) as f32;
+        let src_h = src.height.max(1) as f32;
+        let dst_w = dst.width.max(1) as f32;
+        let dst_h = dst.height.max(1) as f32;
+        let fit_scale = (dst_w / src_w).min(dst_h / src_h);
+        let transform = LayerTransform2D {
+            position: [0.0, 0.0],
+            scale: [fit_scale, fit_scale],
+            rotation: 0.0,
+            anchor: [0.0, 0.0],
+        };
+        self.compositor.composite_layer(
+            &self.ctx,
+            &self.fallback_transparent,
+            src,
+            dst,
+            transform,
+            1.0,
+            BlendMode::SrcOver,
+        );
+    }
+
     fn ensure_image_asset_texture(
         &mut self,
         project: &Project,
         asset_id: &str,
+        premultiply: bool,
     ) -> Option<Arc<RenderTarget>> {
         let record = project.assets.get(asset_id)?;
         let bytes = record.bytes.as_deref()?;
@@ -2043,6 +2324,7 @@ impl ProjectRenderEngine {
         let key = TextureCacheKey {
             asset_key: asset_id.to_owned(),
             content_hash,
+            premultiply,
         };
         if let Some(cached) = self.touch_cached_texture(&key) {
             return Some(cached);
@@ -2113,18 +2395,20 @@ impl ProjectRenderEngine {
         {
             return None;
         }
-        // Premultiply RGB by alpha to preserve the renderer's premultiplied-alpha invariant.
-        let mut premul = img.into_raw();
-        for px in premul.as_chunks_mut::<4>().0 {
-            let a = f32::from(px[3]) / 255.0;
-            px[0] = (f32::from(px[0]) * a).round() as u8;
-            px[1] = (f32::from(px[1]) * a).round() as u8;
-            px[2] = (f32::from(px[2]) * a).round() as u8;
+        let mut pixels = img.into_raw();
+        if premultiply {
+            // Premultiply RGB by alpha to preserve the renderer's premultiplied-alpha invariant.
+            for px in pixels.as_chunks_mut::<4>().0 {
+                let a = f32::from(px[3]) / 255.0;
+                px[0] = (f32::from(px[0]) * a).round() as u8;
+                px[1] = (f32::from(px[1]) * a).round() as u8;
+                px[2] = (f32::from(px[2]) * a).round() as u8;
+            }
         }
 
         let target = self
             .ctx
-            .create_rgba8_texture("zc-asset-image", w, h, &premul)
+            .create_rgba8_texture("zc-asset-image", w, h, &pixels)
             .ok()?;
         Some(self.insert_cached_texture(key, target))
     }
@@ -2186,27 +2470,36 @@ impl ProjectRenderEngine {
     // Effect Stack Execution (Standard 44 + Plugin 12 + CustomShader + Groups)
     // -----------------------------------------------------------------------
 
-    fn apply_project_effect_stack(
-        &mut self,
-        source: RenderTarget,
-        effects: &[EffectInstance],
-        env: &EvalEnv<'_>,
-    ) -> Result<RenderTarget, RenderError> {
-        self.apply_project_effect_stack_depth(source, effects, env, 0)
-    }
-
     fn apply_project_effect_stack_depth(
         &mut self,
         mut source: RenderTarget,
         effects: &[EffectInstance],
         env: &EvalEnv<'_>,
         group_depth: usize,
+        mut temporal_ctx: Option<&mut TemporalEffectContext<'_>>,
     ) -> Result<RenderTarget, RenderError> {
-        for fx in effects {
+        for (idx, fx) in effects.iter().enumerate() {
             if !eval_bool(&fx.enabled, env, true) {
                 continue;
             }
-            source = self.apply_single_effect(source, fx, env, group_depth)?;
+            if let Some(tctx) = temporal_ctx.as_deref_mut() {
+                let mut step_ctx = TemporalEffectContext {
+                    backdrop: tctx.backdrop,
+                    layer: tctx.layer,
+                    prefix_effects: if group_depth == 0 {
+                        &effects[..idx]
+                    } else {
+                        tctx.prefix_effects
+                    },
+                    visited_comps: tctx.visited_comps,
+                    comp_depth: tctx.comp_depth,
+                    scene_override: tctx.scene_override,
+                };
+                source =
+                    self.apply_single_effect(source, fx, env, group_depth, Some(&mut step_ctx))?;
+            } else {
+                source = self.apply_single_effect(source, fx, env, group_depth, None)?;
+            }
         }
         Ok(source)
     }
@@ -2217,6 +2510,7 @@ impl ProjectRenderEngine {
         fx: &EffectInstance,
         env: &EvalEnv<'_>,
         group_depth: usize,
+        temporal_ctx: Option<&mut TemporalEffectContext<'_>>,
     ) -> Result<RenderTarget, RenderError> {
         match &fx.kind {
             EffectKind::EffectGroup {
@@ -2239,15 +2533,22 @@ impl ProjectRenderEngine {
                     frame: env.frame,
                     time: env.time,
                     fps: env.fps,
+                    sequence_resolution: env.sequence_resolution,
                     project: env.project,
                     plugins: env.plugins,
                     controls: env.controls,
                     parent_props: &group_props,
                 };
-                self.apply_project_effect_stack_depth(source, children, &child_env, group_depth + 1)
+                self.apply_project_effect_stack_depth(
+                    source,
+                    children,
+                    &child_env,
+                    group_depth + 1,
+                    temporal_ctx,
+                )
             }
             EffectKind::Standard(effect_id) => {
-                self.apply_builtin_effect(source, effect_id, &fx.params, env)
+                self.apply_builtin_effect(source, effect_id, &fx.params, env, temporal_ctx)
             }
             EffectKind::Plugin {
                 plugin_id,
@@ -2257,7 +2558,7 @@ impl ProjectRenderEngine {
                     return Ok(source);
                 }
                 if lookup_effect_shader(effect_id).is_some() {
-                    self.apply_builtin_effect(source, effect_id, &fx.params, env)
+                    self.apply_builtin_effect(source, effect_id, &fx.params, env, temporal_ctx)
                 } else {
                     debug!(
                         plugin_id,
@@ -2273,12 +2574,58 @@ impl ProjectRenderEngine {
         }
     }
 
+    fn render_temporal_layer_sample(
+        &mut self,
+        tctx: &mut TemporalEffectContext<'_>,
+        env: &EvalEnv<'_>,
+        frame_offset: f64,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<RenderTarget>, RenderError> {
+        let fps = env.fps.max(1.0);
+        let sample_env = EvalEnv {
+            frame: env.frame + frame_offset,
+            time: env.time + frame_offset / fps,
+            fps,
+            sequence_resolution: env.sequence_resolution,
+            project: env.project,
+            plugins: env.plugins,
+            controls: env.controls,
+            parent_props: env.parent_props,
+        };
+        let Some(mut target) = self.render_layer_content(
+            tctx.backdrop,
+            tctx.layer,
+            &sample_env,
+            width,
+            height,
+            tctx.visited_comps,
+            tctx.comp_depth,
+            tctx.scene_override,
+        )?
+        else {
+            return Ok(None);
+        };
+        if !tctx.prefix_effects.is_empty() {
+            // Pass `None` for temporal_ctx as a recursion guard against nested temporal effects.
+            target = self.apply_project_effect_stack_depth(
+                target,
+                tctx.prefix_effects,
+                &sample_env,
+                0,
+                None,
+            )?;
+        }
+        Ok(Some(target))
+    }
+
     fn apply_builtin_effect(
         &mut self,
         source: RenderTarget,
         effect_id: &str,
         param_tracks: &BTreeMap<String, PropertyTrack>,
         env: &EvalEnv<'_>,
+        temporal_ctx: Option<&mut TemporalEffectContext<'_>>,
     ) -> Result<RenderTarget, RenderError> {
         let width = source.width;
         let height = source.height;
@@ -2335,16 +2682,222 @@ impl ProjectRenderEngine {
                         let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
                         if let Some(record) = env.project.assets.get(&asset_id)
                             && let Some(bytes) = record.bytes.as_deref()
-                            && let Some(lut_val) = parse_cube_lut_bytes(bytes, max_dim)
+                            && let Some((lut_val, domain_min, domain_max)) =
+                                parse_cube_lut_bytes(bytes, max_dim)
                         {
                             reg_params.set("lut", lut_val);
+                            reg_params.set("domainMin", RegParamValue::Vec3(domain_min));
+                            reg_params.set("domainMax", RegParamValue::Vec3(domain_max));
                         }
                     } else if aux_tex.is_none() {
-                        aux_tex = self.ensure_image_asset_texture(env.project, &asset_id);
+                        aux_tex = self.ensure_image_asset_texture(env.project, &asset_id, true);
                     }
                 }
                 PropertyValue::Asset(None) | PropertyValue::Json(_) => {}
             }
+        }
+
+        if effect_id == "echo"
+            && let Some(tctx) = temporal_ctx
+        {
+            const MAX_ECHO_TAPS: u32 = 32;
+            let raw_echoes = reg_params.float_or("numberOfEchoes", 4.0);
+            let num_echoes = if raw_echoes.is_finite() {
+                (raw_echoes.round() as i32).clamp(0, MAX_ECHO_TAPS as i32) as u32
+            } else {
+                0
+            };
+            if num_echoes == 0 {
+                return Ok(source);
+            }
+            let raw_echo_time = reg_params.float_or("echoTime", -0.033);
+            let echo_time_sec = if raw_echo_time.is_finite() {
+                f64::from(raw_echo_time)
+            } else {
+                -0.033
+            };
+            let starting_intensity = if reg_params.values.contains_key("startingIntensity") {
+                reg_params.float_or("startingIntensity", 1.0)
+            } else {
+                reg_params.float_or("weight", 1.0)
+            };
+            let decay = reg_params.float_or("decay", 0.5);
+            let mut accum = source;
+            for k in 1..=num_echoes {
+                let frame_offset = f64::from(k) * echo_time_sec * env.fps.max(1.0);
+                let tap_target =
+                    match self.render_temporal_layer_sample(tctx, env, frame_offset, width, height)
+                    {
+                        Ok(Some(t)) => t,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            self.targets.release(accum);
+                            return Err(err);
+                        }
+                    };
+                let tap_weight = if starting_intensity.is_finite() && decay.is_finite() {
+                    (starting_intensity * decay.powi((k - 1) as i32)).max(0.0)
+                } else {
+                    0.0
+                };
+                let mut tap_params = reg_params.clone();
+                tap_params.set("startingIntensity", RegParamValue::Float(tap_weight));
+                tap_params.set("weight", RegParamValue::Float(tap_weight));
+                let dst = match self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                ) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        self.targets.release(tap_target);
+                        self.targets.release(accum);
+                        return Err(err);
+                    }
+                };
+                let mut encoder =
+                    self.ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("zc-project-echo-encoder"),
+                        });
+                let targets = EffectTargets {
+                    input: &accum.view,
+                    output: &dst.view,
+                    aux: Some(&tap_target.view),
+                    aux2: None,
+                };
+                let run_res = self.effects.run_effect(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    &mut encoder,
+                    effect_id,
+                    &tap_params,
+                    &targets,
+                );
+                match run_res {
+                    Ok(true) => {
+                        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                        self.targets.release(tap_target);
+                        self.targets.release(accum);
+                        accum = dst;
+                    }
+                    Ok(false) => {
+                        self.targets.release(tap_target);
+                        self.targets.release(dst);
+                    }
+                    Err(err) => {
+                        self.targets.release(tap_target);
+                        self.targets.release(dst);
+                        self.targets.release(accum);
+                        return Err(RenderError::Effect(err.to_string()));
+                    }
+                }
+            }
+            return Ok(accum);
+        }
+
+        if effect_id == "smartmotionblur"
+            && let Some(tctx) = temporal_ctx
+        {
+            if crate::effects::should_bypass(effect_id, &reg_params) {
+                return Ok(source);
+            }
+            let prev_target = if env.frame >= 1.0 {
+                match self.render_temporal_layer_sample(tctx, env, -1.0, width, height) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        self.targets.release(source);
+                        return Err(err);
+                    }
+                }
+            } else {
+                None
+            };
+            let next_target = match self.render_temporal_layer_sample(tctx, env, 1.0, width, height)
+            {
+                Ok(t) => t,
+                Err(err) => {
+                    if let Some(prev) = prev_target {
+                        self.targets.release(prev);
+                    }
+                    self.targets.release(source);
+                    return Err(err);
+                }
+            };
+            let dst = match self.targets.acquire(
+                &self.ctx,
+                width,
+                height,
+                wgpu::TextureFormat::Rgba8Unorm,
+            ) {
+                Ok(t) => t,
+                Err(err) => {
+                    if let Some(prev) = prev_target {
+                        self.targets.release(prev);
+                    }
+                    if let Some(next) = next_target {
+                        self.targets.release(next);
+                    }
+                    self.targets.release(source);
+                    return Err(err);
+                }
+            };
+            let mut encoder =
+                self.ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("zc-project-smartmotionblur-encoder"),
+                    });
+            let targets = EffectTargets {
+                input: &source.view,
+                output: &dst.view,
+                aux: prev_target.as_ref().map(|t| &t.view),
+                aux2: next_target.as_ref().map(|t| &t.view),
+            };
+            let run_res = self.effects.run_effect(
+                &self.ctx.device,
+                &self.ctx.queue,
+                &mut encoder,
+                effect_id,
+                &reg_params,
+                &targets,
+            );
+            return match run_res {
+                Ok(true) => {
+                    self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                    if let Some(prev) = prev_target {
+                        self.targets.release(prev);
+                    }
+                    if let Some(next) = next_target {
+                        self.targets.release(next);
+                    }
+                    self.targets.release(source);
+                    Ok(dst)
+                }
+                Ok(false) => {
+                    if let Some(prev) = prev_target {
+                        self.targets.release(prev);
+                    }
+                    if let Some(next) = next_target {
+                        self.targets.release(next);
+                    }
+                    self.targets.release(dst);
+                    Ok(source)
+                }
+                Err(err) => {
+                    if let Some(prev) = prev_target {
+                        self.targets.release(prev);
+                    }
+                    if let Some(next) = next_target {
+                        self.targets.release(next);
+                    }
+                    self.targets.release(dst);
+                    self.targets.release(source);
+                    Err(RenderError::Effect(err.to_string()))
+                }
+            };
         }
 
         let dst =
@@ -2610,7 +3163,8 @@ impl ProjectRenderEngine {
                     );
                 }
                 PropertyValue::Asset(Some(asset_id)) => {
-                    if let Some(tex) = self.ensure_image_asset_texture(env.project, &asset_id) {
+                    if let Some(tex) = self.ensure_image_asset_texture(env.project, &asset_id, true)
+                    {
                         extra_textures.insert(cp.name.clone(), tex);
                     }
                 }
@@ -2770,11 +3324,32 @@ struct EvaluatedMaterial {
     matcap: Option<Arc<RenderTarget>>,
 }
 
+struct CollectedCameraHelper {
+    object_id: Uuid,
+    fov_deg: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+    world: [[f32; 4]; 4],
+}
+
+struct CollectedLightHelper {
+    object_id: Uuid,
+    kind: RenderLightKind,
+    position: [f32; 3],
+    target: [f32; 3],
+    angle_deg: f32,
+    color: [f32; 3],
+    ground_color: [f32; 3],
+}
+
 struct CollectedScene3D {
     camera: Option<CameraParams>,
     lights: Vec<SceneLight>,
     meshes: Vec<PreparedMeshSpec>,
     particles: Vec<PreparedParticlesSpec>,
+    camera_helpers: Vec<CollectedCameraHelper>,
+    light_helpers: Vec<CollectedLightHelper>,
     viewport_dims: [f32; 2],
 }
 
@@ -2785,6 +3360,8 @@ impl Default for CollectedScene3D {
             lights: Vec::new(),
             meshes: Vec::new(),
             particles: Vec::new(),
+            camera_helpers: Vec::new(),
+            light_helpers: Vec::new(),
             viewport_dims: [1920.0, 1080.0],
         }
     }
@@ -2867,11 +3444,33 @@ fn build_camera_params(
         world *= vib_tf.to_matrix();
     }
 
-    let view_mat = world.inverse();
+    let view_mat = if world.determinant().abs() > 1e-10 {
+        world.inverse()
+    } else {
+        let right = world.x_axis.truncate().normalize_or_zero();
+        let up = world.y_axis.truncate().normalize_or_zero();
+        let back = world.z_axis.truncate().normalize_or_zero();
+        if right.length_squared() > 0.5 && up.length_squared() > 0.5 && back.length_squared() > 0.5
+        {
+            let safe_world = Mat4::from_cols(
+                right.extend(0.0),
+                up.extend(0.0),
+                back.extend(0.0),
+                world.w_axis,
+            );
+            if safe_world.determinant().abs() > 1e-10 {
+                safe_world.inverse()
+            } else {
+                Mat4::from_translation(-world.w_axis.truncate())
+            }
+        } else {
+            Mat4::from_translation(-world.w_axis.truncate())
+        }
+    };
     let view = view_mat.to_cols_array_2d();
     let eye_position = world.w_axis.truncate().to_array();
 
-    let zoom = eval_f32(&cam.zoom, env).max(1e-3);
+    let zoom = eval_f32(&cam.zoom, env).max(1e-4);
     let near = (cam.near as f32).max(1e-4);
     let far = (cam.far as f32).max(near + 1.0);
     let w = viewport_dims[0].max(1.0);
@@ -2880,12 +3479,15 @@ fn build_camera_params(
 
     let proj = match cam.kind {
         CameraKind::Perspective => {
-            let fov_deg = (eval_f32(&cam.fov, env) / zoom).clamp(1.0, 179.0);
-            mat4_perspective_rh(fov_deg.to_radians(), aspect, near, far)
+            let fov_rad = eval_f32(&cam.fov, env).clamp(1.0, 179.0).to_radians();
+            let effective_fov = (2.0 * ((fov_rad * 0.5).tan() / zoom.max(1e-4)).atan())
+                .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians());
+            mat4_perspective_rh(effective_fov, aspect, near, far)
         }
         CameraKind::Orthographic => {
-            let half_w = (0.05 * w) / zoom;
-            let half_h = (0.05 * h) / zoom;
+            let seq_h = env.sequence_resolution[1].max(1) as f32;
+            let half_h = (0.05 * seq_h) / zoom;
+            let half_w = half_h * aspect;
             mat4_orthographic_rh(-half_w, half_w, -half_h, half_h, near, far)
         }
     };
@@ -3059,6 +3661,7 @@ fn evaluate_sequence_controls(
             frame,
             time: frame / fps,
             fps,
+            sequence_resolution: sequence.resolution,
             project,
             plugins,
             controls: &map,
@@ -3272,10 +3875,16 @@ fn coerce_expr_value(expr: &ExprValue, template: &PropertyValue) -> PropertyValu
         PropertyValue::Vec2(def) => {
             if let Some(arr) = expr.as_f64_vec() {
                 PropertyValue::Vec2([
-                    arr.first().copied().unwrap_or(def[0]),
-                    arr.get(1).copied().unwrap_or(def[1]),
+                    arr.first()
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[0]),
+                    arr.get(1)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[1]),
                 ])
-            } else if let Some(n) = expr.as_f64() {
+            } else if let Some(n) = expr.as_f64().filter(|v| v.is_finite()) {
                 PropertyValue::Vec2([n, n])
             } else {
                 template.clone()
@@ -3284,11 +3893,20 @@ fn coerce_expr_value(expr: &ExprValue, template: &PropertyValue) -> PropertyValu
         PropertyValue::Vec3(def) => {
             if let Some(arr) = expr.as_f64_vec() {
                 PropertyValue::Vec3([
-                    arr.first().copied().unwrap_or(def[0]),
-                    arr.get(1).copied().unwrap_or(def[1]),
-                    arr.get(2).copied().unwrap_or(def[2]),
+                    arr.first()
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[0]),
+                    arr.get(1)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[1]),
+                    arr.get(2)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[2]),
                 ])
-            } else if let Some(n) = expr.as_f64() {
+            } else if let Some(n) = expr.as_f64().filter(|v| v.is_finite()) {
                 PropertyValue::Vec3([n, n, n])
             } else {
                 template.clone()
@@ -3297,11 +3915,20 @@ fn coerce_expr_value(expr: &ExprValue, template: &PropertyValue) -> PropertyValu
         PropertyValue::Color(def) => {
             if let Some(arr) = expr.as_f64_vec() {
                 PropertyValue::Color([
-                    arr.first().copied().unwrap_or(def[0]),
-                    arr.get(1).copied().unwrap_or(def[1]),
-                    arr.get(2).copied().unwrap_or(def[2]),
+                    arr.first()
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[0]),
+                    arr.get(1)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[1]),
+                    arr.get(2)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[2]),
                 ])
-            } else if let Some(n) = expr.as_f64() {
+            } else if let Some(n) = expr.as_f64().filter(|v| v.is_finite()) {
                 PropertyValue::Color([n, n, n])
             } else {
                 template.clone()
@@ -3310,12 +3937,24 @@ fn coerce_expr_value(expr: &ExprValue, template: &PropertyValue) -> PropertyValu
         PropertyValue::Vec4(def) => {
             if let Some(arr) = expr.as_f64_vec() {
                 PropertyValue::Vec4([
-                    arr.first().copied().unwrap_or(def[0]),
-                    arr.get(1).copied().unwrap_or(def[1]),
-                    arr.get(2).copied().unwrap_or(def[2]),
-                    arr.get(3).copied().unwrap_or(def[3]),
+                    arr.first()
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[0]),
+                    arr.get(1)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[1]),
+                    arr.get(2)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[2]),
+                    arr.get(3)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[3]),
                 ])
-            } else if let Some(n) = expr.as_f64() {
+            } else if let Some(n) = expr.as_f64().filter(|v| v.is_finite()) {
                 PropertyValue::Vec4([n, n, n, n])
             } else {
                 template.clone()
@@ -3324,10 +3963,22 @@ fn coerce_expr_value(expr: &ExprValue, template: &PropertyValue) -> PropertyValu
         PropertyValue::ColorRgba(def) => {
             if let Some(arr) = expr.as_f64_vec() {
                 PropertyValue::ColorRgba([
-                    arr.first().copied().unwrap_or(def[0]),
-                    arr.get(1).copied().unwrap_or(def[1]),
-                    arr.get(2).copied().unwrap_or(def[2]),
-                    arr.get(3).copied().unwrap_or(def[3]),
+                    arr.first()
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[0]),
+                    arr.get(1)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[1]),
+                    arr.get(2)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[2]),
+                    arr.get(3)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(def[3]),
                 ])
             } else {
                 template.clone()
@@ -3372,12 +4023,61 @@ fn eval_vec3(track: &PropertyTrack, env: &EvalEnv<'_>) -> [f32; 3] {
 }
 
 fn eval_color_rgb(track: &PropertyTrack, env: &EvalEnv<'_>, default: [f32; 3]) -> [f32; 3] {
+    let c = eval_color_rgba(track, env, [default[0], default[1], default[2], 1.0]);
+    [c[0], c[1], c[2]]
+}
+
+fn eval_color_rgba(track: &PropertyTrack, env: &EvalEnv<'_>, default: [f32; 4]) -> [f32; 4] {
     match eval_property_track(track, env) {
-        PropertyValue::Color(v) | PropertyValue::Vec3(v) => [v[0] as f32, v[1] as f32, v[2] as f32],
-        PropertyValue::ColorRgba(v) | PropertyValue::Vec4(v) => {
-            [v[0] as f32, v[1] as f32, v[2] as f32]
+        PropertyValue::Color(v) | PropertyValue::Vec3(v) => {
+            [v[0] as f32, v[1] as f32, v[2] as f32, 1.0]
         }
+        PropertyValue::ColorRgba(v) | PropertyValue::Vec4(v) => {
+            [v[0] as f32, v[1] as f32, v[2] as f32, v[3] as f32]
+        }
+        PropertyValue::Text(s) | PropertyValue::List(s) => parse_css_rgba(&s),
+        PropertyValue::Json(v) => parse_json_rgba(&v).unwrap_or(default),
         _ => default,
+    }
+}
+
+fn parse_preserved_shadows(val: Option<&serde_json::Value>) -> bool {
+    match val {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(n)) => n.as_f64().is_none_or(|v| v.abs() > 1e-6),
+        Some(serde_json::Value::String(s)) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        _ => true,
+    }
+}
+
+fn parse_json_rgba(val: &serde_json::Value) -> Option<[f32; 4]> {
+    match val {
+        serde_json::Value::Array(arr) if arr.len() >= 3 => {
+            let r = arr[0].as_f64()? as f32;
+            let g = arr[1].as_f64()? as f32;
+            let b = arr[2].as_f64()? as f32;
+            let a = arr
+                .get(3)
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(1.0) as f32;
+            let scale = if r > 1.0 || g > 1.0 || b > 1.0 {
+                1.0 / 255.0
+            } else {
+                1.0
+            };
+            let a_norm = if a > 1.0 { a / 255.0 } else { a };
+            Some([
+                (r * scale).clamp(0.0, 1.0),
+                (g * scale).clamp(0.0, 1.0),
+                (b * scale).clamp(0.0, 1.0),
+                a_norm.clamp(0.0, 1.0),
+            ])
+        }
+        serde_json::Value::String(s) => Some(parse_css_rgba(s)),
+        _ => None,
     }
 }
 
@@ -3417,22 +4117,64 @@ fn build_torus_knot(
         Vec3::new(ring * cu, ring * su, r * qu_over_p.sin() * 0.5)
     };
 
+    let mut points = Vec::with_capacity((t_segs + 1) as usize);
+    let mut tangents = Vec::with_capacity((t_segs + 1) as usize);
+    let du = 1e-3_f32;
+    for i in 0..=t_segs {
+        let u_frac = i as f32 / t_segs as f32;
+        let u = u_frac * TAU;
+        points.push(sample_curve(u));
+        let p_prev = sample_curve(u - du);
+        let p_next = sample_curve(u + du);
+        tangents.push((p_next - p_prev).normalize_or_zero());
+    }
+    tangents[t_segs as usize] = tangents[0];
+
+    // Parallel-transport (Bishop) frame along the closed knot curve.
+    let mut normals = Vec::with_capacity((t_segs + 1) as usize);
+    let mut binormals = Vec::with_capacity((t_segs + 1) as usize);
+    let t0 = tangents[0];
+    let init_up = if t0.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+    let n0 = t0.cross(init_up).normalize_or_zero();
+    let b0 = t0.cross(n0).normalize_or_zero();
+    normals.push(n0);
+    binormals.push(b0);
+
+    for i in 1..=(t_segs as usize) {
+        let t_prev = tangents[i - 1];
+        let t_curr = tangents[i];
+        let n_prev = normals[i - 1];
+        let axis = t_prev.cross(t_curr);
+        let axis_len = axis.length();
+        let n_rot = if axis_len > 1e-6 {
+            let k = axis / axis_len;
+            let angle = t_prev.dot(t_curr).clamp(-1.0, 1.0).acos();
+            let (s, c) = angle.sin_cos();
+            n_prev * c + k.cross(n_prev) * s + k * k.dot(n_prev) * (1.0 - c)
+        } else {
+            n_prev
+        };
+        let n_curr = (n_rot - t_curr * n_rot.dot(t_curr)).normalize_or_zero();
+        let b_curr = t_curr.cross(n_curr).normalize_or_zero();
+        normals.push(n_curr);
+        binormals.push(b_curr);
+    }
+
+    // Distribute closed-loop holonomy twist evenly so seam i == t_segs matches i == 0.
+    let n_end = normals[t_segs as usize];
+    let twist_err = n_end.dot(b0).atan2(n_end.dot(n0));
+
     let mut vertices = Vec::with_capacity(((t_segs + 1) * (r_segs + 1)) as usize);
     let mut indices = Vec::with_capacity((t_segs * r_segs * 6) as usize);
 
     for i in 0..=t_segs {
         let u_frac = i as f32 / t_segs as f32;
-        let u = u_frac * TAU;
-        let p0 = sample_curve(u);
-        let p1 = sample_curve(u + 0.01);
-        let tangent = (p1 - p0).normalize_or_zero();
-        let up = if tangent.y.abs() < 0.9 {
-            Vec3::Y
-        } else {
-            Vec3::X
-        };
-        let normal = tangent.cross(up).normalize_or_zero();
-        let binormal = tangent.cross(normal).normalize_or_zero();
+        let p0 = points[i as usize];
+        let t_i = tangents[i as usize];
+        let theta = -twist_err * u_frac;
+        let (st, ct) = theta.sin_cos();
+        let normal = (normals[i as usize] * ct + binormals[i as usize] * st).normalize_or_zero();
+        let binormal = t_i.cross(normal).normalize_or_zero();
 
         for j in 0..=r_segs {
             let v_frac = j as f32 / r_segs as f32;
@@ -3455,7 +4197,8 @@ fn build_torus_knot(
             let b = (i + 1) * stride + j;
             let c = (i + 1) * stride + j + 1;
             let d = i * stride + j + 1;
-            indices.extend_from_slice(&[a, b, c, a, c, d]);
+            // Reversed winding so CCW triangles face outward along `dir`.
+            indices.extend_from_slice(&[a, c, b, a, d, c]);
         }
     }
 
@@ -3578,6 +4321,16 @@ fn hash_effectors(mut h: u64, obj: &Object3D, env: &EvalEnv<'_>) -> u64 {
     h
 }
 
+fn hash_asset_record(rec: &zc_project::AssetRecord) -> u64 {
+    if !rec.sha256.is_empty() {
+        fnv1a_hash64(rec.sha256.as_bytes())
+    } else if let Some(bytes) = rec.bytes.as_deref() {
+        fnv1a_hash64(bytes)
+    } else {
+        0
+    }
+}
+
 fn hash_shape_and_effectors(shape: &Shape3DKind, obj: &Object3D, env: &EvalEnv<'_>) -> u64 {
     let mut h = fnv1a_hash64(b"shape3d");
     if let Ok(bytes) = serde_json::to_vec(shape) {
@@ -3586,7 +4339,7 @@ fn hash_shape_and_effectors(shape: &Shape3DKind, obj: &Object3D, env: &EvalEnv<'
     if let Shape3DKind::CustomGeometry { asset_id: Some(id) } = shape
         && let Some(rec) = env.project.assets.get(id)
     {
-        h = hash_u64(h, fnv1a_hash64(rec.sha256.as_bytes()));
+        h = hash_u64(h, hash_asset_record(rec));
     }
     hash_effectors(h, obj, env)
 }
@@ -3601,7 +4354,7 @@ fn hash_text3d_and_effectors(
     if let Some(font) = data.font.as_deref() {
         h = hash_u64(h, fnv1a_hash64(font.as_bytes()));
         if let Some(rec) = env.project.assets.get(font) {
-            h = hash_u64(h, fnv1a_hash64(rec.sha256.as_bytes()));
+            h = hash_u64(h, hash_asset_record(rec));
         }
     }
     h = hash_f64(h, data.size[0]);
@@ -3699,6 +4452,58 @@ fn convert_gradient_stops(stops: &[ProjectGradientStop]) -> Vec<ParticleGradient
     out
 }
 
+fn parse_particle_size_stop(value: &str) -> [f32; 4] {
+    let trimmed = value.trim();
+    if let Ok(sz) = trimmed.parse::<f32>()
+        && sz.is_finite()
+    {
+        let v = sz.max(0.0);
+        return [v, v, v, 1.0];
+    }
+    if let Some(inner) = trimmed
+        .strip_prefix("rgba(")
+        .or_else(|| trimmed.strip_prefix("rgb("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let parts: Vec<f32> = inner
+            .split(',')
+            .filter_map(|p| p.trim().parse::<f32>().ok())
+            .collect();
+        if parts.len() >= 3 {
+            let r = if parts[0] > 1.0 {
+                parts[0] / 255.0
+            } else {
+                parts[0]
+            };
+            let g = if parts[1] > 1.0 {
+                parts[1] / 255.0
+            } else {
+                parts[1]
+            };
+            let b = if parts[2] > 1.0 {
+                parts[2] / 255.0
+            } else {
+                parts[2]
+            };
+            let a = parts.get(3).copied().unwrap_or(1.0);
+            return [r.max(0.0), g.max(0.0), b.max(0.0), a.clamp(0.0, 1.0)];
+        }
+    }
+    parse_css_rgba(trimmed)
+}
+
+fn convert_size_gradient_stops(stops: &[ProjectGradientStop]) -> Vec<ParticleGradientStop> {
+    let mut out: Vec<ParticleGradientStop> = stops
+        .iter()
+        .map(|s| ParticleGradientStop {
+            position: (s.position as f32).clamp(0.0, 1.0),
+            color: parse_particle_size_stop(&s.color),
+        })
+        .collect();
+    out.sort_by(|a, b| a.position.total_cmp(&b.position));
+    out
+}
+
 fn bake_project_gradient_lut_rgba8(stops: &[ProjectGradientStop]) -> Vec<[u8; 4]> {
     let converted = convert_gradient_stops(stops);
     let baked = zc_scene::bake_gradient_lut(&converted, 256);
@@ -3769,10 +4574,15 @@ fn bake_color_curves_lut_rgba8(curve_json: &serde_json::Value) -> Vec<[u8; 4]> {
     lut
 }
 
-fn parse_cube_lut_bytes(bytes: &[u8], max_texture_dim: u32) -> Option<RegParamValue> {
+fn parse_cube_lut_bytes(
+    bytes: &[u8],
+    max_texture_dim: u32,
+) -> Option<(RegParamValue, [f32; 3], [f32; 3])> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut size_1d: Option<usize> = None;
     let mut size_3d: Option<u32> = None;
+    let mut domain_min = [0.0_f32; 3];
+    let mut domain_max = [1.0_f32; 3];
     let mut triplets: Vec<[f32; 3]> = Vec::new();
 
     for raw_line in text.lines() {
@@ -3780,20 +4590,67 @@ fn parse_cube_lut_bytes(bytes: &[u8], max_texture_dim: u32) -> Option<RegParamVa
         if line.is_empty() {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("LUT_1D_SIZE") {
-            size_1d = rest.trim().parse().ok();
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.is_empty() {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("LUT_3D_SIZE") {
-            size_3d = rest.trim().parse().ok();
-            continue;
+        match tokens[0] {
+            "TITLE" | "LUT_1D_INPUT_RANGE" | "LUT_3D_INPUT_RANGE" => continue,
+            "LUT_1D_SIZE" => {
+                if let Some(tok) = tokens.get(1) {
+                    size_1d = tok.parse().ok();
+                }
+                continue;
+            }
+            "LUT_3D_SIZE" => {
+                if let Some(tok) = tokens.get(1) {
+                    size_3d = tok.parse().ok();
+                }
+                continue;
+            }
+            "DOMAIN_MIN" => {
+                if tokens.len() == 4
+                    && let (Ok(r), Ok(g), Ok(b)) = (
+                        tokens[1].parse::<f32>(),
+                        tokens[2].parse::<f32>(),
+                        tokens[3].parse::<f32>(),
+                    )
+                    && r.is_finite()
+                    && g.is_finite()
+                    && b.is_finite()
+                {
+                    domain_min = [r, g, b];
+                }
+                continue;
+            }
+            "DOMAIN_MAX" => {
+                if tokens.len() == 4
+                    && let (Ok(r), Ok(g), Ok(b)) = (
+                        tokens[1].parse::<f32>(),
+                        tokens[2].parse::<f32>(),
+                        tokens[3].parse::<f32>(),
+                    )
+                    && r.is_finite()
+                    && g.is_finite()
+                    && b.is_finite()
+                {
+                    domain_max = [r, g, b];
+                }
+                continue;
+            }
+            _ => {}
         }
-        let nums: Vec<f32> = line
-            .split_whitespace()
-            .filter_map(|t| t.parse::<f32>().ok())
-            .collect();
-        if nums.len() == 3 {
-            triplets.push([nums[0], nums[1], nums[2]]);
+        if tokens.len() == 3
+            && let (Ok(r), Ok(g), Ok(b)) = (
+                tokens[0].parse::<f32>(),
+                tokens[1].parse::<f32>(),
+                tokens[2].parse::<f32>(),
+            )
+            && r.is_finite()
+            && g.is_finite()
+            && b.is_finite()
+        {
+            triplets.push([r, g, b]);
         }
     }
 
@@ -3811,14 +4668,25 @@ fn parse_cube_lut_bytes(bytes: &[u8], max_texture_dim: u32) -> Option<RegParamVa
         if triplets.len() < total {
             return None;
         }
-        let mut data = Vec::with_capacity(byte_len);
-        for rgb in triplets.into_iter().take(total) {
-            data.push((rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8);
-            data.push((rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8);
-            data.push((rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8);
-            data.push(255);
+        let mut data = vec![0u8; byte_len];
+        for b in 0..n_usize {
+            for g in 0..n_usize {
+                for r in 0..n_usize {
+                    let src_idx = b * n_usize * n_usize + g * n_usize + r;
+                    let rgb = triplets[src_idx];
+                    let dst_idx = (g * n_usize * n_usize + b * n_usize + r) * 4;
+                    data[dst_idx] = (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                    data[dst_idx + 1] = (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                    data[dst_idx + 2] = (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                    data[dst_idx + 3] = 255;
+                }
+            }
         }
-        return Some(RegParamValue::Lut3D { size: n, data });
+        return Some((
+            RegParamValue::Lut3D { size: n, data },
+            domain_min,
+            domain_max,
+        ));
     }
 
     let max_1d = MAX_CUBE_LUT_1D_SIZE.min(max_texture_dim as usize);
@@ -3836,7 +4704,7 @@ fn parse_cube_lut_bytes(bytes: &[u8], max_texture_dim: u32) -> Option<RegParamVa
                 ]
             })
             .collect();
-        return Some(RegParamValue::Lut1D(entries));
+        return Some((RegParamValue::Lut1D(entries), domain_min, domain_max));
     }
     None
 }
@@ -3867,8 +4735,7 @@ fn collect_shape_style(
         for op in &node.operations {
             match op {
                 DrawOp::Fill { color } => {
-                    let rgb = eval_color_rgb(color, env, [1.0, 1.0, 1.0]);
-                    *fill = Some([rgb[0], rgb[1], rgb[2], 1.0]);
+                    *fill = Some(eval_color_rgba(color, env, [1.0, 1.0, 1.0, 1.0]));
                 }
                 DrawOp::Stroke {
                     color,
@@ -3886,6 +4753,34 @@ fn collect_shape_style(
             collect_shape_style(children, env, fill, stroke);
         }
     }
+}
+
+fn hash_shape_nodes(mut h: u64, nodes: &[Shape2DNode], env: &EvalEnv<'_>) -> u64 {
+    h = hash_u64(h, nodes.len() as u64);
+    for node in nodes {
+        h = hash_u64(h, fnv1a_hash64(node.id.as_bytes()));
+        let pos = eval_vec2(&node.position, env);
+        let rot = eval_f32(&node.rotation, env);
+        let sc = eval_vec2(&node.scale, env);
+        h = hash_u64(h, u64::from(pos[0].to_bits()));
+        h = hash_u64(h, u64::from(pos[1].to_bits()));
+        h = hash_u64(h, u64::from(rot.to_bits()));
+        h = hash_u64(h, u64::from(sc[0].to_bits()));
+        h = hash_u64(h, u64::from(sc[1].to_bits()));
+        match &node.kind {
+            Shape2DKind::Group { children } => {
+                h = hash_u64(h, 1);
+                h = hash_shape_nodes(h, children, env);
+            }
+            Shape2DKind::Path { path } => {
+                h = hash_u64(h, 2);
+                if let Ok(bytes) = serde_json::to_vec(path) {
+                    h = hash_u64(h, fnv1a_hash64(&bytes));
+                }
+            }
+        }
+    }
+    h
 }
 
 fn hash_shape_style(mut h: u64, style: &ShapeStyle2D) -> u64 {
@@ -4119,6 +5014,7 @@ mod tests {
             frame: 5.0,
             time: 5.0 / 30.0,
             fps: 30.0,
+            sequence_resolution: project.sequence.resolution,
             project: &project,
             plugins: &plus_plugins,
             controls: &controls,
@@ -4138,6 +5034,7 @@ mod tests {
             frame: 5.0,
             time: 5.0 / 30.0,
             fps: 30.0,
+            sequence_resolution: project.sequence.resolution,
             project: &project,
             plugins: &vanilla_plugins,
             controls: &controls,
@@ -4401,6 +5298,7 @@ mod tests {
             frame: 15.0,
             time: 0.5,
             fps: 30.0,
+            sequence_resolution: project.sequence.resolution,
             project: &project,
             plugins: &plugins,
             controls: &controls,
@@ -4411,6 +5309,254 @@ mod tests {
         assert!(
             val > 0.75,
             "expected Bezier segment to evaluate persisted control points (>0.75), got {val}"
+        );
+    }
+
+    #[test]
+    fn cube_lut_parser_parses_domain_bounds_without_corrupting_entries() {
+        let cube = b"\
+TITLE \"Test LUT 1 2 3\"
+LUT_3D_SIZE 2
+DOMAIN_MIN 0.1 0.2 0.3
+DOMAIN_MAX 0.9 0.8 0.7
+0.0 0.0 0.0
+1.0 0.0 0.0
+0.0 1.0 0.0
+1.0 1.0 0.0
+0.0 0.0 1.0
+1.0 0.0 1.0
+0.0 1.0 1.0
+1.0 1.0 1.0
+";
+        let (lut, dmin, dmax) =
+            parse_cube_lut_bytes(cube, 8192).expect("valid 3D .cube with DOMAIN_MIN/MAX");
+        assert!((dmin[0] - 0.1).abs() < 1e-5);
+        assert!((dmin[1] - 0.2).abs() < 1e-5);
+        assert!((dmin[2] - 0.3).abs() < 1e-5);
+        assert!((dmax[0] - 0.9).abs() < 1e-5);
+        assert!((dmax[1] - 0.8).abs() < 1e-5);
+        assert!((dmax[2] - 0.7).abs() < 1e-5);
+        match lut {
+            RegParamValue::Lut3D { size, data } => {
+                assert_eq!(size, 2);
+                // Entry (r=0,g=0,b=0) -> dst_idx 0 must be [0, 0, 0, 255].
+                assert_eq!(&data[0..4], &[0, 0, 0, 255]);
+                // Entry (r=1,g=0,b=0) -> dst_idx 4 must be [255, 0, 0, 255] (NOT shifted by DOMAIN_MAX).
+                assert_eq!(&data[4..8], &[255, 0, 0, 255]);
+            }
+            other => panic!("expected Lut3D, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coerce_expr_value_sanitizes_nan_and_inf_in_vectors() {
+        let nan_arr = ExprValue::Array(vec![
+            ExprValue::Number(f64::NAN),
+            ExprValue::Number(f64::INFINITY),
+            ExprValue::Number(0.5),
+            ExprValue::Number(f64::NEG_INFINITY),
+        ]);
+        let v3 = coerce_expr_value(&nan_arr, &PropertyValue::Vec3([1.0, 2.0, 3.0]));
+        assert_eq!(v3, PropertyValue::Vec3([1.0, 2.0, 0.5]));
+
+        let v4 = coerce_expr_value(&nan_arr, &PropertyValue::ColorRgba([0.1, 0.2, 0.3, 1.0]));
+        assert_eq!(v4, PropertyValue::ColorRgba([0.1, 0.2, 0.5, 1.0]));
+
+        let nan_scalar = ExprValue::Number(f64::NAN);
+        let v2 = coerce_expr_value(&nan_scalar, &PropertyValue::Vec2([4.0, 5.0]));
+        assert_eq!(v2, PropertyValue::Vec2([4.0, 5.0]));
+    }
+
+    #[test]
+    fn ortho_camera_respects_viewport_aspect_and_sequence_resolution() {
+        let project = Project::new_cm3_default();
+        let plugins = PluginRegistry::new();
+        let controls = BTreeMap::new();
+        let parent_props = BTreeMap::new();
+        let env = EvalEnv {
+            frame: 0.0,
+            time: 0.0,
+            fps: 30.0,
+            sequence_resolution: [500, 500],
+            project: &project,
+            plugins: &plugins,
+            controls: &controls,
+            parent_props: &parent_props,
+        };
+        let cam = zc_project::CameraData {
+            kind: CameraKind::Orthographic,
+            ..Default::default()
+        };
+        let params = build_camera_params(&cam, Mat4::IDENTITY, &env, [200.0, 100.0]);
+        // half_h = 0.05 * 500 = 25.0 -> proj[1][1] = 1 / 25.0
+        // aspect = 2.0 -> half_w = 50.0 -> proj[0][0] = 1 / 50.0
+        assert!((params.proj[1][1] - (1.0 / 25.0)).abs() < 1e-5);
+        assert!((params.proj[0][0] - (1.0 / 50.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn gpu_regression_text2d_alpha_precomp_gate_and_temporal_effects() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        plugins.enable("precomp-plus").expect("enable precomp-plus");
+        plugins.enable("native-fx").expect("enable native-fx");
+
+        // 1. Semi-transparent Text2D must not double-blend over itself (alpha 0.5 stays ~128, not ~191).
+        let mut text_proj = Project::new_cm3_default();
+        text_proj.sequence.background_color = [0.0, 0.0, 0.0, 0.0];
+        text_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Text2D {
+            text: "H".to_owned(),
+            font: None,
+            size: 600,
+            shapes: vec![Shape2DNode {
+                id: Uuid::new_v4(),
+                name: "Fill".to_owned(),
+                kind: Shape2DKind::Group {
+                    children: Vec::new(),
+                },
+                position: PropertyTrack::vec2([0.0, 0.0]),
+                rotation: PropertyTrack::number(0.0),
+                scale: PropertyTrack::vec2([1.0, 1.0]),
+                operations: vec![DrawOp::Fill {
+                    color: PropertyTrack::constant(PropertyValue::ColorRgba([1.0, 1.0, 1.0, 0.5])),
+                }],
+                preserved: BTreeMap::new(),
+            }],
+        };
+        let text_px = engine
+            .render_frame_rgba8(&text_proj, &plugins, 0.0, 64, 64)
+            .expect("text2d render");
+        let max_alpha = text_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| p[3])
+            .max()
+            .unwrap_or(0);
+        assert!(
+            (115..=140).contains(&max_alpha),
+            "expected semi-transparent Text2D alpha ~128 without double-blend, got {max_alpha}"
+        );
+
+        // 2. PrecompRef is blocked when precomp-plus plugin is disabled.
+        let mut precomp_proj = Project::new_cm3_default();
+        precomp_proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        let comp_id = Uuid::new_v4();
+        let comp_seq = Sequence {
+            background_color: [1.0, 0.0, 0.0, 1.0],
+            ..Default::default()
+        };
+        precomp_proj.compositions.insert(comp_id, comp_seq);
+        precomp_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::PrecompRef {
+            composition_id: comp_id,
+        };
+        let mut no_precomp_plugins = PluginRegistry::new();
+        no_precomp_plugins.disable_all_optional();
+        let disabled_px = engine
+            .render_frame_rgba8(&precomp_proj, &no_precomp_plugins, 0.0, 16, 16)
+            .expect("precomp disabled render");
+        assert_eq!(
+            disabled_px[0], 0,
+            "PrecompRef must not render when precomp-plus is disabled"
+        );
+        let enabled_px = engine
+            .render_frame_rgba8(&precomp_proj, &plugins, 0.0, 16, 16)
+            .expect("precomp enabled render");
+        assert!(
+            enabled_px[0] > 240,
+            "PrecompRef must render when precomp-plus is enabled"
+        );
+
+        // 3. Echo and SmartMotionBlur actually sample neighbor frames in ProjectRenderEngine,
+        // and Echo with startingIntensity > 1.0 maintains valid premultiplied alpha.
+        let make_moving_proj = |fx: Option<EffectInstance>| {
+            let mut p = Project::new_cm3_default();
+            p.sequence.fps = 30;
+            p.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+            let mut layer = Layer {
+                id: Uuid::new_v4(),
+                name: "MovingShader".to_owned(),
+                kind: LayerKind::Generator,
+                position: PropertyTrack::vec2([0.0, 0.0]),
+                scale: PropertyTrack::vec2([1.0, 1.0]),
+                rotation: PropertyTrack::number(0.0),
+                anchor: PropertyTrack::vec2([0.0, 0.0]),
+                opacity: PropertyTrack::number(1.0),
+                blending: "BLEND_SRC_OVER".to_owned(),
+                effects: vec![EffectInstance {
+                    id: Uuid::new_v4(),
+                    name: "MovingBox".to_owned(),
+                    enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+                    kind: EffectKind::CustomShader {
+                        frag_shader: "precision mediump float; varying vec2 vUv; uniform float time; void main() { float cx = 0.2 + time * 1.5; float m = step(abs(vUv.x - cx), 0.12) * step(abs(vUv.y - 0.5), 0.25); gl_FragColor = vec4(m, m * 0.5, 0.0, m); }".to_owned(),
+                        custom_properties: Vec::new(),
+                    },
+                    params: BTreeMap::new(),
+                    preserved: BTreeMap::new(),
+                }],
+                resolution: [32, 32],
+                preserved: BTreeMap::new(),
+            };
+            if let Some(extra_fx) = fx {
+                layer.effects.push(extra_fx);
+            }
+            p.sequence.video_tracks[0].clips[0].layer = layer;
+            p
+        };
+
+        let base_px = engine
+            .render_frame_rgba8(&make_moving_proj(None), &plugins, 6.0, 32, 32)
+            .expect("base moving render");
+
+        let mut echo_params = BTreeMap::new();
+        echo_params.insert("echoTime".into(), PropertyTrack::number(-0.066));
+        echo_params.insert("numberOfEchoes".into(), PropertyTrack::number(3.0));
+        echo_params.insert("startingIntensity".into(), PropertyTrack::number(2.5));
+        echo_params.insert("decay".into(), PropertyTrack::number(0.7));
+        echo_params.insert("operator".into(), PropertyTrack::option(4)); // CompositeInFront
+        let echo_fx = EffectInstance {
+            id: Uuid::new_v4(),
+            name: "Echo".to_owned(),
+            enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+            kind: EffectKind::Plugin {
+                plugin_id: "native-fx".to_owned(),
+                effect_id: "echo".to_owned(),
+            },
+            params: echo_params,
+            preserved: BTreeMap::new(),
+        };
+        let echo_px = engine
+            .render_frame_rgba8(&make_moving_proj(Some(echo_fx)), &plugins, 6.0, 32, 32)
+            .expect("echo moving render");
+        assert_ne!(base_px, echo_px, "echo must modify moving layer frames");
+
+        let mut smb_params = BTreeMap::new();
+        smb_params.insert("blurAmount".into(), PropertyTrack::number(1.0));
+        smb_params.insert("motionSensitivity".into(), PropertyTrack::number(90.0));
+        smb_params.insert("view".into(), PropertyTrack::option(1)); // Motion vectors view
+        let smb_fx = EffectInstance {
+            id: Uuid::new_v4(),
+            name: "SMB".to_owned(),
+            enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+            kind: EffectKind::Plugin {
+                plugin_id: "native-fx".to_owned(),
+                effect_id: "smartmotionblur".to_owned(),
+            },
+            params: smb_params,
+            preserved: BTreeMap::new(),
+        };
+        let smb_px = engine
+            .render_frame_rgba8(&make_moving_proj(Some(smb_fx)), &plugins, 6.0, 32, 32)
+            .expect("smb moving render");
+        // In Motion Vectors view (mode == 1), without neighbor frames every pixel is (128, 128, 0, 255);
+        // with neighbor frames bound, blue channel is 128 (0.5) and active motion pixels deviate.
+        assert!(
+            smb_px.as_chunks::<4>().0.iter().any(|p| p[2] > 100),
+            "smartmotionblur must bind temporal neighbor frames instead of no-oping"
         );
     }
 }

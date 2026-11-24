@@ -779,11 +779,27 @@ fn validate_stmt(
             validate_stmt(&f.body, mode, locals, true, in_switch, next)
         }
         Stmt::ForOf(f) => {
+            if f.kind.is_none()
+                && let Pattern::Ident(name) = &f.target
+                && mode == ExprMode::VanillaCm3
+                && !locals.contains(name)
+                && !is_vanilla_global(name)
+            {
+                return Err(ExprError::ReferenceError(name.clone()));
+            }
             validate_pattern(&f.target, mode, locals, next)?;
             validate_expr(&f.iterable, mode, locals, next)?;
             validate_stmt(&f.body, mode, locals, true, in_switch, next)
         }
         Stmt::ForIn(f) => {
+            if f.kind.is_none()
+                && let Pattern::Ident(name) = &f.target
+                && mode == ExprMode::VanillaCm3
+                && !locals.contains(name)
+                && !is_vanilla_global(name)
+            {
+                return Err(ExprError::ReferenceError(name.clone()));
+            }
             validate_pattern(&f.target, mode, locals, next)?;
             validate_expr(&f.object, mode, locals, next)?;
             validate_stmt(&f.body, mode, locals, true, in_switch, next)
@@ -1148,9 +1164,6 @@ fn root_is_fresh_local(expr: &Expr, fresh_locals: &BTreeSet<String>) -> bool {
     match expr {
         Expr::Array(_) | Expr::Object(_) => true,
         Expr::Ident(name) => fresh_locals.contains(name),
-        Expr::Member { object, .. } | Expr::Index { object, .. } => {
-            root_is_fresh_local(object, fresh_locals)
-        }
         _ => false,
     }
 }
@@ -1295,10 +1308,26 @@ fn stmt_is_cacheable(stmt: &Stmt, fresh_locals: &mut BTreeSet<String>) -> bool {
             true
         }
         Stmt::While { test, body } => {
-            expr_is_cacheable(test, fresh_locals) && stmt_is_cacheable(body, fresh_locals)
+            collect_loop_invalidated_vars(None, Some(test), body, None, fresh_locals);
+            let mut iter_fresh = fresh_locals.clone();
+            if !expr_is_cacheable(test, &mut iter_fresh)
+                || !stmt_is_cacheable(body, &mut iter_fresh)
+            {
+                return false;
+            }
+            fresh_locals.retain(|k| iter_fresh.contains(k));
+            true
         }
         Stmt::DoWhile { body, test } => {
-            stmt_is_cacheable(body, fresh_locals) && expr_is_cacheable(test, fresh_locals)
+            collect_loop_invalidated_vars(None, Some(test), body, None, fresh_locals);
+            let mut iter_fresh = fresh_locals.clone();
+            if !stmt_is_cacheable(body, &mut iter_fresh)
+                || !expr_is_cacheable(test, &mut iter_fresh)
+            {
+                return false;
+            }
+            fresh_locals.retain(|k| iter_fresh.contains(k));
+            true
         }
         Stmt::For(f) => {
             let mut loop_fresh = fresh_locals.clone();
@@ -1320,19 +1349,28 @@ fn stmt_is_cacheable(stmt: &Stmt, fresh_locals: &mut BTreeSet<String>) -> bool {
                     }
                 }
             }
+            collect_loop_invalidated_vars(
+                None,
+                f.test.as_ref(),
+                &f.body,
+                f.update.as_ref(),
+                &mut loop_fresh,
+            );
+            let mut iter_fresh = loop_fresh.clone();
             if let Some(t) = &f.test
-                && !expr_is_cacheable(t, &mut loop_fresh)
+                && !expr_is_cacheable(t, &mut iter_fresh)
             {
+                return false;
+            }
+            if !stmt_is_cacheable(&f.body, &mut iter_fresh) {
                 return false;
             }
             if let Some(u) = &f.update
-                && !expr_is_cacheable(u, &mut loop_fresh)
+                && !expr_is_cacheable(u, &mut iter_fresh)
             {
                 return false;
             }
-            if !stmt_is_cacheable(&f.body, &mut loop_fresh) {
-                return false;
-            }
+            loop_fresh.retain(|k| iter_fresh.contains(k));
             fresh_locals.retain(|k| loop_fresh.contains(k));
             true
         }
@@ -1341,12 +1379,15 @@ fn stmt_is_cacheable(stmt: &Stmt, fresh_locals: &mut BTreeSet<String>) -> bool {
                 return false;
             }
             let mut loop_fresh = fresh_locals.clone();
-            if !pattern_is_cacheable(&f.target, &mut loop_fresh) {
+            collect_loop_invalidated_vars(Some(&f.target), None, &f.body, None, &mut loop_fresh);
+            let mut iter_fresh = loop_fresh.clone();
+            if !pattern_is_cacheable(&f.target, &mut iter_fresh) {
                 return false;
             }
-            if !stmt_is_cacheable(&f.body, &mut loop_fresh) {
+            if !stmt_is_cacheable(&f.body, &mut iter_fresh) {
                 return false;
             }
+            loop_fresh.retain(|k| iter_fresh.contains(k));
             fresh_locals.retain(|k| loop_fresh.contains(k));
             true
         }
@@ -1355,12 +1396,15 @@ fn stmt_is_cacheable(stmt: &Stmt, fresh_locals: &mut BTreeSet<String>) -> bool {
                 return false;
             }
             let mut loop_fresh = fresh_locals.clone();
-            if !pattern_is_cacheable(&f.target, &mut loop_fresh) {
+            collect_loop_invalidated_vars(Some(&f.target), None, &f.body, None, &mut loop_fresh);
+            let mut iter_fresh = loop_fresh.clone();
+            if !pattern_is_cacheable(&f.target, &mut iter_fresh) {
                 return false;
             }
-            if !stmt_is_cacheable(&f.body, &mut loop_fresh) {
+            if !stmt_is_cacheable(&f.body, &mut iter_fresh) {
                 return false;
             }
+            loop_fresh.retain(|k| iter_fresh.contains(k));
             fresh_locals.retain(|k| loop_fresh.contains(k));
             true
         }
@@ -1448,6 +1492,10 @@ fn expr_is_cacheable(expr: &Expr, fresh_locals: &mut BTreeSet<String>) -> bool {
                         expr_is_cacheable(object, fresh_locals)
                     }
                     Expr::Index { object, index } => {
+                        if matches!(index.as_ref(), Expr::Literal(Literal::String(s)) if is_unsafe_meta_prop(s))
+                        {
+                            return false;
+                        }
                         if !root_is_fresh_local(object, fresh_locals) {
                             return false;
                         }
@@ -1472,6 +1520,9 @@ fn expr_is_cacheable(expr: &Expr, fresh_locals: &mut BTreeSet<String>) -> bool {
                 expr_is_cacheable(object, fresh_locals)
             }
             AssignTarget::Index { object, index } => {
+                if matches!(index, Expr::Literal(Literal::String(s)) if is_unsafe_meta_prop(s)) {
+                    return false;
+                }
                 if !root_is_fresh_local(object, fresh_locals) {
                     return false;
                 }
@@ -1581,7 +1632,7 @@ fn expr_is_cacheable(expr: &Expr, fresh_locals: &mut BTreeSet<String>) -> bool {
                         }
                         if is_mutating_method(prop)
                             && matches!(ops.get(idx + 1), Some(ChainOp::Call { .. }))
-                            && !base_is_fresh
+                            && !(idx == 0 && base_is_fresh)
                         {
                             return false;
                         }
@@ -1629,5 +1680,332 @@ fn expr_is_cacheable(expr: &Expr, fresh_locals: &mut BTreeSet<String>) -> bool {
             }
         }
         Expr::Sequence(items) => items.iter().all(|e| expr_is_cacheable(e, fresh_locals)),
+    }
+}
+
+/// Removes from `fresh_locals` every identifier that may be assigned, updated
+/// (`++`/`--`), or pattern-bound anywhere within a loop's target, test, body,
+/// or update expression before checking the loop once.
+fn collect_loop_invalidated_vars(
+    target: Option<&Pattern>,
+    test: Option<&Expr>,
+    body: &Stmt,
+    update: Option<&Expr>,
+    fresh_locals: &mut BTreeSet<String>,
+) {
+    if fresh_locals.is_empty() {
+        return;
+    }
+    if let Some(p) = target {
+        collect_pattern_invalidated_vars(p, fresh_locals);
+    }
+    if let Some(t) = test {
+        collect_expr_invalidated_vars(t, fresh_locals);
+    }
+    collect_stmt_invalidated_vars(body, fresh_locals);
+    if let Some(u) = update {
+        collect_expr_invalidated_vars(u, fresh_locals);
+    }
+}
+
+fn collect_pattern_invalidated_vars(pattern: &Pattern, fresh_locals: &mut BTreeSet<String>) {
+    if fresh_locals.is_empty() {
+        return;
+    }
+    match pattern {
+        Pattern::Ident(name) => {
+            fresh_locals.remove(name);
+        }
+        Pattern::Array(elems) => {
+            for elem in elems {
+                match elem {
+                    ArrayPatternElem::Hole => {}
+                    ArrayPatternElem::Binding { pattern, default } => {
+                        if let Some(d) = default {
+                            collect_expr_invalidated_vars(d, fresh_locals);
+                        }
+                        collect_pattern_invalidated_vars(pattern, fresh_locals);
+                    }
+                    ArrayPatternElem::Rest(name) => {
+                        fresh_locals.remove(name);
+                    }
+                }
+            }
+        }
+        Pattern::Object(props) => {
+            for prop in props {
+                match prop {
+                    ObjectPatternProp::Prop {
+                        pattern, default, ..
+                    } => {
+                        if let Some(d) = default {
+                            collect_expr_invalidated_vars(d, fresh_locals);
+                        }
+                        collect_pattern_invalidated_vars(pattern, fresh_locals);
+                    }
+                    ObjectPatternProp::Rest(name) => {
+                        fresh_locals.remove(name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_stmt_invalidated_vars(stmt: &Stmt, fresh_locals: &mut BTreeSet<String>) {
+    if fresh_locals.is_empty() {
+        return;
+    }
+    match stmt {
+        Stmt::Empty | Stmt::Break | Stmt::Continue => {}
+        Stmt::Expr(e) | Stmt::Throw(e) => collect_expr_invalidated_vars(e, fresh_locals),
+        Stmt::Return(opt) => {
+            if let Some(e) = opt {
+                collect_expr_invalidated_vars(e, fresh_locals);
+            }
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                collect_stmt_invalidated_vars(s, fresh_locals);
+            }
+        }
+        Stmt::VarDecl { decls, .. } => {
+            for d in decls {
+                if let Some(init) = &d.init {
+                    collect_expr_invalidated_vars(init, fresh_locals);
+                }
+                collect_pattern_invalidated_vars(&d.pattern, fresh_locals);
+            }
+        }
+        Stmt::FunctionDecl(f) => {
+            fresh_locals.remove(&f.name);
+            for p in &f.params {
+                if let Some(d) = &p.default {
+                    collect_expr_invalidated_vars(d, fresh_locals);
+                }
+                collect_pattern_invalidated_vars(&p.pattern, fresh_locals);
+            }
+            for s in &f.body {
+                collect_stmt_invalidated_vars(s, fresh_locals);
+            }
+        }
+        Stmt::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            collect_expr_invalidated_vars(test, fresh_locals);
+            collect_stmt_invalidated_vars(consequent, fresh_locals);
+            if let Some(alt) = alternate {
+                collect_stmt_invalidated_vars(alt, fresh_locals);
+            }
+        }
+        Stmt::While { test, body } => {
+            collect_expr_invalidated_vars(test, fresh_locals);
+            collect_stmt_invalidated_vars(body, fresh_locals);
+        }
+        Stmt::DoWhile { body, test } => {
+            collect_stmt_invalidated_vars(body, fresh_locals);
+            collect_expr_invalidated_vars(test, fresh_locals);
+        }
+        Stmt::For(f) => {
+            if let Some(init) = &f.init {
+                match init {
+                    ForInit::VarDecl { decls, .. } => {
+                        for d in decls {
+                            if let Some(i) = &d.init {
+                                collect_expr_invalidated_vars(i, fresh_locals);
+                            }
+                            collect_pattern_invalidated_vars(&d.pattern, fresh_locals);
+                        }
+                    }
+                    ForInit::Expr(e) => collect_expr_invalidated_vars(e, fresh_locals),
+                }
+            }
+            if let Some(t) = &f.test {
+                collect_expr_invalidated_vars(t, fresh_locals);
+            }
+            collect_stmt_invalidated_vars(&f.body, fresh_locals);
+            if let Some(u) = &f.update {
+                collect_expr_invalidated_vars(u, fresh_locals);
+            }
+        }
+        Stmt::ForOf(f) => {
+            collect_expr_invalidated_vars(&f.iterable, fresh_locals);
+            collect_pattern_invalidated_vars(&f.target, fresh_locals);
+            collect_stmt_invalidated_vars(&f.body, fresh_locals);
+        }
+        Stmt::ForIn(f) => {
+            collect_expr_invalidated_vars(&f.object, fresh_locals);
+            collect_pattern_invalidated_vars(&f.target, fresh_locals);
+            collect_stmt_invalidated_vars(&f.body, fresh_locals);
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            collect_expr_invalidated_vars(discriminant, fresh_locals);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    collect_expr_invalidated_vars(t, fresh_locals);
+                }
+                for s in &c.consequent {
+                    collect_stmt_invalidated_vars(s, fresh_locals);
+                }
+            }
+        }
+        Stmt::Try(t) => {
+            for s in &t.block {
+                collect_stmt_invalidated_vars(s, fresh_locals);
+            }
+            if let Some(p) = &t.catch_param {
+                collect_pattern_invalidated_vars(p, fresh_locals);
+            }
+            if let Some(cb) = &t.catch_body {
+                for s in cb {
+                    collect_stmt_invalidated_vars(s, fresh_locals);
+                }
+            }
+            if let Some(fb) = &t.finally_body {
+                for s in fb {
+                    collect_stmt_invalidated_vars(s, fresh_locals);
+                }
+            }
+        }
+    }
+}
+
+fn collect_expr_invalidated_vars(expr: &Expr, fresh_locals: &mut BTreeSet<String>) {
+    if fresh_locals.is_empty() {
+        return;
+    }
+    match expr {
+        Expr::Literal(_) | Expr::Ident(_) => {}
+        Expr::Template(parts) => {
+            for p in parts {
+                if let TemplatePart::Expr(e) = p {
+                    collect_expr_invalidated_vars(e, fresh_locals);
+                }
+            }
+        }
+        Expr::Array(elems) => {
+            for elem in elems {
+                match elem {
+                    ArrayElem::Expr(e) | ArrayElem::Spread(e) => {
+                        collect_expr_invalidated_vars(e, fresh_locals);
+                    }
+                }
+            }
+        }
+        Expr::Object(props) => {
+            for prop in props {
+                match prop {
+                    ObjectProp::KeyValue { key, value } => {
+                        if let ObjectKey::Computed(e) = key {
+                            collect_expr_invalidated_vars(e, fresh_locals);
+                        }
+                        collect_expr_invalidated_vars(value, fresh_locals);
+                    }
+                    ObjectProp::Spread(e) => collect_expr_invalidated_vars(e, fresh_locals),
+                }
+            }
+        }
+        Expr::Unary { expr, .. } => collect_expr_invalidated_vars(expr, fresh_locals),
+        Expr::Update { target, .. } => match target.as_ref() {
+            AssignTarget::Ident(name) => {
+                fresh_locals.remove(name);
+            }
+            AssignTarget::Member { object, .. } => {
+                collect_expr_invalidated_vars(object, fresh_locals);
+            }
+            AssignTarget::Index { object, index } => {
+                collect_expr_invalidated_vars(object, fresh_locals);
+                collect_expr_invalidated_vars(index, fresh_locals);
+            }
+        },
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            collect_expr_invalidated_vars(left, fresh_locals);
+            collect_expr_invalidated_vars(right, fresh_locals);
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            collect_expr_invalidated_vars(test, fresh_locals);
+            collect_expr_invalidated_vars(consequent, fresh_locals);
+            collect_expr_invalidated_vars(alternate, fresh_locals);
+        }
+        Expr::Assign { target, value, .. } => {
+            collect_expr_invalidated_vars(value, fresh_locals);
+            match target.as_ref() {
+                AssignTarget::Ident(name) => {
+                    fresh_locals.remove(name);
+                }
+                AssignTarget::Member { object, .. } => {
+                    collect_expr_invalidated_vars(object, fresh_locals);
+                }
+                AssignTarget::Index { object, index } => {
+                    collect_expr_invalidated_vars(object, fresh_locals);
+                    collect_expr_invalidated_vars(index, fresh_locals);
+                }
+            }
+        }
+        Expr::Member { object, .. } => collect_expr_invalidated_vars(object, fresh_locals),
+        Expr::Index { object, index } => {
+            collect_expr_invalidated_vars(object, fresh_locals);
+            collect_expr_invalidated_vars(index, fresh_locals);
+        }
+        Expr::Call { callee, args } => {
+            collect_expr_invalidated_vars(callee, fresh_locals);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => {
+                        collect_expr_invalidated_vars(e, fresh_locals);
+                    }
+                }
+            }
+        }
+        Expr::OptionalChain { base, ops } => {
+            collect_expr_invalidated_vars(base, fresh_locals);
+            for op in ops {
+                match op {
+                    ChainOp::Member { .. } => {}
+                    ChainOp::Index { index, .. } => {
+                        collect_expr_invalidated_vars(index, fresh_locals);
+                    }
+                    ChainOp::Call { args, .. } => {
+                        for a in args {
+                            match a {
+                                CallArg::Expr(e) | CallArg::Spread(e) => {
+                                    collect_expr_invalidated_vars(e, fresh_locals);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Function(f) => {
+            for p in &f.params {
+                if let Some(d) = &p.default {
+                    collect_expr_invalidated_vars(d, fresh_locals);
+                }
+                collect_pattern_invalidated_vars(&p.pattern, fresh_locals);
+            }
+            match &f.body {
+                FunctionBody::Block(stmts) => {
+                    for s in stmts {
+                        collect_stmt_invalidated_vars(s, fresh_locals);
+                    }
+                }
+                FunctionBody::Expr(e) => collect_expr_invalidated_vars(e, fresh_locals),
+            }
+        }
+        Expr::Sequence(items) => {
+            for e in items {
+                collect_expr_invalidated_vars(e, fresh_locals);
+            }
+        }
     }
 }

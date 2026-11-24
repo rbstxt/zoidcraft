@@ -390,8 +390,10 @@ impl Tick {
         if fps_num == 0 || fps_den == 0 {
             return None;
         }
-        let num = i128::from(frame) * i128::from(TICKS_PER_SECOND) * i128::from(fps_den);
-        let ticks = div_round_i128(num, i128::from(fps_num));
+        let num = i128::from(frame)
+            .checked_mul(i128::from(TICKS_PER_SECOND))?
+            .checked_mul(i128::from(fps_den))?;
+        let ticks = checked_div_round_i128(num, i128::from(fps_num))?;
         i64::try_from(ticks).ok().map(Self)
     }
 
@@ -482,7 +484,7 @@ impl Div<i64> for Tick {
     type Output = Self;
 
     fn div(self, rhs: i64) -> Self::Output {
-        Self(self.0 / rhs)
+        Self(self.0.saturating_div(rhs))
     }
 }
 
@@ -499,6 +501,19 @@ const fn div_round_i128(num: i128, den: i128) -> i128 {
     } else {
         (num - half) / den
     }
+}
+
+fn checked_div_round_i128(num: i128, den: i128) -> Option<i128> {
+    if den <= 0 {
+        return None;
+    }
+    let half = den / 2;
+    let rounded = if num >= 0 {
+        num.checked_add(half)?
+    } else {
+        num.checked_sub(half)?
+    };
+    Some(rounded / den)
 }
 
 /// CM3 timeline timecode display format (cycled modulo 3 on right-click).
@@ -663,7 +678,14 @@ fn parse_hms_millis(input: &str, rate: FrameRate) -> Result<Frame, TimeError> {
         2 => raw_ms * 10,
         _ => raw_ms,
     };
-    let total_secs = (hours * 3_600 + mins * 60 + secs) as f64 + (ms as f64) / 1_000.0;
+    let whole_secs = hours
+        .checked_mul(3_600)
+        .and_then(|v| v.checked_add(mins * 60 + secs))
+        .ok_or_else(|| TimeError::InvalidTimecode {
+            input: input.to_string(),
+            reason: "timecode overflow",
+        })?;
+    let total_secs = whole_secs as f64 + (ms as f64) / 1_000.0;
     Ok(Frame::from_seconds(total_secs, rate))
 }
 
@@ -692,7 +714,15 @@ fn parse_smpte(input: &str, rate: FrameRate) -> Result<Frame, TimeError> {
             reason: "frame field must be < frame rate",
         });
     }
-    let total_frames = (hours * 3_600 + mins * 60 + secs) * fps + frames;
+    let total_frames = hours
+        .checked_mul(3_600)
+        .and_then(|v| v.checked_add(mins * 60 + secs))
+        .and_then(|v| v.checked_mul(fps))
+        .and_then(|v| v.checked_add(frames))
+        .ok_or_else(|| TimeError::InvalidTimecode {
+            input: input.to_string(),
+            reason: "timecode overflow",
+        })?;
     Ok(Frame::new(total_frames as f64))
 }
 
@@ -995,5 +1025,34 @@ mod tests {
         // Edge cases: 0 and negative.
         assert_eq!(sr.total_samples(Frame::ZERO, FrameRate::FPS_30), 0);
         assert_eq!(sr.total_samples(Frame::new(-10.0), FrameRate::FPS_30), 0);
+    }
+
+    #[test]
+    fn overflow_guards_for_timecode_parsing_and_tick_math() {
+        // Bug 1: huge hours must return Err instead of panicking or wrapping.
+        let r120 = FrameRate::FPS_120;
+        assert!(
+            TimeFormat::HmsMillis
+                .parse("9999999999999999:00:00.000", r120)
+                .is_err()
+        );
+        assert!(
+            TimeFormat::Smpte
+                .parse("9999999999999999:00:00:00", r120)
+                .is_err()
+        );
+        assert!(
+            TimeFormat::Smpte
+                .parse("42700796466921:00:00:00", r120)
+                .is_err()
+        );
+
+        // Bug 2: i128 overflow in Tick::from_rational_frame returns None.
+        assert_eq!(Tick::from_rational_frame(i64::MAX, 1, u32::MAX), None);
+        assert_eq!(Tick::from_rational_frame(i64::MIN, 1, u32::MAX), None);
+        assert_eq!(Tick::from_rational_frame(i64::MAX, 24_000, 1_001), None);
+
+        // Bug 3: Tick(i64::MIN) / -1 saturates instead of panicking.
+        assert_eq!(Tick::new(i64::MIN) / -1, Tick::new(i64::MAX));
     }
 }

@@ -44,15 +44,19 @@ impl WaveformPeaks {
             };
         }
 
-        let samples_per_bucket = (buffer.sample_rate / points_per_sec).max(1) as usize;
-        let bucket_count = total_frames.div_ceil(samples_per_bucket);
+        let sr = f64::from(buffer.sample_rate);
+        let pps = f64::from(points_per_sec);
+        let bucket_count = (((total_frames as f64) * pps) / sr).ceil().max(1.0) as usize;
         let mut min_peaks = Vec::with_capacity(bucket_count);
         let mut max_peaks = Vec::with_capacity(bucket_count);
         let inv_ch = 1.0_f32 / ch as f32;
 
         for bucket_idx in 0..bucket_count {
-            let start = bucket_idx * samples_per_bucket;
-            let end = (start + samples_per_bucket).min(total_frames);
+            let start = (((bucket_idx as f64) * sr / pps).floor() as usize).min(total_frames - 1);
+            let end = ((((bucket_idx + 1) as f64) * sr / pps)
+                .floor()
+                .max((start + 1) as f64) as usize)
+                .min(total_frames);
             let mut min_avg = 1.0_f32;
             let mut max_avg = -1.0_f32;
 
@@ -93,31 +97,49 @@ impl WaveformPeaks {
         media_end_sec: f64,
         width_px: usize,
     ) -> Vec<WaveformColumn> {
-        if width_px == 0 || self.is_empty() || self.points_per_sec == 0 {
+        if !media_start_sec.is_finite()
+            || !media_end_sec.is_finite()
+            || width_px == 0
+            || self.is_empty()
+            || self.points_per_sec == 0
+        {
             return Vec::new();
         }
 
         let pps = f64::from(self.points_per_sec);
-        let base_idx = (media_start_sec * pps).floor();
-        let span_buckets = ((media_end_sec - media_start_sec) * pps).floor();
-        let step = span_buckets / width_px as f64;
-        let scan_count = step.abs().ceil().max(1.0) as usize;
-        let len = self.len() as isize;
+        let len = self.len();
+        let len_f = len as f64;
+        let width_f = width_px as f64;
+        let span_sec = media_end_sec - media_start_sec;
+        let col_time = |frac: f64| -> f64 {
+            if span_sec.is_finite() {
+                media_start_sec + span_sec * frac
+            } else {
+                media_start_sec * (1.0 - frac) + media_end_sec * frac
+            }
+        };
 
         let mut cols = Vec::with_capacity(width_px);
         for x in 0..width_px {
-            let start_idx = (step * x as f64).floor() as isize + base_idx as isize;
+            let b0 = col_time(x as f64 / width_f) * pps;
+            let b1 = col_time((x + 1) as f64 / width_f) * pps;
+            let b_lo = b0.min(b1);
+            let b_hi = b0.max(b1);
+
             let mut hi: i8 = 0;
             let mut lo: i8 = 0;
 
-            for p in 0..scan_count {
-                let idx = if step >= 0.0 {
-                    start_idx + p as isize
-                } else {
-                    start_idx - p as isize
-                };
-                if idx >= 0 && idx < len {
-                    let u = idx as usize;
+            if !b_lo.is_nan()
+                && !b_hi.is_nan()
+                && b_lo < len_f
+                && (b_hi > 0.0 || (b_hi == 0.0 && b_lo == 0.0))
+            {
+                let start = (b_lo.floor().max(0.0) as usize).min(len);
+                let mut end = (b_hi.ceil().clamp(0.0, len_f) as usize).min(len);
+                if end <= start && start < len {
+                    end = (start + 1).min(len);
+                }
+                for u in start..end {
                     if self.max_peaks[u] > hi {
                         hi = self.max_peaks[u];
                     }
@@ -216,5 +238,53 @@ mod tests {
             assert!(col.max_i8 >= 120);
             assert!(col.min_i8 <= -120);
         }
+    }
+
+    #[test]
+    fn waveform_peaks_44100_exact_bucket_count_no_drift() {
+        let sr = 44_100_u32;
+        let duration_secs = 180_usize;
+        let total_frames = (sr as usize) * duration_secs;
+        let buf = AudioBuffer {
+            sample_rate: sr,
+            channels: 1,
+            samples_interleaved_f32: vec![0.25_f32; total_frames],
+        };
+
+        let peaks = WaveformPeaks::from_audio_buffer(&buf);
+        // Exact 180s * 200 pts/sec = 36,000 buckets with zero drift.
+        assert_eq!(peaks.len(), duration_secs * DEFAULT_POINTS_PER_SEC as usize);
+    }
+
+    #[test]
+    fn sample_columns_handles_non_finite_and_extreme_bounds() {
+        let sr = STANDARD_SAMPLE_RATE;
+        let mut samples = vec![0.0_f32; sr as usize];
+        for sample in &mut samples[(sr as usize / 2)..] {
+            *sample = 0.75;
+        }
+        let buf = AudioBuffer {
+            sample_rate: sr,
+            channels: 1,
+            samples_interleaved_f32: samples,
+        };
+        let peaks = WaveformPeaks::from_audio_buffer(&buf);
+
+        assert!(peaks.sample_columns(f64::NAN, 1.0, 100).is_empty());
+        assert!(peaks.sample_columns(0.0, f64::INFINITY, 100).is_empty());
+        assert!(peaks.sample_columns(f64::NEG_INFINITY, 1.0, 100).is_empty());
+
+        let far_out = peaks.sample_columns(1e20, 1e20 + 1.0, 16);
+        assert_eq!(far_out.len(), 16);
+        assert!(far_out.iter().all(|c| c.amplitude_u8 == 0));
+
+        let huge_span = peaks.sample_columns(-1e20, 1e20, 16);
+        assert_eq!(huge_span.len(), 16);
+
+        // Reverse sampling mirrors quiet/loud halves cleanly.
+        let rev = peaks.sample_columns(1.0, 0.0, 100);
+        assert_eq!(rev.len(), 100);
+        assert!(rev[10].max_i8 >= 90);
+        assert_eq!(rev[90].amplitude_u8, 0);
     }
 }

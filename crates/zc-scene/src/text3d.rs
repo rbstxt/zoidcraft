@@ -1,4 +1,4 @@
-use std::f32::consts::{FRAC_PI_2, TAU};
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use lyon_tessellation::math::point;
 use lyon_tessellation::path::Path;
@@ -54,12 +54,12 @@ impl TextAlignMode {
         let t = -0.5 * (b_min + b_max);
         match self {
             Self::Center => t,
-            Self::Left => Vec3::new(0.0, t.y, t.z),
-            Self::Right => Vec3::new(2.0 * t.x, t.y, t.z),
-            Self::Top => Vec3::new(t.x, 2.0 * t.y, t.z),
-            Self::Bottom => Vec3::new(t.x, 0.0, t.z),
-            Self::Front => Vec3::new(t.x, t.y, 2.0 * t.z),
-            Self::Back => Vec3::new(t.x, t.y, 0.0),
+            Self::Left => Vec3::new(-b_min.x, t.y, t.z),
+            Self::Right => Vec3::new(-b_max.x, t.y, t.z),
+            Self::Top => Vec3::new(t.x, -b_max.y, t.z),
+            Self::Bottom => Vec3::new(t.x, -b_min.y, t.z),
+            Self::Front => Vec3::new(t.x, t.y, -b_max.z),
+            Self::Back => Vec3::new(t.x, t.y, -b_min.z),
         }
     }
 }
@@ -268,7 +268,7 @@ pub fn build_text3d_mesh(
             GlyphContourCollector::new(scale, Vec2::new(pen_x, pen_y), params.curve_segments);
         face.outline_glyph(gid, &mut collector);
         collector.finish_current();
-        all_contours.extend(collector.contours);
+        all_contours.extend(clean_and_orient_contours(&collector.contours));
 
         let advance = face
             .glyph_hor_advance(gid)
@@ -277,7 +277,7 @@ pub fn build_text3d_mesh(
         prev_glyph = Some(gid);
     }
 
-    extrude_contours(&all_contours, params)
+    extrude_oriented_contours(&all_contours, params)
 }
 
 /// Builds a 3D extruded & beveled text mesh using the built-in geometric vector fallback font.
@@ -305,20 +305,24 @@ pub fn build_fallback_text_mesh(params: &Text3DParams) -> MeshData {
         if ch == '\r' {
             continue;
         }
-        let (glyph_contours, advance_norm) = fallback_glyph_contours(ch);
-        for loop_pts in glyph_contours {
+        let (glyph_contours, advance_norm) = fallback_glyph_contours(ch, params.curve_segments);
+        for (loop_pts, is_hole) in glyph_contours {
             let scaled: Vec<Vec2> = loop_pts
                 .into_iter()
                 .map(|p| Vec2::new(pen_x + p.x * h, pen_y + p.y * h))
                 .collect();
-            if scaled.len() >= 3 {
-                contours.push(scaled);
+            if let Some(mut cleaned) = clean_contour_points(&scaled) {
+                let area = signed_area_2d(&cleaned);
+                if (!is_hole && area < 0.0) || (is_hole && area > 0.0) {
+                    cleaned.reverse();
+                }
+                contours.push(cleaned);
             }
         }
         pen_x += advance_norm * h + params.letter_spacing;
     }
 
-    extrude_contours(&contours, params).unwrap_or_else(|_| MeshData::empty())
+    extrude_oriented_contours(&contours, params).unwrap_or_else(|_| MeshData::empty())
 }
 
 /// Extrudes and optionally bevels a set of closed 2D contours into a `MeshData`.
@@ -330,6 +334,13 @@ pub fn extrude_contours(
     params: &Text3DParams,
 ) -> Result<MeshData, Text3DError> {
     let cleaned = clean_and_orient_contours(raw_contours);
+    extrude_oriented_contours(&cleaned, params)
+}
+
+fn extrude_oriented_contours(
+    cleaned: &[Vec<Vec2>],
+    params: &Text3DParams,
+) -> Result<MeshData, Text3DError> {
     if cleaned.is_empty() {
         return Ok(MeshData::empty());
     }
@@ -338,7 +349,7 @@ pub fn extrude_contours(
     let mut max_x = f32::NEG_INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_y = f32::NEG_INFINITY;
-    for contour in &cleaned {
+    for contour in cleaned {
         for &p in contour {
             min_x = min_x.min(p.x);
             max_x = max_x.max(p.x);
@@ -366,7 +377,7 @@ pub fn extrude_contours(
 
     // Tessellate 2D contours via lyon_tessellation
     let mut path_builder = Path::builder();
-    for contour in &cleaned {
+    for contour in cleaned {
         if let Some((&first, rest)) = contour.split_first() {
             path_builder.begin(point(first.x, first.y));
             for &p in rest {
@@ -489,7 +500,7 @@ pub fn extrude_contours(
 
     // Side walls & bevel strips (material_slot = 1)
     if rings.len() >= 2 {
-        for contour in &cleaned {
+        for contour in cleaned {
             emit_contour_walls(
                 contour,
                 &rings,
@@ -641,34 +652,45 @@ fn emit_contour_walls(
     }
 }
 
+fn clean_contour_points(raw: &[Vec2]) -> Option<Vec<Vec2>> {
+    let mut pts: Vec<Vec2> = Vec::with_capacity(raw.len());
+    for &p in raw {
+        if let Some(&last) = pts.last()
+            && p.distance_squared(last) <= 1e-10
+        {
+            continue;
+        }
+        pts.push(p);
+    }
+    while pts.len() >= 2 && pts[0].distance_squared(*pts.last().unwrap_or(&pts[0])) <= 1e-10 {
+        pts.pop();
+    }
+    if pts.len() >= 3 && signed_area_2d(&pts).abs() > 1e-8 {
+        Some(pts)
+    } else {
+        None
+    }
+}
+
 /// Removes degenerate vertices/loops and normalizes winding: outer contours CCW, holes CW.
 fn clean_and_orient_contours(raw_contours: &[Vec<Vec2>]) -> Vec<Vec<Vec2>> {
-    let mut cleaned: Vec<Vec<Vec2>> = Vec::new();
-    for raw in raw_contours {
-        let mut pts: Vec<Vec2> = Vec::with_capacity(raw.len());
-        for &p in raw {
-            if let Some(&last) = pts.last()
-                && p.distance_squared(last) <= 1e-10
-            {
-                continue;
-            }
-            pts.push(p);
-        }
-        while pts.len() >= 2 && pts[0].distance_squared(*pts.last().unwrap_or(&pts[0])) <= 1e-10 {
-            pts.pop();
-        }
-        if pts.len() >= 3 && signed_area_2d(&pts).abs() > 1e-8 {
-            cleaned.push(pts);
-        }
-    }
+    let mut cleaned: Vec<Vec<Vec2>> = raw_contours
+        .iter()
+        .filter_map(|raw| clean_contour_points(raw))
+        .collect();
 
     let count = cleaned.len();
+    let abs_areas: Vec<f32> = cleaned.iter().map(|c| signed_area_2d(c).abs()).collect();
+    let interior_pts: Vec<Vec2> = cleaned
+        .iter()
+        .map(|c| strictly_interior_point_2d(c))
+        .collect();
     let mut depths = vec![0_usize; count];
     for i in 0..count {
-        let sample = cleaned[i][0];
         let mut depth = 0_usize;
         for (j, other) in cleaned.iter().enumerate() {
-            if i != j && point_in_polygon_2d(sample, other) {
+            if i != j && abs_areas[j] > abs_areas[i] && point_in_polygon_2d(interior_pts[i], other)
+            {
                 depth += 1;
             }
         }
@@ -684,6 +706,86 @@ fn clean_and_orient_contours(raw_contours: &[Vec<Vec2>]) -> Vec<Vec<Vec2>> {
     }
 
     cleaned
+}
+
+fn cross_2d(a: Vec2, b: Vec2, c: Vec2) -> f32 {
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+fn point_in_oriented_tri_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2, sign: f32) -> bool {
+    let c1 = cross_2d(a, b, p) * sign;
+    let c2 = cross_2d(b, c, p) * sign;
+    let c3 = cross_2d(c, a, p) * sign;
+    c1 >= -1e-6 && c2 >= -1e-6 && c3 >= -1e-6
+}
+
+/// Computes a point guaranteed to lie strictly inside a simple 2D polygon by finding
+/// the largest convex ear triangle and returning its centroid (with a convex-bisector
+/// fallback for degenerate contours).
+fn strictly_interior_point_2d(poly: &[Vec2]) -> Vec2 {
+    let n = poly.len();
+    if n < 3 {
+        return poly.first().copied().unwrap_or(Vec2::ZERO);
+    }
+
+    let area = signed_area_2d(poly);
+    let sign = if area >= 0.0 { 1.0_f32 } else { -1.0_f32 };
+
+    let mut best_ear: Option<(f32, Vec2)> = None;
+    let mut best_convex_fallback: Option<(f32, Vec2)> = None;
+
+    for i in 0..n {
+        let prev = (i + n - 1) % n;
+        let next = (i + 1) % n;
+        let a = poly[prev];
+        let b = poly[i];
+        let c = poly[next];
+        let oriented_area2 = cross_2d(a, b, c) * sign;
+        if oriented_area2 <= 1e-8 {
+            continue;
+        }
+
+        let mut closest_intruder: Option<(f32, Vec2)> = None;
+        for (k, &p) in poly.iter().enumerate() {
+            if k == prev || k == i || k == next {
+                continue;
+            }
+            if p.distance_squared(a) <= 1e-10
+                || p.distance_squared(b) <= 1e-10
+                || p.distance_squared(c) <= 1e-10
+            {
+                continue;
+            }
+            if point_in_oriented_tri_2d(p, a, b, c, sign) {
+                let d2 = b.distance_squared(p);
+                if closest_intruder.is_none_or(|(best_d2, _)| d2 < best_d2) {
+                    closest_intruder = Some((d2, p));
+                }
+            }
+        }
+
+        if let Some((_, q)) = closest_intruder {
+            let mid = (b + q) * 0.5;
+            if best_convex_fallback.is_none_or(|(best_a, _)| oriented_area2 > best_a) {
+                best_convex_fallback = Some((oriented_area2, mid));
+            }
+        } else {
+            let centroid = (a + b + c) / 3.0;
+            if best_ear.is_none_or(|(best_a, _)| oriented_area2 > best_a) {
+                best_ear = Some((oriented_area2, centroid));
+            }
+        }
+    }
+
+    if let Some((_, pt)) = best_ear {
+        return pt;
+    }
+    if let Some((_, pt)) = best_convex_fallback {
+        return pt;
+    }
+
+    let sum = poly.iter().copied().fold(Vec2::ZERO, |acc, p| acc + p);
+    sum / n as f32
 }
 
 fn signed_area_2d(pts: &[Vec2]) -> f32 {
@@ -721,7 +823,16 @@ fn point_in_polygon_2d(p: Vec2, poly: &[Vec2]) -> bool {
 // ---------------------------------------------------------------------------
 
 fn stroke_polyline(pts: &[(f32, f32)], half_w: f32) -> Vec<Vec2> {
-    let vecs: Vec<Vec2> = pts.iter().map(|&(x, y)| Vec2::new(x, y)).collect();
+    let mut vecs: Vec<Vec2> = Vec::with_capacity(pts.len());
+    for &(x, y) in pts {
+        let p = Vec2::new(x, y);
+        if vecs
+            .last()
+            .is_none_or(|&last| p.distance_squared(last) > 1e-8)
+        {
+            vecs.push(p);
+        }
+    }
     let n = vecs.len();
     if n < 2 {
         return Vec::new();
@@ -760,11 +871,26 @@ fn stroke_polyline(pts: &[(f32, f32)], half_w: f32) -> Vec<Vec2> {
     let mut poly = Vec::with_capacity(n * 2);
     poly.extend(right_side);
     poly.extend(left_side.into_iter().rev());
+    if signed_area_2d(&poly) < 0.0 {
+        poly.reverse();
+    }
     poly
 }
 
-fn closed_ring_glyph(pts: &[(f32, f32)], half_w: f32) -> Vec<Vec<Vec2>> {
-    let mut ring: Vec<Vec2> = pts.iter().map(|&(x, y)| Vec2::new(x, y)).collect();
+fn closed_ring_glyph(pts: &[(f32, f32)], half_w: f32) -> Vec<(Vec<Vec2>, bool)> {
+    let mut ring: Vec<Vec2> = Vec::with_capacity(pts.len());
+    for &(x, y) in pts {
+        let p = Vec2::new(x, y);
+        if ring
+            .last()
+            .is_none_or(|&last| p.distance_squared(last) > 1e-8)
+        {
+            ring.push(p);
+        }
+    }
+    while ring.len() >= 2 && ring[0].distance_squared(*ring.last().unwrap_or(&ring[0])) <= 1e-8 {
+        ring.pop();
+    }
     let n = ring.len();
     if n < 3 {
         return Vec::new();
@@ -795,8 +921,33 @@ fn closed_ring_glyph(pts: &[(f32, f32)], half_w: f32) -> Vec<Vec<Vec2>> {
         outer.push(ring[i] + miter);
         inner.push(ring[i] - miter);
     }
+    if signed_area_2d(&outer) < 0.0 {
+        outer.reverse();
+    }
     inner.reverse();
-    vec![outer, inner]
+    if signed_area_2d(&inner) > 0.0 {
+        inner.reverse();
+    }
+    vec![(outer, false), (inner, true)]
+}
+
+fn arc_points(
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    start_rad: f32,
+    end_rad: f32,
+    segs: usize,
+) -> Vec<(f32, f32)> {
+    let steps = segs.max(2);
+    (0..=steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32;
+            let a = start_rad + (end_rad - start_rad) * t;
+            (cx + rx * a.cos(), cy + ry * a.sin())
+        })
+        .collect()
 }
 
 fn ellipse_points(cx: f32, cy: f32, rx: f32, ry: f32, segs: usize) -> Vec<(f32, f32)> {
@@ -808,789 +959,893 @@ fn ellipse_points(cx: f32, cy: f32, rx: f32, ry: f32, segs: usize) -> Vec<(f32, 
         .collect()
 }
 
-fn dot_contour(cx: f32, cy: f32, r: f32) -> Vec<Vec2> {
-    (0..8)
+fn dot_contour(cx: f32, cy: f32, r: f32, segs: usize) -> (Vec<Vec2>, bool) {
+    let n = segs.max(8);
+    let pts = (0..n)
         .map(|i| {
-            let a = (i as f32 / 8.0) * TAU;
+            let a = (i as f32 / n as f32) * TAU;
             Vec2::new(cx + r * a.cos(), cy + r * a.sin())
         })
-        .collect()
+        .collect();
+    (pts, false)
 }
 
-fn fallback_glyph_contours(ch: char) -> (Vec<Vec<Vec2>>, f32) {
+fn push_stroke(out: &mut Vec<(Vec<Vec2>, bool)>, pts: &[(f32, f32)], hw: f32) {
+    let p = stroke_polyline(pts, hw);
+    if p.len() >= 3 {
+        out.push((p, false));
+    }
+}
+
+fn push_strokes(out: &mut Vec<(Vec<Vec2>, bool)>, strokes: &[&[(f32, f32)]], hw: f32) {
+    for s in strokes {
+        push_stroke(out, s, hw);
+    }
+}
+
+fn fallback_glyph_contours(ch: char, curve_segments: u32) -> (Vec<(Vec<Vec2>, bool)>, f32) {
     let hw = 0.068_f32;
-    let mut out: Vec<Vec<Vec2>> = Vec::new();
-    let mut stroke_polys: Vec<Vec<Vec2>> = Vec::new();
-    let mut add_strokes = |strokes: &[&[(f32, f32)]]| {
-        for s in strokes {
-            let p = stroke_polyline(s, hw);
-            if p.len() >= 3 {
-                stroke_polys.push(p);
-            }
-        }
-    };
+    let base_segs = (curve_segments as usize).clamp(4, 16);
+    let quarter_segs = base_segs.max(8);
+    let semi_segs = (base_segs * 2).max(12);
+    let open_segs = (base_segs * 4).clamp(20, 48);
+    let full_segs = (base_segs * 4).clamp(24, 64);
+    let small_segs = (base_segs * 3).clamp(16, 40);
+    let dot_segs = (base_segs * 3).clamp(16, 32);
+
+    let mut out: Vec<(Vec<Vec2>, bool)> = Vec::new();
+    let mut stroke_polys: Vec<(Vec<Vec2>, bool)> = Vec::new();
 
     let adv = match ch {
         ' ' => return (out, 0.36),
         'A' => {
-            add_strokes(&[
-                &[(0.06, 0.0), (0.31, 0.96), (0.56, 0.0)],
-                &[(0.15, 0.32), (0.47, 0.32)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.06, 0.0), (0.31, 0.96), (0.56, 0.0)],
+                    &[(0.15, 0.32), (0.47, 0.32)],
+                ],
+                hw,
+            );
             0.66
         }
         'B' => {
-            add_strokes(&[
-                &[(0.08, 0.0), (0.08, 0.96)],
-                &[
-                    (0.08, 0.96),
-                    (0.38, 0.96),
-                    (0.50, 0.85),
-                    (0.50, 0.62),
-                    (0.38, 0.50),
-                    (0.08, 0.50),
-                ],
-                &[
-                    (0.08, 0.50),
-                    (0.42, 0.50),
-                    (0.54, 0.38),
-                    (0.54, 0.14),
-                    (0.42, 0.04),
-                    (0.08, 0.04),
-                ],
-            ]);
+            push_stroke(&mut stroke_polys, &[(0.08, 0.04), (0.08, 0.96)], hw);
+            let mut top_bowl = vec![(0.08, 0.96), (0.28, 0.96)];
+            top_bowl.extend(arc_points(
+                0.28, 0.73, 0.22, 0.23, FRAC_PI_2, -FRAC_PI_2, semi_segs,
+            ));
+            top_bowl.push((0.08, 0.50));
+            push_stroke(&mut stroke_polys, &top_bowl, hw);
+
+            let mut bot_bowl = vec![(0.08, 0.50), (0.30, 0.50)];
+            bot_bowl.extend(arc_points(
+                0.30, 0.27, 0.24, 0.23, FRAC_PI_2, -FRAC_PI_2, semi_segs,
+            ));
+            bot_bowl.push((0.08, 0.04));
+            push_stroke(&mut stroke_polys, &bot_bowl, hw);
             0.66
         }
         'C' => {
-            add_strokes(&[&[
-                (0.54, 0.82),
-                (0.42, 0.95),
-                (0.20, 0.95),
-                (0.08, 0.80),
-                (0.08, 0.20),
-                (0.20, 0.05),
-                (0.42, 0.05),
-                (0.54, 0.18),
-            ]]);
+            let pts = arc_points(0.33, 0.50, 0.25, 0.44, 0.18 * PI, 1.82 * PI, open_segs);
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.66
         }
         'D' => {
-            let pts = [
-                (0.09, 0.07),
-                (0.36, 0.07),
-                (0.51, 0.22),
-                (0.51, 0.78),
-                (0.36, 0.93),
-                (0.09, 0.93),
-            ];
+            let mut pts = vec![(0.09, 0.07), (0.26, 0.07)];
+            pts.extend(arc_points(
+                0.26, 0.50, 0.25, 0.43, -FRAC_PI_2, FRAC_PI_2, semi_segs,
+            ));
+            pts.push((0.09, 0.93));
             out.extend(closed_ring_glyph(&pts, hw));
             0.66
         }
         'E' => {
-            add_strokes(&[
-                &[(0.52, 0.94), (0.10, 0.94), (0.10, 0.06), (0.52, 0.06)],
-                &[(0.10, 0.50), (0.44, 0.50)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.52, 0.94), (0.10, 0.94), (0.10, 0.06), (0.52, 0.06)],
+                    &[(0.10, 0.50), (0.44, 0.50)],
+                ],
+                hw,
+            );
             0.62
         }
         'F' => {
-            add_strokes(&[
-                &[(0.52, 0.94), (0.10, 0.94), (0.10, 0.0)],
-                &[(0.10, 0.50), (0.44, 0.50)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.52, 0.94), (0.10, 0.94), (0.10, 0.0)],
+                    &[(0.10, 0.50), (0.44, 0.50)],
+                ],
+                hw,
+            );
             0.60
         }
         'G' => {
-            add_strokes(&[&[
-                (0.54, 0.82),
-                (0.42, 0.95),
-                (0.20, 0.95),
-                (0.08, 0.80),
-                (0.08, 0.20),
-                (0.20, 0.05),
-                (0.44, 0.05),
-                (0.54, 0.18),
-                (0.54, 0.46),
-                (0.32, 0.46),
-            ]]);
+            let pts = arc_points(0.33, 0.50, 0.25, 0.44, 0.18 * PI, 1.84 * PI, open_segs);
+            push_stroke(&mut stroke_polys, &pts, hw);
+            push_stroke(
+                &mut stroke_polys,
+                &[(0.54, 0.18), (0.54, 0.46), (0.32, 0.46)],
+                hw,
+            );
             0.66
         }
         'H' => {
-            add_strokes(&[
-                &[(0.10, 0.0), (0.10, 1.0)],
-                &[(0.52, 0.0), (0.52, 1.0)],
-                &[(0.10, 0.50), (0.52, 0.50)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.10, 0.0), (0.10, 1.0)],
+                    &[(0.52, 0.0), (0.52, 1.0)],
+                    &[(0.10, 0.50), (0.52, 0.50)],
+                ],
+                hw,
+            );
             0.66
         }
         'I' => {
-            add_strokes(&[
-                &[(0.20, 0.0), (0.20, 1.0)],
-                &[(0.06, 0.94), (0.34, 0.94)],
-                &[(0.06, 0.06), (0.34, 0.06)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.20, 0.0), (0.20, 1.0)],
+                    &[(0.06, 0.94), (0.34, 0.94)],
+                    &[(0.06, 0.06), (0.34, 0.06)],
+                ],
+                hw,
+            );
             0.44
         }
         'J' => {
-            add_strokes(&[&[
-                (0.46, 1.0),
-                (0.46, 0.20),
-                (0.34, 0.06),
-                (0.16, 0.06),
-                (0.06, 0.18),
-            ]]);
+            let mut pts = vec![(0.46, 1.0), (0.46, 0.26)];
+            pts.extend(arc_points(0.26, 0.26, 0.20, 0.20, 0.0, -PI, semi_segs));
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.58
         }
         'K' => {
-            add_strokes(&[
-                &[(0.10, 0.0), (0.10, 1.0)],
-                &[(0.54, 1.0), (0.12, 0.46), (0.56, 0.0)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.10, 0.0), (0.10, 1.0)],
+                    &[(0.54, 1.0), (0.12, 0.46), (0.56, 0.0)],
+                ],
+                hw,
+            );
             0.66
         }
         'L' => {
-            add_strokes(&[&[(0.10, 1.0), (0.10, 0.06), (0.52, 0.06)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.10, 1.0), (0.10, 0.06), (0.52, 0.06)]],
+                hw,
+            );
             0.60
         }
         'M' => {
-            add_strokes(&[&[
-                (0.08, 0.0),
-                (0.08, 0.96),
-                (0.36, 0.34),
-                (0.64, 0.96),
-                (0.64, 0.0),
-            ]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[
+                    (0.08, 0.0),
+                    (0.08, 0.96),
+                    (0.36, 0.34),
+                    (0.64, 0.96),
+                    (0.64, 0.0),
+                ]],
+                hw,
+            );
             0.76
         }
         'N' => {
-            add_strokes(&[&[(0.10, 0.0), (0.10, 0.96), (0.52, 0.04), (0.52, 1.0)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.10, 0.0), (0.10, 0.96), (0.52, 0.04), (0.52, 1.0)]],
+                hw,
+            );
             0.66
         }
         'O' => {
-            let pts = ellipse_points(0.32, 0.50, 0.24, 0.44, 14);
+            let pts = ellipse_points(0.32, 0.50, 0.24, 0.44, full_segs);
             out.extend(closed_ring_glyph(&pts, hw));
             0.68
         }
         'P' => {
-            add_strokes(&[&[
-                (0.10, 0.0),
-                (0.10, 0.94),
-                (0.40, 0.94),
-                (0.52, 0.82),
-                (0.52, 0.58),
-                (0.40, 0.46),
-                (0.10, 0.46),
-            ]]);
+            push_stroke(&mut stroke_polys, &[(0.10, 0.0), (0.10, 0.94)], hw);
+            let mut bowl = vec![(0.10, 0.94), (0.30, 0.94)];
+            bowl.extend(arc_points(
+                0.30, 0.70, 0.22, 0.24, FRAC_PI_2, -FRAC_PI_2, semi_segs,
+            ));
+            bowl.push((0.10, 0.46));
+            push_stroke(&mut stroke_polys, &bowl, hw);
             0.64
         }
         'Q' => {
-            let pts = ellipse_points(0.32, 0.50, 0.24, 0.44, 14);
+            let pts = ellipse_points(0.32, 0.50, 0.24, 0.44, full_segs);
             out.extend(closed_ring_glyph(&pts, hw));
-            add_strokes(&[&[(0.38, 0.24), (0.58, 0.0)]]);
+            push_stroke(&mut stroke_polys, &[(0.38, 0.24), (0.58, 0.0)], hw);
             0.68
         }
         'R' => {
-            add_strokes(&[
-                &[
-                    (0.10, 0.0),
-                    (0.10, 0.94),
-                    (0.40, 0.94),
-                    (0.52, 0.82),
-                    (0.52, 0.60),
-                    (0.40, 0.48),
-                    (0.10, 0.48),
-                ],
-                &[(0.34, 0.48), (0.54, 0.0)],
-            ]);
+            push_stroke(&mut stroke_polys, &[(0.10, 0.0), (0.10, 0.94)], hw);
+            let mut bowl = vec![(0.10, 0.94), (0.30, 0.94)];
+            bowl.extend(arc_points(
+                0.30, 0.71, 0.22, 0.23, FRAC_PI_2, -FRAC_PI_2, semi_segs,
+            ));
+            bowl.push((0.10, 0.48));
+            push_stroke(&mut stroke_polys, &bowl, hw);
+            push_stroke(&mut stroke_polys, &[(0.34, 0.48), (0.54, 0.0)], hw);
             0.66
         }
         'S' => {
-            add_strokes(&[&[
-                (0.52, 0.84),
-                (0.40, 0.95),
-                (0.18, 0.95),
-                (0.08, 0.82),
-                (0.08, 0.64),
-                (0.20, 0.54),
-                (0.42, 0.46),
-                (0.54, 0.34),
-                (0.54, 0.16),
-                (0.42, 0.05),
-                (0.18, 0.05),
-                (0.06, 0.16),
-            ]]);
+            let mut pts = arc_points(0.30, 0.72, 0.22, 0.22, 0.15 * PI, 1.5 * PI, semi_segs);
+            pts.extend(arc_points(
+                0.30,
+                0.28,
+                0.22,
+                0.22,
+                0.5 * PI,
+                -0.85 * PI,
+                semi_segs,
+            ));
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.64
         }
         'T' => {
-            add_strokes(&[&[(0.04, 0.94), (0.56, 0.94)], &[(0.30, 0.94), (0.30, 0.0)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.04, 0.94), (0.56, 0.94)], &[(0.30, 0.94), (0.30, 0.0)]],
+                hw,
+            );
             0.62
         }
         'U' => {
-            add_strokes(&[&[
-                (0.10, 1.0),
-                (0.10, 0.20),
-                (0.22, 0.06),
-                (0.42, 0.06),
-                (0.54, 0.20),
-                (0.54, 1.0),
-            ]]);
+            let mut pts = vec![(0.10, 1.0), (0.10, 0.28)];
+            pts.extend(arc_points(0.32, 0.28, 0.22, 0.22, PI, TAU, semi_segs));
+            pts.push((0.54, 1.0));
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.66
         }
         'V' => {
-            add_strokes(&[&[(0.06, 1.0), (0.31, 0.04), (0.56, 1.0)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.06, 1.0), (0.31, 0.04), (0.56, 1.0)]],
+                hw,
+            );
             0.66
         }
         'W' => {
-            add_strokes(&[&[
-                (0.06, 1.0),
-                (0.18, 0.04),
-                (0.36, 0.62),
-                (0.54, 0.04),
-                (0.66, 1.0),
-            ]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[
+                    (0.06, 1.0),
+                    (0.18, 0.04),
+                    (0.36, 0.62),
+                    (0.54, 0.04),
+                    (0.66, 1.0),
+                ]],
+                hw,
+            );
             0.76
         }
         'X' => {
-            add_strokes(&[&[(0.06, 0.0), (0.54, 1.0)], &[(0.06, 1.0), (0.54, 0.0)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.06, 0.0), (0.54, 1.0)], &[(0.06, 1.0), (0.54, 0.0)]],
+                hw,
+            );
             0.64
         }
         'Y' => {
-            add_strokes(&[
-                &[(0.06, 1.0), (0.30, 0.50), (0.54, 1.0)],
-                &[(0.30, 0.50), (0.30, 0.0)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.06, 1.0), (0.30, 0.50), (0.54, 1.0)],
+                    &[(0.30, 0.50), (0.30, 0.0)],
+                ],
+                hw,
+            );
             0.64
         }
         'Z' => {
-            add_strokes(&[&[(0.06, 0.94), (0.54, 0.94), (0.06, 0.06), (0.54, 0.06)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.06, 0.94), (0.54, 0.94), (0.06, 0.06), (0.54, 0.06)]],
+                hw,
+            );
             0.64
         }
         // Lowercase a-z
         'a' => {
-            add_strokes(&[
-                &[
-                    (0.10, 0.58),
-                    (0.24, 0.68),
-                    (0.42, 0.68),
-                    (0.48, 0.56),
-                    (0.48, 0.0),
-                ],
-                &[
-                    (0.48, 0.36),
-                    (0.18, 0.36),
-                    (0.08, 0.24),
-                    (0.08, 0.14),
-                    (0.18, 0.05),
-                    (0.46, 0.05),
-                ],
-            ]);
+            let mut s1 = arc_points(0.29, 0.49, 0.19, 0.19, 0.85 * PI, 0.0, quarter_segs);
+            s1.push((0.48, 0.0));
+            push_stroke(&mut stroke_polys, &s1, hw);
+
+            let mut s2 = vec![(0.48, 0.36), (0.24, 0.36)];
+            s2.extend(arc_points(
+                0.24,
+                0.205,
+                0.16,
+                0.155,
+                FRAC_PI_2,
+                1.5 * PI,
+                quarter_segs,
+            ));
+            s2.push((0.48, 0.05));
+            push_stroke(&mut stroke_polys, &s2, hw);
             0.60
         }
         'b' => {
-            let pts = ellipse_points(0.29, 0.34, 0.19, 0.29, 12);
+            let pts = ellipse_points(0.29, 0.34, 0.19, 0.29, full_segs);
             out.extend(closed_ring_glyph(&pts, hw * 0.92));
-            add_strokes(&[&[(0.10, 0.0), (0.10, 1.0)]]);
+            push_stroke(&mut stroke_polys, &[(0.10, 0.0), (0.10, 1.0)], hw);
             0.60
         }
         'c' => {
-            add_strokes(&[&[
-                (0.46, 0.56),
-                (0.36, 0.66),
-                (0.18, 0.66),
-                (0.08, 0.52),
-                (0.08, 0.18),
-                (0.18, 0.05),
-                (0.36, 0.05),
-                (0.46, 0.15),
-            ]]);
+            let pts = arc_points(0.29, 0.355, 0.21, 0.30, 0.20 * PI, 1.80 * PI, open_segs);
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.56
         }
         'd' => {
-            let pts = ellipse_points(0.28, 0.34, 0.19, 0.29, 12);
+            let pts = ellipse_points(0.28, 0.34, 0.19, 0.29, full_segs);
             out.extend(closed_ring_glyph(&pts, hw * 0.92));
-            add_strokes(&[&[(0.47, 0.0), (0.47, 1.0)]]);
+            push_stroke(&mut stroke_polys, &[(0.47, 0.0), (0.47, 1.0)], hw);
             0.60
         }
         'e' => {
-            add_strokes(&[&[
-                (0.08, 0.36),
-                (0.48, 0.36),
-                (0.48, 0.52),
-                (0.36, 0.66),
-                (0.18, 0.66),
-                (0.08, 0.52),
-                (0.08, 0.18),
-                (0.18, 0.05),
-                (0.44, 0.05),
-            ]]);
+            let bowl = arc_points(0.28, 0.355, 0.20, 0.295, 0.0, 1.78 * PI, open_segs);
+            push_stroke(&mut stroke_polys, &bowl, hw);
+            push_stroke(
+                &mut stroke_polys,
+                &[(0.08, 0.355), (0.48 + hw * 0.9, 0.355)],
+                hw,
+            );
             0.58
         }
         'f' => {
-            add_strokes(&[
-                &[(0.40, 0.95), (0.28, 0.95), (0.20, 0.84), (0.20, 0.0)],
-                &[(0.06, 0.64), (0.38, 0.64)],
-            ]);
+            let mut stem = arc_points(0.34, 0.81, 0.14, 0.14, 0.40 * PI, PI, quarter_segs);
+            stem.push((0.20, 0.0));
+            push_stroke(&mut stroke_polys, &stem, hw);
+            push_stroke(&mut stroke_polys, &[(0.06, 0.64), (0.38, 0.64)], hw);
             0.46
         }
         'g' => {
-            let pts = ellipse_points(0.28, 0.36, 0.19, 0.28, 12);
+            let pts = ellipse_points(0.28, 0.36, 0.19, 0.28, full_segs);
             out.extend(closed_ring_glyph(&pts, hw * 0.92));
-            add_strokes(&[&[(0.47, 0.66), (0.47, -0.10), (0.36, -0.20), (0.14, -0.20)]]);
+            let mut tail = vec![(0.47, 0.66), (0.47, -0.06)];
+            tail.extend(arc_points(
+                0.32,
+                -0.06,
+                0.15,
+                0.14,
+                0.0,
+                -0.85 * PI,
+                quarter_segs,
+            ));
+            push_stroke(&mut stroke_polys, &tail, hw);
             0.60
         }
         'h' => {
-            add_strokes(&[
-                &[(0.10, 0.0), (0.10, 1.0)],
-                &[
-                    (0.10, 0.52),
-                    (0.22, 0.66),
-                    (0.38, 0.66),
-                    (0.48, 0.52),
-                    (0.48, 0.0),
-                ],
-            ]);
+            push_stroke(&mut stroke_polys, &[(0.10, 0.0), (0.10, 1.0)], hw);
+            let mut arch = arc_points(0.29, 0.46, 0.19, 0.20, PI, 0.0, semi_segs);
+            arch.push((0.48, 0.0));
+            push_stroke(&mut stroke_polys, &arch, hw);
             0.60
         }
         'i' => {
-            add_strokes(&[&[(0.16, 0.0), (0.16, 0.66)]]);
-            out.push(dot_contour(0.16, 0.88, 0.07));
+            push_stroke(&mut stroke_polys, &[(0.16, 0.0), (0.16, 0.66)], hw);
+            out.push(dot_contour(0.16, 0.88, 0.07, dot_segs));
             0.34
         }
         'j' => {
-            add_strokes(&[&[(0.24, 0.66), (0.24, -0.10), (0.16, -0.20), (0.04, -0.20)]]);
-            out.push(dot_contour(0.24, 0.88, 0.07));
+            let mut stem = vec![(0.24, 0.66), (0.24, -0.06)];
+            stem.extend(arc_points(
+                0.10,
+                -0.06,
+                0.14,
+                0.14,
+                0.0,
+                -0.65 * PI,
+                quarter_segs,
+            ));
+            push_stroke(&mut stroke_polys, &stem, hw);
+            out.push(dot_contour(0.24, 0.88, 0.07, dot_segs));
             0.38
         }
         'k' => {
-            add_strokes(&[
-                &[(0.10, 0.0), (0.10, 1.0)],
-                &[(0.48, 0.66), (0.12, 0.30), (0.50, 0.0)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.10, 0.0), (0.10, 1.0)],
+                    &[(0.48, 0.66), (0.12, 0.30), (0.50, 0.0)],
+                ],
+                hw,
+            );
             0.58
         }
         'l' => {
-            add_strokes(&[&[(0.16, 0.0), (0.16, 1.0)]]);
+            push_stroke(&mut stroke_polys, &[(0.16, 0.0), (0.16, 1.0)], hw);
             0.34
         }
         'm' => {
-            add_strokes(&[
-                &[(0.08, 0.0), (0.08, 0.68)],
-                &[
-                    (0.08, 0.54),
-                    (0.20, 0.66),
-                    (0.30, 0.66),
-                    (0.38, 0.54),
-                    (0.38, 0.0),
-                ],
-                &[
-                    (0.38, 0.54),
-                    (0.50, 0.66),
-                    (0.60, 0.66),
-                    (0.68, 0.54),
-                    (0.68, 0.0),
-                ],
-            ]);
+            push_stroke(&mut stroke_polys, &[(0.08, 0.0), (0.08, 0.68)], hw);
+            let mut arch1 = arc_points(0.23, 0.50, 0.15, 0.16, PI, 0.0, quarter_segs);
+            arch1.push((0.38, 0.0));
+            push_stroke(&mut stroke_polys, &arch1, hw);
+            let mut arch2 = arc_points(0.53, 0.50, 0.15, 0.16, PI, 0.0, quarter_segs);
+            arch2.push((0.68, 0.0));
+            push_stroke(&mut stroke_polys, &arch2, hw);
             0.78
         }
         'n' => {
-            add_strokes(&[
-                &[(0.10, 0.0), (0.10, 0.68)],
-                &[
-                    (0.10, 0.52),
-                    (0.22, 0.66),
-                    (0.38, 0.66),
-                    (0.48, 0.52),
-                    (0.48, 0.0),
-                ],
-            ]);
+            push_stroke(&mut stroke_polys, &[(0.10, 0.0), (0.10, 0.68)], hw);
+            let mut arch = arc_points(0.29, 0.46, 0.19, 0.20, PI, 0.0, semi_segs);
+            arch.push((0.48, 0.0));
+            push_stroke(&mut stroke_polys, &arch, hw);
             0.60
         }
         'o' => {
-            let pts = ellipse_points(0.29, 0.36, 0.21, 0.30, 12);
+            let pts = ellipse_points(0.29, 0.36, 0.21, 0.30, full_segs);
             out.extend(closed_ring_glyph(&pts, hw * 0.92));
             0.60
         }
         'p' => {
-            let pts = ellipse_points(0.29, 0.36, 0.19, 0.29, 12);
+            let pts = ellipse_points(0.29, 0.36, 0.19, 0.29, full_segs);
             out.extend(closed_ring_glyph(&pts, hw * 0.92));
-            add_strokes(&[&[(0.10, -0.22), (0.10, 0.68)]]);
+            push_stroke(&mut stroke_polys, &[(0.10, -0.22), (0.10, 0.68)], hw);
             0.60
         }
         'q' => {
-            let pts = ellipse_points(0.28, 0.36, 0.19, 0.29, 12);
+            let pts = ellipse_points(0.28, 0.36, 0.19, 0.29, full_segs);
             out.extend(closed_ring_glyph(&pts, hw * 0.92));
-            add_strokes(&[&[(0.47, -0.22), (0.47, 0.68)]]);
+            push_stroke(&mut stroke_polys, &[(0.47, -0.22), (0.47, 0.68)], hw);
             0.60
         }
         'r' => {
-            add_strokes(&[
-                &[(0.10, 0.0), (0.10, 0.68)],
-                &[(0.10, 0.50), (0.22, 0.66), (0.40, 0.66)],
-            ]);
+            push_stroke(&mut stroke_polys, &[(0.10, 0.0), (0.10, 0.68)], hw);
+            let arch = arc_points(0.29, 0.47, 0.19, 0.19, PI, 0.35 * PI, quarter_segs);
+            push_stroke(&mut stroke_polys, &arch, hw);
             0.46
         }
         's' => {
-            add_strokes(&[&[
-                (0.46, 0.56),
-                (0.36, 0.66),
-                (0.16, 0.66),
-                (0.08, 0.56),
-                (0.08, 0.44),
-                (0.46, 0.28),
-                (0.46, 0.14),
-                (0.36, 0.05),
-                (0.14, 0.05),
-                (0.06, 0.14),
-            ]]);
+            let mut pts = arc_points(0.27, 0.505, 0.19, 0.155, 0.15 * PI, 1.5 * PI, semi_segs);
+            pts.extend(arc_points(
+                0.27,
+                0.20,
+                0.19,
+                0.15,
+                0.5 * PI,
+                -0.85 * PI,
+                semi_segs,
+            ));
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.56
         }
         't' => {
-            add_strokes(&[
-                &[(0.20, 0.90), (0.20, 0.14), (0.28, 0.06), (0.40, 0.06)],
-                &[(0.06, 0.64), (0.38, 0.64)],
-            ]);
+            let mut stem = vec![(0.20, 0.90), (0.20, 0.20)];
+            stem.extend(arc_points(
+                0.34,
+                0.20,
+                0.14,
+                0.14,
+                PI,
+                1.5 * PI,
+                quarter_segs,
+            ));
+            stem.push((0.42, 0.06));
+            push_stroke(&mut stroke_polys, &stem, hw);
+            push_stroke(&mut stroke_polys, &[(0.06, 0.64), (0.38, 0.64)], hw);
             0.46
         }
         'u' => {
-            add_strokes(&[
-                &[
-                    (0.10, 0.68),
-                    (0.10, 0.18),
-                    (0.20, 0.06),
-                    (0.36, 0.06),
-                    (0.48, 0.18),
-                ],
-                &[(0.48, 0.68), (0.48, 0.0)],
-            ]);
+            let mut bowl = vec![(0.10, 0.68), (0.10, 0.25)];
+            bowl.extend(arc_points(0.29, 0.25, 0.19, 0.19, PI, TAU, semi_segs));
+            push_stroke(&mut stroke_polys, &bowl, hw);
+            push_stroke(&mut stroke_polys, &[(0.48, 0.68), (0.48, 0.0)], hw);
             0.60
         }
         'v' => {
-            add_strokes(&[&[(0.06, 0.68), (0.28, 0.04), (0.50, 0.68)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.06, 0.68), (0.28, 0.04), (0.50, 0.68)]],
+                hw,
+            );
             0.58
         }
         'w' => {
-            add_strokes(&[&[
-                (0.06, 0.68),
-                (0.18, 0.04),
-                (0.34, 0.48),
-                (0.50, 0.04),
-                (0.62, 0.68),
-            ]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[
+                    (0.06, 0.68),
+                    (0.18, 0.04),
+                    (0.34, 0.48),
+                    (0.50, 0.04),
+                    (0.62, 0.68),
+                ]],
+                hw,
+            );
             0.70
         }
         'x' => {
-            add_strokes(&[&[(0.06, 0.0), (0.48, 0.68)], &[(0.06, 0.68), (0.48, 0.0)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.06, 0.0), (0.48, 0.68)], &[(0.06, 0.68), (0.48, 0.0)]],
+                hw,
+            );
             0.56
         }
         'y' => {
-            add_strokes(&[
-                &[(0.06, 0.68), (0.28, 0.10)],
-                &[(0.50, 0.68), (0.18, -0.22)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.06, 0.68), (0.28, 0.10)],
+                    &[(0.50, 0.68), (0.18, -0.22)],
+                ],
+                hw,
+            );
             0.58
         }
         'z' => {
-            add_strokes(&[&[(0.06, 0.64), (0.48, 0.64), (0.06, 0.06), (0.48, 0.06)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.06, 0.64), (0.48, 0.64), (0.06, 0.06), (0.48, 0.06)]],
+                hw,
+            );
             0.56
         }
         // Digits 0-9
         '0' => {
-            let pts = ellipse_points(0.30, 0.50, 0.22, 0.44, 14);
+            let pts = ellipse_points(0.30, 0.50, 0.22, 0.44, full_segs);
             out.extend(closed_ring_glyph(&pts, hw));
-            add_strokes(&[&[(0.16, 0.24), (0.44, 0.76)]]);
+            push_stroke(&mut stroke_polys, &[(0.16, 0.24), (0.44, 0.76)], hw);
             0.64
         }
         '1' => {
-            add_strokes(&[
-                &[(0.12, 0.78), (0.28, 0.94), (0.28, 0.0)],
-                &[(0.10, 0.06), (0.46, 0.06)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.12, 0.78), (0.28, 0.94), (0.28, 0.0)],
+                    &[(0.10, 0.06), (0.46, 0.06)],
+                ],
+                hw,
+            );
             0.56
         }
         '2' => {
-            add_strokes(&[&[
-                (0.08, 0.78),
-                (0.18, 0.94),
-                (0.42, 0.94),
-                (0.52, 0.80),
-                (0.52, 0.62),
-                (0.08, 0.06),
-                (0.54, 0.06),
-            ]]);
+            let mut pts = arc_points(0.30, 0.74, 0.21, 0.20, 0.92 * PI, -0.08 * PI, semi_segs);
+            pts.push((0.08, 0.06));
+            pts.push((0.54, 0.06));
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.64
         }
         '3' => {
-            add_strokes(&[
-                &[
-                    (0.08, 0.84),
-                    (0.20, 0.94),
-                    (0.42, 0.94),
-                    (0.52, 0.82),
-                    (0.52, 0.62),
-                    (0.40, 0.52),
-                    (0.22, 0.52),
-                ],
-                &[
-                    (0.40, 0.52),
-                    (0.54, 0.40),
-                    (0.54, 0.18),
-                    (0.42, 0.06),
-                    (0.20, 0.06),
-                    (0.08, 0.16),
-                ],
-            ]);
+            let top = arc_points(0.29, 0.73, 0.21, 0.21, 0.85 * PI, -0.5 * PI, semi_segs);
+            push_stroke(&mut stroke_polys, &top, hw);
+            let bot = arc_points(0.30, 0.29, 0.23, 0.23, 0.5 * PI, -0.85 * PI, semi_segs);
+            push_stroke(&mut stroke_polys, &bot, hw);
             0.64
         }
         '4' => {
-            add_strokes(&[&[(0.42, 0.0), (0.42, 0.96), (0.06, 0.34), (0.56, 0.34)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.42, 0.0), (0.42, 0.96), (0.06, 0.34), (0.56, 0.34)]],
+                hw,
+            );
             0.64
         }
         '5' => {
-            add_strokes(&[&[
-                (0.50, 0.94),
-                (0.10, 0.94),
-                (0.10, 0.54),
-                (0.40, 0.54),
-                (0.52, 0.42),
-                (0.52, 0.18),
-                (0.40, 0.06),
-                (0.16, 0.06),
-                (0.06, 0.16),
-            ]]);
+            let mut pts = vec![(0.50, 0.94), (0.10, 0.94), (0.10, 0.54), (0.28, 0.54)];
+            pts.extend(arc_points(
+                0.28,
+                0.30,
+                0.23,
+                0.24,
+                0.5 * PI,
+                -0.82 * PI,
+                semi_segs,
+            ));
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.64
         }
         '6' => {
-            let pts = ellipse_points(0.30, 0.28, 0.21, 0.23, 12);
+            let pts = ellipse_points(0.30, 0.28, 0.21, 0.23, full_segs);
             out.extend(closed_ring_glyph(&pts, hw * 0.92));
-            add_strokes(&[&[(0.48, 0.90), (0.26, 0.94), (0.10, 0.72), (0.10, 0.30)]]);
+            let mut upper = arc_points(0.34, 0.58, 0.24, 0.36, 0.32 * PI, PI, semi_segs);
+            upper.push((0.10, 0.28));
+            push_stroke(&mut stroke_polys, &upper, hw);
             0.64
         }
         '7' => {
-            add_strokes(&[&[(0.06, 0.94), (0.54, 0.94), (0.22, 0.0)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.06, 0.94), (0.54, 0.94), (0.22, 0.0)]],
+                hw,
+            );
             0.62
         }
         '8' => {
-            let top = ellipse_points(0.30, 0.72, 0.19, 0.21, 12);
-            let bot = ellipse_points(0.30, 0.28, 0.21, 0.23, 12);
+            let top = ellipse_points(0.30, 0.72, 0.19, 0.21, full_segs);
+            let bot = ellipse_points(0.30, 0.28, 0.21, 0.23, full_segs);
             out.extend(closed_ring_glyph(&top, hw * 0.88));
             out.extend(closed_ring_glyph(&bot, hw * 0.88));
             0.64
         }
         '9' => {
-            let pts = ellipse_points(0.30, 0.70, 0.21, 0.23, 12);
+            let pts = ellipse_points(0.30, 0.70, 0.21, 0.23, full_segs);
             out.extend(closed_ring_glyph(&pts, hw * 0.92));
-            add_strokes(&[&[(0.51, 0.68), (0.51, 0.24), (0.34, 0.06), (0.12, 0.08)]]);
+            let mut lower = vec![(0.51, 0.70)];
+            lower.extend(arc_points(
+                0.27,
+                0.42,
+                0.24,
+                0.36,
+                0.0,
+                -0.68 * PI,
+                semi_segs,
+            ));
+            push_stroke(&mut stroke_polys, &lower, hw);
             0.64
         }
         // Punctuation & symbols
         '!' => {
-            add_strokes(&[&[(0.16, 0.30), (0.16, 0.96)]]);
-            out.push(dot_contour(0.16, 0.09, 0.075));
+            push_stroke(&mut stroke_polys, &[(0.16, 0.30), (0.16, 0.96)], hw);
+            out.push(dot_contour(0.16, 0.09, 0.075, dot_segs));
             0.34
         }
         '"' => {
-            add_strokes(&[&[(0.12, 0.68), (0.12, 0.98)], &[(0.32, 0.68), (0.32, 0.98)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.12, 0.68), (0.12, 0.98)], &[(0.32, 0.68), (0.32, 0.98)]],
+                hw,
+            );
             0.46
         }
         '#' => {
-            add_strokes(&[
-                &[(0.18, 0.06), (0.26, 0.94)],
-                &[(0.42, 0.06), (0.50, 0.94)],
-                &[(0.06, 0.34), (0.60, 0.34)],
-                &[(0.08, 0.66), (0.62, 0.66)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.18, 0.06), (0.26, 0.94)],
+                    &[(0.42, 0.06), (0.50, 0.94)],
+                    &[(0.06, 0.34), (0.60, 0.34)],
+                    &[(0.08, 0.66), (0.62, 0.66)],
+                ],
+                hw,
+            );
             0.68
         }
         '$' => {
-            add_strokes(&[
-                &[
-                    (0.50, 0.80),
-                    (0.38, 0.90),
-                    (0.18, 0.90),
-                    (0.08, 0.78),
-                    (0.08, 0.60),
-                    (0.50, 0.42),
-                    (0.50, 0.20),
-                    (0.38, 0.10),
-                    (0.18, 0.10),
-                    (0.06, 0.20),
-                ],
-                &[(0.29, 0.0), (0.29, 1.0)],
-            ]);
+            let mut s_pts = arc_points(0.29, 0.70, 0.21, 0.20, 0.15 * PI, 1.5 * PI, semi_segs);
+            s_pts.extend(arc_points(
+                0.29,
+                0.30,
+                0.21,
+                0.20,
+                0.5 * PI,
+                -0.85 * PI,
+                semi_segs,
+            ));
+            push_stroke(&mut stroke_polys, &s_pts, hw);
+            push_stroke(&mut stroke_polys, &[(0.29, 0.0), (0.29, 1.0)], hw);
             0.62
         }
         '%' => {
-            add_strokes(&[&[(0.08, 0.06), (0.56, 0.94)]]);
+            push_stroke(&mut stroke_polys, &[(0.08, 0.06), (0.56, 0.94)], hw);
             out.extend(closed_ring_glyph(
-                &ellipse_points(0.16, 0.80, 0.10, 0.12, 10),
+                &ellipse_points(0.16, 0.80, 0.10, 0.12, small_segs),
                 hw * 0.7,
             ));
             out.extend(closed_ring_glyph(
-                &ellipse_points(0.48, 0.20, 0.10, 0.12, 10),
+                &ellipse_points(0.48, 0.20, 0.10, 0.12, small_segs),
                 hw * 0.7,
             ));
             0.68
         }
         '&' => {
-            add_strokes(&[&[
-                (0.54, 0.04),
-                (0.14, 0.64),
-                (0.14, 0.84),
-                (0.28, 0.94),
-                (0.42, 0.84),
-                (0.42, 0.68),
-                (0.08, 0.32),
-                (0.08, 0.16),
-                (0.22, 0.05),
-                (0.40, 0.05),
-                (0.54, 0.36),
-            ]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[
+                    (0.54, 0.04),
+                    (0.14, 0.64),
+                    (0.14, 0.84),
+                    (0.28, 0.94),
+                    (0.42, 0.84),
+                    (0.42, 0.68),
+                    (0.08, 0.32),
+                    (0.08, 0.16),
+                    (0.22, 0.05),
+                    (0.40, 0.05),
+                    (0.54, 0.36),
+                ]],
+                hw,
+            );
             0.64
         }
         '\'' => {
-            add_strokes(&[&[(0.14, 0.68), (0.14, 0.98)]]);
+            push_stroke(&mut stroke_polys, &[(0.14, 0.68), (0.14, 0.98)], hw);
             0.30
         }
         '(' => {
-            add_strokes(&[&[(0.32, 0.98), (0.14, 0.72), (0.14, 0.28), (0.32, 0.02)]]);
+            let pts = arc_points(0.56, 0.50, 0.42, 0.62, 0.72 * PI, 1.28 * PI, semi_segs);
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.40
         }
         ')' => {
-            add_strokes(&[&[(0.10, 0.98), (0.28, 0.72), (0.28, 0.28), (0.10, 0.02)]]);
+            let pts = arc_points(-0.14, 0.50, 0.42, 0.62, 0.28 * PI, -0.28 * PI, semi_segs);
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.40
         }
         '*' => {
-            add_strokes(&[
-                &[(0.28, 0.36), (0.28, 0.92)],
-                &[(0.06, 0.50), (0.50, 0.78)],
-                &[(0.06, 0.78), (0.50, 0.50)],
-            ]);
+            push_strokes(
+                &mut stroke_polys,
+                &[
+                    &[(0.28, 0.36), (0.28, 0.92)],
+                    &[(0.06, 0.50), (0.50, 0.78)],
+                    &[(0.06, 0.78), (0.50, 0.50)],
+                ],
+                hw,
+            );
             0.58
         }
         '+' => {
-            add_strokes(&[&[(0.06, 0.50), (0.52, 0.50)], &[(0.29, 0.24), (0.29, 0.76)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.06, 0.50), (0.52, 0.50)], &[(0.29, 0.24), (0.29, 0.76)]],
+                hw,
+            );
             0.60
         }
         ',' => {
-            add_strokes(&[&[(0.18, 0.14), (0.10, -0.10)]]);
+            push_stroke(&mut stroke_polys, &[(0.18, 0.14), (0.10, -0.10)], hw);
             0.32
         }
         '-' => {
-            add_strokes(&[&[(0.08, 0.48), (0.44, 0.48)]]);
+            push_stroke(&mut stroke_polys, &[(0.08, 0.48), (0.44, 0.48)], hw);
             0.52
         }
         '.' => {
-            out.push(dot_contour(0.16, 0.09, 0.08));
+            out.push(dot_contour(0.16, 0.09, 0.08, dot_segs));
             0.32
         }
         '/' => {
-            add_strokes(&[&[(0.08, 0.0), (0.46, 0.98)]]);
+            push_stroke(&mut stroke_polys, &[(0.08, 0.0), (0.46, 0.98)], hw);
             0.54
         }
         ':' => {
-            out.push(dot_contour(0.16, 0.12, 0.075));
-            out.push(dot_contour(0.16, 0.58, 0.075));
+            out.push(dot_contour(0.16, 0.12, 0.075, dot_segs));
+            out.push(dot_contour(0.16, 0.58, 0.075, dot_segs));
             0.34
         }
         ';' => {
-            out.push(dot_contour(0.16, 0.58, 0.075));
-            add_strokes(&[&[(0.18, 0.14), (0.10, -0.10)]]);
+            out.push(dot_contour(0.16, 0.58, 0.075, dot_segs));
+            push_stroke(&mut stroke_polys, &[(0.18, 0.14), (0.10, -0.10)], hw);
             0.34
         }
         '<' => {
-            add_strokes(&[&[(0.48, 0.80), (0.10, 0.50), (0.48, 0.20)]]);
+            push_stroke(
+                &mut stroke_polys,
+                &[(0.48, 0.80), (0.10, 0.50), (0.48, 0.20)],
+                hw,
+            );
             0.58
         }
         '=' => {
-            add_strokes(&[&[(0.06, 0.62), (0.50, 0.62)], &[(0.06, 0.36), (0.50, 0.36)]]);
+            push_strokes(
+                &mut stroke_polys,
+                &[&[(0.06, 0.62), (0.50, 0.62)], &[(0.06, 0.36), (0.50, 0.36)]],
+                hw,
+            );
             0.58
         }
         '>' => {
-            add_strokes(&[&[(0.10, 0.80), (0.48, 0.50), (0.10, 0.20)]]);
+            push_stroke(
+                &mut stroke_polys,
+                &[(0.10, 0.80), (0.48, 0.50), (0.10, 0.20)],
+                hw,
+            );
             0.58
         }
         '?' => {
-            add_strokes(&[&[
-                (0.08, 0.78),
-                (0.18, 0.94),
-                (0.40, 0.94),
-                (0.50, 0.80),
-                (0.50, 0.64),
-                (0.30, 0.46),
-                (0.30, 0.30),
-            ]]);
-            out.push(dot_contour(0.30, 0.09, 0.075));
+            let mut pts = arc_points(0.29, 0.74, 0.20, 0.20, 0.92 * PI, -0.25 * PI, semi_segs);
+            pts.push((0.30, 0.46));
+            pts.push((0.30, 0.30));
+            push_stroke(&mut stroke_polys, &pts, hw);
+            out.push(dot_contour(0.30, 0.09, 0.075, dot_segs));
             0.60
         }
         '@' => {
-            let inner = ellipse_points(0.36, 0.48, 0.14, 0.18, 10);
+            let inner = ellipse_points(0.35, 0.48, 0.13, 0.17, small_segs);
             out.extend(closed_ring_glyph(&inner, hw * 0.75));
-            add_strokes(&[&[
-                (0.54, 0.26),
-                (0.54, 0.72),
-                (0.40, 0.88),
-                (0.18, 0.88),
-                (0.06, 0.66),
-                (0.06, 0.28),
-                (0.20, 0.08),
-                (0.52, 0.08),
-            ]]);
+            let mut outer_c = vec![(0.50, 0.30), (0.50, 0.62)];
+            outer_c.extend(arc_points(
+                0.33,
+                0.48,
+                0.26,
+                0.40,
+                0.12 * PI,
+                1.72 * PI,
+                open_segs,
+            ));
+            push_stroke(&mut stroke_polys, &outer_c, hw);
             0.68
         }
         '[' => {
-            add_strokes(&[&[(0.34, 0.96), (0.14, 0.96), (0.14, 0.04), (0.34, 0.04)]]);
+            push_stroke(
+                &mut stroke_polys,
+                &[(0.34, 0.96), (0.14, 0.96), (0.14, 0.04), (0.34, 0.04)],
+                hw,
+            );
             0.42
         }
         '\\' => {
-            add_strokes(&[&[(0.08, 0.98), (0.46, 0.0)]]);
+            push_stroke(&mut stroke_polys, &[(0.08, 0.98), (0.46, 0.0)], hw);
             0.54
         }
         ']' => {
-            add_strokes(&[&[(0.10, 0.96), (0.30, 0.96), (0.30, 0.04), (0.10, 0.04)]]);
+            push_stroke(
+                &mut stroke_polys,
+                &[(0.10, 0.96), (0.30, 0.96), (0.30, 0.04), (0.10, 0.04)],
+                hw,
+            );
             0.42
         }
         '^' => {
-            add_strokes(&[&[(0.08, 0.66), (0.28, 0.96), (0.48, 0.66)]]);
+            push_stroke(
+                &mut stroke_polys,
+                &[(0.08, 0.66), (0.28, 0.96), (0.48, 0.66)],
+                hw,
+            );
             0.58
         }
         '_' => {
-            add_strokes(&[&[(0.04, 0.04), (0.56, 0.04)]]);
+            push_stroke(&mut stroke_polys, &[(0.04, 0.04), (0.56, 0.04)], hw);
             0.60
         }
         '`' => {
-            add_strokes(&[&[(0.10, 0.96), (0.24, 0.76)]]);
+            push_stroke(&mut stroke_polys, &[(0.10, 0.96), (0.24, 0.76)], hw);
             0.36
         }
         '{' => {
-            add_strokes(&[&[
-                (0.36, 0.96),
-                (0.22, 0.92),
-                (0.20, 0.58),
-                (0.10, 0.50),
-                (0.20, 0.42),
-                (0.22, 0.08),
-                (0.36, 0.04),
-            ]]);
+            push_stroke(
+                &mut stroke_polys,
+                &[
+                    (0.36, 0.96),
+                    (0.22, 0.92),
+                    (0.20, 0.58),
+                    (0.10, 0.50),
+                    (0.20, 0.42),
+                    (0.22, 0.08),
+                    (0.36, 0.04),
+                ],
+                hw,
+            );
             0.46
         }
         '|' => {
-            add_strokes(&[&[(0.16, 0.0), (0.16, 1.0)]]);
+            push_stroke(&mut stroke_polys, &[(0.16, 0.0), (0.16, 1.0)], hw);
             0.34
         }
         '}' => {
-            add_strokes(&[&[
-                (0.10, 0.96),
-                (0.24, 0.92),
-                (0.26, 0.58),
-                (0.36, 0.50),
-                (0.26, 0.42),
-                (0.24, 0.08),
-                (0.10, 0.04),
-            ]]);
+            push_stroke(
+                &mut stroke_polys,
+                &[
+                    (0.10, 0.96),
+                    (0.24, 0.92),
+                    (0.26, 0.58),
+                    (0.36, 0.50),
+                    (0.26, 0.42),
+                    (0.24, 0.08),
+                    (0.10, 0.04),
+                ],
+                hw,
+            );
             0.46
         }
         '~' => {
-            add_strokes(&[&[(0.06, 0.48), (0.20, 0.60), (0.38, 0.40), (0.52, 0.52)]]);
+            let pts: Vec<(f32, f32)> = (0..=semi_segs)
+                .map(|i| {
+                    let t = i as f32 / semi_segs as f32;
+                    (0.06 + 0.46 * t, 0.48 + 0.11 * (t * TAU).sin())
+                })
+                .collect();
+            push_stroke(&mut stroke_polys, &pts, hw);
             0.60
         }
         _ => {
@@ -1601,7 +1856,6 @@ fn fallback_glyph_contours(ch: char) -> (Vec<Vec<Vec2>>, f32) {
         }
     };
 
-    drop(add_strokes);
     out.extend(stroke_polys);
     (out, adv)
 }

@@ -126,7 +126,6 @@ impl<T> Keyframe<T> {
             InterpolationMode::Interpolated => {
                 self.interpolated = true;
                 self.in_tangent = None;
-                self.out_tangent = None;
             }
             InterpolationMode::Bezier => {
                 self.interpolated = true;
@@ -240,6 +239,21 @@ impl Animatable for [f64; 2] {
         [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
     }
 
+    fn eval_bezier_segment(
+        f0: f64,
+        v0: &Self,
+        out_tangent: [f64; 2],
+        f1: f64,
+        v1: &Self,
+        in_tangent: [f64; 2],
+        frame: f64,
+    ) -> Self {
+        [
+            f64::eval_bezier_segment(f0, &v0[0], out_tangent, f1, &v1[0], in_tangent, frame),
+            f64::eval_bezier_segment(f0, &v0[1], out_tangent, f1, &v1[1], in_tangent, frame),
+        ]
+    }
+
     fn sub(a: &Self, b: &Self) -> Self {
         [a[0] - b[0], a[1] - b[1]]
     }
@@ -265,6 +279,22 @@ impl Animatable for [f64; 3] {
             a[0] + (b[0] - a[0]) * t,
             a[1] + (b[1] - a[1]) * t,
             a[2] + (b[2] - a[2]) * t,
+        ]
+    }
+
+    fn eval_bezier_segment(
+        f0: f64,
+        v0: &Self,
+        out_tangent: [f64; 2],
+        f1: f64,
+        v1: &Self,
+        in_tangent: [f64; 2],
+        frame: f64,
+    ) -> Self {
+        [
+            f64::eval_bezier_segment(f0, &v0[0], out_tangent, f1, &v1[0], in_tangent, frame),
+            f64::eval_bezier_segment(f0, &v0[1], out_tangent, f1, &v1[1], in_tangent, frame),
+            f64::eval_bezier_segment(f0, &v0[2], out_tangent, f1, &v1[2], in_tangent, frame),
         ]
     }
 
@@ -297,6 +327,23 @@ impl Animatable for [f64; 4] {
         ]
     }
 
+    fn eval_bezier_segment(
+        f0: f64,
+        v0: &Self,
+        out_tangent: [f64; 2],
+        f1: f64,
+        v1: &Self,
+        in_tangent: [f64; 2],
+        frame: f64,
+    ) -> Self {
+        [
+            f64::eval_bezier_segment(f0, &v0[0], out_tangent, f1, &v1[0], in_tangent, frame),
+            f64::eval_bezier_segment(f0, &v0[1], out_tangent, f1, &v1[1], in_tangent, frame),
+            f64::eval_bezier_segment(f0, &v0[2], out_tangent, f1, &v1[2], in_tangent, frame),
+            f64::eval_bezier_segment(f0, &v0[3], out_tangent, f1, &v1[3], in_tangent, frame),
+        ]
+    }
+
     fn sub(a: &Self, b: &Self) -> Self {
         [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]]
     }
@@ -323,6 +370,55 @@ impl Animatable for [f32; 4] {
             (f64::from(a[1]) + (f64::from(b[1]) - f64::from(a[1])) * t) as f32,
             (f64::from(a[2]) + (f64::from(b[2]) - f64::from(a[2])) * t) as f32,
             (f64::from(a[3]) + (f64::from(b[3]) - f64::from(a[3])) * t) as f32,
+        ]
+    }
+
+    fn eval_bezier_segment(
+        f0: f64,
+        v0: &Self,
+        out_tangent: [f64; 2],
+        f1: f64,
+        v1: &Self,
+        in_tangent: [f64; 2],
+        frame: f64,
+    ) -> Self {
+        [
+            f64::eval_bezier_segment(
+                f0,
+                &f64::from(v0[0]),
+                out_tangent,
+                f1,
+                &f64::from(v1[0]),
+                in_tangent,
+                frame,
+            ) as f32,
+            f64::eval_bezier_segment(
+                f0,
+                &f64::from(v0[1]),
+                out_tangent,
+                f1,
+                &f64::from(v1[1]),
+                in_tangent,
+                frame,
+            ) as f32,
+            f64::eval_bezier_segment(
+                f0,
+                &f64::from(v0[2]),
+                out_tangent,
+                f1,
+                &f64::from(v1[2]),
+                in_tangent,
+                frame,
+            ) as f32,
+            f64::eval_bezier_segment(
+                f0,
+                &f64::from(v0[3]),
+                out_tangent,
+                f1,
+                &f64::from(v1[3]),
+                in_tangent,
+                frame,
+            ) as f32,
         ]
     }
 
@@ -453,7 +549,11 @@ impl<T: Animatable> DynamicProperty<T> {
 
     /// Creates a non-animated linear-ramp property spanning `[0, clip_length]` (e.g., clip `time`).
     pub fn new_linear(start_value: T, end_value: T, clip_length: f64) -> Self {
-        let end_frame = clip_length.max(0.0);
+        let end_frame = if clip_length.is_finite() {
+            clip_length.max(0.0)
+        } else {
+            0.0
+        };
         Self {
             animated: false,
             expression: None,
@@ -467,6 +567,11 @@ impl<T: Animatable> DynamicProperty<T> {
 
     /// Creates an animated property from an arbitrary list of keyframes (sorted automatically).
     pub fn new_animated(mut keyframes: Vec<Keyframe<T>>) -> Self {
+        for kf in &mut keyframes {
+            if !kf.frame.is_finite() {
+                kf.frame = 0.0;
+            }
+        }
         keyframes.sort_by(|a, b| a.frame.total_cmp(&b.frame));
         Self {
             animated: true,
@@ -506,7 +611,7 @@ impl<T: Animatable> DynamicProperty<T> {
                         return last.value.clone();
                     }
                     let span = last.frame - first.frame;
-                    if span <= 0.0 {
+                    if !span.is_finite() || span <= 0.0 {
                         return first.value.clone();
                     }
                     let u = ((frame - first.frame) / span).clamp(0.0, 1.0);
@@ -524,6 +629,12 @@ impl<T: Animatable> DynamicProperty<T> {
         }
 
         let idx = self.keyframes.partition_point(|kf| kf.frame <= frame);
+        if idx == 0 {
+            return self.keyframes[0].value.clone();
+        }
+        if idx >= self.keyframes.len() {
+            return last.value.clone();
+        }
         let k0 = &self.keyframes[idx - 1];
         let k1 = &self.keyframes[idx];
 
@@ -542,7 +653,7 @@ impl<T: Animatable> DynamicProperty<T> {
         }
 
         let span = k1.frame - k0.frame;
-        if span <= 0.0 {
+        if !span.is_finite() || span <= 0.0 {
             return k0.value.clone();
         }
         let u = ((frame - k0.frame) / span).clamp(0.0, 1.0);
@@ -668,13 +779,22 @@ impl<T: Animatable> DynamicProperty<T> {
     /// Toggles stopwatch animation state at `local_frame`, honoring [`StaticBehavior`]
     /// for constant vs. clip-`time` linear properties.
     pub fn toggle_animation(&mut self, local_frame: f64, clip_length: f64) {
-        let clip_end = clip_length.max(0.0);
+        let safe_frame = if local_frame.is_finite() {
+            local_frame
+        } else {
+            0.0
+        };
+        let clip_end = if clip_length.is_finite() {
+            clip_length.max(0.0)
+        } else {
+            0.0
+        };
         if !self.animated {
             match self.static_behavior {
                 StaticBehavior::Constant => {
-                    let current = self.evaluate(local_frame);
+                    let current = self.evaluate(safe_frame);
                     self.animated = true;
-                    self.keyframes = vec![Self::make_default_keyframe(local_frame, current)];
+                    self.keyframes = vec![Self::make_default_keyframe(safe_frame, current)];
                 }
                 StaticBehavior::Linear => {
                     let start_val = self.evaluate(0.0);
@@ -691,9 +811,10 @@ impl<T: Animatable> DynamicProperty<T> {
                 }
             }
         } else {
+            self.expression = None;
             match self.static_behavior {
                 StaticBehavior::Constant => {
-                    let current = self.evaluate(local_frame);
+                    let current = self.evaluate(safe_frame);
                     self.animated = false;
                     self.keyframes = vec![Self::make_default_keyframe(0.0, current)];
                 }
@@ -712,6 +833,9 @@ impl<T: Animatable> DynamicProperty<T> {
 
     /// Shifts all keyframe frames by `delta_frames` (used on clip trim and split).
     pub fn shift_keyframes(&mut self, delta_frames: f64) {
+        if !delta_frames.is_finite() {
+            return;
+        }
         for kf in &mut self.keyframes {
             kf.frame += delta_frames;
         }
@@ -735,42 +859,76 @@ impl<T: Animatable> DynamicProperty<T> {
 }
 
 impl DynamicProperty<f64> {
-    /// Piecewise linear / trapezoidal integral of a scalar channel from frame `0` to `frame`
-    /// (Spec 02 §3.3, used for speed-to-phase accumulation).
-    pub fn integrate(&self, frame: f64) -> f64 {
-        if self.keyframes.is_empty() || !frame.is_finite() || frame == 0.0 {
+    fn integrate_linear_endpoints(
+        first: &Keyframe<f64>,
+        last: &Keyframe<f64>,
+        a: f64,
+        b: f64,
+    ) -> f64 {
+        let f0 = first.frame;
+        let f1 = last.frame;
+        if !f0.is_finite() || !f1.is_finite() {
             return 0.0;
         }
-        if !self.animated && self.static_behavior == StaticBehavior::Constant {
-            return self.keyframes[0].value * frame;
+        let mut acc = 0.0;
+        if f1 <= f0 {
+            if a < f0 {
+                acc += first.value * (b.min(f0) - a);
+            }
+            if b > f0 {
+                acc += last.value * (b - a.max(f0));
+            }
+            return acc;
         }
-        let sign = if frame < 0.0 { -1.0 } else { 1.0 };
-        let target = frame.abs();
+        if a < f0 {
+            acc += first.value * (b.min(f0) - a);
+        }
+        let seg_start = a.max(f0);
+        let seg_end = b.min(f1);
+        let dt = seg_end - seg_start;
+        if dt > 0.0 {
+            let slope = (last.value - first.value) / (f1 - f0);
+            let v_start = first.value + slope * (seg_start - f0);
+            acc += 0.5 * slope * dt * dt + v_start * dt;
+        }
+        if b > f1 {
+            acc += last.value * (b - a.max(f1));
+        }
+        acc
+    }
+
+    fn integrate_interval(&self, a: f64, b: f64) -> f64 {
+        if self.keyframes.len() == 1 {
+            return self.keyframes[0].value * (b - a);
+        }
         let first = &self.keyframes[0];
-        if self.keyframes.len() == 1 || target <= first.frame {
-            return sign * first.value * target;
+        let last = &self.keyframes[self.keyframes.len() - 1];
+        if !self.animated && self.static_behavior == StaticBehavior::Linear {
+            return Self::integrate_linear_endpoints(first, last, a, b);
+        }
+        if !first.frame.is_finite() || !last.frame.is_finite() {
+            return 0.0;
         }
 
         let mut acc = 0.0;
-        let mut cursor = 0.0;
-
-        if first.frame > 0.0 {
-            let dt = first.frame.min(target);
-            acc += first.value * dt;
-            cursor = dt;
+        if a < first.frame {
+            acc += first.value * (b.min(first.frame) - a);
         }
 
         for pair in self.keyframes.windows(2) {
-            if cursor >= target {
-                break;
-            }
             let k0 = &pair[0];
             let k1 = &pair[1];
-            if k1.frame <= cursor {
+            if !k0.frame.is_finite() || !k1.frame.is_finite() {
                 continue;
             }
-            let seg_start = cursor.max(k0.frame);
-            let seg_end = target.min(k1.frame);
+            if k1.frame <= a {
+                continue;
+            }
+            if k0.frame >= b {
+                break;
+            }
+            let seg_start = a.max(k0.frame);
+            let seg_end = b.min(k1.frame);
             let dt = seg_end - seg_start;
             if dt <= 0.0 {
                 continue;
@@ -787,15 +945,30 @@ impl DynamicProperty<f64> {
                 let v_start = k0.value + slope * (seg_start - k0.frame);
                 acc += 0.5 * slope * dt * dt + v_start * dt;
             }
-            cursor = seg_end;
         }
 
-        if cursor < target {
-            let last = &self.keyframes[self.keyframes.len() - 1];
-            acc += last.value * (target - cursor);
+        if b > last.frame {
+            acc += last.value * (b - a.max(last.frame));
         }
 
-        sign * acc
+        acc
+    }
+
+    /// Piecewise linear / trapezoidal integral of a scalar channel from frame `0` to `frame`
+    /// (Spec 02 §3.3, used for speed-to-phase accumulation).
+    pub fn integrate(&self, frame: f64) -> f64 {
+        if self.keyframes.is_empty() || !frame.is_finite() || frame == 0.0 {
+            return 0.0;
+        }
+        if !self.animated && self.static_behavior == StaticBehavior::Constant {
+            return self.keyframes[0].value * frame;
+        }
+        if frame > 0.0 {
+            self.integrate_interval(0.0, frame)
+        } else {
+            let val = -self.integrate_interval(frame, 0.0);
+            if val == 0.0 { 0.0 } else { val }
+        }
     }
 }
 
@@ -999,5 +1172,139 @@ mod tests {
             Keyframe::with_easing(10.0, 100.0, EasingKind::QuadIn),
         ]);
         assert!(approx_eq(prop_quad.evaluate(5.0), 25.0, 1e-9));
+    }
+
+    #[test]
+    fn bezier_segment_vector_matches_scalar_per_component() {
+        let out_t = [10.0, 25.0];
+        let in_t = [-10.0, -15.0];
+        let v0 = [0.0_f64, 50.0, -20.0, 10.0];
+        let v1 = [100.0_f64, 50.0, 80.0, -30.0];
+
+        let expected: [f64; 4] = std::array::from_fn(|i| {
+            f64::eval_bezier_segment(0.0, &v0[i], out_t, 30.0, &v1[i], in_t, 12.0)
+        });
+
+        let prop2 = DynamicProperty::new_animated(vec![
+            Keyframe::bezier(0.0, [v0[0], v0[1]], [-10.0, 0.0], out_t),
+            Keyframe::bezier(30.0, [v1[0], v1[1]], in_t, [10.0, 0.0]),
+        ]);
+        let r2 = prop2.evaluate(12.0);
+        assert!(approx_eq(r2[0], expected[0], 1e-9));
+        assert!(approx_eq(r2[1], expected[1], 1e-9));
+
+        let prop3 = DynamicProperty::new_animated(vec![
+            Keyframe::bezier(0.0, [v0[0], v0[1], v0[2]], [-10.0, 0.0], out_t),
+            Keyframe::bezier(30.0, [v1[0], v1[1], v1[2]], in_t, [10.0, 0.0]),
+        ]);
+        let r3 = prop3.evaluate(12.0);
+        for i in 0..3 {
+            assert!(approx_eq(r3[i], expected[i], 1e-9));
+        }
+
+        let prop4 = DynamicProperty::new_animated(vec![
+            Keyframe::bezier(0.0, v0, [-10.0, 0.0], out_t),
+            Keyframe::bezier(30.0, v1, in_t, [10.0, 0.0]),
+        ]);
+        let r4 = prop4.evaluate(12.0);
+        for i in 0..4 {
+            assert!(approx_eq(r4[i], expected[i], 1e-9));
+        }
+
+        let prop_f32 = DynamicProperty::new_animated(vec![
+            Keyframe::bezier(
+                0.0,
+                [v0[0] as f32, v0[1] as f32, v0[2] as f32, v0[3] as f32],
+                [-10.0, 0.0],
+                out_t,
+            ),
+            Keyframe::bezier(
+                30.0,
+                [v1[0] as f32, v1[1] as f32, v1[2] as f32, v1[3] as f32],
+                in_t,
+                [10.0, 0.0],
+            ),
+        ]);
+        let rf32 = prop_f32.evaluate(12.0);
+        for i in 0..4 {
+            assert!(approx_eq(f64::from(rf32[i]), expected[i], 1e-4));
+        }
+    }
+
+    #[test]
+    fn nan_keyframe_and_shift_and_toggle_guards() {
+        // Bug 11: new_animated sanitizes non-finite frames and evaluate never panics even on raw NaN keyframes.
+        let sanitized = DynamicProperty::new_animated(vec![
+            Keyframe::new(-f64::NAN, 10.0),
+            Keyframe::new(10.0, 20.0),
+        ]);
+        assert!(sanitized.keyframes.iter().all(|k| k.frame.is_finite()));
+        assert!(sanitized.evaluate(5.0).is_finite());
+
+        let mut raw_nan = DynamicProperty::new_animated(vec![
+            Keyframe::new(0.0, 10.0),
+            Keyframe::new(10.0, 20.0),
+        ]);
+        raw_nan.keyframes[0].frame = -f64::NAN;
+        assert!(raw_nan.evaluate(5.0).is_finite());
+
+        // Bug 13: set_cm3_tween_code(Interpolated) clears in_tangent but preserves out_tangent.
+        let mut kf = Keyframe::bezier(10.0, 50.0, [-8.0, 5.0], [12.0, -4.0]);
+        kf.set_cm3_tween_code(1); // Interpolated | Linear
+        assert_eq!(kf.in_tangent, None);
+        assert_eq!(kf.out_tangent, Some([12.0, -4.0]));
+
+        // Bug 14: toggle_animation clears expression on disable and sanitizes non-finite inputs.
+        let mut prop = DynamicProperty::new_static(42.0);
+        prop.toggle_animation(f64::NAN, f64::INFINITY);
+        assert!(prop.animated);
+        assert!(prop.keyframes[0].frame.is_finite());
+        prop.expression = Some("value * 2".to_string());
+        prop.toggle_animation(f64::INFINITY, f64::INFINITY);
+        assert!(!prop.animated);
+        assert_eq!(prop.expression, None);
+
+        // Bug 15: shift_keyframes ignores non-finite deltas.
+        let mut shifted =
+            DynamicProperty::new_animated(vec![Keyframe::new(5.0, 1.0), Keyframe::new(15.0, 2.0)]);
+        shifted.shift_keyframes(f64::NAN);
+        shifted.shift_keyframes(f64::INFINITY);
+        assert_eq!(shifted.keyframes[0].frame, 5.0);
+        assert_eq!(shifted.keyframes[1].frame, 15.0);
+    }
+
+    #[test]
+    fn integrate_negative_frames_and_static_linear_parity() {
+        // Bug 12a: negative frame integration uses -integral_from_frame_to_0.
+        let p1 = DynamicProperty::new_animated(vec![
+            Keyframe::new(0.0, 0.0),
+            Keyframe::new(10.0, 100.0),
+        ]);
+        assert!(approx_eq(p1.integrate(-10.0), 0.0, 1e-12));
+        assert!(approx_eq(p1.integrate(10.0), 500.0, 1e-12));
+
+        let p2 = DynamicProperty::new_animated(vec![
+            Keyframe::new(-10.0, 0.0),
+            Keyframe::new(0.0, 10.0),
+        ]);
+        assert!(approx_eq(p2.integrate(-10.0), -50.0, 1e-12));
+        assert!(approx_eq(p2.integrate(5.0), 50.0, 1e-12));
+
+        let p3 = DynamicProperty::new_animated(vec![
+            Keyframe::new(-10.0, 2.0),
+            Keyframe::new(-5.0, 6.0),
+        ]);
+        // [-12,-10]: 2*2=4; [-10,-5]: (2+6)/2*5=20; [-5,0]: 6*5=30 => -54
+        assert!(approx_eq(p3.integrate(-12.0), -54.0, 1e-12));
+
+        // Bug 12b: static Linear property integrates direct endpoint ramp, matching evaluate.
+        let mut static_lin = DynamicProperty::new_linear(0.0, 10.0, 10.0);
+        static_lin.keyframes.insert(1, Keyframe::hold(5.0, 999.0));
+        static_lin.keyframes[2].easing = EasingKind::Hold;
+        static_lin.keyframes[2].interpolated = false;
+        assert!(approx_eq(static_lin.evaluate(5.0), 5.0, 1e-12));
+        assert!(approx_eq(static_lin.integrate(10.0), 50.0, 1e-12));
+        assert!(approx_eq(static_lin.integrate(-5.0), 0.0, 1e-12));
+        assert!(approx_eq(static_lin.integrate(15.0), 100.0, 1e-12));
     }
 }

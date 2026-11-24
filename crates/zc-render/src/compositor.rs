@@ -335,19 +335,30 @@ impl Compositor2D {
         opacity: f32,
         blend_mode: BlendMode,
     ) {
+        let zero_scale = transform.scale[0].abs() < 1e-6 || transform.scale[1].abs() < 1e-6;
+        if zero_scale && blend_mode == BlendMode::SrcOver {
+            self.blit(ctx, &backdrop.view, dst);
+            return;
+        }
+
         self.ensure_composite_pipeline(ctx, dst.format);
         let pipeline = &self.composite_pipelines[&dst.format];
         let bgl = pipeline.get_bind_group_layout(0);
 
-        let sx = if transform.scale[0].abs() < 1e-4 {
-            1e-4_f32.copysign(transform.scale[0])
+        let sx = if transform.scale[0].abs() < 1e-6 {
+            1.0
         } else {
             transform.scale[0]
         };
-        let sy = if transform.scale[1].abs() < 1e-4 {
-            1e-4_f32.copysign(transform.scale[1])
+        let sy = if transform.scale[1].abs() < 1e-6 {
+            1.0
         } else {
             transform.scale[1]
+        };
+        let effective_opacity = if zero_scale {
+            0.0
+        } else {
+            opacity.clamp(0.0, 1.0)
         };
 
         let u = CompositeUniforms {
@@ -364,7 +375,7 @@ impl Compositor2D {
                 transform.rotation.cos(),
                 transform.rotation.sin(),
             ],
-            opacity_pad: [opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
+            opacity_pad: [effective_opacity, 0.0, 0.0, 0.0],
             mode_pad: [blend_mode.as_u32(), 0, 0, 0],
         };
 
@@ -862,14 +873,10 @@ fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
     let q = d_rot / u.pos_and_scale.zw + u.anchor_and_rot.xy;
     let layer_uv = vec2<f32>(q.x / layer_w + 0.5, 0.5 - q.y / layer_h);
 
-    // Unconditional sample for uniform control flow.
-    let raw_layer = textureSample(t_layer, samp, clamp(layer_uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+    // Unconditional sample with clamped UVs for uniform control flow.
+    let sampled = textureSample(t_layer, samp, clamp(layer_uv, vec2<f32>(0.0), vec2<f32>(1.0))) * u.opacity_pad.x;
     let in_bounds = layer_uv.x >= 0.0 && layer_uv.x <= 1.0 && layer_uv.y >= 0.0 && layer_uv.y <= 1.0;
-    if (!in_bounds) {
-        return dst;
-    }
-
-    let src = raw_layer * u.opacity_pad.x;
+    let src = select(vec4<f32>(0.0), sampled, in_bounds);
     let cs_col = unpremult(src);
     let cd_col = unpremult(dst);
     let mode = u.mode_pad.x;

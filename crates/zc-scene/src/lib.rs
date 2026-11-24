@@ -684,4 +684,199 @@ mod tests {
         let exp_span = (frac_exploded.bounds.max - frac_exploded.bounds.min).length();
         assert!(exp_span > base_span + 1.0);
     }
+
+    fn mesh_signed_volume(mesh: &MeshData) -> f32 {
+        let mut vol6 = 0.0_f32;
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let p0 = Vec3::from_array(mesh.vertices[tri[0] as usize].position);
+            let p1 = Vec3::from_array(mesh.vertices[tri[1] as usize].position);
+            let p2 = Vec3::from_array(mesh.vertices[tri[2] as usize].position);
+            vol6 += p0.dot(p1.cross(p2));
+        }
+        vol6 / 6.0
+    }
+
+    #[test]
+    fn voronoi_fracture_is_watertight_and_preserves_hollow_holes() {
+        // Closed box: sum of Voronoi cell volumes at explode=0 must equal box volume (64.0).
+        let box_mesh = build_box(4.0, 4.0, 4.0);
+        let frac = apply_voronoi_fracture(&box_mesh, 12, 42, 0.0);
+        assert_valid_mesh(&frac, "voronoi_watertight_box");
+        let vol = mesh_signed_volume(&frac);
+        assert!(
+            (vol - 64.0).abs() < 0.25,
+            "expected watertight fractured box volume ~64.0, got {vol}"
+        );
+
+        // Hollow extruded square frame (outer 10x10, inner hole 4x4, thickness 10 -> volume 840).
+        let frame_contours = vec![
+            vec![
+                Vec2::new(-5.0, -5.0),
+                Vec2::new(5.0, -5.0),
+                Vec2::new(5.0, 5.0),
+                Vec2::new(-5.0, 5.0),
+            ],
+            vec![
+                Vec2::new(-2.0, -2.0),
+                Vec2::new(-2.0, 2.0),
+                Vec2::new(2.0, 2.0),
+                Vec2::new(2.0, -2.0),
+            ],
+        ];
+        let hollow_frame = extrude_contours(
+            &frame_contours,
+            &Text3DParams {
+                thickness: 10.0,
+                align: TextAlignMode::Center,
+                ..Text3DParams::default()
+            },
+        )
+        .expect("hollow frame extrusion");
+        let orig_vol = mesh_signed_volume(&hollow_frame);
+        assert!((orig_vol - 840.0).abs() < 0.5);
+
+        let frac_hollow = apply_voronoi_fracture(&hollow_frame, 6, 99, 0.0);
+        assert_valid_mesh(&frac_hollow, "voronoi_hollow_frame");
+        let frac_vol = mesh_signed_volume(&frac_hollow);
+        assert!(
+            (frac_vol - orig_vol).abs() < 1.0,
+            "hollow fracture caps must preserve hole volume (expected ~{orig_vol}, got {frac_vol})"
+        );
+    }
+
+    #[test]
+    fn text3d_boundary_touching_hole_stays_hollow() {
+        // Diamond hole whose 4 vertices graze the midpoints of all 4 outer square edges.
+        let contours = vec![
+            vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(10.0, 0.0),
+                Vec2::new(10.0, 10.0),
+                Vec2::new(0.0, 10.0),
+            ],
+            vec![
+                Vec2::new(5.0, 0.0),
+                Vec2::new(10.0, 5.0),
+                Vec2::new(5.0, 10.0),
+                Vec2::new(0.0, 5.0),
+            ],
+        ];
+        let mesh = extrude_contours(
+            &contours,
+            &Text3DParams {
+                thickness: 2.0,
+                align: TextAlignMode::Center,
+                ..Text3DParams::default()
+            },
+        )
+        .expect("boundary-touching hole should extrude");
+        assert_valid_mesh(&mesh, "boundary_touching_hole");
+
+        // Outer area 100 - inner diamond area 50 = 50 -> extruded volume = 100.
+        let vol = mesh_signed_volume(&mesh);
+        assert!(
+            (vol - 100.0).abs() < 0.5,
+            "expected hollow diamond-in-square volume ~100.0, got {vol}"
+        );
+    }
+
+    #[test]
+    fn warp_centers_around_off_center_mesh_bounds() {
+        let centered = build_box(2.0, 10.0, 2.0);
+        let offset = Vec3::new(50.0, 0.0, -30.0);
+        let mut shifted = centered.clone();
+        shifted.translate(offset);
+
+        let mut warped_centered = apply_warp(&centered, 0.6, 0.4, DeformAxis::Y);
+        warped_centered.translate(offset);
+        let warped_shifted = apply_warp(&shifted, 0.6, 0.4, DeformAxis::Y);
+        assert_valid_mesh(&warped_shifted, "warped_off_center");
+
+        assert_eq!(
+            warped_centered.vertices.len(),
+            warped_shifted.vertices.len()
+        );
+        for (a, b) in warped_centered
+            .vertices
+            .iter()
+            .zip(warped_shifted.vertices.iter())
+        {
+            let diff = Vec3::from_array(a.position) - Vec3::from_array(b.position);
+            assert!(
+                diff.length() < 1e-4,
+                "off-center warp diverged from centered warp by {diff:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn obj_loader_handles_bom_continuations_usemtl_slots_and_concave_ngons() {
+        let obj = "\u{FEFF}v 0 0 0\n\
+            v 2 0 0\n\
+            v 2 1 0\n\
+            v 1 1 0\n\
+            v 1 2 0\n\
+            v 0 2 0\n\
+            # Untagged concave L-shaped 6-gon split across continuation lines\n\
+            f 1 2 3 \\\n\
+              4 5 6\n\
+            usemtl Metal Dark\n\
+            f 1 2 3\n\
+            usemtl Metal Light\n\
+            f 1 5 6\n";
+
+        let mesh = parse_obj(obj).expect("OBJ with BOM, continuation, spaces, concave ngon");
+        assert_valid_mesh(&mesh, "obj_regression");
+
+        // Pre-usemtl face gets slot 0, Metal Dark gets slot 1, Metal Light gets slot 2.
+        assert!(mesh.vertices.iter().any(|v| v.material_slot == 0));
+        assert!(mesh.vertices.iter().any(|v| v.material_slot == 1));
+        assert!(mesh.vertices.iter().any(|v| v.material_slot == 2));
+
+        // Concave L-shape (slot 0) has exact area 3.0 and all triangles facing +Z.
+        let mut slot0_area = 0.0_f32;
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let v0 = mesh.vertices[tri[0] as usize];
+            if v0.material_slot != 0 {
+                continue;
+            }
+            let p0 = Vec3::from_array(v0.position);
+            let p1 = Vec3::from_array(mesh.vertices[tri[1] as usize].position);
+            let p2 = Vec3::from_array(mesh.vertices[tri[2] as usize].position);
+            let cross = (p1 - p0).cross(p2 - p0);
+            assert!(cross.z > 0.0, "concave n-gon triangle inverted: {cross:?}");
+            slot0_area += 0.5 * cross.length();
+        }
+        assert!(
+            (slot0_area - 3.0).abs() < 1e-4,
+            "expected concave L-shape area 3.0, got {slot0_area}"
+        );
+    }
+
+    #[test]
+    fn polyhedra_have_no_minus_z_uv_wrap_seam() {
+        let meshes = [
+            ("tetra_0", build_tetrahedron(5.0, 0)),
+            ("tetra_2", build_tetrahedron(5.0, 2)),
+            ("octa_0", build_octahedron(5.0, 0)),
+            ("octa_2", build_octahedron(5.0, 2)),
+            ("icosa_0", build_icosahedron(5.0, 0)),
+            ("icosa_2", build_icosahedron(5.0, 2)),
+            ("dodeca_0", build_dodecahedron(5.0, 0)),
+            ("dodeca_2", build_dodecahedron(5.0, 2)),
+        ];
+        for (label, mesh) in meshes {
+            assert_valid_mesh(&mesh, label);
+            for tri in mesh.indices.as_chunks::<3>().0 {
+                let u0 = mesh.vertices[tri[0] as usize].uv[0];
+                let u1 = mesh.vertices[tri[1] as usize].uv[0];
+                let u2 = mesh.vertices[tri[2] as usize].uv[0];
+                let span = u0.max(u1).max(u2) - u0.min(u1).min(u2);
+                assert!(
+                    span <= 0.5 + 1e-4,
+                    "{label}: triangle has UV seam wrap span {span} (u = [{u0}, {u1}, {u2}])"
+                );
+            }
+        }
+    }
 }

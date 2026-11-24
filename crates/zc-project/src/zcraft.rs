@@ -22,7 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ProjectError;
 use crate::atomic::write_atomic;
-use crate::model::{PROJECT_SCHEMA_VERSION, Project};
+use crate::model::{Layer, LayerKind, PROJECT_SCHEMA_VERSION, Project, Sequence};
 use crate::sha256::sha256_hex;
 
 /// Maximum uncompressed TAR stream size (2 GiB).
@@ -210,6 +210,9 @@ pub(crate) fn validate_archive_path(
     }
 
     if segments.is_empty() {
+        if allow_trailing_slash && (trimmed == "." || trimmed == "./") {
+            return Ok(String::new());
+        }
         return Err(ProjectError::InvalidArchivePath(raw.to_owned()));
     }
 
@@ -321,6 +324,9 @@ fn save_zcraft_to_bytes_with_limits(
         });
     }
     check_json_depth(&project_json, max_json_depth)?;
+    // Verify the serialized JSON round-trips cleanly so non-finite floats (serialized
+    // by `serde_json` as `null`) or malformed types never produce an unreadable archive.
+    let _: Project = serde_json::from_slice(&project_json)?;
 
     let mut integrity = BTreeMap::new();
     integrity.insert(
@@ -589,8 +595,15 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
         let normalized = validate_archive_path(raw_path, false)?;
         match normalized.as_str() {
             "meta.json" | "manifest.json" => {
+                if meta.is_some() {
+                    return Err(ProjectError::UnsupportedFormat(format!(
+                        "duplicate archive manifest entry {normalized:?}"
+                    )));
+                }
                 let raw = read_bounded_json_entry(&mut entry, &normalized, max_json_bytes)
-                    .map_err(|err| map_limit_err(err, &exceeded, max_uncompressed))?;
+                    .map_err(|err| {
+                        map_limit_err(err, &exceeded, &raw_exceeded, max_uncompressed)
+                    })?;
                 let parsed: ZcraftMeta = serde_json::from_slice(&raw)?;
                 if parsed.format != "zoidcraft" {
                     return Err(ProjectError::UnsupportedFormat(format!(
@@ -598,13 +611,24 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
                         parsed.format
                     )));
                 }
-                if meta.is_none() || normalized == "manifest.json" {
-                    meta = Some(parsed);
+                if parsed.schema_version > PROJECT_SCHEMA_VERSION {
+                    return Err(ProjectError::UnsupportedFormat(format!(
+                        "unsupported manifest schema_version {} (max supported: {PROJECT_SCHEMA_VERSION})",
+                        parsed.schema_version
+                    )));
                 }
+                meta = Some(parsed);
             }
             "project.json" => {
+                if project_bytes.is_some() {
+                    return Err(ProjectError::UnsupportedFormat(
+                        "duplicate archive entry \"project.json\"".to_owned(),
+                    ));
+                }
                 let raw = read_bounded_json_entry(&mut entry, &normalized, max_json_bytes)
-                    .map_err(|err| map_limit_err(err, &exceeded, max_uncompressed))?;
+                    .map_err(|err| {
+                        map_limit_err(err, &exceeded, &raw_exceeded, max_uncompressed)
+                    })?;
                 project_bytes = Some(raw);
             }
             path if path.starts_with("assets/") => {
@@ -622,7 +646,12 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
                 let mut data = Vec::new();
                 let mut bounded = (&mut entry).take(remaining_budget.saturating_add(1));
                 bounded.read_to_end(&mut data).map_err(|err| {
-                    map_limit_err(ProjectError::Io(err), &exceeded, max_uncompressed)
+                    map_limit_err(
+                        ProjectError::Io(err),
+                        &exceeded,
+                        &raw_exceeded,
+                        max_uncompressed,
+                    )
                 })?;
                 if (data.len() as u64) > remaining_budget {
                     return Err(ProjectError::ArchiveTooLarge {
@@ -636,7 +665,12 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
                 // Drain unknown non-asset files through the limited reader to enforce size caps.
                 let mut sink = io::sink();
                 io::copy(&mut entry, &mut sink).map_err(|err| {
-                    map_limit_err(ProjectError::Io(err), &exceeded, max_uncompressed)
+                    map_limit_err(
+                        ProjectError::Io(err),
+                        &exceeded,
+                        &raw_exceeded,
+                        max_uncompressed,
+                    )
                 })?;
             }
         }
@@ -647,6 +681,14 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
     if let Some(ref meta_doc) = meta
         && let Some(expected) = meta_doc.integrity.get("project.json")
     {
+        let actual_size = project_bytes.len() as u64;
+        if actual_size != expected.size {
+            return Err(ProjectError::IntegrityMismatch {
+                entry: "project.json".to_owned(),
+                expected: format!("{} bytes", expected.size),
+                actual: format!("{actual_size} bytes"),
+            });
+        }
         let actual = sha256_hex(&project_bytes);
         if actual != expected.sha256 {
             return Err(ProjectError::IntegrityMismatch {
@@ -658,6 +700,12 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
     }
 
     let mut project: Project = serde_json::from_slice(&project_bytes)?;
+    if project.version > PROJECT_SCHEMA_VERSION {
+        return Err(ProjectError::UnsupportedFormat(format!(
+            "unsupported project version {} (max supported: {PROJECT_SCHEMA_VERSION})",
+            project.version
+        )));
+    }
 
     if let Some(ref meta_doc) = meta {
         if !meta_doc.created_utc.is_empty() {
@@ -692,6 +740,14 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
         for (asset_id, data) in &asset_blobs {
             let entry_key = format!("assets/{asset_id}");
             if let Some(expected) = meta_doc.integrity.get(&entry_key) {
+                let actual_size = data.len() as u64;
+                if actual_size != expected.size {
+                    return Err(ProjectError::IntegrityMismatch {
+                        entry: entry_key,
+                        expected: format!("{} bytes", expected.size),
+                        actual: format!("{actual_size} bytes"),
+                    });
+                }
                 let actual = sha256_hex(data);
                 if actual != expected.sha256 {
                     return Err(ProjectError::IntegrityMismatch {
@@ -706,9 +762,17 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
 
     for (asset_id, record) in &mut project.assets {
         if let Some(data) = asset_blobs.remove(asset_id) {
+            let actual_sha = sha256_hex(&data);
+            if !record.sha256.is_empty() && !record.sha256.eq_ignore_ascii_case(&actual_sha) {
+                return Err(ProjectError::IntegrityMismatch {
+                    entry: format!("assets/{asset_id}"),
+                    expected: record.sha256.clone(),
+                    actual: actual_sha,
+                });
+            }
             record.size = data.len() as u64;
             if record.sha256.is_empty() {
-                record.sha256 = sha256_hex(&data);
+                record.sha256 = actual_sha;
             }
             record.bytes = Some(data);
             record.missing = false;
@@ -718,18 +782,45 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
         }
     }
 
-    project.sequence.fps = project.sequence.fps.clamp(1, 240);
-    project.sequence.resolution[0] = project.sequence.resolution[0].max(1);
-    project.sequence.resolution[1] = project.sequence.resolution[1].max(1);
-    if !project.sequence.length_frames.is_finite() || project.sequence.length_frames < 1.0 {
-        project.sequence.length_frames = 1.0;
+    sanitize_sequence(&mut project.sequence);
+    for comp in project.compositions.values_mut() {
+        sanitize_sequence(comp);
     }
 
     Ok(project)
 }
 
-fn map_limit_err(err: ProjectError, exceeded: &AtomicBool, max_uncompressed: u64) -> ProjectError {
-    if exceeded.load(Ordering::SeqCst) {
+fn sanitize_layer(layer: &mut Layer) {
+    layer.resolution[0] = layer.resolution[0].max(1);
+    layer.resolution[1] = layer.resolution[1].max(1);
+    if let LayerKind::Composite { layers } = &mut layer.kind {
+        for child in layers {
+            sanitize_layer(child);
+        }
+    }
+}
+
+fn sanitize_sequence(seq: &mut Sequence) {
+    seq.fps = seq.fps.clamp(1, 240);
+    seq.resolution[0] = seq.resolution[0].max(1);
+    seq.resolution[1] = seq.resolution[1].max(1);
+    if !seq.length_frames.is_finite() || seq.length_frames < 1.0 {
+        seq.length_frames = 1.0;
+    }
+    for track in &mut seq.video_tracks {
+        for clip in &mut track.clips {
+            sanitize_layer(&mut clip.layer);
+        }
+    }
+}
+
+fn map_limit_err(
+    err: ProjectError,
+    exceeded: &AtomicBool,
+    raw_exceeded: &AtomicBool,
+    max_uncompressed: u64,
+) -> ProjectError {
+    if exceeded.load(Ordering::SeqCst) || raw_exceeded.load(Ordering::SeqCst) {
         ProjectError::ArchiveTooLarge {
             limit_bytes: max_uncompressed,
         }
@@ -741,7 +832,7 @@ fn map_limit_err(err: ProjectError, exceeded: &AtomicBool, max_uncompressed: u64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AssetKind, AssetRecord, AssetSource};
+    use crate::model::{AssetKind, AssetRecord, AssetSource, EffectKind};
     use std::fs;
 
     struct TestDir(std::path::PathBuf);
@@ -1106,6 +1197,248 @@ mod tests {
                 MAX_JSON_ENTRY_BYTES,
                 MAX_ARCHIVE_ENTRIES,
                 MAX_JSON_NESTING_DEPTH,
+            ),
+            Err(ProjectError::ArchiveTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn zcraft_roundtrips_standard_and_namespaced_plugin_effects() {
+        let dir = TestDir::new();
+        let archive_path = dir.0.join("effects.zcraft");
+
+        let mut project = Project::new_cm3_default();
+        let layer = &mut project.sequence.video_tracks[0].clips[0].layer;
+        layer
+            .effects
+            .push(crate::effects::create_standard_effect("bloom").expect("bloom"));
+        layer
+            .effects
+            .push(crate::effects::create_zoidium_effect("vhs").expect("vhs"));
+        project
+            .plugin_requirements
+            .insert("openzoid-legacy".to_owned());
+
+        save_zcraft(&project, &archive_path).expect("save project with standard and plugin fx");
+        let loaded = load_zcraft(&archive_path).expect("load project with standard and plugin fx");
+        let loaded_fx = &loaded.sequence.video_tracks[0].clips[0].layer.effects;
+        assert_eq!(loaded_fx.len(), 2);
+        assert_eq!(loaded_fx[0].kind, EffectKind::Standard("bloom".to_owned()));
+        assert_eq!(
+            loaded_fx[1].kind,
+            EffectKind::Plugin {
+                plugin_id: "openzoid-legacy".to_owned(),
+                effect_id: "vhs".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn save_rejects_non_finite_floats_without_clobbering_existing_file() {
+        let dir = TestDir::new();
+        let archive_path = dir.0.join("finite.zcraft");
+
+        let valid = Project::new_cm3_default();
+        save_zcraft(&valid, &archive_path).expect("initial save");
+
+        let mut bad = Project::new_cm3_default();
+        bad.sequence.video_tracks[0].clips[0].layer.opacity =
+            crate::model::PropertyTrack::number(f64::NAN);
+        assert!(save_zcraft(&bad, &archive_path).is_err());
+
+        let reloaded = load_zcraft(&archive_path).expect("existing file must remain readable");
+        assert_eq!(reloaded.name, valid.name);
+    }
+
+    #[test]
+    fn loader_sanitizes_compositions_and_enforces_integrity_versions_and_duplicates() {
+        // 1. Sanitizes compositions and nested layer resolutions.
+        let mut proj = Project::new_cm3_default();
+        let comp_id = uuid::Uuid::new_v4();
+        let mut comp = Sequence {
+            fps: 0,
+            resolution: [0, 0],
+            length_frames: -5.0,
+            ..Sequence::default()
+        };
+        let mut nested_child = Layer::new("Child", LayerKind::Generator, [0, 0]);
+        nested_child.resolution = [0, 0];
+        let mut parent_layer = Layer::new(
+            "Parent",
+            LayerKind::Composite {
+                layers: vec![nested_child],
+            },
+            [0, 0],
+        );
+        parent_layer.resolution = [0, 0];
+        comp.video_tracks.push(crate::model::VideoTrack {
+            id: uuid::Uuid::new_v4(),
+            name: "V1".into(),
+            enabled: true,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![crate::model::VideoClip {
+                id: uuid::Uuid::new_v4(),
+                name: "CompClip".into(),
+                start: 0.0,
+                length: 10.0,
+                link: None,
+                media: None,
+                time_curve: crate::model::PropertyTrack::linear_time_curve(10.0, 30),
+                layer: parent_layer,
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        });
+        proj.compositions.insert(comp_id, comp);
+        let bytes = save_zcraft_to_bytes(&proj).expect("save");
+        let loaded = load_zcraft_from_bytes(&bytes).expect("load");
+        let loaded_comp = &loaded.compositions[&comp_id];
+        assert_eq!(loaded_comp.fps, 1);
+        assert_eq!(loaded_comp.resolution, [1, 1]);
+        assert!((loaded_comp.length_frames - 1.0).abs() < 1e-9);
+        let loaded_layer = &loaded_comp.video_tracks[0].clips[0].layer;
+        assert_eq!(loaded_layer.resolution, [1, 1]);
+        let LayerKind::Composite { ref layers } = loaded_layer.kind else {
+            panic!("expected composite");
+        };
+        assert_eq!(layers[0].resolution, [1, 1]);
+
+        // 2. Rejects duplicate manifest.json and duplicate project.json.
+        let base_proj = Project::new_cm3_default();
+        let p_json = serde_json::to_vec(&base_proj).expect("json");
+        let valid_meta = serde_json::to_vec(&ZcraftMeta {
+            format: "zoidcraft".into(),
+            schema_version: PROJECT_SCHEMA_VERSION,
+            app_version: "0.1.0".into(),
+            project_name: "Dup".into(),
+            created_utc: String::new(),
+            modified_utc: String::new(),
+            imported_from_pz_version: None,
+            required_plugins: Vec::new(),
+            missing_assets: Vec::new(),
+            integrity: BTreeMap::new(),
+        })
+        .expect("meta");
+        let dup_manifest = build_raw_tgz(&[
+            ("manifest.json", tar::EntryType::Regular, &valid_meta),
+            ("manifest.json", tar::EntryType::Regular, &valid_meta),
+            ("project.json", tar::EntryType::Regular, &p_json),
+        ]);
+        assert!(matches!(
+            load_zcraft_from_bytes(&dup_manifest),
+            Err(ProjectError::UnsupportedFormat(_))
+        ));
+        let dup_project = build_raw_tgz(&[
+            ("manifest.json", tar::EntryType::Regular, &valid_meta),
+            ("project.json", tar::EntryType::Regular, &p_json),
+            ("project.json", tar::EntryType::Regular, &p_json),
+        ]);
+        assert!(matches!(
+            load_zcraft_from_bytes(&dup_project),
+            Err(ProjectError::UnsupportedFormat(_))
+        ));
+
+        // 3. Rejects future schema_version and project.version.
+        let future_meta = serde_json::to_vec(&ZcraftMeta {
+            format: "zoidcraft".into(),
+            schema_version: PROJECT_SCHEMA_VERSION + 1,
+            app_version: "9.9.9".into(),
+            project_name: "Future".into(),
+            created_utc: String::new(),
+            modified_utc: String::new(),
+            imported_from_pz_version: None,
+            required_plugins: Vec::new(),
+            missing_assets: Vec::new(),
+            integrity: BTreeMap::new(),
+        })
+        .expect("future meta");
+        let future_manifest_tgz = build_raw_tgz(&[
+            ("manifest.json", tar::EntryType::Regular, &future_meta),
+            ("project.json", tar::EntryType::Regular, &p_json),
+        ]);
+        assert!(matches!(
+            load_zcraft_from_bytes(&future_manifest_tgz),
+            Err(ProjectError::UnsupportedFormat(_))
+        ));
+
+        let mut future_proj = Project::new_cm3_default();
+        future_proj.version = PROJECT_SCHEMA_VERSION + 1;
+        let fp_json = serde_json::to_vec(&future_proj).expect("fp json");
+        let future_proj_tgz = build_raw_tgz(&[("project.json", tar::EntryType::Regular, &fp_json)]);
+        assert!(matches!(
+            load_zcraft_from_bytes(&future_proj_tgz),
+            Err(ProjectError::UnsupportedFormat(_))
+        ));
+
+        // 4. Rejects IntegrityEntry size mismatch even when sha256 matches.
+        let mut bad_size_integrity = BTreeMap::new();
+        bad_size_integrity.insert(
+            "project.json".to_owned(),
+            IntegrityEntry {
+                size: p_json.len() as u64 + 1,
+                sha256: sha256_hex(&p_json),
+            },
+        );
+        let bad_size_meta = serde_json::to_vec(&ZcraftMeta {
+            format: "zoidcraft".into(),
+            schema_version: PROJECT_SCHEMA_VERSION,
+            app_version: "0.1.0".into(),
+            project_name: "BadSize".into(),
+            created_utc: String::new(),
+            modified_utc: String::new(),
+            imported_from_pz_version: None,
+            required_plugins: Vec::new(),
+            missing_assets: Vec::new(),
+            integrity: bad_size_integrity,
+        })
+        .expect("bad size meta");
+        let bad_size_tgz = build_raw_tgz(&[
+            ("manifest.json", tar::EntryType::Regular, &bad_size_meta),
+            ("project.json", tar::EntryType::Regular, &p_json),
+        ]);
+        assert!(matches!(
+            load_zcraft_from_bytes(&bad_size_tgz),
+            Err(ProjectError::IntegrityMismatch { .. })
+        ));
+
+        // 5. Rejects tampered asset against record.sha256 even without manifest.json.
+        let mut asset_proj = Project::new_cm3_default();
+        let key = asset_proj.insert_binary_asset(AssetKind::Image, "a.png", b"good".to_vec());
+        let ap_json = serde_json::to_vec(&asset_proj).expect("ap json");
+        let asset_path = format!("assets/{key}");
+        let tampered_no_manifest = build_raw_tgz(&[
+            ("project.json", tar::EntryType::Regular, &ap_json),
+            (&asset_path, tar::EntryType::Regular, b"evil"),
+        ]);
+        assert!(matches!(
+            load_zcraft_from_bytes(&tampered_no_manifest),
+            Err(ProjectError::IntegrityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn raw_compressed_limit_maps_to_archive_too_large_during_entry_read() {
+        let mut proj = Project::new_cm3_default();
+        // Incompressible pseudo-random bytes so compressed stream is larger than raw limit.
+        let mut blob = Vec::with_capacity(8192);
+        let mut state: u32 = 0x1234_5678;
+        for _ in 0..8192 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            blob.push((state >> 24) as u8);
+        }
+        proj.insert_binary_asset(AssetKind::Misc, "noise.bin", blob);
+        let bytes = save_zcraft_to_bytes(&proj).expect("save");
+        // Set max_uncompressed smaller than compressed size so `raw_exceeded` triggers mid-entry.
+        let limit = (bytes.len() / 2) as u64;
+        assert!(matches!(
+            load_zcraft_from_reader_with_limits(
+                bytes.as_slice(),
+                limit,
+                MAX_JSON_ENTRY_BYTES,
+                MAX_ARCHIVE_ENTRIES,
+                MAX_RETAINED_ASSET_BYTES,
             ),
             Err(ProjectError::ArchiveTooLarge { .. })
         ));

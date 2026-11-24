@@ -48,13 +48,24 @@ pub struct PlaybackSnapshot {
     pub hardware_clock_active: bool,
 }
 
+struct CommitContext {
+    hw_now: u64,
+    now_nanos: u64,
+    current_frame: f64,
+    hit_stop: bool,
+}
+
 struct ClockShared {
     /// Seqlock counter (odd while a control-thread mutation is in flight, even when stable).
     seq: AtomicU64,
     /// Serializes control-thread writers (never locked inside the real-time audio callback).
     writer_lock: Mutex<()>,
-    /// Wall-clock anchor used when no hardware audio stream is active.
-    wall_anchor: Mutex<Instant>,
+    /// Monotonic origin timestamp set once at construction for lock-free wall-clock offsets.
+    clock_origin: Instant,
+    /// Nanoseconds elapsed since `clock_origin` when the current epoch was anchored.
+    wall_anchor_nanos: AtomicU64,
+    /// Monotonically increasing identifier of the currently active live output stream (`0` = none).
+    active_stream_id: AtomicU64,
 
     epoch_id: AtomicU64,
     anchor_exact_frame_bits: AtomicU64,
@@ -93,7 +104,9 @@ impl ClockShared {
         Self {
             seq: AtomicU64::new(0),
             writer_lock: Mutex::new(()),
-            wall_anchor: Mutex::new(Instant::now()),
+            clock_origin: Instant::now(),
+            wall_anchor_nanos: AtomicU64::new(0),
+            active_stream_id: AtomicU64::new(0),
             epoch_id: AtomicU64::new(1),
             anchor_exact_frame_bits: AtomicU64::new(0.0_f64.to_bits()),
             anchor_sample_count: AtomicU64::new(0),
@@ -110,31 +123,42 @@ impl ClockShared {
         }
     }
 
-    /// Lock-free, tear-free read of the current clock parameters (safe in real-time audio callbacks).
-    fn read_snapshot(&self) -> PlaybackSnapshot {
+    #[inline]
+    fn now_nanos(&self) -> u64 {
+        u64::try_from(self.clock_origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Lock-free, tear-free read of the current clock parameters and wall-clock anchor
+    /// (safe in real-time audio callbacks).
+    fn read_snapshot_with_wall(&self) -> (PlaybackSnapshot, u64) {
         for _ in 0..64 {
             let s1 = self.seq.load(Ordering::Acquire);
             if s1 & 1 != 0 {
                 std::hint::spin_loop();
                 continue;
             }
-            let snap = self.read_snapshot_relaxed();
+            let (snap, wall_nanos) = self.read_snapshot_relaxed_with_wall();
             fence(Ordering::Acquire);
             let s2 = self.seq.load(Ordering::Relaxed);
             if s1 == s2 {
-                return snap;
+                return (snap, wall_nanos);
             }
             std::hint::spin_loop();
         }
         // Fallback after bounded spin: return a paused snapshot to avoid ever blocking audio.
-        let mut snap = self.read_snapshot_relaxed();
+        let (mut snap, wall_nanos) = self.read_snapshot_relaxed_with_wall();
         snap.speed = 0.0;
-        snap
+        (snap, wall_nanos)
+    }
+
+    /// Lock-free, tear-free read of the current clock parameters (safe in real-time audio callbacks).
+    fn read_snapshot(&self) -> PlaybackSnapshot {
+        self.read_snapshot_with_wall().0
     }
 
     #[inline]
-    fn read_snapshot_relaxed(&self) -> PlaybackSnapshot {
-        PlaybackSnapshot {
+    fn read_snapshot_relaxed_with_wall(&self) -> (PlaybackSnapshot, u64) {
+        let snap = PlaybackSnapshot {
             epoch_id: self.epoch_id.load(Ordering::Relaxed),
             anchor_exact_frame: f64::from_bits(
                 self.anchor_exact_frame_bits.load(Ordering::Relaxed),
@@ -146,7 +170,9 @@ impl ClockShared {
             loop_enabled: self.loop_enabled.load(Ordering::Relaxed),
             sample_rate: self.sample_rate.load(Ordering::Relaxed).max(1),
             hardware_clock_active: self.hardware_clock_active.load(Ordering::Relaxed),
-        }
+        };
+        let wall_nanos = self.wall_anchor_nanos.load(Ordering::Relaxed);
+        (snap, wall_nanos)
     }
 
     /// Computes exact frame at a given hardware sample count relative to `anchor_sample`.
@@ -174,11 +200,15 @@ impl ClockShared {
         written.saturating_sub(latency)
     }
 
-    /// Computes current exact frame (using hardware counter if active, else monotonic wall clock).
-    fn current_exact_frame_and_stop_flag(&self) -> (f64, bool, PlaybackSnapshot) {
-        let snap = self.read_snapshot();
+    /// Evaluates current exact frame and stop flag from an already-consistent `(snap, wall_anchor_nanos)`.
+    fn evaluate_snapshot_at(
+        &self,
+        snap: &PlaybackSnapshot,
+        wall_anchor_nanos: u64,
+        now_nanos: u64,
+    ) -> (f64, bool) {
         if snap.speed == 0.0 {
-            return (snap.anchor_exact_frame, false, snap);
+            return (snap.anchor_exact_frame, false);
         }
 
         let raw_frame = if snap.hardware_clock_active {
@@ -194,41 +224,56 @@ impl ClockShared {
                 snap.anchor_exact_frame + elapsed_sec * snap.fps * snap.speed
             }
         } else {
-            let elapsed_sec = self
-                .wall_anchor
-                .lock()
-                .map(|inst| inst.elapsed().as_secs_f64())
-                .unwrap_or(0.0);
+            let elapsed_sec = (now_nanos.saturating_sub(wall_anchor_nanos) as f64) * 1e-9;
             snap.anchor_exact_frame + elapsed_sec * snap.fps * snap.speed
         };
 
-        let (bounded, hit_stop) = apply_bounds(raw_frame, snap.total_frames, snap.loop_enabled);
+        apply_bounds(raw_frame, snap.total_frames, snap.loop_enabled)
+    }
+
+    /// Computes current exact frame (using hardware counter if active, else monotonic wall clock).
+    fn current_exact_frame_and_stop_flag(&self) -> (f64, bool, PlaybackSnapshot) {
+        let (snap, wall_anchor_nanos) = self.read_snapshot_with_wall();
+        let now_nanos = self.now_nanos();
+        let (bounded, hit_stop) = self.evaluate_snapshot_at(&snap, wall_anchor_nanos, now_nanos);
         (bounded, hit_stop, snap)
     }
 
-    /// Mutates the clock atomically under the control-thread seqlock and bumps `epoch_id`.
+    /// Conditionally mutates the clock atomically under the control-thread writer lock and seqlock.
     ///
-    /// Anchors `hw_now` to the **submission cursor** (`hardware_sample_count`) so the very next
-    /// audio callback synthesizes sample 0 at the exact requested frame without skipping the
-    /// queued latency interval, while visual playhead queries subtract `output_latency_samples`.
-    fn commit_update<F>(&self, bump_epoch: bool, mutate: F) -> u64
+    /// Evaluates the current exact frame while holding `writer_lock` so concurrent control-thread
+    /// mutations never race on a stale frame reading. If `mutate` returns `false`, no seqlock
+    /// write or epoch bump is performed and `None` is returned.
+    fn try_commit_update<F>(&self, bump_epoch: bool, mutate: F) -> Option<u64>
     where
-        F: FnOnce(&mut PlaybackSnapshot, u64),
+        F: FnOnce(&mut PlaybackSnapshot, &mut u64, CommitContext) -> bool,
     {
         let _guard = self
             .writer_lock
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
+        let (mut snap, mut wall_anchor_nanos) = self.read_snapshot_relaxed_with_wall();
+        let now_nanos = self.now_nanos();
+        let (current_frame, hit_stop) =
+            self.evaluate_snapshot_at(&snap, wall_anchor_nanos, now_nanos);
         let hw_now = self.hardware_sample_count.load(Ordering::Acquire);
-        let mut snap = self.read_snapshot_relaxed();
-        mutate(&mut snap, hw_now);
+        let ctx = CommitContext {
+            hw_now,
+            now_nanos,
+            current_frame,
+            hit_stop,
+        };
+
+        if !mutate(&mut snap, &mut wall_anchor_nanos, ctx) {
+            return None;
+        }
 
         if bump_epoch {
             snap.epoch_id = snap.epoch_id.wrapping_add(1);
         }
 
-        // Begin seqlock write (odd)
+        // Begin seqlock write (odd) — strictly lock-free atomic stores only.
         let prev_seq = self.seq.load(Ordering::Relaxed);
         self.seq.store(prev_seq.wrapping_add(1), Ordering::Release);
         fence(Ordering::Release);
@@ -249,25 +294,48 @@ impl ClockShared {
             .store(snap.sample_rate.max(1), Ordering::Relaxed);
         self.hardware_clock_active
             .store(snap.hardware_clock_active, Ordering::Relaxed);
-
-        if let Ok(mut wall) = self.wall_anchor.lock() {
-            *wall = Instant::now();
-        }
+        self.wall_anchor_nanos
+            .store(wall_anchor_nanos, Ordering::Relaxed);
 
         // End seqlock write (even)
         self.seq.store(prev_seq.wrapping_add(2), Ordering::Release);
-        snap.epoch_id
+
+        if !snap.hardware_clock_active {
+            self.output_latency_samples.store(0, Ordering::Release);
+        }
+
+        Some(snap.epoch_id)
     }
 
-    fn detach_hardware_clock(&self) {
-        let (current_frame, hit_stop, _) = self.current_exact_frame_and_stop_flag();
-        self.commit_update(false, |snap, hw_now| {
-            snap.anchor_exact_frame = current_frame;
-            snap.anchor_sample_count = hw_now;
+    /// Mutates the clock atomically under the control-thread seqlock and optionally bumps `epoch_id`.
+    ///
+    /// Anchors `hw_now` to the **submission cursor** (`hardware_sample_count`) so the very next
+    /// audio callback synthesizes sample 0 at the exact requested frame without skipping the
+    /// queued latency interval, while visual playhead queries subtract `output_latency_samples`.
+    fn commit_update<F>(&self, bump_epoch: bool, mutate: F) -> u64
+    where
+        F: FnOnce(&mut PlaybackSnapshot, &mut u64, CommitContext),
+    {
+        self.try_commit_update(bump_epoch, |snap, wall_anchor_nanos, ctx| {
+            mutate(snap, wall_anchor_nanos, ctx);
+            true
+        })
+        .unwrap_or_else(|| self.epoch_id.load(Ordering::Acquire))
+    }
+
+    fn detach_hardware_clock(&self, expected_stream_id: u64) {
+        self.try_commit_update(false, |snap, wall_anchor_nanos, ctx| {
+            if self.active_stream_id.load(Ordering::Acquire) != expected_stream_id {
+                return false;
+            }
+            snap.anchor_exact_frame = ctx.current_frame;
+            snap.anchor_sample_count = ctx.hw_now;
             snap.hardware_clock_active = false;
-            if hit_stop {
+            *wall_anchor_nanos = ctx.now_nanos;
+            if ctx.hit_stop {
                 snap.speed = 0.0;
             }
+            true
         });
     }
 }
@@ -346,13 +414,23 @@ impl MasterPlaybackClock {
     /// Automatically stops playback if non-looping playback has reached either sequence boundary.
     #[must_use]
     pub fn exact_frame(&self) -> f64 {
-        let (frame, hit_stop, _) = self.shared.current_exact_frame_and_stop_flag();
+        let (frame, hit_stop, observed_snap) = self.shared.current_exact_frame_and_stop_flag();
         if hit_stop {
-            self.shared.commit_update(true, |snap, hw_now| {
-                snap.anchor_exact_frame = frame;
-                snap.anchor_sample_count = hw_now;
-                snap.speed = 0.0;
-            });
+            let mut result_frame = frame;
+            self.shared
+                .try_commit_update(true, |snap, wall_anchor_nanos, ctx| {
+                    if snap.epoch_id != observed_snap.epoch_id || !ctx.hit_stop {
+                        result_frame = ctx.current_frame;
+                        return false;
+                    }
+                    snap.anchor_exact_frame = ctx.current_frame;
+                    snap.anchor_sample_count = ctx.hw_now;
+                    snap.speed = 0.0;
+                    *wall_anchor_nanos = ctx.now_nanos;
+                    result_frame = ctx.current_frame;
+                    true
+                });
+            return result_frame;
         }
         frame
     }
@@ -420,90 +498,102 @@ impl MasterPlaybackClock {
     /// Sets playback speed multiplier, re-anchoring smoothly at the current frame and bumping epoch.
     pub fn set_speed(&self, speed: f64) -> u64 {
         let clean_speed = if speed.is_finite() { speed } else { 0.0 };
-        let (frame, _, _) = self.shared.current_exact_frame_and_stop_flag();
-        self.shared.commit_update(true, |snap, hw_now| {
-            snap.anchor_exact_frame = frame;
-            snap.anchor_sample_count = hw_now;
-            snap.speed = clean_speed;
-        })
+        self.shared
+            .commit_update(true, |snap, wall_anchor_nanos, ctx| {
+                snap.anchor_exact_frame = ctx.current_frame;
+                snap.anchor_sample_count = ctx.hw_now;
+                snap.speed = clean_speed;
+                *wall_anchor_nanos = ctx.now_nanos;
+            })
     }
 
     /// Scrubs immediately to `frame`, pausing playback (`speed = 0.0`), clamping to
     /// `[0, max(total_frames - 1, 0)]`, and incrementing `epoch_id` (Spec 02 §5.1).
     pub fn set_frame(&self, frame: f64) -> u64 {
-        self.shared.commit_update(true, |snap, hw_now| {
-            let max_frame = (snap.total_frames - 1.0).max(0.0);
-            let clamped = if frame.is_finite() {
-                frame.clamp(0.0, max_frame)
-            } else {
-                0.0
-            };
-            snap.anchor_exact_frame = clamped;
-            snap.anchor_sample_count = hw_now;
-            snap.speed = 0.0;
-        })
+        self.shared
+            .commit_update(true, |snap, wall_anchor_nanos, ctx| {
+                let max_frame = (snap.total_frames - 1.0).max(0.0);
+                let clamped = if frame.is_finite() {
+                    frame.clamp(0.0, max_frame)
+                } else {
+                    0.0
+                };
+                snap.anchor_exact_frame = clamped;
+                snap.anchor_sample_count = ctx.hw_now;
+                snap.speed = 0.0;
+                *wall_anchor_nanos = ctx.now_nanos;
+            })
     }
 
     /// Seeks immediately to `frame` while preserving the active playback speed,
     /// re-anchoring `anchor_sample_count` to the current hardware sample counter and
     /// bumping `epoch_id` so audio and video reposition with zero desync.
     pub fn seek_preserving_playback(&self, frame: f64) -> u64 {
-        self.shared.commit_update(true, |snap, hw_now| {
-            let max_frame = (snap.total_frames - 1.0).max(0.0);
-            let clamped = if frame.is_finite() {
-                frame.clamp(0.0, max_frame)
-            } else {
-                0.0
-            };
-            snap.anchor_exact_frame = clamped;
-            snap.anchor_sample_count = hw_now;
-        })
+        self.shared
+            .commit_update(true, |snap, wall_anchor_nanos, ctx| {
+                let max_frame = (snap.total_frames - 1.0).max(0.0);
+                let clamped = if frame.is_finite() {
+                    frame.clamp(0.0, max_frame)
+                } else {
+                    0.0
+                };
+                snap.anchor_exact_frame = clamped;
+                snap.anchor_sample_count = ctx.hw_now;
+                *wall_anchor_nanos = ctx.now_nanos;
+            })
     }
 
     /// Enables or disables loop wrapping at sequence boundaries.
     pub fn set_loop(&self, enabled: bool) {
-        self.shared.commit_update(false, |snap, _hw| {
-            snap.loop_enabled = enabled;
-        });
+        self.shared
+            .commit_update(false, |snap, _wall_anchor_nanos, _ctx| {
+                snap.loop_enabled = enabled;
+            });
     }
 
     /// Updates sequence `fps` and `total_frames`, clamping the current playhead and bumping epoch.
     pub fn set_timeline_config(&self, fps: f64, total_frames: f64) -> u64 {
-        let (frame, _, _) = self.shared.current_exact_frame_and_stop_flag();
-        self.shared.commit_update(true, |snap, hw_now| {
-            if fps.is_finite() && fps > 0.0 {
-                snap.fps = fps;
-            }
-            if total_frames.is_finite() && total_frames >= 0.0 {
-                snap.total_frames = total_frames;
-            }
-            let max_frame = (snap.total_frames - 1.0).max(0.0);
-            snap.anchor_exact_frame = frame.clamp(0.0, max_frame);
-            snap.anchor_sample_count = hw_now;
-        })
+        self.shared
+            .commit_update(true, |snap, wall_anchor_nanos, ctx| {
+                if fps.is_finite() && fps > 0.0 {
+                    snap.fps = fps;
+                }
+                if total_frames.is_finite() && total_frames >= 0.0 {
+                    snap.total_frames = total_frames;
+                }
+                let max_frame = (snap.total_frames - 1.0).max(0.0);
+                snap.anchor_exact_frame = ctx.current_frame.clamp(0.0, max_frame);
+                snap.anchor_sample_count = ctx.hw_now;
+                *wall_anchor_nanos = ctx.now_nanos;
+            })
     }
 
     /// Invalidates downstream clip/decoder schedules after a timeline edit while preserving playhead.
     pub fn invalidate_schedule(&self) -> u64 {
-        let (frame, _, _) = self.shared.current_exact_frame_and_stop_flag();
-        self.shared.commit_update(true, |snap, hw_now| {
-            snap.anchor_exact_frame = frame;
-            snap.anchor_sample_count = hw_now;
-        })
+        self.shared
+            .commit_update(true, |snap, wall_anchor_nanos, ctx| {
+                snap.anchor_exact_frame = ctx.current_frame;
+                snap.anchor_sample_count = ctx.hw_now;
+                *wall_anchor_nanos = ctx.now_nanos;
+            })
     }
 
     /// Enables or disables hardware sample-counter clock mode manually (useful for deterministic tests
     /// and headless drivers without an OS audio device).
     pub fn set_hardware_clock_mode(&self, active: bool, sample_rate: u32) {
-        let (frame, _, _) = self.shared.current_exact_frame_and_stop_flag();
-        self.shared.commit_update(false, |snap, hw_now| {
-            snap.anchor_exact_frame = frame;
-            snap.anchor_sample_count = hw_now;
-            snap.hardware_clock_active = active;
-            if sample_rate > 0 {
-                snap.sample_rate = sample_rate;
-            }
-        });
+        self.shared
+            .commit_update(true, |snap, wall_anchor_nanos, ctx| {
+                snap.anchor_exact_frame = ctx.current_frame;
+                snap.anchor_sample_count = ctx.hw_now;
+                snap.hardware_clock_active = active;
+                if sample_rate > 0 {
+                    snap.sample_rate = sample_rate;
+                }
+                if !active && ctx.hit_stop {
+                    snap.speed = 0.0;
+                }
+                *wall_anchor_nanos = ctx.now_nanos;
+            });
     }
 
     /// Advances the hardware sample counter by `sample_frames` (called by headless drivers or tests).
@@ -596,14 +686,30 @@ impl MasterPlaybackClock {
             ));
         }
 
-        // Anchor clock to hardware sample counter before starting playback.
-        let (frame, _, _) = self.shared.current_exact_frame_and_stop_flag();
-        self.shared.commit_update(false, |snap, hw_now| {
-            snap.anchor_exact_frame = frame;
-            snap.anchor_sample_count = hw_now;
-            snap.sample_rate = device_sr;
-            snap.hardware_clock_active = true;
-        });
+        // Anchor clock to hardware sample counter, bump epoch, and claim a unique stream ID
+        // before starting playback so re-attaching never double-counts prior samples.
+        let mut stream_id = 0_u64;
+        self.shared
+            .commit_update(true, |snap, wall_anchor_nanos, ctx| {
+                let mut next_id = self
+                    .shared
+                    .active_stream_id
+                    .fetch_add(1, Ordering::AcqRel)
+                    .wrapping_add(1);
+                if next_id == 0 {
+                    next_id = self
+                        .shared
+                        .active_stream_id
+                        .fetch_add(1, Ordering::AcqRel)
+                        .wrapping_add(1);
+                }
+                stream_id = next_id;
+                snap.anchor_exact_frame = ctx.current_frame;
+                snap.anchor_sample_count = ctx.hw_now;
+                snap.sample_rate = device_sr;
+                snap.hardware_clock_active = true;
+                *wall_anchor_nanos = ctx.now_nanos;
+            });
 
         let shared_cb = Arc::clone(&self.shared);
         let err_fn = |err| {
@@ -670,7 +776,7 @@ impl MasterPlaybackClock {
                 None,
             ),
             other => {
-                self.shared.detach_hardware_clock();
+                self.shared.detach_hardware_clock(stream_id);
                 return Err(AudioError::OutputDevice(format!(
                     "unsupported output sample format: {other:?}"
                 )));
@@ -680,19 +786,20 @@ impl MasterPlaybackClock {
         let stream = match stream_result {
             Ok(stream) => stream,
             Err(err) => {
-                self.shared.detach_hardware_clock();
+                self.shared.detach_hardware_clock(stream_id);
                 return Err(AudioError::OutputDevice(err.to_string()));
             }
         };
 
         if let Err(err) = stream.play() {
-            self.shared.detach_hardware_clock();
             drop(stream);
+            self.shared.detach_hardware_clock(stream_id);
             return Err(AudioError::OutputDevice(err.to_string()));
         }
 
         Ok(AudioOutputHandle {
-            _stream: stream,
+            stream: Some(stream),
+            stream_id,
             shared: Arc::clone(&self.shared),
             sample_rate: device_sr,
             channels: device_channels,
@@ -839,7 +946,8 @@ fn render_callback_frames_windowed<T, F>(
 /// Dropping this handle cleanly detaches the clock back to wall-clock fallback mode and
 /// stops/releases the underlying OS audio stream with zero leaked resources.
 pub struct AudioOutputHandle {
-    _stream: cpal::Stream,
+    stream: Option<cpal::Stream>,
+    stream_id: u64,
     shared: Arc<ClockShared>,
     sample_rate: u32,
     channels: u16,
@@ -861,7 +969,11 @@ impl AudioOutputHandle {
 
 impl Drop for AudioOutputHandle {
     fn drop(&mut self) {
-        self.shared.detach_hardware_clock();
+        // Drop the CPAL stream FIRST so the audio callback thread stops before we detach.
+        drop(self.stream.take());
+        if self.shared.active_stream_id.load(Ordering::Acquire) == self.stream_id {
+            self.shared.detach_hardware_clock(self.stream_id);
+        }
     }
 }
 
@@ -1057,5 +1169,68 @@ mod tests {
             active_out[0]
         );
         assert!((clock.exact_frame() - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hardware_reattach_bumps_epoch_and_clears_latency_without_double_count() {
+        let clock = MasterPlaybackClock::new(30.0, 300.0);
+        clock.set_hardware_clock_mode(true, STANDARD_SAMPLE_RATE);
+        clock.play();
+
+        // Advance 1.0s of hardware samples with non-zero output latency recorded.
+        clock
+            .shared
+            .output_latency_samples
+            .store(512, Ordering::Release);
+        clock.advance_hardware_samples(48_000);
+        let frame_before_detach = clock.exact_frame();
+        assert!((frame_before_detach - ((48_000.0 - 512.0) / 48_000.0) * 30.0).abs() < 1e-4);
+
+        // Detach back to wall-clock mode: latency must reset to 0 and epoch must bump.
+        let epoch_before_detach = clock.epoch();
+        clock.set_hardware_clock_mode(false, STANDARD_SAMPLE_RATE);
+        assert!(clock.epoch() > epoch_before_detach);
+        assert_eq!(
+            clock.shared.output_latency_samples.load(Ordering::Acquire),
+            0
+        );
+
+        // Re-attach hardware mode: epoch must bump again so stale callback latch is ignored
+        // and prior hardware samples are never double-counted.
+        let epoch_before_reattach = clock.epoch();
+        clock.set_hardware_clock_mode(true, STANDARD_SAMPLE_RATE);
+        assert!(clock.epoch() > epoch_before_reattach);
+        let frame_after_reattach = clock.exact_frame();
+        assert!(
+            (frame_after_reattach - frame_before_detach).abs() < 5.0,
+            "expected no double-count jump on re-attach: before={frame_before_detach}, after={frame_after_reattach}"
+        );
+    }
+
+    #[test]
+    fn detach_ignores_stale_stream_id() {
+        let clock = MasterPlaybackClock::new(30.0, 300.0);
+        clock.set_hardware_clock_mode(true, STANDARD_SAMPLE_RATE);
+        clock
+            .shared
+            .output_latency_samples
+            .store(256, Ordering::Release);
+        clock.shared.active_stream_id.store(2, Ordering::Release);
+
+        // Stale stream handle (id 1) must NOT clobber active stream (id 2).
+        clock.shared.detach_hardware_clock(1);
+        assert!(clock.snapshot().hardware_clock_active);
+        assert_eq!(
+            clock.shared.output_latency_samples.load(Ordering::Acquire),
+            256
+        );
+
+        // Matching stream handle (id 2) cleanly detaches and clears output latency.
+        clock.shared.detach_hardware_clock(2);
+        assert!(!clock.snapshot().hardware_clock_active);
+        assert_eq!(
+            clock.shared.output_latency_samples.load(Ordering::Acquire),
+            0
+        );
     }
 }

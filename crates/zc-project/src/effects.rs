@@ -584,8 +584,13 @@ pub fn create_zoidium_effect(id: &str) -> Option<EffectInstance> {
 }
 
 /// Instantiates either a standard CM3 effect or a Zoidium plugin effect by ID.
+/// Accepts both bare IDs (e.g. `"vhs"`) and namespaced IDs (e.g. `"zoidium:native-fx/vhs"`).
 #[must_use]
 pub fn create_effect_by_id(id: &str) -> Option<EffectInstance> {
+    if let Some(rest) = id.strip_prefix("zoidium:") {
+        let bare = rest.split_once('/').map_or(rest, |(_, e)| e);
+        return create_zoidium_effect(bare);
+    }
     create_standard_effect(id).or_else(|| create_zoidium_effect(id))
 }
 
@@ -923,6 +928,7 @@ fn default_zoidium_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> {
             p.insert("amount".into(), PropertyTrack::number(10.0));
             p.insert("center".into(), PropertyTrack::vec2([0.0, 0.0]));
             p.insert("samples".into(), PropertyTrack::number(16.0));
+            p.insert("dither".into(), PropertyTrack::number(0.5));
         }
         "dropshadow" => {
             p.insert("color".into(), PropertyTrack::color([0.0, 0.0, 0.0]));
@@ -943,6 +949,22 @@ fn default_zoidium_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> {
         }
         "magiclooks" => {
             p.insert("strength".into(), PropertyTrack::number(1.0));
+            p.insert("exposure".into(), PropertyTrack::number(0.0));
+            p.insert("contrast".into(), PropertyTrack::number(1.0));
+            p.insert("saturation".into(), PropertyTrack::number(1.0));
+            p.insert("diffusion".into(), PropertyTrack::number(0.0));
+            p.insert("temperature".into(), PropertyTrack::number(0.0));
+            p.insert("tint".into(), PropertyTrack::number(0.0));
+            p.insert("splitBalance".into(), PropertyTrack::number(0.5));
+            p.insert("vignetteStrength".into(), PropertyTrack::number(0.0));
+            p.insert("vignetteRadius".into(), PropertyTrack::number(0.75));
+            p.insert("chromaticAberration".into(), PropertyTrack::number(0.0));
+            p.insert("grain".into(), PropertyTrack::number(0.0));
+            p.insert("shadowTint".into(), PropertyTrack::color([1.0, 1.0, 1.0]));
+            p.insert(
+                "highlightTint".into(),
+                PropertyTrack::color([1.0, 1.0, 1.0]),
+            );
             p.insert(
                 "looksInstances".into(),
                 PropertyTrack::constant(PropertyValue::Json(serde_json::json!([]))),
@@ -953,24 +975,34 @@ fn default_zoidium_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> {
             p.insert("trackingJitter".into(), PropertyTrack::number(0.2));
             p.insert("chromaBleed".into(), PropertyTrack::number(0.35));
             p.insert("noise".into(), PropertyTrack::number(0.15));
+            p.insert("headSwitch".into(), PropertyTrack::number(0.5));
+            p.insert("scanlines".into(), PropertyTrack::number(0.4));
             p.insert("showTimestamp".into(), PropertyTrack::option(0));
         }
         "jpegdamage" => {
             p.insert("quality".into(), PropertyTrack::number(25.0));
+            p.insert("amount".into(), PropertyTrack::number(1.0));
+            p.insert("blockSize".into(), PropertyTrack::number(8.0));
             p.insert("chromaSubsample".into(), PropertyTrack::option(1));
             p.insert("blockJitter".into(), PropertyTrack::number(0.0));
         }
         "datamosh" => {
             p.insert("seed".into(), PropertyTrack::number(1.0));
+            p.insert("amount".into(), PropertyTrack::number(0.5));
             p.insert("intensity".into(), PropertyTrack::number(0.5));
+            p.insert("blockSize".into(), PropertyTrack::number(16.0));
             p.insert("motionFamily".into(), PropertyTrack::option(0));
             p.insert("lookMode".into(), PropertyTrack::option(0));
         }
         "tracery" => {
             p.insert("keyColor".into(), PropertyTrack::color([1.0, 1.0, 1.0]));
+            p.insert("accentColor".into(), PropertyTrack::color([0.2, 0.9, 1.0]));
             p.insert("threshold".into(), PropertyTrack::number(0.5));
             p.insert("blur".into(), PropertyTrack::number(1.0));
+            p.insert("gridSize".into(), PropertyTrack::number(32.0));
+            p.insert("opacity".into(), PropertyTrack::number(1.0));
             p.insert("showMask".into(), PropertyTrack::option(0));
+            p.insert("showGrid".into(), PropertyTrack::option(0));
         }
         "ascii" => {
             p.insert("cellSize".into(), PropertyTrack::number(10.0));
@@ -1103,5 +1135,20 @@ mod tests {
 
         let group = create_effect_group("Twitch");
         assert!(matches!(group.kind, EffectKind::EffectGroup { .. }));
+    }
+
+    #[test]
+    fn create_effect_by_id_handles_namespaced_plugin_ids_without_standard_collision() {
+        let vhs = create_effect_by_id("zoidium:openzoid-legacy/vhs").expect("namespaced vhs");
+        assert_eq!(
+            vhs.kind,
+            EffectKind::Plugin {
+                plugin_id: "openzoid-legacy".to_owned(),
+                effect_id: "vhs".to_owned(),
+            }
+        );
+        // Namespaced IDs must not fall back to standard effects.
+        assert!(create_effect_by_id("zoidium:custom/bloom").is_none());
+        assert!(create_effect_by_id("bloom").is_some());
     }
 }

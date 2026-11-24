@@ -309,11 +309,18 @@ impl Parser {
                         props.push(ObjectPatternProp::Rest(name));
                         break;
                     }
+                    let is_ident = matches!(self.peek_kind(), TokenKind::Ident(_));
                     let key = self.parse_static_prop_name()?;
                     let pattern = if self.eat(&TokenKind::Colon) {
                         self.parse_pattern()?
-                    } else {
+                    } else if is_ident {
                         Pattern::Ident(key.clone())
+                    } else {
+                        return Err(ExprError::SyntaxError {
+                            offset: self.peek().span.start,
+                            message: "expected ':' after non-identifier destructuring key"
+                                .to_string(),
+                        });
                     };
                     let default = if self.eat(&TokenKind::Eq) {
                         Some(self.parse_assignment_expr()?)
@@ -693,11 +700,10 @@ impl Parser {
         }
 
         // Parenthesized arrow function: `(a, b = 1, ...rest) => body`
-        if self.check(&TokenKind::LParen)
-            && let Some(params) = self.try_parse_arrow_params()?
-        {
+        if self.check(&TokenKind::LParen) && self.is_arrow_param_list_ahead() {
             self.require_expressions_plus("arrow function")?;
-            self.bump(); // `=>`
+            let params = self.parse_param_list()?;
+            self.expect(&TokenKind::FatArrow, "'=>'")?;
             let body = self.parse_arrow_body()?;
             return Ok(Expr::Function(Box::new(FunctionExpr {
                 name: None,
@@ -732,23 +738,46 @@ impl Parser {
         Ok(left)
     }
 
-    fn try_parse_arrow_params(&mut self) -> Result<Option<Vec<Param>>, ExprError> {
-        let saved = self.pos;
-        // Temporarily allow parsing destructuring params during speculative lookahead,
-        // and re-check mode if `=>` actually follows.
-        let saved_mode = self.mode;
-        self.mode = ExprMode::ExpressionsPlus;
-        let parsed = self.parse_param_list();
-        self.mode = saved_mode;
-
-        if let Ok(params) = parsed
-            && !self.peek().line_before
-            && self.check(&TokenKind::FatArrow)
-        {
-            return Ok(Some(params));
+    /// Linearly scans from `(` to its matching `)` and returns `true` iff `=>`
+    /// immediately follows on the same line, avoiding exponential backtracking.
+    fn is_arrow_param_list_ahead(&self) -> bool {
+        if !self.check(&TokenKind::LParen) {
+            return false;
         }
-        self.pos = saved;
-        Ok(None)
+        let mut paren_depth: usize = 0;
+        let mut bracket_depth: usize = 0;
+        let mut brace_depth: usize = 0;
+        let mut template_depth: usize = 0;
+        let mut i = self.pos;
+        while i < self.tokens.len() {
+            match self.tokens[i].kind {
+                TokenKind::LParen => paren_depth += 1,
+                TokenKind::RParen => {
+                    if paren_depth == 0 {
+                        return false;
+                    }
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
+                        if bracket_depth != 0 || brace_depth != 0 || template_depth != 0 {
+                            return false;
+                        }
+                        return self.tokens.get(i + 1).is_some_and(|tok| {
+                            !tok.line_before && tok.kind == TokenKind::FatArrow
+                        });
+                    }
+                }
+                TokenKind::LBracket => bracket_depth += 1,
+                TokenKind::RBracket => bracket_depth = bracket_depth.saturating_sub(1),
+                TokenKind::LBrace => brace_depth += 1,
+                TokenKind::RBrace => brace_depth = brace_depth.saturating_sub(1),
+                TokenKind::TemplateHead(_) => template_depth += 1,
+                TokenKind::TemplateTail(_) => template_depth = template_depth.saturating_sub(1),
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
     }
 
     fn parse_arrow_body(&mut self) -> Result<FunctionBody, ExprError> {
@@ -1112,8 +1141,29 @@ impl Parser {
     fn parse_exponentiation(&mut self) -> Result<Expr, ExprError> {
         self.enter_depth()?;
         let res = (|| {
+            let is_unary_prefix = matches!(
+                self.peek_kind(),
+                TokenKind::Bang
+                    | TokenKind::Minus
+                    | TokenKind::Plus
+                    | TokenKind::Tilde
+                    | TokenKind::TypeOf
+                    | TokenKind::Void
+                    | TokenKind::Delete
+                    | TokenKind::Await
+                    | TokenKind::Yield
+                    | TokenKind::New
+            );
             let left = self.parse_unary()?;
-            if self.eat(&TokenKind::StarStar) {
+            if self.check(&TokenKind::StarStar) {
+                if is_unary_prefix {
+                    return Err(ExprError::SyntaxError {
+                        offset: self.peek().span.start,
+                        message: "unary operator cannot be the unparenthesized base of '**'"
+                            .to_string(),
+                    });
+                }
+                self.bump();
                 // Right-associative: `2 ** 3 ** 2 == 2 ** (3 ** 2)`.
                 let right = self.parse_exponentiation()?;
                 return Ok(Expr::Binary {

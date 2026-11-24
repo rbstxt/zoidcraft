@@ -11,8 +11,10 @@ use serde_json::Value;
 use zc_color::{Hsl, Rgb, ThemePalette, choose_clip_label_color};
 use zc_session::{
     Command, KeyframeRef, Session, SessionClip, SessionProperty, SessionTrack,
-    TIME_FORMAT_TIMECODE_FRAMES, TIME_FORMAT_TIMECODE_MS, TrackKind,
+    TIME_FORMAT_FRAME_NUMBER, TIME_FORMAT_TIMECODE_FRAMES, TIME_FORMAT_TIMECODE_MS, TrackKind,
 };
+
+use super::theme::{Cm3Icon, TEXT_MUTED, TEXT_PRIMARY, paint_cm3_icon};
 
 // ---------------------------------------------------------------------------
 // Exact CM3 Timeline Geometry & Palette Constants (Spec 01 §1.7, Spec 02 §1)
@@ -22,18 +24,20 @@ use zc_session::{
 pub const HEADER_WIDTH: f32 = 200.0;
 /// Time ruler & top-left timecode box height (`35 px`).
 pub const RULER_HEIGHT: f32 = 35.0;
-/// Keyframe dope-sheet lane area height (`63 px`, Spec 01 §1.7).
-pub const KEYFRAME_AREA_HEIGHT: f32 = 63.0;
+/// Default keyframe dope-sheet lane area height (`60 px`, 3 rows, Spec 02 §1.5).
+pub const KEYFRAME_AREA_HEIGHT: f32 = 60.0;
+/// Keyframe / tracks horizontal splitter height (`3 px`, `#222222`, Spec 02 §1.5).
+pub const KEYFRAME_SPLITTER_HEIGHT: f32 = 3.0;
 /// Height of a single keyframe dope-sheet row (`20 px`, Spec 02 §1.5).
 pub const KEYFRAME_ROW_HEIGHT: f32 = 20.0;
 /// Default video track row height (`30 px`, Spec 01 §1.7).
 pub const DEFAULT_VIDEO_TRACK_HEIGHT: f32 = 30.0;
 /// Default audio track row height (`50 px`, Spec 01 §1.7).
 pub const DEFAULT_AUDIO_TRACK_HEIGHT: f32 = 50.0;
-/// Draggable video/audio split divider height (`4 px`).
+/// Draggable video/audio split divider height (`4 px`, Spec 02 §1.6).
 pub const DIVIDER_HEIGHT: f32 = 4.0;
-/// Bottom horizontal scrollbar height (`12 px`).
-pub const SCROLLBAR_HEIGHT: f32 = 12.0;
+/// Overlay horizontal scrollbar height (`6 px`).
+pub const SCROLLBAR_HEIGHT: f32 = 6.0;
 /// Fixed Audio Level Meter panel width (`45 px`).
 pub const AUDIO_METER_WIDTH: f32 = 45.0;
 /// Clip edge trim invisible hitbox width (`6 px`).
@@ -60,24 +64,26 @@ const COLOR_RULER_BG: Color32 = Color32::from_rgb(0x24, 0x24, 0x24);
 const COLOR_RULER_MAJOR: Color32 = Color32::from_rgb(0x55, 0x55, 0x55);
 const COLOR_RULER_MINOR: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x3a);
 const COLOR_RULER_LABEL: Color32 = Color32::from_rgb(0x65, 0x65, 0x65);
+const COLOR_KF_EMPTY_BG: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x2a);
+const COLOR_KF_SPLITTER_BG: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
 const COLOR_KF_LABEL_EVEN: Color32 = Color32::from_rgb(0x2e, 0x2e, 0x2e);
 const COLOR_KF_LABEL_ODD: Color32 = Color32::from_rgb(0x3b, 0x3b, 0x3b);
 const COLOR_KF_LANE_EVEN: Color32 = Color32::from_rgb(0x34, 0x34, 0x34);
 const COLOR_KF_LANE_ODD: Color32 = Color32::from_rgb(0x3f, 0x3f, 0x3f);
 const COLOR_KF_SELECTED: Color32 = Color32::from_rgb(0x29, 0x29, 0x29);
 const COLOR_KF_TEXT: Color32 = Color32::from_rgb(0x84, 0x84, 0x84);
-const COLOR_TRACK_HEADER_BG: Color32 = Color32::from_rgb(0x33, 0x33, 0x33);
-const COLOR_TRACK_HEADER_TEXT: Color32 = Color32::from_rgb(0xbd, 0xbd, 0xbd);
+const COLOR_TRACK_HEADER_BG: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x2b);
+const COLOR_TRACK_HEADER_TEXT: Color32 = Color32::from_rgb(0x84, 0x84, 0x84);
 const COLOR_TRACK_LANE_BG: Color32 = Color32::from_rgb(0x27, 0x27, 0x27);
 const COLOR_TRACK_BORDER: Color32 = Color32::from_rgb(0x21, 0x21, 0x21);
 const COLOR_CLIP_EDGE_LEFT: Color32 = Color32::from_rgb(0x83, 0x83, 0x83);
 const COLOR_CLIP_EDGE_RIGHT: Color32 = Color32::from_rgb(0x23, 0x23, 0x23);
+const COLOR_CLIP_LABEL_DARK: Color32 = Color32::from_rgb(0x2c, 0x32, 0x3f);
 const COLOR_TRIM_SELECTED: Color32 = Color32::from_rgb(0x98, 0x2b, 0x2b);
 const COLOR_WAVEFORM: Color32 = Color32::from_rgb(0x24, 0x2d, 0x42);
 const COLOR_PLAYHEAD: Color32 = Color32::from_rgb(0xb7, 0x1e, 0x1e);
+const COLOR_PLAYHEAD_CAP: Color32 = Color32::from_rgb(0x53, 0xc8, 0x6b);
 const COLOR_SNAP_GUIDE: Color32 = Color32::from_rgba_premultiplied(114, 114, 114, 175);
-const COLOR_SCROLLBAR_TRACK: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
-const COLOR_SCROLLBAR_THUMB: Color32 = Color32::from_rgb(0x55, 0x55, 0x55);
 const COLOR_RENAME_BG: Color32 = Color32::from_rgb(0xcc, 0xcc, 0xcc);
 const COLOR_RENAME_BORDER: Color32 = Color32::from_rgb(0x86, 0x86, 0x86);
 const COLOR_TOGGLE_ACTIVE: Color32 = Color32::from_rgb(0x8a, 0x28, 0x28);
@@ -151,10 +157,13 @@ pub fn format_time_seconds(t_sec: f64, fps: f64, time_format: u8) -> String {
     let t = t_sec.max(0.0);
     match time_format % 3 {
         TIME_FORMAT_TIMECODE_MS => {
-            let hours = (t / 3600.0).floor() as u64;
-            let minutes = ((t / 60.0) % 60.0).floor() as u64;
-            let seconds = t % 60.0;
-            format!("{hours:02}:{minutes:02}:{seconds:06.3}")
+            let total_ms = (t * 1000.0).round() as u64;
+            let ms = total_ms % 1000;
+            let total_secs = total_ms / 1000;
+            let ss = total_secs % 60;
+            let mm = (total_secs / 60) % 60;
+            let hh = total_secs / 3600;
+            format!("{hh:02}:{mm:02}:{ss:02}.{ms:03}")
         }
         TIME_FORMAT_TIMECODE_FRAMES => {
             let fps_int = safe_fps.round().max(1.0) as u64;
@@ -235,6 +244,7 @@ pub struct ClipDragState {
     pub anchor_kind: TrackKind,
     pub anchor_orig_track_index: usize,
     pub anchor_orig_start: f64,
+    pub anchor_length: f64,
     pub grab_offset_px: f64,
     pub pointer_start: Pos2,
     pub clips: Vec<DraggedClipInfo>,
@@ -251,6 +261,8 @@ pub struct TrimDragState {
     pub track_id: String,
     pub orig_start: f64,
     pub orig_length: f64,
+    pub orig_time_start: f64,
+    pub time_animated: bool,
     pub preview_delta_frames: f64,
     pub rate_stretch: bool,
 }
@@ -264,6 +276,8 @@ pub struct DraggedKeyframeInfo {
     pub orig_local_frame: f64,
     pub value: Value,
     pub tween: u16,
+    pub control_points: [[f64; 2]; 2],
+    pub continuous_tangent: bool,
 }
 
 /// Live horizontal keyframe drag state.
@@ -326,6 +340,7 @@ pub struct TimelineViewState {
     pub video_track_height: f32,
     pub audio_track_height: f32,
     pub video_audio_split_y: f32,
+    pub video_audio_split_custom: bool,
     pub snap_enabled: bool,
     pub drag_state: TimelineDragState,
     pub hover: TimelineHover,
@@ -335,7 +350,10 @@ pub struct TimelineViewState {
     pub last_viewport_width: f32,
     pub focused: bool,
     pub box_selected_clips: BTreeSet<String>,
+    pub keyframe_area_height: f32,
+    pub cached_frame_spans: Vec<(f64, f64)>,
     scrollbar_drag_offset: Option<f32>,
+    kf_splitter_drag: Option<(f32, f32)>,
 }
 
 impl Default for TimelineViewState {
@@ -357,6 +375,7 @@ impl TimelineViewState {
             video_track_height: DEFAULT_VIDEO_TRACK_HEIGHT,
             audio_track_height: DEFAULT_AUDIO_TRACK_HEIGHT,
             video_audio_split_y: -1.0,
+            video_audio_split_custom: false,
             snap_enabled: true,
             drag_state: TimelineDragState::None,
             hover: TimelineHover::None,
@@ -366,7 +385,10 @@ impl TimelineViewState {
             last_viewport_width: 800.0,
             focused: false,
             box_selected_clips: BTreeSet::new(),
+            keyframe_area_height: KEYFRAME_AREA_HEIGHT,
+            cached_frame_spans: Vec::new(),
             scrollbar_drag_offset: None,
+            kf_splitter_drag: None,
         }
     }
 
@@ -411,8 +433,9 @@ impl TimelineViewState {
 
     /// Cancels any active drag, marquee, or inline clip rename. Returns `true` if something was cancelled.
     pub fn cancel_active_interaction(&mut self, session: &mut Session) -> bool {
+        let had_kf_drag = self.kf_splitter_drag.take().is_some();
         if matches!(self.drag_state, TimelineDragState::None) {
-            return false;
+            return had_kf_drag;
         }
         if session.history.is_in_transaction() {
             let _ = session.cancel_transaction();
@@ -428,12 +451,21 @@ impl TimelineViewState {
 // Keyframe Lane Model Collection
 // ---------------------------------------------------------------------------
 
+struct KeyframeLaneItem {
+    local_frame: f64,
+    value: Value,
+    tween: u16,
+    control_points: [[f64; 2]; 2],
+    continuous_tangent: bool,
+}
+
 struct KeyframeLaneRow {
     target_id: String,
     property: String,
     display_label: String,
     frame_offset: f64,
-    keyframes: Vec<(f64, Value, u16)>,
+    locked: bool,
+    keyframes: Vec<KeyframeLaneItem>,
 }
 
 fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
@@ -443,7 +475,14 @@ fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
     if let Some(clip_id) = session.selection.clip_ids.first() {
         for track in doc.video_tracks.iter().chain(doc.audio_tracks.iter()) {
             if let Some(clip) = track.clips.iter().find(|c| &c.id == clip_id) {
-                push_property_rows(&mut rows, &clip.id, "", clip.start, &clip.properties);
+                push_property_rows(
+                    &mut rows,
+                    &clip.id,
+                    "",
+                    clip.start,
+                    track.locked,
+                    &clip.properties,
+                );
                 for obj in &clip.objects_3d {
                     if session.selection.object_3d_ids.is_empty()
                         || session.selection.object_3d_ids.contains(&obj.id)
@@ -454,6 +493,7 @@ fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
                             &obj.id,
                             &prefix,
                             clip.start,
+                            track.locked,
                             &obj.properties,
                         );
                     }
@@ -463,7 +503,14 @@ fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
                         || session.selection.effect_ids.contains(&fx.id)
                     {
                         let prefix = format!("{}.", fx.name);
-                        push_property_rows(&mut rows, &fx.id, &prefix, clip.start, &fx.properties);
+                        push_property_rows(
+                            &mut rows,
+                            &fx.id,
+                            &prefix,
+                            clip.start,
+                            track.locked,
+                            &fx.properties,
+                        );
                     }
                 }
                 break;
@@ -471,7 +518,14 @@ fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
         }
     }
 
-    push_property_rows(&mut rows, "sequence", "seq.", 0.0, &doc.sequence_properties);
+    push_property_rows(
+        &mut rows,
+        "sequence",
+        "seq.",
+        0.0,
+        false,
+        &doc.sequence_properties,
+    );
     rows
 }
 
@@ -480,6 +534,7 @@ fn push_property_rows(
     target_id: &str,
     prefix: &str,
     frame_offset: f64,
+    locked: bool,
     props: &BTreeMap<String, SessionProperty>,
 ) {
     for (name, prop) in props {
@@ -489,13 +544,20 @@ fn push_property_rows(
         let keyframes = prop
             .keyframes
             .iter()
-            .map(|k| (k.frame, k.value.clone(), k.tween))
+            .map(|k| KeyframeLaneItem {
+                local_frame: k.frame,
+                value: k.value.clone(),
+                tween: k.tween,
+                control_points: k.control_points,
+                continuous_tangent: k.continuous_tangent,
+            })
             .collect();
         out.push(KeyframeLaneRow {
             target_id: target_id.to_string(),
             property: name.clone(),
             display_label: format!("{prefix}{name}"),
             frame_offset,
+            locked,
             keyframes,
         });
     }
@@ -648,8 +710,8 @@ pub fn show_timeline(
     );
 
     let kf_top = ruler_rect.bottom();
-    let kf_height = KEYFRAME_AREA_HEIGHT
-        .min((panel_rect.height() - RULER_HEIGHT - SCROLLBAR_HEIGHT - 24.0).max(0.0));
+    let max_kf_h = (panel_rect.height() - RULER_HEIGHT - KEYFRAME_SPLITTER_HEIGHT - 24.0).max(0.0);
+    let kf_height = state.keyframe_area_height.clamp(0.0, max_kf_h);
     let kf_header_rect = Rect::from_min_size(
         pos2(panel_rect.left(), kf_top),
         vec2(HEADER_WIDTH, kf_height),
@@ -657,16 +719,26 @@ pub fn show_timeline(
     let kf_lanes_rect =
         Rect::from_min_size(pos2(content_left, kf_top), vec2(content_width, kf_height));
 
-    let tracks_top = kf_top + kf_height;
-    let tracks_bottom = (panel_rect.bottom() - SCROLLBAR_HEIGHT).max(tracks_top + DIVIDER_HEIGHT);
+    let kf_splitter_rect = Rect::from_min_size(
+        pos2(panel_rect.left(), kf_top + kf_height),
+        vec2(panel_rect.width(), KEYFRAME_SPLITTER_HEIGHT),
+    );
+
+    let tracks_top = kf_splitter_rect.bottom();
+    let tracks_bottom = panel_rect.bottom().max(tracks_top + DIVIDER_HEIGHT);
     let tracks_height = (tracks_bottom - tracks_top).max(DIVIDER_HEIGHT);
 
-    if state.video_audio_split_y < 0.0 {
-        state.video_audio_split_y = (tracks_height * 0.5 - DIVIDER_HEIGHT * 0.5).max(0.0);
+    if !state.video_audio_split_custom || state.video_audio_split_y < 0.0 {
+        state.video_audio_split_y = default_video_audio_split_y(
+            tracks_height,
+            state.video_track_height,
+            state.audio_track_height,
+        );
+    } else {
+        state.video_audio_split_y = state
+            .video_audio_split_y
+            .clamp(0.0, (tracks_height - DIVIDER_HEIGHT).max(0.0));
     }
-    state.video_audio_split_y = state
-        .video_audio_split_y
-        .clamp(0.0, (tracks_height - DIVIDER_HEIGHT).max(0.0));
 
     let video_rect = Rect::from_min_max(
         pos2(panel_rect.left(), tracks_top),
@@ -690,7 +762,10 @@ pub fn show_timeline(
     let audio_lanes_rect = Rect::from_min_max(pos2(content_left, audio_rect.top()), audio_rect.max);
 
     let scrollbar_rect = Rect::from_min_max(
-        pos2(content_left, tracks_bottom),
+        pos2(
+            content_left,
+            (panel_rect.bottom() - SCROLLBAR_HEIGHT).max(tracks_top),
+        ),
         pos2(panel_rect.right(), panel_rect.bottom()),
     );
 
@@ -703,38 +778,53 @@ pub fn show_timeline(
         }
     }
 
-    // Clamp horizontal scroll within content width.
-    let seq_px = frame_to_px(total_frames, fps, state.zoom);
-    let max_scroll_x = (seq_px - f64::from(content_width) + 200.0).max(0.0);
-    state.scroll_x = state.scroll_x.clamp(0.0, max_scroll_x);
+    // Clamp horizontal scroll within content width before handling wheel/pan.
+    let initial_seq_px = frame_to_px(total_frames, fps, state.zoom);
+    let initial_max_scroll_x = (initial_seq_px - f64::from(content_width) + 200.0).max(0.0);
+    state.scroll_x = state.scroll_x.clamp(0.0, initial_max_scroll_x);
 
     // Handle wheel zoom/scroll & middle-mouse panning over the panel.
     handle_wheel_and_middle_pan(
         ui,
         state,
         panel_rect,
+        kf_header_rect,
         video_header_rect,
         audio_header_rect,
         kf_lanes_rect,
         video_lanes_rect,
         audio_lanes_rect,
         content_left,
-        max_scroll_x,
+        initial_max_scroll_x,
     );
 
-    // Paint panel background & focus border.
+    // Recompute sequence pixel width & max_scroll_x AFTER wheel zoom / pan.
+    let seq_px = frame_to_px(total_frames, fps, state.zoom);
+    let max_scroll_x = (seq_px - f64::from(content_width) + 200.0).max(0.0);
+    state.scroll_x = state.scroll_x.clamp(0.0, max_scroll_x);
+
+    // Paint panel background (outer 1 px border is drawn by `layout.rs`).
     let painter = ui.painter();
     painter.rect_filled(panel_rect, CornerRadius::ZERO, COLOR_PANEL_BG);
 
-    // 1. Timecode box (200 x 35 px, right-click cycles format).
-    paint_and_interact_timecode(ui, session, timecode_rect, fps);
+    // 1. Timecode box (200 x 35 px: left frame/timecode + right sunken "Render Time" toggle).
+    paint_and_interact_timecode(ui, session, palette, timecode_rect, fps);
 
-    // 2. Time Ruler (ticks, labels, selection shadow, playhead scrub + auto-scroll).
-    if paint_and_interact_ruler(ui, session, state, palette, ruler_rect, fps, total_frames) {
+    // 2. Time Ruler (full-height minor/major ticks, 14 px #656565 labels, selection bar, playhead scrub).
+    if paint_and_interact_ruler(
+        ui,
+        session,
+        state,
+        palette,
+        ruler_rect,
+        fps,
+        total_frames,
+        max_scroll_x,
+    ) {
         action.playhead_scrubbed = true;
     }
 
-    // 3. Keyframe Dope-Sheet area (63 px).
+    // 3. Keyframe Dope-Sheet area (default 60 px, resizable in 20 px steps) + 3 px #222222 splitter.
     paint_and_interact_keyframes(
         ui,
         session,
@@ -744,8 +834,9 @@ pub fn show_timeline(
         fps,
         &mut action,
     );
+    paint_and_interact_kf_splitter(ui, state, kf_splitter_rect, max_kf_h);
 
-    // 4. Video Tracks (bottom-up: V1 at bottom immediately above divider).
+    // 4. Video Tracks (bottom-up from divider: V1 immediately above divider, V2 above V1).
     paint_and_interact_tracks(
         ui,
         session,
@@ -754,14 +845,15 @@ pub fn show_timeline(
         TrackKind::Video,
         video_header_rect,
         video_lanes_rect,
+        tracks_height,
         fps,
         &mut action,
     );
 
-    // 5. Draggable 4 px Video / Audio Divider.
+    // 5. Draggable 4 px Video / Audio Divider (#212121 / #2a2a2a / #212121).
     paint_and_interact_divider(ui, state, divider_rect, tracks_height);
 
-    // 6. Audio Tracks (top-down: A1 at top immediately below divider).
+    // 6. Audio Tracks (top-down: A1 immediately below divider).
     paint_and_interact_tracks(
         ui,
         session,
@@ -770,6 +862,7 @@ pub fn show_timeline(
         TrackKind::Audio,
         audio_header_rect,
         audio_lanes_rect,
+        tracks_height,
         fps,
         &mut action,
     );
@@ -789,50 +882,81 @@ pub fn show_timeline(
         &mut action,
     );
 
-    // 8. Synced horizontal scrollbar along bottom (left: 200 px).
+    // 8. Slim 6 px overlay horizontal scrollbar (only shown when scrollable and hovered/needed).
     paint_and_interact_scrollbar(ui, state, scrollbar_rect, seq_px, max_scroll_x);
 
-    // 9. Snap indicator guide line (clipped to x >= 200 px).
+    // 9. Snap indicator guide line (clipped to x >= 200 px, full height to panel bottom).
     let content_clip = Rect::from_min_max(
         pos2(content_left, panel_rect.top()),
-        pos2(panel_rect.right(), tracks_bottom),
+        pos2(panel_rect.right(), panel_rect.bottom()),
     );
     let overlay_painter = ui.painter().with_clip_rect(content_clip);
     if let Some(snap_x) = state.snap_guide_x
         && snap_x >= content_left
         && snap_x <= panel_rect.right()
     {
-        overlay_painter.line_segment(
-            [pos2(snap_x, panel_rect.top()), pos2(snap_x, tracks_bottom)],
-            Stroke::new(1.0, COLOR_SNAP_GUIDE),
+        let sx = snap_x.round().clamp(content_left, panel_rect.right() - 1.0);
+        overlay_painter.rect_filled(
+            Rect::from_min_size(pos2(sx, panel_rect.top()), vec2(1.0, panel_rect.height())),
+            CornerRadius::ZERO,
+            COLOR_SNAP_GUIDE,
         );
     }
 
-    // 10. 1 px #b71e1e vertical playhead cursor spanning 100% height (clipped to x >= 200 px).
+    // 10. Playhead cursor: crisp integer-snapped 1 px #b71e1e stem, with 3 px #53c86b green
+    //     preview cache bar painted OVER the stem at the ruler top (matching Zoidium).
     let playhead_screen_x = content_left
         + (frame_to_px(session.playback.current_frame, fps, state.zoom) - state.scroll_x) as f32;
-    if playhead_screen_x >= content_left && playhead_screen_x <= panel_rect.right() {
-        overlay_painter.line_segment(
-            [
-                pos2(playhead_screen_x, panel_rect.top()),
-                pos2(playhead_screen_x, tracks_bottom),
-            ],
-            Stroke::new(1.0, COLOR_PLAYHEAD),
+    if playhead_screen_x >= content_left - 0.5 && playhead_screen_x <= panel_rect.right() + 0.5 {
+        let ph_x_int = playhead_screen_x
+            .round()
+            .clamp(content_left, panel_rect.right() - 1.0);
+        overlay_painter.rect_filled(
+            Rect::from_min_size(
+                pos2(ph_x_int, panel_rect.top()),
+                vec2(1.0, panel_rect.height()),
+            ),
+            CornerRadius::ZERO,
+            COLOR_PLAYHEAD,
         );
     }
 
-    // Panel outer focus border (1 px #384668 when focused, #333333 unfocused).
-    let border_color = if state.focused {
-        rgb_to_color32(palette.focus)
+    let cache_top = ruler_rect.top().round();
+    if !state.cached_frame_spans.is_empty() {
+        for &(start_f, end_f) in &state.cached_frame_spans {
+            if end_f <= start_f {
+                continue;
+            }
+            let x0 = (content_left
+                + (frame_to_px(start_f, fps, state.zoom) - state.scroll_x) as f32)
+                .round();
+            let x1 = (content_left + (frame_to_px(end_f, fps, state.zoom) - state.scroll_x) as f32)
+                .round()
+                .max(x0 + 1.0);
+            if x1 < content_left || x0 > panel_rect.right() {
+                continue;
+            }
+            overlay_painter.rect_filled(
+                Rect::from_min_max(pos2(x0, cache_top), pos2(x1, cache_top + 3.0)),
+                CornerRadius::ZERO,
+                COLOR_PLAYHEAD_CAP,
+            );
+        }
     } else {
-        COLOR_PANEL_BORDER
-    };
-    ui.painter().rect_stroke(
-        panel_rect,
-        CornerRadius::ZERO,
-        Stroke::new(1.0, border_color),
-        StrokeKind::Inside,
-    );
+        let f0 = session.playback.current_frame.floor().max(0.0);
+        let x0 =
+            (content_left + (frame_to_px(f0, fps, state.zoom) - state.scroll_x) as f32).round();
+        let x1 = (content_left + (frame_to_px(f0 + 5.0, fps, state.zoom) - state.scroll_x) as f32)
+            .round()
+            .max(x0 + 1.0);
+        if x1 >= content_left && x0 <= panel_rect.right() {
+            overlay_painter.rect_filled(
+                Rect::from_min_max(pos2(x0, cache_top), pos2(x1, cache_top + 3.0)),
+                CornerRadius::ZERO,
+                COLOR_PLAYHEAD_CAP,
+            );
+        }
+    }
 
     let _ = panel_resp;
     action
@@ -858,12 +982,7 @@ pub fn paint_audio_meter(
 ) {
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::ZERO, COLOR_METER_BG);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::ZERO,
-        Stroke::new(1.0, COLOR_PANEL_BORDER),
-        StrokeKind::Inside,
-    );
+    paint_crisp_border_1px(painter, rect, COLOR_PANEL_BORDER);
 
     let inner = rect.shrink(4.0);
     if inner.width() < 4.0 || inner.height() < 4.0 {
@@ -944,6 +1063,7 @@ fn handle_wheel_and_middle_pan(
     ui: &mut Ui,
     state: &mut TimelineViewState,
     panel_rect: Rect,
+    kf_header_rect: Rect,
     video_header_rect: Rect,
     audio_header_rect: Rect,
     kf_lanes_rect: Rect,
@@ -970,10 +1090,12 @@ fn handle_wheel_and_middle_pan(
                     let delta = pos - *last_pos;
                     *last_pos = pos;
                     state.scroll_x = (state.scroll_x - f64::from(delta.x)).clamp(0.0, max_scroll_x);
-                    if video_lanes_rect.contains(pos) {
+                    if video_lanes_rect.contains(pos) || video_header_rect.contains(pos) {
                         state.video_scroll_y = (state.video_scroll_y + delta.y).max(0.0);
-                    } else if audio_lanes_rect.contains(pos) {
+                    } else if audio_lanes_rect.contains(pos) || audio_header_rect.contains(pos) {
                         state.audio_scroll_y = (state.audio_scroll_y - delta.y).max(0.0);
+                    } else if kf_lanes_rect.contains(pos) || kf_header_rect.contains(pos) {
+                        state.keyframe_scroll_y = (state.keyframe_scroll_y - delta.y).max(0.0);
                     }
                     ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 }
@@ -1025,12 +1147,11 @@ fn handle_wheel_and_middle_pan(
         };
         state.scroll_x = (state.scroll_x + f64::from(horiz)).clamp(0.0, max_scroll_x);
     } else {
-        // Plain vertical wheel scrolls hovered track pane.
+        // Plain vertical wheel scrolls hovered track pane (bottom-up for video, top-down for keyframes/audio).
         let step = -scroll_delta.y;
-        if kf_lanes_rect.contains(pos) {
+        if kf_lanes_rect.contains(pos) || kf_header_rect.contains(pos) {
             state.keyframe_scroll_y = (state.keyframe_scroll_y + step).max(0.0);
         } else if video_lanes_rect.contains(pos) || video_header_rect.contains(pos) {
-            // Video tracks are bottom-anchored; scrolling up moves up the stack.
             state.video_scroll_y = (state.video_scroll_y - step).max(0.0);
         } else if audio_lanes_rect.contains(pos) || audio_header_rect.contains(pos) {
             state.audio_scroll_y = (state.audio_scroll_y + step).max(0.0);
@@ -1038,9 +1159,24 @@ fn handle_wheel_and_middle_pan(
     }
 }
 
-fn paint_and_interact_timecode(ui: &mut Ui, session: &mut Session, rect: Rect, fps: f64) {
+fn paint_and_interact_timecode(
+    ui: &mut Ui,
+    session: &mut Session,
+    palette: &ThemePalette,
+    rect: Rect,
+    fps: f64,
+) {
+    let toggle_w = 85.0;
+    let toggle_h = 22.0;
+    let toggle_rect = Rect::from_min_size(
+        pos2(rect.right() - 4.0 - toggle_w, rect.top() + 4.0),
+        vec2(toggle_w, toggle_h),
+    );
+    let timecode_hit_rect =
+        Rect::from_min_max(rect.min, pos2(toggle_rect.left() - 2.0, rect.bottom()));
+
     let resp = ui.interact(
-        rect,
+        timecode_hit_rect,
         ui.scope_id().with("timeline_timecode"),
         Sense::click(),
     );
@@ -1048,27 +1184,72 @@ fn paint_and_interact_timecode(ui: &mut Ui, session: &mut Session, rect: Rect, f
         session.playback.cycle_time_format();
     }
 
+    let toggle_resp = ui
+        .interact(
+            toggle_rect,
+            ui.scope_id().with("timeline_render_time_pill"),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Toggle Frames / Render Time / Timecode");
+    if toggle_resp.clicked_by(PointerButton::Primary) {
+        session.playback.cycle_time_format();
+    }
+
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::ZERO, COLOR_TIMECODE_BG);
-    painter.line_segment(
-        [rect.right_top(), rect.right_bottom()],
-        Stroke::new(1.0, COLOR_TRACK_BORDER),
-    );
-    painter.line_segment(
-        [rect.left_bottom(), rect.right_bottom()],
-        Stroke::new(1.0, COLOR_TRACK_BORDER),
-    );
 
     let text = session.playback.format_timecode(fps);
-    painter.text(
-        pos2(rect.left() + 10.0, rect.center().y),
+    let tc_font_px = if session.playback.time_format % 3 == TIME_FORMAT_FRAME_NUMBER {
+        16.0
+    } else {
+        12.5
+    };
+    let tc_painter = ui.painter().with_clip_rect(timecode_hit_rect);
+    tc_painter.text(
+        pos2(rect.left() + 10.0, rect.top() + 16.0),
         Align2::LEFT_CENTER,
         text,
-        FontId::monospace(16.0),
+        FontId::monospace(tc_font_px),
         COLOR_TIMECODE_TEXT,
+    );
+
+    // Sunken 85x22 #202020 / 1px #1b1b1b "Render Time" toggle box matching Zoidium `01_startup_clean.png`.
+    let fmt = session.playback.time_format % 3;
+    let is_active = fmt != TIME_FORMAT_FRAME_NUMBER;
+    let toggle_label = match fmt {
+        TIME_FORMAT_TIMECODE_FRAMES => "Timecode",
+        _ => "Render Time",
+    };
+    let toggle_bg = if toggle_resp.hovered() {
+        Color32::from_rgb(0x28, 0x28, 0x28)
+    } else {
+        Color32::from_rgb(0x20, 0x20, 0x20)
+    };
+    let toggle_border = if is_active {
+        rgb_to_color32(palette.focus)
+    } else {
+        Color32::from_rgb(0x1b, 0x1b, 0x1b)
+    };
+    painter.rect_filled(toggle_rect, CornerRadius::ZERO, toggle_bg);
+    paint_crisp_border_1px(painter, toggle_rect, toggle_border);
+    let toggle_fg = if toggle_resp.hovered() {
+        Color32::from_rgb(0xea, 0xea, 0xea)
+    } else if is_active {
+        rgb_to_color32(palette.link)
+    } else {
+        TEXT_MUTED
+    };
+    painter.text(
+        toggle_rect.center(),
+        Align2::CENTER_CENTER,
+        toggle_label,
+        FontId::monospace(11.0),
+        toggle_fg,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_and_interact_ruler(
     ui: &mut Ui,
     session: &mut Session,
@@ -1077,6 +1258,7 @@ fn paint_and_interact_ruler(
     rect: Rect,
     fps: f64,
     total_frames: f64,
+    max_scroll_x: f64,
 ) -> bool {
     let resp = ui.interact(
         rect,
@@ -1104,11 +1286,11 @@ fn paint_and_interact_ruler(
             let rel_x = pos.x - rect.left();
             if rel_x < AUTO_SCROLL_MARGIN_PX {
                 let delta = f64::from(rel_x - AUTO_SCROLL_MARGIN_PX);
-                state.scroll_x = (state.scroll_x + delta * 0.25).max(0.0);
+                state.scroll_x = (state.scroll_x + delta * 0.25).clamp(0.0, max_scroll_x);
                 ui.ctx().request_repaint();
             } else if rel_x > rect.width() - AUTO_SCROLL_MARGIN_PX {
                 let delta = f64::from(rel_x - (rect.width() - AUTO_SCROLL_MARGIN_PX));
-                state.scroll_x = (state.scroll_x + delta * 0.25).max(0.0);
+                state.scroll_x = (state.scroll_x + delta * 0.25).clamp(0.0, max_scroll_x);
                 ui.ctx().request_repaint();
             }
 
@@ -1129,31 +1311,32 @@ fn paint_and_interact_ruler(
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, CornerRadius::ZERO, COLOR_RULER_BG);
 
-    // Major ticks (#555555), half-step minor ticks (#3a3a3a), and 14 px #656565 labels.
+    // Full-height integer-snapped minor ticks (#3a3a3a), major ticks (#555555),
+    // and 14 px #656565 frame labels matching Zoidium.
     let (step_sec, major_px) = ruler_interval(state.zoom);
     let first_tick = (state.scroll_x / major_px).floor() as i64;
     let visible_count = (f64::from(rect.width()) / major_px).ceil() as i64 + 2;
 
     for idx in first_tick..=(first_tick + visible_count) {
         let tick_sec = idx as f64 * step_sec;
-        let x_major = rect.left() + (idx as f64 * major_px - state.scroll_x) as f32;
-        let x_minor = x_major + (major_px * 0.5) as f32;
+        let x_major = (rect.left() + (idx as f64 * major_px - state.scroll_x) as f32).round();
+        let x_minor =
+            (rect.left() + ((idx as f64 + 0.5) * major_px - state.scroll_x) as f32).round() - 1.0;
 
-        painter.line_segment(
-            [pos2(x_major, rect.top()), pos2(x_major, rect.bottom())],
-            Stroke::new(1.0, COLOR_RULER_MAJOR),
+        painter.rect_filled(
+            Rect::from_min_size(pos2(x_major, rect.top()), vec2(1.0, rect.height())),
+            CornerRadius::ZERO,
+            COLOR_RULER_MAJOR,
         );
-        painter.line_segment(
-            [
-                pos2(x_minor, rect.top() + 14.0),
-                pos2(x_minor, rect.bottom()),
-            ],
-            Stroke::new(1.0, COLOR_RULER_MINOR),
+        painter.rect_filled(
+            Rect::from_min_size(pos2(x_minor, rect.top()), vec2(1.0, rect.height())),
+            CornerRadius::ZERO,
+            COLOR_RULER_MINOR,
         );
 
         let label = format_time_seconds(tick_sec, fps, session.playback.time_format);
         painter.text(
-            pos2(x_major + 5.0, rect.top() + 6.0),
+            pos2(x_major + 5.0, rect.top() + 0.5),
             Align2::LEFT_TOP,
             label,
             FontId::monospace(14.0),
@@ -1161,11 +1344,11 @@ fn paint_and_interact_ruler(
         );
     }
 
-    // 2 px selection shadow bar (#526183 @ 80% opacity) along bottom of ruler.
+    // 2 px selection shadow bar at bottom of ruler spanning [min(c.start), max(c.start + c.length)] (Spec 02 §1.4).
     if !session.selection.clip_ids.is_empty() {
+        let doc = session.document();
         let mut min_start = f64::INFINITY;
         let mut max_end = f64::NEG_INFINITY;
-        let doc = session.document();
         for track in doc.video_tracks.iter().chain(doc.audio_tracks.iter()) {
             for clip in &track.clips {
                 if session.selection.clip_ids.contains(&clip.id) {
@@ -1175,27 +1358,21 @@ fn paint_and_interact_ruler(
             }
         }
         if min_start.is_finite() && max_end > min_start {
-            let x0 =
-                rect.left() + (frame_to_px(min_start, fps, state.zoom) - state.scroll_x) as f32;
-            let x1 = rect.left() + (frame_to_px(max_end, fps, state.zoom) - state.scroll_x) as f32;
-            let shadow_rect = Rect::from_min_max(
-                pos2(x0.max(rect.left()), rect.bottom() - 2.0),
-                pos2(x1.min(rect.right()), rect.bottom()),
-            );
-            if shadow_rect.width() > 0.0 {
+            let x0 = (rect.left()
+                + (frame_to_px(min_start, fps, state.zoom) - state.scroll_x) as f32)
+                .round();
+            let x1 = (rect.left()
+                + (frame_to_px(max_end, fps, state.zoom) - state.scroll_x) as f32)
+                .round();
+            if x1 > x0 {
                 painter.rect_filled(
-                    shadow_rect,
+                    Rect::from_min_max(pos2(x0, rect.bottom() - 2.0), pos2(x1, rect.bottom())),
                     CornerRadius::ZERO,
                     rgb_to_color32_alpha(palette.clip, 204),
                 );
             }
         }
     }
-
-    painter.line_segment(
-        [rect.left_bottom(), rect.right_bottom()],
-        Stroke::new(1.0, COLOR_TRACK_BORDER),
-    );
     scrubbed
 }
 
@@ -1213,9 +1390,9 @@ fn paint_and_interact_keyframes(
     state.keyframe_scroll_y = state.keyframe_scroll_y.clamp(0.0, max_scroll);
 
     let header_painter = ui.painter().with_clip_rect(header_rect);
-    header_painter.rect_filled(header_rect, CornerRadius::ZERO, COLOR_KF_LABEL_EVEN);
+    header_painter.rect_filled(header_rect, CornerRadius::ZERO, COLOR_KF_EMPTY_BG);
     let lane_painter = ui.painter().with_clip_rect(lanes_rect);
-    lane_painter.rect_filled(lanes_rect, CornerRadius::ZERO, COLOR_KF_LANE_EVEN);
+    lane_painter.rect_filled(lanes_rect, CornerRadius::ZERO, COLOR_KF_EMPTY_BG);
 
     let lane_resp = ui.interact(
         lanes_rect,
@@ -1280,15 +1457,22 @@ fn paint_and_interact_keyframes(
             _ => 0.0,
         };
 
-        for (kf_idx, (local_frame, _val, _tween)) in row.keyframes.iter().enumerate() {
+        for (kf_idx, item) in row.keyframes.iter().enumerate() {
+            let local_frame = item.local_frame;
             let is_selected = session.selection.keyframes.iter().any(|sel| {
                 sel.target_id == row.target_id
                     && sel.property == row.property
-                    && sel.matches_frame(*local_frame)
+                    && sel.matches_frame(local_frame)
             });
 
-            let display_abs_frame =
-                row.frame_offset + *local_frame + if is_selected { drag_delta } else { 0.0 };
+            let display_abs_frame = (row.frame_offset
+                + local_frame
+                + if is_selected && !row.locked {
+                    drag_delta
+                } else {
+                    0.0
+                })
+            .max(0.0);
             let cx = lanes_rect.left()
                 + (frame_to_px(display_abs_frame, fps, state.zoom) - state.scroll_x) as f32;
             let cy = (y0 + y1) * 0.5;
@@ -1314,33 +1498,36 @@ fn paint_and_interact_keyframes(
                 ui.ctx().set_cursor_icon(CursorIcon::Move);
             }
 
-            if kf_resp.clicked_by(PointerButton::Primary)
-                || kf_resp.drag_started_by(PointerButton::Primary)
-            {
+            // Never toggle selection on BOTH drag_started_by and clicked_by:
+            // clicked_by handles single/Shift-toggle selection; drag_started_by only prepares drag.
+            if kf_resp.clicked_by(PointerButton::Primary) {
                 clicked_any_diamond = true;
                 state.focused = true;
-                let kf_ref = KeyframeRef::new(&row.target_id, &row.property, None, *local_frame);
-                if modifiers.shift {
-                    session.selection.select_keyframe(kf_ref, true);
-                } else if !is_selected {
+                let kf_ref = KeyframeRef::new(&row.target_id, &row.property, None, local_frame);
+                session.selection.select_keyframe(kf_ref, modifiers.shift);
+            } else if kf_resp.drag_started_by(PointerButton::Primary) {
+                clicked_any_diamond = true;
+                state.focused = true;
+                if !modifiers.shift && !is_selected {
+                    let kf_ref = KeyframeRef::new(&row.target_id, &row.property, None, local_frame);
                     session.selection.select_keyframe(kf_ref, false);
                 }
-            }
-
-            if kf_resp.drag_started_by(PointerButton::Primary) {
-                let dragged = collect_selected_keyframe_infos(&rows, &session.selection.keyframes);
-                if !dragged.is_empty() {
-                    let pointer_x = ui.input(|i| i.pointer.interact_pos()).map_or(cx, |p| p.x);
-                    let content_x = f64::from(pointer_x - lanes_rect.left()) + state.scroll_x;
-                    let anchor_abs = row.frame_offset + *local_frame;
-                    let anchor_px = frame_to_px(anchor_abs, fps, state.zoom);
-                    state.drag_state = TimelineDragState::DraggingKeyframe(KeyframeDragState {
-                        anchor_orig_abs_frame: anchor_abs,
-                        grab_offset_px: anchor_px - content_x,
-                        preview_delta_frames: 0.0,
-                        keyframes: dragged,
-                        moved: false,
-                    });
+                if !row.locked && (!modifiers.shift || is_selected) {
+                    let dragged =
+                        collect_selected_keyframe_infos(&rows, &session.selection.keyframes);
+                    if !dragged.is_empty() {
+                        let pointer_x = ui.input(|i| i.pointer.interact_pos()).map_or(cx, |p| p.x);
+                        let content_x = f64::from(pointer_x - lanes_rect.left()) + state.scroll_x;
+                        let anchor_abs = row.frame_offset + local_frame;
+                        let anchor_px = frame_to_px(anchor_abs, fps, state.zoom);
+                        state.drag_state = TimelineDragState::DraggingKeyframe(KeyframeDragState {
+                            anchor_orig_abs_frame: anchor_abs,
+                            grab_offset_px: anchor_px - content_x,
+                            preview_delta_frames: 0.0,
+                            keyframes: dragged,
+                            moved: false,
+                        });
+                    }
                 }
             }
 
@@ -1387,18 +1574,59 @@ fn paint_and_interact_keyframes(
         }
     }
 
-    header_painter.line_segment(
-        [header_rect.right_top(), header_rect.right_bottom()],
-        Stroke::new(1.0, COLOR_TRACK_BORDER),
+    if !rows.is_empty() {
+        let rows_h = (rows.len() as f32 * KEYFRAME_ROW_HEIGHT - state.keyframe_scroll_y)
+            .clamp(0.0, header_rect.height());
+        if rows_h > 0.0 {
+            header_painter.rect_filled(
+                Rect::from_min_size(
+                    pos2(header_rect.right() - 1.0, header_rect.top()),
+                    vec2(1.0, rows_h),
+                ),
+                CornerRadius::ZERO,
+                COLOR_TRACK_BORDER,
+            );
+        }
+    }
+}
+
+fn paint_and_interact_kf_splitter(
+    ui: &mut Ui,
+    state: &mut TimelineViewState,
+    rect: Rect,
+    max_kf_h: f32,
+) {
+    let hit_rect = rect.expand2(vec2(0.0, 2.0));
+    let resp = ui.interact(
+        hit_rect,
+        ui.scope_id().with("timeline_kf_splitter"),
+        Sense::click_and_drag(),
     );
-    header_painter.line_segment(
-        [header_rect.left_bottom(), header_rect.right_bottom()],
-        Stroke::new(1.0, COLOR_TRACK_BORDER),
-    );
-    lane_painter.line_segment(
-        [lanes_rect.left_bottom(), lanes_rect.right_bottom()],
-        Stroke::new(1.0, COLOR_TRACK_BORDER),
-    );
+
+    if resp.hovered() || state.kf_splitter_drag.is_some() {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+    }
+
+    if resp.drag_started_by(PointerButton::Primary)
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        state.kf_splitter_drag = Some((pos.y, state.keyframe_area_height));
+    }
+
+    if let Some((start_y, start_h)) = state.kf_splitter_drag {
+        if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+            let raw_h = start_h + (pos.y - start_y);
+            let quantized = ((raw_h / KEYFRAME_ROW_HEIGHT).round().max(1.0)) * KEYFRAME_ROW_HEIGHT;
+            state.keyframe_area_height =
+                quantized.clamp(KEYFRAME_ROW_HEIGHT.min(max_kf_h), max_kf_h);
+        }
+        if !ui.input(|i| i.pointer.primary_down()) {
+            state.kf_splitter_drag = None;
+        }
+    }
+
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, COLOR_KF_SPLITTER_BG);
 }
 
 fn collect_selected_keyframe_infos(
@@ -1407,19 +1635,24 @@ fn collect_selected_keyframe_infos(
 ) -> Vec<DraggedKeyframeInfo> {
     let mut infos = Vec::new();
     for row in rows {
-        for (local_frame, value, tween) in &row.keyframes {
+        if row.locked {
+            continue;
+        }
+        for item in &row.keyframes {
             if selected.iter().any(|s| {
                 s.target_id == row.target_id
                     && s.property == row.property
-                    && s.matches_frame(*local_frame)
+                    && s.matches_frame(item.local_frame)
             }) {
                 infos.push(DraggedKeyframeInfo {
                     target_id: row.target_id.clone(),
                     property: row.property.clone(),
                     frame_offset: row.frame_offset,
-                    orig_local_frame: *local_frame,
-                    value: value.clone(),
-                    tween: *tween,
+                    orig_local_frame: item.local_frame,
+                    value: item.value.clone(),
+                    tween: item.tween,
+                    control_points: item.control_points,
+                    continuous_tangent: item.continuous_tangent,
                 });
             }
         }
@@ -1436,6 +1669,7 @@ fn paint_and_interact_tracks(
     kind: TrackKind,
     header_rect: Rect,
     lanes_rect: Rect,
+    tracks_height: f32,
     fps: f64,
     action: &mut TimelineAction,
 ) {
@@ -1464,9 +1698,31 @@ fn paint_and_interact_tracks(
     };
 
     let header_painter = ui.painter().with_clip_rect(header_rect);
-    header_painter.rect_filled(header_rect, CornerRadius::ZERO, COLOR_TRACK_HEADER_BG);
+    header_painter.rect_filled(header_rect, CornerRadius::ZERO, COLOR_PANEL_BG);
     let lane_painter = ui.painter().with_clip_rect(lanes_rect);
-    lane_painter.rect_filled(lanes_rect, CornerRadius::ZERO, COLOR_TRACK_LANE_BG);
+    lane_painter.rect_filled(lanes_rect, CornerRadius::ZERO, COLOR_PANEL_BG);
+
+    let header_hovered = ui
+        .input(|i| i.pointer.hover_pos())
+        .is_some_and(|p| header_rect.contains(p));
+
+    if tracks.is_empty() && header_hovered && header_rect.height() >= 18.0 {
+        let add_rect = Rect::from_center_size(
+            pos2(header_rect.left() + 16.0, header_rect.top() + 15.0),
+            vec2(18.0, 18.0),
+        );
+        if paint_track_icon_button(
+            ui,
+            add_rect.intersect(header_rect),
+            header_rect,
+            ("trk_add_empty", kind_tag(kind)),
+            TrackIcon::Add,
+            false,
+            true,
+        ) {
+            add_track_of_kind(session, state, kind, tracks_height);
+        }
+    }
 
     let lane_bg_resp = ui.interact(
         lanes_rect,
@@ -1486,41 +1742,59 @@ fn paint_and_interact_tracks(
         let row_header_rect =
             Rect::from_min_max(pos2(header_rect.left(), y0), pos2(header_rect.right(), y1));
 
-        // Paint track header cell + toggles.
+        // Paint track header cell + flat borderless Zoidium vector icon toggles.
+        let can_delete = kind == TrackKind::Audio || tracks.len() > 1;
+        let show_add_btn = track_idx == 0 && header_hovered;
         paint_track_header(
             ui,
             session,
             state,
             track,
             kind,
+            can_delete,
+            show_add_btn,
+            tracks_height,
             row_header_rect,
             header_rect,
         );
 
-        // Track lane separator border (#212121).
-        let border_y = match kind {
-            TrackKind::Video => y0,
-            TrackKind::Audio => y1,
+        // Paint per-track lane background (#272727) and 1 px #212121 separator border
+        // (top border for bottom-up video tracks; bottom border for top-down audio tracks).
+        let row_lane_rect =
+            Rect::from_min_max(pos2(lanes_rect.left(), y0), pos2(lanes_rect.right(), y1));
+        lane_painter.rect_filled(row_lane_rect, CornerRadius::ZERO, COLOR_TRACK_LANE_BG);
+        let sep_y = match kind {
+            TrackKind::Video => y0.round(),
+            TrackKind::Audio => (y1 - 1.0).round(),
         };
-        lane_painter.line_segment(
-            [
-                pos2(lanes_rect.left(), border_y),
-                pos2(lanes_rect.right(), border_y),
-            ],
-            Stroke::new(1.0, COLOR_TRACK_BORDER),
+        lane_painter.rect_filled(
+            Rect::from_min_size(
+                pos2(lanes_rect.left(), sep_y),
+                vec2(lanes_rect.width(), 1.0),
+            ),
+            CornerRadius::ZERO,
+            COLOR_TRACK_BORDER,
         );
 
-        // Paint and interact clips on this track.
+        // Paint and interact clips on this track (29 px clip bar inside 30 px video row, 49 px inside 50 px audio row).
+        let (clip_top, clip_bottom) = clip_y_bounds(kind, y0, y1);
+        let playhead_x_int = (lanes_rect.left()
+            + (frame_to_px(session.playback.current_frame, fps, state.zoom) - state.scroll_x)
+                as f32)
+            .round();
         for clip in &track.clips {
-            let x0 = lanes_rect.left()
-                + (frame_to_px(clip.start, fps, state.zoom) - state.scroll_x) as f32;
-            let x1 = lanes_rect.left()
-                + (frame_to_px(clip.start + clip.length, fps, state.zoom) - state.scroll_x) as f32;
+            let x0 = (lanes_rect.left()
+                + (frame_to_px(clip.start, fps, state.zoom) - state.scroll_x) as f32)
+                .round();
+            let x1 = (lanes_rect.left()
+                + (frame_to_px(clip.start + clip.length, fps, state.zoom) - state.scroll_x) as f32)
+                .round();
             if x1 < lanes_rect.left() - 2.0 || x0 > lanes_rect.right() + 2.0 {
                 continue;
             }
 
-            let clip_rect = Rect::from_min_max(pos2(x0, y0), pos2(x1.max(x0 + 2.0), y1));
+            let clip_rect =
+                Rect::from_min_max(pos2(x0, clip_top), pos2(x1.max(x0 + 2.0), clip_bottom));
             let visible_clip_rect = clip_rect.intersect(lanes_rect);
             if visible_clip_rect.width() <= 0.0 || visible_clip_rect.height() <= 0.0 {
                 continue;
@@ -1537,7 +1811,16 @@ fn paint_and_interact_tracks(
                 palette.clip
             };
             let bg_color = rgb_to_color32(bg_rgb);
-            let label_color = rgb_to_color32(choose_clip_label_color(bg_rgb));
+            // Default CM3 clips (#526183 unselected / #7f94c7 selected) ALWAYS use dark label
+            // text matching Zoidium `01_startup_clean.png`; custom colors use auto-contrast.
+            let is_default_cm3_clip = !is_box_selected
+                && (bg_rgb == ThemePalette::CLASSIC.clip
+                    || bg_rgb == ThemePalette::CLASSIC.clip_selected);
+            let label_color = if is_default_cm3_clip {
+                COLOR_CLIP_LABEL_DARK
+            } else {
+                rgb_to_color32(choose_clip_label_color(bg_rgb))
+            };
 
             // Fill clip box.
             lane_painter.rect_filled(clip_rect, CornerRadius::ZERO, bg_color);
@@ -1554,31 +1837,33 @@ fn paint_and_interact_tracks(
                 );
             }
 
-            // Left edge highlight (#838383) & right edge border (#232323).
-            lane_painter.line_segment(
-                [clip_rect.left_top(), clip_rect.left_bottom()],
-                Stroke::new(1.0, COLOR_CLIP_EDGE_LEFT),
-            );
-            lane_painter.line_segment(
-                [
-                    pos2(clip_rect.right() - 0.5, clip_rect.top()),
-                    pos2(clip_rect.right() - 0.5, clip_rect.bottom()),
-                ],
-                Stroke::new(1.0, COLOR_CLIP_EDGE_RIGHT),
-            );
-
-            // Selected clip left/right 3 px #982b2b trim handles.
-            if is_selected {
-                let left_bar = Rect::from_min_size(clip_rect.min, vec2(3.0, clip_rect.height()));
-                let right_bar = Rect::from_min_size(
-                    pos2(clip_rect.right() - 3.0, clip_rect.top()),
-                    vec2(3.0, clip_rect.height()),
+            // Left edge highlight (#838383) & right edge border (#232323), integer-snapped 1 px.
+            // Skip any edge occluded directly underneath the 1 px playhead stem so mesh feathering
+            // never bleeds `#838383` into the adjacent clip interior pixel.
+            let left_edge_x = clip_rect.left().round();
+            let right_edge_x = (clip_rect.right().round() - 1.0).max(left_edge_x);
+            if (left_edge_x - playhead_x_int).abs() >= 0.5 {
+                lane_painter.rect_filled(
+                    Rect::from_min_size(
+                        pos2(left_edge_x, clip_rect.top()),
+                        vec2(1.0, clip_rect.height()),
+                    ),
+                    CornerRadius::ZERO,
+                    COLOR_CLIP_EDGE_LEFT,
                 );
-                lane_painter.rect_filled(left_bar, CornerRadius::ZERO, COLOR_TRIM_SELECTED);
-                lane_painter.rect_filled(right_bar, CornerRadius::ZERO, COLOR_TRIM_SELECTED);
+            }
+            if (right_edge_x - playhead_x_int).abs() >= 0.5 {
+                lane_painter.rect_filled(
+                    Rect::from_min_size(
+                        pos2(right_edge_x, clip_rect.top()),
+                        vec2(1.0, clip_rect.height()),
+                    ),
+                    CornerRadius::ZERO,
+                    COLOR_CLIP_EDGE_RIGHT,
+                );
             }
 
-            // Inline rename input OR auto-contrast clip label.
+            // Inline rename input OR clip label.
             let is_renaming = matches!(
                 &state.drag_state,
                 TimelineDragState::InlineRenamingClip { clip_id, .. } if clip_id == &clip.id
@@ -1590,16 +1875,9 @@ fn paint_and_interact_tracks(
                 continue;
             }
 
-            let clipped_label_painter = ui.painter().with_clip_rect(visible_clip_rect);
-            clipped_label_painter.text(
-                pos2(clip_rect.left() + 5.0, clip_rect.top() + 3.0),
-                Align2::LEFT_TOP,
-                clip_display_name(clip),
-                FontId::monospace(14.0),
-                label_color,
-            );
-
             // Invisible edge trim hitboxes (6 px left/right, capped to 25% width for tiny clips).
+            // Register body_resp BEFORE left_resp and right_resp and shrink body_rect so edge trim
+            // hitboxes are always reachable in egui's hit-testing order.
             let edge_w = TRIM_EDGE_HITBOX_PX.min(clip_rect.width() * 0.25).max(2.0);
             let left_edge_rect =
                 Rect::from_min_size(clip_rect.min, vec2(edge_w, clip_rect.height()))
@@ -1609,7 +1887,23 @@ fn paint_and_interact_tracks(
                 vec2(edge_w, clip_rect.height()),
             )
             .intersect(lanes_rect);
+            let body_rect = if visible_clip_rect.width() > edge_w * 2.0 {
+                Rect::from_min_max(
+                    pos2(visible_clip_rect.left() + edge_w, visible_clip_rect.top()),
+                    pos2(
+                        visible_clip_rect.right() - edge_w,
+                        visible_clip_rect.bottom(),
+                    ),
+                )
+            } else {
+                visible_clip_rect
+            };
 
+            let body_resp = ui.interact(
+                body_rect,
+                ui.scope_id().with(("clip_body", &clip.id)),
+                Sense::click_and_drag(),
+            );
             let left_resp = ui.interact(
                 left_edge_rect,
                 ui.scope_id().with(("clip_trim_l", &clip.id)),
@@ -1620,10 +1914,39 @@ fn paint_and_interact_tracks(
                 ui.scope_id().with(("clip_trim_r", &clip.id)),
                 Sense::click_and_drag(),
             );
-            let body_resp = ui.interact(
-                visible_clip_rect,
-                ui.scope_id().with(("clip_body", &clip.id)),
-                Sense::click_and_drag(),
+
+            // Draw 3 px #982b2b trim edge highlight ONLY while hovering or actively trimming that edge.
+            let show_left_trim = !track.locked
+                && (left_resp.hovered()
+                    || matches!(
+                        &state.drag_state,
+                        TimelineDragState::TrimmingLeft(t) if t.clip_id == clip.id
+                    ));
+            let show_right_trim = !track.locked
+                && (right_resp.hovered()
+                    || matches!(
+                        &state.drag_state,
+                        TimelineDragState::TrimmingRight(t) if t.clip_id == clip.id
+                    ));
+            if show_left_trim {
+                let left_bar = Rect::from_min_size(clip_rect.min, vec2(3.0, clip_rect.height()));
+                lane_painter.rect_filled(left_bar, CornerRadius::ZERO, COLOR_TRIM_SELECTED);
+            }
+            if show_right_trim {
+                let right_bar = Rect::from_min_size(
+                    pos2(clip_rect.right() - 3.0, clip_rect.top()),
+                    vec2(3.0, clip_rect.height()),
+                );
+                lane_painter.rect_filled(right_bar, CornerRadius::ZERO, COLOR_TRIM_SELECTED);
+            }
+
+            let clipped_label_painter = ui.painter().with_clip_rect(visible_clip_rect);
+            clipped_label_painter.text(
+                pos2(clip_rect.left() + 4.0, clip_rect.top()),
+                Align2::LEFT_TOP,
+                clip_display_name(clip),
+                FontId::monospace(16.0),
+                label_color,
             );
 
             if left_resp.hovered() {
@@ -1637,7 +1960,11 @@ fn paint_and_interact_tracks(
             }
 
             // Right-click clip -> inline rename.
-            if body_resp.secondary_clicked() && !track.locked {
+            if (body_resp.secondary_clicked()
+                || left_resp.secondary_clicked()
+                || right_resp.secondary_clicked())
+                && !track.locked
+            {
                 interacted_clip = true;
                 let current_name = clip_display_name(clip).to_string();
                 state.drag_state = TimelineDragState::InlineRenamingClip {
@@ -1661,6 +1988,8 @@ fn paint_and_interact_tracks(
                     track_id: track.id.clone(),
                     orig_start: clip.start,
                     orig_length: clip.length,
+                    orig_time_start: clip.time_start,
+                    time_animated: clip.time_animated,
                     preview_delta_frames: 0.0,
                     rate_stretch: modifiers.shift,
                 });
@@ -1679,51 +2008,58 @@ fn paint_and_interact_tracks(
                     track_id: track.id.clone(),
                     orig_start: clip.start,
                     orig_length: clip.length,
+                    orig_time_start: clip.time_start,
+                    time_animated: clip.time_animated,
                     preview_delta_frames: 0.0,
                     rate_stretch: modifiers.shift,
                 });
                 continue;
             }
 
-            // Clip selection click.
-            if body_resp.clicked_by(PointerButton::Primary) {
+            // Clip selection click (handles Shift+Click toggle exactly once; never double-toggle
+            // across drag_started_by and clicked_by).
+            if body_resp.clicked_by(PointerButton::Primary)
+                || left_resp.clicked_by(PointerButton::Primary)
+                || right_resp.clicked_by(PointerButton::Primary)
+            {
                 interacted_clip = true;
                 state.focused = true;
                 let _ = session
                     .selection
                     .select_clip(&clip.id, None, modifiers.shift);
-            }
-
-            // Clip body drag-move start.
-            if body_resp.drag_started_by(PointerButton::Primary) && !modifiers.ctrl && !track.locked
+            } else if body_resp.drag_started_by(PointerButton::Primary)
+                && !modifiers.ctrl
+                && !track.locked
             {
+                // Clip body drag-move start.
                 interacted_clip = true;
                 state.focused = true;
-                if !is_selected {
-                    let _ = session
-                        .selection
-                        .select_clip(&clip.id, None, modifiers.shift);
+                if !modifiers.shift && !is_selected {
+                    let _ = session.selection.select_clip(&clip.id, None, false);
                 }
-                let pointer = ui
-                    .input(|i| i.pointer.interact_pos())
-                    .unwrap_or(clip_rect.min);
-                let content_x = f64::from(pointer.x - lanes_rect.left()) + state.scroll_x;
-                let clip_px = frame_to_px(clip.start, fps, state.zoom);
-                let dragged_clips = collect_selected_clips_of_kind(session, kind);
-                if !dragged_clips.is_empty() {
-                    state.drag_state = TimelineDragState::DraggingClips(ClipDragState {
-                        anchor_clip_id: clip.id.clone(),
-                        anchor_kind: kind,
-                        anchor_orig_track_index: track_idx,
-                        anchor_orig_start: clip.start,
-                        grab_offset_px: clip_px - content_x,
-                        pointer_start: pointer,
-                        clips: dragged_clips,
-                        preview_delta_frames: 0.0,
-                        preview_track_delta: 0,
-                        moved: false,
-                        overlap_blocked: false,
-                    });
+                if !modifiers.shift || is_selected {
+                    let pointer = ui
+                        .input(|i| i.pointer.interact_pos())
+                        .unwrap_or(clip_rect.min);
+                    let content_x = f64::from(pointer.x - lanes_rect.left()) + state.scroll_x;
+                    let clip_px = frame_to_px(clip.start, fps, state.zoom);
+                    let dragged_clips = collect_selected_clips_of_kind(session, kind);
+                    if !dragged_clips.is_empty() {
+                        state.drag_state = TimelineDragState::DraggingClips(ClipDragState {
+                            anchor_clip_id: clip.id.clone(),
+                            anchor_kind: kind,
+                            anchor_orig_track_index: track_idx,
+                            anchor_orig_start: clip.start,
+                            anchor_length: clip.length,
+                            grab_offset_px: clip_px - content_x,
+                            pointer_start: pointer,
+                            clips: dragged_clips,
+                            preview_delta_frames: 0.0,
+                            preview_track_delta: 0,
+                            moved: false,
+                            overlap_blocked: false,
+                        });
+                    }
                 }
             }
         }
@@ -1752,128 +2088,368 @@ fn paint_and_interact_tracks(
             };
         }
     }
-
-    header_painter.line_segment(
-        [header_rect.right_top(), header_rect.right_bottom()],
-        Stroke::new(1.0, COLOR_TRACK_BORDER),
-    );
 }
 
+fn add_track_of_kind(
+    session: &mut Session,
+    state: &mut TimelineViewState,
+    kind: TrackKind,
+    tracks_height: f32,
+) {
+    match kind {
+        TrackKind::Video => {
+            let _ = session.execute(Command::AddVideoTrack { name: None });
+            let needed_h = session.document().video_tracks.len() as f32 * state.video_track_height;
+            let max_v = (tracks_height
+                - DIVIDER_HEIGHT
+                - state.audio_track_height.min(tracks_height * 0.35))
+            .max(state.video_track_height);
+            if state.video_audio_split_y < needed_h {
+                state.video_audio_split_y = needed_h
+                    .min(max_v)
+                    .clamp(0.0, (tracks_height - DIVIDER_HEIGHT).max(0.0));
+                state.video_audio_split_custom = true;
+            }
+        }
+        TrackKind::Audio => {
+            let _ = session.execute(Command::AddAudioTrack { name: None });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_track_header(
     ui: &mut Ui,
     session: &mut Session,
     state: &mut TimelineViewState,
     track: &SessionTrack,
     kind: TrackKind,
+    can_delete: bool,
+    show_add_btn: bool,
+    tracks_height: f32,
     row_rect: Rect,
     clip_rect: Rect,
 ) {
     let painter = ui.painter().with_clip_rect(clip_rect);
     painter.rect_filled(row_rect, CornerRadius::ZERO, COLOR_TRACK_HEADER_BG);
 
-    let border_y = match kind {
-        TrackKind::Video => row_rect.top(),
-        TrackKind::Audio => row_rect.bottom(),
+    // 1 px #212121 right border ONLY on actual track header rows (not empty space).
+    painter.rect_filled(
+        Rect::from_min_size(
+            pos2(row_rect.right() - 1.0, row_rect.top()),
+            vec2(1.0, row_rect.height()),
+        ),
+        CornerRadius::ZERO,
+        COLOR_TRACK_BORDER,
+    );
+
+    // 1 px #212121 separator border: top for bottom-up video tracks, bottom for top-down audio tracks.
+    let sep_y = match kind {
+        TrackKind::Video => row_rect.top().round(),
+        TrackKind::Audio => (row_rect.bottom() - 1.0).round(),
     };
-    painter.line_segment(
-        [
-            pos2(row_rect.left(), border_y),
-            pos2(row_rect.right(), border_y),
-        ],
-        Stroke::new(1.0, COLOR_TRACK_BORDER),
+    painter.rect_filled(
+        Rect::from_min_size(pos2(row_rect.left(), sep_y), vec2(row_rect.width(), 1.0)),
+        CornerRadius::ZERO,
+        COLOR_TRACK_BORDER,
     );
 
-    painter.text(
-        pos2(row_rect.left() + 8.0, row_rect.center().y),
-        Align2::LEFT_CENTER,
-        &track.name,
-        FontId::monospace(14.0),
-        COLOR_TRACK_HEADER_TEXT,
-    );
+    let icon_size = vec2(18.0, 18.0);
+    let (inner_top, inner_bot) = clip_y_bounds(kind, row_rect.top(), row_rect.bottom());
+    let cy = (inner_top + inner_bot) * 0.5;
+    let icon_cy = cy.ceil();
+    let inner_right = row_rect.right() - 1.0;
 
-    let btn_size = vec2(22.0, 20.0);
-    let cy = row_rect.center().y;
-    let mut cursor_x = row_rect.right() - 6.0;
-
-    // 3D toggle (Video tracks only).
-    if kind == TrackKind::Video {
-        cursor_x -= btn_size.x;
-        let r = Rect::from_center_size(pos2(cursor_x + btn_size.x * 0.5, cy), btn_size);
-        let is_3d = *state.track_3d_flags.get(&track.id).unwrap_or(&false);
-        if paint_header_toggle(
-            ui,
-            r.intersect(clip_rect),
-            ("trk_3d", &track.id),
-            "3D",
-            is_3d,
-            false,
-        ) {
-            state.track_3d_flags.insert(track.id.clone(), !is_3d);
-        }
-        cursor_x -= 3.0;
+    // 1. Delete track '×' icon (rightmost, center at inner_right - 15.0 -> x=571.0).
+    let del_rect = Rect::from_center_size(pos2(inner_right - 15.0, icon_cy), icon_size);
+    if paint_track_icon_button(
+        ui,
+        del_rect.intersect(clip_rect),
+        clip_rect,
+        ("trk_del", &track.id),
+        TrackIcon::Delete,
+        false,
+        can_delete,
+    ) && can_delete
+    {
+        let _ = session.execute(Command::RemoveTrack {
+            track_id: track.id.clone(),
+        });
     }
 
-    // Lock toggle (L).
-    cursor_x -= btn_size.x;
-    let lock_rect = Rect::from_center_size(pos2(cursor_x + btn_size.x * 0.5, cy), btn_size);
-    if paint_header_toggle(
+    // 2. Lock icon (center at inner_right - 35.0 -> x=551.0).
+    let lock_rect = Rect::from_center_size(pos2(inner_right - 35.0, icon_cy), icon_size);
+    if paint_track_icon_button(
         ui,
         lock_rect.intersect(clip_rect),
+        clip_rect,
         ("trk_lock", &track.id),
-        "L",
+        TrackIcon::Lock(track.locked),
         track.locked,
-        false,
+        true,
     ) {
         let _ = session.execute(Command::SetTrackLocked {
             track_id: track.id.clone(),
             locked: !track.locked,
         });
     }
-    cursor_x -= 3.0;
 
-    // Solo toggle (S).
-    cursor_x -= btn_size.x;
-    let solo_rect = Rect::from_center_size(pos2(cursor_x + btn_size.x * 0.5, cy), btn_size);
-    if paint_header_toggle(
+    // 3. Solo circle icon (center at inner_right - 55.0 -> x=531.0).
+    let solo_rect = Rect::from_center_size(pos2(inner_right - 55.0, icon_cy), icon_size);
+    if paint_track_icon_button(
         ui,
         solo_rect.intersect(clip_rect),
+        clip_rect,
         ("trk_solo", &track.id),
-        "S",
+        TrackIcon::Solo(track.solo),
         track.solo,
-        false,
+        true,
     ) {
         let _ = session.execute(Command::SetTrackSolo {
             track_id: track.id.clone(),
             solo: !track.solo,
         });
     }
-    cursor_x -= 3.0;
 
-    // Enable (Video: V / eye) or Mute (Audio: M).
-    cursor_x -= btn_size.x;
-    let en_rect = Rect::from_center_size(pos2(cursor_x + btn_size.x * 0.5, cy), btn_size);
-    let (label, active_red) = match kind {
-        TrackKind::Video => ("E", !track.enabled),
-        TrackKind::Audio => ("M", !track.enabled),
+    // 4. Eye (Video) or Speaker (Audio) enable toggle (center at inner_right - 75.0 -> x=511.0).
+    let en_rect = Rect::from_center_size(pos2(inner_right - 75.0, icon_cy), icon_size);
+    let en_icon = match kind {
+        TrackKind::Video => TrackIcon::Eye(track.enabled),
+        TrackKind::Audio => TrackIcon::Speaker(track.enabled),
     };
-    if paint_header_toggle(
+    if paint_track_icon_button(
         ui,
         en_rect.intersect(clip_rect),
+        clip_rect,
         ("trk_en", &track.id),
-        label,
-        active_red,
-        kind == TrackKind::Video && track.enabled,
+        en_icon,
+        !track.enabled,
+        true,
     ) {
         let _ = session.execute(Command::SetTrackEnabled {
             track_id: track.id.clone(),
             enabled: !track.enabled,
         });
     }
+    let mut cursor_x = en_rect.left() - 3.0;
+
+    // 5. Optional Camera+ '3D' badge (Video tracks only when camera-plus plugin is enabled).
+    if kind == TrackKind::Video && session.plugins.is_enabled("camera-plus") {
+        let badge_size = vec2(22.0, 17.0);
+        cursor_x -= badge_size.x;
+        let r = Rect::from_center_size(pos2(cursor_x + badge_size.x * 0.5, cy), badge_size);
+        let is_3d = track.is_3d;
+        state.track_3d_flags.insert(track.id.clone(), is_3d);
+        if paint_header_toggle(
+            ui,
+            r.intersect(clip_rect),
+            clip_rect,
+            ("trk_3d", &track.id),
+            "3D",
+            is_3d,
+            false,
+        ) {
+            let next_3d = !is_3d;
+            if session.set_track_3d(&track.id, next_3d).is_ok() {
+                state.track_3d_flags.insert(track.id.clone(), next_3d);
+            }
+        }
+        cursor_x -= 3.0;
+    }
+
+    // 6. Subtle hover-only `+` track-add icon on first track row (keeps startup header clean).
+    if show_add_btn {
+        cursor_x -= icon_size.x;
+        let add_rect = Rect::from_center_size(pos2(cursor_x + icon_size.x * 0.5, cy), icon_size);
+        if paint_track_icon_button(
+            ui,
+            add_rect.intersect(clip_rect),
+            clip_rect,
+            ("trk_add_hover", kind_tag(kind)),
+            TrackIcon::Add,
+            false,
+            true,
+        ) {
+            add_track_of_kind(session, state, kind, tracks_height);
+        }
+        cursor_x -= 3.0;
+    }
+
+    // Clip track name cleanly so long names never overlap icon toggles.
+    let name_clip = Rect::from_min_max(
+        pos2(row_rect.left(), row_rect.top()),
+        pos2((cursor_x - 2.0).max(row_rect.left()), row_rect.bottom()),
+    )
+    .intersect(clip_rect);
+    let name_painter = ui.painter().with_clip_rect(name_clip);
+    name_painter.text(
+        pos2(row_rect.left() + 5.0, cy),
+        Align2::LEFT_CENTER,
+        &track.name,
+        FontId::monospace(15.0),
+        COLOR_TRACK_HEADER_TEXT,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum TrackIcon {
+    Eye(bool),
+    Speaker(bool),
+    Solo(bool),
+    Lock(bool),
+    Delete,
+    Add,
+}
+
+fn paint_track_icon_button(
+    ui: &mut Ui,
+    rect: Rect,
+    clip_rect: Rect,
+    id_salt: (&str, &str),
+    icon: TrackIcon,
+    active_red: bool,
+    enabled: bool,
+) -> bool {
+    if rect.width() < 2.0 || rect.height() < 2.0 {
+        return false;
+    }
+    let resp = ui.interact(
+        rect,
+        ui.scope_id().with(id_salt),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let painter = ui.painter().with_clip_rect(clip_rect);
+
+    let hovered_bg = enabled && resp.hovered();
+    let cell_bg = if hovered_bg {
+        Color32::from_rgb(0x36, 0x36, 0x36)
+    } else {
+        COLOR_TRACK_HEADER_BG
+    };
+    if hovered_bg {
+        painter.rect_filled(rect, CornerRadius::ZERO, cell_bg);
+    }
+
+    let idle_fg = match icon {
+        TrackIcon::Eye(true) | TrackIcon::Speaker(true) | TrackIcon::Delete | TrackIcon::Add => {
+            TEXT_PRIMARY
+        }
+        TrackIcon::Eye(false)
+        | TrackIcon::Speaker(false)
+        | TrackIcon::Solo(_)
+        | TrackIcon::Lock(_) => TEXT_MUTED,
+    };
+    let fg = if active_red {
+        Color32::from_rgb(0xd4, 0x48, 0x48)
+    } else if hovered_bg {
+        Color32::from_rgb(0xe4, 0xe4, 0xe4)
+    } else if !enabled && !matches!(icon, TrackIcon::Delete) {
+        Color32::from_rgb(0x50, 0x50, 0x50)
+    } else {
+        idle_fg
+    };
+
+    let c = rect.center();
+    match icon {
+        TrackIcon::Eye(on) => {
+            // 16 x 12 px thick filled eye silhouette with dark iris ring and solid center pupil.
+            const N: usize = 12;
+            let rx = 8.0_f32;
+            let ry = 5.5_f32;
+            let mut almond = Vec::with_capacity(N * 2);
+            for i in 0..=N {
+                let u = i as f32 / N as f32;
+                let x = c.x - rx + u * (2.0 * rx);
+                let y = c.y - (std::f32::consts::PI * u).sin() * ry;
+                almond.push(pos2(x, y));
+            }
+            for i in 1..N {
+                let u = 1.0 - (i as f32 / N as f32);
+                let x = c.x - rx + u * (2.0 * rx);
+                let y = c.y + (std::f32::consts::PI * u).sin() * ry;
+                almond.push(pos2(x, y));
+            }
+            painter.add(Shape::convex_polygon(almond, fg, Stroke::NONE));
+            painter.circle_filled(c, 3.8, cell_bg);
+            painter.circle_filled(c, 2.0, fg);
+            if !on {
+                painter.line_segment(
+                    [pos2(c.x - 6.5, c.y + 5.0), pos2(c.x + 6.5, c.y - 5.0)],
+                    Stroke::new(1.5, fg),
+                );
+            }
+        }
+        TrackIcon::Speaker(on) => {
+            // 10 x 14 px solid speaker horn with no sound-wave arcs (matching Zoidium A1).
+            let back = Rect::from_min_max(pos2(c.x - 4.5, c.y - 3.1), pos2(c.x - 1.0, c.y + 3.1));
+            painter.rect_filled(back, CornerRadius::ZERO, fg);
+            let cone = vec![
+                pos2(c.x - 1.2, c.y - 3.1),
+                pos2(c.x + 4.5, c.y - 6.5),
+                pos2(c.x + 4.5, c.y + 6.5),
+                pos2(c.x - 1.2, c.y + 3.1),
+            ];
+            painter.add(Shape::convex_polygon(cone, fg, Stroke::NONE));
+            if !on {
+                painter.line_segment(
+                    [pos2(c.x - 5.5, c.y + 5.5), pos2(c.x + 5.5, c.y - 5.5)],
+                    Stroke::new(1.5, fg),
+                );
+            }
+        }
+        TrackIcon::Solo(on) => {
+            // 8 x 8 px outer diameter ring (r = 2.85, 1.35 px stroke).
+            painter.circle_stroke(c, 2.85, Stroke::new(1.35, fg));
+            if on {
+                painter.circle_filled(c, 1.8, fg);
+            }
+        }
+        TrackIcon::Lock(locked) => {
+            if locked {
+                let ic_rect = Rect::from_center_size(c, vec2(12.0, 12.0));
+                paint_cm3_icon(&painter, ic_rect, Cm3Icon::Lock, fg);
+            } else {
+                // 10 x 12 px unlocked padlock: hollow body + open shackle anchored on left leg.
+                let body = Rect::from_center_size(pos2(c.x, c.y + 2.0), vec2(9.0, 7.0));
+                painter.rect_stroke(
+                    body,
+                    CornerRadius::same(1),
+                    Stroke::new(1.3, fg),
+                    StrokeKind::Inside,
+                );
+                let shackle = vec![
+                    pos2(c.x - 2.2, c.y - 1.5),
+                    pos2(c.x - 2.2, c.y - 3.8),
+                    pos2(c.x - 1.0, c.y - 5.0),
+                    pos2(c.x + 0.8, c.y - 5.0),
+                    pos2(c.x + 1.8, c.y - 3.8),
+                ];
+                painter.add(Shape::line(shackle, Stroke::new(1.3, fg)));
+            }
+        }
+        TrackIcon::Delete => {
+            // 14 x 14 px crisp '×' diagonals (1.4 px stroke).
+            let s = Stroke::new(1.4, fg);
+            painter.line_segment([pos2(c.x - 5.6, c.y - 5.6), pos2(c.x + 5.6, c.y + 5.6)], s);
+            painter.line_segment([pos2(c.x + 5.6, c.y - 5.6), pos2(c.x - 5.6, c.y + 5.6)], s);
+        }
+        TrackIcon::Add => {
+            let ic_rect = Rect::from_center_size(c, vec2(11.0, 11.0));
+            paint_cm3_icon(&painter, ic_rect, Cm3Icon::Add, fg);
+        }
+    }
+
+    enabled && resp.clicked_by(PointerButton::Primary)
 }
 
 fn paint_header_toggle(
     ui: &mut Ui,
     rect: Rect,
+    clip_rect: Rect,
     id_salt: (&str, &str),
     label: &str,
     active_red: bool,
@@ -1897,14 +2473,9 @@ fn paint_header_toggle(
     } else {
         COLOR_TOGGLE_INACTIVE
     };
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(1), bg);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(1),
-        Stroke::new(1.0, Color32::from_rgb(0x1b, 0x1b, 0x1b)),
-        StrokeKind::Inside,
-    );
+    let painter = ui.painter().with_clip_rect(clip_rect);
+    painter.rect_filled(rect, CornerRadius::ZERO, bg);
+    paint_crisp_border_1px(&painter, rect, Color32::from_rgb(0x1b, 0x1b, 0x1b));
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -1952,8 +2523,9 @@ fn paint_audio_clip_waveform(
     if w < 1 {
         return;
     }
-    let x_start = ((visible_rect.left() - clip_rect.left()).max(0.0).floor() as i32).max(1);
-    let x_end = ((visible_rect.right() - clip_rect.left()).ceil() as i32).min(w);
+    let inner_left = clip_rect.left() + 1.0;
+    let x_start = ((visible_rect.left() - inner_left).floor() as i32).clamp(0, w);
+    let x_end = ((visible_rect.right() - inner_left).ceil() as i32).clamp(0, w);
     let inner_h = (clip_rect.height() - 2.0).max(1.0);
     let base_y = clip_rect.bottom() - 1.0;
 
@@ -1975,7 +2547,7 @@ fn paint_audio_clip_waveform(
             }
             let amp = (hi - lo).unsigned_abs() as f32 / 255.0;
             let bar_h = (amp * inner_h).max(1.0);
-            let sx = clip_rect.left() + x as f32 + 0.5;
+            let sx = inner_left + x as f32 + 0.5;
             painter.line_segment(
                 [pos2(sx, base_y - bar_h), pos2(sx, base_y)],
                 Stroke::new(1.0, COLOR_WAVEFORM),
@@ -1990,7 +2562,7 @@ fn paint_audio_clip_waveform(
             let env = 0.28 + 0.52 * ((x as f32 * 0.11 + (seed % 13) as f32).sin().abs());
             let amp = (env * (0.55 + 0.45 * u)).clamp(0.08, 0.92);
             let bar_h = amp * inner_h;
-            let sx = clip_rect.left() + x as f32 + 0.5;
+            let sx = inner_left + x as f32 + 0.5;
             painter.line_segment(
                 [pos2(sx, base_y - bar_h), pos2(sx, base_y)],
                 Stroke::new(1.0, COLOR_WAVEFORM),
@@ -2021,13 +2593,9 @@ fn paint_inline_clip_rename(
         _ => return,
     };
 
-    ui.painter().rect(
-        rect,
-        CornerRadius::ZERO,
-        COLOR_RENAME_BG,
-        Stroke::new(1.0, COLOR_RENAME_BORDER),
-        StrokeKind::Inside,
-    );
+    let rename_painter = ui.painter();
+    rename_painter.rect_filled(rect, CornerRadius::ZERO, COLOR_RENAME_BG);
+    paint_crisp_border_1px(rename_painter, rect, COLOR_RENAME_BORDER);
 
     let edit_resp = ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(1.0)), |ui| {
         ui.visuals_mut().extreme_bg_color = COLOR_RENAME_BG;
@@ -2073,8 +2641,9 @@ fn paint_and_interact_divider(
     rect: Rect,
     tracks_height: f32,
 ) {
+    let hit_rect = rect.expand2(vec2(0.0, 2.0));
     let resp = ui.interact(
-        rect,
+        hit_rect,
         ui.scope_id().with("timeline_va_divider"),
         Sense::click_and_drag(),
     );
@@ -2100,6 +2669,9 @@ fn paint_and_interact_divider(
     {
         if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
             let dy = pos.y - start_y;
+            if dy.abs() > 0.0 {
+                state.video_audio_split_custom = true;
+            }
             state.video_audio_split_y =
                 (start_split_y + dy).clamp(0.0, (tracks_height - DIVIDER_HEIGHT).max(0.0));
         }
@@ -2108,22 +2680,24 @@ fn paint_and_interact_divider(
         }
     }
 
+    // 4 px Video / Audio divider: #212121 top 1 px, #2a2a2a middle 2 px, #212121 bottom 1 px (Spec 02 §1.6).
     let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::ZERO, COLOR_PANEL_BG);
     painter.rect_filled(
-        rect,
+        Rect::from_min_size(
+            pos2(rect.left(), rect.top().round()),
+            vec2(rect.width(), 1.0),
+        ),
         CornerRadius::ZERO,
-        Color32::from_rgb(0x2a, 0x2a, 0x2a),
+        COLOR_TRACK_BORDER,
     );
-    painter.line_segment(
-        [rect.left_top(), rect.right_top()],
-        Stroke::new(1.0, COLOR_TRACK_BORDER),
-    );
-    painter.line_segment(
-        [
-            pos2(rect.left(), rect.bottom() - 0.5),
-            pos2(rect.right(), rect.bottom() - 0.5),
-        ],
-        Stroke::new(1.0, COLOR_TRACK_BORDER),
+    painter.rect_filled(
+        Rect::from_min_size(
+            pos2(rect.left(), (rect.bottom() - 1.0).round()),
+            vec2(rect.width(), 1.0),
+        ),
+        CornerRadius::ZERO,
+        COLOR_TRACK_BORDER,
     );
 }
 
@@ -2177,8 +2751,31 @@ fn process_active_drag_state(
                 let content_x = f64::from(pos.x - lanes_rect.left()) + state.scroll_x;
                 let raw_start =
                     px_to_frame(content_x + drag.grab_offset_px, fps, state.zoom).round();
-                let (snapped_start, snap_abs) =
+                let raw_end = raw_start + drag.anchor_length;
+                let (snapped_l, hit_l) =
                     snap_frame(raw_start, &targets, fps, state.zoom, snap_active);
+                let (snapped_r, hit_r) =
+                    snap_frame(raw_end, &targets, fps, state.zoom, snap_active);
+
+                let (snapped_start, snap_abs) = match (hit_l, hit_r) {
+                    (Some(tl), Some(tr)) => {
+                        let dl = (frame_to_px(tl, fps, state.zoom)
+                            - frame_to_px(raw_start, fps, state.zoom))
+                        .abs();
+                        let dr = (frame_to_px(tr, fps, state.zoom)
+                            - frame_to_px(raw_end, fps, state.zoom))
+                        .abs();
+                        if dl <= dr {
+                            (snapped_l, Some(tl))
+                        } else {
+                            (snapped_r - drag.anchor_length, Some(tr))
+                        }
+                    }
+                    (Some(tl), None) => (snapped_l, Some(tl)),
+                    (None, Some(tr)) => (snapped_r - drag.anchor_length, Some(tr)),
+                    (None, None) => (raw_start, None),
+                };
+
                 if let Some(sa) = snap_abs {
                     state.snap_guide_x = Some(
                         lanes_rect.left()
@@ -2222,49 +2819,70 @@ fn process_active_drag_state(
                 }
             }
 
-            // Paint semi-transparent move proxy boxes.
-            let tracks_slice = match drag.anchor_kind {
-                TrackKind::Video => &session.document().video_tracks,
-                TrackKind::Audio => &session.document().audio_tracks,
-            };
+            // Validate ALL dragged clips (locked destination tracks, non-selected overlaps, and
+            // pairwise collisions) BEFORE painting any proxy boxes.
+            let mut moves = Vec::with_capacity(drag.clips.len());
+            let mut proxy_boxes: Vec<(usize, f64, f64)> = Vec::with_capacity(drag.clips.len());
+            let mut all_valid = !drag.clips.is_empty();
+            {
+                let tracks_slice = match drag.anchor_kind {
+                    TrackKind::Video => &session.document().video_tracks,
+                    TrackKind::Audio => &session.document().audio_tracks,
+                };
+                let mut placed_on_track: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
+                for c in &drag.clips {
+                    let dest_ti = (c.orig_track_index as isize + drag.preview_track_delta)
+                        .clamp(0, tracks_slice.len().saturating_sub(1) as isize)
+                        as usize;
+                    let dest_track = &tracks_slice[dest_ti];
+                    let proposed_start = (c.orig_start + drag.preview_delta_frames).max(0.0);
+                    if dest_track.locked {
+                        all_valid = false;
+                        proxy_boxes.push((dest_ti, proposed_start, c.length));
+                        continue;
+                    }
+                    if let Some(valid_start) = resolve_non_overlapping_start(
+                        dest_track,
+                        proposed_start,
+                        c.length,
+                        &exclude,
+                    ) {
+                        let valid_end = valid_start + c.length;
+                        let entry = placed_on_track.entry(dest_track.id.clone()).or_default();
+                        if entry
+                            .iter()
+                            .any(|&(s, e)| valid_start < e - 1e-6 && s < valid_end - 1e-6)
+                        {
+                            all_valid = false;
+                        }
+                        entry.push((valid_start, valid_end));
+                        proxy_boxes.push((dest_ti, valid_start, c.length));
+                        moves.push((c.clip_id.clone(), dest_track.id.clone(), valid_start));
+                    } else {
+                        all_valid = false;
+                        proxy_boxes.push((dest_ti, proposed_start, c.length));
+                    }
+                }
+            }
+            drag.overlap_blocked = !all_valid;
+
             let proxy_painter = ui.painter().with_clip_rect(lanes_rect);
-            drag.overlap_blocked = false;
-
-            for c in &drag.clips {
-                let dest_ti = (c.orig_track_index as isize + drag.preview_track_delta)
-                    .clamp(0, tracks_slice.len().saturating_sub(1) as isize)
-                    as usize;
-                let proposed_start = (c.orig_start + drag.preview_delta_frames).max(0.0);
-                let resolved = resolve_non_overlapping_start(
-                    &tracks_slice[dest_ti],
-                    proposed_start,
-                    c.length,
-                    &exclude,
-                );
-                let draw_start = resolved.unwrap_or_else(|| {
-                    drag.overlap_blocked = true;
-                    proposed_start
-                });
-
+            let proxy_fill = if drag.overlap_blocked {
+                Color32::from_rgba_unmultiplied(0xb7, 0x1e, 0x1e, 140)
+            } else {
+                rgb_to_color32_alpha(palette.clip_selected, 130)
+            };
+            for &(dest_ti, draw_start, length) in &proxy_boxes {
                 let (y0, y1) =
                     track_row_y_bounds(drag.anchor_kind, dest_ti, track_h, lanes_rect, scroll_y);
+                let (cy0, cy1) = clip_y_bounds(drag.anchor_kind, y0, y1);
                 let x0 = lanes_rect.left()
                     + (frame_to_px(draw_start, fps, state.zoom) - state.scroll_x) as f32;
                 let x1 = lanes_rect.left()
-                    + (frame_to_px(draw_start + c.length, fps, state.zoom) - state.scroll_x) as f32;
-                let proxy_rect = Rect::from_min_max(pos2(x0, y0), pos2(x1.max(x0 + 2.0), y1));
-                let fill = if drag.overlap_blocked {
-                    Color32::from_rgba_unmultiplied(0xb7, 0x1e, 0x1e, 140)
-                } else {
-                    rgb_to_color32_alpha(palette.clip_selected, 130)
-                };
-                proxy_painter.rect(
-                    proxy_rect,
-                    CornerRadius::ZERO,
-                    fill,
-                    Stroke::new(1.0, Color32::BLACK),
-                    StrokeKind::Inside,
-                );
+                    + (frame_to_px(draw_start + length, fps, state.zoom) - state.scroll_x) as f32;
+                let proxy_rect = Rect::from_min_max(pos2(x0, cy0), pos2(x1.max(x0 + 2.0), cy1));
+                proxy_painter.rect_filled(proxy_rect, CornerRadius::ZERO, proxy_fill);
+                paint_crisp_border_1px(&proxy_painter, proxy_rect, Color32::BLACK);
             }
 
             if primary_down {
@@ -2272,54 +2890,11 @@ fn process_active_drag_state(
                 state.drag_state = TimelineDragState::DraggingClips(drag);
             } else if drag.moved
                 && (drag.preview_delta_frames.abs() > 1e-6 || drag.preview_track_delta != 0)
+                && all_valid
+                && !moves.is_empty()
+                && session.move_clips_atomic(&moves).is_ok()
             {
-                // Validate every target clip position against non-selected clips AND pairwise
-                // within the selected group, then commit atomically so moving adjacent selected
-                // clips never trims or deletes another clip in the selection.
-                let mut moves = Vec::new();
-                let mut all_valid = true;
-                {
-                    let tracks_slice = match drag.anchor_kind {
-                        TrackKind::Video => &session.document().video_tracks,
-                        TrackKind::Audio => &session.document().audio_tracks,
-                    };
-                    let mut placed_on_track: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
-                    for c in &drag.clips {
-                        let dest_ti = (c.orig_track_index as isize + drag.preview_track_delta)
-                            .clamp(0, tracks_slice.len().saturating_sub(1) as isize)
-                            as usize;
-                        let dest_track = &tracks_slice[dest_ti];
-                        if dest_track.locked {
-                            all_valid = false;
-                            break;
-                        }
-                        let proposed_start = (c.orig_start + drag.preview_delta_frames).max(0.0);
-                        if let Some(valid_start) = resolve_non_overlapping_start(
-                            dest_track,
-                            proposed_start,
-                            c.length,
-                            &exclude,
-                        ) {
-                            let valid_end = valid_start + c.length;
-                            let entry = placed_on_track.entry(dest_track.id.clone()).or_default();
-                            if entry
-                                .iter()
-                                .any(|&(s, e)| valid_start < e - 1e-6 && s < valid_end - 1e-6)
-                            {
-                                all_valid = false;
-                                break;
-                            }
-                            entry.push((valid_start, valid_end));
-                            moves.push((c.clip_id.clone(), dest_track.id.clone(), valid_start));
-                        } else {
-                            all_valid = false;
-                            break;
-                        }
-                    }
-                }
-                if all_valid && !moves.is_empty() && session.move_clips_atomic(&moves).is_ok() {
-                    action.clips_modified = true;
-                }
+                action.clips_modified = true;
             }
         }
         TimelineDragState::TrimmingLeft(mut trim) => {
@@ -2339,7 +2914,11 @@ fn process_active_drag_state(
                             + (frame_to_px(sa, fps, state.zoom) - state.scroll_x) as f32,
                     );
                 }
-                let min_delta = -trim.orig_start;
+                let adjust_time = !trim.rate_stretch && !trim.time_animated;
+                let mut min_delta = -trim.orig_start;
+                if adjust_time {
+                    min_delta = min_delta.max(-trim.orig_time_start * fps);
+                }
                 let max_delta = (trim.orig_length - 1.0).max(0.0);
                 trim.preview_delta_frames =
                     if min_delta.is_finite() && max_delta.is_finite() && min_delta <= max_delta {
@@ -2422,14 +3001,14 @@ fn process_active_drag_state(
         TimelineDragState::DraggingKeyframe(mut drag) => {
             let mut snap_targets = vec![0.0, session.playback.current_frame.round(), total_frames];
             for row in collect_keyframe_rows(session) {
-                for (lf, _, _) in row.keyframes {
+                for item in row.keyframes {
                     let is_dragged = drag.keyframes.iter().any(|dk| {
                         dk.target_id == row.target_id
                             && dk.property == row.property
-                            && (dk.orig_local_frame - lf).abs() < 1e-6
+                            && (dk.orig_local_frame - item.local_frame).abs() < 1e-6
                     });
                     if !is_dragged {
-                        snap_targets.push(row.frame_offset + lf);
+                        snap_targets.push(row.frame_offset + item.local_frame);
                     }
                 }
             }
@@ -2445,7 +3024,15 @@ fn process_active_drag_state(
                             + (frame_to_px(sa, fps, state.zoom) - state.scroll_x) as f32,
                     );
                 }
-                let delta = snapped_abs - drag.anchor_orig_abs_frame;
+                let min_abs = drag
+                    .keyframes
+                    .iter()
+                    .map(|kf| kf.frame_offset + kf.orig_local_frame)
+                    .fold(f64::INFINITY, f64::min);
+                let mut delta = snapped_abs - drag.anchor_orig_abs_frame;
+                if min_abs.is_finite() {
+                    delta = delta.max(-min_abs);
+                }
                 if delta.abs() > 1e-6 {
                     drag.moved = true;
                 }
@@ -2474,6 +3061,14 @@ fn process_active_drag_state(
                         })
                         .is_ok()
                     {
+                        let _ = session.set_keyframe_bezier_handles(
+                            &kf.target_id,
+                            &kf.property,
+                            new_frame,
+                            kf.control_points,
+                            kf.continuous_tangent,
+                            Some(kf.tween),
+                        );
                         changed = true;
                         new_selection.push(KeyframeRef::new(
                             &kf.target_id,
@@ -2483,24 +3078,26 @@ fn process_active_drag_state(
                         ));
                     }
                 }
-                for kf in &drag.keyframes {
-                    let still_occupied = drag.keyframes.iter().any(|other| {
-                        other.target_id == kf.target_id
-                            && other.property == kf.property
-                            && ((other.orig_local_frame + drag.preview_delta_frames)
-                                - kf.orig_local_frame)
-                                .abs()
-                                < 1e-6
-                    });
-                    if !still_occupied {
-                        let _ = session.execute(Command::DeleteKeyframe {
-                            target_id: kf.target_id.clone(),
-                            property: kf.property.clone(),
-                            frame: kf.orig_local_frame,
+                if changed {
+                    for kf in &drag.keyframes {
+                        let still_occupied = drag.keyframes.iter().any(|other| {
+                            other.target_id == kf.target_id
+                                && other.property == kf.property
+                                && ((other.orig_local_frame + drag.preview_delta_frames)
+                                    - kf.orig_local_frame)
+                                    .abs()
+                                    < 1e-6
                         });
+                        if !still_occupied {
+                            let _ = session.execute(Command::DeleteKeyframe {
+                                target_id: kf.target_id.clone(),
+                                property: kf.property.clone(),
+                                frame: kf.orig_local_frame,
+                            });
+                        }
                     }
+                    session.selection.keyframes = new_selection;
                 }
-                session.selection.keyframes = new_selection;
                 let _ = session.commit_transaction(changed);
             }
         }
@@ -2553,14 +3150,22 @@ fn process_active_drag_state(
                         for (idx, row) in rows.iter().enumerate() {
                             let cy = kf_lanes_rect.top() + (idx as f32 + 0.5) * KEYFRAME_ROW_HEIGHT
                                 - state.keyframe_scroll_y;
-                            for (lf, _, _) in &row.keyframes {
+                            for item in &row.keyframes {
                                 let cx = kf_lanes_rect.left()
-                                    + (frame_to_px(row.frame_offset + *lf, fps, state.zoom)
-                                        - state.scroll_x)
+                                    + (frame_to_px(
+                                        row.frame_offset + item.local_frame,
+                                        fps,
+                                        state.zoom,
+                                    ) - state.scroll_x)
                                         as f32;
-                                if rect.contains(pos2(cx, cy)) {
-                                    let kf_ref =
-                                        KeyframeRef::new(&row.target_id, &row.property, None, *lf);
+                                let pt = pos2(cx, cy);
+                                if kf_lanes_rect.contains(pt) && rect.contains(pt) {
+                                    let kf_ref = KeyframeRef::new(
+                                        &row.target_id,
+                                        &row.property,
+                                        None,
+                                        item.local_frame,
+                                    );
                                     if !session.selection.keyframes.contains(&kf_ref) {
                                         session.selection.keyframes.push(kf_ref);
                                     }
@@ -2627,6 +3232,7 @@ fn paint_trim_proxy(
         ),
     };
     let (y0, y1) = track_row_y_bounds(kind, ti, track_h, lanes_rect, scroll_y);
+    let (cy0, cy1) = clip_y_bounds(kind, y0, y1);
     let (new_start, new_len) = if is_left {
         (
             trim.orig_start + trim.preview_delta_frames,
@@ -2641,7 +3247,7 @@ fn paint_trim_proxy(
     let x0 = lanes_rect.left() + (frame_to_px(new_start, fps, state.zoom) - state.scroll_x) as f32;
     let x1 = lanes_rect.left()
         + (frame_to_px(new_start + new_len, fps, state.zoom) - state.scroll_x) as f32;
-    let rect = Rect::from_min_max(pos2(x0, y0), pos2(x1.max(x0 + 2.0), y1));
+    let rect = Rect::from_min_max(pos2(x0, cy0), pos2(x1.max(x0 + 2.0), cy1));
     ui.painter().with_clip_rect(lanes_rect).rect(
         rect,
         CornerRadius::ZERO,
@@ -2658,14 +3264,19 @@ fn paint_and_interact_scrollbar(
     seq_px: f64,
     max_scroll_x: f64,
 ) {
-    let painter = ui.painter();
-    // Empty 200 px bottom-left corner.
-    let corner = Rect::from_min_max(
-        pos2(rect.left() - HEADER_WIDTH, rect.top()),
-        pos2(rect.left(), rect.bottom()),
-    );
-    painter.rect_filled(corner, CornerRadius::ZERO, COLOR_SCROLLBAR_TRACK);
-    painter.rect_filled(rect, CornerRadius::ZERO, COLOR_SCROLLBAR_TRACK);
+    let dragging = state.scrollbar_drag_offset.is_some();
+    if max_scroll_x <= 0.5 && !dragging {
+        return;
+    }
+
+    let reveal_rect = Rect::from_min_max(pos2(rect.left(), rect.top() - 6.0), rect.max);
+    let hover_near = ui
+        .input(|i| i.pointer.hover_pos())
+        .is_some_and(|p| reveal_rect.contains(p));
+    let scrolled = state.scroll_x > 0.5;
+    if !hover_near && !dragging && !scrolled {
+        return;
+    }
 
     let total_px = (seq_px + 200.0).max(f64::from(rect.width()));
     let visible_ratio = (f64::from(rect.width()) / total_px).clamp(0.05, 1.0);
@@ -2679,56 +3290,120 @@ fn paint_and_interact_scrollbar(
     let thumb_x = rect.left() + track_span * scroll_frac;
     let thumb_rect = Rect::from_min_size(
         pos2(thumb_x, rect.top() + 1.0),
-        vec2(thumb_w, rect.height() - 2.0),
+        vec2(thumb_w, (rect.height() - 2.0).max(2.0)),
     );
 
-    let resp = ui.interact(
-        rect,
-        ui.scope_id().with("timeline_hscrollbar"),
-        Sense::click_and_drag(),
-    );
+    let mut hovered = false;
+    if hover_near || dragging {
+        let resp = ui.interact(
+            rect,
+            ui.scope_id().with("timeline_hscrollbar"),
+            Sense::click_and_drag(),
+        );
+        hovered = resp.hovered();
 
-    if resp.drag_started_by(PointerButton::Primary)
-        && let Some(pos) = resp.interact_pointer_pos()
-    {
-        if thumb_rect.contains(pos) {
-            state.scrollbar_drag_offset = Some(pos.x - thumb_rect.left());
-        } else {
-            state.scrollbar_drag_offset = Some(thumb_w * 0.5);
+        if resp.drag_started_by(PointerButton::Primary)
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            if thumb_rect.contains(pos) {
+                state.scrollbar_drag_offset = Some(pos.x - thumb_rect.left());
+            } else {
+                state.scrollbar_drag_offset = Some(thumb_w * 0.5);
+            }
+        }
+
+        if resp.dragged_by(PointerButton::Primary)
+            && let (Some(pos), Some(offset)) = (
+                ui.input(|i| i.pointer.latest_pos()),
+                state.scrollbar_drag_offset,
+            )
+            && track_span > 0.0
+        {
+            let new_frac = ((pos.x - offset - rect.left()) / track_span).clamp(0.0, 1.0);
+            state.scroll_x = f64::from(new_frac) * max_scroll_x;
+        }
+
+        if resp.drag_stopped() {
+            state.scrollbar_drag_offset = None;
         }
     }
 
-    if resp.dragged_by(PointerButton::Primary)
-        && let (Some(pos), Some(offset)) = (
-            ui.input(|i| i.pointer.latest_pos()),
-            state.scrollbar_drag_offset,
-        )
-        && track_span > 0.0
-    {
-        let new_frac = ((pos.x - offset - rect.left()) / track_span).clamp(0.0, 1.0);
-        state.scroll_x = f64::from(new_frac) * max_scroll_x;
-    }
-
-    if resp.drag_stopped() {
-        state.scrollbar_drag_offset = None;
-    }
-
-    let thumb_color = if resp.hovered() || state.scrollbar_drag_offset.is_some() {
-        Color32::from_rgb(0x6d, 0x6d, 0x6d)
+    let thumb_color = if state.scrollbar_drag_offset.is_some() {
+        Color32::from_rgba_unmultiplied(0x78, 0x78, 0x78, 200)
+    } else if hovered || hover_near {
+        Color32::from_rgba_unmultiplied(0x66, 0x66, 0x66, 160)
     } else {
-        COLOR_SCROLLBAR_THUMB
+        Color32::from_rgba_unmultiplied(0x55, 0x55, 0x55, 85)
     };
-    painter.rect_filled(thumb_rect, CornerRadius::same(2), thumb_color);
+    ui.painter()
+        .rect_filled(thumb_rect, CornerRadius::same(2), thumb_color);
 }
 
 // ---------------------------------------------------------------------------
 // Internal Geometry & Drawing Utilities
 // ---------------------------------------------------------------------------
 
+fn default_video_audio_split_y(
+    tracks_height: f32,
+    video_track_height: f32,
+    audio_track_height: f32,
+) -> f32 {
+    let total_unit = (video_track_height + audio_track_height).max(1.0);
+    let desired_v =
+        (tracks_height * (video_track_height / total_unit) - DIVIDER_HEIGHT * 0.5).floor();
+    desired_v.clamp(0.0, (tracks_height - DIVIDER_HEIGHT).max(0.0))
+}
+
+fn paint_crisp_border_1px(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let min_x = rect.left().round();
+    let max_x = rect.right().round();
+    let min_y = rect.top().round();
+    let max_y = rect.bottom().round();
+    let w = (max_x - min_x).max(0.0);
+    let h = (max_y - min_y).max(0.0);
+    if w < 1.0 || h < 1.0 {
+        return;
+    }
+    painter.rect_filled(
+        Rect::from_min_size(pos2(min_x, min_y), vec2(w, 1.0)),
+        CornerRadius::ZERO,
+        color,
+    );
+    if h >= 2.0 {
+        painter.rect_filled(
+            Rect::from_min_size(pos2(min_x, max_y - 1.0), vec2(w, 1.0)),
+            CornerRadius::ZERO,
+            color,
+        );
+    }
+    let inner_h = (h - 2.0).max(0.0);
+    if inner_h > 0.0 {
+        painter.rect_filled(
+            Rect::from_min_size(pos2(min_x, min_y + 1.0), vec2(1.0, inner_h)),
+            CornerRadius::ZERO,
+            color,
+        );
+        if w >= 2.0 {
+            painter.rect_filled(
+                Rect::from_min_size(pos2(max_x - 1.0, min_y + 1.0), vec2(1.0, inner_h)),
+                CornerRadius::ZERO,
+                color,
+            );
+        }
+    }
+}
+
 fn kind_tag(kind: TrackKind) -> &'static str {
     match kind {
         TrackKind::Video => "video",
         TrackKind::Audio => "audio",
+    }
+}
+
+fn clip_y_bounds(kind: TrackKind, y0: f32, y1: f32) -> (f32, f32) {
+    match kind {
+        TrackKind::Video => ((y0 + 1.0).min(y1), y1),
+        TrackKind::Audio => (y0, (y1 - 1.0).max(y0 + 1.0)),
     }
 }
 
@@ -2740,13 +3415,13 @@ fn track_row_y_bounds(
     scroll_y: f32,
 ) -> (f32, f32) {
     match kind {
-        // Video tracks stack bottom-up from the Video/Audio divider: V1 is at index 0.
+        // Video tracks stack bottom-up from the Video/Audio divider (V1 immediately above divider).
         TrackKind::Video => {
             let y1 = lanes_rect.bottom() - track_idx as f32 * track_h + scroll_y;
             let y0 = y1 - track_h;
             (y0, y1)
         }
-        // Audio tracks stack top-down from the divider: A1 is at index 0.
+        // Audio tracks stack top-down below the Video/Audio divider (A1 immediately below divider).
         TrackKind::Audio => {
             let y0 = lanes_rect.top() + track_idx as f32 * track_h - scroll_y;
             let y1 = y0 + track_h;
@@ -2768,7 +3443,7 @@ fn y_to_track_index(
     }
     let idx = match kind {
         TrackKind::Video => {
-            ((lanes_rect.bottom() + scroll_y - pointer_y) / track_h).floor() as isize
+            ((lanes_rect.bottom() - pointer_y + scroll_y) / track_h).floor() as isize
         }
         TrackKind::Audio => ((pointer_y - lanes_rect.top() + scroll_y) / track_h).floor() as isize,
     };
@@ -2782,6 +3457,9 @@ fn collect_selected_clips_of_kind(session: &Session, kind: TrackKind) -> Vec<Dra
     };
     let mut out = Vec::new();
     for (ti, track) in tracks.iter().enumerate() {
+        if track.locked {
+            continue;
+        }
         for clip in &track.clips {
             if session.selection.clip_ids.contains(&clip.id) {
                 out.push(DraggedClipInfo {
@@ -2816,12 +3494,14 @@ fn collect_clips_in_rect(
             video_lanes_rect,
             state.video_scroll_y,
         );
+        let (cy0, cy1) = clip_y_bounds(TrackKind::Video, y0, y1);
         for clip in &track.clips {
             let x0 = video_lanes_rect.left()
                 + (frame_to_px(clip.start, fps, state.zoom) - state.scroll_x) as f32;
             let x1 = video_lanes_rect.left()
                 + (frame_to_px(clip.start + clip.length, fps, state.zoom) - state.scroll_x) as f32;
-            if Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)).intersects(marquee) {
+            let vis = Rect::from_min_max(pos2(x0, cy0), pos2(x1, cy1)).intersect(video_lanes_rect);
+            if vis.width() > 0.0 && vis.height() > 0.0 && vis.intersects(marquee) {
                 selected.insert(clip.id.clone());
             }
         }
@@ -2834,12 +3514,14 @@ fn collect_clips_in_rect(
             audio_lanes_rect,
             state.audio_scroll_y,
         );
+        let (cy0, cy1) = clip_y_bounds(TrackKind::Audio, y0, y1);
         for clip in &track.clips {
             let x0 = audio_lanes_rect.left()
                 + (frame_to_px(clip.start, fps, state.zoom) - state.scroll_x) as f32;
             let x1 = audio_lanes_rect.left()
                 + (frame_to_px(clip.start + clip.length, fps, state.zoom) - state.scroll_x) as f32;
-            if Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)).intersects(marquee) {
+            let vis = Rect::from_min_max(pos2(x0, cy0), pos2(x1, cy1)).intersect(audio_lanes_rect);
+            if vis.width() > 0.0 && vis.height() > 0.0 && vis.intersects(marquee) {
                 selected.insert(clip.id.clone());
             }
         }
@@ -2973,6 +3655,7 @@ mod tests {
             enabled: true,
             solo: false,
             locked: false,
+            is_3d: false,
             clips: vec![SessionClip {
                 id: "c1".to_string(),
                 kind: "scene".to_string(),
@@ -3062,5 +3745,65 @@ mod tests {
             "reverse clip final column must sample [0.50s, 0.51s]"
         );
         assert_eq!(peaks.max_buf[rev_last_idx], 120);
+    }
+
+    #[test]
+    fn video_tracks_stack_bottom_up_and_audio_tracks_top_down() {
+        let video_rect = Rect::from_min_max(pos2(587.0, 664.0), pos2(1232.0, 712.0));
+        let (v0_y0, v0_y1) = track_row_y_bounds(TrackKind::Video, 0, 30.0, video_rect, 0.0);
+        assert_eq!((v0_y0, v0_y1), (682.0, 712.0));
+        assert_eq!(
+            clip_y_bounds(TrackKind::Video, v0_y0, v0_y1),
+            (683.0, 712.0)
+        );
+        assert_eq!(
+            y_to_track_index(TrackKind::Video, 695.0, 30.0, video_rect, 0.0, 2),
+            0
+        );
+        assert_eq!(
+            y_to_track_index(TrackKind::Video, 670.0, 30.0, video_rect, 0.0, 2),
+            1
+        );
+
+        let audio_rect = Rect::from_min_max(pos2(587.0, 716.0), pos2(1232.0, 799.0));
+        let (a0_y0, a0_y1) = track_row_y_bounds(TrackKind::Audio, 0, 50.0, audio_rect, 0.0);
+        assert_eq!((a0_y0, a0_y1), (716.0, 766.0));
+        assert_eq!(
+            clip_y_bounds(TrackKind::Audio, a0_y0, a0_y1),
+            (716.0, 765.0)
+        );
+        assert_eq!(
+            y_to_track_index(TrackKind::Audio, 740.0, 50.0, audio_rect, 0.0, 2),
+            0
+        );
+        assert_eq!(
+            y_to_track_index(TrackKind::Audio, 780.0, 50.0, audio_rect, 0.0, 2),
+            1
+        );
+    }
+
+    #[test]
+    fn default_video_audio_split_matches_zoidium_at_720p_and_800p() {
+        // 1280x720 -> tracks_height = 107 px -> split at 38 px.
+        assert_eq!(
+            default_video_audio_split_y(
+                107.0,
+                DEFAULT_VIDEO_TRACK_HEIGHT,
+                DEFAULT_AUDIO_TRACK_HEIGHT
+            ),
+            38.0
+        );
+        // 1280x800 -> tracks_height = 135 px -> split at 48 px (V1 682..712, divider 712..716, A1 716..766).
+        let split_800 = default_video_audio_split_y(
+            135.0,
+            DEFAULT_VIDEO_TRACK_HEIGHT,
+            DEFAULT_AUDIO_TRACK_HEIGHT,
+        );
+        assert_eq!(split_800, 48.0);
+        let tracks_top = 664.0;
+        let divider_top = tracks_top + split_800;
+        assert_eq!(divider_top, 712.0);
+        assert_eq!(divider_top + DIVIDER_HEIGHT, 716.0);
+        assert!(!TimelineViewState::new().video_audio_split_custom);
     }
 }

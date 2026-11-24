@@ -188,11 +188,13 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         }
     }
     let grad = textureSampleLevel(t_aux, s_linear, vec2<f32>(clamp(t, 0.0, 1.0), 0.5), 0.0);
-    let eff_alpha = clamp(grad.a * u.p1.y, 0.0, 1.0);
+    let src_a = clamp(grad.a * u.p1.y, 0.0, 1.0);
+    let fg_rgb = clamp(grad.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     let bg_rgb = unpremultiply(bg);
-    let blended = apply_blend(bg_rgb, grad.rgb, u.mode);
-    let out_rgb = mix(bg_rgb, blended, eff_alpha);
-    return premultiply(out_rgb, bg.a);
+    let blended = apply_blend(bg_rgb, fg_rgb, u.mode);
+    let out_a = clamp(src_a + bg.a * (1.0 - src_a), 0.0, 1.0);
+    let out_rgb = (1.0 - bg.a) * (fg_rgb * src_a) + (1.0 - src_a) * bg.rgb + src_a * bg.a * blended;
+    return vec4<f32>(clamp(out_rgb, vec3<f32>(0.0), vec3<f32>(out_a)), out_a);
 }
 "#;
 
@@ -255,8 +257,9 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let dist = select(max(abs(q.x), abs(q.y)), length(q), u.mode == 1u);
     let inner = 1.0 / (1.0 + feather);
     let edge = 1.0 - smoothstep(inner - 1e-4, 1.0 + 1e-4, dist);
-    let cov = clamp(edge, 0.0, 1.0) * clamp(u.p1.z, 0.0, 1.0);
-    let factor = select(cov, 1.0 - cov, (u.flags & 1u) != 0u);
+    let cov = clamp(edge, 0.0, 1.0);
+    let inverted = select(cov, 1.0 - cov, (u.flags & 1u) != 0u);
+    let factor = inverted * clamp(u.p1.z, 0.0, 1.0);
     return texel * clamp(factor, 0.0, 1.0);
 }
 "#;
@@ -290,12 +293,13 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let sample_uv = select(clamped_uv, uv_ov, repeat_on);
     let raw_ov = sample_aux_repeat(sample_uv);
     let ov = select(vec4<f32>(0.0), raw_ov, repeat_on || in_bounds);
-    let ov_rgb = unpremultiply(ov);
+    let ov_rgb = clamp(unpremultiply(ov), vec3<f32>(0.0), vec3<f32>(1.0));
     let bg_rgb = unpremultiply(bg);
     let blended = apply_blend(bg_rgb, ov_rgb, u.mode);
-    let eff_alpha = clamp(ov.a * u.p1.y, 0.0, 1.0);
-    let out_rgb = mix(bg_rgb, blended, eff_alpha);
-    return premultiply(out_rgb, bg.a);
+    let src_a = clamp(ov.a * u.p1.y, 0.0, 1.0);
+    let out_a = clamp(src_a + bg.a * (1.0 - src_a), 0.0, 1.0);
+    let out_rgb = (1.0 - bg.a) * (ov_rgb * src_a) + (1.0 - src_a) * bg.rgb + src_a * bg.a * blended;
+    return vec4<f32>(clamp(out_rgb, vec3<f32>(0.0), vec3<f32>(out_a)), out_a);
 }
 "#;
 

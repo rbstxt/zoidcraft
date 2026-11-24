@@ -1,11 +1,11 @@
 //! Pixel-exact ClipMaker 3 dark chrome palette, Zoidium HSL theme derivation,
 //! exact typography scale, and procedural vector icon painter.
 
-use std::f32::consts::TAU;
+use std::f32::consts::{FRAC_PI_4, TAU};
 
 use egui::{
-    Align2, Color32, CornerRadius, FontFamily, FontId, Margin, Painter, Pos2, Rect, Shape, Stroke,
-    StrokeKind, TextStyle, Vec2,
+    Align2, Color32, CornerRadius, FontFamily, FontId, Margin, Mesh, Painter, Pos2, Rect, Shape,
+    Stroke, StrokeKind, TextStyle, Vec2,
 };
 use zc_anim::{EasingKind, eval_easing};
 use zc_color::{Hsl, Rgb, Rgba, ThemePalette, ThemeProfile};
@@ -255,6 +255,26 @@ impl ThemeProfileChoice {
     }
 }
 
+/// Selectable editor UI monospace font (OFL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EditorFontChoice {
+    #[default]
+    SourceCodePro,
+    GeistMono,
+}
+
+impl EditorFontChoice {
+    pub const ALL: [Self; 2] = [Self::SourceCodePro, Self::GeistMono];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SourceCodePro => "Source Code Pro",
+            Self::GeistMono => "Geist Mono",
+        }
+    }
+}
+
 /// Active CM3 / Zoidium UI theme holding the derived 5-color accent palette.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cm3Theme {
@@ -269,6 +289,8 @@ pub struct Cm3Theme {
     pub palette: ThemePalette,
     /// Global UI font scale multiplier (`1.0` = exact CM3 px sizes).
     pub font_scale: f32,
+    /// Selected editor monospace typeface.
+    pub editor_font: EditorFontChoice,
 }
 
 impl Default for Cm3Theme {
@@ -280,6 +302,7 @@ impl Default for Cm3Theme {
             custom_main_rgb: ThemePalette::CLASSIC.focus,
             palette: ThemePalette::CLASSIC,
             font_scale: 1.0,
+            editor_font: EditorFontChoice::SourceCodePro,
         }
     }
 }
@@ -320,7 +343,8 @@ impl Cm3Theme {
     /// Recomputes `self.palette` from the active profile & custom parameters.
     pub fn recompute_palette(&mut self) {
         self.palette = match self.profile {
-            ThemeProfileChoice::Panzoid => ThemeProfile::Panzoid.palette(),
+            // Exact canonical Zoidium / CM3 Classic colors (#384668 accent, #526183 clip).
+            ThemeProfileChoice::Panzoid => ThemePalette::CLASSIC,
             ThemeProfileChoice::Signal => ThemeProfile::Signal.palette(),
             ThemeProfileChoice::Ember => ThemeProfile::Ember.palette(),
             ThemeProfileChoice::Moss => ThemeProfile::Moss.palette(),
@@ -402,31 +426,90 @@ impl Cm3Theme {
         let scale = self.font_scale.clamp(0.75, 1.5);
         font_mono((base_px * scale).round())
     }
+
+    /// Returns a high-contrast foreground color (`TEXT_BRIGHT` or near-black `#141414`)
+    /// selected by WCAG 2.1 relative-luminance contrast ratio against `bg`.
+    #[must_use]
+    pub fn contrast_fg(&self, bg: Color32) -> Color32 {
+        fn srgb_to_linear(channel: u8) -> f32 {
+            let c = f32::from(channel) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn rel_lum(c: Color32) -> f32 {
+            0.2126 * srgb_to_linear(c.r())
+                + 0.7152 * srgb_to_linear(c.g())
+                + 0.0722 * srgb_to_linear(c.b())
+        }
+        fn contrast_ratio(l1: f32, l2: f32) -> f32 {
+            let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+
+        const DARK_FG: Color32 = Color32::from_rgb(0x14, 0x14, 0x14);
+        let bg_lum = rel_lum(bg);
+        let light_ratio = contrast_ratio(rel_lum(TEXT_BRIGHT), bg_lum);
+        let dark_ratio = contrast_ratio(rel_lum(DARK_FG), bg_lum);
+        if dark_ratio > light_ratio {
+            DARK_FG
+        } else {
+            TEXT_BRIGHT
+        }
+    }
 }
 
+/// Embedded Adobe Source Code Pro Regular font bytes (SIL OFL 1.1).
+const SOURCE_CODE_PRO_TTF: &[u8] = include_bytes!("../../assets/fonts/SourceCodePro-Regular.ttf");
 /// Embedded open-source Geist Mono Regular font bytes (SIL OFL 1.1).
 const GEIST_MONO_TTF: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Regular.ttf");
 
-/// Registers the bundled SIL OFL 1.1 monospace font (`Geist Mono`) as the primary
-/// typeface for both `Monospace` and `Proportional` families while preserving
-/// egui's built-in fallback fonts for extended Unicode symbols.
-pub fn install_cm3_fonts(ctx: &egui::Context) {
+/// Rebuilds `FontDefinitions` with both bundled SIL OFL 1.1 fonts (`"source_code_pro"` and
+/// `"geist_mono"`) registered and the selected `font` placed first in both `Monospace` and
+/// `Proportional` families while preserving egui's built-in fallback fonts.
+pub fn apply_editor_font(ctx: &egui::Context, font: EditorFontChoice) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "GeistMono".to_owned(),
+        "source_code_pro".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(SOURCE_CODE_PRO_TTF)),
+    );
+    fonts.font_data.insert(
+        "geist_mono".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(GEIST_MONO_TTF)),
     );
-    if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
-        mono.insert(0, "GeistMono".to_owned());
-    }
-    if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional) {
-        prop.insert(0, "GeistMono".to_owned());
+    let (primary, secondary) = match font {
+        EditorFontChoice::SourceCodePro => ("source_code_pro", "geist_mono"),
+        EditorFontChoice::GeistMono => ("geist_mono", "source_code_pro"),
+    };
+    for family in [FontFamily::Monospace, FontFamily::Proportional] {
+        if let Some(list) = fonts.families.get_mut(&family) {
+            list.insert(0, secondary.to_owned());
+            list.insert(0, primary.to_owned());
+        }
     }
     ctx.set_fonts(fonts);
+    ctx.data_mut(|d| {
+        d.insert_temp(egui::Id::NULL.with("cm3_active_editor_font"), font);
+    });
+}
+
+/// Registers both bundled SIL OFL 1.1 monospace fonts (`Source Code Pro` and `Geist Mono`),
+/// with `Source Code Pro` set as the default primary typeface for both `Monospace` and
+/// `Proportional` families.
+pub fn install_cm3_fonts(ctx: &egui::Context) {
+    apply_editor_font(ctx, EditorFontChoice::SourceCodePro);
 }
 
 /// Applies pixel-exact CM3 visuals, spacing, borders, and monospace typography to `ctx`.
 pub fn apply_cm3_style(ctx: &egui::Context, theme: &Cm3Theme) {
+    let active_font =
+        ctx.data(|d| d.get_temp::<EditorFontChoice>(egui::Id::NULL.with("cm3_active_editor_font")));
+    if active_font != Some(theme.editor_font) {
+        apply_editor_font(ctx, theme.editor_font);
+    }
+
     let mut style = (*ctx.global_style()).clone();
 
     let accent = theme.accent();
@@ -462,8 +545,9 @@ pub fn apply_cm3_style(ctx: &egui::Context, theme: &Cm3Theme) {
     visuals.window_corner_radius = CornerRadius::ZERO;
     visuals.menu_corner_radius = CornerRadius::ZERO;
     visuals.window_stroke = Stroke::new(1.0, BORDER_PANEL);
+    let accent_fg = theme.contrast_fg(accent);
     visuals.selection.bg_fill = accent;
-    visuals.selection.stroke = Stroke::new(1.0, accent);
+    visuals.selection.stroke = Stroke::new(1.0, accent_fg);
 
     // Noninteractive widget visuals
     visuals.widgets.noninteractive.bg_fill = BG_PANEL;
@@ -475,7 +559,7 @@ pub fn apply_cm3_style(ctx: &egui::Context, theme: &Cm3Theme) {
     // Inactive widget visuals
     visuals.widgets.inactive.bg_fill = BG_BUTTON;
     visuals.widgets.inactive.weak_bg_fill = BG_INPUT;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_CONTROL);
+    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_BUTTON);
     visuals.widgets.inactive.corner_radius = CornerRadius::ZERO;
 
@@ -491,7 +575,7 @@ pub fn apply_cm3_style(ctx: &egui::Context, theme: &Cm3Theme) {
     visuals.widgets.active.bg_fill = BG_BUTTON_PRESSED;
     visuals.widgets.active.weak_bg_fill = accent;
     visuals.widgets.active.bg_stroke = Stroke::new(2.0, accent);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_BRIGHT);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, accent_fg);
     visuals.widgets.active.corner_radius = CornerRadius::ZERO;
     visuals.widgets.active.expansion = 0.0;
 
@@ -509,6 +593,12 @@ pub fn apply_cm3_style(ctx: &egui::Context, theme: &Cm3Theme) {
     style.spacing.scroll.bar_width = 12.0;
 
     ctx.set_global_style(style);
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            egui::Id::NULL.with("cm3_badge_font"),
+            theme.font(FONT_BADGE),
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -532,12 +622,15 @@ pub enum Cm3Icon {
     Objects,
     Fx,
     Export,
+    TabRestore,
     About,
     Plugins,
+    TabAssets,
     Settings,
     // Playback & Viewport Toolbar
     Camera,
     Transform,
+    TransparencyGrid,
     Start,
     PrevFrame,
     Play,
@@ -546,6 +639,7 @@ pub enum Cm3Icon {
     End,
     Loop,
     Graph,
+    SoloCircle,
     // Property & Tree Controls
     Stopwatch,
     KeyframeHollow,
@@ -581,6 +675,108 @@ fn pt(rect: Rect, nx: f32, ny: f32) -> Pos2 {
     )
 }
 
+/// Appends an unfeathered solid quad into `mesh` (zero epaint anti-alias feather bleed).
+#[inline]
+fn push_crisp_quad(mesh: &mut Mesh, rect: Rect, color: Color32) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let idx = mesh.vertices.len() as u32;
+    mesh.colored_vertex(rect.left_top(), color);
+    mesh.colored_vertex(rect.right_top(), color);
+    mesh.colored_vertex(rect.right_bottom(), color);
+    mesh.colored_vertex(rect.left_bottom(), color);
+    mesh.add_triangle(idx, idx + 1, idx + 2);
+    mesh.add_triangle(idx, idx + 2, idx + 3);
+}
+
+/// Paints a solid axis-rotated rectangle centered at `center`.
+fn paint_rotated_rect(
+    painter: &Painter,
+    center: Pos2,
+    angle: f32,
+    half_len: f32,
+    half_thick: f32,
+    color: Color32,
+) {
+    let (sin, cos) = angle.sin_cos();
+    let dir = Vec2::new(cos, sin);
+    let perp = Vec2::new(-sin, cos);
+    let pts = vec![
+        center - dir * half_len - perp * half_thick,
+        center + dir * half_len - perp * half_thick,
+        center + dir * half_len + perp * half_thick,
+        center - dir * half_len + perp * half_thick,
+    ];
+    painter.add(Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
+/// Paints a solid closed folder silhouette inside normalized bounds `[left..right] x [top..bottom]`.
+fn paint_solid_folder(
+    painter: &Painter,
+    r: Rect,
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+    color: Color32,
+) {
+    let w = right - left;
+    let h = bottom - top;
+    let tab_bottom = top + h * 0.18;
+    let tab = vec![
+        pt(r, left, top),
+        pt(r, left + w * 0.38, top),
+        pt(r, left + w * 0.46, tab_bottom),
+        pt(r, left, tab_bottom),
+    ];
+    painter.add(Shape::convex_polygon(tab, color, Stroke::NONE));
+    let body = Rect::from_min_max(pt(r, left, tab_bottom - h * 0.02), pt(r, right, bottom));
+    painter.rect_filled(body, CornerRadius::same(1), color);
+}
+
+/// Paints a solid tapered curved swooping arrow (left-pointing for Undo, mirrored for Redo).
+fn paint_swoop_arrow(painter: &Painter, r: Rect, mirror_x: bool, color: Color32) {
+    let mx = |nx: f32| if mirror_x { 1.0 - nx } else { nx };
+    let qbez = |p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), t: f32| {
+        let mt = 1.0 - t;
+        let x = mt * mt * p0.0 + 2.0 * mt * t * p1.0 + t * t * p2.0;
+        let y = mt * mt * p0.1 + 2.0 * mt * t * p1.1 + t * t * p2.1;
+        pt(r, mx(x), y)
+    };
+    let head = vec![
+        pt(r, mx(0.18), 0.34),
+        pt(r, mx(0.47), 0.13),
+        pt(r, mx(0.47), 0.54),
+    ];
+    painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
+
+    let o0 = (0.44, 0.25);
+    let o1 = (0.98, 0.28);
+    let o2 = (0.66, 0.89);
+    let i0 = (0.44, 0.43);
+    let i1 = (0.80, 0.46);
+    let i2 = (0.54, 0.83);
+    const STEPS: usize = 12;
+    for s in 0..STEPS {
+        let t0 = s as f32 / STEPS as f32;
+        let t1 = ((s + 1) as f32 / STEPS as f32 + if s + 1 < STEPS { 0.015 } else { 0.0 }).min(1.0);
+        let quad = vec![
+            qbez(o0, o1, o2, t0),
+            qbez(o0, o1, o2, t1),
+            qbez(i0, i1, i2, t1),
+            qbez(i0, i1, i2, t0),
+        ];
+        painter.add(Shape::convex_polygon(quad, color, Stroke::NONE));
+    }
+    let tip = vec![
+        qbez(o0, o1, o2, 1.0),
+        pt(r, mx(0.58), 0.90),
+        qbez(i0, i1, i2, 1.0),
+    ];
+    painter.add(Shape::convex_polygon(tip, color, Stroke::NONE));
+}
+
 /// Paints a crisp procedural CM3 vector icon inside `rect` using `color`.
 pub fn paint_cm3_icon(painter: &Painter, rect: Rect, icon: Cm3Icon, color: Color32) {
     let side = rect.width().min(rect.height()).max(1.0);
@@ -591,268 +787,496 @@ pub fn paint_cm3_icon(painter: &Painter, rect: Rect, icon: Cm3Icon, color: Color
 
     match icon {
         Cm3Icon::New => {
-            // Page outline with folded top-right corner
-            let pts = vec![
-                pt(r, 0.22, 0.12),
-                pt(r, 0.62, 0.12),
-                pt(r, 0.78, 0.28),
-                pt(r, 0.78, 0.88),
-                pt(r, 0.22, 0.88),
-            ];
-            painter.add(Shape::closed_line(pts, stroke));
-            painter.line_segment([pt(r, 0.62, 0.12), pt(r, 0.62, 0.28)], thin);
-            painter.line_segment([pt(r, 0.62, 0.28), pt(r, 0.78, 0.28)], thin);
-            // Center plus
-            painter.line_segment([pt(r, 0.50, 0.44), pt(r, 0.50, 0.72)], stroke);
-            painter.line_segment([pt(r, 0.36, 0.58), pt(r, 0.64, 0.58)], stroke);
-        }
-        Cm3Icon::Load => {
-            // Open folder silhouette
-            let pts = vec![
-                pt(r, 0.12, 0.24),
-                pt(r, 0.40, 0.24),
-                pt(r, 0.48, 0.34),
-                pt(r, 0.86, 0.34),
-                pt(r, 0.86, 0.48),
-                pt(r, 0.20, 0.48),
-                pt(r, 0.12, 0.82),
-            ];
-            painter.add(Shape::closed_line(pts, thin));
-            let front = vec![
-                pt(r, 0.22, 0.48),
-                pt(r, 0.90, 0.48),
-                pt(r, 0.80, 0.82),
-                pt(r, 0.12, 0.82),
-            ];
-            painter.add(Shape::convex_polygon(front, color, Stroke::NONE));
-        }
-        Cm3Icon::Save => {
-            // Floppy disk
-            let body = Rect::from_min_max(pt(r, 0.15, 0.15), pt(r, 0.85, 0.85));
-            painter.rect_stroke(body, CornerRadius::ZERO, stroke, StrokeKind::Inside);
-            let shutter = Rect::from_min_max(pt(r, 0.30, 0.15), pt(r, 0.70, 0.42));
-            painter.rect_filled(shutter, CornerRadius::ZERO, color);
-            let label = Rect::from_min_max(pt(r, 0.28, 0.56), pt(r, 0.72, 0.85));
-            painter.rect_stroke(label, CornerRadius::ZERO, thin, StrokeKind::Inside);
-        }
-        Cm3Icon::Undo => {
-            // Counter-clockwise curved arrow pointing left
-            let head = vec![pt(r, 0.14, 0.36), pt(r, 0.38, 0.18), pt(r, 0.38, 0.52)];
-            painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
-            let arc = vec![
-                pt(r, 0.36, 0.36),
-                pt(r, 0.66, 0.36),
-                pt(r, 0.82, 0.46),
-                pt(r, 0.84, 0.64),
-                pt(r, 0.74, 0.78),
-                pt(r, 0.46, 0.80),
-            ];
-            painter.add(Shape::line(arc, stroke));
-        }
-        Cm3Icon::Redo => {
-            // Clockwise curved arrow pointing right
-            let head = vec![pt(r, 0.86, 0.36), pt(r, 0.62, 0.18), pt(r, 0.62, 0.52)];
-            painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
-            let arc = vec![
-                pt(r, 0.64, 0.36),
-                pt(r, 0.34, 0.36),
-                pt(r, 0.18, 0.46),
-                pt(r, 0.16, 0.64),
-                pt(r, 0.26, 0.78),
-                pt(r, 0.54, 0.80),
-            ];
-            painter.add(Shape::line(arc, stroke));
-        }
-        Cm3Icon::Menu => {
-            // 3 crisp hamburger bars
-            for ny in [0.26_f32, 0.50, 0.74] {
-                let bar = Rect::from_min_max(pt(r, 0.14, ny - 0.055), pt(r, 0.86, ny + 0.055));
-                painter.rect_filled(bar, CornerRadius::ZERO, color);
-            }
-        }
-        Cm3Icon::Project => {
-            // Media library 2x2 tiles
-            let tiles = [
-                (0.14, 0.14, 0.46, 0.46),
-                (0.54, 0.14, 0.86, 0.46),
-                (0.14, 0.54, 0.46, 0.86),
-                (0.54, 0.54, 0.86, 0.86),
-            ];
-            for (x0, y0, x1, y1) in tiles {
-                let tile = Rect::from_min_max(pt(r, x0, y0), pt(r, x1, y1));
-                painter.rect_filled(tile, CornerRadius::ZERO, color);
-            }
-        }
-        Cm3Icon::Sequence => {
-            // Filmstrip / sequence frame
-            let outer = Rect::from_min_max(pt(r, 0.12, 0.18), pt(r, 0.88, 0.82));
-            painter.rect_stroke(outer, CornerRadius::ZERO, stroke, StrokeKind::Inside);
-            painter.line_segment([pt(r, 0.28, 0.18), pt(r, 0.28, 0.82)], thin);
-            painter.line_segment([pt(r, 0.72, 0.18), pt(r, 0.72, 0.82)], thin);
-            for ny in [0.34_f32, 0.50, 0.66] {
-                painter.line_segment([pt(r, 0.12, ny), pt(r, 0.28, ny)], thin);
-                painter.line_segment([pt(r, 0.72, ny), pt(r, 0.88, ny)], thin);
-            }
-            painter.line_segment([pt(r, 0.28, 0.50), pt(r, 0.72, 0.50)], thin);
-        }
-        Cm3Icon::Edit2 => {
-            // Horizontal mixer sliders (3 tracks with knobs)
-            for (ny, kx) in [(0.26_f32, 0.36_f32), (0.50, 0.68), (0.74, 0.44)] {
-                painter.line_segment([pt(r, 0.14, ny), pt(r, 0.86, ny)], thin);
-                let knob =
-                    Rect::from_center_size(pt(r, kx, ny), Vec2::new(side * 0.16, side * 0.18));
-                painter.rect_filled(knob, CornerRadius::ZERO, color);
-            }
-        }
-        Cm3Icon::Objects => {
-            // Isometric 3D cube wireframe
-            let top = pt(r, 0.50, 0.12);
-            let tr = pt(r, 0.84, 0.30);
-            let br = pt(r, 0.84, 0.70);
-            let bot = pt(r, 0.50, 0.88);
-            let bl = pt(r, 0.16, 0.70);
-            let tl = pt(r, 0.16, 0.30);
-            let mid = pt(r, 0.50, 0.48);
-            painter.add(Shape::closed_line(vec![top, tr, br, bot, bl, tl], stroke));
-            painter.line_segment([tl, mid], thin);
-            painter.line_segment([tr, mid], thin);
-            painter.line_segment([mid, bot], thin);
-        }
-        Cm3Icon::Fx => {
-            // Crisp geometric "FX" / sparkle star
+            // Crisp thin 8-spoked asterisk / starburst (21x21 at 25px)
             let c = r.center();
-            let outer = side * 0.38;
-            let inner = side * 0.14;
-            let mut pts = Vec::with_capacity(8);
-            for i in 0..8 {
-                let ang = (i as f32) * (TAU / 8.0) - std::f32::consts::FRAC_PI_2;
-                let rad = if i % 2 == 0 { outer } else { inner };
-                pts.push(Pos2::new(c.x + ang.cos() * rad, c.y + ang.sin() * rad));
-            }
-            painter.add(Shape::closed_line(pts, stroke));
-            painter.circle_filled(c, side * 0.08, color);
-        }
-        Cm3Icon::Export => {
-            // Upward export arrow out of tray
-            painter.line_segment([pt(r, 0.50, 0.18), pt(r, 0.50, 0.66)], stroke);
-            let head = vec![pt(r, 0.50, 0.12), pt(r, 0.70, 0.36), pt(r, 0.30, 0.36)];
-            painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
-            let tray = vec![
-                pt(r, 0.16, 0.60),
-                pt(r, 0.16, 0.84),
-                pt(r, 0.84, 0.84),
-                pt(r, 0.84, 0.60),
-            ];
-            painter.add(Shape::line(tray, stroke));
-        }
-        Cm3Icon::About => {
-            // Circled "i"
-            painter.circle_stroke(r.center(), side * 0.38, stroke);
-            painter.circle_filled(pt(r, 0.50, 0.32), side * 0.06, color);
-            painter.line_segment([pt(r, 0.50, 0.46), pt(r, 0.50, 0.74)], stroke);
-        }
-        Cm3Icon::Plugins => {
-            // Modular plugin puzzle/plug icon
-            let body = Rect::from_min_max(pt(r, 0.22, 0.34), pt(r, 0.78, 0.84));
-            painter.rect_stroke(body, CornerRadius::ZERO, stroke, StrokeKind::Inside);
-            painter.line_segment([pt(r, 0.36, 0.14), pt(r, 0.36, 0.34)], stroke);
-            painter.line_segment([pt(r, 0.64, 0.14), pt(r, 0.64, 0.34)], stroke);
-            painter.circle_filled(pt(r, 0.50, 0.59), side * 0.10, color);
-        }
-        Cm3Icon::Settings => {
-            // 8-tooth gear
-            let c = r.center();
-            let r_in = side * 0.16;
-            let r_mid = side * 0.30;
-            let r_out = side * 0.40;
-            painter.circle_stroke(c, r_mid, stroke);
-            painter.circle_stroke(c, r_in, thin);
-            for i in 0..8 {
-                let ang = (i as f32) * (TAU / 8.0);
-                let p0 = Pos2::new(c.x + ang.cos() * r_mid, c.y + ang.sin() * r_mid);
-                let p1 = Pos2::new(c.x + ang.cos() * r_out, c.y + ang.sin() * r_out);
-                painter.line_segment([p0, p1], stroke);
-            }
-        }
-        Cm3Icon::Camera => {
-            // Cinema camera body + right lens cone
-            let body = Rect::from_min_max(pt(r, 0.12, 0.28), pt(r, 0.66, 0.74));
-            painter.rect_filled(body, CornerRadius::ZERO, color);
-            let lens = vec![
-                pt(r, 0.66, 0.42),
-                pt(r, 0.88, 0.26),
-                pt(r, 0.88, 0.74),
-                pt(r, 0.66, 0.58),
-            ];
-            painter.add(Shape::convex_polygon(lens, color, Stroke::NONE));
-        }
-        Cm3Icon::Transform => {
-            // 2D bounding box with 4 corner handles
-            let box_rect = Rect::from_min_max(pt(r, 0.22, 0.22), pt(r, 0.78, 0.78));
-            painter.rect_stroke(box_rect, CornerRadius::ZERO, thin, StrokeKind::Middle);
-            let hs = Vec2::splat(side * 0.16);
-            for corner in [
-                box_rect.left_top(),
-                box_rect.right_top(),
-                box_rect.left_bottom(),
-                box_rect.right_bottom(),
-            ] {
-                painter.rect_filled(
-                    Rect::from_center_size(corner, hs),
-                    CornerRadius::ZERO,
+            let half_len = side * 0.39;
+            let half_thick = side * 0.052;
+            for i in 0..4 {
+                paint_rotated_rect(
+                    painter,
+                    c,
+                    (i as f32) * FRAC_PI_4,
+                    half_len,
+                    half_thick,
                     color,
                 );
             }
         }
+        Cm3Icon::Load => {
+            // Solid filled flat closed folder (21x19 at 25px)
+            paint_solid_folder(painter, r, 0.10, 0.90, 0.14, 0.86, color);
+        }
+        Cm3Icon::Save => {
+            // Solid downward arrow over a single flat horizontal bottom bar (head y=21..26 at 25px)
+            let shaft = Rect::from_min_max(pt(r, 0.44, 0.10), pt(r, 0.56, 0.58));
+            painter.rect_filled(shaft, CornerRadius::ZERO, color);
+            let head = vec![pt(r, 0.50, 0.78), pt(r, 0.24, 0.54), pt(r, 0.76, 0.54)];
+            painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
+            let tray_bottom = Rect::from_min_max(pt(r, 0.14, 0.78), pt(r, 0.86, 0.90));
+            painter.rect_filled(tray_bottom, CornerRadius::ZERO, color);
+        }
+        Cm3Icon::Undo => {
+            // Thick solid curved swooping arrow pointing left
+            paint_swoop_arrow(painter, r, false, color);
+        }
+        Cm3Icon::Redo => {
+            // Thick solid curved swooping arrow pointing right
+            paint_swoop_arrow(painter, r, true, color);
+        }
+        Cm3Icon::Menu => {
+            // 3 unfeathered crisp 2px full-width horizontal bars at y = +6, +14.5, +24 (at 30px)
+            let bar_h = (side * (2.0 / 30.0)).round().max(1.0);
+            let x0 = r.left().round();
+            let x1 = r.right().round().max(x0 + 1.0);
+            let mut mesh = Mesh::default();
+            for (frac, snap_y) in [
+                (6.0_f32 / 30.0, true),
+                (14.5 / 30.0, false),
+                (24.0 / 30.0, true),
+            ] {
+                let raw_y = r.top() + side * frac;
+                let y0 = if snap_y {
+                    raw_y.round()
+                } else {
+                    (raw_y * 2.0).round() * 0.5
+                };
+                push_crisp_quad(
+                    &mut mesh,
+                    Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y0 + bar_h)),
+                    color,
+                );
+            }
+            painter.add(Shape::mesh(mesh));
+        }
+        Cm3Icon::Project => {
+            // Solid filled closed folder (30x24 at 30px, tab top-left)
+            paint_solid_folder(painter, r, 0.01, 0.99, 0.10, 0.90, color);
+        }
+        Cm3Icon::Sequence => {
+            // Two crisp 2px vertical end-bars framing 3 staggered 3px horizontal clip bars
+            let mut mesh = Mesh::default();
+            let bar_w = (side * (2.0 / 30.0)).round().max(1.0);
+            let clip_h = (side * (3.0 / 30.0)).round().max(1.0);
+            let y_top = (r.top() + side * (7.0 / 30.0)).round();
+            let y_bot = (r.top() + side * (23.0 / 30.0)).round();
+            let lx = r.left().round();
+            let rx = (r.right() - bar_w).round();
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_max(Pos2::new(lx, y_top), Pos2::new(lx + bar_w, y_bot)),
+                color,
+            );
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_max(Pos2::new(rx, y_top), Pos2::new(rx + bar_w, y_bot)),
+                color,
+            );
+            for (x0, x1, y_frac) in [
+                (0.10_f32, 0.40_f32, 9.0_f32 / 30.0),
+                (0.17, 0.63, 13.5 / 30.0),
+                (0.47, 0.83, 18.0 / 30.0),
+            ] {
+                let cx0 = (r.left() + side * x0).round();
+                let cx1 = (r.left() + side * x1).round().max(cx0 + 1.0);
+                let cy0 = (r.top() + side * y_frac).round();
+                push_crisp_quad(
+                    &mut mesh,
+                    Rect::from_min_max(Pos2::new(cx0, cy0), Pos2::new(cx1, cy0 + clip_h)),
+                    color,
+                );
+            }
+            painter.add(Shape::mesh(mesh));
+        }
+        Cm3Icon::Edit2 => {
+            // Solid filled diagonal pencil tilted 45° (22x22 at 30px)
+            let dp = |s: f32, w: f32| pt(r, 0.15 + s + w, 0.83 - s + w);
+            let hw = 0.095;
+            let tip = vec![dp(0.0, 0.0), dp(0.18, -hw), dp(0.18, hw)];
+            painter.add(Shape::convex_polygon(tip, color, Stroke::NONE));
+            let shaft = vec![dp(0.17, -hw), dp(0.64, -hw), dp(0.64, hw), dp(0.17, hw)];
+            painter.add(Shape::convex_polygon(shaft, color, Stroke::NONE));
+        }
+        Cm3Icon::Objects => {
+            // Oblique wireframe 3D cube (28x26 at 30px; thicker edges at Media card size)
+            let stroke_w = if side <= 34.0 {
+                (side * 0.058).clamp(1.2, 1.8)
+            } else {
+                (side * 0.068).clamp(2.2, 3.6)
+            };
+            let cube_stroke = Stroke::new(stroke_w, color);
+            let back = Rect::from_min_max(pt(r, 0.08, 0.10), pt(r, 0.65, 0.65));
+            let front = Rect::from_min_max(pt(r, 0.35, 0.36), pt(r, 0.92, 0.90));
+            painter.rect_stroke(back, CornerRadius::ZERO, cube_stroke, StrokeKind::Middle);
+            painter.rect_stroke(front, CornerRadius::ZERO, cube_stroke, StrokeKind::Middle);
+            painter.line_segment([back.left_top(), front.left_top()], cube_stroke);
+            painter.line_segment([back.right_top(), front.right_top()], cube_stroke);
+            painter.line_segment([back.left_bottom(), front.left_bottom()], cube_stroke);
+            painter.line_segment([back.right_bottom(), front.right_bottom()], cube_stroke);
+        }
+        Cm3Icon::Fx => {
+            // Solid filled 9-pointed irregular starburst polygon with narrower spikes & compact core
+            let c = r.center();
+            const SPIKES: usize = 9;
+            // (angle_deg, outer_radius_frac, inner_radius_frac)
+            let spec: [(f32, f32, f32); SPIKES] = [
+                (-96.0, 0.47, 0.22),
+                (-66.0, 0.43, 0.21),
+                (-12.0, 0.48, 0.23),
+                (25.0, 0.48, 0.22),
+                (65.0, 0.43, 0.21),
+                (96.0, 0.48, 0.22),
+                (142.0, 0.44, 0.21),
+                (176.0, 0.49, 0.23),
+                (212.0, 0.47, 0.22),
+            ];
+            let polar = |deg: f32, rad_frac: f32| {
+                let a = deg.to_radians();
+                Pos2::new(
+                    c.x + a.cos() * side * rad_frac,
+                    c.y + a.sin() * side * rad_frac,
+                )
+            };
+            painter.circle_filled(c, side * 0.22, color);
+            for i in 0..SPIKES {
+                let (deg_cur, r_out, r_in_cur) = spec[i];
+                let (deg_prev, _, r_in_prev) = spec[(i + SPIKES - 1) % SPIKES];
+                let (deg_next, _, _) = spec[(i + 1) % SPIKES];
+                let mid_prev = {
+                    let mut d = deg_cur - deg_prev;
+                    if d < 0.0 {
+                        d += 360.0;
+                    }
+                    deg_cur - d * 0.5 - 1.0
+                };
+                let mid_next = {
+                    let mut d = deg_next - deg_cur;
+                    if d < 0.0 {
+                        d += 360.0;
+                    }
+                    deg_cur + d * 0.5 + 1.0
+                };
+                let kite = vec![
+                    c,
+                    polar(mid_prev, r_in_prev),
+                    polar(deg_cur, r_out),
+                    polar(mid_next, r_in_cur),
+                ];
+                painter.add(Shape::convex_polygon(kite, color, Stroke::NONE));
+            }
+        }
+        Cm3Icon::Export => {
+            // Wide tall U-tray (4px arms & bottom at 30px) + narrow upward arrow above it
+            let shaft = Rect::from_min_max(pt(r, 0.44, 0.28), pt(r, 0.56, 0.63));
+            painter.rect_filled(shaft, CornerRadius::ZERO, color);
+            let head = vec![pt(r, 0.50, 0.08), pt(r, 0.67, 0.30), pt(r, 0.33, 0.30)];
+            painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
+            let tray_bottom = Rect::from_min_max(pt(r, 0.07, 0.85), pt(r, 0.93, 0.96));
+            let tray_left = Rect::from_min_max(pt(r, 0.07, 0.38), pt(r, 0.18, 0.96));
+            let tray_right = Rect::from_min_max(pt(r, 0.82, 0.38), pt(r, 0.93, 0.96));
+            painter.rect_filled(tray_bottom, CornerRadius::ZERO, color);
+            painter.rect_filled(tray_left, CornerRadius::ZERO, color);
+            painter.rect_filled(tray_right, CornerRadius::ZERO, color);
+        }
+        Cm3Icon::TabRestore => {
+            // Clockwise circular restore arrow with top right-pointing triangular head (25x29 at 30px)
+            let c = pt(r, 0.51, 0.52);
+            let rad = side * 0.35;
+            let arc_stroke = Stroke::new((side * 0.135).clamp(1.8, 4.0), color);
+            let start_deg = -22.0_f32;
+            let end_deg = 268.0_f32;
+            const SEGS: usize = 24;
+            let mut pts = Vec::with_capacity(SEGS + 1);
+            for i in 0..=SEGS {
+                let u = i as f32 / SEGS as f32;
+                let ang = (start_deg + (end_deg - start_deg) * u).to_radians();
+                pts.push(Pos2::new(c.x + ang.cos() * rad, c.y + ang.sin() * rad));
+            }
+            painter.add(Shape::line(pts, arc_stroke));
+            let head = vec![pt(r, 0.73, 0.18), pt(r, 0.50, 0.01), pt(r, 0.50, 0.34)];
+            painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
+        }
+        Cm3Icon::About => {
+            // Uncircled bold serif 'i' with detached round dot (12x29 at 30px)
+            painter.circle_filled(pt(r, 0.50, 0.13), side * 0.09, color);
+            let mut mesh = Mesh::default();
+            let snap_box = |x0: f32, y0: f32, x1: f32, y1: f32| {
+                Rect::from_min_max(
+                    Pos2::new(
+                        (r.left() + side * x0).round(),
+                        (r.top() + side * y0).round(),
+                    ),
+                    Pos2::new(
+                        (r.left() + side * x1).round(),
+                        (r.top() + side * y1).round(),
+                    ),
+                )
+            };
+            push_crisp_quad(&mut mesh, snap_box(0.41, 0.30, 0.59, 0.93), color);
+            push_crisp_quad(&mut mesh, snap_box(0.31, 0.30, 0.59, 0.40), color);
+            push_crisp_quad(&mut mesh, snap_box(0.31, 0.86, 0.69, 0.96), color);
+            painter.add(Shape::mesh(mesh));
+        }
+        Cm3Icon::Plugins => {
+            // Solid tilted +45° diamond jigsaw piece (28x28 at 30px):
+            // corners at N/S/E/W, protruding round knobs on NW (-u) & SE (+u), notches on NE (-v) & SW (+v)
+            let c = r.center();
+            let (sin, cos) = FRAC_PI_4.sin_cos();
+            let u_vec = Vec2::new(cos, sin);
+            let v_vec = Vec2::new(-sin, cos);
+            let lp = |u: f32, v: f32| c + u_vec * (u * side) + v_vec * (v * side);
+            let local_rect = |u0: f32, v0: f32, u1: f32, v1: f32| {
+                painter.add(Shape::convex_polygon(
+                    vec![lp(u0, v0), lp(u1, v0), lp(u1, v1), lp(u0, v1)],
+                    color,
+                    Stroke::NONE,
+                ));
+            };
+            let h = 0.33_f32;
+            let n = 0.08_f32;
+            let d = 0.12_f32;
+            let ov = 0.01_f32;
+            // -u wing, center bridge between NE/SW notches, and +u wing
+            local_rect(-h, -h, -n, h);
+            local_rect(-n - ov, -h + d, n + ov, h - d);
+            local_rect(n, -h, h, h);
+            // Protruding round knobs on NW (-u) and SE (+u) edges
+            local_rect(-h - 0.07, -0.055, -h + ov, 0.055);
+            painter.circle_filled(lp(-h - 0.10, 0.0), side * 0.105, color);
+            local_rect(h - ov, -0.055, h + 0.07, 0.055);
+            painter.circle_filled(lp(h + 0.10, 0.0), side * 0.105, color);
+        }
+        Cm3Icon::TabAssets => {
+            // Crisp unfeathered integer-snapped 4x4 grid-library icon (23..24px with uniform 5px tiles & 1px gaps at 30px)
+            const N: usize = 4;
+            let step = (side * 0.20).round().max(2.0);
+            let gap = (side / 30.0).round().max(1.0);
+            let tile_px = (step - gap).max(1.0);
+            let grid_span = (N as f32) * step - gap;
+            let ox = (r.left() + (side - grid_span) * 0.5).floor();
+            let oy = (r.top() + (side - grid_span) * 0.5).floor();
+            let mut mesh = Mesh::default();
+            for row in 0..N {
+                for col in 0..N {
+                    let x0 = ox + (col as f32) * step;
+                    let y0 = oy + (row as f32) * step;
+                    push_crisp_quad(
+                        &mut mesh,
+                        Rect::from_min_size(Pos2::new(x0, y0), Vec2::splat(tile_px)),
+                        color,
+                    );
+                }
+            }
+            painter.add(Shape::mesh(mesh));
+        }
+        Cm3Icon::Settings => {
+            // Solid 6-tooth gear (24x24 at 30px): flat top & bottom teeth at 30°+60°k clearly
+            // protruding beyond the gear ring. Note: epaint's `circle_stroke` strokes OUTSIDE
+            // `radius`, so `radius = 0.135*side` (inner hole ~8px dia) + `width = 0.185*side`
+            // produces an outer ring radius of `0.32*side` (~19px dia), leaving the `0.405*side`
+            // (~24px dia) teeth boldly protruding with crisp notches between them.
+            let c = Pos2::new(
+                r.center().x - side * (0.5 / 30.0),
+                r.center().y - side * (0.5 / 30.0),
+            );
+            painter.circle_stroke(c, side * 0.135, Stroke::new(side * 0.185, color));
+            let r0 = side * 0.27;
+            let r1 = side * 0.405;
+            let hw_base = side * 0.14;
+            let hw_tip = side * 0.098;
+            for i in 0..6 {
+                let ang = (i as f32) * (TAU / 6.0) + TAU / 12.0;
+                let (sin, cos) = ang.sin_cos();
+                let dir = Vec2::new(cos, sin);
+                let perp = Vec2::new(-sin, cos);
+                let tooth = vec![
+                    c + dir * r0 - perp * hw_base,
+                    c + dir * r1 - perp * hw_tip,
+                    c + dir * r1 + perp * hw_tip,
+                    c + dir * r0 + perp * hw_base,
+                ];
+                painter.add(Shape::convex_polygon(tooth, color, Stroke::NONE));
+            }
+        }
+        Cm3Icon::Camera => {
+            // Iconic 2-reel movie camera silhouette (19x17 at 25px): larger left reel + smaller right reel
+            let body = Rect::from_min_max(pt(r, 0.14, 0.44), pt(r, 0.68, 0.84));
+            painter.rect_filled(body, CornerRadius::ZERO, color);
+            painter.circle_filled(pt(r, 0.26, 0.26), side * 0.135, color);
+            painter.circle_filled(pt(r, 0.51, 0.31), side * 0.105, color);
+            let lens = vec![
+                pt(r, 0.66, 0.56),
+                pt(r, 0.88, 0.44),
+                pt(r, 0.88, 0.84),
+                pt(r, 0.66, 0.72),
+            ];
+            painter.add(Shape::convex_polygon(lens, color, Stroke::NONE));
+        }
+        Cm3Icon::Transform => {
+            // 2D bounding box with crisp 1px unfeathered connecting edges & 4x4 corner handles
+            let x0 = (r.left() + side * 0.22).round();
+            let x1 = (r.left() + side * 0.78).round();
+            let y0 = (r.top() + side * 0.22).round();
+            let y1 = (r.top() + side * 0.78).round();
+            let mut mesh = Mesh::default();
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1 + 1.0, y0 + 1.0)),
+                color,
+            );
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_max(Pos2::new(x0, y1), Pos2::new(x1 + 1.0, y1 + 1.0)),
+                color,
+            );
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x0 + 1.0, y1 + 1.0)),
+                color,
+            );
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_max(Pos2::new(x1, y0), Pos2::new(x1 + 1.0, y1 + 1.0)),
+                color,
+            );
+            let hs = (side * 0.16).round().max(3.0);
+            let half = (hs * 0.5).floor();
+            for (cx, cy) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+                push_crisp_quad(
+                    &mut mesh,
+                    Rect::from_min_size(Pos2::new(cx - half, cy - half), Vec2::splat(hs)),
+                    color,
+                );
+            }
+            painter.add(Shape::mesh(mesh));
+        }
+        Cm3Icon::TransparencyGrid => {
+            // Crisp integer-snapped 4x4 checkerboard square (16x16 at 25px, shifted +3px Y to match Zoidium)
+            const N: usize = 4;
+            let cell = (side * 0.16).round().max(1.0);
+            let grid_size = cell * (N as f32);
+            let gx = (r.center().x - grid_size * 0.5).round();
+            let gy = (r.center().y - grid_size * 0.5 + side * 0.10).round();
+            let mut mesh = Mesh::default();
+            for row in 0..N {
+                for col in 0..N {
+                    if (row + col) % 2 == 0 {
+                        let x0 = gx + (col as f32) * cell;
+                        let y0 = gy + (row as f32) * cell;
+                        push_crisp_quad(
+                            &mut mesh,
+                            Rect::from_min_size(Pos2::new(x0, y0), Vec2::splat(cell)),
+                            color,
+                        );
+                    }
+                }
+            }
+            // Crisp 1px outer frame around the 16x16 grid
+            let gx1 = gx + grid_size;
+            let gy1 = gy + grid_size;
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_max(Pos2::new(gx, gy), Pos2::new(gx1, gy + 1.0)),
+                color,
+            );
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_max(Pos2::new(gx, gy1 - 1.0), Pos2::new(gx1, gy1)),
+                color,
+            );
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_max(Pos2::new(gx, gy + 1.0), Pos2::new(gx + 1.0, gy1 - 1.0)),
+                color,
+            );
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_max(Pos2::new(gx1 - 1.0, gy + 1.0), Pos2::new(gx1, gy1 - 1.0)),
+                color,
+            );
+            painter.add(Shape::mesh(mesh));
+        }
         Cm3Icon::Start => {
-            // Vertical bar + left-pointing triangle
-            let bar = Rect::from_min_max(pt(r, 0.16, 0.20), pt(r, 0.28, 0.80));
+            // Jump to start (|<): 17x17 inside 25px box
+            let bar = Rect::from_min_max(pt(r, 0.18, 0.19), pt(r, 0.32, 0.81));
             painter.rect_filled(bar, CornerRadius::ZERO, color);
-            let tri = vec![pt(r, 0.32, 0.50), pt(r, 0.82, 0.20), pt(r, 0.82, 0.80)];
+            let tri = vec![pt(r, 0.32, 0.50), pt(r, 0.82, 0.19), pt(r, 0.82, 0.81)];
             painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
         }
         Cm3Icon::PrevFrame => {
-            // Step back: vertical bar + compact left triangle
-            let bar = Rect::from_min_max(pt(r, 0.24, 0.22), pt(r, 0.34, 0.78));
-            painter.rect_filled(bar, CornerRadius::ZERO, color);
-            let tri = vec![pt(r, 0.40, 0.50), pt(r, 0.78, 0.24), pt(r, 0.78, 0.76)];
+            // Step back one frame (<|): 17x17 inside 25px box
+            let tri = vec![pt(r, 0.18, 0.50), pt(r, 0.64, 0.19), pt(r, 0.64, 0.81)];
             painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
+            let bar = Rect::from_min_max(pt(r, 0.70, 0.19), pt(r, 0.84, 0.81));
+            painter.rect_filled(bar, CornerRadius::ZERO, color);
         }
         Cm3Icon::Play => {
-            let tri = vec![pt(r, 0.24, 0.16), pt(r, 0.84, 0.50), pt(r, 0.24, 0.84)];
+            let tri = vec![pt(r, 0.14, 0.14), pt(r, 0.86, 0.50), pt(r, 0.14, 0.86)];
             painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
         }
         Cm3Icon::Pause => {
-            let left = Rect::from_min_max(pt(r, 0.22, 0.18), pt(r, 0.43, 0.82));
-            let right = Rect::from_min_max(pt(r, 0.57, 0.18), pt(r, 0.78, 0.82));
+            // Two crisp 5px bars with a 5px inner gap (15x17 at 25px)
+            let left = Rect::from_min_max(pt(r, 0.20, 0.18), pt(r, 0.40, 0.82));
+            let right = Rect::from_min_max(pt(r, 0.60, 0.18), pt(r, 0.80, 0.82));
             painter.rect_filled(left, CornerRadius::ZERO, color);
             painter.rect_filled(right, CornerRadius::ZERO, color);
         }
         Cm3Icon::NextFrame => {
-            let tri = vec![pt(r, 0.22, 0.24), pt(r, 0.60, 0.50), pt(r, 0.22, 0.76)];
-            painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
-            let bar = Rect::from_min_max(pt(r, 0.66, 0.22), pt(r, 0.76, 0.78));
+            // Step forward one frame (|>): 17x17 inside 25px box
+            let bar = Rect::from_min_max(pt(r, 0.16, 0.19), pt(r, 0.30, 0.81));
             painter.rect_filled(bar, CornerRadius::ZERO, color);
+            let tri = vec![pt(r, 0.36, 0.19), pt(r, 0.82, 0.50), pt(r, 0.36, 0.81)];
+            painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
         }
         Cm3Icon::End => {
-            let tri = vec![pt(r, 0.18, 0.20), pt(r, 0.68, 0.50), pt(r, 0.18, 0.80)];
+            // Jump to end (>|): 17x17 inside 25px box
+            let tri = vec![pt(r, 0.18, 0.19), pt(r, 0.68, 0.50), pt(r, 0.18, 0.81)];
             painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
-            let bar = Rect::from_min_max(pt(r, 0.72, 0.20), pt(r, 0.84, 0.80));
+            let bar = Rect::from_min_max(pt(r, 0.68, 0.19), pt(r, 0.82, 0.81));
             painter.rect_filled(bar, CornerRadius::ZERO, color);
         }
         Cm3Icon::Loop => {
-            // Two opposing rounded arrows forming a repeat cycle
-            let top = vec![pt(r, 0.18, 0.46), pt(r, 0.18, 0.28), pt(r, 0.72, 0.28)];
-            painter.add(Shape::line(top, stroke));
-            let top_head = vec![pt(r, 0.86, 0.28), pt(r, 0.68, 0.15), pt(r, 0.68, 0.41)];
+            // Two opposing thicker rounded repeat arrows
+            let loop_stroke = Stroke::new((side * 0.105).clamp(1.8, 2.8), color);
+            let top = vec![
+                pt(r, 0.10, 0.72),
+                pt(r, 0.10, 0.38),
+                pt(r, 0.13, 0.31),
+                pt(r, 0.20, 0.28),
+                pt(r, 0.60, 0.28),
+            ];
+            painter.add(Shape::line(top, loop_stroke));
+            let top_head = vec![pt(r, 0.76, 0.28), pt(r, 0.56, 0.14), pt(r, 0.56, 0.42)];
             painter.add(Shape::convex_polygon(top_head, color, Stroke::NONE));
 
-            let bot = vec![pt(r, 0.82, 0.54), pt(r, 0.82, 0.72), pt(r, 0.28, 0.72)];
-            painter.add(Shape::line(bot, stroke));
-            let bot_head = vec![pt(r, 0.14, 0.72), pt(r, 0.32, 0.59), pt(r, 0.32, 0.85)];
+            let bot = vec![
+                pt(r, 0.90, 0.28),
+                pt(r, 0.90, 0.62),
+                pt(r, 0.87, 0.69),
+                pt(r, 0.80, 0.72),
+                pt(r, 0.40, 0.72),
+            ];
+            painter.add(Shape::line(bot, loop_stroke));
+            let bot_head = vec![pt(r, 0.24, 0.72), pt(r, 0.44, 0.58), pt(r, 0.44, 0.86)];
             painter.add(Shape::convex_polygon(bot_head, color, Stroke::NONE));
         }
-        Cm3Icon::Graph | Cm3Icon::InterpBezier => {
+        Cm3Icon::Graph => {
+            // Smooth upward parabolic bell arch + compact baseline endpoints (y=534..548 at 25px)
+            const SAMPLES: usize = 16;
+            let mut curve = Vec::with_capacity(SAMPLES + 1);
+            for i in 0..=SAMPLES {
+                let u = i as f32 / SAMPLES as f32;
+                let arch = 4.0 * u * (1.0 - u);
+                curve.push(pt(r, 0.14 + u * 0.72, 0.74 - arch * 0.52));
+            }
+            painter.add(Shape::line(curve, thin));
+            painter.circle_filled(pt(r, 0.14, 0.74), side * 0.045, color);
+            painter.circle_filled(pt(r, 0.86, 0.74), side * 0.045, color);
+        }
+        Cm3Icon::SoloCircle => {
+            // Hollow circle matching Zoidium's timeline track solo button
+            painter.circle_stroke(r.center(), side * 0.34, Stroke::new(1.8, color));
+        }
+        Cm3Icon::InterpBezier => {
             // S-curve with two tangent handles (CM3 interp_1 icon)
             let mut curve = Vec::with_capacity(13);
             for i in 0..=12 {
@@ -879,22 +1303,34 @@ pub fn paint_cm3_icon(painter: &Painter, rect: Rect, icon: Cm3Icon, color: Color
             painter.circle_filled(pt(r, 0.86, 0.18), side * 0.06, color);
         }
         Cm3Icon::Stopwatch => {
-            // Circular clock body + top button + hand
-            let c = pt(r, 0.50, 0.56);
-            painter.circle_stroke(c, side * 0.32, stroke);
-            painter.line_segment([pt(r, 0.36, 0.14), pt(r, 0.64, 0.14)], stroke);
-            painter.line_segment([pt(r, 0.50, 0.14), pt(r, 0.50, 0.24)], stroke);
-            painter.line_segment([c, pt(r, 0.64, 0.42)], thin);
-            painter.circle_filled(c, side * 0.06, color);
+            // Solid top crown button + angled pusher at ~1:30 + thick hollow ring
+            // (epaint circle_stroke strokes OUTSIDE `radius`, so inner_rad = outer - watch_w)
+            let c = pt(r, 0.50, 0.61);
+            let watch_w = (side * 0.11).clamp(1.6, 2.2);
+            let inner_rad = (side * 0.35 - watch_w).max(side * 0.18);
+            let watch_stroke = Stroke::new(watch_w, color);
+            painter.circle_stroke(c, inner_rad, watch_stroke);
+            let crown = Rect::from_min_max(pt(r, 0.38, 0.06), pt(r, 0.62, 0.24));
+            painter.rect_filled(crown, CornerRadius::ZERO, color);
+            let pusher_ang = (-42.0_f32).to_radians();
+            let dir = Vec2::new(pusher_ang.cos(), pusher_ang.sin());
+            painter.line_segment(
+                [
+                    c + dir * (inner_rad + watch_w * 0.5),
+                    c + dir * (inner_rad + watch_w + side * 0.11),
+                ],
+                watch_stroke,
+            );
         }
         Cm3Icon::KeyframeHollow => {
+            let kf_stroke = Stroke::new((side * 0.11).clamp(1.6, 2.2), color);
             let diamond = vec![
-                pt(r, 0.50, 0.14),
-                pt(r, 0.86, 0.50),
-                pt(r, 0.50, 0.86),
-                pt(r, 0.14, 0.50),
+                pt(r, 0.50, 0.12),
+                pt(r, 0.88, 0.50),
+                pt(r, 0.50, 0.88),
+                pt(r, 0.12, 0.50),
             ];
-            painter.add(Shape::closed_line(diamond, stroke));
+            painter.add(Shape::closed_line(diamond, kf_stroke));
         }
         Cm3Icon::KeyframeSolid => {
             let diamond = vec![
@@ -906,16 +1342,40 @@ pub fn paint_cm3_icon(painter: &Painter, rect: Rect, icon: Cm3Icon, color: Color
             painter.add(Shape::convex_polygon(diamond, color, Stroke::NONE));
         }
         Cm3Icon::PrevKf => {
-            let tri = vec![pt(r, 0.22, 0.50), pt(r, 0.74, 0.20), pt(r, 0.74, 0.80)];
+            let tri = vec![pt(r, 0.24, 0.50), pt(r, 0.72, 0.12), pt(r, 0.72, 0.88)];
             painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
         }
         Cm3Icon::NextKf => {
-            let tri = vec![pt(r, 0.78, 0.50), pt(r, 0.26, 0.20), pt(r, 0.26, 0.80)];
+            let tri = vec![pt(r, 0.76, 0.50), pt(r, 0.28, 0.12), pt(r, 0.28, 0.88)];
             painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
         }
         Cm3Icon::Add => {
-            painter.line_segment([pt(r, 0.50, 0.16), pt(r, 0.50, 0.84)], stroke);
-            painter.line_segment([pt(r, 0.16, 0.50), pt(r, 0.84, 0.50)], stroke);
+            // Crisp unfeathered solid + glyph (15x15 with 3px arms at 20px, 2px arms at 15px)
+            let thick = if side >= 18.0 { 3.0 } else { 2.0 };
+            let span = if side >= 18.0 {
+                (side * 0.75).round()
+            } else {
+                (side * 0.86).round()
+            }
+            .max(thick);
+            let cx = r.center().x.round();
+            let cy = r.center().y.round();
+            let half_span = (span * 0.5).floor();
+            let half_t = (thick * 0.5).floor();
+            let x0 = cx - half_span;
+            let y0 = cy - half_span;
+            let mut mesh = Mesh::default();
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_size(Pos2::new(cx - half_t, y0), Vec2::new(thick, span)),
+                color,
+            );
+            push_crisp_quad(
+                &mut mesh,
+                Rect::from_min_size(Pos2::new(x0, cy - half_t), Vec2::new(span, thick)),
+                color,
+            );
+            painter.add(Shape::mesh(mesh));
         }
         Cm3Icon::Duplicate => {
             let back = Rect::from_min_max(pt(r, 0.32, 0.14), pt(r, 0.84, 0.66));
@@ -924,25 +1384,28 @@ pub fn paint_cm3_icon(painter: &Painter, rect: Rect, icon: Cm3Icon, color: Color
             painter.rect_filled(front, CornerRadius::ZERO, color);
         }
         Cm3Icon::Remove => {
-            // Trash can
-            painter.line_segment([pt(r, 0.18, 0.26), pt(r, 0.82, 0.26)], stroke);
-            painter.line_segment([pt(r, 0.38, 0.16), pt(r, 0.62, 0.16)], stroke);
-            let bin = Rect::from_min_max(pt(r, 0.24, 0.28), pt(r, 0.76, 0.86));
-            painter.rect_stroke(bin, CornerRadius::ZERO, thin, StrokeKind::Inside);
-            painter.line_segment([pt(r, 0.42, 0.40), pt(r, 0.42, 0.74)], thin);
-            painter.line_segment([pt(r, 0.58, 0.40), pt(r, 0.58, 0.74)], thin);
+            // Crisp X cross matching Zoidium's delete glyph
+            let x_stroke = Stroke::new((side * 0.13).clamp(1.6, 2.2), color);
+            painter.line_segment([pt(r, 0.18, 0.18), pt(r, 0.82, 0.82)], x_stroke);
+            painter.line_segment([pt(r, 0.82, 0.18), pt(r, 0.18, 0.82)], x_stroke);
         }
         Cm3Icon::Reset => {
-            // Circular reset arrow
-            let c = r.center();
-            let rad = side * 0.32;
-            let mut pts = Vec::with_capacity(14);
-            for i in 0..=12 {
-                let ang = -0.3 + (i as f32 / 12.0) * (TAU * 0.78);
+            // Tall clockwise circular reload arrow with top right-pointing triangular head
+            // (matches Zoidium L1_reset 19x23 at 25px and Sequence/Edit Reset 15x17 at 20px)
+            let c = pt(r, 0.50, 0.57);
+            let rad = side * 0.31;
+            let arc_stroke = Stroke::new((side * 0.12).clamp(1.8, 3.0), color);
+            let start_deg = -22.0_f32;
+            let end_deg = 268.0_f32;
+            const SEGS: usize = 20;
+            let mut pts = Vec::with_capacity(SEGS + 1);
+            for i in 0..=SEGS {
+                let u = i as f32 / SEGS as f32;
+                let ang = (start_deg + (end_deg - start_deg) * u).to_radians();
                 pts.push(Pos2::new(c.x + ang.cos() * rad, c.y + ang.sin() * rad));
             }
-            painter.add(Shape::line(pts, stroke));
-            let head = vec![pt(r, 0.84, 0.18), pt(r, 0.86, 0.46), pt(r, 0.60, 0.34)];
+            painter.add(Shape::line(pts, arc_stroke));
+            let head = vec![pt(r, 0.72, 0.24), pt(r, 0.49, 0.08), pt(r, 0.49, 0.40)];
             painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
         }
         Cm3Icon::Code => {
@@ -958,10 +1421,11 @@ pub fn paint_cm3_icon(painter: &Painter, rect: Rect, icon: Cm3Icon, color: Color
             painter.line_segment([pt(r, 0.56, 0.22), pt(r, 0.44, 0.78)], thin);
         }
         Cm3Icon::Eyedropper => {
-            // Diagonal pipette
-            painter.line_segment([pt(r, 0.18, 0.82), pt(r, 0.68, 0.32)], stroke);
-            painter.line_segment([pt(r, 0.52, 0.24), pt(r, 0.76, 0.48)], stroke);
-            painter.circle_filled(pt(r, 0.76, 0.24), side * 0.13, color);
+            // Thick diagonal pipette matching Zoidium swatch eyedropper
+            let barrel_stroke = Stroke::new((side * 0.15).clamp(1.8, 2.6), color);
+            painter.line_segment([pt(r, 0.20, 0.80), pt(r, 0.66, 0.34)], barrel_stroke);
+            painter.line_segment([pt(r, 0.48, 0.22), pt(r, 0.76, 0.50)], barrel_stroke);
+            painter.circle_filled(pt(r, 0.74, 0.26), side * 0.15, color);
         }
         Cm3Icon::Error => {
             // Warning triangle with exclamation
@@ -1019,12 +1483,16 @@ pub fn paint_cm3_icon(painter: &Painter, rect: Rect, icon: Cm3Icon, color: Color
             painter.add(Shape::line(shackle, stroke));
         }
         Cm3Icon::ChevronDown => {
-            let tri = vec![pt(r, 0.22, 0.32), pt(r, 0.78, 0.32), pt(r, 0.50, 0.72)];
-            painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
+            painter.add(Shape::line(
+                vec![pt(r, 0.22, 0.36), pt(r, 0.50, 0.66), pt(r, 0.78, 0.36)],
+                Stroke::new(1.6, color),
+            ));
         }
         Cm3Icon::ChevronRight => {
-            let tri = vec![pt(r, 0.32, 0.22), pt(r, 0.72, 0.50), pt(r, 0.32, 0.78)];
-            painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
+            painter.add(Shape::line(
+                vec![pt(r, 0.36, 0.22), pt(r, 0.66, 0.50), pt(r, 0.36, 0.78)],
+                Stroke::new(1.6, color),
+            ));
         }
     }
 }
@@ -1066,14 +1534,21 @@ pub fn paint_easing_preview(
     painter.add(Shape::line(pts, stroke));
 }
 
-/// Paints a small pill badge (used for `"In Use"`, `"Beta"`, error counts).
+/// Paints a small pill badge (used for `"In Use"`, `"Beta"`, error counts),
+/// scaling its monospace font via the active `Cm3Theme`'s `theme.font(FONT_BADGE)`.
 pub fn paint_badge(painter: &Painter, rect: Rect, text: &str, bg: Color32, fg: Color32) {
+    let font = painter
+        .ctx()
+        .data(|d| d.get_temp::<FontId>(egui::Id::NULL.with("cm3_badge_font")))
+        .unwrap_or_else(|| {
+            let scale = painter
+                .ctx()
+                .global_style()
+                .text_styles
+                .get(&TextStyle::Body)
+                .map_or(1.0, |f| (f.size / FONT_BODY).clamp(0.75, 1.5));
+            font_mono((FONT_BADGE * scale).round())
+        });
     painter.rect_filled(rect, CornerRadius::same(8), bg);
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        text,
-        font_mono(FONT_BADGE),
-        fg,
-    );
+    painter.text(rect.center(), Align2::CENTER_CENTER, text, font, fg);
 }

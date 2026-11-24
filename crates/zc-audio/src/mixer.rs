@@ -115,7 +115,7 @@ pub fn try_offline_total_samples(
     if total_frames == 0.0 {
         return Ok(0);
     }
-    let raw = ((total_frames / fps) * f64::from(sample_rate)).floor();
+    let raw = ((total_frames * f64::from(sample_rate)) / fps).floor();
     if !raw.is_finite() || raw < 0.0 || raw > MAX_OFFLINE_MIX_SAMPLES as f64 {
         return Err(AudioError::InvalidFormat(format!(
             "offline mix sample count ({raw}) exceeds memory cap ({MAX_OFFLINE_MIX_SAMPLES})"
@@ -493,5 +493,14 @@ mod tests {
         // Trailing region beyond clip must be strictly zero-filled.
         assert_eq!(mixed[20_000], [0.0, 0.0]);
         assert_eq!(mixed[27_199], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn offline_total_samples_exact_quotient_no_off_by_one() {
+        assert_eq!(offline_total_samples(69.0, 30.0, 48_000), 110_400);
+        assert_eq!(
+            try_offline_total_samples(69.0, 30.0, 48_000).unwrap(),
+            110_400
+        );
     }
 }

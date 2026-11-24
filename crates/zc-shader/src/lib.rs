@@ -593,4 +593,261 @@ mod tests {
         assert_eq!(count, 16);
         assert!((arr[15][0] - 1.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn escapes_glsl450_keywords_and_texture_identifier_without_changing_api_names() {
+        let sampler_named_texture = r#"
+            precision highp float;
+            varying vec2 vUvScaled;
+            uniform sampler2D texture;
+            uniform float smooth;
+            uniform float sample;
+            uniform float noperspective;
+
+            struct Data {
+                vec4 sample;
+                float smooth;
+            };
+
+            vec4 sampleHelper(sampler2D tex, vec2 uv) {
+                return texture2D(tex, uv);
+            }
+
+            void main() {
+                vec4 a = texture2D(texture, vUvScaled);
+                vec4 b = sampleHelper(texture, vUvScaled + vec2(0.01));
+                float patch = smooth + sample + noperspective;
+                float buffer = 0.25, shared = 0.5, readonly = 0.75, writeonly = 1.0;
+                float coherent = 0.1, volatile = 0.2, restrict = 0.3, subroutine = 0.4;
+                Data d;
+                d.sample = mix(a, b, 0.5);
+                d.smooth = patch + buffer + shared + readonly + writeonly + coherent + volatile + restrict + subroutine;
+                gl_FragColor = d.sample * clamp(d.smooth, 0.0, 1.0);
+            }
+        "#;
+        let compiled = translate_glsl_es100(sampler_named_texture)
+            .expect("shader with GLSL 450 keyword identifiers and sampler `texture` must compile");
+        assert_eq!(compiled.texture_bindings.len(), 1);
+        assert_eq!(compiled.texture_bindings[0].name, "texture");
+        assert!(compiled.uniform_layout.field("smooth").is_some());
+        assert!(compiled.uniform_layout.field("sample").is_some());
+        assert!(compiled.uniform_layout.field("noperspective").is_some());
+
+        let local_var_named_texture = r#"
+            precision highp float;
+            varying vec2 vUvScaled;
+            uniform sampler2D tDiffuse;
+            void main() {
+                vec4 texture = texture2D(tDiffuse, vUvScaled);
+                vec4 sample = texture2D(tDiffuse, vUvScaled + vec2(0.01));
+                gl_FragColor = mix(texture, sample, 0.5);
+            }
+        "#;
+        translate_glsl_es100(local_var_named_texture)
+            .expect("local `vec4 texture` before `texture2D()` must compile");
+    }
+
+    #[test]
+    fn compiles_non_sampler_uniform_named_texture() {
+        let src = "uniform float texture; void main() { gl_FragColor = vec4(texture); }";
+        let compiled = translate_glsl_es100(src)
+            .expect("non-sampler uniform named `texture` must compile through Naga");
+        assert!(compiled.uniform_layout.field("texture").is_some());
+        assert!(compiled.glsl450_source.contains("_zc_u._zc_id_texture"));
+        assert!(compiled.wgsl.contains("@fragment"));
+    }
+
+    #[test]
+    fn evaluates_preprocessor_conditionals_before_extraction_and_validation() {
+        let src = r#"
+            precision highp float;
+            varying vec2 vUvScaled;
+            uniform sampler2D tDiffuse;
+
+            #if MODE == 1
+                uniform vec3 Tint;
+                #define ARR_LEN 4
+            #else
+                uniform vec4 Tint;
+                uniform sampler2D GhostTex;
+                #define ARR_LEN 8
+                #extension GL_EXT_frag_depth : require
+                void deadFunc() { gl_FragDepthEXT = 0.5; }
+            #endif
+
+            uniform float Weights[ARR_LEN];
+
+            #if defined(MODE) && MODE == 1
+            vec3 pickTint() {
+            #else
+            vec3 pickTint() {
+            #endif
+                return Tint * Weights[0];
+            }
+
+            void main() {
+                vec4 bg = texture2D(tDiffuse, vUvScaled);
+                gl_FragColor = vec4(bg.rgb * pickTint(), bg.a);
+            }
+        "#;
+
+        let mut opts = CompileOptions::default();
+        opts.defines.insert("MODE".to_string(), "1".to_string());
+        let compiled = translate_glsl_es100_with_options(src, &opts)
+            .expect("conditional branches must be evaluated before extraction/validation");
+
+        assert_eq!(compiled.texture_bindings.len(), 1);
+        assert_eq!(compiled.texture_bindings[0].name, "tDiffuse");
+        let tint = compiled.uniform_layout.field("Tint").unwrap();
+        assert_eq!(tint.ty, UniformType::Vec3);
+        let weights = compiled.uniform_layout.field("Weights").unwrap();
+        assert_eq!(weights.array_len, Some(4));
+    }
+
+    #[test]
+    fn expands_sampling_macros_sampler_aliases_parens_and_include_helpers() {
+        let src = r#"
+            # include <zoidium/gradient> // trailing comment on spaced # include
+            precision highp float;
+            varying vec2 vUvScaled;
+            uniform sampler2D tDiffuse;
+            uniform sampler2D MyGrad;
+            uniform float MyGrad_repetitions;
+
+            #define iChannel0 tDiffuse
+            #define TEX (tDiffuse)
+            #define SAMPLE(tex, uv) texture2D(tex, uv)
+            #define MY_GRAD(t) zSampleGradient(MyGrad, t, MyGrad_repetitions)
+
+            void main() {
+                vec4 a = SAMPLE(iChannel0, vUvScaled);
+                vec4 b = texture2D(TEX, vUvScaled);
+                vec4 c = SAMPLE(tDiffuse, SAMPLE(tDiffuse, vUvScaled).xy);
+                vec4 g = MY_GRAD(vUvScaled.x);
+                gl_FragColor = (a + b + c + g) * 0.25;
+            }
+        "#;
+
+        let compiled = translate_glsl_es100(src).expect(
+            "sampling macros, aliases, parens, and include helpers inside #define must compile",
+        );
+        assert!(compiled.wgsl.contains("@fragment"));
+        assert_eq!(compiled.texture_bindings.len(), 2);
+    }
+
+    #[test]
+    fn handles_block_comment_reopen_directive_comments_and_extension_behaviors() {
+        let src = r#"
+            /* header */ #version 100
+            /* first
+            */ /* reopened block comment
+            #extension GL_EXT_frag_depth : require
+            */
+            #extension all : disable
+            #extension GL_EXT_shader_texture_lod : warn
+            #extension GL_OES_standard_derivatives : enable
+            #define GAIN /* http://example.com/path */ 0.5
+
+            #ifndef GL_OES_standard_derivatives
+                #error GL_OES_standard_derivatives must be defined
+            #endif
+
+            precision highp float;
+            varying vec2 vUv;
+
+            void main() {
+                float dy = dFdy(vUv.y);
+                float fw = fwidth(vUv.x);
+                gl_FragColor = vec4(abs(dy) * GAIN, fw, 0.0, 1.0);
+            }
+        "#;
+
+        let compiled = translate_glsl_es100(src)
+            .expect("block comments, URL in #define comment, dFdy, and disable/warn extensions must compile");
+        assert!(
+            compiled
+                .glsl450_source
+                .contains("#define GL_OES_standard_derivatives 1")
+        );
+        assert!(compiled.glsl450_source.contains("(- dFdy(vUv.y))"));
+    }
+
+    #[test]
+    fn supports_invariant_varying_array_varying_const_expr_arrays_and_gradient_uv_bounds() {
+        let src = r#"
+            #include <zoidium/gradient>
+            #include <zoidium/curve>
+            precision highp float;
+
+            invariant varying vec2 vUv;
+            varying vec2 vOffsets[2];
+
+            #define BASE 0x4u//inline comment
+            uniform float HexArr[0x4];
+            uniform vec4 ExprArr[(BASE) * 2 + 1];
+            uniform sampler2D GradTex;
+            uniform sampler2D CurveTex;
+
+            void main() {
+                vec4 g = zSampleGradient(GradTex, 1.0, 1.0);
+                float c = zSampleCurveValue(CurveTex, 1.0);
+                gl_FragColor = g * c + ExprArr[0] * HexArr[0] + vec4(vOffsets[0], vOffsets[1]);
+            }
+        "#;
+
+        let compiled = translate_glsl_es100(src)
+            .expect("invariant varying, array varying, hex/expr arrays must compile");
+        assert_eq!(
+            compiled.uniform_layout.field("HexArr").unwrap().array_len,
+            Some(4)
+        );
+        assert_eq!(
+            compiled.uniform_layout.field("ExprArr").unwrap().array_len,
+            Some(9)
+        );
+        assert!(compiled.glsl450_source.contains("in vec2 vOffsets[2];"));
+        assert!(
+            compiled
+                .glsl450_source
+                .contains("reps <= 1.0 ? clamp(scaled, 0.0, 1.0) : fract(scaled)")
+        );
+        assert!(
+            compiled
+                .glsl450_source
+                .contains("(0.5 + clamp(u, 0.0, 1.0) * 255.0) / 256.0")
+        );
+        assert!(
+            compiled
+                .glsl450_source
+                .contains("(0.5 + clamp(t, 0.0, 1.0) * 1023.0) / 1024.0")
+        );
+    }
+
+    #[test]
+    fn bake_curve_rgba8_scales_master_and_identity_alpha_with_custom_range() {
+        let spec = CurveSpec {
+            mode: CurveMode::Rgba,
+            master: CurveChannel {
+                points: vec![CurvePoint::new(0.0, -1.0), CurvePoint::new(1.0, 1.0)],
+            },
+            red: Some(CurveChannel {
+                points: vec![CurvePoint::new(0.0, 1.0), CurvePoint::new(1.0, -1.0)],
+            }),
+            green: None,
+            blue: None,
+            alpha: None,
+            range: [-1.0, 1.0],
+        };
+        let lut = bake_curve_rgba8(&spec);
+        // x = 0.0 -> master = -1.0 (norm 0.0) -> red(0.0) = +1.0 (u8 255), G/B = 0, identity A = 0
+        assert_eq!(&lut[0..4], &[255, 0, 0, 0]);
+        // x = 1.0 -> master = +1.0 (norm 1.0) -> red(1.0) = -1.0 (u8 0), G/B = 255, identity A = 255
+        let last = (CURVE_LUT_WIDTH - 1) * 4;
+        assert_eq!(&lut[last..last + 4], &[0, 255, 255, 255]);
+        // Midpoint x ~= 0.5 -> all channels ~= 128
+        let mid = 512 * 4;
+        for ch in 0..4 {
+            assert!((i32::from(lut[mid + ch]) - 128).abs() <= 1);
+        }
+    }
 }

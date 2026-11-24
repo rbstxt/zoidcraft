@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const MAX_INCLUDE_DEPTH: usize = 8;
+/// Maximum recursive macro expansion depth during Stage 1 preprocessing.
+const MAX_MACRO_EXPANSION_DEPTH: usize = 32;
 /// Maximum uniform array element count allowed in a custom shader UBO.
 const MAX_UNIFORM_ARRAY_LEN: u32 = 1024;
 /// Maximum custom shader uniform block byte size (matches WebGPU minimum 64 KiB UBO binding limit).
@@ -21,11 +23,12 @@ const MAX_UNIFORM_BUFFER_BYTES: u32 = 65_536;
 const INCLUDE_GRADIENT: &str = r#"
 float zGradientUv(float t, float repetitions) {
     float reps = max(repetitions, 0.0001);
-    float u = fract(t * reps);
-    return clamp(u, 0.5 / 256.0, 255.5 / 256.0);
+    float scaled = t * reps;
+    float u = reps <= 1.0 ? clamp(scaled, 0.0, 1.0) : fract(scaled);
+    return (0.5 + clamp(u, 0.0, 1.0) * 255.0) / 256.0;
 }
 float zGradientUvClamp(float t) {
-    return clamp(t, 0.5 / 256.0, 255.5 / 256.0);
+    return (0.5 + clamp(t, 0.0, 1.0) * 255.0) / 256.0;
 }
 float zSrgbToLinearChannel(float c) {
     return c <= 0.04045 ? c / 12.92 : pow(max((c + 0.055) / 1.055, 0.0), 2.4);
@@ -51,7 +54,7 @@ vec3 zLinearToSrgb(vec3 c) {
 
 const INCLUDE_CURVE: &str = r#"
 float zCurveUv(float t) {
-    return clamp(t, 0.5 / 1024.0, 1023.5 / 1024.0);
+    return (0.5 + clamp(t, 0.0, 1.0) * 1023.0) / 1024.0;
 }
 float zCurveMapRange(float v, vec2 range) {
     return mix(range.x, range.y, v);
@@ -383,18 +386,16 @@ pub fn translate_glsl_es100_with_options(
         )));
     }
 
-    let mut included = HashSet::new();
-    let mut int_defines = harvest_option_int_defines(&options.defines);
-    let preprocessed = preprocess_lines(source, options, &mut included, &mut int_defines, 0)?;
-    if preprocessed.len() > MAX_GLSL_SOURCE_BYTES {
+    let preprocessed = preprocess_source(source, options)?;
+    if preprocessed.source.len() > MAX_GLSL_SOURCE_BYTES {
         return Err(ShaderError::GlslParse(format!(
             "preprocessed shader ({} bytes) exceeds {} byte limit",
-            preprocessed.len(),
+            preprocessed.source.len(),
             MAX_GLSL_SOURCE_BYTES
         )));
     }
 
-    let tokens = tokenize(&preprocessed);
+    let tokens = tokenize(&preprocessed.source);
     if tokens.len() > MAX_REWRITE_TOKENS {
         return Err(ShaderError::GlslParse(format!(
             "shader token count ({}) exceeds {} limit",
@@ -404,7 +405,28 @@ pub fn translate_glsl_es100_with_options(
     }
     reject_unsupported_features(&tokens)?;
 
-    let extracted = extract_declarations(&tokens, &int_defines)?;
+    let mut extracted = extract_declarations(&tokens, &preprocessed.int_defines)?;
+
+    let mut budget = RewriteBudget::new();
+    let body_tokens = expand_builtin_include_helpers(
+        &extracted.body_tokens,
+        &preprocessed.included,
+        0,
+        &mut budget,
+    )?;
+
+    let uses_frag_coord = tokens_reference_ident(&body_tokens, "gl_FragCoord");
+    if uses_frag_coord
+        && !extracted.uniforms.iter().any(|u| u.name == "resolution")
+        && !extracted.samplers.iter().any(|s| s == "resolution")
+    {
+        extracted.uniforms.push(UniformDecl {
+            name: "resolution".to_string(),
+            ty: UniformType::Vec2,
+            array_len: None,
+        });
+    }
+
     let uniform_layout = build_uniform_layout(&extracted.uniforms)?;
     let texture_bindings = build_texture_bindings(&extracted.samplers);
 
@@ -414,15 +436,25 @@ pub fn translate_glsl_es100_with_options(
         .map(|u| (u.name.as_str(), u))
         .collect();
     let sampler_set: HashSet<&str> = extracted.samplers.iter().map(String::as_str).collect();
+    let (sampler_fns, user_fns) = collect_function_info(&body_tokens)?;
+    let frag_coord_res_y = if uses_frag_coord {
+        frag_coord_resolution_mode(&uniform_map)
+    } else {
+        FragCoordResY::None
+    };
 
-    let mut budget = RewriteBudget::new();
-    let body_tokens =
-        expand_builtin_include_helpers(&extracted.body_tokens, &included, 0, &mut budget)?;
-    let rewritten_tokens = rewrite_body(&body_tokens, &uniform_map, &sampler_set, &mut budget)?;
+    let rewritten_tokens = rewrite_body(
+        &body_tokens,
+        &uniform_map,
+        &sampler_set,
+        &sampler_fns,
+        &user_fns,
+        frag_coord_res_y,
+        &mut budget,
+    )?;
     let body_glsl = render_tokens(&rewritten_tokens);
 
     let glsl450_source = assemble_glsl450(
-        options,
         &extracted.extra_varyings,
         &extracted.uniforms,
         &texture_bindings,
@@ -681,17 +713,88 @@ fn write_u32_slice(buf: &mut [u8], offset: usize, values: &[u32]) {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 1: Line Preprocessor (#include, #version, #extension, integer #define)
+// Stage 1: GLSL ES 1.00 Preprocessor (comments, conditionals, macros, #include, #extension)
 // ---------------------------------------------------------------------------
 
-fn harvest_option_int_defines(defines: &BTreeMap<String, String>) -> HashMap<String, u32> {
-    let mut map = HashMap::new();
-    for (k, v) in defines {
-        if let Ok(n) = v.trim().parse::<u32>() {
-            map.insert(k.clone(), n);
+#[derive(Debug, Clone)]
+struct MacroDef {
+    params: Option<Vec<String>>,
+    body: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CondFrame {
+    parent_active: bool,
+    this_active: bool,
+    any_taken: bool,
+    seen_else: bool,
+}
+
+struct PpState {
+    macros: HashMap<String, MacroDef>,
+    int_defines: HashMap<String, u32>,
+    included: HashSet<String>,
+    cond_stack: Vec<CondFrame>,
+    budget: usize,
+}
+
+impl PpState {
+    fn new(options: &CompileOptions) -> Self {
+        let mut macros = HashMap::new();
+        let mut int_defines = HashMap::new();
+        for (k, v) in [
+            ("GL_ES", "1"),
+            ("GL_FRAGMENT_PRECISION_HIGH", "1"),
+            ("GL_OES_standard_derivatives", "1"),
+            ("__VERSION__", "100"),
+        ] {
+            macros.insert(
+                k.to_string(),
+                MacroDef {
+                    params: None,
+                    body: v.to_string(),
+                },
+            );
+            if let Some(n) = parse_int_literal_i64(v).and_then(|x| u32::try_from(x).ok()) {
+                int_defines.insert(k.to_string(), n);
+            }
+        }
+        for (k, v) in &options.defines {
+            let trimmed = v.trim();
+            macros.insert(
+                k.clone(),
+                MacroDef {
+                    params: None,
+                    body: trimmed.to_string(),
+                },
+            );
+            if let Some(n) = parse_int_literal_i64(trimmed).and_then(|x| u32::try_from(x).ok()) {
+                int_defines.insert(k.clone(), n);
+            }
+        }
+        Self {
+            macros,
+            int_defines,
+            included: HashSet::new(),
+            cond_stack: Vec::new(),
+            budget: 0,
         }
     }
-    map
+
+    fn is_active(&self) -> bool {
+        self.cond_stack.last().is_none_or(|f| f.this_active)
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), ShaderError> {
+        self.budget = self.budget.saturating_add(bytes);
+        if self.budget > MAX_GLSL_SOURCE_BYTES * 2 {
+            return Err(ShaderError::GlslParse(format!(
+                "preprocessed shader exceeded {} byte expansion budget",
+                MAX_GLSL_SOURCE_BYTES
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn lookup_include<'a>(name: &str, options: &'a CompileOptions) -> Option<&'a str> {
@@ -706,13 +809,133 @@ fn lookup_include<'a>(name: &str, options: &'a CompileOptions) -> Option<&'a str
     }
 }
 
-fn parse_include_directive(trimmed: &str) -> Option<&str> {
-    let rest = if let Some(after_comment) = trimmed.strip_prefix("//") {
-        after_comment.trim_start().strip_prefix("#include")?
-    } else {
-        trimmed.strip_prefix("#include")?
-    };
+/// Strips `/* ... */` and `// ...` comments cleanly across physical lines (scanning the
+/// remainder of a line after `*/` for additional `/*` openings or directives, preserving
+/// `// #include ...` lines), then joins trailing-backslash (`\`) line continuations.
+fn strip_comments_and_join_continuations(source: &str) -> Vec<String> {
+    let mut stripped_lines: Vec<String> = Vec::new();
+    let mut in_block_comment = false;
 
+    for raw_line in source.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut out = String::with_capacity(len);
+        let mut i = 0;
+
+        while i < len {
+            if in_block_comment {
+                if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                    in_block_comment = false;
+                    out.push(' ');
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+
+            if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+                in_block_comment = true;
+                out.push(' ');
+                i += 2;
+                continue;
+            }
+
+            if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+                // Preserve Panzoid/Zoidium `// #include <...>` directives when nothing precedes `//`.
+                if out.trim().is_empty() {
+                    let after_slashes = line[i + 2..].trim_start();
+                    if let Some(after_hash) = after_slashes.strip_prefix('#') {
+                        let after_hash_trimmed = after_hash.trim_start();
+                        if let Some(after_inc) = after_hash_trimmed.strip_prefix("include")
+                            && after_inc
+                                .chars()
+                                .next()
+                                .is_some_and(|c| c.is_whitespace() || c == '<' || c == '"')
+                        {
+                            // Strip any trailing comments inside the `// #include ...` line itself.
+                            let cleaned = strip_inline_comments(after_slashes);
+                            out.push_str(&cleaned);
+                        }
+                    }
+                }
+                break;
+            }
+
+            let ch = line[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+
+        stripped_lines.push(out);
+    }
+
+    // Join lines ending with `\` continuation.
+    let mut logical: Vec<String> = Vec::with_capacity(stripped_lines.len());
+    let mut acc: Option<String> = None;
+    for line in stripped_lines {
+        let trimmed_end = line.trim_end_matches([' ', '\t']);
+        if let Some(continued) = trimmed_end.strip_suffix('\\') {
+            match &mut acc {
+                Some(buf) => {
+                    buf.push_str(continued);
+                    buf.push(' ');
+                }
+                None => {
+                    let mut buf = String::from(continued);
+                    buf.push(' ');
+                    acc = Some(buf);
+                }
+            }
+        } else if let Some(mut buf) = acc.take() {
+            buf.push_str(&line);
+            logical.push(buf);
+        } else {
+            logical.push(line);
+        }
+    }
+    if let Some(buf) = acc {
+        logical.push(buf);
+    }
+
+    logical
+}
+
+fn strip_inline_comments(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    let mut in_block = false;
+    while i < len {
+        if in_block {
+            if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                in_block = false;
+                out.push(' ');
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            in_block = true;
+            out.push(' ');
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            break;
+        }
+        let ch = s[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn parse_include_arg(rest: &str) -> Option<&str> {
     let arg = rest.trim();
     if let Some(inner) = arg.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
         Some(inner.trim())
@@ -723,102 +946,937 @@ fn parse_include_directive(trimmed: &str) -> Option<&str> {
     }
 }
 
-fn preprocess_lines(
-    source: &str,
-    options: &CompileOptions,
-    included: &mut HashSet<String>,
-    int_defines: &mut HashMap<String, u32>,
-    depth: usize,
-) -> Result<String, ShaderError> {
-    let mut out = String::with_capacity(source.len());
-    let mut in_block_comment = false;
+fn is_ident_start_byte(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
 
-    for raw_line in source.lines() {
-        if in_block_comment {
-            if let Some(end_idx) = raw_line.find("*/") {
-                in_block_comment = false;
-                let after = &raw_line[end_idx + 2..];
-                if !after.trim().is_empty() {
-                    out.push_str(after);
-                    out.push('\n');
-                }
-            }
-            continue;
-        }
+fn is_ident_continue_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
 
-        let trimmed = raw_line.trim();
-        if let Some(inc_name) = parse_include_directive(trimmed) {
-            if depth >= MAX_INCLUDE_DEPTH {
-                return Err(ShaderError::IncludeDepthExceeded(inc_name.to_string()));
-            }
-            let snippet = lookup_include(inc_name, options)
-                .ok_or_else(|| ShaderError::UnknownInclude(inc_name.to_string()))?;
-            if included.insert(inc_name.to_string()) {
-                let expanded =
-                    preprocess_lines(snippet, options, included, int_defines, depth + 1)?;
-                out.push_str(&expanded);
-                out.push('\n');
-            }
-            continue;
-        }
-
-        if let Some(after_hash) = trimmed.strip_prefix('#') {
-            let directive = after_hash.trim_start();
-            if directive.starts_with("version")
-                && directive[7..]
-                    .chars()
-                    .next()
-                    .is_none_or(char::is_whitespace)
-            {
-                continue;
-            }
-            if let Some(ext_rest) = directive.strip_prefix("extension")
-                && ext_rest.chars().next().is_none_or(char::is_whitespace)
-            {
-                let ext_name = ext_rest.split(':').next().unwrap_or("").trim();
-                if ext_name == "GL_OES_standard_derivatives" {
-                    continue;
-                }
-                return Err(ShaderError::UnsupportedExtension(ext_name.to_string()));
-            }
-            if let Some(def_rest) = directive.strip_prefix("define")
-                && def_rest.chars().next().is_some_and(char::is_whitespace)
-            {
-                let mut parts = def_rest.split_whitespace();
-                if let (Some(name), Some(val)) = (parts.next(), parts.next())
-                    && !name.contains('(')
-                    && let Ok(n) = val.parse::<u32>()
-                {
-                    int_defines.insert(name.to_string(), n);
-                }
-            }
-        }
-
-        // Update block-comment state for subsequent lines while keeping line content intact.
-        let bytes = raw_line.as_bytes();
-        let mut i = 0;
-        while i + 1 < bytes.len() {
-            if !in_block_comment && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-                break;
-            }
-            if !in_block_comment && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-            if in_block_comment && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                in_block_comment = false;
-                i += 2;
-                continue;
-            }
+fn scan_number_literal_len(bytes: &[u8], start: usize) -> usize {
+    let len = bytes.len();
+    let mut i = start;
+    if bytes[i] == b'0' && i + 1 < len && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+        i += 2;
+        while i < len && bytes[i].is_ascii_hexdigit() {
             i += 1;
         }
+        if i < len && (bytes[i] == b'u' || bytes[i] == b'U') {
+            i += 1;
+        }
+        return i - start;
+    }
+    while i < len && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i < len && bytes[i] == b'.' {
+        i += 1;
+        while i < len && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i < len && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        if i < len && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        while i < len && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i < len && matches!(bytes[i], b'u' | b'U' | b'f' | b'F') {
+        i += 1;
+    }
+    i - start
+}
 
-        out.push_str(raw_line);
-        out.push('\n');
+fn parse_macro_call_args(text: &str, open_paren_idx: usize) -> Option<(Vec<String>, usize)> {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut args = Vec::new();
+    let mut arg_start = open_paren_idx + 1;
+    let mut depth = 1_usize;
+    let mut i = open_paren_idx + 1;
+
+    while i < len {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let tail = &text[arg_start..i];
+                    if !args.is_empty() || !tail.trim().is_empty() {
+                        args.push(tail.trim().to_string());
+                    }
+                    return Some((args, i + 1));
+                }
+            }
+            b',' if depth == 1 => {
+                args.push(text[arg_start..i].trim().to_string());
+                arg_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn substitute_macro_params(body: &str, param_map: &HashMap<&str, &str>) -> String {
+    if param_map.is_empty() {
+        return body.to_string();
+    }
+    let bytes = body.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_digit() || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
+            let nlen = scan_number_literal_len(bytes, i);
+            out.push_str(&body[i..i + nlen]);
+            i += nlen;
+            continue;
+        }
+        if is_ident_start_byte(b) {
+            let start = i;
+            i += 1;
+            while i < len && is_ident_continue_byte(bytes[i]) {
+                i += 1;
+            }
+            let ident = &body[start..i];
+            if let Some(replacement) = param_map.get(ident) {
+                if out
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|&pb| is_ident_continue_byte(pb))
+                    && replacement
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|&nb| is_ident_continue_byte(nb))
+                {
+                    out.push(' ');
+                }
+                out.push_str(replacement);
+            } else {
+                out.push_str(ident);
+            }
+            continue;
+        }
+        let ch = body[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+fn expand_macros_in_text(
+    text: &str,
+    macros: &HashMap<String, MacroDef>,
+    hidden: &HashSet<String>,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<String, ShaderError> {
+    if depth > MAX_MACRO_EXPANSION_DEPTH {
+        return Err(ShaderError::GlslParse(format!(
+            "macro expansion nesting depth exceeds {MAX_MACRO_EXPANSION_DEPTH} limit"
+        )));
+    }
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_digit() || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
+            let nlen = scan_number_literal_len(bytes, i);
+            out.push_str(&text[i..i + nlen]);
+            i += nlen;
+            continue;
+        }
+
+        if is_ident_start_byte(b) {
+            let start = i;
+            i += 1;
+            while i < len && is_ident_continue_byte(bytes[i]) {
+                i += 1;
+            }
+            let ident = &text[start..i];
+
+            if !hidden.contains(ident)
+                && let Some(def) = macros.get(ident)
+            {
+                match &def.params {
+                    None => {
+                        *budget = budget.saturating_add(def.body.len().max(1));
+                        if *budget > MAX_GLSL_SOURCE_BYTES * 2 {
+                            return Err(ShaderError::GlslParse(format!(
+                                "macro expansion exceeded {} byte budget",
+                                MAX_GLSL_SOURCE_BYTES
+                            )));
+                        }
+                        let mut next_hidden = hidden.clone();
+                        next_hidden.insert(ident.to_string());
+                        let expanded = expand_macros_in_text(
+                            &def.body,
+                            macros,
+                            &next_hidden,
+                            depth + 1,
+                            budget,
+                        )?;
+                        if out
+                            .as_bytes()
+                            .last()
+                            .is_some_and(|&pb| is_ident_continue_byte(pb))
+                            && expanded
+                                .as_bytes()
+                                .first()
+                                .is_some_and(|&nb| is_ident_continue_byte(nb))
+                        {
+                            out.push(' ');
+                        }
+                        out.push_str(&expanded);
+                        continue;
+                    }
+                    Some(params) => {
+                        let mut look = i;
+                        while look < len && matches!(bytes[look], b' ' | b'\t' | b'\n' | b'\r') {
+                            look += 1;
+                        }
+                        if look < len
+                            && bytes[look] == b'('
+                            && let Some((raw_args, after_call)) = parse_macro_call_args(text, look)
+                            && raw_args.len() == params.len()
+                        {
+                            let mut expanded_args = Vec::with_capacity(raw_args.len());
+                            for raw_arg in &raw_args {
+                                expanded_args.push(expand_macros_in_text(
+                                    raw_arg,
+                                    macros,
+                                    hidden,
+                                    depth + 1,
+                                    budget,
+                                )?);
+                            }
+                            let param_map: HashMap<&str, &str> = params
+                                .iter()
+                                .zip(expanded_args.iter())
+                                .map(|(p, a)| (p.as_str(), a.as_str()))
+                                .collect();
+                            let substituted = substitute_macro_params(&def.body, &param_map);
+                            *budget = budget.saturating_add(substituted.len().max(1));
+                            if *budget > MAX_GLSL_SOURCE_BYTES * 2 {
+                                return Err(ShaderError::GlslParse(format!(
+                                    "macro expansion exceeded {} byte budget",
+                                    MAX_GLSL_SOURCE_BYTES
+                                )));
+                            }
+                            let mut next_hidden = hidden.clone();
+                            next_hidden.insert(ident.to_string());
+                            let expanded = expand_macros_in_text(
+                                &substituted,
+                                macros,
+                                &next_hidden,
+                                depth + 1,
+                                budget,
+                            )?;
+                            if out
+                                .as_bytes()
+                                .last()
+                                .is_some_and(|&pb| is_ident_continue_byte(pb))
+                                && expanded
+                                    .as_bytes()
+                                    .first()
+                                    .is_some_and(|&nb| is_ident_continue_byte(nb))
+                            {
+                                out.push(' ');
+                            }
+                            out.push_str(&expanded);
+                            i = after_call;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            out.push_str(ident);
+            continue;
+        }
+
+        let ch = text[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
     }
 
     Ok(out)
+}
+
+fn replace_defined_operators(expr: &str, macros: &HashMap<String, MacroDef>) -> String {
+    let bytes = expr.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            let nlen = scan_number_literal_len(bytes, i);
+            out.push_str(&expr[i..i + nlen]);
+            i += nlen;
+            continue;
+        }
+        if is_ident_start_byte(b) {
+            let start = i;
+            i += 1;
+            while i < len && is_ident_continue_byte(bytes[i]) {
+                i += 1;
+            }
+            let ident = &expr[start..i];
+            if ident == "defined" {
+                let mut j = i;
+                while j < len && matches!(bytes[j], b' ' | b'\t') {
+                    j += 1;
+                }
+                let has_paren = j < len && bytes[j] == b'(';
+                if has_paren {
+                    j += 1;
+                    while j < len && matches!(bytes[j], b' ' | b'\t') {
+                        j += 1;
+                    }
+                }
+                if j < len && is_ident_start_byte(bytes[j]) {
+                    let name_start = j;
+                    j += 1;
+                    while j < len && is_ident_continue_byte(bytes[j]) {
+                        j += 1;
+                    }
+                    let macro_name = &expr[name_start..j];
+                    if has_paren {
+                        while j < len && matches!(bytes[j], b' ' | b'\t') {
+                            j += 1;
+                        }
+                        if j < len && bytes[j] == b')' {
+                            j += 1;
+                        }
+                    }
+                    out.push_str(if macros.contains_key(macro_name) {
+                        "1"
+                    } else {
+                        "0"
+                    });
+                    i = j;
+                    continue;
+                }
+            }
+            out.push_str(ident);
+            continue;
+        }
+        let ch = expr[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+fn parse_int_literal_i64(raw: &str) -> Option<i64> {
+    let s = raw.trim().trim_end_matches(['u', 'U']);
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()
+    } else if s.len() > 1 && s.starts_with('0') && s.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        i64::from_str_radix(&s[1..], 8).ok()
+    } else {
+        s.parse::<i64>().ok()
+    }
+}
+
+struct ConstIntParser<'a> {
+    tokens: &'a [Token],
+    pos: usize,
+    int_defines: Option<&'a HashMap<String, u32>>,
+    unknown_ident_as_zero: bool,
+    eval_enabled: bool,
+}
+
+impl<'a> ConstIntParser<'a> {
+    fn peek(&self) -> Option<&'a Token> {
+        let mut p = self.pos;
+        while matches!(self.tokens.get(p), Some(Token::Newline)) {
+            p += 1;
+        }
+        self.tokens.get(p)
+    }
+
+    fn advance(&mut self) -> Option<&'a Token> {
+        while matches!(self.tokens.get(self.pos), Some(Token::Newline)) {
+            self.pos += 1;
+        }
+        let tok = self.tokens.get(self.pos);
+        if tok.is_some() {
+            self.pos += 1;
+        }
+        tok
+    }
+
+    fn consume_punct(&mut self, expected: &str) -> bool {
+        if matches!(self.peek(), Some(Token::Punct(p)) if p == expected) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_expr(&mut self) -> Result<i64, ShaderError> {
+        self.parse_ternary()
+    }
+
+    fn parse_ternary(&mut self) -> Result<i64, ShaderError> {
+        let cond = self.parse_logical_or()?;
+        if self.consume_punct("?") {
+            let prev = self.eval_enabled;
+            self.eval_enabled = prev && cond != 0;
+            let then_val = self.parse_expr()?;
+            self.eval_enabled = prev;
+            if !self.consume_punct(":") {
+                return Err(ShaderError::GlslParse(
+                    "expected ':' in conditional constant expression".to_string(),
+                ));
+            }
+            self.eval_enabled = prev && cond == 0;
+            let else_val = self.parse_ternary()?;
+            self.eval_enabled = prev;
+            Ok(if cond != 0 { then_val } else { else_val })
+        } else {
+            Ok(cond)
+        }
+    }
+
+    fn parse_logical_or(&mut self) -> Result<i64, ShaderError> {
+        let mut lhs = self.parse_logical_and()?;
+        while self.consume_punct("||") {
+            let prev = self.eval_enabled;
+            self.eval_enabled = prev && lhs == 0;
+            let rhs = self.parse_logical_and()?;
+            self.eval_enabled = prev;
+            lhs = i64::from(lhs != 0 || rhs != 0);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_logical_and(&mut self) -> Result<i64, ShaderError> {
+        let mut lhs = self.parse_bit_or()?;
+        while self.consume_punct("&&") {
+            let prev = self.eval_enabled;
+            self.eval_enabled = prev && lhs != 0;
+            let rhs = self.parse_bit_or()?;
+            self.eval_enabled = prev;
+            lhs = i64::from(lhs != 0 && rhs != 0);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bit_or(&mut self) -> Result<i64, ShaderError> {
+        let mut lhs = self.parse_bit_xor()?;
+        while self.consume_punct("|") {
+            let rhs = self.parse_bit_xor()?;
+            lhs |= rhs;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bit_xor(&mut self) -> Result<i64, ShaderError> {
+        let mut lhs = self.parse_bit_and()?;
+        while self.consume_punct("^") {
+            let rhs = self.parse_bit_and()?;
+            lhs ^= rhs;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bit_and(&mut self) -> Result<i64, ShaderError> {
+        let mut lhs = self.parse_equality()?;
+        while self.consume_punct("&") {
+            let rhs = self.parse_equality()?;
+            lhs &= rhs;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_equality(&mut self) -> Result<i64, ShaderError> {
+        let mut lhs = self.parse_relational()?;
+        loop {
+            if self.consume_punct("==") {
+                let rhs = self.parse_relational()?;
+                lhs = i64::from(lhs == rhs);
+            } else if self.consume_punct("!=") {
+                let rhs = self.parse_relational()?;
+                lhs = i64::from(lhs != rhs);
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_relational(&mut self) -> Result<i64, ShaderError> {
+        let mut lhs = self.parse_shift()?;
+        loop {
+            if self.consume_punct("<=") {
+                let rhs = self.parse_shift()?;
+                lhs = i64::from(lhs <= rhs);
+            } else if self.consume_punct(">=") {
+                let rhs = self.parse_shift()?;
+                lhs = i64::from(lhs >= rhs);
+            } else if self.consume_punct("<") {
+                let rhs = self.parse_shift()?;
+                lhs = i64::from(lhs < rhs);
+            } else if self.consume_punct(">") {
+                let rhs = self.parse_shift()?;
+                lhs = i64::from(lhs > rhs);
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_shift(&mut self) -> Result<i64, ShaderError> {
+        let mut lhs = self.parse_additive()?;
+        loop {
+            if self.consume_punct("<<") {
+                let rhs = self.parse_additive()?;
+                lhs = lhs.wrapping_shl((rhs.clamp(0, 63)) as u32);
+            } else if self.consume_punct(">>") {
+                let rhs = self.parse_additive()?;
+                lhs = lhs.wrapping_shr((rhs.clamp(0, 63)) as u32);
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_additive(&mut self) -> Result<i64, ShaderError> {
+        let mut lhs = self.parse_multiplicative()?;
+        loop {
+            if self.consume_punct("+") {
+                let rhs = self.parse_multiplicative()?;
+                lhs = lhs.wrapping_add(rhs);
+            } else if self.consume_punct("-") {
+                let rhs = self.parse_multiplicative()?;
+                lhs = lhs.wrapping_sub(rhs);
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<i64, ShaderError> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            if self.consume_punct("*") {
+                let rhs = self.parse_unary()?;
+                lhs = lhs.wrapping_mul(rhs);
+            } else if self.consume_punct("/") {
+                let rhs = self.parse_unary()?;
+                if rhs == 0 {
+                    if !self.eval_enabled {
+                        lhs = 0;
+                        continue;
+                    }
+                    return Err(ShaderError::GlslParse(
+                        "division by zero in constant integer expression".to_string(),
+                    ));
+                }
+                lhs = lhs.wrapping_div(rhs);
+            } else if self.consume_punct("%") {
+                let rhs = self.parse_unary()?;
+                if rhs == 0 {
+                    if !self.eval_enabled {
+                        lhs = 0;
+                        continue;
+                    }
+                    return Err(ShaderError::GlslParse(
+                        "modulo by zero in constant integer expression".to_string(),
+                    ));
+                }
+                lhs = lhs.wrapping_rem(rhs);
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Result<i64, ShaderError> {
+        if self.consume_punct("+") {
+            return self.parse_unary();
+        }
+        if self.consume_punct("-") {
+            return Ok(self.parse_unary()?.wrapping_neg());
+        }
+        if self.consume_punct("!") {
+            return Ok(i64::from(self.parse_unary()? == 0));
+        }
+        if self.consume_punct("~") {
+            return Ok(!self.parse_unary()?);
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<i64, ShaderError> {
+        if self.consume_punct("(") {
+            let val = self.parse_expr()?;
+            if !self.consume_punct(")") {
+                return Err(ShaderError::GlslParse(
+                    "expected ')' in constant integer expression".to_string(),
+                ));
+            }
+            return Ok(val);
+        }
+
+        match self.advance() {
+            Some(Token::Number(n)) => parse_int_literal_i64(n).ok_or_else(|| {
+                ShaderError::GlslParse(format!("invalid integer literal `{n}` in expression"))
+            }),
+            Some(Token::Ident(name)) => {
+                if let Some(map) = self.int_defines
+                    && let Some(&v) = map.get(name)
+                {
+                    return Ok(i64::from(v));
+                }
+                if self.unknown_ident_as_zero {
+                    Ok(0)
+                } else {
+                    Err(ShaderError::GlslParse(format!(
+                        "unknown identifier `{name}` in constant integer expression"
+                    )))
+                }
+            }
+            _ => Err(ShaderError::GlslParse(
+                "invalid token in constant integer expression".to_string(),
+            )),
+        }
+    }
+}
+
+fn eval_pp_expr(
+    expr: &str,
+    macros: &HashMap<String, MacroDef>,
+    budget: &mut usize,
+) -> Result<i64, ShaderError> {
+    let with_defined = replace_defined_operators(expr, macros);
+    let expanded = expand_macros_in_text(&with_defined, macros, &HashSet::new(), 0, budget)?;
+    let tokens = tokenize(&expanded);
+    let mut parser = ConstIntParser {
+        tokens: &tokens,
+        pos: 0,
+        int_defines: None,
+        unknown_ident_as_zero: true,
+        eval_enabled: true,
+    };
+    let val = parser.parse_expr()?;
+    if parser.peek().is_some() {
+        return Err(ShaderError::GlslParse(format!(
+            "unexpected trailing tokens in preprocessor expression `{}`",
+            expr.trim()
+        )));
+    }
+    Ok(val)
+}
+
+fn eval_const_int_tokens(tokens: &[Token], int_defines: &HashMap<String, u32>) -> Option<i64> {
+    let mut parser = ConstIntParser {
+        tokens,
+        pos: 0,
+        int_defines: Some(int_defines),
+        unknown_ident_as_zero: false,
+        eval_enabled: true,
+    };
+    let val = parser.parse_expr().ok()?;
+    if parser.peek().is_some() {
+        return None;
+    }
+    Some(val)
+}
+
+struct PreprocessedSource {
+    source: String,
+    included: HashSet<String>,
+    int_defines: HashMap<String, u32>,
+}
+
+fn parse_define_directive(rest: &str) -> Option<(String, MacroDef)> {
+    let rest = rest.trim_start();
+    let bytes = rest.as_bytes();
+    if bytes.is_empty() || !is_ident_start_byte(bytes[0]) {
+        return None;
+    }
+    let mut name_end = 1;
+    while name_end < bytes.len() && is_ident_continue_byte(bytes[name_end]) {
+        name_end += 1;
+    }
+    let name = rest[..name_end].to_string();
+    let after_name = &rest[name_end..];
+
+    // Function-like macro ONLY when `(` immediately follows macro name with no whitespace.
+    if let Some(after_open) = after_name.strip_prefix('(') {
+        let close_idx = after_open.find(')')?;
+        let params_str = &after_open[..close_idx];
+        let mut params = Vec::new();
+        for p in params_str.split(',') {
+            let pt = p.trim();
+            if !pt.is_empty() {
+                params.push(pt.to_string());
+            }
+        }
+        let body = after_open[close_idx + 1..].trim().to_string();
+        Some((
+            name,
+            MacroDef {
+                params: Some(params),
+                body,
+            },
+        ))
+    } else {
+        let body = after_name.trim().to_string();
+        Some((name, MacroDef { params: None, body }))
+    }
+}
+
+fn preprocess_source(
+    source: &str,
+    options: &CompileOptions,
+) -> Result<PreprocessedSource, ShaderError> {
+    let mut state = PpState::new(options);
+    let mut out = String::with_capacity(source.len());
+    preprocess_lines_into(source, options, &mut state, 0, &mut out)?;
+    if !state.cond_stack.is_empty() {
+        return Err(ShaderError::GlslParse(
+            "unterminated #if/#ifdef/#ifndef directive".to_string(),
+        ));
+    }
+    Ok(PreprocessedSource {
+        source: out,
+        included: state.included,
+        int_defines: state.int_defines,
+    })
+}
+
+fn flush_active_chunk(
+    chunk: &mut String,
+    state: &mut PpState,
+    out: &mut String,
+) -> Result<(), ShaderError> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let expanded =
+        expand_macros_in_text(chunk, &state.macros, &HashSet::new(), 0, &mut state.budget)?;
+    state.charge(expanded.len())?;
+    out.push_str(&expanded);
+    chunk.clear();
+    Ok(())
+}
+
+fn preprocess_lines_into(
+    source: &str,
+    options: &CompileOptions,
+    state: &mut PpState,
+    depth: usize,
+    out: &mut String,
+) -> Result<(), ShaderError> {
+    let logical_lines = strip_comments_and_join_continuations(source);
+    let mut active_chunk = String::new();
+    let base_cond_depth = state.cond_stack.len();
+
+    for line in logical_lines {
+        let trimmed = line.trim();
+        if let Some(after_hash) = trimmed.strip_prefix('#') {
+            flush_active_chunk(&mut active_chunk, state, out)?;
+
+            let directive_line = after_hash.trim_start();
+            let dir_end = directive_line
+                .bytes()
+                .take_while(|b| b.is_ascii_alphabetic())
+                .count();
+            let dir_name = &directive_line[..dir_end];
+            let rest = &directive_line[dir_end..];
+
+            // Conditional directives are evaluated even when inside an inactive branch.
+            match dir_name {
+                "ifdef" => {
+                    let parent = state.is_active();
+                    let name = rest.split_whitespace().next().unwrap_or("");
+                    let cond = parent && !name.is_empty() && state.macros.contains_key(name);
+                    state.cond_stack.push(CondFrame {
+                        parent_active: parent,
+                        this_active: cond,
+                        any_taken: cond,
+                        seen_else: false,
+                    });
+                    continue;
+                }
+                "ifndef" => {
+                    let parent = state.is_active();
+                    let name = rest.split_whitespace().next().unwrap_or("");
+                    let cond = parent && !name.is_empty() && !state.macros.contains_key(name);
+                    state.cond_stack.push(CondFrame {
+                        parent_active: parent,
+                        this_active: cond,
+                        any_taken: cond,
+                        seen_else: false,
+                    });
+                    continue;
+                }
+                "if" => {
+                    let parent = state.is_active();
+                    let cond = if parent {
+                        eval_pp_expr(rest, &state.macros, &mut state.budget)? != 0
+                    } else {
+                        false
+                    };
+                    state.cond_stack.push(CondFrame {
+                        parent_active: parent,
+                        this_active: cond,
+                        any_taken: cond,
+                        seen_else: false,
+                    });
+                    continue;
+                }
+                "elif" => {
+                    let Some(frame) = state.cond_stack.last_mut() else {
+                        return Err(ShaderError::GlslParse("unexpected #elif".to_string()));
+                    };
+                    if frame.seen_else {
+                        return Err(ShaderError::GlslParse("#elif after #else".to_string()));
+                    }
+                    if !frame.parent_active || frame.any_taken {
+                        frame.this_active = false;
+                    } else {
+                        let cond = eval_pp_expr(rest, &state.macros, &mut state.budget)? != 0;
+                        frame.this_active = cond;
+                        if cond {
+                            frame.any_taken = true;
+                        }
+                    }
+                    continue;
+                }
+                "else" => {
+                    let Some(frame) = state.cond_stack.last_mut() else {
+                        return Err(ShaderError::GlslParse("unexpected #else".to_string()));
+                    };
+                    if frame.seen_else {
+                        return Err(ShaderError::GlslParse("duplicate #else".to_string()));
+                    }
+                    frame.seen_else = true;
+                    frame.this_active = frame.parent_active && !frame.any_taken;
+                    if frame.this_active {
+                        frame.any_taken = true;
+                    }
+                    continue;
+                }
+                "endif" => {
+                    if state.cond_stack.len() <= base_cond_depth {
+                        return Err(ShaderError::GlslParse("unexpected #endif".to_string()));
+                    }
+                    state.cond_stack.pop();
+                    continue;
+                }
+                _ => {}
+            }
+
+            if !state.is_active() {
+                continue;
+            }
+
+            match dir_name {
+                "include" => {
+                    let Some(inc_name) = parse_include_arg(rest) else {
+                        return Err(ShaderError::GlslParse(format!(
+                            "malformed #include directive: {trimmed}"
+                        )));
+                    };
+                    if depth >= MAX_INCLUDE_DEPTH {
+                        return Err(ShaderError::IncludeDepthExceeded(inc_name.to_string()));
+                    }
+                    let snippet = lookup_include(inc_name, options)
+                        .ok_or_else(|| ShaderError::UnknownInclude(inc_name.to_string()))?;
+                    if state.included.insert(inc_name.to_string()) {
+                        preprocess_lines_into(snippet, options, state, depth + 1, out)?;
+                        out.push('\n');
+                    }
+                }
+                "version" | "pragma" | "line" | "" => {}
+                "extension" => {
+                    let mut parts = rest.splitn(2, ':');
+                    let ext_name = parts.next().unwrap_or("").trim();
+                    let behavior = parts.next().map_or("", str::trim);
+                    if behavior == "disable"
+                        || behavior == "warn"
+                        || ext_name == "GL_OES_standard_derivatives"
+                    {
+                        continue;
+                    }
+                    return Err(ShaderError::UnsupportedExtension(ext_name.to_string()));
+                }
+                "define" => {
+                    if let Some((name, def)) = parse_define_directive(rest) {
+                        if def.params.is_none() {
+                            if let Ok(val) =
+                                eval_pp_expr(&def.body, &state.macros, &mut state.budget)
+                                && let Ok(u) = u32::try_from(val)
+                            {
+                                state.int_defines.insert(name.clone(), u);
+                            } else {
+                                state.int_defines.remove(&name);
+                            }
+                        } else {
+                            state.int_defines.remove(&name);
+                        }
+                        state.macros.insert(name, def);
+                    }
+                }
+                "undef" => {
+                    if let Some(name) = rest.split_whitespace().next() {
+                        state.macros.remove(name);
+                        state.int_defines.remove(name);
+                    }
+                }
+                "error" => {
+                    return Err(ShaderError::GlslParse(format!("#error {}", rest.trim())));
+                }
+                _ => {
+                    // Ignore unknown preprocessor directives in active branches.
+                }
+            }
+            continue;
+        }
+
+        if !state.is_active() {
+            continue;
+        }
+
+        active_chunk.push_str(&line);
+        active_chunk.push('\n');
+    }
+
+    flush_active_chunk(&mut active_chunk, state, out)?;
+    if state.cond_stack.len() != base_cond_depth {
+        return Err(ShaderError::GlslParse(
+            "unterminated #if/#ifdef/#ifndef directive".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -885,16 +1943,57 @@ fn tokenize(src: &str) -> Vec<Token> {
 
         // Preprocessor line (#define, #ifdef, #if, #elif, #else, #endif, #undef)
         if b == b'#' && at_line_start {
-            let start = i;
-            while i < len && bytes[i] != b'\n' {
-                if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            let mut directive = String::new();
+            let mut in_block_comment = false;
+            loop {
+                let seg_start = i;
+                let mut hit_line_comment = false;
+                while i < len && bytes[i] != b'\n' {
+                    if in_block_comment {
+                        if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                            in_block_comment = false;
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+                        in_block_comment = true;
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+                        hit_line_comment = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                let raw_seg = &src[seg_start..i];
+                if hit_line_comment {
+                    while i < len && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    directive.push_str(raw_seg.trim_end());
                     break;
                 }
-                i += 1;
-            }
-            let directive = src[start..i].trim_end().to_string();
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
+                let trimmed_seg = raw_seg.trim_end_matches([' ', '\t', '\r']);
+                if !in_block_comment && let Some(continued) = trimmed_seg.strip_suffix('\\') {
+                    directive.push_str(continued);
+                    if i < len && bytes[i] == b'\n' {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    directive.push_str(trimmed_seg);
+                    if in_block_comment && i < len && bytes[i] == b'\n' {
+                        directive.push(' ');
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
             }
             tokens.push(Token::Preprocessor(directive));
             at_line_start = false;
@@ -1045,6 +2144,7 @@ struct UniformDecl {
 struct VaryingDecl {
     ty: String,
     name: String,
+    array_len: Option<u32>,
 }
 
 struct ExtractedDecls {
@@ -1063,6 +2163,26 @@ fn next_non_newline(tokens: &[Token], mut idx: usize) -> usize {
         idx += 1;
     }
     idx
+}
+
+fn parse_array_len_bracket(
+    tokens: &[Token],
+    open_bracket_idx: usize,
+    int_defines: &HashMap<String, u32>,
+    decl_name: &str,
+) -> Result<(u32, usize), ShaderError> {
+    let Some((inner, after_bracket)) = parse_bracket_expr(tokens, open_bracket_idx) else {
+        return Err(ShaderError::InvalidUniformDeclaration(format!(
+            "expected ']' in array declaration `{decl_name}`"
+        )));
+    };
+    let len_val = eval_const_int_tokens(&inner, int_defines)
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|&n| n > 0)
+        .ok_or_else(|| {
+            ShaderError::InvalidUniformDeclaration(format!("invalid array length on `{decl_name}`"))
+        })?;
+    Ok((len_val, after_bracket))
 }
 
 fn extract_declarations(
@@ -1101,8 +2221,30 @@ fn extract_declarations(
                     i += 1;
                 }
             }
+            Token::Ident(kw) if brace_depth == 0 && kw == "invariant" => {
+                let next_i = next_non_newline(tokens, i + 1);
+                if matches!(tokens.get(next_i), Some(Token::Ident(next_kw)) if next_kw == "varying")
+                {
+                    i = parse_varying_decl(
+                        tokens,
+                        next_i + 1,
+                        int_defines,
+                        &mut extra_varyings,
+                        &mut varying_seen,
+                    )?;
+                } else {
+                    body_tokens.push(tokens[i].clone());
+                    i += 1;
+                }
+            }
             Token::Ident(kw) if brace_depth == 0 && kw == "varying" => {
-                i = parse_varying_decl(tokens, i + 1, &mut extra_varyings, &mut varying_seen)?;
+                i = parse_varying_decl(
+                    tokens,
+                    i + 1,
+                    int_defines,
+                    &mut extra_varyings,
+                    &mut varying_seen,
+                )?;
             }
             Token::Ident(kw) if brace_depth == 0 && kw == "uniform" => {
                 i = parse_uniform_decl(
@@ -1133,6 +2275,7 @@ fn extract_declarations(
 fn parse_varying_decl(
     tokens: &[Token],
     mut i: usize,
+    int_defines: &HashMap<String, u32>,
     extra_varyings: &mut Vec<VaryingDecl>,
     varying_seen: &mut HashSet<String>,
 ) -> Result<usize, ShaderError> {
@@ -1162,13 +2305,27 @@ fn parse_varying_decl(
                 ));
             }
         };
+        i = next_non_newline(tokens, i + 1);
+
+        let mut array_len = None;
+        if matches!(tokens.get(i), Some(Token::Punct(p)) if p == "[") {
+            let (len_val, after_bracket) = parse_array_len_bracket(tokens, i, int_defines, &name)?;
+            if len_val > MAX_UNIFORM_ARRAY_LEN {
+                return Err(ShaderError::InvalidUniformDeclaration(format!(
+                    "varying array `{name}` length {len_val} exceeds allowed range 1..={MAX_UNIFORM_ARRAY_LEN}"
+                )));
+            }
+            array_len = Some(len_val);
+            i = next_non_newline(tokens, after_bracket);
+        }
+
         if name != "vUv" && name != "vUvScaled" && varying_seen.insert(name.clone()) {
             extra_varyings.push(VaryingDecl {
                 ty: ty.clone(),
                 name,
+                array_len,
             });
         }
-        i = next_non_newline(tokens, i + 1);
         match tokens.get(i) {
             Some(Token::Punct(p)) if p == "," => {
                 i = next_non_newline(tokens, i + 1);
@@ -1235,29 +2392,12 @@ fn parse_uniform_decl(
         };
         i = next_non_newline(tokens, i + 1);
 
-        // Optional array suffix `[N]`
+        // Optional array suffix `[N]` (supports decimal, hex, uint suffix, and constant expressions)
         let mut array_len = None;
         if matches!(tokens.get(i), Some(Token::Punct(p)) if p == "[") {
-            i = next_non_newline(tokens, i + 1);
-            let len_val = match tokens.get(i) {
-                Some(Token::Number(n)) => n.trim_end_matches(['u', 'U']).parse::<u32>().ok(),
-                Some(Token::Ident(macro_name)) => int_defines.get(macro_name).copied(),
-                _ => None,
-            }
-            .filter(|&n| n > 0)
-            .ok_or_else(|| {
-                ShaderError::InvalidUniformDeclaration(format!(
-                    "invalid array length on uniform `{name}`"
-                ))
-            })?;
+            let (len_val, after_bracket) = parse_array_len_bracket(tokens, i, int_defines, &name)?;
             array_len = Some(len_val);
-            i = next_non_newline(tokens, i + 1);
-            if !matches!(tokens.get(i), Some(Token::Punct(p)) if p == "]") {
-                return Err(ShaderError::InvalidUniformDeclaration(format!(
-                    "expected ']' in array uniform `{name}`"
-                )));
-            }
-            i = next_non_newline(tokens, i + 1);
+            i = next_non_newline(tokens, after_bracket);
         }
 
         // Skip optional non-standard initializer `= ...` up to `,` or `;`
@@ -1671,20 +2811,101 @@ fn is_glsl_builtin_type(ident: &str) -> bool {
             | "mat3"
             | "mat4"
             | "sampler2D"
-            | "sampler"
     )
 }
 
-fn first_single_ident(arg: &[Token]) -> Option<&str> {
-    let mut found = None;
-    for tok in arg {
-        match tok {
-            Token::Newline => {}
-            Token::Ident(name) if found.is_none() => found = Some(name.as_str()),
-            _ => return None,
-        }
+/// Identifiers that are valid user names in GLSL ES 1.00 but collide with GLSL 450 / Vulkan
+/// keywords or the GLSL 450 `texture()`/`textureProj()` built-ins emitted by this shim.
+fn is_glsl450_escaped_ident(name: &str) -> bool {
+    matches!(
+        name,
+        "sample"
+            | "smooth"
+            | "flat"
+            | "noperspective"
+            | "centroid"
+            | "patch"
+            | "subroutine"
+            | "buffer"
+            | "shared"
+            | "coherent"
+            | "volatile"
+            | "restrict"
+            | "readonly"
+            | "writeonly"
+            | "layout"
+            | "precise"
+            | "double"
+            | "dvec2"
+            | "dvec3"
+            | "dvec4"
+            | "dmat2"
+            | "dmat3"
+            | "dmat4"
+            | "dmat2x2"
+            | "dmat2x3"
+            | "dmat2x4"
+            | "dmat3x2"
+            | "dmat3x3"
+            | "dmat3x4"
+            | "dmat4x2"
+            | "dmat4x3"
+            | "dmat4x4"
+            | "atomic_uint"
+            | "sampler"
+            | "texture"
+            | "textureProj"
+    )
+}
+
+fn escape_glsl450_ident(name: &str) -> String {
+    if is_glsl450_escaped_ident(name) {
+        format!("_zc_id_{name}")
+    } else {
+        name.to_string()
     }
-    found
+}
+
+fn first_single_ident(arg: &[Token]) -> Option<&str> {
+    let mut slice = arg;
+    loop {
+        while matches!(slice.first(), Some(Token::Newline)) {
+            slice = &slice[1..];
+        }
+        while matches!(slice.last(), Some(Token::Newline)) {
+            slice = &slice[..slice.len() - 1];
+        }
+        if slice.len() >= 2
+            && matches!(slice.first(), Some(Token::Punct(p)) if p == "(")
+            && matches!(slice.last(), Some(Token::Punct(p)) if p == ")")
+        {
+            let mut depth = 0_usize;
+            let mut wraps_all = true;
+            for (idx, tok) in slice.iter().enumerate() {
+                match tok {
+                    Token::Punct(p) if p == "(" => depth += 1,
+                    Token::Punct(p) if p == ")" => {
+                        depth -= 1;
+                        if depth == 0 && idx + 1 < slice.len() {
+                            wraps_all = false;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if wraps_all && depth == 0 {
+                slice = &slice[1..slice.len() - 1];
+                continue;
+            }
+        }
+        break;
+    }
+    if let [Token::Ident(name)] = slice {
+        Some(name.as_str())
+    } else {
+        None
+    }
 }
 
 fn parse_bracket_expr(tokens: &[Token], open_bracket_idx: usize) -> Option<(Vec<Token>, usize)> {
@@ -1712,34 +2933,272 @@ fn parse_bracket_expr(tokens: &[Token], open_bracket_idx: usize) -> Option<(Vec<
     None
 }
 
-fn is_shadowed(name: &str, scopes: &[HashSet<String>]) -> bool {
-    scopes.iter().rev().any(|scope| scope.contains(name))
+type SamplerFnMap = HashMap<String, HashMap<usize, HashSet<usize>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FragCoordResY {
+    None,
+    Float,
+    CastFloat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    Root,
+    Brace,
+    ForHeader { paren_depth: usize },
+    ForBodyStart,
+    ForSingleStmt { if_depth: usize },
+}
+
+#[derive(Debug, Clone)]
+struct ScopeFrame {
+    vars: HashSet<String>,
+    samplers: HashSet<String>,
+    kind: ScopeKind,
+}
+
+impl ScopeFrame {
+    fn new(kind: ScopeKind) -> Self {
+        Self {
+            vars: HashSet::new(),
+            samplers: HashSet::new(),
+            kind,
+        }
+    }
+}
+
+struct RewriteCtx<'a> {
+    uniforms: &'a HashMap<&'a str, &'a UniformDecl>,
+    samplers: &'a HashSet<&'a str>,
+    sampler_fns: &'a SamplerFnMap,
+    user_fns: &'a HashSet<String>,
+    frag_coord_res_y: FragCoordResY,
+}
+
+fn tokens_reference_ident(tokens: &[Token], target: &str) -> bool {
+    for tok in tokens {
+        match tok {
+            Token::Ident(name) if name == target => return true,
+            Token::Preprocessor(line) if line.contains(target) => {
+                let body = line.trim_start().strip_prefix('#').unwrap_or(line);
+                if tokenize(body)
+                    .iter()
+                    .any(|t| matches!(t, Token::Ident(name) if name == target))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn frag_coord_resolution_mode(uniforms: &HashMap<&str, &UniformDecl>) -> FragCoordResY {
+    let Some(decl) = uniforms.get("resolution") else {
+        return FragCoordResY::None;
+    };
+    if decl.array_len.is_some() {
+        return FragCoordResY::None;
+    }
+    match decl.ty {
+        UniformType::Vec2 | UniformType::Vec3 | UniformType::Vec4 => FragCoordResY::Float,
+        UniformType::Ivec2
+        | UniformType::Ivec3
+        | UniformType::Ivec4
+        | UniformType::Uvec2
+        | UniformType::Uvec3
+        | UniformType::Uvec4 => FragCoordResY::CastFloat,
+        _ => FragCoordResY::None,
+    }
+}
+
+fn emit_gl_frag_coord(out: &mut Vec<Token>, res_y: FragCoordResY) {
+    match res_y {
+        FragCoordResY::None => {
+            out.push(Token::Ident("gl_FragCoord".to_string()));
+        }
+        FragCoordResY::Float | FragCoordResY::CastFloat => {
+            out.push(Token::Punct("(".to_string()));
+            out.push(Token::Ident("vec4".to_string()));
+            out.push(Token::Punct("(".to_string()));
+            out.push(Token::Ident("gl_FragCoord".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident("x".to_string()));
+            out.push(Token::Punct(",".to_string()));
+            if res_y == FragCoordResY::CastFloat {
+                out.push(Token::Ident("float".to_string()));
+                out.push(Token::Punct("(".to_string()));
+            }
+            out.push(Token::Ident("_zc_u".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident("resolution".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident("y".to_string()));
+            if res_y == FragCoordResY::CastFloat {
+                out.push(Token::Punct(")".to_string()));
+            }
+            out.push(Token::Punct("-".to_string()));
+            out.push(Token::Ident("gl_FragCoord".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident("y".to_string()));
+            out.push(Token::Punct(",".to_string()));
+            out.push(Token::Ident("gl_FragCoord".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident("z".to_string()));
+            out.push(Token::Punct(",".to_string()));
+            out.push(Token::Ident("gl_FragCoord".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident("w".to_string()));
+            out.push(Token::Punct(")".to_string()));
+            out.push(Token::Punct(")".to_string()));
+        }
+    }
+}
+
+fn collect_function_info(tokens: &[Token]) -> Result<(SamplerFnMap, HashSet<String>), ShaderError> {
+    let mut map: SamplerFnMap = HashMap::new();
+    let mut user_fns: HashSet<String> = HashSet::new();
+    let mut brace_depth: usize = 0;
+    let mut prev_non_newline: Option<&Token> = None;
+    let mut i = 0;
+
+    while i < tokens.len() {
+        match &tokens[i] {
+            Token::Newline => {
+                i += 1;
+                continue;
+            }
+            Token::Punct(p) if p == "{" => {
+                brace_depth += 1;
+            }
+            Token::Punct(p) if p == "}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+            }
+            Token::Ident(fn_name)
+                if brace_depth == 0
+                    && matches!(prev_non_newline, Some(Token::Ident(_)))
+                    && !matches!(
+                        fn_name.as_str(),
+                        "if" | "for"
+                            | "while"
+                            | "switch"
+                            | "return"
+                            | "else"
+                            | "do"
+                            | "struct"
+                            | "uniform"
+                            | "varying"
+                            | "precision"
+                    ) =>
+            {
+                let next_i = next_non_newline(tokens, i + 1);
+                if matches!(tokens.get(next_i), Some(Token::Punct(p)) if p == "(")
+                    && let Some((param_ranges, after_paren)) =
+                        parse_call_arg_ranges(tokens, next_i)?
+                {
+                    let after_tok = next_non_newline(tokens, after_paren);
+                    if matches!(
+                        tokens.get(after_tok),
+                        Some(Token::Punct(p)) if p == "{" || p == ";"
+                    ) {
+                        user_fns.insert(fn_name.clone());
+                        let mut sampler_indices = HashSet::new();
+                        for (idx, &(lo, hi)) in param_ranges.iter().enumerate() {
+                            if tokens[lo..hi]
+                                .iter()
+                                .any(|t| matches!(t, Token::Ident(s) if s == "sampler2D"))
+                            {
+                                sampler_indices.insert(idx);
+                            }
+                        }
+                        if !sampler_indices.is_empty() {
+                            map.entry(fn_name.clone())
+                                .or_default()
+                                .entry(param_ranges.len())
+                                .or_default()
+                                .extend(sampler_indices);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        prev_non_newline = Some(&tokens[i]);
+        i += 1;
+    }
+
+    Ok((map, user_fns))
+}
+
+fn is_shadowed(name: &str, scopes: &[ScopeFrame]) -> bool {
+    scopes.iter().rev().any(|scope| scope.vars.contains(name))
+}
+
+fn is_sampler_in_scope(name: &str, samplers: &HashSet<&str>, scopes: &[ScopeFrame]) -> bool {
+    for scope in scopes.iter().rev() {
+        if scope.samplers.contains(name) {
+            return true;
+        }
+        if scope.vars.contains(name) {
+            return false;
+        }
+    }
+    samplers.contains(name)
+}
+
+fn flush_pending_decl(pending_decl_var: &mut Option<String>, scopes: &mut [ScopeFrame]) {
+    if let Some(var) = pending_decl_var.take()
+        && let Some(current_scope) = scopes.last_mut()
+    {
+        current_scope.vars.insert(var);
+    }
+}
+
+fn pop_completed_for_scopes(scopes: &mut Vec<ScopeFrame>, next_is_else: bool) {
+    while let Some(top) = scopes.last_mut() {
+        match &mut top.kind {
+            ScopeKind::ForBodyStart => {
+                scopes.pop();
+            }
+            ScopeKind::ForSingleStmt { if_depth } => {
+                if next_is_else && *if_depth > 0 {
+                    *if_depth -= 1;
+                    break;
+                }
+                scopes.pop();
+            }
+            _ => break,
+        }
+    }
 }
 
 fn rewrite_body(
     tokens: &[Token],
     uniforms: &HashMap<&str, &UniformDecl>,
     samplers: &HashSet<&str>,
+    sampler_fns: &SamplerFnMap,
+    user_fns: &HashSet<String>,
+    frag_coord_res_y: FragCoordResY,
     budget: &mut RewriteBudget,
 ) -> Result<Vec<Token>, ShaderError> {
-    let mut scopes: Vec<HashSet<String>> = vec![HashSet::new()];
-    let mut user_types: HashSet<String> = HashSet::new();
-    rewrite_slice(
-        tokens,
+    let ctx = RewriteCtx {
         uniforms,
         samplers,
-        &mut scopes,
-        &mut user_types,
-        0,
-        budget,
-    )
+        sampler_fns,
+        user_fns,
+        frag_coord_res_y,
+    };
+    let mut scopes: Vec<ScopeFrame> = vec![ScopeFrame::new(ScopeKind::Root)];
+    let mut user_types: HashSet<String> = HashSet::new();
+    rewrite_slice(tokens, &ctx, &mut scopes, &mut user_types, 0, budget)
 }
 
 fn rewrite_slice(
     tokens: &[Token],
-    uniforms: &HashMap<&str, &UniformDecl>,
-    samplers: &HashSet<&str>,
-    scopes: &mut Vec<HashSet<String>>,
+    ctx: &RewriteCtx<'_>,
+    scopes: &mut Vec<ScopeFrame>,
     user_types: &mut HashSet<String>,
     depth: usize,
     budget: &mut RewriteBudget,
@@ -1751,6 +3210,8 @@ fn rewrite_slice(
     }
     let mut out = Vec::with_capacity(tokens.len());
     let mut pending_scope_vars: Vec<String> = Vec::new();
+    let mut pending_scope_samplers: Vec<String> = Vec::new();
+    let mut pending_decl_var: Option<String> = None;
     let mut decl_in_progress = false;
     let mut decl_expecting_name = false;
     let mut decl_paren_depth: usize = 0;
@@ -1766,12 +3227,34 @@ fn rewrite_slice(
             .find(|t| !matches!(t, Token::Newline))
             .is_some_and(|t| matches!(t, Token::Punct(p) if p == "."));
 
+        // Transition a `for (...)` waiting for its body into a single-statement body scope
+        // when the body does not begin with `{`, `;`, or a nested `for`.
+        if !matches!(&tokens[i], Token::Newline | Token::Preprocessor(_))
+            && !matches!(&tokens[i], Token::Punct(p) if p == "{" || p == ";")
+            && !matches!(&tokens[i], Token::Ident(kw) if kw == "for")
+            && let Some(top) = scopes.last_mut()
+        {
+            match &mut top.kind {
+                ScopeKind::ForBodyStart => {
+                    let is_if = matches!(&tokens[i], Token::Ident(kw) if kw == "if");
+                    top.kind = ScopeKind::ForSingleStmt {
+                        if_depth: usize::from(is_if),
+                    };
+                }
+                ScopeKind::ForSingleStmt { if_depth } => {
+                    if matches!(&tokens[i], Token::Ident(kw) if kw == "if") {
+                        *if_depth += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         match &tokens[i] {
             Token::Preprocessor(line) => {
                 out.push(Token::Preprocessor(rewrite_preprocessor_line(
                     line,
-                    uniforms,
-                    samplers,
+                    ctx,
                     depth + 1,
                     budget,
                 )?));
@@ -1779,9 +3262,13 @@ fn rewrite_slice(
                 continue;
             }
             Token::Punct(p) if p == "{" => {
-                let mut new_scope = HashSet::new();
+                flush_pending_decl(&mut pending_decl_var, scopes);
+                let mut new_scope = ScopeFrame::new(ScopeKind::Brace);
                 for var in pending_scope_vars.drain(..) {
-                    new_scope.insert(var);
+                    new_scope.vars.insert(var);
+                }
+                for samp in pending_scope_samplers.drain(..) {
+                    new_scope.samplers.insert(samp);
                 }
                 scopes.push(new_scope);
                 decl_in_progress = false;
@@ -1792,9 +3279,14 @@ fn rewrite_slice(
                 continue;
             }
             Token::Punct(p) if p == "}" => {
+                flush_pending_decl(&mut pending_decl_var, scopes);
                 if scopes.len() > 1 {
                     scopes.pop();
                 }
+                let next_i = next_non_newline(tokens, i + 1);
+                let next_is_else =
+                    matches!(tokens.get(next_i), Some(Token::Ident(kw)) if kw == "else");
+                pop_completed_for_scopes(scopes, next_is_else);
                 decl_in_progress = false;
                 decl_expecting_name = false;
                 out.push(tokens[i].clone());
@@ -1802,11 +3294,17 @@ fn rewrite_slice(
                 continue;
             }
             Token::Punct(p) if p == ";" => {
+                flush_pending_decl(&mut pending_decl_var, scopes);
                 decl_in_progress = false;
                 decl_expecting_name = false;
                 if !in_param_list {
                     pending_scope_vars.clear();
+                    pending_scope_samplers.clear();
                 }
+                let next_i = next_non_newline(tokens, i + 1);
+                let next_is_else =
+                    matches!(tokens.get(next_i), Some(Token::Ident(kw)) if kw == "else");
+                pop_completed_for_scopes(scopes, next_is_else);
                 out.push(tokens[i].clone());
                 i += 1;
                 continue;
@@ -1814,8 +3312,15 @@ fn rewrite_slice(
             Token::Punct(p) if p == "(" => {
                 if in_param_list {
                     param_paren_depth += 1;
-                } else if decl_in_progress {
-                    decl_paren_depth += 1;
+                } else {
+                    if let Some(top) = scopes.last_mut()
+                        && let ScopeKind::ForHeader { paren_depth } = &mut top.kind
+                    {
+                        *paren_depth += 1;
+                    }
+                    if decl_in_progress {
+                        decl_paren_depth += 1;
+                    }
                 }
                 out.push(tokens[i].clone());
                 i += 1;
@@ -1827,14 +3332,30 @@ fn rewrite_slice(
                     if param_paren_depth == 0 {
                         in_param_list = false;
                     }
-                } else if decl_in_progress {
-                    decl_paren_depth = decl_paren_depth.saturating_sub(1);
+                } else {
+                    if decl_in_progress {
+                        decl_paren_depth = decl_paren_depth.saturating_sub(1);
+                    }
+                    if let Some(top) = scopes.last_mut()
+                        && let ScopeKind::ForHeader { paren_depth } = &mut top.kind
+                    {
+                        *paren_depth = paren_depth.saturating_sub(1);
+                        if *paren_depth == 0 {
+                            if let Some(var) = pending_decl_var.take() {
+                                top.vars.insert(var);
+                            }
+                            decl_in_progress = false;
+                            decl_expecting_name = false;
+                            top.kind = ScopeKind::ForBodyStart;
+                        }
+                    }
                 }
                 out.push(tokens[i].clone());
                 i += 1;
                 continue;
             }
             Token::Punct(p) if p == "," && decl_in_progress && decl_paren_depth == 0 => {
+                flush_pending_decl(&mut pending_decl_var, scopes);
                 decl_expecting_name = true;
                 out.push(tokens[i].clone());
                 i += 1;
@@ -1853,15 +3374,46 @@ fn rewrite_slice(
                 out.push(tokens[i].clone());
                 let next_i = next_non_newline(tokens, i + 1);
                 if matches!(tokens.get(next_i), Some(Token::Punct(p)) if p == "(") {
-                    in_param_list = true;
-                    param_paren_depth = 0;
+                    scopes.push(ScopeFrame::new(ScopeKind::ForHeader { paren_depth: 0 }));
                 }
+                i += 1;
+                continue;
+            }
+            Token::Ident(name)
+                if !prev_is_dot
+                    && name == "sampler2D"
+                    && in_param_list
+                    && param_paren_depth == 1 =>
+            {
+                let next_i = next_non_newline(tokens, i + 1);
+                if let Some(Token::Ident(var_name)) = tokens.get(next_i) {
+                    pending_scope_vars.push(var_name.clone());
+                    pending_scope_samplers.push(var_name.clone());
+                    let esc_var = escape_glsl450_ident(var_name);
+                    out.push(Token::Ident("texture2D".to_string()));
+                    out.push(Token::Ident(esc_var.clone()));
+                    out.push(Token::Punct(",".to_string()));
+                    out.push(Token::Ident("sampler".to_string()));
+                    out.push(Token::Ident(format!("{esc_var}_sampler")));
+                    budget.charge(4)?;
+                    i = next_i + 1;
+                    continue;
+                }
+                out.push(Token::Ident("texture2D".to_string()));
+                out.push(Token::Punct(",".to_string()));
+                out.push(Token::Ident("sampler".to_string()));
+                budget.charge(2)?;
                 i += 1;
                 continue;
             }
             Token::Ident(name)
                 if !prev_is_dot && (is_glsl_builtin_type(name) || user_types.contains(name)) =>
             {
+                let emitted_type = if user_types.contains(name) {
+                    Token::Ident(escape_glsl450_ident(name))
+                } else {
+                    tokens[i].clone()
+                };
                 let next_i = next_non_newline(tokens, i + 1);
                 if let Some(Token::Ident(var_name)) = tokens.get(next_i) {
                     let after_name = next_non_newline(tokens, next_i + 1);
@@ -1869,34 +3421,34 @@ fn rewrite_slice(
                         // Function declaration / definition: enter parameter list tracking.
                         in_param_list = true;
                         param_paren_depth = 0;
-                        out.push(tokens[i].clone());
+                        out.push(emitted_type);
                         i += 1;
                         continue;
                     }
                     // Local variable, struct field, or function parameter declaration.
                     if in_param_list {
                         pending_scope_vars.push(var_name.clone());
-                    } else if let Some(current_scope) = scopes.last_mut() {
-                        current_scope.insert(var_name.clone());
+                    } else {
+                        flush_pending_decl(&mut pending_decl_var, scopes);
+                        pending_decl_var = Some(var_name.clone());
                     }
-                    out.push(tokens[i].clone());
-                    out.push(Token::Ident(var_name.clone()));
+                    out.push(emitted_type);
+                    out.push(Token::Ident(escape_glsl450_ident(var_name)));
                     decl_in_progress = !in_param_list;
                     decl_expecting_name = false;
                     decl_paren_depth = 0;
                     i = next_i + 1;
                     continue;
                 }
-                out.push(tokens[i].clone());
+                out.push(emitted_type);
                 i += 1;
                 continue;
             }
             Token::Ident(name) if decl_expecting_name => {
-                if let Some(current_scope) = scopes.last_mut() {
-                    current_scope.insert(name.clone());
-                }
+                flush_pending_decl(&mut pending_decl_var, scopes);
+                pending_decl_var = Some(name.clone());
                 decl_expecting_name = false;
-                out.push(tokens[i].clone());
+                out.push(Token::Ident(escape_glsl450_ident(name)));
                 i += 1;
                 continue;
             }
@@ -1905,35 +3457,82 @@ fn rewrite_slice(
                 i += 1;
                 continue;
             }
+            Token::Ident(name) if name == "gl_FragCoord" && !prev_is_dot => {
+                let before_len = out.len();
+                emit_gl_frag_coord(&mut out, ctx.frag_coord_res_y);
+                budget.charge(out.len().saturating_sub(before_len))?;
+                i += 1;
+                continue;
+            }
             Token::Ident(name)
                 if !prev_is_dot
-                    && matches!(name.as_str(), "texture2D" | "texture2DProj" | "texture") =>
+                    && name == "dFdy"
+                    && !is_shadowed(name, scopes)
+                    && !ctx.user_fns.contains("dFdy")
+                    && matches!(
+                        tokens.get(next_non_newline(tokens, i + 1)),
+                        Some(Token::Punct(p)) if p == "("
+                    ) =>
             {
                 let next_i = next_non_newline(tokens, i + 1);
-                if matches!(tokens.get(next_i), Some(Token::Punct(p)) if p == "(")
-                    && let Some((arg_ranges, after_call)) = parse_call_arg_ranges(tokens, next_i)?
+                if let Some((arg_ranges, after_call)) = parse_call_arg_ranges(tokens, next_i)?
+                    && arg_ranges.len() == 1
+                {
+                    let (lo, hi) = arg_ranges[0];
+                    let rewritten_arg =
+                        rewrite_slice(&tokens[lo..hi], ctx, scopes, user_types, depth + 1, budget)?;
+                    let before_len = out.len();
+                    out.push(Token::Punct("(".to_string()));
+                    out.push(Token::Punct("-".to_string()));
+                    out.push(Token::Ident("dFdy".to_string()));
+                    out.push(Token::Punct("(".to_string()));
+                    out.extend(rewritten_arg);
+                    out.push(Token::Punct(")".to_string()));
+                    out.push(Token::Punct(")".to_string()));
+                    budget.charge(out.len().saturating_sub(before_len))?;
+                    i = after_call;
+                    continue;
+                }
+                out.push(tokens[i].clone());
+                i += 1;
+                continue;
+            }
+            Token::Ident(name)
+                if !prev_is_dot
+                    && !ctx.uniforms.contains_key(name.as_str())
+                    && matches!(
+                        tokens.get(next_non_newline(tokens, i + 1)),
+                        Some(Token::Punct(p)) if p == "("
+                    )
+                    && (matches!(name.as_str(), "texture2D" | "texture2DProj")
+                        || (name == "texture"
+                            && !ctx.user_fns.contains("texture")
+                            && !is_shadowed("texture", scopes))) =>
+            {
+                let next_i = next_non_newline(tokens, i + 1);
+                if let Some((arg_ranges, after_call)) = parse_call_arg_ranges(tokens, next_i)?
                     && arg_ranges.len() >= 2
                     && let Some(tex_ident) =
                         first_single_ident(&tokens[arg_ranges[0].0..arg_ranges[0].1])
-                    && samplers.contains(tex_ident)
+                    && is_sampler_in_scope(tex_ident, ctx.samplers, scopes)
                 {
                     let is_proj = name == "texture2DProj";
                     let fn_name = if is_proj { "textureProj" } else { "texture" };
+                    let esc_tex = escape_glsl450_ident(tex_ident);
                     let before_len = out.len();
                     out.push(Token::Ident(fn_name.to_string()));
                     out.push(Token::Punct("(".to_string()));
                     out.push(Token::Ident("sampler2D".to_string()));
                     out.push(Token::Punct("(".to_string()));
-                    out.push(Token::Ident(tex_ident.to_string()));
+                    out.push(Token::Ident(esc_tex.clone()));
                     out.push(Token::Punct(",".to_string()));
-                    out.push(Token::Ident(format!("{tex_ident}_sampler")));
+                    out.push(Token::Ident(format!("{esc_tex}_sampler")));
                     out.push(Token::Punct(")".to_string()));
                     for (arg_idx, &(lo, hi)) in arg_ranges[1..].iter().enumerate() {
                         out.push(Token::Punct(",".to_string()));
                         let rewritten_arg = rewrite_slice(
                             &tokens[lo..hi],
-                            uniforms,
-                            samplers,
+                            ctx,
                             scopes,
                             user_types,
                             depth + 1,
@@ -1959,16 +3558,69 @@ fn rewrite_slice(
                     i = after_call;
                     continue;
                 }
-                out.push(tokens[i].clone());
+                out.push(Token::Ident(escape_glsl450_ident(name)));
+                i += 1;
+                continue;
+            }
+            Token::Ident(name)
+                if !prev_is_dot
+                    && !(in_param_list && param_paren_depth == 0)
+                    && ctx.sampler_fns.contains_key(name.as_str())
+                    && matches!(
+                        tokens.get(next_non_newline(tokens, i + 1)),
+                        Some(Token::Punct(p)) if p == "("
+                    ) =>
+            {
+                let next_i = next_non_newline(tokens, i + 1);
+                if let Some((arg_ranges, after_call)) = parse_call_arg_ranges(tokens, next_i)?
+                    && let Some(sampler_arg_indices) = ctx
+                        .sampler_fns
+                        .get(name.as_str())
+                        .and_then(|arities| arities.get(&arg_ranges.len()))
+                {
+                    let before_len = out.len();
+                    out.push(Token::Ident(escape_glsl450_ident(name)));
+                    out.push(Token::Punct("(".to_string()));
+                    for (arg_idx, &(lo, hi)) in arg_ranges.iter().enumerate() {
+                        if arg_idx > 0 {
+                            out.push(Token::Punct(",".to_string()));
+                        }
+                        if sampler_arg_indices.contains(&arg_idx)
+                            && let Some(tex_ident) = first_single_ident(&tokens[lo..hi])
+                            && is_sampler_in_scope(tex_ident, ctx.samplers, scopes)
+                        {
+                            let esc_tex = escape_glsl450_ident(tex_ident);
+                            out.push(Token::Ident(esc_tex.clone()));
+                            out.push(Token::Punct(",".to_string()));
+                            out.push(Token::Ident(format!("{esc_tex}_sampler")));
+                        } else {
+                            let rewritten_arg = rewrite_slice(
+                                &tokens[lo..hi],
+                                ctx,
+                                scopes,
+                                user_types,
+                                depth + 1,
+                                budget,
+                            )?;
+                            out.extend(rewritten_arg);
+                        }
+                    }
+                    out.push(Token::Punct(")".to_string()));
+                    budget.charge(out.len().saturating_sub(before_len))?;
+                    i = after_call;
+                    continue;
+                }
+                out.push(Token::Ident(escape_glsl450_ident(name)));
                 i += 1;
                 continue;
             }
             Token::Ident(name)
                 if !prev_is_dot
                     && !is_shadowed(name, scopes)
-                    && uniforms.contains_key(name.as_str()) =>
+                    && ctx.uniforms.contains_key(name.as_str()) =>
             {
-                let decl = uniforms[name.as_str()];
+                let decl = ctx.uniforms[name.as_str()];
+                let esc_field = escape_glsl450_ident(&decl.name);
                 if decl.array_len.is_some() {
                     let next_i = next_non_newline(tokens, i + 1);
                     if let Some(swizzle) = decl.ty.array_swizzle()
@@ -1976,21 +3628,14 @@ fn rewrite_slice(
                         && let Some((idx_tokens, after_bracket)) =
                             parse_bracket_expr(tokens, next_i)
                     {
-                        let rewritten_idx = rewrite_slice(
-                            &idx_tokens,
-                            uniforms,
-                            samplers,
-                            scopes,
-                            user_types,
-                            depth + 1,
-                            budget,
-                        )?;
+                        let rewritten_idx =
+                            rewrite_slice(&idx_tokens, ctx, scopes, user_types, depth + 1, budget)?;
                         if decl.ty == UniformType::Bool {
                             out.push(Token::Punct("(".to_string()));
                         }
                         out.push(Token::Ident("_zc_u".to_string()));
                         out.push(Token::Punct(".".to_string()));
-                        out.push(Token::Ident(decl.name.clone()));
+                        out.push(Token::Ident(esc_field));
                         out.push(Token::Punct("[".to_string()));
                         out.extend(rewritten_idx);
                         out.push(Token::Punct("]".to_string()));
@@ -2006,22 +3651,26 @@ fn rewrite_slice(
                     }
                     out.push(Token::Ident("_zc_u".to_string()));
                     out.push(Token::Punct(".".to_string()));
-                    out.push(Token::Ident(decl.name.clone()));
+                    out.push(Token::Ident(esc_field));
                 } else if decl.ty == UniformType::Bool {
                     out.push(Token::Punct("(".to_string()));
                     out.push(Token::Ident("_zc_u".to_string()));
                     out.push(Token::Punct(".".to_string()));
-                    out.push(Token::Ident(decl.name.clone()));
+                    out.push(Token::Ident(esc_field));
                     out.push(Token::Punct("!=".to_string()));
                     out.push(Token::Number("0u".to_string()));
                     out.push(Token::Punct(")".to_string()));
                 } else {
                     out.push(Token::Ident("_zc_u".to_string()));
                     out.push(Token::Punct(".".to_string()));
-                    out.push(Token::Ident(decl.name.clone()));
+                    out.push(Token::Ident(esc_field));
                 }
                 i += 1;
                 continue;
+            }
+            Token::Ident(name) => {
+                out.push(Token::Ident(escape_glsl450_ident(name)));
+                i += 1;
             }
             _ => {
                 out.push(tokens[i].clone());
@@ -2030,13 +3679,13 @@ fn rewrite_slice(
         }
     }
 
+    flush_pending_decl(&mut pending_decl_var, scopes);
     Ok(out)
 }
 
 fn rewrite_preprocessor_line(
     line: &str,
-    uniforms: &HashMap<&str, &UniformDecl>,
-    samplers: &HashSet<&str>,
+    ctx: &RewriteCtx<'_>,
     depth: usize,
     budget: &mut RewriteBudget,
 ) -> Result<String, ShaderError> {
@@ -2090,12 +3739,13 @@ fn rewrite_preprocessor_line(
     }
 
     let body_tokens = tokenize(body);
-    let mut scopes = vec![macro_params];
+    let mut root_scope = ScopeFrame::new(ScopeKind::Root);
+    root_scope.vars = macro_params;
+    let mut scopes = vec![root_scope];
     let mut user_types = HashSet::new();
     let rewritten = rewrite_slice(
         &body_tokens,
-        uniforms,
-        samplers,
+        ctx,
         &mut scopes,
         &mut user_types,
         depth,
@@ -2172,7 +3822,6 @@ fn render_tokens(tokens: &[Token]) -> String {
 // ---------------------------------------------------------------------------
 
 fn assemble_glsl450(
-    options: &CompileOptions,
     extra_varyings: &[VaryingDecl],
     uniforms: &[UniformDecl],
     texture_bindings: &[TextureBinding],
@@ -2182,23 +3831,32 @@ fn assemble_glsl450(
     src.push_str("#version 450\n");
     src.push_str("#define GL_ES 1\n");
     src.push_str("#define GL_FRAGMENT_PRECISION_HIGH 1\n");
-
-    for (name, value) in &options.defines {
-        if value.is_empty() {
-            src.push_str(&format!("#define {name}\n"));
-        } else {
-            src.push_str(&format!("#define {name} {value}\n"));
-        }
-    }
+    src.push_str("#define GL_OES_standard_derivatives 1\n");
 
     src.push_str("\nlayout(location = 0) in vec2 vUv;\n");
     src.push_str("layout(location = 1) in vec2 vUvScaled;\n");
-    for (idx, var) in extra_varyings.iter().enumerate() {
-        let loc = idx + 2;
-        src.push_str(&format!(
-            "layout(location = {loc}) in {} {};\n",
-            var.ty, var.name
-        ));
+    let mut next_loc: u32 = 2;
+    for var in extra_varyings {
+        let esc_name = escape_glsl450_ident(&var.name);
+        let cols: u32 = match var.ty.as_str() {
+            "mat2" => 2,
+            "mat3" => 3,
+            "mat4" => 4,
+            _ => 1,
+        };
+        if let Some(len) = var.array_len {
+            src.push_str(&format!(
+                "layout(location = {next_loc}) in {} {esc_name}[{len}];\n",
+                var.ty
+            ));
+            next_loc += cols.saturating_mul(len);
+        } else {
+            src.push_str(&format!(
+                "layout(location = {next_loc}) in {} {esc_name};\n",
+                var.ty
+            ));
+            next_loc += cols;
+        }
     }
     src.push_str("layout(location = 0) out vec4 _zc_frag_color;\n");
 
@@ -2206,34 +3864,39 @@ fn assemble_glsl450(
         src.push_str("\nlayout(set = 0, binding = 0, std140) uniform ZcCustomUniforms {\n");
         for u in uniforms {
             let glsl_ty = u.ty.ubo_glsl_type(u.array_len.is_some());
+            let esc_name = escape_glsl450_ident(&u.name);
             if let Some(len) = u.array_len {
-                src.push_str(&format!("    {glsl_ty} {}[{len}];\n", u.name));
+                src.push_str(&format!("    {glsl_ty} {esc_name}[{len}];\n"));
             } else {
-                src.push_str(&format!("    {glsl_ty} {};\n", u.name));
+                src.push_str(&format!("    {glsl_ty} {esc_name};\n"));
             }
         }
         src.push_str("} _zc_u;\n");
     }
 
-    if !texture_bindings.is_empty() {
+    let emit_uv_helpers = !texture_bindings.is_empty() || body_glsl.contains("_zc_flip_uv");
+    if !texture_bindings.is_empty() || emit_uv_helpers {
         src.push('\n');
         for tb in texture_bindings {
+            let esc_name = escape_glsl450_ident(&tb.name);
             src.push_str(&format!(
-                "layout(set = {}, binding = {}) uniform texture2D {};\n",
-                tb.group, tb.texture_binding, tb.name
+                "layout(set = {}, binding = {}) uniform texture2D {esc_name};\n",
+                tb.group, tb.texture_binding
             ));
             src.push_str(&format!(
-                "layout(set = {}, binding = {}) uniform sampler {}_sampler;\n",
-                tb.group, tb.sampler_binding, tb.name
+                "layout(set = {}, binding = {}) uniform sampler {esc_name}_sampler;\n",
+                tb.group, tb.sampler_binding
             ));
         }
-        src.push_str("vec2 _zc_flip_uv(vec2 uv) { return vec2(uv.x, 1.0 - uv.y); }\n");
-        src.push_str(
-            "vec3 _zc_flip_uv_proj(vec3 uvw) { return vec3(uvw.x, uvw.z - uvw.y, uvw.z); }\n",
-        );
-        src.push_str(
-            "vec4 _zc_flip_uv_proj(vec4 uvw) { return vec4(uvw.x, uvw.w - uvw.y, uvw.z, uvw.w); }\n",
-        );
+        if emit_uv_helpers {
+            src.push_str("vec2 _zc_flip_uv(vec2 uv) { return vec2(uv.x, 1.0 - uv.y); }\n");
+            src.push_str(
+                "vec3 _zc_flip_uv_proj(vec3 uvw) { return vec3(uvw.x, uvw.z - uvw.y, uvw.z); }\n",
+            );
+            src.push_str(
+                "vec4 _zc_flip_uv_proj(vec4 uvw) { return vec4(uvw.x, uvw.w - uvw.y, uvw.z, uvw.w); }\n",
+            );
+        }
     }
 
     src.push('\n');

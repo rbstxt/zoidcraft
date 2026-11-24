@@ -162,6 +162,8 @@ pub enum Command {
         #[serde(default)]
         expression: Option<String>,
     },
+    #[serde(rename = "property.remove")]
+    RemoveProperty { target_id: String, property: String },
     #[serde(rename = "property.reset_list")]
     ResetPropertyList { target_id: String },
 
@@ -225,6 +227,7 @@ impl Command {
             Self::SetKeyframe { .. } => "property.set_keyframe",
             Self::DeleteKeyframe { .. } => "property.delete_keyframe",
             Self::SetExpression { .. } => "property.set_expression",
+            Self::RemoveProperty { .. } => "property.remove",
             Self::ResetPropertyList { .. } => "property.reset_list",
             Self::EnablePlugin { .. } => "plugins.enable",
             Self::DisablePlugin { .. } => "plugins.disable",
@@ -270,6 +273,7 @@ impl Command {
                 | Self::SetKeyframe { .. }
                 | Self::DeleteKeyframe { .. }
                 | Self::SetExpression { .. }
+                | Self::RemoveProperty { .. }
                 | Self::ResetPropertyList { .. }
         )
     }
@@ -360,6 +364,7 @@ fn resolve_canonical_command_id(name: &str) -> Option<&'static str> {
         "property.set_keyframe" | "SetKeyframe" => Some("property.set_keyframe"),
         "property.delete_keyframe" | "DeleteKeyframe" => Some("property.delete_keyframe"),
         "property.set_expression" | "SetExpression" => Some("property.set_expression"),
+        "property.remove" | "RemoveProperty" => Some("property.remove"),
         "property.reset_list" | "ResetPropertyList" => Some("property.reset_list"),
         "plugins.enable" | "EnablePlugin" => Some("plugins.enable"),
         "plugins.disable" | "DisablePlugin" => Some("plugins.disable"),
@@ -419,7 +424,7 @@ impl Default for CommandRegistry {
 }
 
 impl CommandRegistry {
-    /// Creates a registry populated with all 45 built-in ZoidCraft commands.
+    /// Creates a registry populated with all 46 built-in ZoidCraft commands.
     #[must_use]
     pub fn new_default() -> Self {
         let mut reg = Self {
@@ -966,6 +971,20 @@ fn builtin_command_metadata() -> Vec<CommandMeta> {
             ),
         ),
         CommandMeta::new(
+            "property.remove",
+            "Properties/Remove Property",
+            "Remove a dynamic or custom property (and its keyframes/expressions) from a target",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "target_id": { "type": "string" },
+                    "property": { "type": "string" }
+                }),
+                &["target_id", "property"],
+            ),
+        ),
+        CommandMeta::new(
             "property.reset_list",
             "Properties/Reset Property List",
             "Reset all properties on a target to static defaults at frame 0 in one undo step",
@@ -1031,11 +1050,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_contains_all_45_commands() {
+    fn registry_contains_all_46_commands() {
         let reg = CommandRegistry::new_default();
-        assert_eq!(reg.len(), 45);
+        assert_eq!(reg.len(), 46);
         assert!(reg.get("project.new").is_some());
         assert!(reg.get("NewProject").is_some());
+        assert!(reg.get("property.remove").is_some());
+        assert!(reg.get("RemoveProperty").is_some());
         assert!(reg.get("control.inspect_state").is_some());
     }
 

@@ -569,15 +569,23 @@ fn bounce_out(u: f64) -> f64 {
 ///
 /// `x1` and `x2` are clamped to `[0, 1]`, guaranteeing `x(u)` is monotonically non-decreasing.
 pub fn solve_bezier_param(x1: f64, x2: f64, t: f64) -> f64 {
-    if t <= 0.0 {
+    if !t.is_finite() || t <= 0.0 {
         return 0.0;
     }
     if t >= 1.0 {
         return 1.0;
     }
 
-    let x1 = x1.clamp(0.0, 1.0);
-    let x2 = x2.clamp(0.0, 1.0);
+    let x1 = if x1.is_finite() {
+        x1.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let x2 = if x2.is_finite() {
+        x2.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
 
     // Cubic polynomial x(u) = ((ax * u + bx) * u + cx) * u.
     let cx = 3.0 * x1;
@@ -635,15 +643,15 @@ pub fn solve_bezier_param(x1: f64, x2: f64, t: f64) -> f64 {
 
 /// Evaluates a normalized cubic Bezier easing curve `y(u)` where `x(u) = t`.
 pub fn eval_cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, t: f64) -> f64 {
-    if !t.is_finite() {
-        return 0.0;
-    }
-    if t <= 0.0 {
+    if !t.is_finite() || t <= 0.0 {
         return 0.0;
     }
     if t >= 1.0 {
         return 1.0;
     }
+
+    let y1 = if y1.is_finite() { y1 } else { 0.0 };
+    let y2 = if y2.is_finite() { y2 } else { 1.0 };
 
     let u = solve_bezier_param(x1, x2, t);
     let cy = 3.0 * y1;
@@ -656,7 +664,7 @@ pub fn eval_cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, t: f64) -> f64 {
 ///
 /// `out_x` is `k0.controlPoints[1][0]` (`>= 0`) and `in_x` is `k1.controlPoints[0][0]` (`<= 0`).
 pub fn correct_curve(duration: f64, out_x: f64, in_x: f64) -> f64 {
-    if duration <= 0.0 {
+    if !duration.is_finite() || duration <= 0.0 || !out_x.is_finite() || !in_x.is_finite() {
         return 1.0;
     }
     let x1 = out_x / duration;
@@ -666,6 +674,9 @@ pub fn correct_curve(duration: f64, out_x: f64, in_x: f64) -> f64 {
         return 1.0;
     }
     let sum_x = out_x.abs() + in_x.abs();
+    if !sum_x.is_finite() {
+        return 0.0;
+    }
     if sum_x > duration {
         duration / sum_x
     } else {
@@ -689,15 +700,37 @@ pub struct BezierSegment {
 /// Evaluates a CM3 handle-driven cubic Bezier segment at `frame` (Spec 02 §3.3).
 pub fn eval_segment_bezier(segment: BezierSegment, frame: f64) -> f64 {
     let duration = segment.end_frame - segment.start_frame;
-    if duration <= 0.0 || frame <= segment.start_frame {
+    if !frame.is_finite()
+        || !duration.is_finite()
+        || duration <= 0.0
+        || frame <= segment.start_frame
+    {
         return segment.start_value;
     }
     if frame >= segment.end_frame {
         return segment.end_value;
     }
 
-    let out_x = segment.out_tangent[0].max(0.0);
-    let in_x = segment.in_tangent[0].min(0.0);
+    let out_x = if segment.out_tangent[0].is_finite() {
+        segment.out_tangent[0].max(0.0)
+    } else {
+        0.0
+    };
+    let out_y = if segment.out_tangent[1].is_finite() {
+        segment.out_tangent[1]
+    } else {
+        0.0
+    };
+    let in_x = if segment.in_tangent[0].is_finite() {
+        segment.in_tangent[0].min(0.0)
+    } else {
+        0.0
+    };
+    let in_y = if segment.in_tangent[1].is_finite() {
+        segment.in_tangent[1]
+    } else {
+        0.0
+    };
     let s = correct_curve(duration, out_x, in_x);
 
     let nx1 = (s * out_x / duration).clamp(0.0, 1.0);
@@ -706,8 +739,8 @@ pub fn eval_segment_bezier(segment: BezierSegment, frame: f64) -> f64 {
     let u = solve_bezier_param(nx1, nx2, norm_t);
 
     let y0 = segment.start_value;
-    let y1 = segment.start_value + s * segment.out_tangent[1];
-    let y2 = segment.end_value + s * segment.in_tangent[1];
+    let y1 = segment.start_value + s * out_y;
+    let y2 = segment.end_value + s * in_y;
     let y3 = segment.end_value;
 
     let mu = 1.0 - u;
@@ -1280,5 +1313,42 @@ mod tests {
         assert!(approx_eq(correct_curve(10.0, 8.0, -8.0), 1.0, 1e-12));
         // Handles exceeding segment duration scale down proportionally.
         assert!(approx_eq(correct_curve(10.0, 15.0, -5.0), 0.5, 1e-12));
+    }
+
+    #[test]
+    fn bezier_helpers_guard_non_finite_inputs() {
+        assert_eq!(solve_bezier_param(0.25, 0.75, f64::NAN), 0.0);
+        assert_eq!(solve_bezier_param(0.25, 0.75, f64::NEG_INFINITY), 0.0);
+        assert_eq!(solve_bezier_param(0.25, 0.75, f64::INFINITY), 0.0);
+        assert!(solve_bezier_param(f64::NAN, f64::NAN, 0.5).is_finite());
+        assert!(solve_bezier_param(f64::INFINITY, f64::NEG_INFINITY, 0.5).is_finite());
+
+        assert!(
+            eval_cubic_bezier(f64::NAN, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.5)
+                .is_finite()
+        );
+        assert_eq!(eval_cubic_bezier(0.25, 0.1, 0.25, 1.0, f64::NAN), 0.0);
+
+        let seg_inf_handles = BezierSegment {
+            start_frame: 0.0,
+            start_value: 10.0,
+            out_tangent: [f64::INFINITY, f64::NAN],
+            end_frame: 30.0,
+            end_value: 110.0,
+            in_tangent: [f64::NEG_INFINITY, f64::INFINITY],
+        };
+        let v_mid = eval_segment_bezier(seg_inf_handles, 15.0);
+        assert!(v_mid.is_finite());
+        assert_eq!(eval_segment_bezier(seg_inf_handles, f64::NAN), 10.0);
+
+        let seg_inf_frames = BezierSegment {
+            start_frame: 0.0,
+            start_value: 5.0,
+            out_tangent: [10.0, 0.0],
+            end_frame: f64::INFINITY,
+            end_value: 100.0,
+            in_tangent: [-10.0, 0.0],
+        };
+        assert_eq!(eval_segment_bezier(seg_inf_frames, 10.0), 5.0);
     }
 }

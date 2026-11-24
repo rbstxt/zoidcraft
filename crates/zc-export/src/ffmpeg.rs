@@ -371,9 +371,9 @@ pub(crate) fn probe_ffmpeg_with_timeout(
 
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None => {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
                 if Instant::now() >= deadline {
                     kill_process_tree_and_reap(&mut child);
                     let _ = abort_and_join_worker(
@@ -399,6 +399,24 @@ pub(crate) fn probe_ffmpeg_with_timeout(
                     });
                 }
                 std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                kill_process_tree_and_reap(&mut child);
+                let _ = abort_and_join_worker(
+                    &io_abort,
+                    &stdout_cancel,
+                    &out_rx,
+                    out_handle,
+                    Duration::from_millis(250),
+                );
+                let _ = abort_and_join_worker(
+                    &io_abort,
+                    &stderr_cancel,
+                    &err_rx,
+                    err_handle,
+                    Duration::from_millis(250),
+                );
+                return Err(ExportError::Io(err));
             }
         }
     };
@@ -591,7 +609,7 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
                 QualityMode::Crf(crf) => {
                     args.extend([
                         "-crf".into(),
-                        crf.min(63).to_string().into(),
+                        crf.clamp(4, 63).to_string().into(),
                         "-b:v".into(),
                         "10000k".into(),
                     ]);
@@ -633,13 +651,18 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
     if has_audio {
         match settings.audio_codec {
             AudioCodec::Aac => {
+                let aac_rate = match settings.sample_rate {
+                    7_350 | 8_000 | 11_025 | 12_000 | 16_000 | 22_050 | 24_000 | 32_000
+                    | 44_100 | 48_000 | 64_000 | 88_200 | 96_000 => settings.sample_rate,
+                    _ => 48_000,
+                };
                 args.extend([
                     "-c:a".into(),
                     "aac".into(),
                     "-b:a".into(),
                     format!("{}k", settings.audio_bitrate_kbps).into(),
                     "-ar".into(),
-                    settings.sample_rate.to_string().into(),
+                    aac_rate.to_string().into(),
                     "-ac".into(),
                     "2".into(),
                 ]);
@@ -649,11 +672,12 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
                     8_000 | 12_000 | 16_000 | 24_000 | 48_000 => settings.sample_rate,
                     _ => 48_000,
                 };
+                let opus_bitrate = settings.audio_bitrate_kbps.clamp(6, 510);
                 args.extend([
                     "-c:a".into(),
                     "libopus".into(),
                     "-b:a".into(),
-                    format!("{}k", settings.audio_bitrate_kbps).into(),
+                    format!("{opus_bitrate}k").into(),
                     "-ar".into(),
                     opus_rate.to_string().into(),
                     "-ac".into(),
@@ -917,5 +941,29 @@ mod tests {
         let out = ring.into_string_lossy();
         assert!(out.contains("truncated"));
         assert!(out.ends_with("456789abcdefghij"));
+    }
+
+    #[test]
+    fn encoder_args_clamp_vp8_crf_aac_rate_and_opus_bitrate() {
+        let audio = PathBuf::from("/tmp/audio.wav");
+
+        let mut vp8 = base_settings();
+        vp8.container = ExportContainer::Webm;
+        vp8.video_codec = VideoCodec::Vp8;
+        vp8.audio_codec = AudioCodec::Opus;
+        vp8.quality = QualityMode::Crf(0);
+        vp8.audio_bitrate_kbps = 1000;
+        let vp8_args = build_ffmpeg_args(&vp8, Some(&audio)).expect("valid VP8/Opus args");
+        assert!(has_pair(&vp8_args, "-crf", "4"));
+        assert!(has_pair(&vp8_args, "-b:a", "510k"));
+
+        vp8.audio_bitrate_kbps = 2;
+        let vp8_low = build_ffmpeg_args(&vp8, Some(&audio)).expect("valid low Opus bitrate args");
+        assert!(has_pair(&vp8_low, "-b:a", "6k"));
+
+        let mut aac = base_settings();
+        aac.sample_rate = 192_000;
+        let aac_args = build_ffmpeg_args(&aac, Some(&audio)).expect("valid AAC fallback rate args");
+        assert!(has_pair(&aac_args, "-ar", "48000"));
     }
 }

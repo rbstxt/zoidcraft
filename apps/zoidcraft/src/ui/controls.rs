@@ -18,7 +18,7 @@ use super::theme::{
     DANGER_TEXT, FONT_BANNER, FONT_BODY, FONT_EASING, FONT_SMALL, FONT_TITLE, TEXT_BRIGHT,
     TEXT_BUTTON, TEXT_DISABLED, TEXT_FAINT, TEXT_MUTED, TEXT_OPTION_DESC, TEXT_PRIMARY,
     TEXT_STRONG, color32_with_alpha, paint_cm3_icon, paint_easing_preview, rgb_to_color32,
-    rgba_to_color32, stopwatch_active_color,
+    rgba_to_color32,
 };
 
 // ---------------------------------------------------------------------------
@@ -108,18 +108,21 @@ enum ScrubMode {
         start_pos: Pos2,
         last_pos: Pos2,
         initial_display: f64,
+        start_value: f64,
         accum_display: f64,
         alt_at_start: bool,
     },
     Scrubbing {
         last_pos: Pos2,
         initial_display: f64,
+        start_value: f64,
         accum_display: f64,
         alt_at_start: bool,
     },
     TextEdit {
         buffer: String,
         initial_display: f64,
+        start_value: f64,
         just_entered: bool,
         alt_at_start: bool,
     },
@@ -144,8 +147,44 @@ fn round_decimals(val: f64, decimals: usize) -> f64 {
 }
 
 fn clamp_and_round(val: f64, cfg: ScrubConfig) -> f64 {
-    let clamped = val.clamp(cfg.min, cfg.max);
+    let (lo, hi) = if cfg.min <= cfg.max {
+        (cfg.min, cfg.max)
+    } else {
+        (cfg.max, cfg.min)
+    };
+    let mut clamped = if val.is_finite() { val } else { 0.0 };
+    if lo.is_finite() && clamped < lo {
+        clamped = lo;
+    }
+    if hi.is_finite() && clamped > hi {
+        clamped = hi;
+    }
     round_decimals(clamped, cfg.decimals)
+}
+
+fn clamp_stored_bounds(val: f64, cfg: ScrubConfig) -> f64 {
+    let safe_scale = if cfg.scale_factor.is_finite() && cfg.scale_factor.abs() > 1e-12 {
+        cfg.scale_factor
+    } else {
+        1.0
+    };
+    let mut a = cfg.min * safe_scale;
+    let mut b = cfg.max * safe_scale;
+    if a.is_nan() {
+        a = f64::NEG_INFINITY;
+    }
+    if b.is_nan() {
+        b = f64::INFINITY;
+    }
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut out = if val.is_finite() { val } else { 0.0 };
+    if lo.is_finite() && out < lo {
+        out = lo;
+    }
+    if hi.is_finite() && out > hi {
+        out = hi;
+    }
+    out
 }
 
 /// Exact CM3 numeric scrub + click-to-type control (Spec 01 §4.3).
@@ -156,40 +195,72 @@ pub fn cm3_scrub_number(
     config: ScrubConfig,
     theme: &Cm3Theme,
 ) -> ScrubEvent {
-    let safe_scale = if config.scale_factor.abs() > 1e-12 {
+    cm3_scrub_number_inner(ui, id, value, config, theme).0
+}
+
+/// Internal numeric scrub implementation returning `(event, text_edit_commit_info)` where
+/// `text_edit_commit_info` is `Some((pre_edit_start_value, alt_at_start))` on a committed `TextEdit`.
+fn cm3_scrub_number_inner(
+    ui: &mut Ui,
+    id: Id,
+    value: &mut f64,
+    config: ScrubConfig,
+    theme: &Cm3Theme,
+) -> (ScrubEvent, Option<(f64, bool)>) {
+    let safe_scale = if config.scale_factor.is_finite() && config.scale_factor.abs() > 1e-12 {
         config.scale_factor
     } else {
         1.0
     };
-    let display_val = clamp_and_round(*value / safe_scale, config);
 
     // Read-only state: #999999 text, default cursor, non-interactive.
+    // If read_only flipped on mid-gesture (PendingDrag or Scrubbing), emit cancelled and reset to Idle.
     if config.read_only {
+        let mut ev = ScrubEvent::default();
+        if let Some(prev_mem) = ui.data_mut(|d| d.get_temp::<ScrubMemory>(id)) {
+            match prev_mem.mode {
+                ScrubMode::PendingDrag { start_value, .. }
+                | ScrubMode::Scrubbing { start_value, .. } => {
+                    *value = start_value;
+                    ev.cancelled = true;
+                    ui.data_mut(|d| d.insert_temp(id, ScrubMemory::default()));
+                }
+                ScrubMode::TextEdit { .. } => {
+                    ui.memory_mut(|m| m.surrender_focus(id.with("text_edit")));
+                    ui.data_mut(|d| d.insert_temp(id, ScrubMemory::default()));
+                }
+                ScrubMode::Idle => {}
+            }
+        }
+        let display_val = clamp_and_round(*value / safe_scale, config);
         let formatted = format!("{:.*}", config.decimals, display_val);
         let galley = ui
             .painter()
             .layout_no_wrap(formatted, theme.font(FONT_BODY), TEXT_DISABLED);
-        let desired = Vec2::new((galley.size().x + 6.0).max(26.0), 24.0);
+        let desired = Vec2::new(galley.size().x.max(18.0) + 3.0, 24.0);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         ui.painter().galley(
             Pos2::new(rect.left() + 3.0, rect.center().y - galley.size().y * 0.5),
             galley,
             TEXT_DISABLED,
         );
-        return ScrubEvent::default();
+        return (ev, None);
     }
 
+    let display_val = clamp_and_round(*value / safe_scale, config);
     let mut mem: ScrubMemory = ui
         .data_mut(|d| d.get_temp::<ScrubMemory>(id))
         .unwrap_or_default();
     let mut ev = ScrubEvent::default();
+    let mut text_commit: Option<(f64, bool)> = None;
 
     match &mut mem.mode {
         ScrubMode::TextEdit {
             buffer,
             initial_display,
+            start_value,
             just_entered,
-            ..
+            alt_at_start,
         } => {
             let edit_id = id.with("text_edit");
             let mut commit_edit = false;
@@ -218,8 +289,6 @@ pub fn cm3_scrub_number(
                 let parsed = buffer.trim().parse::<f64>().unwrap_or(*initial_display);
                 let stepped = clamp_and_round(parsed + step_delta, config);
                 *buffer = format!("{:.*}", config.decimals, stepped);
-                *value = stepped * safe_scale;
-                ev.changed = true;
             }
 
             let desired_w = (buffer.len().max(5) as f32 * 9.5 + 12.0).clamp(48.0, 140.0);
@@ -231,6 +300,7 @@ pub fn cm3_scrub_number(
                     let resp = ui.add(
                         TextEdit::singleline(buffer)
                             .id(edit_id)
+                            .frame(Frame::NONE)
                             .font(theme.font(FONT_BODY))
                             .text_color(theme.value())
                             .desired_width(desired_w),
@@ -244,8 +314,11 @@ pub fn cm3_scrub_number(
 
             let resp = frame_resp.inner;
             if cancel_edit {
-                *value = *initial_display * safe_scale;
-                ev.cancelled = true;
+                // Never hold an open transaction in TextEdit: revert buffer without emitting cancel/change.
+                *buffer = format!("{:.*}", config.decimals, *initial_display);
+                ev.changed = false;
+                ev.committed = false;
+                ev.cancelled = false;
                 ui.memory_mut(|m| m.surrender_focus(edit_id));
                 mem.mode = ScrubMode::Idle;
             } else if commit_edit || resp.lost_focus() {
@@ -255,11 +328,18 @@ pub fn cm3_scrub_number(
                     .ok()
                     .filter(|v| v.is_finite())
                     .map_or(*initial_display, |v| clamp_and_round(v, config));
-                *value = final_display * safe_scale;
                 if (final_display - *initial_display).abs() > 1e-12 {
+                    *value = final_display * safe_scale;
+                    ev.changed = true;
                     ev.committed = true;
+                    ev.started = false;
+                    ev.cancelled = false;
+                    text_commit = Some((*start_value, *alt_at_start));
                 } else {
-                    ev.cancelled = true;
+                    *buffer = format!("{:.*}", config.decimals, *initial_display);
+                    ev.changed = false;
+                    ev.committed = false;
+                    ev.cancelled = false;
                 }
                 ui.memory_mut(|m| m.surrender_focus(edit_id));
                 mem.mode = ScrubMode::Idle;
@@ -267,28 +347,34 @@ pub fn cm3_scrub_number(
         }
         ScrubMode::Idle => {
             let formatted = format!("{:.*}", config.decimals, display_val);
-            let galley =
+            let font = theme.font(FONT_BODY);
+            let base_galley =
                 ui.painter()
-                    .layout_no_wrap(formatted, theme.font(FONT_BODY), theme.value());
-            let desired = Vec2::new((galley.size().x + 6.0).max(26.0), 24.0);
-            let (rect, resp) = ui.allocate_exact_size(desired, Sense::click_and_drag());
-            let resp = resp.on_hover_cursor(CursorIcon::Move);
+                    .layout_no_wrap(formatted.clone(), font.clone(), theme.value());
+            let desired = Vec2::new(base_galley.size().x.max(18.0) + 3.0, 24.0);
+            let (_, rect) = ui.allocate_space(desired);
+            let resp = ui
+                .interact(rect, id.with("hit"), Sense::click_and_drag())
+                .on_hover_cursor(CursorIcon::ResizeHorizontal);
 
-            if resp.hovered() {
-                ui.painter().rect_stroke(
-                    rect,
-                    CornerRadius::ZERO,
-                    Stroke::new(1.0, color32_with_alpha(theme.accent(), 140)),
-                    StrokeKind::Inside,
-                );
-            }
+            // Clean flat Zoidium value text with +3px left inset; highlight text on hover.
+            let (galley, text_color) = if resp.hovered() {
+                (
+                    ui.painter()
+                        .layout_no_wrap(formatted, font, theme.value_strong()),
+                    theme.value_strong(),
+                )
+            } else {
+                (base_galley, theme.value())
+            };
             ui.painter().galley(
                 Pos2::new(rect.left() + 3.0, rect.center().y - galley.size().y * 0.5),
                 galley,
-                theme.value(),
+                text_color,
             );
 
             if resp.is_pointer_button_down_on()
+                && ui.input(|i| i.pointer.primary_down())
                 && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
             {
                 let alt = ui.input(|i| i.modifiers.alt);
@@ -296,6 +382,7 @@ pub fn cm3_scrub_number(
                     start_pos: pos,
                     last_pos: pos,
                     initial_display: display_val,
+                    start_value: *value,
                     accum_display: display_val,
                     alt_at_start: alt,
                 };
@@ -306,6 +393,7 @@ pub fn cm3_scrub_number(
             start_pos,
             last_pos,
             initial_display,
+            start_value,
             accum_display,
             alt_at_start,
         } => {
@@ -315,14 +403,17 @@ pub fn cm3_scrub_number(
                 theme.font(FONT_BODY),
                 theme.value_strong(),
             );
-            let desired = Vec2::new((galley.size().x + 6.0).max(26.0), 24.0);
-            let (rect, _) = ui.allocate_exact_size(desired, Sense::click_and_drag());
+            let desired = Vec2::new(galley.size().x.max(18.0) + 3.0, 24.0);
+            let (_, rect) = ui.allocate_space(desired);
+            let _resp = ui
+                .interact(rect, id.with("hit"), Sense::click_and_drag())
+                .on_hover_cursor(CursorIcon::ResizeHorizontal);
             ui.painter().galley(
                 Pos2::new(rect.left() + 3.0, rect.center().y - galley.size().y * 0.5),
                 galley,
                 theme.value_strong(),
             );
-            ui.ctx().set_cursor_icon(CursorIcon::Move);
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
 
             let (down, pos_opt, esc) = ui.input(|i| {
                 (
@@ -333,15 +424,17 @@ pub fn cm3_scrub_number(
             });
 
             if esc {
-                *value = *initial_display * safe_scale;
+                *value = *start_value;
                 ev.cancelled = true;
                 mem.mode = ScrubMode::Idle;
             } else if !down {
-                // Released before 2 px threshold -> discard drag transaction and enter TextEdit.
+                // Released before 2 px threshold -> immediately cancel PendingDrag transaction
+                // before entering TextEdit so no session transaction is left open.
                 ev.cancelled = true;
                 mem.mode = ScrubMode::TextEdit {
                     buffer: formatted,
                     initial_display: *initial_display,
+                    start_value: *start_value,
                     just_entered: true,
                     alt_at_start: *alt_at_start,
                 };
@@ -349,12 +442,14 @@ pub fn cm3_scrub_number(
                 let d2 = (pos.x - start_pos.x) - (pos.y - start_pos.y);
                 if d2.abs() > 2.0 {
                     let init = *initial_display;
+                    let sv = *start_value;
                     let accum = *accum_display;
                     let alt = *alt_at_start;
                     *last_pos = pos;
                     mem.mode = ScrubMode::Scrubbing {
                         last_pos: pos,
                         initial_display: init,
+                        start_value: sv,
                         accum_display: accum,
                         alt_at_start: alt,
                     };
@@ -364,6 +459,7 @@ pub fn cm3_scrub_number(
         ScrubMode::Scrubbing {
             last_pos,
             initial_display,
+            start_value,
             accum_display,
             ..
         } => {
@@ -377,41 +473,51 @@ pub fn cm3_scrub_number(
                 )
             });
 
-            ui.ctx().set_cursor_icon(CursorIcon::Move);
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
 
             if esc {
-                *value = *initial_display * safe_scale;
+                *value = *start_value;
                 ev.cancelled = true;
                 mem.mode = ScrubMode::Idle;
             } else if let Some(pos) = pos_opt {
                 let delta = f64::from((pos.x - last_pos.x) - (pos.y - last_pos.y));
                 *last_pos = pos;
                 if delta.abs() > 0.0 {
+                    let prev_rounded = clamp_and_round(*value / safe_scale, config);
                     let m_shift = if shift { 10.0 } else { 1.0 };
                     let m_ctrl = if ctrl { 0.1 } else { 1.0 };
+                    let (lo, hi) = if config.min <= config.max {
+                        (config.min, config.max)
+                    } else {
+                        (config.max, config.min)
+                    };
                     *accum_display = (*accum_display
                         + delta * config.step * 0.01 * m_shift * m_ctrl)
-                        .clamp(config.min, config.max);
+                        .clamp(lo, hi);
                     let rounded = round_decimals(*accum_display, config.decimals);
                     *value = rounded * safe_scale;
-                    ev.changed = true;
+                    if (rounded - prev_rounded).abs() > 1e-12 {
+                        ev.changed = true;
+                    }
                 }
                 if !down {
                     let final_display = clamp_and_round(*accum_display, config);
-                    *value = final_display * safe_scale;
                     if (final_display - *initial_display).abs() > 1e-12 {
+                        *value = final_display * safe_scale;
                         ev.committed = true;
                     } else {
+                        *value = *start_value;
                         ev.cancelled = true;
                     }
                     mem.mode = ScrubMode::Idle;
                 }
             } else if !down {
                 let final_display = clamp_and_round(*accum_display, config);
-                *value = final_display * safe_scale;
                 if (final_display - *initial_display).abs() > 1e-12 {
+                    *value = final_display * safe_scale;
                     ev.committed = true;
                 } else {
+                    *value = *start_value;
                     ev.cancelled = true;
                 }
                 mem.mode = ScrubMode::Idle;
@@ -422,15 +528,11 @@ pub fn cm3_scrub_number(
             let galley =
                 ui.painter()
                     .layout_no_wrap(formatted, theme.font(FONT_BODY), theme.value_strong());
-            let desired = Vec2::new((galley.size().x + 6.0).max(26.0), 24.0);
-            let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, BG_INPUT);
-            ui.painter().rect_stroke(
-                rect,
-                CornerRadius::ZERO,
-                Stroke::new(1.0, theme.accent()),
-                StrokeKind::Inside,
-            );
+            let desired = Vec2::new(galley.size().x.max(18.0) + 3.0, 24.0);
+            let (_, rect) = ui.allocate_space(desired);
+            let _resp = ui
+                .interact(rect, id.with("hit"), Sense::click_and_drag())
+                .on_hover_cursor(CursorIcon::ResizeHorizontal);
             ui.painter().galley(
                 Pos2::new(rect.left() + 3.0, rect.center().y - galley.size().y * 0.5),
                 galley,
@@ -440,7 +542,7 @@ pub fn cm3_scrub_number(
     }
 
     ui.data_mut(|d| d.insert_temp(id, mem));
-    ev
+    (ev, text_commit)
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +553,140 @@ pub fn cm3_scrub_number(
 struct VectorLinkMemory {
     active_axis: Option<usize>,
     ratios: [f64; 3],
+    initial_values: [f64; 3],
     unlinked: bool,
+}
+
+/// Inline CM3 Vector2 control with custom `#999999` separator (`"x"` or `","`) and proportional link ratio.
+pub fn cm3_vector2_with_sep(
+    ui: &mut Ui,
+    id: Id,
+    values: &mut [f64; 2],
+    cfg: &ScrubConfig,
+    link_enabled: bool,
+    sep: &str,
+    theme: &Cm3Theme,
+) -> ScrubEvent {
+    let config = *cfg;
+    let mut link_mem: VectorLinkMemory = ui
+        .data_mut(|d| d.get_temp::<VectorLinkMemory>(id.with("link")))
+        .unwrap_or_default();
+    let alt_held = ui.input(|i| i.modifiers.alt);
+    let mut total = ScrubEvent::default();
+    let sep_color = Color32::from_rgb(0x99, 0x99, 0x99);
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.5;
+        let mut started_axis: Option<usize> = None;
+        for axis in 0..2 {
+            if axis > 0 {
+                ui.label(
+                    egui::RichText::new(sep)
+                        .font(theme.font(FONT_BODY))
+                        .color(sep_color),
+                );
+            }
+            let (ev, text_commit) =
+                cm3_scrub_number_inner(ui, id.with(axis), &mut values[axis], config, theme);
+            if ev.started {
+                started_axis = Some(axis);
+                link_mem.active_axis = Some(axis);
+                link_mem.initial_values[0] = values[0];
+                link_mem.initial_values[1] = values[1];
+                link_mem.unlinked = alt_held || !link_enabled;
+                if !link_mem.unlinked {
+                    if values[axis].abs() > 1e-9 {
+                        let denom = values[axis];
+                        link_mem.ratios[0] = values[0] / denom;
+                        link_mem.ratios[1] = values[1] / denom;
+                    } else if values.iter().all(|v| v.abs() <= 1e-9) {
+                        // Uniform proportional scale when starting from exact zero.
+                        link_mem.ratios = [1.0; 3];
+                    } else {
+                        // Undefined ratio (other axis non-zero while active axis is ~0): unlink cleanly.
+                        link_mem.ratios = [1.0; 3];
+                        link_mem.unlinked = true;
+                    }
+                }
+            }
+            if let Some((start_value, alt_at_start)) = text_commit {
+                if ev.committed && link_enabled && !alt_at_start && !alt_held {
+                    let other = 1 - axis;
+                    if start_value.abs() > 1e-9 {
+                        let factor = values[axis] / start_value;
+                        values[other] = clamp_stored_bounds(values[other] * factor, config);
+                    } else if values[other].abs() <= 1e-9 {
+                        values[other] = clamp_stored_bounds(values[axis], config);
+                    }
+                }
+                // If an earlier axis started PendingDrag on this same frame, refresh its snapshot
+                // so the new drag begins from the post-TextEdit committed values.
+                if ev.committed
+                    && let Some(prev_axis) = started_axis
+                    && prev_axis != axis
+                {
+                    link_mem.initial_values[0] = values[0];
+                    link_mem.initial_values[1] = values[1];
+                    if !link_mem.unlinked {
+                        if values[prev_axis].abs() > 1e-9 {
+                            let denom = values[prev_axis];
+                            link_mem.ratios[0] = values[0] / denom;
+                            link_mem.ratios[1] = values[1] / denom;
+                        } else if values.iter().all(|v| v.abs() <= 1e-9) {
+                            link_mem.ratios = [1.0; 3];
+                        } else {
+                            link_mem.ratios = [1.0; 3];
+                            link_mem.unlinked = true;
+                        }
+                    }
+                    let safe_scale =
+                        if config.scale_factor.is_finite() && config.scale_factor.abs() > 1e-12 {
+                            config.scale_factor
+                        } else {
+                            1.0
+                        };
+                    let new_disp = clamp_and_round(values[prev_axis] / safe_scale, config);
+                    ui.data_mut(|d| {
+                        if let Some(mut sm) = d.get_temp::<ScrubMemory>(id.with(prev_axis))
+                            && let ScrubMode::PendingDrag {
+                                initial_display,
+                                start_value,
+                                accum_display,
+                                ..
+                            } = &mut sm.mode
+                        {
+                            *initial_display = new_disp;
+                            *start_value = values[prev_axis];
+                            *accum_display = new_disp;
+                            d.insert_temp(id.with(prev_axis), sm);
+                        }
+                    });
+                }
+            } else if (ev.changed || ev.committed)
+                && link_mem.active_axis == Some(axis)
+                && !link_mem.unlinked
+                && link_enabled
+            {
+                let other = 1 - axis;
+                values[other] = clamp_stored_bounds(values[axis] * link_mem.ratios[other], config);
+            }
+            if ev.cancelled
+                && link_mem.active_axis == Some(axis)
+                && !link_mem.unlinked
+                && link_enabled
+            {
+                let other = 1 - axis;
+                values[other] = link_mem.initial_values[other];
+            }
+            if (ev.committed || ev.cancelled) && link_mem.active_axis == Some(axis) {
+                link_mem.active_axis = None;
+            }
+            total = total.merge(ev);
+        }
+    });
+
+    ui.data_mut(|d| d.insert_temp(id.with("link"), link_mem));
+    total
 }
 
 /// Inline CM3 Vector2 control with `#999999` comma separator and proportional `link_ratio`.
@@ -463,52 +698,7 @@ pub fn cm3_vector2(
     link_ratio: bool,
     theme: &Cm3Theme,
 ) -> ScrubEvent {
-    let mut link_mem: VectorLinkMemory = ui
-        .data_mut(|d| d.get_temp::<VectorLinkMemory>(id.with("link")))
-        .unwrap_or_default();
-    let alt_held = ui.input(|i| i.modifiers.alt);
-    let mut total = ScrubEvent::default();
-
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        for axis in 0..2 {
-            if axis > 0 {
-                ui.label(
-                    egui::RichText::new(",")
-                        .font(theme.font(FONT_BODY))
-                        .color(TEXT_DISABLED),
-                );
-            }
-            let ev = cm3_scrub_number(ui, id.with(axis), &mut values[axis], config, theme);
-            if ev.started {
-                link_mem.active_axis = Some(axis);
-                link_mem.unlinked = alt_held || !link_ratio;
-                if !link_mem.unlinked && values[axis].abs() > 1e-9 {
-                    let denom = values[axis];
-                    link_mem.ratios[0] = values[0] / denom;
-                    link_mem.ratios[1] = values[1] / denom;
-                }
-            }
-            if (ev.changed || ev.committed)
-                && link_mem.active_axis == Some(axis)
-                && !link_mem.unlinked
-                && link_ratio
-            {
-                let other = 1 - axis;
-                values[other] = (values[axis] * link_mem.ratios[other]).clamp(
-                    config.min * config.scale_factor,
-                    config.max * config.scale_factor,
-                );
-            }
-            if ev.committed || ev.cancelled {
-                link_mem.active_axis = None;
-            }
-            total = total.merge(ev);
-        }
-    });
-
-    ui.data_mut(|d| d.insert_temp(id.with("link"), link_mem));
-    total
+    cm3_vector2_with_sep(ui, id, values, &config, link_ratio, ",", theme)
 }
 
 /// Inline CM3 Vector3 control with `#999999` comma separators and proportional `link_ratio`.
@@ -527,7 +717,8 @@ pub fn cm3_vector3(
     let mut total = ScrubEvent::default();
 
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().item_spacing.x = 2.5;
+        let mut started_axis: Option<usize> = None;
         for axis in 0..3 {
             if axis > 0 {
                 ui.label(
@@ -536,18 +727,92 @@ pub fn cm3_vector3(
                         .color(TEXT_DISABLED),
                 );
             }
-            let ev = cm3_scrub_number(ui, id.with(axis), &mut values[axis], config, theme);
+            let (ev, text_commit) =
+                cm3_scrub_number_inner(ui, id.with(axis), &mut values[axis], config, theme);
             if ev.started {
+                started_axis = Some(axis);
                 link_mem.active_axis = Some(axis);
+                link_mem.initial_values = *values;
                 link_mem.unlinked = alt_held || !link_ratio;
-                if !link_mem.unlinked && values[axis].abs() > 1e-9 {
-                    let denom = values[axis];
-                    for (ratio, &val) in link_mem.ratios.iter_mut().zip(values.iter()) {
-                        *ratio = val / denom;
+                if !link_mem.unlinked {
+                    if values[axis].abs() > 1e-9 {
+                        let denom = values[axis];
+                        for (ratio, &val) in link_mem.ratios.iter_mut().zip(values.iter()) {
+                            *ratio = val / denom;
+                        }
+                    } else if values.iter().all(|v| v.abs() <= 1e-9) {
+                        link_mem.ratios = [1.0; 3];
+                    } else {
+                        link_mem.ratios = [1.0; 3];
+                        link_mem.unlinked = true;
                     }
                 }
             }
-            if (ev.changed || ev.committed)
+            if let Some((start_value, alt_at_start)) = text_commit {
+                if ev.committed && link_ratio && !alt_at_start && !alt_held {
+                    let v = values[axis];
+                    if start_value.abs() > 1e-9 {
+                        let factor = v / start_value;
+                        for (other, slot) in values.iter_mut().enumerate() {
+                            if other != axis {
+                                *slot = clamp_stored_bounds(*slot * factor, config);
+                            }
+                        }
+                    } else if values
+                        .iter()
+                        .enumerate()
+                        .all(|(other, val)| other == axis || val.abs() <= 1e-9)
+                    {
+                        for (other, slot) in values.iter_mut().enumerate() {
+                            if other != axis {
+                                *slot = clamp_stored_bounds(v, config);
+                            }
+                        }
+                    }
+                }
+                // Refresh an earlier axis's same-frame PendingDrag snapshot after a TextEdit commit.
+                if ev.committed
+                    && let Some(prev_axis) = started_axis
+                    && prev_axis != axis
+                {
+                    link_mem.initial_values = *values;
+                    if !link_mem.unlinked {
+                        if values[prev_axis].abs() > 1e-9 {
+                            let denom = values[prev_axis];
+                            for (ratio, &val) in link_mem.ratios.iter_mut().zip(values.iter()) {
+                                *ratio = val / denom;
+                            }
+                        } else if values.iter().all(|v| v.abs() <= 1e-9) {
+                            link_mem.ratios = [1.0; 3];
+                        } else {
+                            link_mem.ratios = [1.0; 3];
+                            link_mem.unlinked = true;
+                        }
+                    }
+                    let safe_scale =
+                        if config.scale_factor.is_finite() && config.scale_factor.abs() > 1e-12 {
+                            config.scale_factor
+                        } else {
+                            1.0
+                        };
+                    let new_disp = clamp_and_round(values[prev_axis] / safe_scale, config);
+                    ui.data_mut(|d| {
+                        if let Some(mut sm) = d.get_temp::<ScrubMemory>(id.with(prev_axis))
+                            && let ScrubMode::PendingDrag {
+                                initial_display,
+                                start_value,
+                                accum_display,
+                                ..
+                            } = &mut sm.mode
+                        {
+                            *initial_display = new_disp;
+                            *start_value = values[prev_axis];
+                            *accum_display = new_disp;
+                            d.insert_temp(id.with(prev_axis), sm);
+                        }
+                    });
+                }
+            } else if (ev.changed || ev.committed)
                 && link_mem.active_axis == Some(axis)
                 && !link_mem.unlinked
                 && link_ratio
@@ -557,14 +822,26 @@ pub fn cm3_vector3(
                     values.iter_mut().zip(link_mem.ratios.iter()).enumerate()
                 {
                     if other != axis {
-                        *slot = (v * ratio).clamp(
-                            config.min * config.scale_factor,
-                            config.max * config.scale_factor,
-                        );
+                        *slot = clamp_stored_bounds(v * ratio, config);
                     }
                 }
             }
-            if ev.committed || ev.cancelled {
+            if ev.cancelled
+                && link_mem.active_axis == Some(axis)
+                && !link_mem.unlinked
+                && link_ratio
+            {
+                for (other, (slot, &init_val)) in values
+                    .iter_mut()
+                    .zip(link_mem.initial_values.iter())
+                    .enumerate()
+                {
+                    if other != axis {
+                        *slot = init_val;
+                    }
+                }
+            }
+            if (ev.committed || ev.cancelled) && link_mem.active_axis == Some(axis) {
                 link_mem.active_axis = None;
             }
             total = total.merge(ev);
@@ -588,7 +865,8 @@ pub struct StopwatchEvent {
     pub alt_expression: bool,
 }
 
-/// Exact `17 x 17 px` CM3 stopwatch button (`#2a2a2a` inactive, hashed HSL active).
+/// Exact `16 x 16 px` CM3 stopwatch icon centered in a `21 x 21 px` button
+/// (`#cccccc` inactive, theme value accent when animated, amber when expression-driven).
 pub fn cm3_stopwatch_button(
     ui: &mut Ui,
     prop_name: &str,
@@ -596,11 +874,17 @@ pub fn cm3_stopwatch_button(
     has_expression: bool,
     theme: &Cm3Theme,
 ) -> StopwatchEvent {
+    let _ = prop_name;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(21.0), Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
 
-    let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(17.0));
-    let active_color = stopwatch_active_color(prop_name);
+    let icon_rect = Rect::from_min_size(
+        Pos2::new(
+            (rect.center().x - 9.0).round(),
+            (rect.center().y - 8.0).round(),
+        ),
+        Vec2::splat(16.0),
+    );
 
     if resp.hovered() {
         ui.painter().rect_stroke(
@@ -611,15 +895,14 @@ pub fn cm3_stopwatch_button(
         );
     }
 
-    let icon_color = if animated || has_expression {
-        active_color
+    let icon_color = if has_expression {
+        Color32::from_rgb(0xe0, 0xa8, 0x4a)
+    } else if animated {
+        theme.value()
     } else if resp.hovered() {
-        TEXT_MUTED
+        TEXT_BRIGHT
     } else {
-        // Recessed CM3 inactive stopwatch (#2a2a2a fill over subtle dark rim)
-        ui.painter()
-            .circle_filled(icon_rect.center(), 6.0, BG_PANEL);
-        Color32::from_rgb(0x4c, 0x4c, 0x4c)
+        TEXT_PRIMARY
     };
     paint_cm3_icon(ui.painter(), icon_rect, Cm3Icon::Stopwatch, icon_color);
 
@@ -700,15 +983,15 @@ pub fn cm3_keyframe_bar(
         } else {
             TEXT_FAINT
         };
-        if cm3_icon_button(
+        if cm3_icon_button_enabled(
             ui,
             Cm3Icon::PrevKf,
             17.0,
             prev_color,
             "previous keyframe",
+            state.has_prev,
             theme,
-        ) && state.has_prev
-        {
+        ) {
             ev.prev_kf = true;
         }
 
@@ -728,22 +1011,23 @@ pub fn cm3_keyframe_bar(
         } else {
             TEXT_FAINT
         };
-        if cm3_icon_button(
+        if cm3_icon_button_enabled(
             ui,
             Cm3Icon::NextKf,
             17.0,
             next_color,
             "next keyframe",
+            state.has_next,
             theme,
-        ) && state.has_next
-        {
+        ) {
             ev.next_kf = true;
         }
 
         // 4. Interpolation Toggle & Easing Dropdown (only when keyed & interpolated)
         if state.is_keyed && state.interpolated {
-            let (interp_rect, interp_resp) =
+            let (raw_interp_rect, interp_resp) =
                 ui.allocate_exact_size(Vec2::new(37.0, 27.0), Sense::click());
+            let interp_rect = snap_rect_px(raw_interp_rect);
             let interp_resp = interp_resp
                 .on_hover_cursor(CursorIcon::PointingHand)
                 .on_hover_text(if is_bezier {
@@ -758,12 +1042,7 @@ pub fn cm3_keyframe_bar(
             } else {
                 BORDER_CONTROL
             };
-            ui.painter().rect_stroke(
-                interp_rect,
-                CornerRadius::ZERO,
-                Stroke::new(1.0, interp_border),
-                StrokeKind::Inside,
-            );
+            paint_crisp_border_1px(ui.painter(), interp_rect, interp_border);
             paint_cm3_icon(
                 ui.painter(),
                 interp_rect.shrink2(Vec2::new(2.0, 2.0)),
@@ -779,25 +1058,22 @@ pub fn cm3_keyframe_bar(
             }
 
             if state.easing_plus_enabled && is_bezier {
-                let (ez_rect, ez_resp) =
+                let (raw_ez_rect, ez_resp) =
                     ui.allocate_exact_size(Vec2::new(42.0, 27.0), Sense::click());
+                let ez_rect = snap_rect_px(raw_ez_rect);
                 let ez_resp = ez_resp
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("Open Easing+ Bezier Curve Editor");
                 ui.painter()
                     .rect_filled(ez_rect, CornerRadius::ZERO, BG_INPUT);
-                ui.painter().rect_stroke(
+                paint_crisp_border_1px(
+                    ui.painter(),
                     ez_rect,
-                    CornerRadius::ZERO,
-                    Stroke::new(
-                        1.0,
-                        if ez_resp.hovered() {
-                            theme.accent()
-                        } else {
-                            BORDER_CONTROL
-                        },
-                    ),
-                    StrokeKind::Inside,
+                    if ez_resp.hovered() {
+                        theme.accent()
+                    } else {
+                        BORDER_CONTROL
+                    },
                 );
                 ui.painter().text(
                     ez_rect.center(),
@@ -810,26 +1086,23 @@ pub fn cm3_keyframe_bar(
                     ev.open_easing_plus = true;
                 }
             } else {
-                let (e_rect, e_resp) =
+                let (raw_e_rect, e_resp) =
                     ui.allocate_exact_size(Vec2::new(37.0, 27.0), Sense::click());
+                let e_rect = snap_rect_px(raw_e_rect);
                 easing_btn_rect = e_rect;
                 let e_resp = e_resp
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text(format!("easing: {}", easing.display_name()));
                 ui.painter()
                     .rect_filled(e_rect, CornerRadius::ZERO, BG_INPUT);
-                ui.painter().rect_stroke(
+                paint_crisp_border_1px(
+                    ui.painter(),
                     e_rect,
-                    CornerRadius::ZERO,
-                    Stroke::new(
-                        1.0,
-                        if popup_state.open || e_resp.hovered() {
-                            theme.accent()
-                        } else {
-                            BORDER_CONTROL
-                        },
-                    ),
-                    StrokeKind::Inside,
+                    if popup_state.open || e_resp.hovered() {
+                        theme.accent()
+                    } else {
+                        BORDER_CONTROL
+                    },
                 );
                 paint_easing_preview(
                     ui.painter(),
@@ -853,14 +1126,18 @@ pub fn cm3_keyframe_bar(
         let pos = clamp_popup_pos(easing_btn_rect, popup_size, state.viewport_rect);
 
         let mut close_popup = false;
+        let mut key_navigated = false;
+        let pointer_moved = ui.input(|i| i.pointer.delta() != Vec2::ZERO);
         ui.input(|i| {
             if i.key_pressed(Key::Escape) {
                 close_popup = true;
             } else if i.key_pressed(Key::ArrowDown) {
                 popup_state.highlighted = (popup_state.highlighted + 1) % EasingKind::ALL_CM3.len();
+                key_navigated = true;
             } else if i.key_pressed(Key::ArrowUp) {
                 popup_state.highlighted = (popup_state.highlighted + EasingKind::ALL_CM3.len() - 1)
                     % EasingKind::ALL_CM3.len();
+                key_navigated = true;
             } else if i.key_pressed(Key::Enter) {
                 ev.set_easing = Some(popup_state.highlighted as u8);
                 close_popup = true;
@@ -885,20 +1162,25 @@ pub fn cm3_keyframe_bar(
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
+                                let menu_active_bg = theme.menu_active();
+                                let menu_active_fg = theme.contrast_fg(menu_active_bg);
                                 for (idx, kind) in EasingKind::ALL_CM3.iter().copied().enumerate() {
                                     let row_size = Vec2::new(ui.available_width(), 27.0);
                                     let (row_rect, row_resp) =
                                         ui.allocate_exact_size(row_size, Sense::click());
-                                    if row_resp.hovered() {
+                                    if row_resp.hovered() && pointer_moved {
                                         popup_state.highlighted = idx;
                                     }
                                     let is_selected = idx == usize::from(ease_idx);
                                     let is_hi = idx == popup_state.highlighted;
+                                    if key_navigated && is_hi {
+                                        row_resp.scroll_to_me(None);
+                                    }
                                     if is_hi {
                                         ui.painter().rect_filled(
                                             row_rect,
                                             CornerRadius::ZERO,
-                                            theme.menu_active(),
+                                            menu_active_bg,
                                         );
                                     } else if is_selected {
                                         ui.painter().rect_filled(
@@ -916,18 +1198,22 @@ pub fn cm3_keyframe_bar(
                                         ui.painter(),
                                         icon_rect,
                                         kind,
-                                        if is_hi || is_selected {
+                                        if is_hi {
+                                            menu_active_fg
+                                        } else if is_selected {
                                             TEXT_BRIGHT
                                         } else {
                                             theme.value()
                                         },
                                     );
-                                    ui.painter().text(
+                                    ui.painter().with_clip_rect(row_rect).text(
                                         Pos2::new(icon_rect.right() + 8.0, row_rect.center().y),
                                         Align2::LEFT_CENTER,
                                         kind.display_name(),
                                         theme.font(FONT_SMALL),
-                                        if is_hi || is_selected {
+                                        if is_hi {
+                                            menu_active_fg
+                                        } else if is_selected {
                                             TEXT_BRIGHT
                                         } else {
                                             TEXT_PRIMARY
@@ -984,8 +1270,17 @@ struct ColorPopupState {
 }
 
 fn default_recent_swatches() -> Vec<Rgb> {
-    // 12 varied colors + 6 grayscales + 18 full-saturation rainbow hues = 36 swatches (Spec 01 §4.5)
+    // Rows 0-2 (0..18): 18 full-saturation rainbow hues (0..340 deg in 20 deg steps)
+    // Row 3 (18..24): 6 grayscales white -> black
+    // Rows 4-5 (24..36): 12 recent/varied seed colors
     let mut swatches = Vec::with_capacity(36);
+    for i in 0..18 {
+        let h = i as f32 / 18.0;
+        swatches.push(Rgb::from_hsv(Hsv { h, s: 1.0, v: 1.0 }));
+    }
+    for v in [255_u8, 204, 153, 102, 51, 0] {
+        swatches.push(Rgb::from_u8(v, v, v));
+    }
     let seed_colors = [
         Rgb::from_u8(0xe0, 0x4f, 0x5f),
         Rgb::from_u8(0xf2, 0x8f, 0x3b),
@@ -1001,35 +1296,72 @@ fn default_recent_swatches() -> Vec<Rgb> {
         Rgb::from_u8(0xee, 0x9b, 0x00),
     ];
     swatches.extend_from_slice(&seed_colors);
-    for i in 0..6 {
-        let v = (i as f32 / 5.0 * 255.0).round() as u8;
-        swatches.push(Rgb::from_u8(v, v, v));
-    }
-    for i in 0..18 {
-        let h = i as f32 / 18.0;
-        swatches.push(Rgb::from_hsv(Hsv { h, s: 1.0, v: 1.0 }));
-    }
     swatches
 }
 
 fn push_recent_swatch(ui: &mut Ui, rgb: Rgb) {
-    let key = Id::unique("zoidcraft_recent_color_swatches");
+    let key = Id::unique("zoidcraft_recent_color_swatches_v2");
     let mut list = ui
         .data_mut(|d| d.get_persisted::<Vec<Rgb>>(key))
+        .filter(|v| v.len() == 36)
         .unwrap_or_else(default_recent_swatches);
     let target = rgb.to_u8();
-    if let Some(pos) = list.iter().position(|c| c.to_u8() == target) {
-        list.remove(pos);
+    // Preserve fixed 24-swatch palette (rows 0-3); rotate only the 12 recent slots (24..36).
+    let mut recent = list.split_off(24);
+    if let Some(pos) = recent.iter().position(|c| c.to_u8() == target) {
+        recent.remove(pos);
     }
-    list.insert(0, rgb);
-    list.truncate(36);
+    recent.insert(0, rgb);
+    recent.truncate(12);
+    list.extend(recent);
     ui.data_mut(|d| d.insert_persisted(key, list));
 }
 
 fn read_recent_swatches(ui: &mut Ui) -> Vec<Rgb> {
-    let key = Id::unique("zoidcraft_recent_color_swatches");
+    let key = Id::unique("zoidcraft_recent_color_swatches_v2");
     ui.data_mut(|d| d.get_persisted::<Vec<Rgb>>(key))
+        .filter(|v| v.len() == 36)
         .unwrap_or_else(default_recent_swatches)
+}
+
+fn format_picker_css(c: Rgba, has_alpha: bool) -> String {
+    let [r, g, b, _] = c.to_u8();
+    if has_alpha {
+        let a = (c.a().clamp(0.0, 1.0) * 1000.0).round() / 1000.0;
+        let a_str = if (a - a.round()).abs() < 1e-4 {
+            format!("{}", a.round() as i32)
+        } else {
+            let s = format!("{a:.3}");
+            s.trim_end_matches('0').trim_end_matches('.').to_owned()
+        };
+        format!("rgba({r}, {g}, {b}, {a_str})")
+    } else {
+        format!("rgb({r}, {g}, {b})")
+    }
+}
+
+fn parse_picker_color(input: &str) -> Option<Rgba> {
+    let trimmed = input.trim();
+    if let Ok(c) = Rgba::from_hex(trimmed) {
+        return Some(c);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let inner = lower
+        .strip_prefix("rgba(")
+        .or_else(|| lower.strip_prefix("rgb("))
+        .and_then(|s| s.strip_suffix(')'))?;
+    let parts: Vec<f32> = inner
+        .split(',')
+        .map(|p| p.trim().parse::<f32>().ok())
+        .collect::<Option<Vec<f32>>>()?;
+    if (parts.len() == 3 || parts.len() == 4) && parts.iter().all(|v| v.is_finite()) {
+        let r = (parts[0] / 255.0).clamp(0.0, 1.0);
+        let g = (parts[1] / 255.0).clamp(0.0, 1.0);
+        let b = (parts[2] / 255.0).clamp(0.0, 1.0);
+        let a = parts.get(3).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+        return Some(Rgba::new(r, g, b, a));
+    }
+    None
 }
 
 fn paint_checkerboard(painter: &Painter, rect: Rect, cell: f32) {
@@ -1063,19 +1395,33 @@ fn paint_sv_square(painter: &Painter, rect: Rect, hue: f32) {
         s: 1.0,
         v: 1.0,
     }));
-    let mut mesh = Mesh::default();
-    // 2x2 quad: top-left white, top-right pure hue, bottom-left black, bottom-right black
-    let tl = mesh.vertices.len() as u32;
-    mesh.colored_vertex(rect.left_top(), Color32::WHITE);
-    let tr = mesh.vertices.len() as u32;
-    mesh.colored_vertex(rect.right_top(), pure);
-    let br = mesh.vertices.len() as u32;
-    mesh.colored_vertex(rect.right_bottom(), Color32::BLACK);
-    let bl = mesh.vertices.len() as u32;
-    mesh.colored_vertex(rect.left_bottom(), Color32::BLACK);
-    mesh.add_triangle(tl, tr, br);
-    mesh.add_triangle(tl, br, bl);
-    painter.add(Shape::mesh(mesh));
+    // Pass 1: Horizontal saturation gradient (WHITE on left -> pure hue on right).
+    let mut sat_mesh = Mesh::default();
+    let tl = sat_mesh.vertices.len() as u32;
+    sat_mesh.colored_vertex(rect.left_top(), Color32::WHITE);
+    let tr = sat_mesh.vertices.len() as u32;
+    sat_mesh.colored_vertex(rect.right_top(), pure);
+    let br = sat_mesh.vertices.len() as u32;
+    sat_mesh.colored_vertex(rect.right_bottom(), pure);
+    let bl = sat_mesh.vertices.len() as u32;
+    sat_mesh.colored_vertex(rect.left_bottom(), Color32::WHITE);
+    sat_mesh.add_triangle(tl, tr, br);
+    sat_mesh.add_triangle(tl, br, bl);
+    painter.add(Shape::mesh(sat_mesh));
+
+    // Pass 2: Vertical value alpha overlay (TRANSPARENT on top -> opaque BLACK on bottom).
+    let mut val_mesh = Mesh::default();
+    let tl = val_mesh.vertices.len() as u32;
+    val_mesh.colored_vertex(rect.left_top(), Color32::TRANSPARENT);
+    let tr = val_mesh.vertices.len() as u32;
+    val_mesh.colored_vertex(rect.right_top(), Color32::TRANSPARENT);
+    let br = val_mesh.vertices.len() as u32;
+    val_mesh.colored_vertex(rect.right_bottom(), Color32::BLACK);
+    let bl = val_mesh.vertices.len() as u32;
+    val_mesh.colored_vertex(rect.left_bottom(), Color32::BLACK);
+    val_mesh.add_triangle(tl, tr, br);
+    val_mesh.add_triangle(tl, br, bl);
+    painter.add(Shape::mesh(val_mesh));
 }
 
 fn paint_hue_bar(painter: &Painter, rect: Rect) {
@@ -1126,7 +1472,7 @@ fn paint_alpha_bar(painter: &Painter, rect: Rect, rgb: Rgb) {
     painter.add(Shape::mesh(mesh));
 }
 
-/// CM3 `30x20` swatch + `17x17` eyedropper + `470x250`/`500x250` HSVA popup picker (Spec 01 §4.5).
+/// CM3 `30x20` swatch + `17x17` eyedropper + `482x262`/`512x262` HSVA popup picker (Spec 01 §4.5).
 pub fn cm3_hsva_color_picker(
     ui: &mut Ui,
     id: Id,
@@ -1136,6 +1482,7 @@ pub fn cm3_hsva_color_picker(
     viewport_rect: Rect,
     theme: &Cm3Theme,
 ) -> ColorPickerEvent {
+    CM3_ROW_HAS_COLOR_PICKER.with(|f| f.set(true));
     let mut ev = ColorPickerEvent::default();
     let popup_id = id.with("hsva_popup");
     let mut state = ui
@@ -1145,93 +1492,104 @@ pub fn cm3_hsva_color_picker(
             initial: *color,
             hsv: color.rgb().to_hsv(),
             alpha: color.a(),
-            hex_buf: if has_alpha {
-                color.to_hex_rgba()
-            } else {
-                color.to_hex_rgb()
-            },
+            hex_buf: format_picker_css(*color, has_alpha),
             dirty: false,
         });
 
+    // If read_only (e.g. expression toggled on) flips true while the popup is open,
+    // immediately close, restore initial color if dirty, and emit cancelled so any open tx closes.
+    if read_only && state.open {
+        let was_dirty = state.dirty;
+        state.open = false;
+        if was_dirty {
+            *color = state.initial;
+            state.hsv = state.initial.rgb().to_hsv();
+            state.alpha = state.initial.a();
+            state.hex_buf = format_picker_css(*color, has_alpha);
+        }
+        state.dirty = false;
+        ev.cancelled = true;
+        ev.changed = was_dirty;
+        ui.memory_mut(|m| m.surrender_focus(popup_id.with("hex_input")));
+    }
+
     let mut swatch_rect = Rect::NOTHING;
 
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        let (rect, resp) = ui.allocate_exact_size(
-            Vec2::new(30.0, 20.0),
-            if read_only {
-                Sense::hover()
-            } else {
-                Sense::click()
-            },
-        );
-        swatch_rect = rect;
-        if has_alpha {
-            paint_checkerboard(ui.painter(), rect, 5.0);
-        }
-        let fill = if has_alpha {
-            rgba_to_color32(*color)
-        } else {
-            rgb_to_color32(color.rgb())
-        };
-        ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
-        let border = if state.open || (!read_only && resp.hovered()) {
-            theme.accent()
-        } else {
-            BORDER_CONTROL
-        };
-        ui.painter().rect_stroke(
-            rect,
-            CornerRadius::ZERO,
-            Stroke::new(1.0, border),
-            StrokeKind::Inside,
-        );
-
-        if !read_only {
-            let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-            if resp.clicked() {
-                if !state.open {
-                    state.open = true;
-                    state.initial = *color;
-                    state.hsv = color.rgb().to_hsv();
-                    state.alpha = if has_alpha { color.a() } else { 1.0 };
-                    state.hex_buf = if has_alpha {
-                        color.to_hex_rgba()
-                    } else {
-                        color.to_hex_rgb()
-                    };
-                    state.dirty = false;
-                    ev.started = true;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 9.0;
+            let (raw_rect, resp) = ui.allocate_exact_size(
+                Vec2::new(30.0, 20.0),
+                if read_only {
+                    Sense::hover()
                 } else {
-                    state.open = false;
-                    if state.dirty {
-                        push_recent_swatch(ui, color.rgb());
-                        ev.committed = true;
+                    Sense::click()
+                },
+            );
+            let rect = snap_rect_px(raw_rect);
+            swatch_rect = rect;
+            if has_alpha {
+                paint_checkerboard(ui.painter(), rect, 5.0);
+            }
+            let fill = if has_alpha {
+                rgba_to_color32(*color)
+            } else {
+                rgb_to_color32(color.rgb())
+            };
+            ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
+            let border = if state.open || (!read_only && resp.hovered()) {
+                theme.accent()
+            } else {
+                BORDER_CONTROL
+            };
+            paint_crisp_border_1px(ui.painter(), rect, border);
+
+            if !read_only {
+                let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+                if resp.clicked() {
+                    if !state.open {
+                        state.open = true;
+                        state.initial = *color;
+                        state.hsv = color.rgb().to_hsv();
+                        state.alpha = if has_alpha { color.a() } else { 1.0 };
+                        state.hex_buf = format_picker_css(*color, has_alpha);
+                        state.dirty = false;
+                        ev.started = true;
                     } else {
-                        ev.cancelled = true;
+                        state.open = false;
+                        if state.dirty {
+                            push_recent_swatch(ui, color.rgb());
+                            ev.committed = true;
+                        } else {
+                            ev.cancelled = true;
+                        }
                     }
                 }
-            }
 
-            // Eyedropper (17x17 px, 10px right of swatch)
-            if cm3_icon_button(
-                ui,
-                Cm3Icon::Eyedropper,
-                17.0,
-                TEXT_PRIMARY,
-                "pick color from viewport",
-                theme,
-            ) {
-                ev.eyedropper_clicked = true;
+                // Eyedropper (17x17 px, 9px right of swatch)
+                if cm3_icon_button(
+                    ui,
+                    Cm3Icon::Eyedropper,
+                    17.0,
+                    TEXT_PRIMARY,
+                    "pick color from viewport",
+                    theme,
+                ) {
+                    ev.eyedropper_clicked = true;
+                }
             }
-        }
+        });
     });
 
     if state.open && !read_only && swatch_rect != Rect::NOTHING {
-        let popup_size = Vec2::new(if has_alpha { 500.0 } else { 470.0 }, 260.0);
+        // Exact Zoidium popup size: 1px border + 5px padding = 6px margin per side around 470x250 / 500x250 content.
+        let popup_size = Vec2::new(if has_alpha { 512.0 } else { 482.0 }, 262.0);
         let pos = clamp_popup_pos(swatch_rect, popup_size, viewport_rect);
         let mut commit_now = false;
         let mut cancel_now = false;
+        let mut hex_enter_handled = false;
 
         let recent = read_recent_swatches(ui);
 
@@ -1240,275 +1598,266 @@ pub fn cm3_hsva_color_picker(
             .fixed_pos(pos)
             .interactable(true)
             .show(ui.ctx(), |ui| {
-                Frame::NONE
-                    .fill(BG_PANEL)
-                    .stroke(Stroke::new(1.0, theme.accent()))
-                    .inner_margin(egui::Margin::same(5))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::new(5.0, 0.0);
+                let outer_rect = Rect::from_min_size(pos, popup_size);
+                let _ = ui.allocate_space(popup_size);
+                ui.painter()
+                    .rect_filled(outer_rect, CornerRadius::ZERO, BG_PANEL);
 
-                            // 1. 250x250 SV square
-                            let (sv_rect, sv_resp) =
-                                ui.allocate_exact_size(Vec2::splat(250.0), Sense::click_and_drag());
-                            paint_sv_square(ui.painter(), sv_rect, state.hsv.h);
-                            ui.painter().rect_stroke(
-                                sv_rect,
-                                CornerRadius::ZERO,
-                                Stroke::new(1.0, BORDER_CONTROL),
-                                StrokeKind::Inside,
-                            );
-                            if (sv_resp.clicked() || sv_resp.dragged())
-                                && let Some(p) = ui.input(|i| i.pointer.interact_pos())
-                            {
-                                state.hsv.s =
-                                    ((p.x - sv_rect.left()) / sv_rect.width()).clamp(0.0, 1.0);
-                                state.hsv.v = (1.0 - (p.y - sv_rect.top()) / sv_rect.height())
-                                    .clamp(0.0, 1.0);
-                                let rgb = Rgb::from_hsv(state.hsv);
-                                *color = rgb.with_alpha(if has_alpha { state.alpha } else { 1.0 });
-                                state.hex_buf = if has_alpha {
-                                    color.to_hex_rgba()
-                                } else {
-                                    color.to_hex_rgb()
-                                };
-                                state.dirty = true;
-                                ev.changed = true;
-                            }
-                            let reticle = Pos2::new(
-                                sv_rect.left() + state.hsv.s * sv_rect.width(),
-                                sv_rect.top() + (1.0 - state.hsv.v) * sv_rect.height(),
-                            );
-                            ui.painter().circle_stroke(
-                                reticle,
-                                4.0,
-                                Stroke::new(1.5, Color32::from_gray(0xaa)),
-                            );
+                let content_rect = outer_rect.shrink(6.0);
+                let mut content_ui = ui.new_child(
+                    UiBuilder::new()
+                        .id_salt(popup_id.with("content"))
+                        .max_rect(content_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::TOP)),
+                );
+                content_ui.spacing_mut().item_spacing = Vec2::new(5.0, 0.0);
 
-                            // 2. 25x250 Hue bar
-                            let (hue_rect, hue_resp) = ui.allocate_exact_size(
-                                Vec2::new(25.0, 250.0),
-                                Sense::click_and_drag(),
-                            );
-                            paint_hue_bar(ui.painter(), hue_rect);
-                            ui.painter().rect_stroke(
-                                hue_rect,
-                                CornerRadius::ZERO,
-                                Stroke::new(1.0, BORDER_CONTROL),
-                                StrokeKind::Inside,
-                            );
-                            if (hue_resp.clicked() || hue_resp.dragged())
-                                && let Some(p) = ui.input(|i| i.pointer.interact_pos())
-                            {
-                                state.hsv.h =
-                                    ((p.y - hue_rect.top()) / hue_rect.height()).clamp(0.0, 0.9999);
-                                let rgb = Rgb::from_hsv(state.hsv);
-                                *color = rgb.with_alpha(if has_alpha { state.alpha } else { 1.0 });
-                                state.hex_buf = if has_alpha {
-                                    color.to_hex_rgba()
-                                } else {
-                                    color.to_hex_rgb()
-                                };
-                                state.dirty = true;
-                                ev.changed = true;
-                            }
-                            let hy = hue_rect.top() + state.hsv.h * hue_rect.height();
-                            let h_cursor = Rect::from_min_max(
-                                Pos2::new(hue_rect.left(), (hy - 3.0).max(hue_rect.top())),
-                                Pos2::new(hue_rect.right(), (hy + 3.0).min(hue_rect.bottom())),
-                            );
-                            ui.painter().rect_stroke(
-                                h_cursor,
-                                CornerRadius::ZERO,
-                                Stroke::new(1.5, Color32::from_gray(0xaa)),
-                                StrokeKind::Inside,
-                            );
+                // 1. 250x250 SV square (borderless on #2a2a2a)
+                let (sv_rect, sv_resp) =
+                    content_ui.allocate_exact_size(Vec2::splat(250.0), Sense::click_and_drag());
+                let sv_rect = snap_rect_px(sv_rect);
+                paint_sv_square(content_ui.painter(), sv_rect, state.hsv.h);
+                if (sv_resp.clicked() || sv_resp.dragged())
+                    && let Some(p) = content_ui.input(|i| i.pointer.interact_pos())
+                {
+                    state.hsv.s = ((p.x - sv_rect.left()) / sv_rect.width()).clamp(0.0, 1.0);
+                    state.hsv.v = (1.0 - (p.y - sv_rect.top()) / sv_rect.height()).clamp(0.0, 1.0);
+                    let rgb = Rgb::from_hsv(state.hsv);
+                    *color = rgb.with_alpha(if has_alpha { state.alpha } else { 1.0 });
+                    state.hex_buf = format_picker_css(*color, has_alpha);
+                    state.dirty = true;
+                    ev.changed = true;
+                }
+                let reticle = Pos2::new(
+                    (sv_rect.left() + state.hsv.s * sv_rect.width()).round(),
+                    (sv_rect.top() + (1.0 - state.hsv.v) * sv_rect.height()).round(),
+                );
+                // Paint reticle on outer ui.painter() so edge overhang into the 5px padding is never clipped.
+                ui.painter().circle_stroke(
+                    reticle,
+                    4.0,
+                    Stroke::new(1.0, Color32::from_gray(0xaa)),
+                );
 
-                            // 3. Optional 25x250 Alpha bar
-                            if has_alpha {
-                                let (a_rect, a_resp) = ui.allocate_exact_size(
-                                    Vec2::new(25.0, 250.0),
-                                    Sense::click_and_drag(),
-                                );
-                                paint_alpha_bar(ui.painter(), a_rect, Rgb::from_hsv(state.hsv));
-                                ui.painter().rect_stroke(
-                                    a_rect,
-                                    CornerRadius::ZERO,
-                                    Stroke::new(1.0, BORDER_CONTROL),
-                                    StrokeKind::Inside,
-                                );
-                                if (a_resp.clicked() || a_resp.dragged())
-                                    && let Some(p) = ui.input(|i| i.pointer.interact_pos())
-                                {
-                                    state.alpha = (1.0 - (p.y - a_rect.top()) / a_rect.height())
-                                        .clamp(0.0, 1.0);
-                                    *color = Rgb::from_hsv(state.hsv).with_alpha(state.alpha);
-                                    state.hex_buf = color.to_hex_rgba();
-                                    state.dirty = true;
-                                    ev.changed = true;
-                                }
-                                let ay = a_rect.top() + (1.0 - state.alpha) * a_rect.height();
-                                let a_cursor = Rect::from_min_max(
-                                    Pos2::new(a_rect.left(), (ay - 3.0).max(a_rect.top())),
-                                    Pos2::new(a_rect.right(), (ay + 3.0).min(a_rect.bottom())),
-                                );
-                                ui.painter().rect_stroke(
-                                    a_cursor,
-                                    CornerRadius::ZERO,
-                                    Stroke::new(1.5, Color32::from_gray(0xaa)),
-                                    StrokeKind::Inside,
-                                );
-                            }
+                // 2. 25x250 Hue bar (borderless, un-squashed 25x6 1px #aaaaaa cursor centered on hy)
+                let (hue_rect, hue_resp) =
+                    content_ui.allocate_exact_size(Vec2::new(25.0, 250.0), Sense::click_and_drag());
+                let hue_rect = snap_rect_px(hue_rect);
+                paint_hue_bar(content_ui.painter(), hue_rect);
+                if (hue_resp.clicked() || hue_resp.dragged())
+                    && let Some(p) = content_ui.input(|i| i.pointer.interact_pos())
+                {
+                    state.hsv.h = ((p.y - hue_rect.top()) / hue_rect.height()).clamp(0.0, 0.9999);
+                    let rgb = Rgb::from_hsv(state.hsv);
+                    *color = rgb.with_alpha(if has_alpha { state.alpha } else { 1.0 });
+                    state.hex_buf = format_picker_css(*color, has_alpha);
+                    state.dirty = true;
+                    ev.changed = true;
+                }
+                let hy = (hue_rect.top() + state.hsv.h * hue_rect.height()).round();
+                let h_cursor = Rect::from_min_max(
+                    Pos2::new(hue_rect.left(), hy - 3.0),
+                    Pos2::new(hue_rect.right(), hy + 3.0),
+                );
+                paint_crisp_border_1px(ui.painter(), h_cursor, Color32::from_gray(0xaa));
 
-                            // 4. Right panel (185 px): comparison bar, 36 swatches, CSS hex input
-                            ui.vertical(|ui| {
-                                ui.set_width(185.0);
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 5.0);
+                // 3. Optional 25x250 Alpha bar (borderless, un-squashed 25x6 1px #aaaaaa cursor)
+                if has_alpha {
+                    let (a_rect, a_resp) = content_ui
+                        .allocate_exact_size(Vec2::new(25.0, 250.0), Sense::click_and_drag());
+                    let a_rect = snap_rect_px(a_rect);
+                    paint_alpha_bar(content_ui.painter(), a_rect, Rgb::from_hsv(state.hsv));
+                    if (a_resp.clicked() || a_resp.dragged())
+                        && let Some(p) = content_ui.input(|i| i.pointer.interact_pos())
+                    {
+                        state.alpha =
+                            (1.0 - (p.y - a_rect.top()) / a_rect.height()).clamp(0.0, 1.0);
+                        *color = Rgb::from_hsv(state.hsv).with_alpha(state.alpha);
+                        state.hex_buf = format_picker_css(*color, has_alpha);
+                        state.dirty = true;
+                        ev.changed = true;
+                    }
+                    let ay = (a_rect.top() + (1.0 - state.alpha) * a_rect.height()).round();
+                    let a_cursor = Rect::from_min_max(
+                        Pos2::new(a_rect.left(), ay - 3.0),
+                        Pos2::new(a_rect.right(), ay + 3.0),
+                    );
+                    paint_crisp_border_1px(ui.painter(), a_cursor, Color32::from_gray(0xaa));
+                }
 
-                                // Split comparison bar (25px)
-                                let (cmp_rect, cmp_resp) =
-                                    ui.allocate_exact_size(Vec2::new(185.0, 25.0), Sense::click());
-                                let mid_x = cmp_rect.center().x;
-                                let left_half = Rect::from_min_max(
-                                    cmp_rect.left_top(),
-                                    Pos2::new(mid_x, cmp_rect.bottom()),
-                                );
-                                let right_half = Rect::from_min_max(
-                                    Pos2::new(mid_x, cmp_rect.top()),
-                                    cmp_rect.right_bottom(),
-                                );
-                                if has_alpha {
-                                    paint_checkerboard(ui.painter(), cmp_rect, 5.0);
-                                }
-                                ui.painter().rect_filled(
-                                    left_half,
-                                    CornerRadius::ZERO,
-                                    rgba_to_color32(state.initial),
-                                );
-                                ui.painter().rect_filled(
-                                    right_half,
-                                    CornerRadius::ZERO,
-                                    rgba_to_color32(*color),
-                                );
-                                ui.painter().rect_stroke(
-                                    cmp_rect,
-                                    CornerRadius::ZERO,
-                                    Stroke::new(1.0, BORDER_CONTROL),
-                                    StrokeKind::Inside,
-                                );
-                                if cmp_resp.clicked()
-                                    && cmp_resp
-                                        .interact_pointer_pos()
-                                        .is_some_and(|p| left_half.contains(p))
-                                {
-                                    *color = state.initial;
-                                    state.hsv = state.initial.rgb().to_hsv();
-                                    state.alpha = state.initial.a();
-                                    state.hex_buf = if has_alpha {
-                                        color.to_hex_rgba()
-                                    } else {
-                                        color.to_hex_rgb()
-                                    };
-                                    state.dirty = false;
-                                    ev.changed = true;
-                                }
+                // 4. Right panel (185x250 px): 25px preview + 5px gap + 185px 6x6 grid + 14px gap + 21px input
+                let right_rect = Rect::from_min_size(
+                    Pos2::new(content_ui.cursor().left().round(), content_rect.top()),
+                    Vec2::new(185.0, 250.0),
+                );
+                let mut right_ui = content_ui.new_child(
+                    UiBuilder::new()
+                        .id_salt(popup_id.with("right_col"))
+                        .max_rect(right_rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                right_ui.spacing_mut().item_spacing = Vec2::ZERO;
 
-                                // 36 swatches (6 x 6 grid, 27x27 tiles, 4px gap)
-                                for row in 0..6 {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        for col in 0..6 {
-                                            let idx = row * 6 + col;
-                                            let sw_rgb =
-                                                recent.get(idx).copied().unwrap_or(Rgb::BLACK);
-                                            let (s_rect, s_resp) = ui.allocate_exact_size(
-                                                Vec2::new(27.5, 25.0),
-                                                Sense::click(),
-                                            );
-                                            ui.painter().rect_filled(
-                                                s_rect,
-                                                CornerRadius::ZERO,
-                                                rgb_to_color32(sw_rgb),
-                                            );
-                                            ui.painter().rect_stroke(
-                                                s_rect,
-                                                CornerRadius::ZERO,
-                                                Stroke::new(
-                                                    1.0,
-                                                    if s_resp.hovered() {
-                                                        TEXT_BRIGHT
-                                                    } else {
-                                                        BORDER_CONTROL
-                                                    },
-                                                ),
-                                                StrokeKind::Inside,
-                                            );
-                                            if s_resp.clicked() {
-                                                state.hsv = sw_rgb.to_hsv();
-                                                *color = sw_rgb.with_alpha(if has_alpha {
-                                                    state.alpha
-                                                } else {
-                                                    1.0
-                                                });
-                                                state.hex_buf = if has_alpha {
-                                                    color.to_hex_rgba()
-                                                } else {
-                                                    color.to_hex_rgb()
-                                                };
-                                                state.dirty = true;
-                                                ev.changed = true;
-                                            }
-                                        }
-                                    });
-                                }
+                // Split comparison preview bar (185 x 25 px, borderless)
+                let (cmp_rect, cmp_resp) =
+                    right_ui.allocate_exact_size(Vec2::new(185.0, 25.0), Sense::click());
+                let cmp_rect = snap_rect_px(cmp_rect);
+                let mid_x = cmp_rect.center().x.round();
+                let left_half =
+                    Rect::from_min_max(cmp_rect.left_top(), Pos2::new(mid_x, cmp_rect.bottom()));
+                let right_half =
+                    Rect::from_min_max(Pos2::new(mid_x, cmp_rect.top()), cmp_rect.right_bottom());
+                if has_alpha {
+                    paint_checkerboard(right_ui.painter(), cmp_rect, 5.0);
+                }
+                right_ui.painter().rect_filled(
+                    left_half,
+                    CornerRadius::ZERO,
+                    rgba_to_color32(state.initial),
+                );
+                right_ui.painter().rect_filled(
+                    right_half,
+                    CornerRadius::ZERO,
+                    rgba_to_color32(*color),
+                );
+                if cmp_resp.clicked()
+                    && cmp_resp
+                        .interact_pointer_pos()
+                        .is_some_and(|p| left_half.contains(p))
+                {
+                    *color = state.initial;
+                    state.hsv = state.initial.rgb().to_hsv();
+                    state.alpha = state.initial.a();
+                    state.hex_buf = format_picker_css(*color, has_alpha);
+                    state.dirty = false;
+                    ev.changed = true;
+                }
 
-                                // Bottom CSS hex input
-                                let hex_id = popup_id.with("hex_input");
-                                let hex_resp = Frame::NONE
-                                    .fill(BG_INPUT)
-                                    .stroke(Stroke::new(1.0, BORDER_CONTROL))
-                                    .inner_margin(egui::Margin::symmetric(4, 2))
-                                    .show(ui, |ui| {
-                                        ui.add(
-                                            TextEdit::singleline(&mut state.hex_buf)
-                                                .id(hex_id)
-                                                .font(theme.font(FONT_SMALL))
-                                                .text_color(theme.value())
-                                                .desired_width(175.0),
-                                        )
-                                    })
-                                    .inner;
-                                if hex_resp.lost_focus()
-                                    || (hex_resp.has_focus()
-                                        && ui.input(|i| i.key_pressed(Key::Enter)))
-                                {
-                                    if let Ok(parsed) = Rgba::from_hex(&state.hex_buf) {
-                                        *color = if has_alpha {
-                                            parsed
-                                        } else {
-                                            parsed.rgb().with_alpha(1.0)
-                                        };
-                                        state.hsv = color.rgb().to_hsv();
-                                        state.alpha = color.a();
-                                        state.dirty = true;
-                                        ev.changed = true;
-                                    }
-                                    if hex_resp.has_focus()
-                                        && ui.input(|i| i.key_pressed(Key::Enter))
-                                    {
-                                        ui.memory_mut(|m| m.surrender_focus(hex_id));
-                                    }
-                                }
-                            });
-                        });
-                    });
+                // 5 px gap between preview bar and 6x6 swatch grid
+                right_ui.add_space(5.0);
+
+                // 36 swatches (6 x 6 grid, 27.5x27.5 alternating 28/27px tiles, exact 4px gaps = 185x185 px)
+                let (_, raw_grid_rect) = right_ui.allocate_space(Vec2::new(185.0, 185.0));
+                let grid_rect = snap_rect_px(raw_grid_rect);
+                for row in 0..6 {
+                    let y0 = (grid_rect.top() + row as f32 * 31.5).round();
+                    let y1 = (grid_rect.top() + row as f32 * 31.5 + 27.5).round();
+                    for col in 0..6 {
+                        let idx = row * 6 + col;
+                        let sw_rgb = recent.get(idx).copied().unwrap_or(Rgb::BLACK);
+                        let x0 = (grid_rect.left() + col as f32 * 31.5).round();
+                        let x1 = (grid_rect.left() + col as f32 * 31.5 + 27.5).round();
+                        let s_rect = Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1));
+                        let s_resp = right_ui
+                            .interact(s_rect, popup_id.with(("swatch", idx)), Sense::click())
+                            .on_hover_cursor(CursorIcon::PointingHand);
+                        right_ui.painter().rect_filled(
+                            s_rect,
+                            CornerRadius::ZERO,
+                            rgb_to_color32(sw_rgb),
+                        );
+                        if s_resp.hovered() {
+                            paint_crisp_border_1px(right_ui.painter(), s_rect, TEXT_BRIGHT);
+                        }
+                        if s_resp.clicked() {
+                            state.hsv = sw_rgb.to_hsv();
+                            *color = sw_rgb.with_alpha(if has_alpha { state.alpha } else { 1.0 });
+                            state.hex_buf = format_picker_css(*color, has_alpha);
+                            state.dirty = true;
+                            ev.changed = true;
+                        }
+                    }
+                }
+
+                // 14 px gap above bottom CSS rgb()/rgba() input
+                right_ui.add_space(14.0);
+
+                // Bottom CSS input (exact 185 x 21 px, FONT_BODY 16px, 4px left padding, flush with SV bottom)
+                let sub_control_changed = ev.changed;
+                let hex_id = popup_id.with("hex_input");
+                let hex_focused_now = right_ui.memory(|m| m.has_focus(hex_id));
+                let hex_enter_pressed = right_ui.input(|i| i.key_pressed(Key::Enter));
+                let (_, raw_input_rect) = right_ui.allocate_space(Vec2::new(185.0, 21.0));
+                let input_rect = snap_rect_px(raw_input_rect);
+                right_ui
+                    .painter()
+                    .rect_filled(input_rect, CornerRadius::ZERO, BG_INPUT);
+                paint_crisp_border_1px(
+                    right_ui.painter(),
+                    input_rect,
+                    if hex_focused_now {
+                        theme.accent()
+                    } else {
+                        BORDER_CONTROL
+                    },
+                );
+                let inner_input_rect = Rect::from_min_max(
+                    Pos2::new(input_rect.left() + 4.0, input_rect.top() + 1.0),
+                    Pos2::new(input_rect.right() - 4.0, input_rect.bottom() - 1.0),
+                );
+                let hex_resp = {
+                    let mut input_ui = right_ui.new_child(
+                        UiBuilder::new()
+                            .id_salt(popup_id.with("hex_child"))
+                            .max_rect(inner_input_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    input_ui.set_clip_rect(input_ui.clip_rect().intersect(inner_input_rect));
+                    input_ui.add(
+                        TextEdit::singleline(&mut state.hex_buf)
+                            .id(hex_id)
+                            .frame(Frame::NONE)
+                            .font(theme.font(FONT_BODY))
+                            .text_color(theme.value())
+                            .desired_width(inner_input_rect.width()),
+                    )
+                };
+                let enter_in_hex = hex_enter_pressed
+                    && (hex_resp.has_focus() || hex_resp.lost_focus() || hex_focused_now);
+                if enter_in_hex {
+                    hex_enter_handled = true;
+                    if let Some(parsed) = parse_picker_color(&state.hex_buf) {
+                        *color = if has_alpha {
+                            parsed
+                        } else {
+                            parsed.rgb().with_alpha(1.0)
+                        };
+                        state.hsv = color.rgb().to_hsv();
+                        state.alpha = color.a();
+                        state.hex_buf = format_picker_css(*color, has_alpha);
+                        state.dirty = true;
+                        ev.changed = true;
+                        right_ui.memory_mut(|m| m.surrender_focus(hex_id));
+                    } else {
+                        // Invalid color text: keep focus in the field and do NOT close popup.
+                        hex_resp.request_focus();
+                    }
+                } else if hex_resp.lost_focus() && !sub_control_changed {
+                    if let Some(parsed) = parse_picker_color(&state.hex_buf) {
+                        *color = if has_alpha {
+                            parsed
+                        } else {
+                            parsed.rgb().with_alpha(1.0)
+                        };
+                        state.hsv = color.rgb().to_hsv();
+                        state.alpha = color.a();
+                        state.hex_buf = format_picker_css(*color, has_alpha);
+                        state.dirty = true;
+                        ev.changed = true;
+                    } else {
+                        state.hex_buf = format_picker_css(*color, has_alpha);
+                    }
+                }
+
+                // Crisp 1 px outer popup border (#384668 / theme.accent())
+                paint_crisp_border_1px(ui.painter(), outer_rect, theme.accent());
             });
 
         let hex_focused = ui.memory(|m| m.has_focus(popup_id.with("hex_input")));
         ui.input(|i| {
             if i.key_pressed(Key::Escape) {
                 cancel_now = true;
-            } else if (!hex_focused && i.key_pressed(Key::Enter))
+            } else if (!hex_focused && !hex_enter_handled && i.key_pressed(Key::Enter))
                 || (i.pointer.primary_pressed()
                     && i.pointer.interact_pos().is_some_and(|p| {
                         !area_resp.response.rect.contains(p) && !swatch_rect.contains(p)
@@ -1546,12 +1895,14 @@ pub fn cm3_hsva_color_picker(
 pub struct GradientBarEvent {
     pub changed: bool,
     pub committed: bool,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 struct GradientBarState {
     selected_stop: usize,
     dragging_stop: Option<usize>,
+    drag_dirty: bool,
 }
 
 fn parse_css_rgba(css: &str) -> Rgba {
@@ -1639,6 +1990,8 @@ pub fn cm3_gradient_bar(
     if state.selected_stop >= stops.len() {
         state.selected_stop = stops.len().saturating_sub(1);
     }
+    let prev_selected = state.selected_stop;
+    let mut stop_changed = false;
 
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
@@ -1688,6 +2041,7 @@ pub fn cm3_gradient_bar(
                 color: format_css_rgba(sampled),
             });
             state.selected_stop = stops.len() - 1;
+            stop_changed = true;
             ev.changed = true;
             ev.committed = true;
         }
@@ -1720,6 +2074,7 @@ pub fn cm3_gradient_bar(
             }
             if s_resp.drag_started() {
                 state.dragging_stop = Some(idx);
+                state.drag_dirty = false;
             }
             if s_resp.dragged()
                 && state.dragging_stop == Some(idx)
@@ -1728,12 +2083,16 @@ pub fn cm3_gradient_bar(
                 let t = f64::from(((p.x - lane_rect.left()) / lane_rect.width()).clamp(0.0, 1.0));
                 if (stop.position - t).abs() > 1e-4 {
                     stop.position = t;
+                    state.drag_dirty = true;
                     ev.changed = true;
                 }
             }
             if s_resp.drag_stopped() && state.dragging_stop == Some(idx) {
                 state.dragging_stop = None;
-                ev.committed = true;
+                if state.drag_dirty {
+                    state.drag_dirty = false;
+                    ev.committed = true;
+                }
             }
             if s_resp.secondary_clicked() {
                 remove_idx = Some(idx);
@@ -1744,12 +2103,41 @@ pub fn cm3_gradient_bar(
             && stops.len() > 1
         {
             stops.remove(idx);
-            state.selected_stop = state.selected_stop.min(stops.len() - 1);
+            if idx < state.selected_stop {
+                state.selected_stop -= 1;
+            } else if state.selected_stop >= stops.len() {
+                state.selected_stop = stops.len() - 1;
+            }
+            state.dragging_stop = None;
+            state.drag_dirty = false;
+            stop_changed = true;
             ev.changed = true;
             ev.committed = true;
         }
 
-        // Inline color editor for selected stop
+        if state.selected_stop != prev_selected {
+            stop_changed = true;
+        }
+
+        // Inline color editor for selected stop (single picker ID; commit & close popup when stop changes)
+        let stop_picker_id = id.with("stop_color");
+        if stop_changed {
+            let stop_popup_id = stop_picker_id.with("hsva_popup");
+            let mut was_open_dirty = false;
+            ui.data_mut(|d| {
+                if let Some(mut st) = d.get_temp::<ColorPopupState>(stop_popup_id)
+                    && st.open
+                {
+                    was_open_dirty = st.dirty;
+                    st.open = false;
+                    st.dirty = false;
+                    d.insert_temp(stop_popup_id, st);
+                }
+            });
+            if was_open_dirty {
+                ev.committed = true;
+            }
+        }
         if let Some(sel) = stops.get_mut(state.selected_stop) {
             let mut stop_rgba = parse_css_rgba(&sel.color);
             ui.horizontal(|ui| {
@@ -1760,14 +2148,19 @@ pub fn cm3_gradient_bar(
                 );
                 let cev = cm3_hsva_color_picker(
                     ui,
-                    id.with(("stop_color", state.selected_stop)),
+                    stop_picker_id,
                     &mut stop_rgba,
                     true,
                     false,
                     viewport_rect,
                     theme,
                 );
-                if cev.changed || cev.committed {
+                if cev.cancelled {
+                    sel.color = format_css_rgba(stop_rgba);
+                    ev.changed = true;
+                    ev.cancelled = true;
+                    ev.committed = false;
+                } else if cev.changed || cev.committed {
                     sel.color = format_css_rgba(stop_rgba);
                     ev.changed = true;
                     if cev.committed {
@@ -1804,21 +2197,16 @@ pub fn cm3_prop_button(
     full_width: bool,
     theme: &Cm3Theme,
 ) -> Response {
-    let galley = ui.painter().layout_no_wrap(
-        label.to_owned(),
-        theme.font(FONT_BODY),
-        match variant {
-            ButtonVariant::Primary => TEXT_BRIGHT,
-            ButtonVariant::Danger => DANGER_TEXT,
-            ButtonVariant::Normal | ButtonVariant::Back => TEXT_BUTTON,
-        },
-    );
+    let font = theme.font(FONT_BODY);
+    let measure = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), TEXT_BUTTON);
     let desired_w = if full_width {
         ui.available_width().max(24.0)
     } else {
-        (galley.size().x + 18.0).min(ui.available_width().max(24.0))
+        (measure.size().x + 18.0).min(ui.available_width().max(24.0))
     };
-    let desired = Vec2::new(desired_w, (galley.size().y + 10.0).max(28.0));
+    let desired = Vec2::new(desired_w, (measure.size().y + 10.0).max(28.0));
     let (rect, resp) = ui.allocate_exact_size(desired, Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
 
@@ -1850,7 +2238,7 @@ pub fn cm3_prop_button(
     }
 
     let text_color = match variant {
-        ButtonVariant::Primary => TEXT_BRIGHT,
+        ButtonVariant::Primary => theme.contrast_fg(bg),
         ButtonVariant::Danger => DANGER_TEXT,
         ButtonVariant::Normal | ButtonVariant::Back => {
             if resp.hovered() {
@@ -1859,6 +2247,12 @@ pub fn cm3_prop_button(
                 TEXT_BUTTON
             }
         }
+    };
+    let galley = if text_color == TEXT_BUTTON {
+        measure
+    } else {
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), font, text_color)
     };
     let text_x = if galley.size().x + 8.0 <= rect.width() {
         rect.center().x - galley.size().x * 0.5
@@ -1876,6 +2270,47 @@ pub fn cm3_prop_button(
     resp
 }
 
+fn cm3_icon_button_enabled(
+    ui: &mut Ui,
+    icon: Cm3Icon,
+    icon_px: f32,
+    color: Color32,
+    tooltip: &str,
+    enabled: bool,
+    theme: &Cm3Theme,
+) -> bool {
+    let box_px = icon_px + 4.0;
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(box_px), sense);
+    let resp = if enabled {
+        resp.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        resp
+    };
+    if enabled && resp.hovered() {
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::ZERO,
+            Stroke::new(2.0, theme.accent()),
+            StrokeKind::Inside,
+        );
+    }
+    let icon_rect = Rect::from_min_size(
+        Pos2::new(
+            (rect.center().x - icon_px * 0.5).round(),
+            (rect.center().y - icon_px * 0.5).round(),
+        ),
+        Vec2::splat(icon_px),
+    );
+    paint_cm3_icon(ui.painter(), icon_rect, icon, color);
+    let resp = resp.on_hover_text(tooltip);
+    enabled && resp.clicked()
+}
+
 /// Compact CM3 action icon button (`17x17` or toolbar `25x25`) with `2px` focus/hover border.
 pub fn cm3_icon_button(
     ui: &mut Ui,
@@ -1885,20 +2320,13 @@ pub fn cm3_icon_button(
     tooltip: &str,
     theme: &Cm3Theme,
 ) -> bool {
-    let box_px = icon_px + 4.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(box_px), Sense::click());
-    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    if resp.hovered() {
-        ui.painter().rect_stroke(
-            rect,
-            CornerRadius::ZERO,
-            Stroke::new(2.0, theme.accent()),
-            StrokeKind::Inside,
-        );
-    }
-    let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(icon_px));
-    paint_cm3_icon(ui.painter(), icon_rect, icon, color);
-    resp.on_hover_text(tooltip).clicked()
+    cm3_icon_button_enabled(ui, icon, icon_px, color, tooltip, true, theme)
+}
+
+#[derive(Debug, Clone, Default)]
+struct DropdownPopupState {
+    open: bool,
+    highlighted: usize,
 }
 
 /// Exact CM3 `.pz-inputbox` dropdown select (`#202020` bg, `1px solid #1b1b1b`, `#7e8fb9` text).
@@ -1911,6 +2339,7 @@ pub fn cm3_dropdown(
     viewport_rect: Rect,
     theme: &Cm3Theme,
 ) -> bool {
+    CM3_ROW_HAS_DROPDOWN.with(|f| f.set(true));
     if options.is_empty() {
         return false;
     }
@@ -1929,65 +2358,110 @@ pub fn cm3_dropdown(
     }
 
     let popup_id = id.with("dropdown_popup");
-    let mut open = ui
-        .data_mut(|d| d.get_temp::<bool>(popup_id))
-        .unwrap_or(false);
+    let mut popup_state = ui
+        .data_mut(|d| d.get_temp::<DropdownPopupState>(popup_id))
+        .unwrap_or(DropdownPopupState {
+            open: false,
+            highlighted: *selected_idx,
+        });
     let mut changed = false;
 
-    let width = ui.available_width().clamp(90.0, 220.0);
-    let (btn_rect, btn_resp) = ui.allocate_exact_size(Vec2::new(width, 25.0), Sense::click());
-    let btn_resp = btn_resp.on_hover_cursor(CursorIcon::PointingHand);
+    let font = theme.font(13.3);
+    let mut max_opt_w = 0.0_f32;
+    let mut current_galley = None;
+    for (idx, opt) in options.iter().enumerate() {
+        let galley = ui
+            .painter()
+            .layout_no_wrap((*opt).to_owned(), font.clone(), theme.value());
+        max_opt_w = max_opt_w.max(galley.size().x);
+        if idx == *selected_idx {
+            current_galley = Some(galley);
+        }
+    }
+    let label_galley = current_galley.unwrap_or_else(|| {
+        ui.painter()
+            .layout_no_wrap(current_label.to_owned(), font.clone(), theme.value())
+    });
+    let max_w = ui.available_width().max(46.0);
+    let width = (max_opt_w + 22.0).clamp(46.0, max_w).round();
+    let (_, raw_slot_rect) = ui.allocate_space(Vec2::new(width, 23.0));
+    let btn_rect = snap_rect_px(Rect::from_min_size(
+        Pos2::new(raw_slot_rect.left(), raw_slot_rect.top() + 2.0),
+        Vec2::new(width, 21.0),
+    ));
+    let btn_resp = ui
+        .interact(btn_rect, id.with("btn"), Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
 
     ui.painter()
         .rect_filled(btn_rect, CornerRadius::ZERO, BG_INPUT);
-    ui.painter().rect_stroke(
+    paint_crisp_border_1px(
+        ui.painter(),
         btn_rect,
-        CornerRadius::ZERO,
-        Stroke::new(
-            1.0,
-            if open || btn_resp.hovered() {
-                theme.accent()
-            } else {
-                BORDER_CONTROL
-            },
-        ),
-        StrokeKind::Inside,
+        if popup_state.open || btn_resp.hovered() {
+            theme.accent()
+        } else {
+            BORDER_CONTROL
+        },
     );
 
     let clip_painter = ui.painter().with_clip_rect(Rect::from_min_max(
         btn_rect.left_top(),
         Pos2::new(
-            (btn_rect.right() - 18.0).max(btn_rect.left()),
+            (btn_rect.right() - 15.0).max(btn_rect.left()),
             btn_rect.bottom(),
         ),
     ));
-    clip_painter.text(
-        Pos2::new(btn_rect.left() + 6.0, btn_rect.center().y),
-        Align2::LEFT_CENTER,
-        current_label,
-        theme.font(FONT_BODY),
+    clip_painter.galley(
+        Pos2::new(
+            btn_rect.left() + 5.0,
+            (btn_rect.center().y - label_galley.size().y * 0.5).round(),
+        ),
+        label_galley,
         theme.value(),
     );
 
     let caret_rect = Rect::from_center_size(
-        Pos2::new(btn_rect.right() - 9.0, btn_rect.center().y),
-        Vec2::splat(10.0),
+        Pos2::new(btn_rect.right() - 8.5, btn_rect.center().y),
+        Vec2::splat(12.0),
     );
-    paint_cm3_icon(ui.painter(), caret_rect, Cm3Icon::ChevronDown, TEXT_MUTED);
+    paint_cm3_icon(
+        ui.painter(),
+        caret_rect,
+        Cm3Icon::ChevronDown,
+        theme.value(),
+    );
 
     if btn_resp.clicked() {
-        open = !open;
+        popup_state.open = !popup_state.open;
+        popup_state.highlighted = *selected_idx;
     }
 
-    if open {
+    if popup_state.open {
+        popup_state.highlighted = popup_state.highlighted.min(options.len().saturating_sub(1));
         let row_h = 24.0;
         let popup_h = (options.len() as f32 * row_h + 6.0).min(280.0);
-        let popup_size = Vec2::new(width.max(150.0), popup_h);
+        let popup_size = Vec2::new(width, popup_h);
         let pos = clamp_popup_pos(btn_rect, popup_size, viewport_rect);
         let mut close_now = false;
+        let mut key_navigated = false;
+        let pointer_moved = ui.input(|i| i.pointer.delta() != Vec2::ZERO);
 
         ui.input(|i| {
             if i.key_pressed(Key::Escape) {
+                close_now = true;
+            } else if i.key_pressed(Key::ArrowDown) {
+                popup_state.highlighted = (popup_state.highlighted + 1) % options.len();
+                key_navigated = true;
+            } else if i.key_pressed(Key::ArrowUp) {
+                popup_state.highlighted =
+                    (popup_state.highlighted + options.len() - 1) % options.len();
+                key_navigated = true;
+            } else if i.key_pressed(Key::Enter) {
+                if *selected_idx != popup_state.highlighted {
+                    *selected_idx = popup_state.highlighted;
+                    changed = true;
+                }
                 close_now = true;
             }
         });
@@ -1997,30 +2471,39 @@ pub fn cm3_dropdown(
             .fixed_pos(pos)
             .interactable(true)
             .show(ui.ctx(), |ui| {
-                Frame::NONE
+                let inner_w = (popup_size.x - 4.0).max(20.0);
+                let frame_resp = Frame::NONE
                     .fill(BG_INPUT)
-                    .stroke(Stroke::new(1.0, theme.accent()))
                     .inner_margin(egui::Margin::same(2))
                     .show(ui, |ui| {
-                        ui.set_min_width(popup_size.x - 6.0);
-                        ui.set_max_width(popup_size.x - 6.0);
+                        ui.set_min_width(inner_w);
+                        ui.set_max_width(inner_w);
                         ScrollArea::vertical()
                             .id_salt(popup_id.with("scroll"))
-                            .max_height(popup_h - 6.0)
+                            .max_height(popup_h - 4.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing = Vec2::ZERO;
+                                let menu_active_bg = theme.menu_active();
+                                let menu_active_fg = theme.contrast_fg(menu_active_bg);
                                 for (idx, opt) in options.iter().enumerate() {
                                     let (r_rect, r_resp) = ui.allocate_exact_size(
                                         Vec2::new(ui.available_width(), row_h),
                                         Sense::click(),
                                     );
+                                    if r_resp.hovered() && pointer_moved {
+                                        popup_state.highlighted = idx;
+                                    }
                                     let selected = idx == *selected_idx;
-                                    if r_resp.hovered() {
+                                    let is_hi = idx == popup_state.highlighted;
+                                    if key_navigated && is_hi {
+                                        r_resp.scroll_to_me(None);
+                                    }
+                                    if is_hi {
                                         ui.painter().rect_filled(
                                             r_rect,
                                             CornerRadius::ZERO,
-                                            theme.menu_active(),
+                                            menu_active_bg,
                                         );
                                     } else if selected {
                                         ui.painter().rect_filled(
@@ -2029,17 +2512,21 @@ pub fn cm3_dropdown(
                                             BG_DROPDOWN_HOVER,
                                         );
                                     }
-                                    ui.painter().text(
-                                        Pos2::new(r_rect.left() + 8.0, r_rect.center().y),
-                                        Align2::LEFT_CENTER,
-                                        *opt,
-                                        theme.font(FONT_SMALL),
-                                        if r_resp.hovered() || selected {
-                                            TEXT_BRIGHT
-                                        } else {
-                                            TEXT_PRIMARY
-                                        },
-                                    );
+                                    ui.painter()
+                                        .with_clip_rect(r_rect.shrink2(Vec2::new(2.0, 0.0)))
+                                        .text(
+                                            Pos2::new(r_rect.left() + 4.0, r_rect.center().y),
+                                            Align2::LEFT_CENTER,
+                                            *opt,
+                                            font.clone(),
+                                            if is_hi {
+                                                menu_active_fg
+                                            } else if selected {
+                                                TEXT_BRIGHT
+                                            } else {
+                                                TEXT_PRIMARY
+                                            },
+                                        );
                                     if r_resp.clicked() {
                                         if *selected_idx != idx {
                                             *selected_idx = idx;
@@ -2050,6 +2537,7 @@ pub fn cm3_dropdown(
                                 }
                             });
                     });
+                paint_crisp_border_1px(ui.painter(), frame_resp.response.rect, theme.accent());
             });
 
         let outside = ui.input(|i| {
@@ -2059,15 +2547,157 @@ pub fn cm3_dropdown(
                     .is_some_and(|p| !area_resp.response.rect.contains(p) && !btn_rect.contains(p))
         });
         if close_now || outside {
-            open = false;
+            popup_state.open = false;
         }
     }
 
-    ui.data_mut(|d| d.insert_temp(popup_id, open));
+    ui.data_mut(|d| d.insert_temp(popup_id, popup_state));
     changed
 }
 
-/// CM3 collapsible section with `50 ms` linear chevron rotation (`0 deg <-> -90 deg`, Spec 01 §4.7).
+/// Crisp `7x7 px` framed square collapse glyph (`1px` hollow square with a center
+/// `-` dash when open or `+` when collapsed) matching Zoidium tree headers.
+pub fn paint_cm3_tree_box(painter: &Painter, center: Pos2, open: bool, color: Color32) {
+    let x0 = (center.x - 3.5).round();
+    let y0 = (center.y - 3.5).round();
+    let outer = Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x0 + 7.0, y0 + 7.0));
+    paint_crisp_border_1px(painter, outer, color);
+    // Horizontal center dash (3x1 px)
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(x0 + 2.0, y0 + 3.0), Pos2::new(x0 + 5.0, y0 + 4.0)),
+        CornerRadius::ZERO,
+        color,
+    );
+    if !open {
+        // Vertical center stem (1x3 px)
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(x0 + 3.0, y0 + 2.0), Pos2::new(x0 + 4.0, y0 + 5.0)),
+            CornerRadius::ZERO,
+            color,
+        );
+    }
+}
+
+/// CM3 collapsible section (`27 px` root / `28 px` nested or action header, `16 px` body title, `7x7` framed square collapse glyph)
+/// with automatic tree nesting indents (`+15 px` per level), optional `nested` surface styling,
+/// and Column-2-aligned action icon (e.g. Reset / `+`).
+/// Returns `(action_clicked, body_result)`.
+#[allow(clippy::too_many_arguments)]
+pub fn cm3_collapsible_section_with_action<R>(
+    ui: &mut Ui,
+    id: Id,
+    title: &str,
+    default_open: bool,
+    nested: bool,
+    col_ratio: f32,
+    action_icon: Option<(Cm3Icon, &str)>,
+    theme: &Cm3Theme,
+    add_body: impl FnOnce(&mut Ui) -> R,
+) -> (bool, Option<R>) {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let mut open = ui
+        .data_mut(|d| d.get_temp::<bool>(id))
+        .unwrap_or(default_open);
+
+    let depth = CM3_TREE_DEPTH.with(|d| d.get());
+    let effective_depth = if nested { depth.max(1) } else { depth };
+    let indent_px = effective_depth as f32 * 15.0;
+    let hdr_h = if nested || action_icon.is_some() {
+        28.0
+    } else {
+        27.0
+    };
+
+    let (_, raw_hdr_rect) = ui.allocate_space(Vec2::new(ui.available_width(), hdr_h));
+    let hdr_rect = snap_rect_px(raw_hdr_rect);
+    let hdr_resp = ui
+        .interact(hdr_rect, id.with("hdr"), Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
+
+    let title_x = hdr_rect.left() + 21.0 + indent_px;
+    let action_rect = action_icon.map(|_| {
+        let max_x = (hdr_rect.right() - 20.0).max(title_x + 4.0);
+        let action_x = ((hdr_rect.left() + hdr_rect.width() * col_ratio).round() + 1.0)
+            .clamp(title_x + 4.0, max_x);
+        let action_y = (hdr_rect.center().y - 10.0).round();
+        Rect::from_min_size(Pos2::new(action_x, action_y), Vec2::splat(20.0))
+    });
+
+    let mut action_clicked = false;
+    let mut action_hovered = false;
+    if let (Some((icon, tooltip)), Some(a_rect)) = (action_icon, action_rect) {
+        let a_resp = ui
+            .interact(a_rect, id.with("action"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(tooltip);
+        action_hovered = a_resp.hovered();
+        action_clicked = a_resp.clicked();
+        let _ = icon;
+    }
+
+    let bg = if nested { BG_PANEL } else { BG_TITLE };
+    ui.painter().rect_filled(hdr_rect, CornerRadius::ZERO, bg);
+    let div_y = (hdr_rect.bottom() - 1.0).round();
+    let div_rect = Rect::from_min_max(
+        Pos2::new(hdr_rect.left(), div_y),
+        Pos2::new(hdr_rect.right(), div_y + 1.0),
+    );
+    ui.painter()
+        .rect_filled(div_rect, CornerRadius::ZERO, BORDER_ROW_SOFT);
+
+    // Crisp 7x7 framed square collapse glyph (`1px #9a9a9a` hollow square with `-` / `+`)
+    let box_color = if hdr_resp.hovered() && !action_hovered {
+        TEXT_BRIGHT
+    } else {
+        TEXT_MUTED
+    };
+    paint_cm3_tree_box(
+        ui.painter(),
+        Pos2::new(
+            hdr_rect.left() + 10.5 + indent_px,
+            hdr_rect.center().y + 0.5,
+        ),
+        open,
+        box_color,
+    );
+
+    let title_right = action_rect.map_or(hdr_rect.right() - 4.0, |r| (r.left() - 4.0).max(title_x));
+    let title_clip = Rect::from_min_max(
+        Pos2::new(title_x - 1.0, hdr_rect.top()),
+        Pos2::new(title_right.max(title_x), hdr_rect.bottom()),
+    );
+    ui.painter().with_clip_rect(title_clip).text(
+        Pos2::new(title_x, hdr_rect.center().y),
+        Align2::LEFT_CENTER,
+        title,
+        theme.font(FONT_BODY),
+        TEXT_PRIMARY,
+    );
+
+    if let (Some((icon, _)), Some(a_rect)) = (action_icon, action_rect) {
+        let icon_color = if action_hovered {
+            TEXT_BRIGHT
+        } else {
+            TEXT_PRIMARY
+        };
+        paint_cm3_icon(ui.painter(), a_rect, icon, icon_color);
+    }
+
+    if hdr_resp.clicked() && !action_clicked {
+        open = !open;
+    }
+    ui.data_mut(|d| d.insert_temp(id, open));
+
+    let body = if open {
+        let _depth_guard = TreeDepthGuard::push(effective_depth + 1);
+        Some(add_body(ui))
+    } else {
+        None
+    };
+    (action_clicked, body)
+}
+
+/// CM3 collapsible section with `7x7` framed square collapse glyph (Spec 01 §4.7).
 pub fn cm3_collapsible_section<R>(
     ui: &mut Ui,
     id: Id,
@@ -2076,53 +2706,18 @@ pub fn cm3_collapsible_section<R>(
     theme: &Cm3Theme,
     add_body: impl FnOnce(&mut Ui) -> R,
 ) -> Option<R> {
-    let mut open = ui
-        .data_mut(|d| d.get_temp::<bool>(id))
-        .unwrap_or(default_open);
-
-    // 50 ms linear animation matching Spec 01 §7
-    let t = ui.ctx().animate_bool_with_time(id.with("anim"), open, 0.05);
-
-    let (hdr_rect, hdr_resp) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
-    let hdr_resp = hdr_resp.on_hover_cursor(CursorIcon::PointingHand);
-    ui.painter()
-        .rect_filled(hdr_rect, CornerRadius::ZERO, BG_TITLE);
-    ui.painter().line_segment(
-        [hdr_rect.left_bottom(), hdr_rect.right_bottom()],
-        Stroke::new(1.0, BORDER_ROW_SOFT),
-    );
-
-    // Rotated chevron triangle: -90 deg (pointing right) when t=0, 0 deg (pointing down) when t=1
-    let angle = -std::f32::consts::FRAC_PI_2 * (1.0 - t);
-    let center = Pos2::new(hdr_rect.left() + 12.0, hdr_rect.center().y);
-    let rot = |dx: f32, dy: f32| -> Pos2 {
-        let (s, c) = angle.sin_cos();
-        Pos2::new(center.x + dx * c - dy * s, center.y + dx * s + dy * c)
-    };
-    let tri = vec![rot(-4.0, -2.5), rot(4.0, -2.5), rot(0.0, 3.5)];
-    let chev_color = if hdr_resp.hovered() {
-        TEXT_PRIMARY
-    } else {
-        TEXT_MUTED
-    };
-    ui.painter()
-        .add(Shape::convex_polygon(tri, chev_color, Stroke::NONE));
-
-    ui.painter().text(
-        Pos2::new(hdr_rect.left() + 24.0, hdr_rect.center().y),
-        Align2::LEFT_CENTER,
+    let (_, body) = cm3_collapsible_section_with_action(
+        ui,
+        id,
         title,
-        theme.font(FONT_TITLE),
-        TEXT_STRONG,
+        default_open,
+        false,
+        PropertyColumnState::default().label_ratio,
+        None,
+        theme,
+        add_body,
     );
-
-    if hdr_resp.clicked() {
-        open = !open;
-    }
-    ui.data_mut(|d| d.insert_temp(id, open));
-
-    if open { Some(add_body(ui)) } else { None }
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -2241,6 +2836,7 @@ pub fn cm3_fuzzy_picker(
             let resp = ui.add(
                 TextEdit::singleline(&mut state.query)
                     .id(filter_id)
+                    .frame(Frame::NONE)
                     .hint_text("type to filter")
                     .font(theme.font(FONT_BODY))
                     .text_color(TEXT_PRIMARY)
@@ -2272,14 +2868,18 @@ pub fn cm3_fuzzy_picker(
     }
 
     // Keyboard navigation (Escape, ArrowUp, ArrowDown, Enter)
+    let mut key_navigated = false;
+    let pointer_moved = ui.input(|i| i.pointer.delta() != Vec2::ZERO);
     ui.input(|i| {
         if i.key_pressed(Key::Escape) {
             event = FuzzyPickerEvent::Cancelled;
         } else if !filtered.is_empty() {
             if i.key_pressed(Key::ArrowDown) {
                 state.active_index = (state.active_index + 1) % filtered.len();
+                key_navigated = true;
             } else if i.key_pressed(Key::ArrowUp) {
                 state.active_index = (state.active_index + filtered.len() - 1) % filtered.len();
+                key_navigated = true;
             } else if i.key_pressed(Key::Enter) {
                 event = FuzzyPickerEvent::Selected(filtered[state.active_index].id.clone());
             }
@@ -2315,13 +2915,15 @@ pub fn cm3_fuzzy_picker(
                         .allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
                     ui.painter()
                         .rect_filled(cat_rect, CornerRadius::ZERO, BG_TITLE);
-                    ui.painter().text(
-                        Pos2::new(cat_rect.left() + 5.0, cat_rect.center().y),
-                        Align2::LEFT_CENTER,
-                        &item.category,
-                        theme.font(FONT_BANNER),
-                        TEXT_FAINT,
-                    );
+                    ui.painter()
+                        .with_clip_rect(cat_rect.shrink2(Vec2::new(4.0, 0.0)))
+                        .text(
+                            Pos2::new(cat_rect.left() + 5.0, cat_rect.center().y),
+                            Align2::LEFT_CENTER,
+                            &item.category,
+                            theme.font(FONT_BANNER),
+                            TEXT_FAINT,
+                        );
                 }
 
                 let has_desc = !item.desc.is_empty();
@@ -2330,6 +2932,9 @@ pub fn cm3_fuzzy_picker(
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
                 let row_resp = row_resp.on_hover_cursor(CursorIcon::PointingHand);
                 let is_active = idx == state.active_index;
+                if key_navigated && is_active {
+                    row_resp.scroll_to_me(None);
+                }
 
                 if is_active {
                     ui.painter()
@@ -2345,7 +2950,10 @@ pub fn cm3_fuzzy_picker(
                         .rect_filled(row_rect, CornerRadius::ZERO, BG_OPTION_HOVER);
                 }
 
-                ui.painter().text(
+                let row_clip = ui
+                    .painter()
+                    .with_clip_rect(row_rect.shrink2(Vec2::new(4.0, 0.0)));
+                row_clip.text(
                     Pos2::new(
                         row_rect.left() + 8.0,
                         if has_desc {
@@ -2361,7 +2969,7 @@ pub fn cm3_fuzzy_picker(
                 );
 
                 if has_desc {
-                    ui.painter().text(
+                    row_clip.text(
                         Pos2::new(row_rect.left() + 8.0, row_rect.top() + 31.0),
                         Align2::LEFT_CENTER,
                         &item.desc,
@@ -2370,7 +2978,7 @@ pub fn cm3_fuzzy_picker(
                     );
                 }
 
-                if row_resp.hovered() {
+                if row_resp.hovered() && pointer_moved {
                     state.active_index = idx;
                 }
                 if row_resp.clicked() {
@@ -2386,7 +2994,7 @@ pub fn cm3_fuzzy_picker(
 // 8. Resizable 2-Column Property Row Helper (Spec 01 §4.1)
 // ---------------------------------------------------------------------------
 
-/// Shared column width state for CM3 property trees (`layout = 0`, default `50%`).
+/// Shared column width state for CM3 property trees (`layout = 0`, default `53.3%`).
 #[derive(Debug, Clone, Copy)]
 pub struct PropertyColumnState {
     pub label_ratio: f32,
@@ -2394,7 +3002,7 @@ pub struct PropertyColumnState {
 
 impl Default for PropertyColumnState {
     fn default() -> Self {
-        Self { label_ratio: 0.48 }
+        Self { label_ratio: 0.533 }
     }
 }
 
@@ -2405,7 +3013,10 @@ pub fn cm3_column_adjust_splitter(
     panel_rect: Rect,
     col_state: &mut PropertyColumnState,
 ) {
-    let split_x = panel_rect.left() + (panel_rect.width() * col_state.label_ratio).max(10.0);
+    let split_x = (panel_rect.left()
+        + (panel_rect.width() * col_state.label_ratio)
+            .clamp(72.0, (panel_rect.width() - 60.0).max(72.0)))
+    .round();
     let hit = Rect::from_min_max(
         Pos2::new(split_x - 2.5, panel_rect.top()),
         Pos2::new(split_x + 2.5, panel_rect.bottom()),
@@ -2413,6 +3024,20 @@ pub fn cm3_column_adjust_splitter(
     let resp = ui
         .interact(hit, id, Sense::drag())
         .on_hover_cursor(CursorIcon::ResizeHorizontal);
+    if resp.hovered() || resp.dragged() {
+        let line_color = if resp.dragged() {
+            BORDER_OPTION_ACTIVE
+        } else {
+            BORDER_BUTTON_HOVER
+        };
+        ui.painter().line_segment(
+            [
+                Pos2::new(split_x + 0.5, panel_rect.top()),
+                Pos2::new(split_x + 0.5, panel_rect.bottom()),
+            ],
+            Stroke::new(1.0, line_color),
+        );
+    }
     if resp.dragged() {
         let new_w = (split_x + resp.drag_delta().x - panel_rect.left())
             .clamp(50.0, (panel_rect.width() - 60.0).max(50.0));
@@ -2420,7 +3045,151 @@ pub fn cm3_column_adjust_splitter(
     }
 }
 
-/// Renders one CM3 2-column property row (`1px solid #242424` divider, `5px` gap, Spec 01 §4.1).
+#[allow(clippy::too_many_arguments)]
+fn cm3_property_row_inner<R>(
+    ui: &mut Ui,
+    label: &str,
+    col_state: PropertyColumnState,
+    base_indent_px: f32,
+    _reserve_stopwatch_gutter: bool,
+    theme: &Cm3Theme,
+    left_extra: impl FnOnce(&mut Ui),
+    right_value: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let total_w = ui.available_width().max(120.0);
+        let row_left = ui.cursor().left().round();
+        let row_top = ui.cursor().top().round();
+        let row_right = (row_left + total_w).round();
+        let split_x = (row_left
+            + (total_w * col_state.label_ratio).clamp(72.0, (total_w - 60.0).max(72.0)))
+        .round();
+        let col1_right = (split_x - 11.0).max(row_left + 40.0);
+
+        // Column 2 runs first (disjoint horizontal rect [split_x .. row_right]) so Column 1
+        // knows whether this row contains a dropdown or color picker for exact vertical centering.
+        let col2_max_rect = Rect::from_min_max(
+            Pos2::new(split_x, row_top),
+            Pos2::new(row_right, (row_top + 1000.0).max(ui.max_rect().bottom())),
+        );
+        let prev_dropdown_flag = CM3_ROW_HAS_DROPDOWN.with(|f| f.replace(false));
+        let prev_color_flag = CM3_ROW_HAS_COLOR_PICKER.with(|f| f.replace(false));
+        let (out, col2_used_h, row_has_dropdown, row_has_color_picker) = {
+            let mut col2_ui = ui.new_child(
+                UiBuilder::new()
+                    .id_salt("col2")
+                    .max_rect(col2_max_rect)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            col2_ui.spacing_mut().item_spacing.y = 0.0;
+            let col2_clip = ui.clip_rect().intersect(Rect::from_min_max(
+                Pos2::new(split_x, ui.clip_rect().top()),
+                Pos2::new(row_right, ui.clip_rect().bottom()),
+            ));
+            col2_ui.set_clip_rect(col2_clip);
+            col2_ui.add_space(2.0);
+            let result = right_value(&mut col2_ui);
+            let used_h = (col2_ui.min_rect().bottom() - row_top).max(0.0);
+            let has_dd = CM3_ROW_HAS_DROPDOWN.with(|f| f.replace(prev_dropdown_flag));
+            let has_cp = CM3_ROW_HAS_COLOR_PICKER.with(|f| f.replace(prev_color_flag));
+            (result, used_h, has_dd, has_cp)
+        };
+
+        // Column 1: fixed rect [row_left .. split_x - 11.0] so short labels never pull Column 2 left.
+        // Center labels at row_top + 14.0 on 27-28px rows (dropdown, color picker, stopwatch) and
+        // row_top + 13.0 on 26px plain rows, while keeping stopwatch icon alignment unchanged.
+        let base_col1_h = if row_has_dropdown || row_has_color_picker {
+            28.0
+        } else {
+            26.0
+        };
+        let col1_rect = Rect::from_min_max(
+            Pos2::new(row_left, row_top),
+            Pos2::new(col1_right, row_top + base_col1_h),
+        );
+        let has_left_widget = {
+            let mut col1_ui = ui.new_child(
+                UiBuilder::new()
+                    .id_salt("col1")
+                    .max_rect(col1_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            col1_ui.set_clip_rect(ui.clip_rect().intersect(col1_rect));
+            col1_ui.spacing_mut().item_spacing = Vec2::new(5.0, 0.0);
+            if base_indent_px > 0.0 {
+                col1_ui.add_space(base_indent_px);
+            }
+            let gutter_start = col1_ui.cursor().left();
+            left_extra(&mut col1_ui);
+            let drew_left = col1_ui.cursor().left() > gutter_start + 0.5;
+            if drew_left && !row_has_dropdown && !row_has_color_picker {
+                let label_rect = Rect::from_min_max(
+                    Pos2::new(col1_ui.cursor().left(), row_top),
+                    Pos2::new(col1_right, row_top + 28.0),
+                );
+                let mut label_ui = ui.new_child(
+                    UiBuilder::new()
+                        .id_salt("col1_lbl")
+                        .max_rect(label_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                label_ui.set_clip_rect(ui.clip_rect().intersect(label_rect));
+                label_ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(label)
+                            .font(theme.font(FONT_BODY))
+                            .color(TEXT_PRIMARY),
+                    )
+                    .truncate(),
+                );
+            } else {
+                col1_ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(label)
+                            .font(theme.font(FONT_BODY))
+                            .color(TEXT_PRIMARY),
+                    )
+                    .truncate(),
+                );
+            }
+            drew_left
+        };
+
+        // Match Zoidium row pitch:
+        // - Dropdown rows: 28 px content + 1 px divider = 29 px pitch
+        // - Stopwatch / color picker rows: 27 px content + 1 px divider = 28 px pitch
+        // - Plain rows: 26 px content + 1 px divider = 27 px pitch
+        let min_content_h = if row_has_dropdown {
+            28.0
+        } else if has_left_widget || row_has_color_picker {
+            27.0
+        } else {
+            26.0
+        };
+        let content_h = if col2_used_h > min_content_h {
+            (col2_used_h + 2.0).ceil()
+        } else {
+            min_content_h
+        };
+        let _ = ui.allocate_space(Vec2::new(total_w, content_h));
+
+        // Crisp integer-snapped 1 px #242424 bottom divider.
+        let (_, div_rect) = ui.allocate_space(Vec2::new(total_w, 1.0));
+        let div_y = div_rect.top().round();
+        let div_snap = Rect::from_min_max(
+            Pos2::new(row_left, div_y),
+            Pos2::new(row_right, div_y + 1.0),
+        );
+        ui.painter()
+            .rect_filled(div_snap, CornerRadius::ZERO, BORDER_ROW_SOFT);
+        out
+    })
+    .inner
+}
+
+/// Renders one CM3 2-column property row (`27..29 px` total pitch, Spec 01 §4.1).
 pub fn cm3_property_row<R>(
     ui: &mut Ui,
     label: &str,
@@ -2430,56 +3199,42 @@ pub fn cm3_property_row<R>(
     left_extra: impl FnOnce(&mut Ui),
     right_value: impl FnOnce(&mut Ui) -> R,
 ) -> R {
-    let total_w = ui.available_width().max(120.0);
-    let label_w = (total_w * col_state.label_ratio).clamp(72.0, (total_w - 60.0).max(72.0));
-    let indent_px = indent_depth as f32 * 15.0;
+    let base_indent_px = 21.0 + indent_depth as f32 * 15.0;
+    cm3_property_row_inner(
+        ui,
+        label,
+        col_state,
+        base_indent_px,
+        false,
+        theme,
+        left_extra,
+        right_value,
+    )
+}
 
-    let mut out: Option<R> = None;
-    let row_resp = ui.horizontal(|ui| {
-        ui.set_min_width(total_w);
-        ui.spacing_mut().item_spacing.x = 5.0;
-
-        // Column 1: optional stopwatch + label
-        ui.allocate_ui_with_layout(
-            Vec2::new(label_w, 26.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                if indent_px > 0.0 {
-                    ui.add_space(indent_px);
-                }
-                left_extra(ui);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(label)
-                            .font(theme.font(FONT_BODY))
-                            .color(TEXT_PRIMARY),
-                    )
-                    .truncate(),
-                );
-            },
-        );
-
-        // Column 2: value controls
-        let val_w = (total_w - label_w - 10.0).max(40.0);
-        ui.allocate_ui_with_layout(
-            Vec2::new(val_w, 26.0),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                out = Some(right_value(ui));
-            },
-        );
-    });
-
-    let r = row_resp.response.rect;
-    ui.painter().line_segment(
-        [
-            Pos2::new(r.left(), r.bottom() + 1.0),
-            Pos2::new(r.right(), r.bottom() + 1.0),
-        ],
-        Stroke::new(1.0, BORDER_ROW_SOFT),
-    );
-    ui.add_space(2.0);
-    out.expect("property row value closure always runs")
+/// Renders one CM3 2-column property row aligned to the active tree nesting depth
+/// (`21 px + depth * 15 px`: `36 px` at Depth 1, `51 px` at Depth 2) with crisp Column 2 alignment.
+pub fn cm3_property_row_aligned<R>(
+    ui: &mut Ui,
+    label: &str,
+    reserve_stopwatch_gutter: bool,
+    col_state: PropertyColumnState,
+    theme: &Cm3Theme,
+    left_extra: impl FnOnce(&mut Ui),
+    add_control: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let depth = CM3_TREE_DEPTH.with(|d| d.get());
+    let base_indent_px = 21.0 + depth as f32 * 15.0;
+    cm3_property_row_inner(
+        ui,
+        label,
+        col_state,
+        base_indent_px,
+        reserve_stopwatch_gutter,
+        theme,
+        left_extra,
+        add_control,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2630,6 +3385,11 @@ impl FloatingWindowManager {
         }
     }
 
+    /// Clears floating-window focus when clicking back into a main workspace pane.
+    pub fn clear_focus(&mut self) {
+        self.focused_id = None;
+    }
+
     /// Returns `true` if `id` is currently open.
     #[must_use]
     pub fn is_open(&self, id: &str) -> bool {
@@ -2681,8 +3441,8 @@ pub fn cm3_floating_window(
     let min_w = spec.min_size.x.max(180.0);
     let min_h = spec.min_size.y.max(80.0);
 
-    // Escape closes the focused floating window (Spec 01 §4.8)
-    if is_focused && ctx.input(|i| i.key_pressed(Key::Escape)) {
+    // Escape closes the focused floating window unless a text input owns keyboard focus (Spec 01 §4.8)
+    if is_focused && !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Escape)) {
         manager.close(&spec.id);
         ev.closed = true;
         return ev;
@@ -2697,7 +3457,11 @@ pub fn cm3_floating_window(
             ),
         )
     } else if win.collapsed {
-        (win.pos, Vec2::new(260.0, 30.0))
+        let collapsed_size = Vec2::new(260.0, 30.0);
+        (
+            clamp_window_pos(win.pos, collapsed_size, viewport),
+            collapsed_size,
+        )
     } else {
         (
             clamp_window_pos(win.pos, win.size, viewport),
@@ -2708,14 +3472,17 @@ pub fn cm3_floating_window(
     let win_id = Id::unique(("zoidcraft_floating_window", &spec.id));
     let drag_alpha = if win.dragging { 235 } else { 255 }; // 0.92 opacity while dragging
     let body_bg = color32_with_alpha(BG_PANEL, drag_alpha);
-    let title_bg = color32_with_alpha(
-        if is_focused {
-            theme.bg_title_focused()
-        } else {
-            BG_TITLE
-        },
-        drag_alpha,
-    );
+    let title_bg_opaque = if is_focused {
+        theme.bg_title_focused()
+    } else {
+        BG_TITLE
+    };
+    let title_bg = color32_with_alpha(title_bg_opaque, drag_alpha);
+    let title_fg = if is_focused {
+        theme.contrast_fg(title_bg_opaque)
+    } else {
+        TEXT_STRONG
+    };
     let border_color = if is_focused {
         theme.accent()
     } else {
@@ -2725,7 +3492,7 @@ pub fn cm3_floating_window(
     let mut request_focus = false;
     let mut request_close = false;
 
-    Area::new(win_id)
+    let area_resp = Area::new(win_id)
         .order(Order::Middle)
         .fixed_pos(rect_pos)
         .interactable(true)
@@ -2738,6 +3505,21 @@ pub fn cm3_floating_window(
                 let sr = outer_rect.expand(expand).translate(Vec2::new(0.0, 4.0));
                 ui.painter()
                     .rect_filled(sr, CornerRadius::ZERO, Color32::from_black_alpha(alpha));
+            }
+
+            // Detect primary press anywhere inside outer_rect on this window's layer (including body widgets).
+            let area_layer_id = ui.layer_id();
+            let press_pos = ctx.input(|i| {
+                if i.pointer.primary_pressed() {
+                    i.pointer.interact_pos()
+                } else {
+                    None
+                }
+            });
+            if press_pos.is_some_and(|p| {
+                outer_rect.contains(p) && ctx.layer_id_at(p) == Some(area_layer_id)
+            }) {
+                request_focus = true;
             }
 
             let bg_resp = ui.interact(outer_rect, win_id.with("bg"), Sense::click());
@@ -2811,13 +3593,13 @@ pub fn cm3_floating_window(
             // Title & optional subtitle
             let title_clip = ui.painter().with_clip_rect(drag_rect);
             let title_galley =
-                title_clip.layout_no_wrap(spec.title.clone(), theme.font(FONT_TITLE), TEXT_STRONG);
+                title_clip.layout_no_wrap(spec.title.clone(), theme.font(FONT_TITLE), title_fg);
             let title_pos = Pos2::new(
                 title_rect.left() + 9.0,
                 title_rect.center().y - title_galley.size().y * 0.5,
             );
             let title_right = title_pos.x + title_galley.size().x;
-            title_clip.galley(title_pos, title_galley, TEXT_STRONG);
+            title_clip.galley(title_pos, title_galley, title_fg);
 
             if !win.collapsed && !spec.subtitle.is_empty() {
                 title_clip.text(
@@ -2896,12 +3678,12 @@ pub fn cm3_floating_window(
                     },
                 );
 
-                // --- 5 Edge Resize Grips (E, W, S, SE, SW; hidden when maximized) ---
+                // --- 5 Edge Resize Grips on outer rim (E, W, S, SE, SW; hidden when maximized) ---
                 if !win.maximized {
-                    // East
+                    // East outer rim
                     let e_rect = Rect::from_min_max(
-                        Pos2::new(outer_rect.right() - 4.0, title_rect.bottom()),
-                        Pos2::new(outer_rect.right() + 6.0, outer_rect.bottom() - 12.0),
+                        Pos2::new(outer_rect.right() - 2.0, title_rect.bottom()),
+                        Pos2::new(outer_rect.right() + 6.0, outer_rect.bottom() - 8.0),
                     );
                     let e_resp = ui
                         .interact(e_rect, win_id.with("rz_e"), Sense::drag())
@@ -2911,10 +3693,10 @@ pub fn cm3_floating_window(
                         request_focus = true;
                     }
 
-                    // West (anchors right edge)
+                    // West outer rim (anchors right edge)
                     let w_rect = Rect::from_min_max(
                         Pos2::new(outer_rect.left() - 6.0, title_rect.bottom()),
-                        Pos2::new(outer_rect.left() + 4.0, outer_rect.bottom() - 12.0),
+                        Pos2::new(outer_rect.left() + 2.0, outer_rect.bottom() - 8.0),
                     );
                     let w_resp = ui
                         .interact(w_rect, win_id.with("rz_w"), Sense::drag())
@@ -2927,10 +3709,10 @@ pub fn cm3_floating_window(
                         request_focus = true;
                     }
 
-                    // South
+                    // South outer rim
                     let s_rect = Rect::from_min_max(
-                        Pos2::new(outer_rect.left() + 12.0, outer_rect.bottom() - 4.0),
-                        Pos2::new(outer_rect.right() - 12.0, outer_rect.bottom() + 6.0),
+                        Pos2::new(outer_rect.left() + 8.0, outer_rect.bottom() - 2.0),
+                        Pos2::new(outer_rect.right() - 8.0, outer_rect.bottom() + 6.0),
                     );
                     let s_resp = ui
                         .interact(s_rect, win_id.with("rz_s"), Sense::drag())
@@ -2940,10 +3722,10 @@ pub fn cm3_floating_window(
                         request_focus = true;
                     }
 
-                    // South-East (20x20 grip + 6x6 #6d6d6d L-bracket)
+                    // South-East outer rim corner + 6x6 #6d6d6d L-bracket
                     let se_rect = Rect::from_min_max(
-                        Pos2::new(outer_rect.right() - 13.0, outer_rect.bottom() - 13.0),
-                        Pos2::new(outer_rect.right() + 7.0, outer_rect.bottom() + 7.0),
+                        Pos2::new(outer_rect.right() - 8.0, outer_rect.bottom() - 8.0),
+                        Pos2::new(outer_rect.right() + 6.0, outer_rect.bottom() + 6.0),
                     );
                     let se_resp = ui
                         .interact(se_rect, win_id.with("rz_se"), Sense::drag())
@@ -2961,10 +3743,10 @@ pub fn cm3_floating_window(
                     ui.painter()
                         .line_segment([Pos2::new(p_br.x, p_br.y - 6.0), p_br], l_stroke);
 
-                    // South-West (anchors right edge)
+                    // South-West outer rim corner (anchors right edge)
                     let sw_rect = Rect::from_min_max(
-                        Pos2::new(outer_rect.left() - 7.0, outer_rect.bottom() - 13.0),
-                        Pos2::new(outer_rect.left() + 13.0, outer_rect.bottom() + 7.0),
+                        Pos2::new(outer_rect.left() - 6.0, outer_rect.bottom() - 8.0),
+                        Pos2::new(outer_rect.left() + 8.0, outer_rect.bottom() + 6.0),
                     );
                     let sw_resp = ui
                         .interact(sw_rect, win_id.with("rz_sw"), Sense::drag())
@@ -2997,22 +3779,107 @@ pub fn cm3_floating_window(
         manager.windows.insert(spec.id.clone(), win);
         if request_focus {
             manager.focus(&spec.id);
+            ctx.move_to_top(area_resp.response.layer_id);
             ev.focused = true;
+        } else if is_focused {
+            ctx.move_to_top(area_resp.response.layer_id);
         }
     }
     ev
 }
 
 // ---------------------------------------------------------------------------
-// Shared Viewport Popup Clamping / Flipping Helper
+// Shared Viewport Popup Clamping, Pixel Snapping & Tree-Depth Helpers
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    static CM3_TREE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CM3_ROW_HAS_DROPDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CM3_ROW_HAS_COLOR_PICKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct TreeDepthGuard {
+    prev: usize,
+}
+
+impl TreeDepthGuard {
+    fn push(next: usize) -> Self {
+        let prev = CM3_TREE_DEPTH.with(|d| {
+            let old = d.get();
+            d.set(next);
+            old
+        });
+        Self { prev }
+    }
+}
+
+impl Drop for TreeDepthGuard {
+    fn drop(&mut self) {
+        CM3_TREE_DEPTH.with(|d| d.set(self.prev));
+    }
+}
+
+#[inline]
+fn snap_rect_px(r: Rect) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(r.left().round(), r.top().round()),
+        Pos2::new(r.right().round(), r.bottom().round()),
+    )
+}
+
+#[inline]
+fn paint_crisp_border_1px(painter: &Painter, rect: Rect, color: Color32) {
+    let snapped = snap_rect_px(rect);
+    let min_x = snapped.min.x;
+    let min_y = snapped.min.y;
+    let max_x = snapped.max.x;
+    let max_y = snapped.max.y;
+    if max_x - min_x < 1.0 || max_y - min_y < 1.0 {
+        return;
+    }
+    // Top edge: [min_x..max_x, min_y..min_y+1]
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(min_x, min_y), Pos2::new(max_x, min_y + 1.0)),
+        CornerRadius::ZERO,
+        color,
+    );
+    // Bottom edge: [min_x..max_x, max_y-1..max_y]
+    if max_y - min_y > 1.0 {
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(min_x, max_y - 1.0), Pos2::new(max_x, max_y)),
+            CornerRadius::ZERO,
+            color,
+        );
+    }
+    // Left & right inner edges: [min_y+1..max_y-1]
+    if max_y - min_y > 2.0 {
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(min_x, min_y + 1.0),
+                Pos2::new(min_x + 1.0, max_y - 1.0),
+            ),
+            CornerRadius::ZERO,
+            color,
+        );
+        if max_x - min_x > 1.0 {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(max_x - 1.0, min_y + 1.0),
+                    Pos2::new(max_x, max_y - 1.0),
+                ),
+                CornerRadius::ZERO,
+                color,
+            );
+        }
+    }
+}
+
 fn clamp_popup_pos(anchor: Rect, popup_size: Vec2, viewport: Rect) -> Pos2 {
-    let mut x = anchor.left();
-    let mut y = anchor.bottom() + 2.0;
+    let mut x = anchor.left().round();
+    let mut y = anchor.bottom().round() + 1.0;
 
     if y + popup_size.y > viewport.bottom() - 4.0 {
-        let flipped_y = anchor.top() - popup_size.y - 2.0;
+        let flipped_y = anchor.top().round() - popup_size.y - 1.0;
         if flipped_y >= viewport.top() + 4.0 {
             y = flipped_y;
         } else {
@@ -3025,5 +3892,474 @@ fn clamp_popup_pos(anchor: Rect, popup_size: Vec2, viewport: Rect) -> Pos2 {
     if x < viewport.left() + 4.0 {
         x = viewport.left() + 4.0;
     }
-    Pos2::new(x, y)
+    Pos2::new(x.round(), y.round())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_frame(ctx: &egui::Context, events: Vec<egui::Event>, f: impl FnMut(&mut Ui)) {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        raw.focused = true;
+        let mut f = f;
+        let mut out = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default()
+                .frame(Frame::NONE)
+                .show(ui, |ui| {
+                    f(ui);
+                });
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn default_swatches_order_and_css_roundtrip() {
+        let sw = default_recent_swatches();
+        assert_eq!(sw.len(), 36);
+        // Row 0 col 0 is pure red (h = 0)
+        assert_eq!(sw[0].to_u8(), [255, 0, 0]);
+        // Row 3 (18..24) is white -> black grayscale
+        assert_eq!(sw[18].to_u8(), [255, 255, 255]);
+        assert_eq!(sw[19].to_u8(), [204, 204, 204]);
+        assert_eq!(sw[20].to_u8(), [153, 153, 153]);
+        assert_eq!(sw[21].to_u8(), [102, 102, 102]);
+        assert_eq!(sw[22].to_u8(), [51, 51, 51]);
+        assert_eq!(sw[23].to_u8(), [0, 0, 0]);
+
+        let black = Rgba::new(0.0, 0.0, 0.0, 1.0);
+        assert_eq!(format_picker_css(black, false), "rgb(0, 0, 0)");
+        assert_eq!(format_picker_css(black, true), "rgba(0, 0, 0, 1)");
+        let semi = Rgba::new(1.0, 0.0, 0.5, 0.5);
+        let css = format_picker_css(semi, true);
+        assert!(css.starts_with("rgba(255, 0, 128, 0.5"));
+        let parsed_css = parse_picker_color("rgb(12, 34, 56)").expect("rgb parse");
+        assert_eq!(parsed_css.to_u8(), [12, 34, 56, 255]);
+        let parsed_hex = parse_picker_color("#112233").expect("hex parse");
+        assert_eq!(parsed_hex.to_u8(), [0x11, 0x22, 0x33, 255]);
+        assert!(parse_picker_color("not-a-color").is_none());
+    }
+
+    #[test]
+    fn scrub_pending_drag_to_text_edit_cancels_transaction_and_commits_cleanly() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let id = Id::unique("test_scrub_tx");
+        let cfg = ScrubConfig::new(0.0, 100.0, 1.0, 2);
+        let mut val = 10.0_f64;
+
+        // Frame 1: layout to discover hit rect
+        let mut hit_center = Pos2::ZERO;
+        run_frame(&ctx, vec![], |ui| {
+            let start = ui.cursor().min;
+            let ev = cm3_scrub_number(ui, id, &mut val, cfg, &theme);
+            assert_eq!(ev, ScrubEvent::default());
+            hit_center = Pos2::new(start.x + 8.0, start.y + 10.0);
+        });
+
+        // Frame 2: pointer down -> PendingDrag, ev.started = true
+        let mut ev2 = ScrubEvent::default();
+        run_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(hit_center),
+                egui::Event::PointerButton {
+                    pos: hit_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            |ui| {
+                ev2 = cm3_scrub_number(ui, id, &mut val, cfg, &theme);
+            },
+        );
+        assert!(ev2.started && !ev2.cancelled && !ev2.committed);
+
+        // Frame 3: pointer up without dragging -> immediately cancels PendingDrag tx & enters TextEdit
+        let mut ev3 = ScrubEvent::default();
+        run_frame(
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: hit_center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            |ui| {
+                ev3 = cm3_scrub_number(ui, id, &mut val, cfg, &theme);
+            },
+        );
+        assert!(ev3.cancelled && !ev3.started && !ev3.committed && !ev3.changed);
+
+        // Frame 4: TextEdit renders and requests focus
+        let mut ev4 = ScrubEvent::default();
+        run_frame(&ctx, vec![], |ui| {
+            ev4 = cm3_scrub_number(ui, id, &mut val, cfg, &theme);
+        });
+        assert_eq!(ev4, ScrubEvent::default());
+
+        // Frame 5: Escape in TextEdit -> reverts and emits NO events (no open tx)
+        let mut ev5 = ScrubEvent::default();
+        run_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            |ui| {
+                ev5 = cm3_scrub_number(ui, id, &mut val, cfg, &theme);
+            },
+        );
+        assert_eq!(ev5, ScrubEvent::default());
+        assert!((val - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scrub_read_only_mid_pending_drag_emits_cancel() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let id = Id::unique("test_scrub_ro");
+        let cfg = ScrubConfig::new(0.0, 100.0, 1.0, 2);
+        let mut val = 25.0_f64;
+
+        let mut hit_center = Pos2::ZERO;
+        run_frame(&ctx, vec![], |ui| {
+            let start = ui.cursor().min;
+            let _ = cm3_scrub_number(ui, id, &mut val, cfg, &theme);
+            hit_center = Pos2::new(start.x + 8.0, start.y + 10.0);
+        });
+        run_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(hit_center),
+                egui::Event::PointerButton {
+                    pos: hit_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            |ui| {
+                let ev = cm3_scrub_number(ui, id, &mut val, cfg, &theme);
+                assert!(ev.started);
+            },
+        );
+
+        let mut ev_ro = ScrubEvent::default();
+        run_frame(&ctx, vec![], |ui| {
+            ev_ro = cm3_scrub_number(ui, id, &mut val, cfg.with_read_only(true), &theme);
+        });
+        assert!(ev_ro.cancelled);
+        assert!((val - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn vector2_text_edit_commit_scales_linked_axis_proportionally() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let id = Id::unique("test_vec2_link");
+        let cfg = ScrubConfig::new(0.0, 100.0, 1.0, 2);
+        let mut vals = [2.0_f64, 6.0_f64];
+
+        // Enter TextEdit on axis 0 via temp memory (simulating pointer-down -> pointer-up -> typed "5.00")
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                id.with(0usize),
+                ScrubMemory {
+                    mode: ScrubMode::TextEdit {
+                        buffer: "5.00".to_owned(),
+                        initial_display: 2.0,
+                        start_value: 2.0,
+                        just_entered: false,
+                        alt_at_start: false,
+                    },
+                },
+            );
+        });
+        ctx.memory_mut(|m| m.request_focus(id.with(0usize).with("text_edit")));
+
+        // Frame to settle focus
+        run_frame(&ctx, vec![], |ui| {
+            let _ = cm3_vector2_with_sep(ui, id, &mut vals, &cfg, true, ",", &theme);
+        });
+
+        // Press Enter to commit 5.00 on axis 0 -> axis 1 should scale 6.0 * (5.0 / 2.0) = 15.0
+        let mut ev = ScrubEvent::default();
+        run_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            |ui| {
+                ev = cm3_vector2_with_sep(ui, id, &mut vals, &cfg, true, ",", &theme);
+            },
+        );
+        assert!(ev.changed && ev.committed && !ev.started && !ev.cancelled);
+        assert!((vals[0] - 5.0).abs() < 1e-6);
+        assert!((vals[1] - 15.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn property_row_col2_aligns_identically_for_short_and_long_labels() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let col_state = PropertyColumnState::default();
+        let mut short_x = 0.0_f32;
+        let mut long_x = 0.0_f32;
+
+        run_frame(&ctx, vec![], |ui| {
+            ui.set_width(321.0);
+            cm3_property_row_aligned(
+                ui,
+                "Time",
+                true,
+                col_state,
+                &theme,
+                |_| {},
+                |ui| {
+                    short_x = ui.cursor().left();
+                },
+            );
+            cm3_property_row_aligned(
+                ui,
+                "Multisample motion blur",
+                true,
+                col_state,
+                &theme,
+                |_| {},
+                |ui| {
+                    long_x = ui.cursor().left();
+                },
+            );
+        });
+        assert!(
+            (short_x - long_x).abs() < 1e-3,
+            "Column 2 misaligned: short={short_x}, long={long_x}"
+        );
+    }
+
+    #[test]
+    fn gradient_bar_stop_cancel_and_switch_events() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let id = Id::unique("test_grad_bar");
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut stops = vec![
+            GradientStop {
+                position: 0.0,
+                color: "rgba(255,0,0,1.000)".to_owned(),
+            },
+            GradientStop {
+                position: 1.0,
+                color: "rgba(0,0,255,1.000)".to_owned(),
+            },
+        ];
+
+        // Open stop color picker popup in dirty state with pre-drag initial = red, current = green
+        let stop_popup_id = id.with("stop_color").with("hsva_popup");
+        stops[0].color = "rgba(0,255,0,1.000)".to_owned();
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                stop_popup_id,
+                ColorPopupState {
+                    open: true,
+                    initial: Rgba::new(1.0, 0.0, 0.0, 1.0),
+                    hsv: Rgb::from_u8(0, 255, 0).to_hsv(),
+                    alpha: 1.0,
+                    hex_buf: "rgba(0, 255, 0, 1)".to_owned(),
+                    dirty: true,
+                },
+            );
+        });
+
+        // Press Escape -> restores red, emits changed=true, cancelled=true, committed=false
+        let mut ev = GradientBarEvent::default();
+        run_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            |ui| {
+                ev = cm3_gradient_bar(ui, id, &mut stops, vp, &theme);
+            },
+        );
+        assert!(ev.changed && ev.cancelled && !ev.committed);
+        assert_eq!(parse_css_rgba(&stops[0].color).to_u8(), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn hsva_color_picker_read_only_mid_open_cancels_and_restores() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let id = Id::unique("test_color_ro_cancel");
+        let popup_id = id.with("hsva_popup");
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let initial = Rgba::new(0.2, 0.4, 0.8, 1.0);
+        let mut color = Rgba::new(0.9, 0.1, 0.1, 1.0);
+
+        // Case 1: popup is open and dirty, then read_only flips true -> restores initial, cancels, changed=true
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                popup_id,
+                ColorPopupState {
+                    open: true,
+                    initial,
+                    hsv: color.rgb().to_hsv(),
+                    alpha: 1.0,
+                    hex_buf: format_picker_css(color, false),
+                    dirty: true,
+                },
+            );
+        });
+        let mut ev = ColorPickerEvent::default();
+        run_frame(&ctx, vec![], |ui| {
+            ev = cm3_hsva_color_picker(ui, id, &mut color, false, true, vp, &theme);
+        });
+        assert!(ev.cancelled && ev.changed && !ev.committed && !ev.started);
+        assert_eq!(color.to_u8(), initial.to_u8());
+        let st = ctx
+            .data_mut(|d| d.get_temp::<ColorPopupState>(popup_id))
+            .expect("persisted state");
+        assert!(!st.open && !st.dirty);
+
+        // Case 2: popup is open and clean (not dirty), read_only flips true -> cancels, changed=false
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                popup_id,
+                ColorPopupState {
+                    open: true,
+                    initial,
+                    hsv: initial.rgb().to_hsv(),
+                    alpha: 1.0,
+                    hex_buf: format_picker_css(initial, false),
+                    dirty: false,
+                },
+            );
+        });
+        let mut ev_clean = ColorPickerEvent::default();
+        run_frame(&ctx, vec![], |ui| {
+            ev_clean = cm3_hsva_color_picker(ui, id, &mut color, false, true, vp, &theme);
+        });
+        assert!(ev_clean.cancelled && !ev_clean.changed && !ev_clean.committed);
+        let st2 = ctx
+            .data_mut(|d| d.get_temp::<ColorPopupState>(popup_id))
+            .expect("persisted state");
+        assert!(!st2.open && !st2.dirty);
+    }
+
+    #[test]
+    fn gradient_bar_clean_stop_switch_emits_no_spurious_commit() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let id = Id::unique("test_grad_clean_switch");
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut stops = vec![
+            GradientStop {
+                position: 0.0,
+                color: "rgba(255,0,0,1.000)".to_owned(),
+            },
+            GradientStop {
+                position: 1.0,
+                color: "rgba(0,0,255,1.000)".to_owned(),
+            },
+        ];
+
+        // Frame 1: layout to discover stop 1 rect (right end of 245px lane)
+        let mut lane_origin = Pos2::ZERO;
+        run_frame(&ctx, vec![], |ui| {
+            ui.set_width(245.0);
+            lane_origin = ui.cursor().min;
+            let _ = cm3_gradient_bar(ui, id, &mut stops, vp, &theme);
+        });
+
+        // Open stop 0's color picker in clean (dirty=false) state
+        let stop_popup_id = id.with("stop_color").with("hsva_popup");
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                stop_popup_id,
+                ColorPopupState {
+                    open: true,
+                    initial: Rgba::new(1.0, 0.0, 0.0, 1.0),
+                    hsv: Rgb::from_u8(255, 0, 0).to_hsv(),
+                    alpha: 1.0,
+                    hex_buf: "rgba(255, 0, 0, 1)".to_owned(),
+                    dirty: false,
+                },
+            );
+        });
+
+        // Click stop 1 (at x = lane_origin.x + 245.0, y = lane_origin.y + 30.0 + 3.0 + 7.5)
+        let stop1_pos = Pos2::new(lane_origin.x + 244.0, lane_origin.y + 40.5);
+        let mut ev_down = GradientBarEvent::default();
+        run_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(stop1_pos),
+                egui::Event::PointerButton {
+                    pos: stop1_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            |ui| {
+                ui.set_width(245.0);
+                ev_down = cm3_gradient_bar(ui, id, &mut stops, vp, &theme);
+            },
+        );
+        let mut ev_up = GradientBarEvent::default();
+        run_frame(
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: stop1_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            |ui| {
+                ui.set_width(245.0);
+                ev_up = cm3_gradient_bar(ui, id, &mut stops, vp, &theme);
+            },
+        );
+        assert!(!ev_down.committed && !ev_up.committed);
+        let st = ctx
+            .data_mut(|d| d.get_temp::<ColorPopupState>(stop_popup_id))
+            .expect("stop popup state");
+        assert!(!st.open);
+    }
+
+    #[test]
+    fn scrub_event_merge_preserves_same_frame_text_commit_and_pending_drag_start() {
+        let a = ScrubEvent {
+            started: false,
+            changed: true,
+            committed: true,
+            cancelled: false,
+        };
+        let b = ScrubEvent {
+            started: true,
+            changed: false,
+            committed: false,
+            cancelled: false,
+        };
+        let merged = a.merge(b);
+        assert!(merged.started && merged.changed && merged.committed && !merged.cancelled);
+        assert_eq!(b.merge(a), merged);
+    }
 }

@@ -201,7 +201,7 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 
     let dir_raw = vec2<f32>(
         -((luma_nw + luma_ne) - (luma_sw + luma_se)),
-        (luma_nw + luma_sw) - (luma_ne + luma_se),
+        (luma_ne + luma_se) - (luma_nw + luma_sw),
     );
     let dir_reduce = max((luma_nw + luma_ne + luma_sw + luma_se) * (0.25 * 0.125), 1.0 / 128.0);
     let rcp_dir_min = 1.0 / (min(abs(dir_raw.x), abs(dir_raw.y)) + dir_reduce);
@@ -266,10 +266,12 @@ pub const SHADER_RADIAL_BLUR: &str = r#"
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     const SAMPLES: i32 = 32;
+    let orig = sample_diffuse(in_v.v_uv);
     let density = u.p0.x;
     let dither = u.p0.y;
     let decay = clamp(u.p0.z, 0.0, 1.0);
     let weight = u.p0.w;
+    let overbright = (u.flags & 1u) != 0u;
     let center = vec2<f32>(0.5) + u.p1.xy;
     let step_uv = (in_v.v_uv - center) * (density / f32(SAMPLES));
     let jitter = hash12(in_v.v_uv * u.resolution) * dither;
@@ -279,15 +281,15 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     var illum = 1.0;
     for (var i = 0; i < SAMPLES; i = i + 1) {
         let uv_s = clamp(in_v.v_uv - step_uv * (f32(i) + jitter), vec2<f32>(0.0), vec2<f32>(1.0));
-        let tap_w = illum * weight;
+        let tap_w = select(illum, illum * weight, overbright);
         accum = accum + sample_diffuse(uv_s) * tap_w;
         w_total = w_total + tap_w;
         illum = illum * decay;
     }
-    if ((u.flags & 1u) != 0u) {
+    if (overbright) {
         return vec4<f32>(min(accum.rgb, vec3<f32>(1.0)), clamp(accum.a, 0.0, 1.0));
     }
-    return accum / max(w_total, EPS);
+    return mix(orig, accum / max(w_total, 1e-6), clamp(weight, 0.0, 1.0));
 }
 "#;
 

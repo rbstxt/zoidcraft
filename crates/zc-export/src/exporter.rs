@@ -186,6 +186,19 @@ where
     F: FrameProvider,
     P: FnMut(ExportProgress),
 {
+    if let Ok(meta) = fs::symlink_metadata(&settings.output_path)
+        && !meta.is_dir()
+        && !(meta.is_symlink() && fs::metadata(&settings.output_path).is_ok_and(|m| m.is_dir()))
+    {
+        return Err(ExportError::Io(std::io::Error::new(
+            ErrorKind::NotADirectory,
+            format!(
+                "PNG sequence output path {} already exists and is not a directory",
+                settings.output_path.display()
+            ),
+        )));
+    }
+
     if let Some(parent) = settings.output_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -218,6 +231,10 @@ where
 
         if cancel.load(Ordering::Acquire) {
             return Err(ExportError::Cancelled);
+        }
+
+        if !settings.transparent_alpha {
+            flatten_rgba_over_black_in_place(&mut frame_buf);
         }
 
         let file_name = format!("frame_{:06}.png", offset + 1);
@@ -341,6 +358,18 @@ where
     F: FrameProvider,
     P: FnMut(ExportProgress),
 {
+    if let Ok(meta) = fs::symlink_metadata(&settings.output_path)
+        && meta.is_dir()
+    {
+        return Err(ExportError::Io(std::io::Error::new(
+            ErrorKind::IsADirectory,
+            format!(
+                "video output path {} is an existing directory",
+                settings.output_path.display()
+            ),
+        )));
+    }
+
     let raw_bytes = checked_rgba_len(settings.width, settings.height)?;
     let (enc_w, enc_h) = settings.padded_dimensions();
     let needs_padding = enc_w != settings.width || enc_h != settings.height;
@@ -689,6 +718,10 @@ where
                 break;
             }
 
+            if !settings.transparent_alpha {
+                flatten_rgba_over_black_in_place(&mut raw_frame);
+            }
+
             if needs_padding {
                 pad_rgba_frame_into(
                     &raw_frame,
@@ -977,6 +1010,18 @@ fn publish_temp_output(src: &Path, dst: &Path) -> Result<(), ExportError> {
             }
         }
         Err(err) => Err(ExportError::Io(err)),
+    }
+}
+
+fn flatten_rgba_over_black_in_place(buf: &mut [u8]) {
+    for px in buf.as_chunks_mut::<4>().0 {
+        let a = u16::from(px[3]);
+        if a < 255 {
+            px[0] = ((u16::from(px[0]) * a + 127) / 255) as u8;
+            px[1] = ((u16::from(px[1]) * a + 127) / 255) as u8;
+            px[2] = ((u16::from(px[2]) * a + 127) / 255) as u8;
+            px[3] = 255;
+        }
     }
 }
 
@@ -1371,5 +1416,83 @@ mod tests {
         );
         assert_eq!(fs::read(&file).expect("read backup"), b"ORIGINAL-BACKUP");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flatten_rgba_over_black_and_early_destination_checks_work() {
+        let mut px = [200_u8, 100, 50, 128, 255, 255, 255, 0, 10, 20, 30, 255];
+        flatten_rgba_over_black_in_place(&mut px);
+        assert_eq!(px, [100, 50, 25, 255, 0, 0, 0, 255, 10, 20, 30, 255]);
+
+        // Opaque PNG sequence flattens semi-transparent pixels onto black with alpha=255.
+        let out_dir = unique_test_path("opaque_png_seq");
+        let settings = ExportSettings {
+            width: 2,
+            height: 1,
+            fps: 30.0,
+            start_frame: 0,
+            end_frame: 1,
+            container: ExportContainer::PngSequence,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::None,
+            quality: QualityMode::Crf(18),
+            audio_bitrate_kbps: 0,
+            sample_rate: 48_000,
+            transparent_alpha: false,
+            output_path: out_dir.clone(),
+            ffmpeg_binary: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        export_video(&settings, None, &cancel, |_idx, buf: &mut Vec<u8>| {
+            buf.copy_from_slice(&[200, 100, 50, 128, 255, 255, 255, 0]);
+            Ok(())
+        })
+        .expect("opaque PNG sequence export succeeds");
+        let decoded = image::open(out_dir.join("frame_000001.png"))
+            .expect("decode opaque PNG")
+            .to_rgba8();
+        assert_eq!(
+            decoded.as_raw().as_slice(),
+            &[100, 50, 25, 255, 0, 0, 0, 255]
+        );
+        let _ = fs::remove_dir_all(&out_dir);
+
+        // PNG sequence rejects existing regular file before rendering any frames.
+        let existing_file = unique_test_path("file_not_dir");
+        let _file_guard = TempFileGuard::new(existing_file.clone());
+        fs::write(&existing_file, b"regular file").expect("write file");
+        let mut bad_png = settings.clone();
+        bad_png.output_path = existing_file.clone();
+        let mut rendered = false;
+        let err = export_video(&bad_png, None, &cancel, |_idx, _buf: &mut Vec<u8>| {
+            rendered = true;
+            Ok(())
+        })
+        .expect_err("PNG sequence targeting regular file must fail early");
+        assert!(matches!(err, ExportError::Io(_)));
+        assert!(
+            !rendered,
+            "frame provider must not be called on incompatible destination"
+        );
+
+        // FFmpeg export rejects existing directory before rendering or spawning FFmpeg.
+        let existing_dir = unique_test_path("dir_not_file");
+        fs::create_dir_all(&existing_dir).expect("create dir");
+        let bad_video = ExportSettings {
+            container: ExportContainer::Mp4,
+            output_path: existing_dir.clone(),
+            ..settings
+        };
+        let err = export_video(&bad_video, None, &cancel, |_idx, _buf: &mut Vec<u8>| {
+            rendered = true;
+            Ok(())
+        })
+        .expect_err("video export targeting directory must fail early");
+        assert!(matches!(err, ExportError::Io(_)));
+        assert!(
+            !rendered,
+            "frame provider must not be called when destination is a directory"
+        );
+        let _ = fs::remove_dir_all(&existing_dir);
     }
 }

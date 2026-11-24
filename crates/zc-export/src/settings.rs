@@ -64,7 +64,7 @@ pub enum AudioCodec {
 /// Video rate-control mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityMode {
-    /// Constant Rate Factor (`0..=51` for H.264/H.265, `0..=63` for VP8/VP9/AV1).
+    /// Constant Rate Factor (`0..=51` for H.264/H.265, `4..=63` for VP8, `0..=63` for VP9/AV1).
     Crf(u8),
     /// Target average video bitrate in kilobits per second.
     BitrateKbps(u32),
@@ -91,7 +91,7 @@ pub struct ExportSettings {
     pub audio_codec: AudioCodec,
     /// Video quality or bitrate control.
     pub quality: QualityMode,
-    /// Lossy audio bitrate in kbps (e.g. `192`). Ignored for PCM/None.
+    /// Lossy audio bitrate in kbps (e.g. `192`; Opus is clamped to `6..=510`). Ignored for PCM/None.
     pub audio_bitrate_kbps: u32,
     /// Audio sample rate in Hz (typically `48_000` or `44_100`).
     pub sample_rate: u32,

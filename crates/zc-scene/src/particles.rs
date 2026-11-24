@@ -172,19 +172,19 @@ pub fn evaluate_particle(pid: u32, time: f32, params: &ParticleSystemParams) -> 
         };
     }
 
-    let i = pid as f32;
-    let delay = i / params.rate;
+    let delay = pid as f32 / params.rate;
     let alive = time >= delay;
     let elapsed = time - delay;
     let cycles_floor = (elapsed / params.lifetime).floor();
     let tau = elapsed - cycles_floor * params.lifetime;
     let cycle = cycles_floor + 1.0;
-    let k = i * cycle;
+    let seed = (u64::from(pid) + 1) as f32;
+    let k = seed * cycle;
     let u = (tau / params.lifetime).clamp(0.0, 1.0);
 
-    let r1 = particle_hash(k, i);
-    let r2 = particle_hash(k, 2.0 * i);
-    let r3 = particle_hash(k, 3.0 * i);
+    let r1 = particle_hash(k, seed);
+    let r2 = particle_hash(k, 2.0 * seed);
+    let r3 = particle_hash(k, 3.0 * seed);
 
     let spawn_offset = match params.position_dist {
         PositionDistribution::Box => {
@@ -209,7 +209,15 @@ pub fn evaluate_particle(pid: u32, time: f32, params: &ParticleSystemParams) -> 
         }
         VelocityDistribution::Sphere => {
             let speed = params.radial_velocity + (r3 - 0.5) * params.radial_velocity_spread;
-            spawn_offset.normalize_or_zero() * speed
+            let dir = if spawn_offset.length_squared() > 1e-8 {
+                spawn_offset.normalize()
+            } else {
+                let phi = TAU * r1;
+                let cos_theta = 1.0 - 2.0 * r2;
+                let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+                Vec3::new(sin_theta * phi.cos(), sin_theta * phi.sin(), cos_theta)
+            };
+            dir * speed
         }
     };
 

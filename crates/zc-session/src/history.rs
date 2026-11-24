@@ -202,6 +202,15 @@ impl<T> UndoStack<T> {
         self.active_tx.as_ref().map(|tx| tx.label.as_str())
     }
 
+    /// Iterates over all snapshots currently retained in undo history, redo history, and any active transaction baseline.
+    pub fn snapshots(&self) -> impl Iterator<Item = &T> {
+        self.undo_stack
+            .iter()
+            .map(|e| &e.snapshot)
+            .chain(self.redo_stack.iter().map(|e| &e.snapshot))
+            .chain(self.active_tx.iter().map(|tx| &tx.baseline))
+    }
+
     /// Clears all undo/redo entries and resets dirty tracking to a clean state.
     pub fn clear(&mut self) {
         self.undo_stack.clear();
@@ -229,6 +238,7 @@ impl<T> UndoStack<T> {
         self.current_revision = self.alloc_revision();
 
         if self.max_entries == 0 || bytes > self.max_bytes {
+            self.clear_undo();
             return;
         }
 
@@ -325,6 +335,8 @@ impl<T> UndoStack<T> {
                 revision: tx.baseline_revision,
             });
             self.enforce_limits(false);
+        } else {
+            self.clear_undo();
         }
 
         Ok(true)
@@ -367,6 +379,8 @@ impl<T> UndoStack<T> {
                 revision: redo_revision,
             });
             self.enforce_limits(true);
+        } else {
+            self.clear_redo();
         }
 
         Some((entry.label, entry.snapshot))
@@ -407,6 +421,8 @@ impl<T> UndoStack<T> {
                 revision: undo_revision,
             });
             self.enforce_limits(false);
+        } else {
+            self.clear_undo();
         }
 
         Some((entry.label, entry.snapshot))
@@ -425,6 +441,11 @@ impl<T> UndoStack<T> {
         let rev = self.next_revision;
         self.next_revision = self.next_revision.saturating_add(1);
         rev
+    }
+
+    fn clear_undo(&mut self) {
+        self.undo_stack.clear();
+        self.undo_bytes = 0;
     }
 
     fn clear_redo(&mut self) {
@@ -515,5 +536,48 @@ mod tests {
         }
         assert_eq!(stack.undo_len(), 16);
         assert_eq!(stack.total_bytes(), 64 * 1024);
+    }
+
+    #[test]
+    fn oversized_snapshot_clears_stack_to_preserve_contiguity() {
+        let mut stack = UndoStack::<Vec<u8>>::with_limits(10, 16);
+        stack.push("small-1", vec![1u8; 4]);
+        stack.push("small-2", vec![2u8; 4]);
+        assert_eq!(stack.undo_len(), 2);
+
+        // Oversized push cannot be stored -> clears undo_stack so Undo never skips it.
+        stack.push("too-big", vec![3u8; 32]);
+        assert_eq!(stack.undo_len(), 0);
+        assert!(!stack.can_undo());
+
+        // Same for commit_transaction when baseline exceeds max_bytes.
+        stack.push("small-3", vec![4u8; 4]);
+        assert_eq!(stack.undo_len(), 1);
+        stack
+            .begin_transaction("big-tx", vec![5u8; 32])
+            .expect("begin tx");
+        assert!(stack.commit_transaction(true).expect("commit tx"));
+        assert_eq!(stack.undo_len(), 0);
+
+        // Oversized current snapshot on undo clears stale redo_stack.
+        stack.push("e1", vec![1u8; 4]);
+        stack.push("e2", vec![2u8; 4]);
+        let _ = stack.undo(vec![3u8; 4]).expect("undo e2");
+        assert_eq!(stack.redo_len(), 1);
+        let _ = stack
+            .undo(vec![9u8; 32])
+            .expect("undo e1 with huge current");
+        assert_eq!(stack.redo_len(), 0);
+
+        // Oversized current snapshot on redo clears stale undo_stack.
+        stack.push("r1", vec![1u8; 4]);
+        stack.push("r2", vec![2u8; 4]);
+        let _ = stack.undo(vec![3u8; 4]).expect("undo r2");
+        assert_eq!(stack.undo_len(), 1);
+        assert_eq!(stack.redo_len(), 1);
+        let _ = stack
+            .redo(vec![8u8; 32])
+            .expect("redo r2 with huge current");
+        assert_eq!(stack.undo_len(), 0);
     }
 }

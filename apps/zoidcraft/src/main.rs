@@ -22,11 +22,11 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::{Align2, Area, Color32, CornerRadius, Frame, Id, Key, Order, Pos2, Rect, Stroke, Vec2};
 use serde_json::{Value, json};
-use zc_anim::{InterpolationMode, eval_easing};
+use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
 use zc_audio::{
     AudioBuffer, AudioClipScheduleItem, AudioMixWindow, AudioOutputHandle, ClipAudioSampleParams,
-    MasterPlaybackClock, STANDARD_SAMPLE_RATE, WaveformPeaks, decode_audio_bytes,
-    effective_playback_rate, try_mix_offline_stereo_animated,
+    MasterPlaybackClock, STANDARD_SAMPLE_RATE, WaveformPeaks, apply_gain_and_pan,
+    decode_audio_bytes, effective_playback_rate, try_mix_offline_stereo_animated,
 };
 use zc_export::{
     AudioCodec, ExportContainer as CoreExportContainer, ExportError, ExportProgress, ExportReport,
@@ -34,7 +34,8 @@ use zc_export::{
     probe_ffmpeg,
 };
 use zc_project::{
-    AssetKind, MediaItem, Project, Uuid, import_pz, load_zcraft, save_zcraft, write_atomic,
+    AssetKind, LayerKind, MediaItem, Project, Uuid, import_pz, load_zcraft, save_zcraft,
+    write_atomic,
 };
 use zc_render::{
     CameraParams, FrameCache, ProjectRenderEngine, RenderError, RenderOverrides, RenderTarget,
@@ -42,19 +43,20 @@ use zc_render::{
 };
 use zc_session::{Command, Session, SessionProperty};
 
-use ui::graph_editor::{GraphEditorState, show_graph_editor_window};
+use ui::graph_editor::{GraphDragState, GraphEditorState, show_graph_editor_window};
 use ui::layout::{Cm3Workspace, UiAction};
 use ui::panels::{
     ExportAudioCodec, ExportCm3Preset, ExportContainer as UiExportContainer, ExportMode,
     ExportRateControl, ExportSettings as UiExportSettings, ExportStatus, ExportVideoCodec,
+    PanelsState,
 };
 use ui::shortcuts::dispatch_shortcuts;
 use ui::theme::{
     BG_PANEL, BG_SUNKEN, BG_TITLE, BORDER_PANEL, Cm3Theme, FONT_COMPACT, FONT_SMALL, TEXT_BRIGHT,
     TEXT_PRIMARY, apply_cm3_style, install_cm3_fonts,
 };
-use ui::timeline::{AudioWaveformPeaks, TimelineViewState, show_timeline};
-use ui::viewport::{EditorCameraState, ViewportState, show_viewport};
+use ui::timeline::{AudioWaveformPeaks, TimelineDragState, TimelineViewState, show_timeline};
+use ui::viewport::{EditorCameraState, ViewportDragState, ViewportState, show_viewport};
 
 const TOAST_LIFETIME: Duration = Duration::from_secs(4);
 const CLEAR_BG_RGBA: [f32; 4] = [29.0 / 255.0, 29.0 / 255.0, 29.0 / 255.0, 1.0];
@@ -86,6 +88,38 @@ fn pack_camera_bits(cam: &EditorCameraState) -> [u32; 7] {
         cam.target.z.to_bits(),
         cam.fov_deg.to_bits(),
     ]
+}
+
+/// Computes the interactive preview render resolution matching the viewport canvas's
+/// logical/CSS dimensions (scaled by `player-plus` quality divisor and clamped to
+/// `[64, seq_res]`), falling back to half sequence resolution before frame 0 layout.
+fn compute_preview_render_resolution(
+    seq_resolution: [u32; 2],
+    canvas_rect: Option<Rect>,
+    divisor: u32,
+) -> (u32, u32) {
+    let seq_w = seq_resolution[0].max(1);
+    let seq_h = seq_resolution[1].max(1);
+    let div = divisor.max(1);
+    let (base_w, base_h) = match canvas_rect {
+        Some(rect)
+            if rect.width().is_finite()
+                && rect.height().is_finite()
+                && rect.width() >= 1.0
+                && rect.height() >= 1.0 =>
+        {
+            (
+                (rect.width().round() as u32).min(seq_w),
+                (rect.height().round() as u32).min(seq_h),
+            )
+        }
+        _ => ((seq_w / 2).max(1), (seq_h / 2).max(1)),
+    };
+    let min_w = 64_u32.min(seq_w);
+    let min_h = 64_u32.min(seq_h);
+    let render_w = ((f64::from(base_w) / f64::from(div)).round() as u32).clamp(min_w, seq_w);
+    let render_h = ((f64::from(base_h) / f64::from(div)).round() as u32).clamp(min_h, seq_h);
+    (render_w, render_h)
 }
 
 // ---------------------------------------------------------------------------
@@ -153,16 +187,12 @@ impl ViewportGpuPresenter {
         }
 
         let aspect = (width.max(1) as f32) / (height.max(1) as f32);
-        let overrides = if editing_camera {
-            let clip_id = if session.selection.clip_ids.len() == 1 {
-                session
-                    .selection
-                    .clip_ids
-                    .first()
-                    .and_then(|s| Uuid::parse_str(s).ok())
-            } else {
-                None
-            };
+        let selected_scene3d_uuid = selected_single_scene3d_clip_uuid(session);
+        let editing_camera_active = editing_camera
+            && session
+                .selection
+                .is_editing_camera_active(&session.playback, selected_scene3d_uuid.is_some());
+        let overrides = if editing_camera_active {
             let selected_object_ids: Vec<Uuid> = session
                 .selection
                 .object_3d_ids
@@ -170,7 +200,7 @@ impl ViewportGpuPresenter {
                 .filter_map(|s| Uuid::parse_str(s).ok())
                 .collect();
             Some(RenderOverrides {
-                editing_camera_clip_id: clip_id,
+                editing_camera_clip_id: selected_scene3d_uuid,
                 editing_camera: Some(CameraParams::perspective_look_at(
                     editor_cam.position.to_array(),
                     editor_cam.target.to_array(),
@@ -257,29 +287,60 @@ impl ViewportGpuPresenter {
             return Ok(());
         }
 
-        let target = RenderTarget::new(
-            &self.engine.ctx,
+        self.engine
+            .ctx
+            .validate_dimensions(width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+
+        let texture = self
+            .render_state
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("zc-viewport-display"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+        // `egui-wgpu` expects a non-sRGB (`Rgba8Unorm`) texture view and applies
+        // `linear_from_gamma_rgb()` itself; passing `Rgba8UnormSrgb` would double-decode sRGB.
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let target = RenderTarget {
+            texture,
+            view,
             width,
             height,
-            wgpu::TextureFormat::Rgba8Unorm,
-            Some("zc-viewport-display"),
-        )?;
+            format: wgpu::TextureFormat::Rgba8Unorm,
+        };
 
-        let mut renderer = self.render_state.renderer.write();
-        if let Some(existing_id) = self.egui_texture_id {
-            renderer.update_egui_texture_from_wgpu_texture(
-                &self.render_state.device,
-                &target.view,
-                wgpu::FilterMode::Linear,
-                existing_id,
-            );
-        } else {
-            let id = renderer.register_native_texture(
-                &self.render_state.device,
-                &target.view,
-                wgpu::FilterMode::Linear,
-            );
-            self.egui_texture_id = Some(id);
+        {
+            let mut renderer = self.render_state.renderer.write();
+            if let Some(existing_id) = self.egui_texture_id {
+                renderer.update_egui_texture_from_wgpu_texture(
+                    &self.render_state.device,
+                    &target.view,
+                    wgpu::FilterMode::Linear,
+                    existing_id,
+                );
+            } else {
+                let id = renderer.register_native_texture(
+                    &self.render_state.device,
+                    &target.view,
+                    wgpu::FilterMode::Linear,
+                );
+                self.egui_texture_id = Some(id);
+            }
         }
         self.display_target = Some(target);
         Ok(())
@@ -370,6 +431,7 @@ struct ZoidCraftApp {
     last_audio_epoch: u64,
     last_audio_playing: bool,
     last_audio_speed: f64,
+    last_audio_frame: f64,
     last_audio_loop: bool,
     last_audio_fps: f64,
     last_audio_seq_len: f64,
@@ -377,6 +439,7 @@ struct ZoidCraftApp {
     ffmpeg_probe_rx: Option<Receiver<Result<String, ExportError>>>,
     active_export: Option<ActiveExportJob>,
     pending_eyedropper: Option<(String, String)>,
+    eyedropper_swallow_pointer: bool,
     pending_unsaved_dialog: Option<PendingUnsavedAction>,
     allow_close_now: bool,
     last_canvas_rect: Option<Rect>,
@@ -392,18 +455,7 @@ impl ZoidCraftApp {
         let theme = Cm3Theme::default();
         apply_cm3_style(&cc.egui_ctx, &theme);
 
-        let mut session = Session::new();
-        // Auto-select the default 3D Scene clip so Objects/Edit/Effects are immediately populated.
-        if let Some(first_clip) = session
-            .document()
-            .video_tracks
-            .first()
-            .and_then(|t| t.clips.first())
-        {
-            let cid = first_clip.id.clone();
-            let ckind = first_clip.kind.clone();
-            let _ = session.selection.select_clip(cid, Some(&ckind), false);
-        }
+        let session = Session::new();
 
         let mut workspace = Cm3Workspace::new();
         sync_export_settings_from_session(&session, &mut workspace.panels.export_settings);
@@ -459,12 +511,14 @@ impl ZoidCraftApp {
             last_audio_epoch: init_epoch,
             last_audio_playing: false,
             last_audio_speed: 0.0,
+            last_audio_frame: 0.0,
             last_audio_loop: init_loop,
             last_audio_fps: init_fps,
             last_audio_seq_len: init_seq_len,
             ffmpeg_probe_rx: Some(probe_rx),
             active_export: None,
             pending_eyedropper: None,
+            eyedropper_swallow_pointer: false,
             pending_unsaved_dialog: None,
             allow_close_now: false,
             last_canvas_rect: None,
@@ -641,6 +695,20 @@ impl ZoidCraftApp {
                     .seek_preserving_playback(self.session.playback.current_frame);
                 self.audio_clock.set_speed(speed);
             } else {
+                // If playback paused in-place (Space / K / Pause button) on a fractional
+                // frame without an explicit seek to a different target frame, snap to the
+                // nearest integer frame so viewport, inspector, and eyedropper agree.
+                if self.last_audio_playing
+                    && (self.session.playback.current_frame - self.last_audio_frame).abs() < 1e-9
+                {
+                    let max_frame = (seq_len - 1.0).max(0.0);
+                    self.session.playback.current_frame = self
+                        .session
+                        .playback
+                        .current_frame
+                        .round()
+                        .clamp(0.0, max_frame);
+                }
                 self.audio_clock
                     .set_frame(self.session.playback.current_frame);
             }
@@ -652,29 +720,46 @@ impl ZoidCraftApp {
         if is_playing {
             if self.audio_output.is_some() && self.audio_clock.snapshot().hardware_clock_active {
                 let exact = self.audio_clock.exact_frame();
-                self.session.playback.current_frame = exact;
                 if !self.audio_clock.is_playing() {
+                    let max_frame = (seq_len - 1.0).max(0.0);
+                    self.session.playback.current_frame = exact.round().clamp(0.0, max_frame);
                     self.session.playback.speed = 0.0;
                     self.last_audio_playing = false;
                     self.last_audio_speed = 0.0;
+                } else {
+                    self.session.playback.current_frame = exact;
                 }
             } else {
                 self.session.playback.advance(dt, fps, seq_len);
+                if !self.session.playback.is_playing() {
+                    let max_frame = (seq_len - 1.0).max(0.0);
+                    self.session.playback.current_frame = self
+                        .session
+                        .playback
+                        .current_frame
+                        .round()
+                        .clamp(0.0, max_frame);
+                }
             }
-            let (rms, peak) = sample_live_audio_meter(
+            let (rms_l, rms_r) = sample_live_audio_meter(
                 &self.session,
                 &self.decoded_audio,
                 self.session.playback.current_frame,
                 fps,
             );
-            self.workspace.audio_meter.update(rms, peak);
+            self.workspace
+                .audio_meter
+                .update_stereo(rms_l, rms_r, dt as f32);
             ctx.request_repaint();
         } else if self.workspace.audio_meter.peak_hold > 0.001
             || self.workspace.audio_meter.rms > 0.001
         {
-            self.workspace.audio_meter.update(0.0, 0.0);
+            self.workspace
+                .audio_meter
+                .update_stereo(0.0, 0.0, dt as f32);
             ctx.request_repaint();
         }
+        self.last_audio_frame = self.session.playback.current_frame;
     }
 
     fn poll_export_worker(&mut self, ctx: &egui::Context) {
@@ -716,35 +801,24 @@ impl ZoidCraftApp {
         }
     }
 
-    fn update_viewport_gpu(&mut self) {
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
-        };
-
-        renderer.sync_cache_budget(self.workspace.panels.app_settings.preview_cache_mib);
-
+    fn current_viewport_render_key(&self) -> (f64, u32, u32, bool, ViewportRenderKey) {
         let player_plus_enabled = self.session.plugins.is_enabled("player-plus");
-        if player_plus_enabled && self.workspace.player_plus.drawing_paused {
-            if self.force_single_render || self.workspace.player_plus.single_render_requested {
-                self.force_single_render = false;
-                self.workspace.player_plus.single_render_requested = false;
-            } else {
-                return;
-            }
-        }
-
-        let [seq_w, seq_h] = self.session.document().resolution;
+        let seq_res = self.session.document().resolution;
         let divisor = if player_plus_enabled {
             self.workspace.player_plus.preview_quality.divisor().max(1)
         } else {
             1
         };
-        let render_w = (seq_w / divisor).max(16);
-        let render_h = (seq_h / divisor).max(16);
+        let (render_w, render_h) =
+            compute_preview_render_resolution(seq_res, self.last_canvas_rect, divisor);
 
         let frame = self.session.playback.current_frame;
-        let frame_index = frame.round() as i64;
-        let editing_camera = self.session.playback.editing_camera;
+        let frame_index = (frame * 1000.0).round() as i64;
+        let selected_scene3d_uuid = selected_single_scene3d_clip_uuid(&self.session);
+        let editing_camera = self
+            .session
+            .selection
+            .is_editing_camera_active(&self.session.playback, selected_scene3d_uuid.is_some());
         let key = ViewportRenderKey {
             frame_index,
             width: render_w,
@@ -757,6 +831,33 @@ impl ZoidCraftApp {
                 [0; 7]
             },
         };
+        (frame, render_w, render_h, editing_camera, key)
+    }
+
+    fn update_viewport_gpu(&mut self) {
+        if self.renderer.is_none() {
+            return;
+        }
+
+        let cache_budget = self.workspace.panels.app_settings.preview_cache_mib;
+        let player_plus_enabled = self.session.plugins.is_enabled("player-plus");
+        if player_plus_enabled && self.workspace.player_plus.drawing_paused {
+            if self.force_single_render || self.workspace.player_plus.single_render_requested {
+                self.force_single_render = false;
+                self.workspace.player_plus.single_render_requested = false;
+            } else {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.sync_cache_budget(cache_budget);
+                }
+                return;
+            }
+        }
+
+        let (frame, render_w, render_h, editing_camera, key) = self.current_viewport_render_key();
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        renderer.sync_cache_budget(cache_budget);
 
         if let Err(err) = renderer.render_viewport_if_dirty(
             &self.session,
@@ -771,6 +872,58 @@ impl ZoidCraftApp {
         }
     }
 
+    fn reset_ephemeral_ui_state(&mut self) {
+        self.pending_eyedropper = None;
+        self.eyedropper_swallow_pointer = false;
+
+        // Reset ephemeral panel states (plugin_notice, shader_editor, expr_editor,
+        // tree drag/rename states, pickers, floating windows) while preserving user
+        // layout splits, preferences, export settings, and probed FFmpeg status.
+        let mut fresh_panels = PanelsState::default();
+        std::mem::swap(
+            &mut fresh_panels.objects_split,
+            &mut self.workspace.panels.objects_split,
+        );
+        std::mem::swap(
+            &mut fresh_panels.effects_split,
+            &mut self.workspace.panels.effects_split,
+        );
+        std::mem::swap(
+            &mut fresh_panels.prop_columns,
+            &mut self.workspace.panels.prop_columns,
+        );
+        std::mem::swap(
+            &mut fresh_panels.export_settings,
+            &mut self.workspace.panels.export_settings,
+        );
+        std::mem::swap(
+            &mut fresh_panels.export_status,
+            &mut self.workspace.panels.export_status,
+        );
+        std::mem::swap(
+            &mut fresh_panels.app_settings,
+            &mut self.workspace.panels.app_settings,
+        );
+        self.workspace.panels = fresh_panels;
+        self.workspace.panels.plugin_notice = None;
+        self.workspace.panels.floating_windows.clear_focus();
+        self.workspace.audio_meter = Default::default();
+
+        self.timeline.drag_state = TimelineDragState::None;
+        self.timeline.snap_guide_x = None;
+        self.timeline.box_selected_clips.clear();
+        self.viewport.drag_state = ViewportDragState::None;
+
+        self.graph_editor.focused_property = None;
+        self.graph_editor.selected_keys.clear();
+        self.graph_editor.handles.clear();
+        self.graph_editor.drag_state = GraphDragState::None;
+        self.graph_editor.snap_guide_frame = None;
+        self.graph_editor.solo_track = None;
+        self.graph_editor.hidden_tracks.clear();
+        self.graph_editor.show_all_easings_popup = false;
+    }
+
     fn handle_new_project(&mut self) {
         if self.has_unsaved_changes() {
             self.pending_unsaved_dialog = Some(PendingUnsavedAction::NewProject);
@@ -781,24 +934,24 @@ impl ZoidCraftApp {
 
     fn perform_new_project(&mut self) {
         self.cancel_active_export();
-        let _ = self.session.execute(Command::NewProject);
-        self.session.mark_saved();
-        if let Some(first_clip) = self
-            .session
-            .document()
-            .video_tracks
-            .first()
-            .and_then(|t| t.clips.first())
-        {
-            let cid = first_clip.id.clone();
-            let ckind = first_clip.kind.clone();
-            let _ = self.session.selection.select_clip(cid, Some(&ckind), false);
+        if self.session.history.is_in_transaction() {
+            let _ = self.session.cancel_transaction();
         }
+        let _ = self.session.execute(Command::NewProject);
+        self.session.selection.clear_all();
+        self.session.mark_saved();
         self.current_file = None;
+        self.pending_unsaved_dialog = None;
+        self.reset_live_audio_output();
+        self.audio_clock.set_frame(0.0);
+        self.last_audio_epoch = self.session.playback.epoch_id;
+        self.last_audio_frame = 0.0;
         self.decoded_audio.clear();
         self.asset_waveform_peaks.clear();
         self.timeline.audio_peaks.clear();
+        self.reset_ephemeral_ui_state();
         self.viewport.camera.reset();
+        self.force_single_render = true;
         sync_export_settings_from_session(
             &self.session,
             &mut self.workspace.panels.export_settings,
@@ -885,22 +1038,19 @@ impl ZoidCraftApp {
         self.cancel_active_export();
         let plugins = self.session.plugins.clone();
         self.session = Session::from_project(project, plugins);
+        self.session.selection.clear_all();
         self.session.mark_saved();
-        if let Some(first_clip) = self
-            .session
-            .document()
-            .video_tracks
-            .first()
-            .and_then(|t| t.clips.first())
-        {
-            let cid = first_clip.id.clone();
-            let ckind = first_clip.kind.clone();
-            let _ = self.session.selection.select_clip(cid, Some(&ckind), false);
-        }
         self.current_file = path;
+        self.pending_unsaved_dialog = None;
         self.reset_live_audio_output();
+        self.audio_clock
+            .set_frame(self.session.playback.current_frame);
+        self.last_audio_epoch = self.session.playback.epoch_id;
+        self.last_audio_frame = self.session.playback.current_frame;
         self.rebuild_audio_caches();
+        self.reset_ephemeral_ui_state();
         self.viewport.camera.reset();
+        self.force_single_render = true;
         sync_export_settings_from_session(
             &self.session,
             &mut self.workspace.panels.export_settings,
@@ -984,27 +1134,13 @@ impl ZoidCraftApp {
         }
     }
 
-    fn handle_import_media(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter(
-                "Media & Assets",
-                &[
-                    "png", "jpg", "jpeg", "webp", "gif", "wav", "mp3", "ogg", "flac", "aac", "mp4",
-                    "obj", "ttf", "otf",
-                ],
-            )
-            .pick_file()
-        else {
-            return;
-        };
-
-        let file_len = match fs::metadata(&path) {
-            Ok(m) => m.len(),
-            Err(err) => {
-                self.show_toast(format!("Failed to inspect media file: {err}"));
-                return;
-            }
-        };
+    fn read_asset_bytes_within_budget(
+        &self,
+        path: &Path,
+    ) -> Result<(String, String, AssetKind, Vec<u8>), String> {
+        let file_len = fs::metadata(path)
+            .map_err(|err| format!("Failed to inspect media file: {err}"))?
+            .len();
         let existing_asset_bytes: u64 = self
             .session
             .project
@@ -1016,33 +1152,27 @@ impl ZoidCraftApp {
         let remaining_budget =
             zc_project::MAX_RETAINED_ASSET_BYTES.saturating_sub(existing_asset_bytes);
         if file_len > remaining_budget {
-            self.show_toast(format!(
+            return Err(format!(
                 "Cannot import media: total embedded assets would exceed {} MiB project limit",
                 zc_project::MAX_RETAINED_ASSET_BYTES / (1024 * 1024)
             ));
-            return;
         }
 
-        let bytes = match fs::File::open(&path).and_then(|file| {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            file.take(remaining_budget.saturating_add(1))
-                .read_to_end(&mut buf)?;
-            Ok(buf)
-        }) {
-            Ok(b) if (b.len() as u64) <= remaining_budget => b,
-            Ok(_) => {
-                self.show_toast(format!(
-                    "Cannot import media: file grew beyond {} MiB project limit",
-                    zc_project::MAX_RETAINED_ASSET_BYTES / (1024 * 1024)
-                ));
-                return;
-            }
-            Err(err) => {
-                self.show_toast(format!("Failed to read media file: {err}"));
-                return;
-            }
-        };
+        let bytes = fs::File::open(path)
+            .and_then(|file| {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                file.take(remaining_budget.saturating_add(1))
+                    .read_to_end(&mut buf)?;
+                Ok(buf)
+            })
+            .map_err(|err| format!("Failed to read media file: {err}"))?;
+        if (bytes.len() as u64) > remaining_budget {
+            return Err(format!(
+                "Cannot import media: file grew beyond {} MiB project limit",
+                zc_project::MAX_RETAINED_ASSET_BYTES / (1024 * 1024)
+            ));
+        }
 
         let filename = path
             .file_name()
@@ -1063,9 +1193,111 @@ impl ZoidCraftApp {
             _ => AssetKind::Misc,
         };
 
+        Ok((filename, ext, kind, bytes))
+    }
+
+    fn handle_pick_asset_for_property(
+        &mut self,
+        target_id: String,
+        property: String,
+        is_lut: bool,
+    ) {
+        let dialog = if is_lut {
+            rfd::FileDialog::new()
+                .add_filter("3D LUT (.cube)", &["cube"])
+                .add_filter(
+                    "LUT & Media Assets",
+                    &["cube", "png", "jpg", "jpeg", "webp", "gif"],
+                )
+        } else {
+            rfd::FileDialog::new().add_filter(
+                "Media & Assets",
+                &[
+                    "png", "jpg", "jpeg", "webp", "gif", "mp4", "obj", "gltf", "glb", "ttf", "otf",
+                    "wav", "mp3", "ogg", "flac", "aac", "cube",
+                ],
+            )
+        };
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+
+        let (filename, _ext, kind, bytes) = match self.read_asset_bytes_within_budget(&path) {
+            Ok(data) => data,
+            Err(msg) => {
+                self.show_toast(msg);
+                return;
+            }
+        };
+
+        let tx_started = self
+            .session
+            .begin_transaction(format!("Assign {filename} to {property}"))
+            .is_ok();
+
+        let asset_id = self
+            .session
+            .project
+            .insert_binary_asset(kind, filename.clone(), bytes);
+        self.session.project.media.push(MediaItem {
+            id: Uuid::new_v4(),
+            name: filename.clone(),
+            asset_id: Some(asset_id.clone()),
+            kind,
+            preserved: BTreeMap::new(),
+        });
+
+        match self.session.execute(Command::SetPropertyValue {
+            target_id,
+            property,
+            value: json!(asset_id),
+        }) {
+            Ok(_) => {
+                if tx_started {
+                    let _ = self.session.commit_transaction(true);
+                }
+                self.show_toast(format!("Assigned {filename}"));
+            }
+            Err(err) => {
+                if tx_started {
+                    let _ = self.session.cancel_transaction();
+                }
+                self.show_toast(format!("Failed to assign {filename}: {err}"));
+            }
+        }
+    }
+
+    fn handle_import_media(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(
+                "Media & Assets",
+                &[
+                    "png", "jpg", "jpeg", "webp", "gif", "wav", "mp3", "ogg", "flac", "aac", "mp4",
+                    "obj", "ttf", "otf", "cube",
+                ],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+
+        let (filename, ext, kind, bytes) = match self.read_asset_bytes_within_budget(&path) {
+            Ok(data) => data,
+            Err(msg) => {
+                self.show_toast(msg);
+                return;
+            }
+        };
+
         let is_audio_ext = matches!(ext.as_str(), "wav" | "mp3" | "ogg" | "flac" | "aac");
         let maybe_audio = if is_audio_ext {
-            decode_audio_bytes(&bytes, Some(&ext)).ok()
+            match decode_audio_bytes(&bytes, Some(&ext)) {
+                Ok(buf) => Some(buf),
+                Err(err) => {
+                    self.show_toast(format!("Failed to decode audio '{filename}': {err}"));
+                    return;
+                }
+            }
         } else {
             None
         };
@@ -1087,49 +1319,76 @@ impl ZoidCraftApp {
             preserved: BTreeMap::new(),
         });
 
+        let mut placement_warning: Option<String> = None;
         if let Some(audio_buf) = maybe_audio {
             let peaks = WaveformPeaks::from_audio_buffer(&audio_buf);
             let dur_frames = (audio_buf.duration_secs() * self.session.document().fps.max(1.0))
                 .round()
                 .max(1.0);
-            let track_id = if let Some(first_a) = self.session.document().audio_tracks.first() {
-                Some(first_a.id.clone())
-            } else if let Ok(res) = self.session.execute(Command::AddAudioTrack { name: None })
-                && let Some(tid) = res.get("track_id").and_then(Value::as_str)
-            {
-                Some(tid.to_owned())
-            } else {
-                None
+            let ui_peaks = AudioWaveformPeaks {
+                points_per_sec: f64::from(peaks.points_per_sec()),
+                min_buf: peaks.min_peaks().to_vec(),
+                max_buf: peaks.max_peaks().to_vec(),
             };
+            // Always cache decoded audio and waveform peaks immediately so Media/Assets placement
+            // and live audio/metering work regardless of whether an initial timeline clip is placed.
+            self.asset_waveform_peaks
+                .insert(asset_id.clone(), ui_peaks.clone());
+            self.decoded_audio
+                .insert(asset_id.clone(), Arc::new(audio_buf));
 
-            if let Some(track_id) = track_id {
-                let start = self.session.playback.current_frame.round().max(0.0);
-                if let Ok(res) = self.session.execute(Command::AddClip {
+            let desired_start = self.session.playback.current_frame.round().max(0.0);
+            let target_slot = choose_audio_clip_placement(&self.session, desired_start, dur_frames)
+                .or_else(|| {
+                    self.session
+                        .execute(Command::AddAudioTrack { name: None })
+                        .ok()
+                        .and_then(|res| {
+                            res.get("track_id")
+                                .and_then(Value::as_str)
+                                .map(|tid| (tid.to_owned(), desired_start))
+                        })
+                });
+
+            if let Some((track_id, start)) = target_slot {
+                match self.session.execute(Command::AddClip {
                     track_id,
                     kind: "audio".to_owned(),
                     name: Some(filename.clone()),
                     start,
                     length: dur_frames,
-                }) && let Some(clip_id) = res.get("clip_id").and_then(Value::as_str)
-                {
-                    // Associate audio asset ID on the synchronized project AudioClip.
-                    for at in &mut self.session.project.sequence.audio_tracks {
-                        if let Some(ac) = at.clips.iter_mut().find(|c| c.id.to_string() == clip_id)
-                        {
-                            ac.media = Some(asset_id.clone());
+                }) {
+                    Ok(res) => {
+                        if let Some(clip_id) = res.get("clip_id").and_then(Value::as_str) {
+                            // Bind `assetId` via session command so both `session.document`
+                            // (Edit tab Media field) and `session.project` (`ac.media`) stay in sync.
+                            if self
+                                .session
+                                .execute(Command::SetPropertyValue {
+                                    target_id: clip_id.to_owned(),
+                                    property: "assetId".to_owned(),
+                                    value: json!(asset_id),
+                                })
+                                .is_err()
+                            {
+                                for at in &mut self.session.project.sequence.audio_tracks {
+                                    if let Some(ac) =
+                                        at.clips.iter_mut().find(|c| c.id.to_string() == clip_id)
+                                    {
+                                        ac.media = Some(asset_id.clone());
+                                    }
+                                }
+                            }
+                            self.timeline
+                                .audio_peaks
+                                .insert(clip_id.to_owned(), ui_peaks);
                         }
                     }
-                    let ui_peaks = AudioWaveformPeaks {
-                        points_per_sec: f64::from(peaks.points_per_sec()),
-                        min_buf: peaks.min_peaks().to_vec(),
-                        max_buf: peaks.max_peaks().to_vec(),
-                    };
-                    self.asset_waveform_peaks
-                        .insert(asset_id.clone(), ui_peaks.clone());
-                    self.timeline
-                        .audio_peaks
-                        .insert(clip_id.to_owned(), ui_peaks);
-                    self.decoded_audio.insert(asset_id, Arc::new(audio_buf));
+                    Err(err) => {
+                        placement_warning = Some(format!(
+                            "Imported {filename} to Media (could not place clip: {err})"
+                        ));
+                    }
                 }
             }
         }
@@ -1138,13 +1397,53 @@ impl ZoidCraftApp {
             let _ = self.session.commit_transaction(true);
         }
 
-        self.show_toast(format!("Imported {filename}"));
+        self.show_toast(placement_warning.unwrap_or_else(|| format!("Imported {filename}")));
     }
 
     fn rebuild_audio_caches(&mut self) {
         self.decoded_audio.clear();
         self.asset_waveform_peaks.clear();
         self.timeline.audio_peaks.clear();
+
+        // Decode embedded audio assets (including those only present in Media/Assets so placing
+        // them later onto the timeline immediately has waveforms and audio playback).
+        let audio_asset_keys: Vec<String> = self
+            .session
+            .project
+            .assets
+            .iter()
+            .filter_map(|(k, rec)| {
+                let ext = Path::new(&rec.filename)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_ascii_lowercase);
+                let is_audio_ext =
+                    matches!(ext.as_deref(), Some("wav" | "mp3" | "ogg" | "flac" | "aac"));
+                (is_audio_ext && rec.bytes.is_some()).then(|| k.clone())
+            })
+            .collect();
+        for asset_key in audio_asset_keys {
+            if let Some(rec) = self.session.project.assets.get(&asset_key)
+                && let Some(bytes) = rec.bytes.as_deref()
+            {
+                let ext = Path::new(&rec.filename)
+                    .extension()
+                    .and_then(|e| e.to_str());
+                if let Ok(buf) = decode_audio_bytes(bytes, ext) {
+                    let peaks = WaveformPeaks::from_audio_buffer(&buf);
+                    self.asset_waveform_peaks.insert(
+                        asset_key.clone(),
+                        AudioWaveformPeaks {
+                            points_per_sec: f64::from(peaks.points_per_sec()),
+                            min_buf: peaks.min_peaks().to_vec(),
+                            max_buf: peaks.max_peaks().to_vec(),
+                        },
+                    );
+                    self.decoded_audio.insert(asset_key, Arc::new(buf));
+                }
+            }
+        }
+
         for at in &self.session.project.sequence.audio_tracks {
             for ac in &at.clips {
                 let Some(asset_key) = ac.media.as_deref() else {
@@ -1262,7 +1561,54 @@ impl ZoidCraftApp {
             return;
         }
 
-        // Video or PNG Sequence background export mode.
+        // Video or PNG Sequence background export mode:
+        // Pre-validate codec/settings and FFmpeg availability BEFORE opening the native file dialog.
+        let seq_fps = self.session.document().fps.max(1.0);
+        let start_seq_frame = ui_cfg.start_frame.round().max(0.0) as u32;
+        let end_seq_frame = (ui_cfg
+            .end_frame
+            .round()
+            .max(f64::from(start_seq_frame) + 1.0)) as u32;
+        let mut core_settings = match convert_export_settings(
+            &ui_cfg,
+            seq_fps,
+            start_seq_frame,
+            end_seq_frame,
+            PathBuf::from("zoidcraft_export_preview"),
+        ) {
+            Ok(settings) => settings,
+            Err(err) => {
+                let msg = format!("Invalid export settings: {err}");
+                self.workspace.panels.export_status.status_message = msg.clone();
+                self.show_toast(msg);
+                return;
+            }
+        };
+        if let Err(err) = core_settings.validate() {
+            let msg = format!("Invalid export settings: {err}");
+            self.workspace.panels.export_status.status_message = msg.clone();
+            self.show_toast(msg);
+            return;
+        }
+        let needs_ffmpeg = !matches!(
+            core_settings.container,
+            zc_export::ExportContainer::PngSequence
+        );
+        if needs_ffmpeg && !self.workspace.panels.export_status.ffmpeg_available {
+            let msg = if self.ffmpeg_probe_rx.is_some() {
+                "Still checking FFmpeg availability; please try exporting again in a moment."
+                    .to_owned()
+            } else {
+                format!(
+                    "Cannot start video export: FFmpeg is unavailable ({}).",
+                    self.workspace.panels.export_status.ffmpeg_version
+                )
+            };
+            self.workspace.panels.export_status.status_message = msg.clone();
+            self.show_toast(msg);
+            return;
+        }
+
         let output_path = if ui_cfg.container == UiExportContainer::PngSequence {
             let Some(dir) = rfd::FileDialog::new().pick_folder() else {
                 return;
@@ -1289,19 +1635,7 @@ impl ZoidCraftApp {
             file
         };
 
-        let seq_fps = self.session.document().fps.max(1.0);
-        let start_seq_frame = ui_cfg.start_frame.round().max(0.0) as u32;
-        let end_seq_frame = (ui_cfg
-            .end_frame
-            .round()
-            .max(f64::from(start_seq_frame) + 1.0)) as u32;
-        let core_settings = convert_export_settings(
-            &ui_cfg,
-            seq_fps,
-            start_seq_frame,
-            end_seq_frame,
-            output_path,
-        );
+        core_settings.output_path = output_path;
         if let Err(err) = core_settings.validate() {
             let msg = format!("Invalid export settings: {err}");
             self.workspace.panels.export_status.status_message = msg.clone();
@@ -1408,17 +1742,67 @@ impl ZoidCraftApp {
         }
     }
 
-    fn handle_eyedropper_click(&mut self, ctx: &egui::Context) {
+    fn handle_eyedropper_click(&mut self, ctx: &egui::Context) -> bool {
+        if self.eyedropper_swallow_pointer {
+            if let Some(canvas_rect) = self.last_canvas_rect {
+                Area::new(Id::unique("zc_eyedropper_capture"))
+                    .order(Order::Foreground)
+                    .fixed_pos(canvas_rect.min)
+                    .show(ctx, |ui| {
+                        let _ = ui.allocate_rect(canvas_rect, egui::Sense::click_and_drag());
+                    });
+            }
+            ctx.input_mut(|i| {
+                i.events.retain(|ev| {
+                    !matches!(
+                        ev,
+                        egui::Event::PointerButton {
+                            button: egui::PointerButton::Primary,
+                            ..
+                        }
+                    )
+                });
+            });
+            if !ctx.input(|i| i.pointer.primary_down()) {
+                self.eyedropper_swallow_pointer = false;
+            }
+            if self.pending_eyedropper.is_none() {
+                return false;
+            }
+        }
+
         let Some((target_id, prop_key)) = self.pending_eyedropper.clone() else {
-            return;
+            return false;
         };
 
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.pending_eyedropper = None;
-            return;
+            ctx.input_mut(|i| {
+                i.events.retain(|ev| {
+                    !matches!(
+                        ev,
+                        egui::Event::Key {
+                            key: Key::Escape,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                });
+            });
+            return true;
         }
 
         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        if let Some(canvas_rect) = self.last_canvas_rect {
+            Area::new(Id::unique("zc_eyedropper_capture"))
+                .order(Order::Foreground)
+                .fixed_pos(canvas_rect.min)
+                .show(ctx, |ui| {
+                    let resp = ui.allocate_rect(canvas_rect, egui::Sense::click_and_drag());
+                    let _ = resp.on_hover_cursor(egui::CursorIcon::Crosshair);
+                });
+        }
+
         let clicked_pos = ctx.input(|i| {
             if i.pointer.primary_pressed() {
                 i.pointer.interact_pos()
@@ -1437,15 +1821,28 @@ impl ZoidCraftApp {
                 .as_ref()
                 .and_then(|r| r.sample_display_pixel(nx, ny))
             {
-                let _ = self.session.execute(Command::SetPropertyValue {
-                    target_id,
-                    property: prop_key,
-                    value: json!(rgb),
-                });
-                self.show_toast("Sampled color from viewport");
+                let cmd = build_eyedropper_command(&self.session, target_id, prop_key, rgb);
+                if let Err(err) = self.session.execute(cmd) {
+                    self.show_toast(format!("Failed to apply sampled color: {err}"));
+                } else {
+                    self.show_toast("Sampled color from viewport");
+                }
             }
             self.pending_eyedropper = None;
+            self.eyedropper_swallow_pointer = true;
+            ctx.input_mut(|i| {
+                i.events.retain(|ev| {
+                    !matches!(
+                        ev,
+                        egui::Event::PointerButton {
+                            button: egui::PointerButton::Primary,
+                            ..
+                        }
+                    )
+                });
+            });
         }
+        false
     }
 
     fn show_unsaved_changes_modal(&mut self, ctx: &egui::Context) {
@@ -1475,7 +1872,7 @@ impl ZoidCraftApp {
 
         egui::Window::new("Unsaved Changes")
             .id(Id::unique("zc_unsaved_changes_modal"))
-            .order(Order::Foreground)
+            .order(Order::Tooltip)
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
@@ -1652,11 +2049,13 @@ impl eframe::App for ZoidCraftApp {
         self.poll_ffmpeg_probe(&ctx);
         self.sync_timeline_audio_peaks();
         self.tick_playback_and_meter(&ctx);
+        let was_playing = self.session.playback.is_playing();
         self.poll_export_worker(&ctx);
-        self.handle_eyedropper_click(&ctx);
+        let eyedropper_cancelled = self.handle_eyedropper_click(&ctx);
 
-        // 3. Dispatch full CM3 shortcuts (avoiding double-fire with layout.rs by consuming handled keys).
-        if self.workspace.panels.floating_windows.focused_id.is_none()
+        // 3. Dispatch full CM3 shortcuts (avoiding double-fire with layout.rs by consuming only handled keys).
+        if !eyedropper_cancelled
+            && self.workspace.panels.floating_windows.focused_id.is_none()
             && self.pending_unsaved_dialog.is_none()
         {
             let shortcut_outcome = dispatch_shortcuts(
@@ -1666,8 +2065,8 @@ impl eframe::App for ZoidCraftApp {
                 &mut self.graph_editor,
                 &mut self.viewport,
             );
-            if shortcut_outcome.handled_any {
-                consume_dispatched_shortcut_keys(&ctx);
+            if !shortcut_outcome.handled_keys.is_empty() {
+                consume_dispatched_shortcut_keys(&ctx, &shortcut_outcome.handled_keys);
             }
             if shortcut_outcome.new_project_requested {
                 self.handle_new_project();
@@ -1699,6 +2098,9 @@ impl eframe::App for ZoidCraftApp {
             .frame(Frame::NONE.fill(BG_SUNKEN))
             .show(ui, |ui| {
                 let palette = self.theme.palette;
+                self.viewport.transparency_grid = self.workspace.transparency_grid;
+                self.viewport.motion_path_visible = self.workspace.motion_path_visible;
+                self.workspace.graph_open = self.graph_editor.open;
                 let viewport_state = &mut self.viewport;
                 let timeline_state = &mut self.timeline;
 
@@ -1725,7 +2127,9 @@ impl eframe::App for ZoidCraftApp {
         // 6. Process bubbled workspace/panel/timeline actions.
         if let Some((target_id, prop)) = open_graph_target {
             self.graph_editor.focused_property = Some((target_id, prop));
+            self.graph_editor.follow_selection = false;
             self.graph_editor.open = true;
+            self.graph_editor.window_focused = true;
         }
 
         for action in ui_actions {
@@ -1736,7 +2140,30 @@ impl eframe::App for ZoidCraftApp {
                     let _ = self.handle_save_project(include_assets);
                 }
                 UiAction::ImportMedia => self.handle_import_media(),
-                UiAction::OpenGraphEditor => self.graph_editor.open = !self.graph_editor.open,
+                UiAction::PickAssetForProperty {
+                    target_id,
+                    property,
+                    is_lut,
+                } => self.handle_pick_asset_for_property(target_id, property, is_lut),
+                UiAction::OpenGraphEditor => {
+                    if self.graph_editor.open {
+                        self.graph_editor
+                            .cancel_active_interaction(&mut self.session);
+                        self.graph_editor.open = false;
+                    } else {
+                        self.graph_editor.open = true;
+                        self.graph_editor.window_focused = true;
+                    }
+                }
+                UiAction::OpenGraphForProperty {
+                    target_id,
+                    property,
+                } => {
+                    self.graph_editor.focused_property = Some((target_id, property));
+                    self.graph_editor.follow_selection = false;
+                    self.graph_editor.open = true;
+                    self.graph_editor.window_focused = true;
+                }
                 UiAction::StartExport(cfg) => self.handle_start_export(cfg),
                 UiAction::CancelExport => self.cancel_active_export(),
                 UiAction::EyedropperActivate {
@@ -1751,6 +2178,7 @@ impl eframe::App for ZoidCraftApp {
         }
 
         // 7. Floating dual-mode Graph Editor / Graph Editor 2 + Easing+ window.
+        let graph_open_before_window = self.graph_editor.open;
         if self.graph_editor.open {
             let _ = show_graph_editor_window(
                 &ctx,
@@ -1759,8 +2187,35 @@ impl eframe::App for ZoidCraftApp {
                 &self.theme.palette,
             );
         }
+        self.workspace.graph_open = self.graph_editor.open;
+        if self.graph_editor.open != graph_open_before_window {
+            ctx.request_repaint();
+        }
 
-        // 8. Optional FPS overlay, status toasts, and native window title sync.
+        // 8. Post-UI repaint scheduling & transport synchronization so UI mutations
+        //    never stall behind idle repaint sleep.
+        if self.session.playback.is_playing() != was_playing {
+            self.tick_playback_and_meter(&ctx);
+            ctx.request_repaint();
+        }
+        if self.active_export.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+        let (_, _, _, _, post_ui_key) = self.current_viewport_render_key();
+        let last_rendered_key = self.renderer.as_ref().and_then(|r| r.last_render_key);
+        let player_plus_paused = self.session.plugins.is_enabled("player-plus")
+            && self.workspace.player_plus.drawing_paused;
+        let single_requested =
+            self.force_single_render || self.workspace.player_plus.single_render_requested;
+        if single_requested
+            || (self.renderer.is_some()
+                && !player_plus_paused
+                && last_rendered_key != Some(post_ui_key))
+        {
+            ctx.request_repaint();
+        }
+
+        // 9. Optional FPS overlay, status toasts, and native window title sync.
         if self.workspace.panels.app_settings.show_fps_overlay
             && let Some(rect) = self.last_canvas_rect
         {
@@ -1784,46 +2239,198 @@ impl eframe::App for ZoidCraftApp {
 }
 
 // ---------------------------------------------------------------------------
-// Shortcut Deduplication Helper
+// Shortcut Deduplication & Selection Helpers
 // ---------------------------------------------------------------------------
 
-fn consume_dispatched_shortcut_keys(ctx: &egui::Context) {
+fn consume_dispatched_shortcut_keys(ctx: &egui::Context, handled_keys: &[Key]) {
+    if handled_keys.is_empty() {
+        return;
+    }
     ctx.input_mut(|i| {
         i.events.retain(|ev| {
             !matches!(
                 ev,
                 egui::Event::Key {
-                    key: Key::Space
-                        | Key::Home
-                        | Key::End
-                        | Key::ArrowLeft
-                        | Key::ArrowRight
-                        | Key::J
-                        | Key::K
-                        | Key::L
-                        | Key::C
-                        | Key::T
-                        | Key::Z
-                        | Key::Y
-                        | Key::S
-                        | Key::O
-                        | Key::M
-                        | Key::N
-                        | Key::G
-                        | Key::D
-                        | Key::Delete
-                        | Key::Backspace
-                        | Key::Minus
-                        | Key::Equals
-                        | Key::Plus
-                        | Key::Backslash
-                        | Key::Escape,
+                    key,
                     pressed: true,
                     ..
-                }
+                } if handled_keys.contains(key)
             )
         });
     });
+}
+
+fn selected_single_scene3d_clip_uuid(session: &Session) -> Option<Uuid> {
+    if session.selection.clip_ids.len() != 1 {
+        return None;
+    }
+    let clip_id_str = session.selection.clip_ids.first()?;
+    let clip_uuid = Uuid::parse_str(clip_id_str).ok()?;
+    let is_scene3d = session.project.sequence.video_tracks.iter().any(|track| {
+        track.clips.iter().any(|clip| {
+            clip.id == clip_uuid && matches!(clip.layer.kind, LayerKind::Scene3D { .. })
+        })
+    });
+    is_scene3d.then_some(clip_uuid)
+}
+
+fn find_non_overlapping_start(
+    clips: &[zc_session::SessionClip],
+    mut start: f64,
+    length: f64,
+) -> f64 {
+    loop {
+        if let Some(blocker) = clips
+            .iter()
+            .find(|c| c.start < start + length - 1e-6 && start < c.start + c.length - 1e-6)
+        {
+            start = (blocker.start + blocker.length).ceil();
+        } else {
+            return start;
+        }
+    }
+}
+
+/// Picks an unlocked audio track with no overlap at `desired_start`, or the earliest
+/// non-overlapping start on the first unlocked audio track (returns `None` when no unlocked
+/// audio track exists, signaling the caller to create a new audio track).
+fn choose_audio_clip_placement(
+    session: &Session,
+    desired_start: f64,
+    length: f64,
+) -> Option<(String, f64)> {
+    let tracks = &session.document().audio_tracks;
+    if let Some(free_track) = tracks.iter().find(|t| {
+        !t.locked
+            && !t.clips.iter().any(|c| {
+                c.start < desired_start + length - 1e-6 && desired_start < c.start + c.length - 1e-6
+            })
+    }) {
+        Some((free_track.id.clone(), desired_start))
+    } else {
+        tracks.iter().find(|t| !t.locked).map(|t| {
+            let start = find_non_overlapping_start(&t.clips, desired_start, length);
+            (t.id.clone(), start)
+        })
+    }
+}
+
+fn find_target_property_and_local_frame<'a>(
+    session: &'a Session,
+    target_id: &str,
+    prop_key: &str,
+) -> Option<(Option<&'a SessionProperty>, f64)> {
+    let global_frame = session.playback.current_frame;
+    let doc = session.document();
+    if target_id == "sequence" {
+        return Some((doc.sequence_properties.get(prop_key), global_frame));
+    }
+    for track in doc.video_tracks.iter().chain(doc.audio_tracks.iter()) {
+        for clip in &track.clips {
+            let local_frame = global_frame - clip.start;
+            if clip.id == target_id {
+                return Some((clip.properties.get(prop_key), local_frame));
+            }
+            if let Some(obj) = clip.objects_3d.iter().find(|o| o.id == target_id) {
+                return Some((obj.properties.get(prop_key), local_frame));
+            }
+            if let Some(fx) = clip.effects.iter().find(|e| e.id == target_id) {
+                return Some((fx.properties.get(prop_key), local_frame));
+            }
+        }
+    }
+    None
+}
+
+fn eval_prop_alpha_if_rgba(prop: &SessionProperty, local_frame: f64) -> Option<f64> {
+    let rgba_alpha = |v: &Value| -> Option<f64> {
+        let arr = v.as_array()?;
+        if arr.len() == 4 && arr[0].is_number() && arr[1].is_number() && arr[2].is_number() {
+            arr[3].as_f64()
+        } else {
+            None
+        }
+    };
+    if prop.keyframes.is_empty() {
+        return rgba_alpha(&prop.default_value);
+    }
+    if !prop.animated || prop.keyframes.len() == 1 || local_frame <= prop.keyframes[0].frame {
+        return rgba_alpha(&prop.keyframes[0].value).or_else(|| rgba_alpha(&prop.default_value));
+    }
+    let last = &prop.keyframes[prop.keyframes.len() - 1];
+    if local_frame >= last.frame {
+        return rgba_alpha(&last.value).or_else(|| rgba_alpha(&prop.default_value));
+    }
+    let idx = prop
+        .keyframes
+        .partition_point(|k| k.frame <= local_frame)
+        .clamp(1, prop.keyframes.len() - 1);
+    let k0 = &prop.keyframes[idx - 1];
+    let k1 = &prop.keyframes[idx];
+    let a0 = rgba_alpha(&k0.value).or_else(|| rgba_alpha(&prop.default_value))?;
+    let a1 = rgba_alpha(&k1.value).unwrap_or(a0);
+    let span = k1.frame - k0.frame;
+    if span <= 1e-9 {
+        return Some(a0);
+    }
+    let (mode, easing) = InterpolationMode::from_cm3_tween_code(k1.tween);
+    Some(match mode {
+        InterpolationMode::Discrete => a0,
+        InterpolationMode::Interpolated => {
+            let u = ((local_frame - k0.frame) / span).clamp(0.0, 1.0);
+            a0 + (a1 - a0) * eval_easing(easing, u)
+        }
+        InterpolationMode::Bezier => eval_segment_bezier(
+            BezierSegment {
+                start_frame: k0.frame,
+                start_value: a0,
+                out_tangent: k0.control_points[1],
+                end_frame: k1.frame,
+                end_value: a1,
+                in_tangent: k1.control_points[0],
+            },
+            local_frame,
+        ),
+    })
+}
+
+fn build_eyedropper_command(
+    session: &Session,
+    target_id: String,
+    prop_key: String,
+    rgb: [f64; 3],
+) -> Command {
+    let found = find_target_property_and_local_frame(session, &target_id, &prop_key);
+    let (animated, local_frame, value) = match found {
+        Some((prop_opt, local_frame)) => {
+            let normalized_frame = local_frame.round();
+            let animated = prop_opt.is_some_and(|p| p.animated);
+            let value = if let Some(alpha) =
+                prop_opt.and_then(|p| eval_prop_alpha_if_rgba(p, normalized_frame))
+            {
+                json!([rgb[0], rgb[1], rgb[2], alpha.clamp(0.0, 1.0)])
+            } else {
+                json!(rgb)
+            };
+            (animated, normalized_frame, value)
+        }
+        None => (false, 0.0, json!(rgb)),
+    };
+    if animated {
+        Command::SetKeyframe {
+            target_id,
+            property: prop_key,
+            frame: local_frame,
+            value,
+            tween: None,
+        }
+    } else {
+        Command::SetPropertyValue {
+            target_id,
+            property: prop_key,
+            value,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1869,10 +2476,25 @@ fn fnv_mix_value(hash: &mut u64, val: &Value) {
     }
 }
 
+struct FnvWriter<'a>(&'a mut u64);
+
+impl std::io::Write for FnvWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        fnv_mix(self.0, buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn fnv_mix_props(hash: &mut u64, props: &BTreeMap<String, SessionProperty>) {
     for (k, p) in props {
         fnv_mix(hash, k.as_bytes());
         fnv_mix(hash, &[u8::from(p.animated)]);
+        fnv_mix_value(hash, &p.default_value);
+        fnv_mix(hash, &[u8::from(p.expression.is_some())]);
         if let Some(expr) = &p.expression {
             fnv_mix(hash, expr.as_bytes());
         }
@@ -1896,6 +2518,7 @@ fn compute_scene_hash(session: &Session) -> u64 {
     fnv_mix(&mut h, &doc.resolution[1].to_le_bytes());
     fnv_mix_f64(&mut h, doc.fps);
     fnv_mix_f64(&mut h, doc.sequence_length);
+    fnv_mix_props(&mut h, &doc.sequence_properties);
     for c in session.project.sequence.background_color {
         fnv_mix(&mut h, &c.to_bits().to_le_bytes());
     }
@@ -1903,6 +2526,25 @@ fn compute_scene_hash(session: &Session) -> u64 {
         &mut h,
         &[u8::from(session.project.sequence.motion_blur.enabled)],
     );
+    let _ = serde_json::to_writer(
+        FnvWriter(&mut h),
+        &session.project.sequence.motion_blur.samples,
+    );
+    let _ = serde_json::to_writer(
+        FnvWriter(&mut h),
+        &session.project.sequence.motion_blur.shutter,
+    );
+    let _ = serde_json::to_writer(FnvWriter(&mut h), &session.project.sequence.controls);
+    let _ = serde_json::to_writer(FnvWriter(&mut h), &session.project.compositions);
+    fnv_mix(&mut h, &(session.project.assets.len() as u64).to_le_bytes());
+    for (asset_key, rec) in &session.project.assets {
+        fnv_mix(&mut h, asset_key.as_bytes());
+        fnv_mix(&mut h, &rec.size.to_le_bytes());
+        fnv_mix(&mut h, rec.sha256.as_bytes());
+        fnv_mix(&mut h, &[u8::from(rec.missing)]);
+        let byte_len = rec.bytes.as_ref().map_or(0_u64, |b| b.len() as u64);
+        fnv_mix(&mut h, &byte_len.to_le_bytes());
+    }
     for pid in session.plugins.enabled_ids() {
         fnv_mix(&mut h, pid.as_bytes());
     }
@@ -1975,11 +2617,22 @@ fn eval_prop_f64(prop: Option<&SessionProperty>, local_frame: f64, fallback: f64
     let (mode, easing) = InterpolationMode::from_cm3_tween_code(k1.tween);
     match mode {
         InterpolationMode::Discrete => v0,
-        InterpolationMode::Interpolated | InterpolationMode::Bezier => {
+        InterpolationMode::Interpolated => {
             let u = ((local_frame - k0.frame) / span).clamp(0.0, 1.0);
             let e = eval_easing(easing, u);
             v0 + (v1 - v0) * e
         }
+        InterpolationMode::Bezier => eval_segment_bezier(
+            BezierSegment {
+                start_frame: k0.frame,
+                start_value: v0,
+                out_tangent: k0.control_points[1],
+                end_frame: k1.frame,
+                end_value: v1,
+                in_tangent: k1.control_points[0],
+            },
+            local_frame,
+        ),
     }
 }
 
@@ -2002,7 +2655,7 @@ fn convert_export_settings(
     start_seq_frame: u32,
     end_seq_frame: u32,
     output_path: PathBuf,
-) -> CoreExportSettings {
+) -> Result<CoreExportSettings, String> {
     let container = match ui.container {
         UiExportContainer::Mp4 => CoreExportContainer::Mp4,
         UiExportContainer::WebM => CoreExportContainer::Webm,
@@ -2015,7 +2668,14 @@ fn convert_export_settings(
         ExportVideoCodec::Vp9 => VideoCodec::Vp9,
         ExportVideoCodec::Vp8 => VideoCodec::Vp8,
         ExportVideoCodec::Av1 => VideoCodec::Av1,
-        ExportVideoCodec::Png => VideoCodec::H264,
+        ExportVideoCodec::Png => {
+            if ui.container != UiExportContainer::PngSequence {
+                return Err(
+                    "PNG video codec is only supported with the PNG Sequence container.".to_owned(),
+                );
+            }
+            VideoCodec::H264
+        }
     };
     let audio_codec = if container == CoreExportContainer::PngSequence {
         AudioCodec::None
@@ -2050,7 +2710,7 @@ fn convert_export_settings(
         .round()
         .max(1.0)) as u32;
 
-    CoreExportSettings {
+    Ok(CoreExportSettings {
         width: ui.width.max(2),
         height: ui.height.max(2),
         fps: export_fps,
@@ -2065,7 +2725,7 @@ fn convert_export_settings(
         transparent_alpha: ui.transparent_alpha,
         output_path,
         ffmpeg_binary: None,
-    }
+    })
 }
 
 fn poll_export_job(
@@ -2315,7 +2975,7 @@ fn build_offline_export_audio(
     {
         return Ok(None);
     }
-    let sr = settings.sample_rate.max(STANDARD_SAMPLE_RATE);
+    let sr = settings.sample_rate.max(8_000);
     mix_sequence_audio_stereo(
         session,
         cached_buffers,
@@ -2406,7 +3066,7 @@ fn mix_sequence_audio_stereo(
         return Ok(None);
     }
     let seq_span_frames = f64::from(end_seq_frame.saturating_sub(start_seq_frame).max(1));
-    let sr = sample_rate.max(STANDARD_SAMPLE_RATE);
+    let sr = sample_rate.max(8_000);
     try_mix_offline_stereo_animated(
         seq_span_frames,
         seq_fps,
@@ -2434,15 +3094,17 @@ fn sample_live_audio_meter(
     frame: f64,
     fps: f64,
 ) -> (f32, f32) {
+    const METER_WINDOW: usize = 512;
     if buffers.is_empty() {
         return (0.0, 0.0);
     }
     let clip_assets = collect_clip_audio_assets(&session.project);
     let doc = session.document();
     let any_solo = doc.audio_tracks.iter().any(|t| t.enabled && t.solo);
-    let mut sum_sq = 0.0_f64;
-    let mut peak = 0.0_f32;
-    let mut count = 0usize;
+    let safe_fps = fps.max(1.0);
+    let mut mix_l = [0.0_f32; METER_WINDOW];
+    let mut mix_r = [0.0_f32; METER_WINDOW];
+    let mut has_active_audio = false;
 
     for track in &doc.audio_tracks {
         let audible = if any_solo {
@@ -2454,7 +3116,7 @@ fn sample_live_audio_meter(
             continue;
         }
         for clip in &track.clips {
-            if frame < clip.start || frame >= clip.start + clip.length {
+            if clip.length <= 0.0 || frame < clip.start || frame >= clip.start + clip.length {
                 continue;
             }
             let Some(asset_id) = clip_assets.get(&clip.id) else {
@@ -2463,36 +3125,60 @@ fn sample_live_audio_meter(
             let Some(buf) = buffers.get(asset_id) else {
                 continue;
             };
-            let local_f = frame - clip.start;
-            let u = if clip.length > 0.0 {
-                (local_f / clip.length).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let media_t = clip.time_start + (clip.time_end - clip.time_start) * u;
-            let center_sample = (media_t * f64::from(buf.sample_rate)).max(0.0) as usize;
-            let ch = usize::from(buf.channels.max(1));
             let total_frames = buf.frame_count();
-            let window = 512.min(total_frames);
+            if total_frames == 0 {
+                continue;
+            }
+            let ch = usize::from(buf.channels.max(1));
+            let local_f = frame - clip.start;
+            let rate =
+                effective_playback_rate(clip.time_start, clip.time_end, clip.length, safe_fps);
+            let sr = f64::from(buf.sample_rate.max(1));
+            let base_t = clip.time_start + (local_f / safe_fps) * rate;
+            let base_pos = base_t * sr;
+            let step_samples = (sr / f64::from(STANDARD_SAMPLE_RATE)) * rate;
             let vol = eval_prop_f64(clip.properties.get("volume"), local_f, 1.0).max(0.0) as f32;
-            let start = center_sample.min(total_frames.saturating_sub(window));
-            let end = (start + window).min(total_frames);
-            for fi in start..end {
-                let s = (buf.samples_interleaved_f32[fi * ch] * vol).abs().min(1.0);
-                sum_sq += f64::from(s) * f64::from(s);
-                peak = peak.max(s);
-                count += 1;
+            let pan = eval_prop_f64(clip.properties.get("pan"), local_f, 0.0) as f32;
+
+            for i in 0..METER_WINDOW {
+                let pos = base_pos + (i as f64) * step_samples;
+                if pos < 0.0 {
+                    continue;
+                }
+                let fi = pos as usize;
+                if fi >= total_frames {
+                    break;
+                }
+                let base_idx = fi * ch;
+                let raw_l = buf.samples_interleaved_f32[base_idx];
+                let raw_r = if ch >= 2 {
+                    buf.samples_interleaved_f32[base_idx + 1]
+                } else {
+                    raw_l
+                };
+                let [out_l, out_r] = apply_gain_and_pan([raw_l, raw_r], vol, pan);
+                mix_l[i] += out_l;
+                mix_r[i] += out_r;
+                has_active_audio = true;
             }
         }
     }
 
-    let _ = fps;
-    if count == 0 {
-        (0.0, 0.0)
-    } else {
-        let rms = (sum_sq / count as f64).sqrt().clamp(0.0, 1.0) as f32;
-        (rms, peak.clamp(0.0, 1.0))
+    if !has_active_audio {
+        return (0.0, 0.0);
     }
+
+    let mut sum_sq_l = 0.0_f64;
+    let mut sum_sq_r = 0.0_f64;
+    for i in 0..METER_WINDOW {
+        let l = f64::from(mix_l[i].clamp(-1.0, 1.0));
+        let r = f64::from(mix_r[i].clamp(-1.0, 1.0));
+        sum_sq_l += l * l;
+        sum_sq_r += r * r;
+    }
+    let rms_l = (sum_sq_l / METER_WINDOW as f64).sqrt().clamp(0.0, 1.0) as f32;
+    let rms_r = (sum_sq_r / METER_WINDOW as f64).sqrt().clamp(0.0, 1.0) as f32;
+    (rms_l, rms_r)
 }
 
 fn sanitize_filename(raw: &str) -> String {
@@ -2583,7 +3269,14 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        session.project.sequence.audio_tracks[0].clips[0].media = Some(asset_id);
+        session
+            .project
+            .sequence
+            .audio_tracks
+            .last_mut()
+            .expect("audio track")
+            .clips[0]
+            .media = Some(asset_id);
 
         // Split at frame 15 -> right half gets a brand new clip_id; then duplicate right half.
         let split_res = session
@@ -2598,7 +3291,7 @@ mod tests {
             .expect("duplicate right half");
         let dup_id = dup_res["clip_id"].as_str().unwrap().to_owned();
         // Move duplicate to frame 30..45 so all 3 clips occupy [0, 45).
-        let audio_track_id = session.document().audio_tracks[0].id.clone();
+        let audio_track_id = session.document().audio_tracks.last().unwrap().id.clone();
         session
             .execute(Command::MoveClip {
                 clip_id: dup_id,
@@ -2741,5 +3434,86 @@ mod tests {
         let (rstart, rend) = compute_live_audio_window(10_000.0, -1.0, total_frames, window_frames);
         assert_eq!(rend, 10_001);
         assert_eq!(rend - rstart, window_frames);
+    }
+
+    #[test]
+    fn eyedropper_preserves_rgba_alpha_and_rounds_animated_frame() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let fx_id = session
+            .execute(Command::AddEffect {
+                clip_id,
+                kind: "customShader".to_owned(),
+                name: None,
+            })
+            .expect("add customShader")["effect_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: fx_id.clone(),
+                property: "u_Tint".to_owned(),
+                value: json!([1.0, 1.0, 1.0, 0.42]),
+            })
+            .expect("init rgba uniform");
+        session
+            .execute(Command::TogglePropertyAnimated {
+                target_id: fx_id.clone(),
+                property: "u_Tint".to_owned(),
+                frame: 0.0,
+            })
+            .expect("enable animation");
+
+        session.playback.current_frame = 12.37;
+        let cmd = build_eyedropper_command(&session, fx_id, "u_Tint".to_owned(), [0.2, 0.4, 0.8]);
+        match &cmd {
+            Command::SetKeyframe { frame, value, .. } => {
+                assert!(
+                    (*frame - 12.0).abs() < 1e-6,
+                    "expected rounded frame 12.0, got {frame}"
+                );
+                let arr = value.as_array().expect("4-element RGBA array");
+                assert_eq!(arr.len(), 4);
+                assert!((arr[0].as_f64().unwrap() - 0.2).abs() < 1e-6);
+                assert!((arr[1].as_f64().unwrap() - 0.4).abs() < 1e-6);
+                assert!((arr[2].as_f64().unwrap() - 0.8).abs() < 1e-6);
+                assert!((arr[3].as_f64().unwrap() - 0.42).abs() < 1e-6);
+            }
+            other => panic!("expected SetKeyframe, got {other:?}"),
+        }
+        session.execute(cmd).expect("execute eyedropper cmd");
+    }
+
+    #[test]
+    fn audio_clip_placement_avoids_overwriting_existing_and_locked_tracks() {
+        let mut session = Session::new();
+        let track1 = session.document().audio_tracks[0].id.clone();
+        session
+            .execute(Command::AddClip {
+                track_id: track1.clone(),
+                kind: "audio".to_owned(),
+                name: Some("a.wav".to_owned()),
+                start: 0.0,
+                length: 60.0,
+            })
+            .expect("add clip a");
+
+        // Importing a second clip at frame 0 must place after clip A (frame 60) rather than
+        // overlapping/destroying clip A on Track 1.
+        let (chosen_tid, chosen_start) =
+            choose_audio_clip_placement(&session, 0.0, 45.0).expect("placement on unlocked track");
+        assert_eq!(chosen_tid, track1);
+        assert!((chosen_start - 60.0).abs() < 1e-6);
+
+        // If Track 1 is locked, placement returns None so caller creates a new unlocked track.
+        session
+            .execute(Command::SetTrackLocked {
+                track_id: track1,
+                locked: true,
+            })
+            .expect("lock track 1");
+        assert!(choose_audio_clip_placement(&session, 0.0, 45.0).is_none());
     }
 }

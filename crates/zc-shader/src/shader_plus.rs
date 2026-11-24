@@ -968,14 +968,14 @@ pub fn bake_curve_rgba8(spec: &CurveSpec) -> Vec<u8> {
 
     let min_val = spec.range[0];
     let span = spec.range[1] - spec.range[0];
-    let normalize = |v: f32| -> u8 {
-        let norm = if span.abs() > 1e-7 {
-            (v - min_val) / span
+    let normalize_f32 = |v: f32| -> f32 {
+        if span.abs() > 1e-7 {
+            ((v - min_val) / span).clamp(0.0, 1.0)
         } else {
             0.0
-        };
-        f32_to_u8(norm)
+        }
     };
+    let normalize = |v: f32| -> u8 { f32_to_u8(normalize_f32(v)) };
 
     let mut out = vec![0u8; CURVE_LUT_WIDTH * 4];
     for (idx, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -991,14 +991,17 @@ pub fn bake_curve_rgba8(spec: &CurveSpec) -> Vec<u8> {
                 pixel[3] = 255;
             }
             CurveMode::Rgba => {
-                let r_val = red.as_ref().map_or(m, |ch| ch.evaluate(m));
-                let g_val = green.as_ref().map_or(m, |ch| ch.evaluate(m));
-                let b_val = blue.as_ref().map_or(m, |ch| ch.evaluate(m));
-                let a_val = alpha.as_ref().map_or(x, |ch| ch.evaluate(x));
+                let m_norm = normalize_f32(m);
+                let r_val = red.as_ref().map_or(m, |ch| ch.evaluate(m_norm));
+                let g_val = green.as_ref().map_or(m, |ch| ch.evaluate(m_norm));
+                let b_val = blue.as_ref().map_or(m, |ch| ch.evaluate(m_norm));
                 pixel[0] = normalize(r_val);
                 pixel[1] = normalize(g_val);
                 pixel[2] = normalize(b_val);
-                pixel[3] = normalize(a_val);
+                pixel[3] = match alpha.as_ref() {
+                    Some(ch) => normalize(ch.evaluate(x)),
+                    None => f32_to_u8(x),
+                };
             }
         }
     }

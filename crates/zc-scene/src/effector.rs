@@ -1,3 +1,8 @@
+use lyon_tessellation::math::point;
+use lyon_tessellation::path::Path;
+use lyon_tessellation::{
+    BuffersBuilder, FillOptions, FillRule, FillTessellator, FillVertex, VertexBuffers,
+};
 use zc_geom::{Aabb3, Mat4, Vec2, Vec3};
 
 use crate::mesh::{MeshData, Vertex3D};
@@ -104,10 +109,25 @@ pub fn apply_warp(mesh: &MeshData, bend: f32, bulge: f32, axis: DeformAxis) -> M
     }
 
     let bounds = out.bounds;
-    let (min_a, max_a) = match axis {
-        DeformAxis::X => (bounds.min.x, bounds.max.x),
-        DeformAxis::Y => (bounds.min.y, bounds.max.y),
-        DeformAxis::Z => (bounds.min.z, bounds.max.z),
+    let (min_a, max_a, center_p1, center_p2) = match axis {
+        DeformAxis::X => (
+            bounds.min.x,
+            bounds.max.x,
+            0.5 * (bounds.min.y + bounds.max.y),
+            0.5 * (bounds.min.z + bounds.max.z),
+        ),
+        DeformAxis::Y => (
+            bounds.min.y,
+            bounds.max.y,
+            0.5 * (bounds.min.x + bounds.max.x),
+            0.5 * (bounds.min.z + bounds.max.z),
+        ),
+        DeformAxis::Z => (
+            bounds.min.z,
+            bounds.max.z,
+            0.5 * (bounds.min.x + bounds.max.x),
+            0.5 * (bounds.min.y + bounds.max.y),
+        ),
     };
     let span = max_a - min_a;
     if span.abs() <= 1e-6 {
@@ -117,11 +137,13 @@ pub fn apply_warp(mesh: &MeshData, bend: f32, bulge: f32, axis: DeformAxis) -> M
 
     for v in &mut out.vertices {
         let p = Vec3::from_array(v.position);
-        let (mut along, mut perp1, mut perp2) = match axis {
+        let (mut along, raw_perp1, raw_perp2) = match axis {
             DeformAxis::X => (p.x, p.y, p.z),
             DeformAxis::Y => (p.y, p.x, p.z),
             DeformAxis::Z => (p.z, p.x, p.y),
         };
+        let mut perp1 = raw_perp1 - center_p1;
+        let mut perp2 = raw_perp2 - center_p2;
 
         let s = along - center_a;
         let t = s / span; // [-0.5, +0.5] across mesh bounds
@@ -140,6 +162,9 @@ pub fn apply_warp(mesh: &MeshData, bend: f32, bulge: f32, axis: DeformAxis) -> M
             along = center_a + radial * sin_t;
             perp1 = radius - radial * cos_t;
         }
+
+        perp1 += center_p1;
+        perp2 += center_p2;
 
         let warped = match axis {
             DeformAxis::X => Vec3::new(along, perp1, perp2),
@@ -246,9 +271,18 @@ fn clip_polygon_halfspace(
         .map(|v| (v.pos - plane_origin).dot(inward_normal))
         .collect();
 
-    let mut out = Vec::with_capacity(n + 1);
+    let mut out: Vec<ClipVert> = Vec::with_capacity(n + 1);
     let mut cross_pts = [Vec3::ZERO; 2];
     let mut cross_count = 0_usize;
+
+    let push_dedup = |dst: &mut Vec<ClipVert>, v: ClipVert| {
+        if dst
+            .last()
+            .is_none_or(|prev| prev.pos.distance_squared(v.pos) > 1e-10)
+        {
+            dst.push(v);
+        }
+    };
 
     for i in 0..n {
         let j = (i + 1) % n;
@@ -260,7 +294,7 @@ fn clip_polygon_halfspace(
         let in_j = dj >= -eps;
 
         if in_i {
-            out.push(vi);
+            push_dedup(&mut out, vi);
         }
         if in_i != in_j {
             let denom = di - dj;
@@ -270,12 +304,16 @@ fn clip_polygon_halfspace(
                 0.5
             };
             let hit = ClipVert::lerp(vi, vj, t);
-            out.push(hit);
+            push_dedup(&mut out, hit);
             if cross_count < 2 {
                 cross_pts[cross_count] = hit.pos;
                 cross_count += 1;
             }
         }
+    }
+
+    while out.len() >= 2 && out[0].pos.distance_squared(out[out.len() - 1].pos) <= 1e-10 {
+        out.pop();
     }
 
     if cross_count == 2 && cross_pts[0].distance_squared(cross_pts[1]) > 1e-10 {
@@ -285,14 +323,51 @@ fn clip_polygon_halfspace(
     if out.len() >= 3 { out } else { Vec::new() }
 }
 
-/// Builds planar ear-clipped inner cap triangles on a Voronoi bisector plane (`material_slot = 1`).
-fn build_planar_cap(
+fn extend_cap_chain(
+    chain: &mut Vec<Vec2>,
+    remaining: &mut Vec<(Vec2, Vec2)>,
+    snap_eps2: f32,
+) -> bool {
+    loop {
+        let head = chain[0];
+        let tail = *chain.last().unwrap_or(&head);
+        if chain.len() >= 3 && tail.distance_squared(head) <= snap_eps2 {
+            chain.pop();
+            return true;
+        }
+        let mut best: Option<(usize, Vec2, f32)> = None;
+        for (idx, &(a, b)) in remaining.iter().enumerate() {
+            let da = a.distance_squared(tail);
+            if da <= snap_eps2 && best.is_none_or(|(_, _, bd)| da < bd) {
+                best = Some((idx, b, da));
+            }
+            let db = b.distance_squared(tail);
+            if db <= snap_eps2 && best.is_none_or(|(_, _, bd)| db < bd) {
+                best = Some((idx, a, db));
+            }
+        }
+        if let Some((idx, pt, _)) = best {
+            remaining.swap_remove(idx);
+            if pt.distance_squared(tail) > 1e-10 {
+                chain.push(pt);
+            }
+            if chain.len() >= MAX_CAP_CONTOUR_VERTS {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+}
+
+/// Builds planar inner cap triangles on a Voronoi bisector plane (`material_slot = 1`)
+/// using `lyon_tessellation::FillRule::EvenOdd` so hollow/non-convex cuts preserve interior holes,
+/// and appends them directly to `cell_polys` so subsequent bisector planes clip them cleanly.
+fn build_planar_cap_polys(
     segments: &[(Vec3, Vec3)],
     plane_origin: Vec3,
     inward_normal: Vec3,
-    cell_offset: Vec3,
-    out_verts: &mut Vec<Vertex3D>,
-    out_indices: &mut Vec<u32>,
+    cell_polys: &mut Vec<Vec<ClipVert>>,
 ) {
     if segments.len() < 3 {
         return;
@@ -312,13 +387,12 @@ fn build_planar_cap(
     let mut remaining: Vec<(Vec2, Vec2)> = segments
         .iter()
         .take(MAX_CAP_CONTOUR_VERTS)
-        .map(|&(a, b)| {
+        .filter_map(|&(a, b)| {
             let da = a - plane_origin;
             let db = b - plane_origin;
-            (
-                Vec2::new(da.dot(tangent_u), da.dot(tangent_v)),
-                Vec2::new(db.dot(tangent_u), db.dot(tangent_v)),
-            )
+            let p0 = Vec2::new(da.dot(tangent_u), da.dot(tangent_v));
+            let p1 = Vec2::new(db.dot(tangent_u), db.dot(tangent_v));
+            (p0.distance_squared(p1) > 1e-10).then_some((p0, p1))
         })
         .collect();
 
@@ -327,70 +401,86 @@ fn build_planar_cap(
 
     while let Some((start, next)) = remaining.pop() {
         let mut chain = vec![start, next];
-        loop {
-            let tail = *chain.last().unwrap_or(&start);
-            if chain.len() >= 3 && tail.distance_squared(start) <= snap_eps2 {
-                chain.pop();
-                break;
-            }
-            let mut found = None;
-            for (idx, &(a, b)) in remaining.iter().enumerate() {
-                if a.distance_squared(tail) <= snap_eps2 {
-                    found = Some((idx, b));
-                    break;
-                }
-                if b.distance_squared(tail) <= snap_eps2 {
-                    found = Some((idx, a));
-                    break;
-                }
-            }
-            if let Some((idx, pt)) = found {
-                remaining.swap_remove(idx);
-                if pt.distance_squared(tail) > 1e-10 {
-                    chain.push(pt);
-                }
-                if chain.len() >= MAX_CAP_CONTOUR_VERTS {
-                    break;
-                }
-            } else {
-                break;
-            }
+        if !extend_cap_chain(&mut chain, &mut remaining, snap_eps2) {
+            chain.reverse();
+            extend_cap_chain(&mut chain, &mut remaining, snap_eps2);
         }
-        if chain.len() >= 3 {
+        if chain.len() >= 3 && polygon_area_2d(&chain).abs() > 1e-7 {
             loops.push(chain);
         }
     }
 
-    for mut poly in loops {
-        let area = polygon_area_2d(&poly);
-        if area.abs() <= 1e-7 {
+    if loops.is_empty() {
+        return;
+    }
+
+    let mut path_builder = Path::builder();
+    for contour in &loops {
+        if let Some((&first, rest)) = contour.split_first() {
+            path_builder.begin(point(first.x, first.y));
+            for &p in rest {
+                path_builder.line_to(point(p.x, p.y));
+            }
+            path_builder.end(true);
+        }
+    }
+    let path = path_builder.build();
+
+    let mut cap_geo: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
+    let mut tessellator = FillTessellator::new();
+    let options = FillOptions::default()
+        .with_fill_rule(FillRule::EvenOdd)
+        .with_tolerance(0.01);
+    if tessellator
+        .tessellate_path(
+            &path,
+            &options,
+            &mut BuffersBuilder::new(&mut cap_geo, |v: FillVertex| {
+                let p = v.position();
+                [p.x, p.y]
+            }),
+        )
+        .is_err()
+        || cap_geo.vertices.is_empty()
+        || cap_geo.indices.len() < 3
+    {
+        return;
+    }
+
+    let mut min_uv = Vec2::splat(f32::INFINITY);
+    let mut max_uv = Vec2::splat(f32::NEG_INFINITY);
+    for &[x, y] in &cap_geo.vertices {
+        let p = Vec2::new(x, y);
+        min_uv = min_uv.min(p);
+        max_uv = max_uv.max(p);
+    }
+    let span = (max_uv - min_uv).max(Vec2::splat(1e-5));
+
+    let make_vert = |p2: [f32; 2]| -> ClipVert {
+        let pos = plane_origin + tangent_u * p2[0] + tangent_v * p2[1];
+        let uv = [(p2[0] - min_uv.x) / span.x, (p2[1] - min_uv.y) / span.y];
+        ClipVert {
+            pos,
+            normal: cap_normal,
+            uv,
+            material_slot: 1,
+        }
+    };
+
+    for tri in cap_geo.indices.as_chunks::<3>().0 {
+        let p0 = cap_geo.vertices[tri[0] as usize];
+        let p1 = cap_geo.vertices[tri[1] as usize];
+        let p2 = cap_geo.vertices[tri[2] as usize];
+        let area2 = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
+        if area2.abs() <= 1e-10 {
             continue;
         }
-        if area < 0.0 {
-            poly.reverse();
-        }
-        let tris = ear_clip_2d(&poly);
-        if tris.is_empty() {
-            continue;
-        }
-
-        let mut min_uv = poly[0];
-        let mut max_uv = poly[0];
-        for &p in &poly[1..] {
-            min_uv = min_uv.min(p);
-            max_uv = max_uv.max(p);
-        }
-        let span = (max_uv - min_uv).max(Vec2::splat(1e-5));
-
-        let base = out_verts.len() as u32;
-        for &p2 in &poly {
-            let p3 = plane_origin + tangent_u * p2.x + tangent_v * p2.y + cell_offset;
-            let uv = [(p2.x - min_uv.x) / span.x, (p2.y - min_uv.y) / span.y];
-            out_verts.push(Vertex3D::new(p3.to_array(), cap_normal.to_array(), uv, 1));
-        }
-        for [i0, i1, i2] in tris {
-            out_indices.extend_from_slice(&[base + i0 as u32, base + i1 as u32, base + i2 as u32]);
-        }
+        let ordered = if area2 >= 0.0 {
+            [make_vert(p0), make_vert(p1), make_vert(p2)]
+        } else {
+            [make_vert(p0), make_vert(p2), make_vert(p1)]
+        };
+        cell_polys.push(ordered.to_vec());
     }
 }
 
@@ -403,77 +493,6 @@ fn polygon_area_2d(poly: &[Vec2]) -> f32 {
         sum += a.x * b.y - b.x * a.y;
     }
     0.5 * sum
-}
-
-fn cross_2d(a: Vec2, b: Vec2, c: Vec2) -> f32 {
-    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
-}
-
-fn point_in_tri_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
-    let c1 = cross_2d(a, b, p);
-    let c2 = cross_2d(b, c, p);
-    let c3 = cross_2d(c, a, p);
-    c1 >= -1e-6 && c2 >= -1e-6 && c3 >= -1e-6
-}
-
-fn ear_clip_2d(poly: &[Vec2]) -> Vec<[usize; 3]> {
-    let n = poly.len();
-    if n < 3 {
-        return Vec::new();
-    }
-    let mut active: Vec<usize> = (0..n).collect();
-    let mut tris = Vec::with_capacity(n - 2);
-    let mut guard = n * n;
-
-    while active.len() > 3 && guard > 0 {
-        guard -= 1;
-        let m = active.len();
-        let mut clipped = false;
-
-        for k in 0..m {
-            let prev = active[(k + m - 1) % m];
-            let curr = active[k];
-            let next = active[(k + 1) % m];
-            let a = poly[prev];
-            let b = poly[curr];
-            let c = poly[next];
-
-            if cross_2d(a, b, c) <= 1e-8 {
-                continue;
-            }
-
-            let mut contains_other = false;
-            for &idx in &active {
-                if idx == prev || idx == curr || idx == next {
-                    continue;
-                }
-                if point_in_tri_2d(poly[idx], a, b, c) {
-                    contains_other = true;
-                    break;
-                }
-            }
-            if !contains_other {
-                tris.push([prev, curr, next]);
-                active.remove(k);
-                clipped = true;
-                break;
-            }
-        }
-
-        if !clipped {
-            // Safe fallback on degenerate/open contours
-            let root = active[0];
-            for pair in active[1..].windows(2) {
-                tris.push([root, pair[0], pair[1]]);
-            }
-            return tris;
-        }
-    }
-
-    if active.len() == 3 {
-        tris.push([active[0], active[1], active[2]]);
-    }
-    tris
 }
 
 /// Deterministic Effector `Voronoi Fracture`: clips `mesh` into up to `cell_count` convex
@@ -508,8 +527,6 @@ pub fn apply_voronoi_fracture(
         sites.push(Vec3::new(sx, sy, sz));
     }
 
-    type PlaneCut = (Vec3, Vec3, Vec<(Vec3, Vec3)>);
-
     // Collect source triangles once
     let mut source_tris: Vec<Vec<ClipVert>> = Vec::with_capacity(mesh.indices.len() / 3);
     for tri in mesh.indices.as_chunks::<3>().0 {
@@ -527,8 +544,10 @@ pub fn apply_voronoi_fracture(
     let mut out_indices: Vec<u32> = Vec::new();
 
     for (ci, &site_c) in sites.iter().enumerate() {
+        if out_indices.len() / 3 >= MAX_VORONOI_OUTPUT_TRIS {
+            break;
+        }
         let mut cell_polys = source_tris.clone();
-        let mut plane_cuts: Vec<PlaneCut> = Vec::new();
 
         for (cj, &site_j) in sites.iter().enumerate() {
             if ci == cj || cell_polys.is_empty() {
@@ -551,12 +570,8 @@ pub fn apply_voronoi_fracture(
             }
             cell_polys = next_polys;
 
-            if !cut_segs.is_empty() {
-                // Clip earlier planes' cut segments against this new half-space too
-                for (_, _, existing_segs) in &mut plane_cuts {
-                    clip_segments_halfspace(existing_segs, mid, inward_n);
-                }
-                plane_cuts.push((mid, inward_n, cut_segs));
+            if !cell_polys.is_empty() && !cut_segs.is_empty() {
+                build_planar_cap_polys(&cut_segs, mid, inward_n, &mut cell_polys);
             }
         }
 
@@ -588,7 +603,7 @@ pub fn apply_voronoi_fracture(
         }
         let cell_offset = dir * explode;
 
-        // Emit outer shell triangles
+        // Emit outer shell and inner cut-cap polygons
         for poly in &cell_polys {
             if out_indices.len() / 3 >= MAX_VORONOI_OUTPUT_TRIS {
                 break;
@@ -603,56 +618,7 @@ pub fn apply_voronoi_fracture(
                 out_indices.push(base + k as u32 + 1);
             }
         }
-
-        // Emit planar inner cut caps (material_slot = 1)
-        for (origin, inward_n, segs) in &plane_cuts {
-            if out_indices.len() / 3 >= MAX_VORONOI_OUTPUT_TRIS {
-                break;
-            }
-            build_planar_cap(
-                segs,
-                *origin,
-                *inward_n,
-                cell_offset,
-                &mut out_verts,
-                &mut out_indices,
-            );
-        }
     }
 
     MeshData::new(out_verts, out_indices)
-}
-
-fn clip_segments_halfspace(
-    segments: &mut Vec<(Vec3, Vec3)>,
-    plane_origin: Vec3,
-    inward_normal: Vec3,
-) {
-    let eps = 1e-5_f32;
-    let mut kept = Vec::with_capacity(segments.len());
-    for &(a, b) in segments.iter() {
-        let da = (a - plane_origin).dot(inward_normal);
-        let db = (b - plane_origin).dot(inward_normal);
-        let in_a = da >= -eps;
-        let in_b = db >= -eps;
-        match (in_a, in_b) {
-            (true, true) => kept.push((a, b)),
-            (true, false) => {
-                let t = (da / (da - db)).clamp(0.0, 1.0);
-                let hit = a.lerp(b, t);
-                if a.distance_squared(hit) > 1e-10 {
-                    kept.push((a, hit));
-                }
-            }
-            (false, true) => {
-                let t = (da / (da - db)).clamp(0.0, 1.0);
-                let hit = a.lerp(b, t);
-                if hit.distance_squared(b) > 1e-10 {
-                    kept.push((hit, b));
-                }
-            }
-            (false, false) => {}
-        }
-    }
-    *segments = kept;
 }

@@ -394,12 +394,13 @@ fn cmd_render(
         eprintln!("warning: {warning}");
     }
 
-    let width = width_override
-        .unwrap_or(project.sequence.resolution[0])
-        .max(1);
-    let height = height_override
-        .unwrap_or(project.sequence.resolution[1])
-        .max(1);
+    let width = width_override.unwrap_or(project.sequence.resolution[0]);
+    let height = height_override.unwrap_or(project.sequence.resolution[1]);
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "invalid render dimensions: {width}x{height} (width and height must be greater than zero)"
+        ));
+    }
     let plugins = build_plugins_for_project(&project);
 
     let mut engine = ProjectRenderEngine::new_headless()
@@ -477,10 +478,12 @@ fn parse_container(format: Option<&str>, out: &Path) -> Result<ExportContainer, 
 fn parse_video_codec(
     codec: Option<&str>,
     container: ExportContainer,
+    transparent: bool,
 ) -> Result<VideoCodec, String> {
     let Some(raw) = codec else {
         return Ok(match container {
             ExportContainer::Webm => VideoCodec::Vp9,
+            ExportContainer::Mkv if transparent => VideoCodec::Vp9,
             ExportContainer::Mp4 | ExportContainer::Mkv | ExportContainer::PngSequence => {
                 VideoCodec::H264
             }
@@ -524,7 +527,7 @@ fn parse_audio_codec(
     }
 }
 
-fn eval_scalar_track(track: &PropertyTrack, frame: f64, default: f64) -> f64 {
+fn build_scalar_property(track: &PropertyTrack, default: f64) -> DynamicProperty<f64> {
     let base = match &track.value {
         PropertyValue::Number(v) => *v,
         _ => default,
@@ -536,11 +539,12 @@ fn eval_scalar_track(track: &PropertyTrack, frame: f64, default: f64) -> f64 {
     if (!track.animated && static_behavior == StaticBehavior::Constant)
         || track.keyframes.is_empty()
     {
-        return base;
+        return DynamicProperty::new_static(base);
     }
     let mut prop = DynamicProperty::new_static(base);
     prop.static_behavior = static_behavior;
     prop.animated = track.animated;
+    prop.keyframes.clear();
     for kf in &track.keyframes {
         if let PropertyValue::Number(v) = kf.value {
             let tween_code = if kf.tween != 0 {
@@ -553,7 +557,7 @@ fn eval_scalar_track(track: &PropertyTrack, frame: f64, default: f64) -> f64 {
             let (mode, easing) = InterpolationMode::from_cm3_tween_code(tween_code);
             let mut key = Keyframe::with_easing(kf.frame, v, easing);
             key.interpolated = mode != InterpolationMode::Discrete;
-            if kf.is_bezier {
+            if mode == InterpolationMode::Bezier {
                 key.in_tangent = Some(kf.control_points[0]);
                 key.out_tangent = Some(kf.control_points[1]);
             }
@@ -561,7 +565,15 @@ fn eval_scalar_track(track: &PropertyTrack, frame: f64, default: f64) -> f64 {
             prop.set_keyframe(key);
         }
     }
-    prop.evaluate(frame)
+    if prop.keyframes.is_empty() {
+        return DynamicProperty::new_static(base);
+    }
+    prop
+}
+
+#[cfg(test)]
+fn eval_scalar_track(track: &PropertyTrack, frame: f64, default: f64) -> f64 {
+    build_scalar_property(track, default).evaluate(frame)
 }
 
 fn project_has_active_audio_in_range(
@@ -599,23 +611,33 @@ fn project_has_active_audio_in_range(
     false
 }
 
+struct CompiledAudioClipProps {
+    has_time_keyframes: bool,
+    time: DynamicProperty<f64>,
+    volume: DynamicProperty<f64>,
+    pan: DynamicProperty<f64>,
+}
+
 fn mix_project_audio(
     project: &Project,
     start_seq_frame: u32,
-    end_seq_frame: u32,
+    total_seq_frames: f64,
     seq_fps: f64,
     sample_rate: u32,
 ) -> Result<Option<Vec<[f32; 2]>>, String> {
+    if !total_seq_frames.is_finite() || total_seq_frames <= 0.0 {
+        return Ok(None);
+    }
     let seq = &project.sequence;
     let any_solo = seq
         .audio_tracks
         .iter()
         .any(|t| t.enabled && !t.muted && t.solo);
     let range_start = f64::from(start_seq_frame);
-    let range_end = f64::from(end_seq_frame);
+    let range_end = range_start + total_seq_frames;
     let mut buffers: HashMap<String, AudioBuffer> = HashMap::new();
     let mut scheduled: Vec<AudioClipScheduleItem> = Vec::new();
-    let mut source_clips: Vec<&zc_project::AudioClip> = Vec::new();
+    let mut compiled_props: Vec<CompiledAudioClipProps> = Vec::new();
 
     for track in &seq.audio_tracks {
         if !track.enabled || track.muted || (any_solo && !track.solo) {
@@ -647,20 +669,34 @@ fn mix_project_audio(
                 buffers.insert(asset_id.to_owned(), decoded);
             }
 
+            let has_time_keyframes = !clip.time_curve.keyframes.is_empty();
+            let time_prop = build_scalar_property(&clip.time_curve, 0.0);
+            let vol_prop = build_scalar_property(&clip.audio.volume, 1.0);
+            let pan_prop = build_scalar_property(&clip.audio.pan, 0.0);
+
             // Spec 03 §1.4 & Spec 04 §4.2: effective playback rate is evaluated against `seq_fps`.
-            let t0 = eval_scalar_track(&clip.time_curve, 0.0, 0.0);
-            let t1 = eval_scalar_track(&clip.time_curve, clip.length, clip.length / seq_fps);
+            let t0 = time_prop.evaluate(0.0);
+            let t1 = if has_time_keyframes {
+                time_prop.evaluate(clip.length)
+            } else {
+                t0 + clip.length / seq_fps
+            };
             let rate = zc_audio::effective_playback_rate(t0, t1, clip.length, seq_fps);
             scheduled.push(AudioClipScheduleItem {
                 clip_start_frame: clip.start - range_start,
                 clip_length_frames: clip.length,
                 media_start_sec: t0,
                 playback_rate: rate,
-                volume: eval_scalar_track(&clip.audio.volume, 0.0, 1.0) as f32,
-                pan: eval_scalar_track(&clip.audio.pan, 0.0, 0.0) as f32,
+                volume: vol_prop.evaluate(0.0) as f32,
+                pan: pan_prop.evaluate(0.0) as f32,
                 buffer_id: asset_id.to_owned(),
             });
-            source_clips.push(clip);
+            compiled_props.push(CompiledAudioClipProps {
+                has_time_keyframes,
+                time: time_prop,
+                volume: vol_prop,
+                pan: pan_prop,
+            });
         }
     }
 
@@ -668,7 +704,6 @@ fn mix_project_audio(
         return Ok(None);
     }
 
-    let total_seq_frames = f64::from(end_seq_frame.saturating_sub(start_seq_frame));
     let mixed = try_mix_offline_stereo_animated(
         total_seq_frames,
         seq_fps,
@@ -676,11 +711,16 @@ fn mix_project_audio(
         &scheduled,
         &buffers,
         |idx, item, local_frame| {
-            let clip = source_clips[idx];
+            let props = &compiled_props[idx];
+            let media_time_sec = if props.has_time_keyframes {
+                props.time.evaluate(local_frame)
+            } else {
+                item.media_start_sec + (local_frame / seq_fps) * item.playback_rate
+            };
             ClipAudioSampleParams {
-                media_time_sec: item.media_start_sec + (local_frame / seq_fps) * item.playback_rate,
-                volume: eval_scalar_track(&clip.audio.volume, local_frame, 1.0) as f32,
-                pan: eval_scalar_track(&clip.audio.pan, local_frame, 0.0) as f32,
+                media_time_sec,
+                volume: props.volume.evaluate(local_frame) as f32,
+                pan: props.pan.evaluate(local_frame) as f32,
             }
         },
     )
@@ -697,8 +737,8 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
         eprintln!("warning: {warning}");
     }
 
-    let width = args.width.unwrap_or(project.sequence.resolution[0]).max(1);
-    let height = args.height.unwrap_or(project.sequence.resolution[1]).max(1);
+    let width = args.width.unwrap_or(project.sequence.resolution[0]);
+    let height = args.height.unwrap_or(project.sequence.resolution[1]);
     let seq_fps = f64::from(project.sequence.fps.max(1));
     let export_fps = args.fps.unwrap_or(seq_fps);
     let default_end = project.sequence.length_frames.round().max(1.0) as u32;
@@ -710,37 +750,41 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
         ));
     }
 
-    let container = parse_container(args.format, args.out)?;
-    let video_codec = parse_video_codec(args.video_codec, container)?;
-    let sample_rate = STANDARD_SAMPLE_RATE;
-    let has_active_audio = project_has_active_audio_in_range(
-        &project,
-        f64::from(args.start_frame),
-        f64::from(end_seq_frame),
-    );
-    let audio_codec = parse_audio_codec(args.audio_codec, container, has_active_audio)?;
-    let quality = match args.bitrate_kbps {
-        Some(kbps) => QualityMode::BitrateKbps(kbps),
-        None => QualityMode::Crf(args.crf),
-    };
-
     // Spec 04 §4.1: frameAdvance = seqRate / exportRate so changing export FPS preserves
     // real-time playback speed instead of speeding up or slowing down the scene.
     if !export_fps.is_finite() || export_fps <= 0.0 {
         return Err(format!("invalid export fps: {export_fps}"));
     }
     let duration_sec = f64::from(end_seq_frame - args.start_frame) / seq_fps;
-    let export_frames_f64 = (duration_sec * export_fps).round();
-    if !export_frames_f64.is_finite()
-        || export_frames_f64 < 1.0
-        || export_frames_f64 > f64::from(u32::MAX)
-    {
+    let raw_export_frames = duration_sec * export_fps;
+    if !raw_export_frames.is_finite() {
+        return Err(format!(
+            "export frame count out of range for duration {duration_sec}s at {export_fps} fps"
+        ));
+    }
+    let export_frames_f64 = raw_export_frames.round().max(1.0);
+    if export_frames_f64 > f64::from(u32::MAX) {
         return Err(format!(
             "export frame count out of range for duration {duration_sec}s at {export_fps} fps"
         ));
     }
     let export_frame_count = export_frames_f64 as u32;
     let frame_advance = seq_fps / export_fps;
+    let audio_seq_frames = f64::from(export_frame_count) * frame_advance;
+
+    let container = parse_container(args.format, args.out)?;
+    let video_codec = parse_video_codec(args.video_codec, container, args.transparent)?;
+    let sample_rate = STANDARD_SAMPLE_RATE;
+    let has_active_audio = project_has_active_audio_in_range(
+        &project,
+        f64::from(args.start_frame),
+        f64::from(args.start_frame) + audio_seq_frames,
+    );
+    let audio_codec = parse_audio_codec(args.audio_codec, container, has_active_audio)?;
+    let quality = match args.bitrate_kbps {
+        Some(kbps) => QualityMode::BitrateKbps(kbps),
+        None => QualityMode::Crf(args.crf),
+    };
 
     let settings = ExportSettings {
         width,
@@ -772,7 +816,7 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
         mix_project_audio(
             &project,
             args.start_frame,
-            end_seq_frame,
+            audio_seq_frames,
             seq_fps,
             sample_rate,
         )?
@@ -783,6 +827,7 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
         .map_err(|e| format!("failed to initialize headless GPU renderer: {e}"))?;
     let cancel = Arc::new(AtomicBool::new(false));
     let start_seq = f64::from(args.start_frame);
+    let transparent = args.transparent;
 
     let report = export_video_with_progress(
         &settings,
@@ -793,9 +838,16 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
             let premul = engine
                 .render_frame_rgba8(&project, &plugins, scene_frame, width, height)
                 .map_err(|e| ExportError::Render(e.to_string()))?;
-            let straight = zc_render::unpremultiply_rgba8(&premul);
             rgba_out.clear();
-            rgba_out.extend_from_slice(&straight);
+            if transparent {
+                let straight = zc_render::unpremultiply_rgba8(&premul);
+                rgba_out.extend_from_slice(&straight);
+            } else {
+                rgba_out.extend_from_slice(&premul);
+                for px in rgba_out.as_chunks_mut::<4>().0 {
+                    px[3] = 255;
+                }
+            }
             Ok(())
         },
         |_progress| {},
@@ -985,12 +1037,13 @@ mod tests {
                 preserved: std::collections::BTreeMap::new(),
             },
         );
-        project.sequence.audio_tracks.push(zc_project::AudioTrack {
+        project.sequence.audio_tracks = vec![zc_project::AudioTrack {
             id: zc_project::Uuid::new_v4(),
             name: "Audio 1".to_owned(),
             enabled: true,
             muted: false,
             solo: false,
+            locked: false,
             clips: vec![zc_project::AudioClip {
                 id: zc_project::Uuid::new_v4(),
                 name: "Tone".to_owned(),
@@ -1003,7 +1056,7 @@ mod tests {
                 preserved: std::collections::BTreeMap::new(),
             }],
             preserved: std::collections::BTreeMap::new(),
-        });
+        }];
         // Configure linear time curve 0 -> 15 frames = 0.0 -> 0.5s at 30fps.
         let tc = &mut project.sequence.audio_tracks[0].clips[0].time_curve;
         tc.static_behavior = ProjectStaticBehavior::Linear;
@@ -1028,7 +1081,7 @@ mod tests {
             },
         ];
 
-        let mixed = mix_project_audio(&project, 0, 15, fps, sr)
+        let mixed = mix_project_audio(&project, 0, 15.0, fps, sr)
             .expect("audio mixing must succeed")
             .expect("mixed buffer must be Some");
         assert_eq!(
@@ -1039,5 +1092,49 @@ mod tests {
             .iter()
             .fold(0.0_f32, |acc, &[l, r]| acc.max(l.abs()).max(r.abs()));
         assert!(peak > 0.3, "expected audible sine wave peak, got {peak}");
+    }
+
+    #[test]
+    fn parse_video_codec_defaults_mkv_transparent_to_vp9() {
+        assert_eq!(
+            parse_video_codec(None, ExportContainer::Mkv, true).expect("mkv transparent"),
+            VideoCodec::Vp9
+        );
+        assert_eq!(
+            parse_video_codec(None, ExportContainer::Mkv, false).expect("mkv opaque"),
+            VideoCodec::H264
+        );
+    }
+
+    #[test]
+    fn eval_scalar_track_holds_first_keyframe_after_zero_and_uses_bezier_mode() {
+        let mut track = PropertyTrack::number(0.0);
+        track.animated = true;
+        track.keyframes = vec![
+            zc_project::PropertyKeyframe {
+                frame: 10.0,
+                value: PropertyValue::Number(2.0),
+                tween: 0,
+                easing_index: 0,
+                is_bezier: false,
+                control_points: [[0.0, 0.0], [3.0, 2.0]],
+                continuous_tangent: true,
+            },
+            zc_project::PropertyKeyframe {
+                frame: 20.0,
+                value: PropertyValue::Number(4.0),
+                tween: (1 << 8) | 1, // Bezier mode via tween code even if is_bezier is false
+                easing_index: 0,
+                is_bezier: false,
+                control_points: [[-3.0, -2.0], [0.0, 0.0]],
+                continuous_tangent: true,
+            },
+        ];
+        assert!((eval_scalar_track(&track, 0.0, 0.0) - 2.0).abs() < 1e-9);
+        assert!((eval_scalar_track(&track, 5.0, 0.0) - 2.0).abs() < 1e-9);
+
+        let prop = build_scalar_property(&track, 0.0);
+        assert_eq!(prop.keyframes.len(), 2);
+        assert_eq!(prop.keyframes[1].in_tangent, Some([-3.0, -2.0]));
     }
 }

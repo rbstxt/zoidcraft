@@ -54,6 +54,17 @@ impl Drop for TempFileGuard {
     }
 }
 
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Allocates a unique sibling temporary path in the same directory as `dest` so
 /// FFmpeg never clobbers an existing destination file prior to successful muxing.
 pub(crate) fn unique_sibling_temp_path(dest: &Path) -> PathBuf {
@@ -63,10 +74,12 @@ pub(crate) fn unique_sibling_temp_path(dest: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let stem = dest
+    let raw_stem = dest
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("export");
+    let stem = truncate_utf8_bytes(raw_stem, 64);
+    let stem = if stem.is_empty() { "export" } else { stem };
     let file_name = format!(".{stem}.zoidcraft_tmp_{pid}_{seq}_{nanos}");
     match dest.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(file_name),
@@ -204,5 +217,32 @@ mod tests {
             .clone()
             .expect("path recorded");
         assert!(!p.exists(), "temp WAV must be deleted even after panic");
+    }
+
+    #[test]
+    fn unique_sibling_temp_path_truncates_long_utf8_stems() {
+        let long_ascii = format!("/tmp/{}.mp4", "a".repeat(250));
+        let tmp_ascii = unique_sibling_temp_path(Path::new(&long_ascii));
+        let name_ascii = tmp_ascii
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("valid UTF-8 file name");
+        assert!(
+            name_ascii.len() <= 160,
+            "temp filename too long: {}",
+            name_ascii.len()
+        );
+
+        let long_utf8 = format!("/tmp/{}.mp4", "あ".repeat(80));
+        let tmp_utf8 = unique_sibling_temp_path(Path::new(&long_utf8));
+        let name_utf8 = tmp_utf8
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("valid UTF-8 file name");
+        assert!(
+            name_utf8.len() <= 160,
+            "temp UTF-8 filename too long: {}",
+            name_utf8.len()
+        );
     }
 }

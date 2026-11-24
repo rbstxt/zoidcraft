@@ -35,7 +35,26 @@ impl Drop for TempFileGuard {
     }
 }
 
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn create_unique_sibling(target: &Path) -> Result<(File, PathBuf), ProjectError> {
+    let Some(raw_file_name) = target.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target path has no file name",
+        )
+        .into());
+    };
+
     let parent = match target.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => {
             fs::create_dir_all(dir)?;
@@ -44,10 +63,13 @@ fn create_unique_sibling(target: &Path) -> Result<(File, PathBuf), ProjectError>
         _ => Path::new("."),
     };
 
-    let base_name = target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("zcraft");
+    let raw_base = raw_file_name.to_str().unwrap_or("zcraft");
+    let truncated = truncate_utf8_bytes(raw_base, 64);
+    let base_name = if truncated.is_empty() {
+        "zcraft"
+    } else {
+        truncated
+    };
     let pid = std::process::id();
 
     for _ in 0..16 {
@@ -174,5 +196,31 @@ mod tests {
             .map(|e| e.expect("entry").file_name())
             .collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn atomic_write_supports_long_utf8_filename_and_rejects_empty_target() {
+        let dir = TestDir::new();
+        // 230-byte ASCII filename (would exceed NAME_MAX=255 if not truncated for sibling temp name).
+        let long_ascii = format!("{}.zcraft", "a".repeat(223));
+        let long_target = dir.0.join(long_ascii);
+        write_atomic(&long_target, b"long-ok").expect("write long ascii target");
+        assert_eq!(fs::read(&long_target).expect("read long ascii"), b"long-ok");
+
+        // Multi-byte UTF-8 filename (> 64 bytes) truncates safely on a char boundary.
+        let utf8_name = format!("{}.zcraft", "あ".repeat(30)); // 97 bytes
+        let utf8_target = dir.0.join(utf8_name);
+        write_atomic(&utf8_target, b"utf8-ok").expect("write utf8 target");
+        assert_eq!(fs::read(&utf8_target).expect("read utf8"), b"utf8-ok");
+
+        // Empty or root paths have no file name and fail fast without writing.
+        assert!(matches!(
+            write_atomic(Path::new(""), b"nope"),
+            Err(ProjectError::Io(ref err)) if err.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert!(matches!(
+            write_atomic(Path::new("/"), b"nope"),
+            Err(ProjectError::Io(ref err)) if err.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 }

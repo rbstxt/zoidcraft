@@ -153,9 +153,21 @@ impl Rgb {
 
     /// Converts sRGB to [`Hsv`] (`h in [0, 1)`, `s in [0, 1]`, `v in [0, 1]`).
     pub fn to_hsv(self) -> Hsv {
-        let r = self.0[0];
-        let g = self.0[1];
-        let b = self.0[2];
+        let r = if self.0[0].is_finite() {
+            self.0[0].clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let g = if self.0[1].is_finite() {
+            self.0[1].clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let b = if self.0[2].is_finite() {
+            self.0[2].clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let max = r.max(g).max(b);
         let min = r.min(g).min(b);
         let d = max - min;
@@ -1028,9 +1040,9 @@ pub fn blend_premul(dst: PremulRgba, src: PremulRgba, mode: BlendMode) -> Premul
         BlendMode::HardMix => {
             compose_separable(dst, src, |d, s| if d + s >= 1.0 { 1.0 } else { 0.0 })
         }
-        BlendMode::Contrast => compose_separable(dst, src, |d, s| {
-            (0.5 + 2.0 * (d - 0.5) * (s - 0.5)).clamp(0.0, 1.0)
-        }),
+        BlendMode::Contrast => {
+            compose_separable(dst, src, |d, s| (0.5 + 2.0 * (d - 0.5) * s).clamp(0.0, 1.0))
+        }
 
         // Non-separable HSL blend modes (W3C Compositing Level 1)
         BlendMode::Hue => {
@@ -1217,6 +1229,9 @@ fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
 }
 
 fn parse_hex_byte(pair: &str, full: &str) -> Result<u8, ColorError> {
+    if pair.len() != 2 || !pair.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ColorError::InvalidHex(full.to_string()));
+    }
     u8::from_str_radix(pair, 16).map_err(|_| ColorError::InvalidHex(full.to_string()))
 }
 
@@ -1231,6 +1246,21 @@ fn wrap_unit_f64(x: f64) -> f64 {
 }
 
 fn rgb_to_hsl_f64(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    let r = if r.is_finite() {
+        r.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let g = if g.is_finite() {
+        g.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let b = if b.is_finite() {
+        b.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let l = 0.5 * (max + min);
@@ -1238,10 +1268,11 @@ fn rgb_to_hsl_f64(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     if d == 0.0 {
         return (0.0, 0.0, l);
     }
-    let s = if l > 0.5 {
-        d / (2.0 - max - min)
+    let denom = if l > 0.5 { 2.0 - max - min } else { max + min };
+    let s = if denom > 0.0 {
+        (d / denom).clamp(0.0, 1.0)
     } else {
-        d / (max + min)
+        0.0
     };
     let h_raw = if max == r {
         (g - b) / d + if g < b { 6.0 } else { 0.0 }
@@ -1551,5 +1582,52 @@ mod tests {
             PremulRgba::new(0.5, 0.0, 0.5, 1.0),
             1e-6,
         );
+    }
+
+    #[test]
+    fn contrast_blend_hex_validation_and_out_of_gamut_hsl_hsv() {
+        // Bug 8: Contrast formula matches compositor: clamp(0.5 + 2*(d - 0.5)*s, 0, 1).
+        let dst = Rgba::new(0.8, 0.4, 0.2, 1.0).to_premul();
+        let zero = Rgba::new(0.0, 0.0, 0.0, 1.0).to_premul();
+        let mid = Rgba::new(0.5, 0.5, 0.5, 1.0).to_premul();
+        let one = Rgba::new(1.0, 1.0, 1.0, 1.0).to_premul();
+
+        assert_premul_close(
+            blend_premul(dst, zero, BlendMode::Contrast),
+            PremulRgba::new(0.5, 0.5, 0.5, 1.0),
+            1e-6,
+        );
+        assert_premul_close(blend_premul(dst, mid, BlendMode::Contrast), dst, 1e-6);
+        assert_premul_close(
+            blend_premul(dst, one, BlendMode::Contrast),
+            PremulRgba::new(1.0, 0.3, 0.0, 1.0),
+            1e-5,
+        );
+
+        // Bug 9: Reject '+'-prefixed hex byte pairs.
+        assert!(Rgb::from_hex("#+f+f+f").is_err());
+        assert!(Rgb::from_hex("#+1+2+3").is_err());
+        assert!(Rgba::from_hex("#+1+2+3").is_err());
+        assert!(Rgba::from_hex("#+1+2+3+4").is_err());
+
+        // Bug 10: Out-of-gamut and non-finite RGB stay finite and in [0, 1] for HSL/HSV.
+        for rgb in [
+            Rgb::new(1.5, 0.5, 0.5),
+            Rgb::new(0.5, -0.5, -0.5),
+            Rgb::new(-0.2, -0.5, -0.5),
+            Rgb::new(f32::NAN, 0.5, f32::INFINITY),
+        ] {
+            let hsl = rgb.to_hsl();
+            assert!(hsl.h.is_finite() && (0.0..1.0).contains(&hsl.h));
+            assert!(hsl.s.is_finite() && (0.0..=1.0).contains(&hsl.s));
+            assert!(hsl.l.is_finite() && (0.0..=1.0).contains(&hsl.l));
+            let back = Rgb::from_hsl(hsl);
+            assert!(back.0.iter().all(|c| c.is_finite()));
+
+            let hsv = rgb.to_hsv();
+            assert!(hsv.h.is_finite() && (0.0..1.0).contains(&hsv.h));
+            assert!(hsv.s.is_finite() && (0.0..=1.0).contains(&hsv.s));
+            assert!(hsv.v.is_finite() && (0.0..=1.0).contains(&hsv.v));
+        }
     }
 }

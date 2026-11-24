@@ -37,11 +37,12 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 
 /// Radial Blur Spin (`radialblurspin`, Native FX).
 /// Angular rotational blur around `center` on premultiplied RGBA.
-/// `p0 = [center.x, center.y, amount_rad, dither]`.
+/// `p0 = [center.x, center.y, amount_rad, dither]`, `p1.x = samples (default 24, clamped 4..=64)`.
 pub const SHADER_RADIAL_BLUR_SPIN: &str = r#"
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
-    const TAPS: i32 = 24;
+    let raw_taps = select(24.0, u.p1.x, u.p1.x > 0.5);
+    let taps = clamp(i32(round(raw_taps)), 4, 64);
     let aspect = u.resolution.x / max(u.resolution.y, 1.0);
     let center = vec2<f32>(0.5) + u.p0.xy;
     let rel = (in_v.v_uv - center) * vec2<f32>(aspect, 1.0);
@@ -50,8 +51,8 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 
     var sum = vec4<f32>(0.0);
     var w_sum = 0.0;
-    for (var i = 0; i < TAPS; i = i + 1) {
-        let t = ((f32(i) + 0.5 + jitter) / f32(TAPS)) - 0.5;
+    for (var i = 0; i < taps; i = i + 1) {
+        let t = ((f32(i) + 0.5 + jitter) / f32(taps)) - 0.5;
         let ang = t * spread;
         let rot_p = rot2(rel, ang);
         let uv_s = center + rot_p / vec2<f32>(aspect, 1.0);
@@ -142,7 +143,7 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let line_id = floor(in_v.v_uv.y * u.resolution.y * 0.5);
     let line_jit = (hash12(vec2<f32>(line_id, seed * 1.13)) - 0.5) * 0.006 * jitter;
     let wave = sin(in_v.v_uv.y * 28.0 + u.time * 7.5 + seed * 0.1) * 0.002 * jitter;
-    let tear_zone = smoothstep(0.08 * head_sw, 0.0, in_v.v_uv.y);
+    let tear_zone = select(0.0, 1.0 - smoothstep(0.0, max(0.08 * head_sw, 1e-4), in_v.v_uv.y), head_sw > 1e-4);
     let tear_shift = tear_zone * (hash12(vec2<f32>(floor(in_v.v_uv.y * 120.0), seed)) - 0.5) * 0.08 * head_sw;
 
     let uv_base = vec2<f32>(clamp(in_v.v_uv.x + line_jit + wave + tear_shift, 0.0, 1.0), in_v.v_uv.y);
@@ -192,15 +193,26 @@ fn ycbcr_to_rgb(c: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let texel = sample_diffuse(in_v.v_uv);
-    let src_rgb = unpremultiply(texel);
+    let orig_rgb = unpremultiply(texel);
     let res = max(u.resolution, vec2<f32>(1.0));
+    let q = clamp(u.p0.x, 0.0, 1.0);
     let amount = clamp(u.p0.y, 0.0, 1.0);
     let block_px = max(u.p0.z, 2.0);
-    let px = in_v.v_uv * res;
+    let block_jitter = max(u.p1.x, 0.0);
+    let px_raw = in_v.v_uv * res;
+    let block_id = floor(px_raw / block_px);
+    let jitter_off = select(
+        vec2<f32>(0.0),
+        (hash22(block_id + vec2<f32>(u.frame * 0.13, u.frame * 0.29)) - vec2<f32>(0.5)) * block_px * block_jitter,
+        block_jitter > 1e-4,
+    );
+    let px = clamp(px_raw + jitter_off, vec2<f32>(0.0), res);
+    let jittered_tex = sample_diffuse(px / res);
+    let src_rgb = unpremultiply(jittered_tex);
     let block_origin = floor(px / block_px) * block_px;
     let block_uv_center = (block_origin + vec2<f32>(block_px * 0.5)) / res;
 
-    // 4-point block DC approximation + 4:2:0 chroma subsampling.
+    // 4-point block DC approximation + configurable chroma subsampling.
     let q1 = (block_origin + vec2<f32>(block_px * 0.25, block_px * 0.25)) / res;
     let q2 = (block_origin + vec2<f32>(block_px * 0.75, block_px * 0.25)) / res;
     let q3 = (block_origin + vec2<f32>(block_px * 0.25, block_px * 0.75)) / res;
@@ -212,14 +224,14 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         + unpremultiply(sample_diffuse(clamp(q4, vec2<f32>(0.0), vec2<f32>(1.0))))
     );
 
-    let sub_px = max(u.p0.w, 1.0) * 2.0;
+    let sub_px = select(max(u.p0.w, 1.0) * 2.0, 1.0, u.p0.w < 0.5);
     let chroma_uv = (floor(px / sub_px) * sub_px + vec2<f32>(sub_px * 0.5)) / res;
     let chroma_ycc = rgb_to_ycbcr(unpremultiply(sample_diffuse(clamp(chroma_uv, vec2<f32>(0.0), vec2<f32>(1.0)))));
     let src_ycc = rgb_to_ycbcr(src_rgb);
     let dc_ycc = rgb_to_ycbcr(dc_rgb);
 
     // Quantize AC residual and chroma according to inverse quality.
-    let q_levels = mix(64.0, 4.0, clamp(1.0 - u.p0.x, 0.0, 1.0));
+    let q_levels = mix(64.0, 4.0, 1.0 - q);
     let ac_y = src_ycc.x - dc_ycc.x;
     let ac_quant = round(ac_y * q_levels) / q_levels;
     let y_out = clamp(dc_ycc.x + ac_quant, 0.0, 1.0);
@@ -228,11 +240,12 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 
     // Subtle 8x8 DCT boundary ringing.
     let local = fract(px / block_px);
-    let ring = sin(local.x * TAU) * sin(local.y * TAU) * 0.025 * (1.0 - u.p0.x);
+    let ring = sin(local.x * TAU) * sin(local.y * TAU) * 0.025 * (1.0 - q);
     let center_l = luma601(unpremultiply(sample_diffuse(clamp(block_uv_center, vec2<f32>(0.0), vec2<f32>(1.0)))));
     let dmg_rgb = ycbcr_to_rgb(vec3<f32>(clamp(y_out + ring * (src_ycc.x - center_l), 0.0, 1.0), cb_out, cr_out));
-    let out_rgb = mix(src_rgb, dmg_rgb, amount);
-    return premultiply(out_rgb, texel.a);
+    let out_rgb = mix(orig_rgb, dmg_rgb, amount);
+    let out_a = mix(texel.a, jittered_tex.a, amount);
+    return premultiply(out_rgb, out_a);
 }
 "#;
 
@@ -439,11 +452,11 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let tex_r = sample_diffuse(clamp(in_v.v_uv + center_vec * ca, vec2<f32>(0.0), vec2<f32>(1.0)));
     let tex_g = sample_diffuse(in_v.v_uv);
     let tex_b = sample_diffuse(clamp(in_v.v_uv - center_vec * ca, vec2<f32>(0.0), vec2<f32>(1.0)));
-    let alpha = tex_g.a;
-    var rgb = vec3<f32>(
-        unpremultiply(tex_r).r,
-        unpremultiply(tex_g).g,
-        unpremultiply(tex_b).b,
+    let alpha = max(tex_r.a, max(tex_g.a, tex_b.a));
+    var rgb = select(
+        vec3<f32>(0.0),
+        clamp(vec3<f32>(tex_r.r, tex_g.g, tex_b.b) / max(alpha, EPS), vec3<f32>(0.0), vec3<f32>(1.0)),
+        alpha > EPS,
     );
 
     // Exposure & white balance (temperature / tint).
@@ -478,7 +491,8 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let g_noise = (hash13(vec3<f32>(floor(in_v.v_uv * u.resolution), u.frame)) - 0.5) * u.p2.w * 0.25;
     rgb = rgb + vec3<f32>(g_noise);
 
-    return premultiply(rgb, alpha);
+    let graded = premultiply(rgb, alpha);
+    return mix(tex_g, graded, clamp(u.p1.w, 0.0, 1.0));
 }
 "#;
 
@@ -517,7 +531,7 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
             let sr = sample_diffuse(uvr);
             let sg = sample_diffuse(uvg);
             let sb = sample_diffuse(uvb);
-            sum = sum + vec4<f32>(sr.r, sg.g, sb.b, sg.a) * w;
+            sum = sum + vec4<f32>(sr.r, sg.g, sb.b, max(sr.a, max(sg.a, sb.a))) * w;
             w_sum = w_sum + w;
         }
         return sum / max(w_sum, EPS);
@@ -526,7 +540,8 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let src = sample_diffuse(in_v.v_uv);
     var glow = sample_aux(in_v.v_uv);
     if ((u.flags & 1u) != 0u) {
-        return glow;
+        let ga = clamp(glow.a, 0.0, 1.0);
+        return vec4<f32>(clamp(glow.rgb, vec3<f32>(0.0), vec3<f32>(ga)), ga);
     }
 
     // Deterministic procedural atmospheric dust modulation.
@@ -561,7 +576,15 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         case 4u: {
             // Overlay
             let s_str = unpremultiply(src_scaled);
-            combined_rgb = apply_blend(s_str, clamp(glow_rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 3u) * max(src_scaled.a, glow.a);
+            let ga = clamp(max(glow.a, max(glow_rgb.r, max(glow_rgb.g, glow_rgb.b))), 0.0, 1.0);
+            let g_str = select(
+                vec3<f32>(0.0),
+                clamp(glow_rgb / max(ga, EPS), vec3<f32>(0.0), vec3<f32>(1.0)),
+                ga > EPS,
+            );
+            combined_rgb = (1.0 - src_scaled.a) * glow_rgb
+                + (1.0 - ga) * src_scaled.rgb
+                + src_scaled.a * ga * apply_blend(s_str, g_str, 3u);
         }
         default: {
             // Screen (default)
@@ -570,8 +593,10 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     }
 
     let under_rgb = src_scaled.rgb + glow_rgb * (1.0 - src_scaled.a);
-    let out_rgb = clamp(mix(combined_rgb, under_rgb, glow_under), vec3<f32>(0.0), vec3<f32>(1.0));
-    let out_a = clamp(src_scaled.a + glow.a * affect_a * (1.0 - src_scaled.a), 0.0, 1.0);
+    let raw_rgb = clamp(mix(combined_rgb, under_rgb, glow_under), vec3<f32>(0.0), vec3<f32>(1.0));
+    let glow_alpha = max(glow.a, max(glow_rgb.r, max(glow_rgb.g, glow_rgb.b)));
+    let out_a = clamp(src_scaled.a + glow_alpha * affect_a * (1.0 - src_scaled.a), 0.0, 1.0);
+    let out_rgb = min(raw_rgb, vec3<f32>(out_a));
     return vec4<f32>(out_rgb, out_a);
 }
 "#;
@@ -657,7 +682,11 @@ pub const SHADER_ECHO: &str = r#"
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let base = sample_diffuse(in_v.v_uv);
-    let tap = sample_aux(in_v.v_uv) * max(u.p0.x, 0.0);
+    if ((u.flags & 1u) == 0u) {
+        return base;
+    }
+    let tap_raw = clamp(sample_aux(in_v.v_uv) * max(u.p0.x, 0.0), vec4<f32>(0.0), vec4<f32>(1.0));
+    let tap = vec4<f32>(min(tap_raw.rgb, vec3<f32>(tap_raw.a)), tap_raw.a);
     switch (u.mode) {
         case 0u: {
             // Add

@@ -113,9 +113,18 @@ impl SelectionState {
     ) -> Result<bool, SelectionError> {
         let clip_id = clip_id.into();
         if !shift {
+            let changed_clip =
+                self.clip_ids.len() != 1 || self.clip_ids[0].as_str() != clip_id.as_str();
             self.clip_ids.clear();
             self.clip_ids.push(clip_id);
             self.clip_base_type = base_type.map(str::to_string);
+            if changed_clip {
+                self.object_3d_ids.clear();
+                self.object_3d_base_type = None;
+                self.effect_ids.clear();
+                self.effect_base_type = None;
+                self.keyframes.clear();
+            }
             return Ok(true);
         }
 
@@ -123,21 +132,25 @@ impl SelectionState {
             self.clip_ids.remove(pos);
             if self.clip_ids.is_empty() {
                 self.clip_base_type = None;
+                self.clear_objects_3d();
+                self.clear_effects();
+                self.clear_keyframes();
             }
             return Ok(false);
         }
 
-        if let (Some(expected), Some(actual)) = (self.clip_base_type.as_deref(), base_type)
-            && expected != actual
-        {
+        if !self.clip_ids.is_empty() && self.clip_base_type.as_deref() != base_type {
             return Err(SelectionError::MixedType {
                 domain: SelectionDomain::Clip,
-                expected: expected.to_string(),
-                actual: actual.to_string(),
+                expected: self
+                    .clip_base_type
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                actual: base_type.unwrap_or("unknown").to_string(),
             });
         }
 
-        if self.clip_base_type.is_none() {
+        if self.clip_ids.is_empty() {
             self.clip_base_type = base_type.map(str::to_string);
         }
         self.clip_ids.push(clip_id);
@@ -229,7 +242,12 @@ impl SelectionState {
     }
 
     /// Selects or toggles a keyframe reference.
+    ///
+    /// Rejects non-finite (`NaN` / `±inf`) frame numbers, returning `false`.
     pub fn select_keyframe(&mut self, kf: KeyframeRef, shift: bool) -> bool {
+        if !kf.frame.is_finite() {
+            return false;
+        }
         if !shift {
             self.keyframes.clear();
             self.keyframes.push(kf);
@@ -250,10 +268,13 @@ impl SelectionState {
         true
     }
 
-    /// Clears selected clips.
+    /// Clears selected clips and any dependent child selections.
     pub fn clear_clips(&mut self) {
         self.clip_ids.clear();
         self.clip_base_type = None;
+        self.clear_objects_3d();
+        self.clear_effects();
+        self.clear_keyframes();
     }
 
     /// Clears selected 3D objects.
@@ -374,7 +395,11 @@ impl PlaybackState {
     /// Scrubs directly to `frame`, pausing playback (`speed = 0`) and clamping to
     /// `[0, max(total_frames - 1, 0)]` per Spec 02 §5.1.
     pub fn set_frame(&mut self, frame: f64, total_frames: f64) {
-        let max_frame = (total_frames - 1.0).max(0.0);
+        let max_frame = if total_frames.is_finite() {
+            (total_frames - 1.0).max(0.0)
+        } else {
+            0.0
+        };
         self.speed = 0.0;
         self.current_frame = if frame.is_finite() {
             frame.clamp(0.0, max_frame)
@@ -435,14 +460,29 @@ impl PlaybackState {
 
     /// Advances playback by `dt_seconds` using exact CM3 boundary and loop semantics (Spec 02 §5.1).
     pub fn advance(&mut self, dt_seconds: f64, fps: f64, total_frames: f64) {
-        if !self.is_playing() || !dt_seconds.is_finite() || dt_seconds <= 0.0 || fps <= 0.0 {
+        if !self.is_playing()
+            || !dt_seconds.is_finite()
+            || dt_seconds <= 0.0
+            || !fps.is_finite()
+            || fps <= 0.0
+            || !total_frames.is_finite()
+            || total_frames < 0.0
+        {
             return;
         }
 
         let next = self.current_frame + dt_seconds * fps * self.speed;
+        if !next.is_finite() {
+            return;
+        }
         if next >= total_frames || next < 0.0 {
             if self.looping && total_frames > 0.0 {
-                self.current_frame = next.rem_euclid(total_frames);
+                let wrapped = next.rem_euclid(total_frames);
+                self.current_frame = if wrapped >= total_frames || !wrapped.is_finite() {
+                    0.0
+                } else {
+                    wrapped
+                };
             } else {
                 let max_frame = (total_frames - 1.0).max(0.0);
                 self.current_frame = next.clamp(0.0, max_frame);
@@ -466,11 +506,13 @@ impl PlaybackState {
 
         match self.time_format % 3 {
             TIME_FORMAT_TIMECODE_MS => {
-                let t = frame / safe_fps;
-                let hours = (t / 3600.0).floor() as u64;
-                let minutes = ((t / 60.0) % 60.0).floor() as u64;
-                let seconds = t % 60.0;
-                format!("{hours:02}:{minutes:02}:{seconds:06.3}")
+                let total_ms = ((frame / safe_fps) * 1000.0).round().max(0.0) as u64;
+                let ms = total_ms % 1000;
+                let total_secs = total_ms / 1000;
+                let ss = total_secs % 60;
+                let mm = (total_secs / 60) % 60;
+                let hh = total_secs / 3600;
+                format!("{hh:02}:{mm:02}:{ss:02}.{ms:03}")
             }
             TIME_FORMAT_TIMECODE_FRAMES => {
                 let fps_int = safe_fps.round().max(1.0) as u64;

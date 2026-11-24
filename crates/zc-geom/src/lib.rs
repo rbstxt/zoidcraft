@@ -190,7 +190,19 @@ pub fn mat4_to_euler(mat: Mat4, order: EulerOrder) -> Vec3 {
 
 /// Extracts intrinsic Euler angles `(x, y, z)` in radians from a quaternion.
 pub fn quat_to_euler(quat: Quat, order: EulerOrder) -> Vec3 {
-    mat3_to_euler(Mat3::from_quat(quat.normalize()), order)
+    let v = Vec4::new(quat.x, quat.y, quat.z, quat.w);
+    let q = if v.is_finite() {
+        let max_c = v.abs().max_element();
+        if max_c > 1e-12 {
+            let n = (v / max_c).normalize();
+            Quat::from_xyzw(n.x, n.y, n.z, n.w)
+        } else {
+            Quat::IDENTITY
+        }
+    } else {
+        Quat::IDENTITY
+    };
+    mat3_to_euler(Mat3::from_quat(q), order)
 }
 
 /// 3D local transform (`T * R * S`) using right-handed Y-up intrinsic Euler angles.
@@ -404,9 +416,19 @@ pub enum CameraProjection {
 impl CameraProjection {
     /// Default CM3 perspective camera projection (`fov = 60 deg`, `near = 0.1`, `far = 5000.0`).
     pub fn cm3_perspective(width: f32, height: f32) -> Self {
+        let w = if width.is_finite() {
+            width.max(1.0)
+        } else {
+            1.0
+        };
+        let h = if height.is_finite() {
+            height.max(1.0)
+        } else {
+            1.0
+        };
         Self::Perspective {
             fov_deg: 60.0,
-            aspect: width / height.max(1.0),
+            aspect: w / h,
             near: 0.1,
             far: 5000.0,
         }
@@ -414,11 +436,21 @@ impl CameraProjection {
 
     /// Default CM3 orthographic camera projection (`±0.05 * width`, `±0.05 * height`, `0.1..5000.0`).
     pub fn cm3_orthographic(width: f32, height: f32) -> Self {
+        let w = if width.is_finite() {
+            width.max(1.0)
+        } else {
+            1.0
+        };
+        let h = if height.is_finite() {
+            height.max(1.0)
+        } else {
+            1.0
+        };
         Self::Orthographic {
-            left: -0.05 * width,
-            right: 0.05 * width,
-            top: 0.05 * height,
-            bottom: -0.05 * height,
+            left: -0.05 * w,
+            right: 0.05 * w,
+            top: 0.05 * h,
+            bottom: -0.05 * h,
             near: 0.1,
             far: 5000.0,
         }
@@ -465,22 +497,69 @@ impl CameraProjection {
     }
 }
 
+fn sanitize_perspective_params(
+    fov_y_radians: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+) -> (f32, f32, f32, f32, f32) {
+    let safe_fov = if fov_y_radians.is_finite() {
+        fov_y_radians.clamp(1e-4, std::f32::consts::PI - 1e-4)
+    } else {
+        60.0_f32.to_radians()
+    };
+    let f = 1.0 / (0.5 * safe_fov).tan();
+    let safe_aspect = if aspect.is_finite() && aspect.abs() > 1e-6 {
+        aspect
+    } else {
+        1.0
+    };
+    let safe_near = if near.is_finite() { near } else { 0.1 };
+    let safe_far = if far.is_finite() { far } else { 5000.0 };
+    let dz = safe_near - safe_far;
+    let (near_out, far_out, r) = if dz.is_finite() && dz.abs() > 1e-6 {
+        (safe_near, safe_far, 1.0 / dz)
+    } else {
+        (0.1, 5000.0, 1.0 / (0.1 - 5000.0))
+    };
+    (f, safe_aspect, near_out, far_out, r)
+}
+
 fn perspective_rh_wgpu(fov_y_radians: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
-    let f = 1.0 / (0.5 * fov_y_radians).tan();
-    let r = 1.0 / (near - far);
-    Mat4::from_cols(
-        Vec4::new(f / aspect, 0.0, 0.0, 0.0),
+    let (f, safe_aspect, safe_near, safe_far, r) =
+        sanitize_perspective_params(fov_y_radians, aspect, near, far);
+    let m = Mat4::from_cols(
+        Vec4::new(f / safe_aspect, 0.0, 0.0, 0.0),
         Vec4::new(0.0, f, 0.0, 0.0),
-        Vec4::new(0.0, 0.0, far * r, -1.0),
-        Vec4::new(0.0, 0.0, near * far * r, 0.0),
-    )
+        Vec4::new(0.0, 0.0, safe_far * r, -1.0),
+        Vec4::new(0.0, 0.0, safe_near * (safe_far * r), 0.0),
+    );
+    if m.is_finite() { m } else { Mat4::IDENTITY }
 }
 
 fn orthographic_rh_wgpu(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Mat4 {
-    let rct = 1.0 / (right - left);
-    let tcb = 1.0 / (top - bottom);
-    let fcn = 1.0 / (near - far);
-    Mat4::from_cols(
+    let dx = right - left;
+    let dy = top - bottom;
+    let dz = near - far;
+    if !left.is_finite()
+        || !right.is_finite()
+        || !bottom.is_finite()
+        || !top.is_finite()
+        || !near.is_finite()
+        || !far.is_finite()
+        || !dx.is_finite()
+        || dx.abs() <= 1e-6
+        || !dy.is_finite()
+        || dy.abs() <= 1e-6
+        || !dz.is_finite()
+        || dz.abs() <= 1e-6
+    {
+        return Mat4::IDENTITY;
+    }
+    let rct = 1.0 / dx;
+    let tcb = 1.0 / dy;
+    let fcn = 1.0 / dz;
+    let m = Mat4::from_cols(
         Vec4::new(2.0 * rct, 0.0, 0.0, 0.0),
         Vec4::new(0.0, 2.0 * tcb, 0.0, 0.0),
         Vec4::new(0.0, 0.0, fcn, 0.0),
@@ -490,25 +569,45 @@ fn orthographic_rh_wgpu(left: f32, right: f32, bottom: f32, top: f32, near: f32,
             near * fcn,
             1.0,
         ),
-    )
+    );
+    if m.is_finite() { m } else { Mat4::IDENTITY }
 }
 
 fn perspective_rh_gl(fov_y_radians: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
-    let f = 1.0 / (0.5 * fov_y_radians).tan();
-    let r = 1.0 / (near - far);
-    Mat4::from_cols(
-        Vec4::new(f / aspect, 0.0, 0.0, 0.0),
+    let (f, safe_aspect, safe_near, safe_far, r) =
+        sanitize_perspective_params(fov_y_radians, aspect, near, far);
+    let m = Mat4::from_cols(
+        Vec4::new(f / safe_aspect, 0.0, 0.0, 0.0),
         Vec4::new(0.0, f, 0.0, 0.0),
-        Vec4::new(0.0, 0.0, (far + near) * r, -1.0),
-        Vec4::new(0.0, 0.0, 2.0 * far * near * r, 0.0),
-    )
+        Vec4::new(0.0, 0.0, (safe_far + safe_near) * r, -1.0),
+        Vec4::new(0.0, 0.0, 2.0 * safe_near * (safe_far * r), 0.0),
+    );
+    if m.is_finite() { m } else { Mat4::IDENTITY }
 }
 
 fn orthographic_rh_gl(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Mat4 {
-    let rct = 1.0 / (right - left);
-    let tcb = 1.0 / (top - bottom);
-    let fcn = 1.0 / (near - far);
-    Mat4::from_cols(
+    let dx = right - left;
+    let dy = top - bottom;
+    let dz = near - far;
+    if !left.is_finite()
+        || !right.is_finite()
+        || !bottom.is_finite()
+        || !top.is_finite()
+        || !near.is_finite()
+        || !far.is_finite()
+        || !dx.is_finite()
+        || dx.abs() <= 1e-6
+        || !dy.is_finite()
+        || dy.abs() <= 1e-6
+        || !dz.is_finite()
+        || dz.abs() <= 1e-6
+    {
+        return Mat4::IDENTITY;
+    }
+    let rct = 1.0 / dx;
+    let tcb = 1.0 / dy;
+    let fcn = 1.0 / dz;
+    let m = Mat4::from_cols(
         Vec4::new(2.0 * rct, 0.0, 0.0, 0.0),
         Vec4::new(0.0, 2.0 * tcb, 0.0, 0.0),
         Vec4::new(0.0, 0.0, 2.0 * fcn, 0.0),
@@ -518,13 +617,35 @@ fn orthographic_rh_gl(left: f32, right: f32, bottom: f32, top: f32, near: f32, f
             (near + far) * fcn,
             1.0,
         ),
-    )
+    );
+    if m.is_finite() { m } else { Mat4::IDENTITY }
+}
+
+fn safe_normalize_vec3(v: Vec3) -> Option<Vec3> {
+    if !v.is_finite() {
+        return None;
+    }
+    let max_c = v.abs().max_element();
+    if max_c <= 1e-12 {
+        return None;
+    }
+    (v / max_c).try_normalize()
 }
 
 /// Builds a right-handed camera view matrix looking from `eye` toward `target` along local `-Z`.
 pub fn camera_look_at_view(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
-    let f = (target - eye).normalize();
-    let s = f.cross(up).normalize();
+    if !eye.is_finite() || !target.is_finite() {
+        return Mat4::IDENTITY;
+    }
+    let dir = target - eye;
+    let Some(f) = safe_normalize_vec3(dir) else {
+        return Mat4::from_translation(-eye);
+    };
+    let up_safe = if up.is_finite() { up } else { Vec3::Y };
+    let s = safe_normalize_vec3(f.cross(up_safe)).unwrap_or_else(|| {
+        let fallback = if f.y.abs() < 0.99 { Vec3::Y } else { Vec3::Z };
+        f.cross(fallback).normalize()
+    });
     let u = s.cross(f);
     Mat4::from_cols(
         Vec4::new(s.x, u.x, -f.x, 0.0),
@@ -544,12 +665,18 @@ pub fn view_matrix_from_transform(transform: &Transform3D) -> Mat4 {
 /// Returns `XYZ` Euler angles in radians orienting an object's local `+Z` axis from `from`
 /// toward `to` (per Expressions+ `lookAt(from, to)` specification).
 pub fn look_at_euler_xyz(from: Vec3, to: Vec3) -> Vec3 {
-    let dir = to - from;
-    let len_sq = dir.length_squared();
-    if len_sq < 1e-12 {
+    if !from.is_finite() || !to.is_finite() {
         return Vec3::ZERO;
     }
-    let z_axis = dir / len_sq.sqrt();
+    let dir = to - from;
+    if !dir.is_finite() {
+        return Vec3::ZERO;
+    }
+    let max_c = dir.abs().max_element();
+    if max_c < 1e-6 {
+        return Vec3::ZERO;
+    }
+    let z_axis = (dir / max_c).normalize();
 
     let mut x_axis = Vec3::Y.cross(z_axis);
     if x_axis.length_squared() < 1e-10 {
@@ -967,5 +1094,94 @@ mod tests {
             assert_vec3_close(aabb.text_alignment_offset(mode), exp, 1e-6);
         }
         assert_eq!(TextPositionMode::from_u8(7), None);
+    }
+
+    #[test]
+    fn degenerate_camera_projection_quat_and_look_at_stay_finite() {
+        // Bug 4: camera_look_at_view with eye == target, collinear up, zero up, non-finite.
+        let eye = Vec3::new(3.0, 4.0, 5.0);
+        assert_eq!(
+            camera_look_at_view(eye, eye, Vec3::Y),
+            Mat4::from_translation(-eye)
+        );
+        for (e, t, u) in [
+            (Vec3::ZERO, Vec3::Y, Vec3::Y),
+            (Vec3::ZERO, Vec3::NEG_Y, Vec3::Y),
+            (Vec3::ZERO, Vec3::Z, Vec3::ZERO),
+            (Vec3::new(0.0, 0.0, 1e25), Vec3::ZERO, Vec3::Y),
+            (Vec3::splat(f32::NAN), Vec3::ZERO, Vec3::Y),
+        ] {
+            let m = camera_look_at_view(e, t, u);
+            assert!(
+                m.is_finite(),
+                "non-finite view matrix for ({e:?}, {t:?}, {u:?})"
+            );
+        }
+
+        // Bug 5: CameraProjection zero/degenerate/non-finite dimensions and frusta.
+        for proj in [
+            CameraProjection::cm3_perspective(0.0, 1080.0),
+            CameraProjection::cm3_perspective(0.0, 0.0),
+            CameraProjection::cm3_perspective(f32::NAN, f32::INFINITY),
+            CameraProjection::cm3_orthographic(0.0, 1080.0),
+            CameraProjection::cm3_orthographic(1920.0, 0.0),
+            CameraProjection::cm3_orthographic(0.0, 0.0),
+            CameraProjection::Perspective {
+                fov_deg: 0.0,
+                aspect: 0.0,
+                near: 1.0,
+                far: 1.0,
+            },
+            CameraProjection::Perspective {
+                fov_deg: 180.0,
+                aspect: f32::NAN,
+                near: f32::INFINITY,
+                far: 10.0,
+            },
+            CameraProjection::Orthographic {
+                left: 0.0,
+                right: 0.0,
+                top: 0.0,
+                bottom: 0.0,
+                near: 1.0,
+                far: 1.0,
+            },
+        ] {
+            assert!(
+                proj.to_wgpu_matrix().is_finite(),
+                "wgpu non-finite for {proj:?}"
+            );
+            assert!(
+                proj.to_gl_matrix().is_finite(),
+                "gl non-finite for {proj:?}"
+            );
+        }
+
+        // Bug 6: quat_to_euler on zero / non-finite quaternion.
+        for order in EulerOrder::ALL {
+            assert_vec3_close(
+                quat_to_euler(Quat::from_xyzw(0.0, 0.0, 0.0, 0.0), order),
+                Vec3::ZERO,
+                1e-6,
+            );
+            assert!(quat_to_euler(Quat::NAN, order).is_finite());
+            assert!(
+                quat_to_euler(Quat::from_xyzw(f32::INFINITY, 0.0, 0.0, 0.0), order).is_finite()
+            );
+        }
+
+        // Bug 7: look_at_euler_xyz on non-finite and huge coordinates (|dir| >= 1e20).
+        assert_eq!(
+            look_at_euler_xyz(Vec3::splat(f32::NAN), Vec3::Z),
+            Vec3::ZERO
+        );
+        assert_eq!(
+            look_at_euler_xyz(Vec3::ZERO, Vec3::splat(f32::INFINITY)),
+            Vec3::ZERO
+        );
+        let huge_euler = look_at_euler_xyz(Vec3::ZERO, Vec3::new(1e25, 0.0, 0.0));
+        assert!(huge_euler.is_finite());
+        let huge_fwd = euler_to_quat(huge_euler, EulerOrder::XYZ) * Vec3::Z;
+        assert_vec3_close(huge_fwd, Vec3::X, 1e-5);
     }
 }

@@ -865,12 +865,62 @@ fn build_polyhedron(
     for [a, b, c] in triangles {
         let face_n = (b - a).cross(c - a).normalize_or_zero();
         let base = vertices.len() as u32;
-        for dir in [a, b, c] {
+        let dirs = [a, b, c];
+        let mut us = [0.0_f32; 3];
+        let mut vs = [0.0_f32; 3];
+        let mut is_pole = [false; 3];
+
+        for k in 0..3 {
+            let dir = dirs[k];
+            is_pole[k] = dir.x.hypot(dir.z) < 1e-5;
+            us[k] = 0.5 + dir.x.atan2(dir.z) / TAU;
+            vs[k] = 0.5 + dir.y.clamp(-1.0, 1.0).asin() / PI;
+        }
+
+        // Unwrap triangles straddling the -Z meridian seam so U spans <= 0.5.
+        let mut min_u = f32::INFINITY;
+        let mut max_u = f32::NEG_INFINITY;
+        for k in 0..3 {
+            if !is_pole[k] {
+                min_u = min_u.min(us[k]);
+                max_u = max_u.max(us[k]);
+            }
+        }
+        if max_u - min_u > 0.5 {
+            for k in 0..3 {
+                if !is_pole[k] && us[k] < 0.5 {
+                    us[k] += 1.0;
+                }
+            }
+        }
+
+        // Assign polar vertices the midpoint U of the non-polar vertices in the triangle.
+        for k in 0..3 {
+            if is_pole[k] {
+                let mut sum = 0.0_f32;
+                let mut count = 0_u32;
+                for m in 0..3 {
+                    if m != k && !is_pole[m] {
+                        sum += us[m];
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    us[k] = sum / count as f32;
+                }
+            }
+        }
+
+        for k in 0..3 {
+            let dir = dirs[k];
             let pos = dir * r;
             let normal = if levels == 0 { face_n } else { dir };
-            let u = 0.5 + dir.x.atan2(dir.z) / TAU;
-            let v = 0.5 + dir.y.clamp(-1.0, 1.0).asin() / PI;
-            vertices.push(Vertex3D::new(pos.to_array(), normal.to_array(), [u, v], 0));
+            vertices.push(Vertex3D::new(
+                pos.to_array(),
+                normal.to_array(),
+                [us[k], vs[k]],
+                0,
+            ));
         }
         indices.extend_from_slice(&[base, base + 1, base + 2]);
     }

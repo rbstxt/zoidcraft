@@ -231,12 +231,14 @@ impl PropertyKeyframe {
         control_points: [[f64; 2]; 2],
         continuous_tangent: bool,
     ) -> Self {
+        let easing_index = (tween & 0xFF) as u8;
+        let is_bezier = easing_index != 0 && ((tween >> 8) & 1) == 1;
         Self {
             frame,
             value,
             tween,
-            easing_index: (tween & 0xFF) as u8,
-            is_bezier: (tween >> 8) == 1,
+            easing_index,
+            is_bezier,
             control_points,
             continuous_tangent,
         }
@@ -392,21 +394,20 @@ pub struct Project {
 }
 
 impl Project {
-    /// Creates the canonical CM3 starter project:
-    /// 1920x1080 @ 30fps, 300 frames, 1 video track containing a 3D Scene clip
-    /// with a Perspective Camera at `[0, 0, 80]`, a Spot Light at `[0, 10, 0]`,
-    /// and 3D Text `"text"`.
+    /// Creates the canonical Zoidium / CM3 starter project:
+    /// 1920x1080 @ 30fps, 180 frames (6s), 1 video track (`V1`) containing a 3D Scene clip
+    /// with a single Perspective Camera named `"Camera"` at `[0, 0, 80]`, and 1 empty audio
+    /// track (`A1`).
     #[must_use]
     pub fn new_cm3_default() -> Self {
         let fps = 30u32;
-        let length_frames = 300.0;
+        let length_frames = 180.0;
         let resolution = [1920, 1080];
 
-        let camera = Object3D::new_perspective_camera();
-        let light = Object3D::new_spot_light();
-        let text = Object3D::new_text_3d("text");
+        let mut camera = Object3D::new_perspective_camera();
+        camera.name = "Camera".to_owned();
 
-        let scene_layer = Layer::new_scene_3d(resolution, vec![camera, light, text]);
+        let scene_layer = Layer::new_scene_3d(resolution, vec![camera]);
         let clip = VideoClip {
             id: Uuid::new_v4(),
             name: "Scene".to_owned(),
@@ -421,12 +422,23 @@ impl Project {
 
         let video_track = VideoTrack {
             id: Uuid::new_v4(),
-            name: "Video 1".to_owned(),
+            name: "V1".to_owned(),
             enabled: true,
             solo: false,
             locked: false,
             is_3d: false,
             clips: vec![clip],
+            preserved: BTreeMap::new(),
+        };
+
+        let audio_track = AudioTrack {
+            id: Uuid::new_v4(),
+            name: "A1".to_owned(),
+            enabled: true,
+            muted: false,
+            solo: false,
+            locked: false,
+            clips: Vec::new(),
             preserved: BTreeMap::new(),
         };
 
@@ -441,14 +453,14 @@ impl Project {
             markers: Vec::new(),
             controls: Vec::new(),
             video_tracks: vec![video_track],
-            audio_tracks: Vec::new(),
+            audio_tracks: vec![audio_track],
             clip_links: BTreeMap::new(),
             preserved: BTreeMap::new(),
         };
 
         Self {
             version: PROJECT_SCHEMA_VERSION,
-            name: "Project".to_owned(),
+            name: "project".to_owned(),
             assets: BTreeMap::new(),
             media: Vec::new(),
             sequence,
@@ -733,6 +745,8 @@ pub struct AudioTrack {
     pub muted: bool,
     #[serde(default)]
     pub solo: bool,
+    #[serde(default)]
+    pub locked: bool,
     #[serde(default)]
     pub clips: Vec<AudioClip>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1814,22 +1828,18 @@ pub struct EffectInstance {
 }
 
 /// Discriminated effect type.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EffectKind {
     /// One of the 44 standard CM3 effects by internal ID (e.g. `"bloom"`, `"wavy"`).
     Standard(String),
     /// CM3 type 1 (`effect.shader`): custom GLSL ES 1.00 fragment shader.
     CustomShader {
         frag_shader: String,
-        #[serde(default)]
         custom_properties: Vec<CustomProperty>,
     },
     /// CM3 type 0 (`effect.group`): macro container holding child effects.
     EffectGroup {
-        #[serde(default)]
         custom_properties: Vec<CustomProperty>,
-        #[serde(default)]
         children: Vec<EffectInstance>,
     },
     /// Toggleable Zoidium native plugin or unknown external effect.
@@ -1837,6 +1847,114 @@ pub enum EffectKind {
         plugin_id: String,
         effect_id: String,
     },
+}
+
+impl Serialize for EffectKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum EffectKindSer<'a> {
+            Standard {
+                id: &'a str,
+            },
+            CustomShader {
+                frag_shader: &'a str,
+                custom_properties: &'a [CustomProperty],
+            },
+            EffectGroup {
+                custom_properties: &'a [CustomProperty],
+                children: &'a [EffectInstance],
+            },
+            Plugin {
+                plugin_id: &'a str,
+                effect_id: &'a str,
+            },
+        }
+
+        let helper = match self {
+            Self::Standard(id) => EffectKindSer::Standard { id },
+            Self::CustomShader {
+                frag_shader,
+                custom_properties,
+            } => EffectKindSer::CustomShader {
+                frag_shader,
+                custom_properties,
+            },
+            Self::EffectGroup {
+                custom_properties,
+                children,
+            } => EffectKindSer::EffectGroup {
+                custom_properties,
+                children,
+            },
+            Self::Plugin {
+                plugin_id,
+                effect_id,
+            } => EffectKindSer::Plugin {
+                plugin_id,
+                effect_id,
+            },
+        };
+        helper.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EffectKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum EffectKindDe {
+            Standard {
+                id: String,
+            },
+            CustomShader {
+                frag_shader: String,
+                #[serde(default)]
+                custom_properties: Vec<CustomProperty>,
+            },
+            EffectGroup {
+                #[serde(default)]
+                custom_properties: Vec<CustomProperty>,
+                #[serde(default)]
+                children: Vec<EffectInstance>,
+            },
+            Plugin {
+                plugin_id: String,
+                effect_id: String,
+            },
+        }
+
+        match EffectKindDe::deserialize(deserializer)? {
+            EffectKindDe::Standard { id } => Ok(Self::Standard(id)),
+            EffectKindDe::CustomShader {
+                frag_shader,
+                custom_properties,
+            } => Ok(Self::CustomShader {
+                frag_shader,
+                custom_properties,
+            }),
+            EffectKindDe::EffectGroup {
+                custom_properties,
+                children,
+            } => Ok(Self::EffectGroup {
+                custom_properties,
+                children,
+            }),
+            EffectKindDe::Plugin {
+                plugin_id,
+                effect_id,
+            } => Ok(Self::Plugin {
+                plugin_id,
+                effect_id,
+            }),
+        }
+    }
 }
 
 const fn default_true() -> bool {
@@ -1907,14 +2025,19 @@ mod tests {
     fn cm3_default_starter_project_matches_spec() {
         let project = Project::new_cm3_default();
         assert_eq!(project.version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(project.name, "project");
         assert_eq!(project.sequence.resolution, [1920, 1080]);
         assert_eq!(project.sequence.fps, 30);
-        assert!((project.sequence.length_frames - 300.0).abs() < 1e-9);
+        assert!((project.sequence.length_frames - 180.0).abs() < 1e-9);
         assert_eq!(project.sequence.background_color, [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(project.sequence.video_tracks.len(), 1);
         assert_eq!(project.sequence.video_tracks[0].clips.len(), 1);
+        assert_eq!(project.sequence.audio_tracks.len(), 1);
+        assert!(project.sequence.audio_tracks[0].clips.is_empty());
 
         let clip = &project.sequence.video_tracks[0].clips[0];
+        assert!((clip.start - 0.0).abs() < 1e-9);
+        assert!((clip.length - 180.0).abs() < 1e-9);
         assert_eq!(clip.time_curve.keyframes.len(), 2);
         assert_eq!(clip.time_curve.static_behavior, StaticBehavior::Linear);
         assert_eq!(clip.layer.blending, "BLEND_SRC_OVER");
@@ -1927,30 +2050,15 @@ mod tests {
             panic!("expected Scene3D layer");
         };
         assert_eq!(*shadow_mode, CompatMode::Current);
-        assert_eq!(objects.len(), 3);
+        assert_eq!(objects.len(), 1);
 
-        // Camera at [0, 0, 80]
+        // Camera "Camera" at [0, 0, 80]
+        assert_eq!(objects[0].name, "Camera");
         assert_eq!(
             objects[0].position.value,
             PropertyValue::Vec3([0.0, 0.0, 80.0])
         );
         assert!(matches!(objects[0].kind, Object3DKind::Camera(_)));
-
-        // Spot light at [0, 10, 0]
-        assert_eq!(
-            objects[1].position.value,
-            PropertyValue::Vec3([0.0, 10.0, 0.0])
-        );
-        assert!(matches!(
-            &objects[1].kind,
-            Object3DKind::Light(l) if l.kind == LightKind::Spot
-        ));
-
-        // 3D Text "text"
-        assert!(matches!(
-            &objects[2].kind,
-            Object3DKind::Text3D(t) if t.text == "text"
-        ));
     }
 
     #[test]
@@ -1959,5 +2067,63 @@ mod tests {
         let json = serde_json::to_string(&project).expect("serialize project");
         let parsed: Project = serde_json::from_str(&json).expect("deserialize project");
         assert_eq!(project, parsed);
+    }
+
+    #[test]
+    fn effect_kind_standard_serializes_internally_tagged_and_roundtrips() {
+        let std_kind = EffectKind::Standard("bloom".to_owned());
+        let json = serde_json::to_value(&std_kind).expect("serialize standard effect kind");
+        assert_eq!(
+            json,
+            serde_json::json!({ "type": "standard", "id": "bloom" })
+        );
+        let parsed: EffectKind = serde_json::from_value(json).expect("deserialize standard");
+        assert_eq!(parsed, std_kind);
+
+        let plugin_kind = EffectKind::Plugin {
+            plugin_id: "openzoid-legacy".to_owned(),
+            effect_id: "vhs".to_owned(),
+        };
+        let pjson = serde_json::to_value(&plugin_kind).expect("serialize plugin effect kind");
+        let pparsed: EffectKind = serde_json::from_value(pjson).expect("deserialize plugin");
+        assert_eq!(pparsed, plugin_kind);
+    }
+
+    #[test]
+    fn cm3_tween_decoding_handles_hold_bit8_and_high_bits() {
+        let cp = [[-10.0, 0.0], [10.0, 0.0]];
+        // tween == 256: easing_index == 0 (Hold) takes precedence over Bezier bit 8.
+        let hold_256 =
+            PropertyKeyframe::from_cm3_tween(0.0, PropertyValue::Number(1.0), 256, cp, true);
+        assert_eq!(hold_256.easing_index, 0);
+        assert!(!hold_256.is_bezier);
+
+        // tween == 257: easing_index == 1, bit 8 == 1 => Bezier.
+        let bez_257 =
+            PropertyKeyframe::from_cm3_tween(0.0, PropertyValue::Number(1.0), 257, cp, true);
+        assert_eq!(bez_257.easing_index, 1);
+        assert!(bez_257.is_bezier);
+
+        // High bits above bit 8 do not break bit 8 masking: (3 << 8) | 1 => bit 8 is 1.
+        let high_on = PropertyKeyframe::from_cm3_tween(
+            0.0,
+            PropertyValue::Number(1.0),
+            (3 << 8) | 1,
+            cp,
+            true,
+        );
+        assert_eq!(high_on.easing_index, 1);
+        assert!(high_on.is_bezier);
+
+        // (2 << 8) | 1 => bit 8 is 0 => not Bezier.
+        let high_off = PropertyKeyframe::from_cm3_tween(
+            0.0,
+            PropertyValue::Number(1.0),
+            (2 << 8) | 1,
+            cp,
+            true,
+        );
+        assert_eq!(high_off.easing_index, 1);
+        assert!(!high_off.is_bezier);
     }
 }

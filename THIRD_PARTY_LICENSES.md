@@ -9,7 +9,18 @@ copyright notices and full license texts.
 
 ## 1. Bundled Fonts
 
-### Geist Mono (`apps/zoidcraft/assets/fonts/GeistMono-Regular.ttf`)
+### Source Code Pro (`apps/zoidcraft/assets/fonts/SourceCodePro-Regular.ttf`)
+- Source: https://github.com/adobe-fonts/source-code-pro
+- License: SIL Open Font License, Version 1.1
+
+```text
+© 2023 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'. All Rights Reserved. Source is a trademark of Adobe in the United States and/or other countries.
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+Full license text is reproduced in `apps/zoidcraft/assets/fonts/LICENSE-SourceCodePro-OFL.txt` and below under Geist Mono.
+```
+
+### Geist & Geist Mono (`apps/zoidcraft/assets/fonts/GeistMono-Regular.ttf`, `crates/zc-render/assets/fonts/Geist-Regular.ttf`)
 - Source: https://github.com/vercel/geist-font
 - License: SIL Open Font License, Version 1.1
 

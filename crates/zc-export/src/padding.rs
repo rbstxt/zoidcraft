@@ -3,10 +3,21 @@
 
 use crate::ExportError;
 
-/// Rounds odd `width` or `height` up by 1 pixel to the nearest even dimension.
+/// Rounds odd `width` or `height` up by 1 pixel to the nearest even dimension
+/// (clamping `u32::MAX` to `u32::MAX - 1` so addition never overflows).
 #[must_use]
 pub const fn even_padded_dimensions(width: u32, height: u32) -> (u32, u32) {
-    (width + (width & 1), height + (height & 1))
+    let w = if width == u32::MAX {
+        u32::MAX - 1
+    } else {
+        width + (width & 1)
+    };
+    let h = if height == u32::MAX {
+        u32::MAX - 1
+    } else {
+        height + (height & 1)
+    };
+    (w, h)
 }
 
 /// Copies a tightly packed RGBA8 frame (`src_size`) into `dst` (`dst_size`),
@@ -92,6 +103,10 @@ mod tests {
         assert_eq!(even_padded_dimensions(161, 90), (162, 90));
         assert_eq!(even_padded_dimensions(160, 91), (160, 92));
         assert_eq!(even_padded_dimensions(161, 91), (162, 92));
+        assert_eq!(
+            even_padded_dimensions(u32::MAX, u32::MAX),
+            (u32::MAX - 1, u32::MAX - 1)
+        );
     }
 
     #[test]

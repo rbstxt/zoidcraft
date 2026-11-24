@@ -68,16 +68,16 @@ pub struct DetRng {
 impl DetRng {
     pub fn from_seed(seed: f64, frame: f64, timeless: bool) -> Self {
         let s_bits = canonical_f64_bits(seed);
-        let mut h = splitmix64(s_bits ^ 0x9E37_79B9_7F4A_7C15);
-        if !timeless {
+        let base = splitmix64(s_bits ^ 0x9E37_79B9_7F4A_7C15);
+        // `seed_offset` depends only on `seed` so `wiggle()` remains smooth across frames.
+        let seed_offset = ((splitmix64(base) >> 11) as f64) * (1.0 / ((1u64 << 53) as f64)) * 997.0;
+        let state = if timeless {
+            base
+        } else {
             let f_bits = canonical_f64_bits(frame);
-            h = splitmix64(h ^ splitmix64(f_bits ^ 0xBF58_476D_1CE4_E5B9));
-        }
-        let seed_offset = ((splitmix64(h) >> 11) as f64) * (1.0 / ((1u64 << 53) as f64)) * 997.0;
-        Self {
-            state: h,
-            seed_offset,
-        }
+            splitmix64(base ^ splitmix64(f_bits ^ 0xBF58_476D_1CE4_E5B9))
+        };
+        Self { state, seed_offset }
     }
 
     /// Returns the next uniform deterministic `f64` in `[0.0, 1.0)`.
@@ -162,6 +162,74 @@ pub fn format_js_number(n: f64) -> String {
     } else {
         format!("{n}")
     }
+}
+
+/// Formats an `f64` in the given radix (`2..=36`) for `Number.prototype.toString(radix)`.
+pub fn format_js_number_radix(n: f64, radix: u32) -> String {
+    if !n.is_finite() || n == 0.0 || radix == 10 {
+        return format_js_number(n);
+    }
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let base = radix.clamp(2, 36);
+    let base_f = base as f64;
+    let negative = n.is_sign_negative();
+    let abs = n.abs();
+    let int_part = abs.trunc();
+    let mut frac = abs - int_part;
+
+    let mut int_digits = Vec::new();
+    if int_part == 0.0 {
+        int_digits.push(b'0');
+    } else if int_part < (u128::MAX as f64) {
+        let mut v = int_part as u128;
+        let b = base as u128;
+        while v > 0 {
+            int_digits.push(DIGITS[(v % b) as usize]);
+            v /= b;
+        }
+        int_digits.reverse();
+    } else {
+        let mut v = int_part;
+        while v >= 1.0 {
+            let rem = v.rem_euclid(base_f) as usize;
+            int_digits.push(DIGITS[rem.min(base as usize - 1)]);
+            v = (v / base_f).floor();
+        }
+        int_digits.reverse();
+    }
+
+    let mut out = String::with_capacity(int_digits.len() + 2);
+    if negative {
+        out.push('-');
+    }
+    for d in int_digits {
+        out.push(char::from(d));
+    }
+
+    if frac > 0.0 {
+        let max_frac = (53.0 / base_f.log2()).ceil() as usize;
+        let mut frac_digits = Vec::with_capacity(max_frac);
+        for _ in 0..max_frac {
+            if frac <= 0.0 {
+                break;
+            }
+            frac *= base_f;
+            let d = (frac.floor() as usize).min(base as usize - 1);
+            frac_digits.push(DIGITS[d]);
+            frac -= d as f64;
+        }
+        while frac_digits.last() == Some(&b'0') {
+            frac_digits.pop();
+        }
+        if !frac_digits.is_empty() {
+            out.push('.');
+            for d in frac_digits {
+                out.push(char::from(d));
+            }
+        }
+    }
+
+    out
 }
 
 /// JS `Math.round` (rounds half toward `+Infinity`).
@@ -1034,10 +1102,25 @@ where
 }
 
 pub fn json_parse(input: &str) -> Result<Value, ExprError> {
+    json_parse_bounded(input, usize::MAX, &mut |_| Ok(()))
+}
+
+/// Parses a JSON string while enforcing `max_container_len` on arrays and objects and charging
+/// incremental heap allocation estimates to `charge_alloc`.
+pub fn json_parse_bounded<F>(
+    input: &str,
+    max_container_len: usize,
+    charge_alloc: &mut F,
+) -> Result<Value, ExprError>
+where
+    F: FnMut(usize) -> Result<(), ExprError>,
+{
     let mut parser = JsonParser {
         src: input,
         bytes: input.as_bytes(),
         pos: 0,
+        max_container_len,
+        charge_alloc,
     };
     parser.skip_ws();
     let val = parser.parse_value(0)?;
@@ -1051,13 +1134,20 @@ pub fn json_parse(input: &str) -> Result<Value, ExprError> {
     Ok(val)
 }
 
-struct JsonParser<'a> {
+const JSON_ELEM_BUDGET_BYTES: usize = 32;
+
+struct JsonParser<'a, F> {
     src: &'a str,
     bytes: &'a [u8],
     pos: usize,
+    max_container_len: usize,
+    charge_alloc: &'a mut F,
 }
 
-impl<'a> JsonParser<'a> {
+impl<'a, F> JsonParser<'a, F>
+where
+    F: FnMut(usize) -> Result<(), ExprError>,
+{
     fn skip_ws(&mut self) {
         while let Some(&b) = self.bytes.get(self.pos) {
             if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
@@ -1121,16 +1211,53 @@ impl<'a> JsonParser<'a> {
         }
     }
 
+    fn parse_unicode_hex4(&mut self) -> Result<u32, ExprError> {
+        let Some(end) = self.pos.checked_add(4) else {
+            return Err(ExprError::SyntaxError {
+                offset: self.pos,
+                message: "incomplete JSON unicode escape".to_string(),
+            });
+        };
+        if end > self.bytes.len() {
+            return Err(ExprError::SyntaxError {
+                offset: self.pos,
+                message: "incomplete JSON unicode escape".to_string(),
+            });
+        }
+        let Some(hex) = self.src.get(self.pos..end) else {
+            return Err(ExprError::SyntaxError {
+                offset: self.pos,
+                message: "invalid JSON unicode escape".to_string(),
+            });
+        };
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ExprError::SyntaxError {
+                offset: self.pos,
+                message: "invalid JSON unicode escape".to_string(),
+            });
+        }
+        self.pos = end;
+        u32::from_str_radix(hex, 16).map_err(|_| ExprError::SyntaxError {
+            offset: self.pos,
+            message: "invalid JSON unicode escape".to_string(),
+        })
+    }
+
     fn parse_string(&mut self) -> Result<String, ExprError> {
         let start = self.pos;
         self.pos += 1; // opening `"`
         let mut out = String::new();
+        let mut pending_bytes = 0usize;
         while self.pos < self.bytes.len() {
             let b = self.bytes[self.pos];
             if b == b'"' {
                 self.pos += 1;
+                if pending_bytes > 0 {
+                    (self.charge_alloc)(pending_bytes)?;
+                }
                 return Ok(out);
             }
+            let prev_len = out.len();
             if b == b'\\' {
                 self.pos += 1;
                 let Some(&esc) = self.bytes.get(self.pos) else {
@@ -1150,20 +1277,30 @@ impl<'a> JsonParser<'a> {
                     b'r' => out.push('\r'),
                     b't' => out.push('\t'),
                     b'u' => {
-                        if self.pos + 4 > self.bytes.len() {
-                            return Err(ExprError::SyntaxError {
-                                offset: self.pos,
-                                message: "incomplete JSON unicode escape".to_string(),
-                            });
-                        }
-                        let hex = &self.src[self.pos..self.pos + 4];
-                        self.pos += 4;
-                        let code =
-                            u32::from_str_radix(hex, 16).map_err(|_| ExprError::SyntaxError {
-                                offset: self.pos,
-                                message: "invalid JSON unicode escape".to_string(),
-                            })?;
-                        let ch = char::from_u32(code).ok_or_else(|| ExprError::SyntaxError {
+                        let code = self.parse_unicode_hex4()?;
+                        let scalar = if (0xD800..=0xDBFF).contains(&code) {
+                            if self.bytes.get(self.pos) == Some(&b'\\')
+                                && self.bytes.get(self.pos + 1) == Some(&b'u')
+                            {
+                                self.pos += 2;
+                                let lo = self.parse_unicode_hex4()?;
+                                if !(0xDC00..=0xDFFF).contains(&lo) {
+                                    return Err(ExprError::SyntaxError {
+                                        offset: self.pos,
+                                        message: "invalid JSON unicode low surrogate".to_string(),
+                                    });
+                                }
+                                0x10000 + (((code - 0xD800) << 10) | (lo - 0xDC00))
+                            } else {
+                                return Err(ExprError::SyntaxError {
+                                    offset: self.pos,
+                                    message: "unpaired JSON unicode high surrogate".to_string(),
+                                });
+                            }
+                        } else {
+                            code
+                        };
+                        let ch = char::from_u32(scalar).ok_or_else(|| ExprError::SyntaxError {
                             offset: self.pos,
                             message: "invalid JSON unicode scalar".to_string(),
                         })?;
@@ -1187,6 +1324,12 @@ impl<'a> JsonParser<'a> {
                         })?;
                 self.pos += ch.len_utf8();
                 out.push(ch);
+            }
+            pending_bytes = pending_bytes.saturating_add(out.len() - prev_len);
+            if pending_bytes >= 256 {
+                let charge = pending_bytes;
+                pending_bytes = 0;
+                (self.charge_alloc)(charge)?;
             }
         }
         Err(ExprError::SyntaxError {
@@ -1235,6 +1378,13 @@ impl<'a> JsonParser<'a> {
             return Ok(Value::Array(items));
         }
         loop {
+            if items.len() >= self.max_container_len {
+                return Err(ExprError::RangeError(format!(
+                    "array length exceeds {} limit",
+                    self.max_container_len
+                )));
+            }
+            (self.charge_alloc)(JSON_ELEM_BUDGET_BYTES)?;
             items.push(self.parse_value(depth)?);
             self.skip_ws();
             match self.peek() {
@@ -1273,6 +1423,13 @@ impl<'a> JsonParser<'a> {
                 });
             }
             let key = self.parse_string()?;
+            if !map.contains_key(&key) && map.len() >= self.max_container_len {
+                return Err(ExprError::RangeError(format!(
+                    "object property count exceeds {} limit",
+                    self.max_container_len
+                )));
+            }
+            (self.charge_alloc)(JSON_ELEM_BUDGET_BYTES)?;
             self.skip_ws();
             if self.peek() != Some(b':') {
                 return Err(ExprError::SyntaxError {

@@ -13,10 +13,10 @@ use crate::ast::{
 use crate::builtins::{
     DetRng, ae_ease, ae_ease_in, ae_ease_out, ae_linear, catmull_rom_value, clamp_f64, cm3_ease,
     cm3_gauss_random, cm3_random, cm3_shake, cm3_wave, eval_math_fn, eval_wiggle, format_js_number,
-    js_parse_float, js_parse_int, json_parse, json_stringify_bounded, lerp_value,
-    look_at_xyz_euler, math_constant, to_i32, to_u32, vec_add, vec_cross, vec_div_componentwise,
-    vec_div_scalar, vec_dot, vec_length, vec_mul_componentwise, vec_mul_scalar, vec_normalize,
-    vec_sub,
+    format_js_number_radix, js_parse_float, js_parse_int, json_parse_bounded,
+    json_stringify_bounded, lerp_value, look_at_xyz_euler, math_constant, to_i32, to_u32, vec_add,
+    vec_cross, vec_div_componentwise, vec_div_scalar, vec_dot, vec_length, vec_mul_componentwise,
+    vec_mul_scalar, vec_normalize, vec_sub,
 };
 use crate::{
     EvalConfig, ExprContext, ExprError, ExprMode, HandleId, HandleRef, KeyframeRecord, NameOrIndex,
@@ -49,7 +49,18 @@ pub fn evaluate_program(
 
     let mut completion = RuntimeValue::Undefined;
     for stmt in &program.body {
-        match evaluator.exec_stmt(stmt, root_env)? {
+        let flow = match evaluator.exec_stmt(stmt, root_env) {
+            Ok(flow) => flow,
+            Err(ExprError::Thrown(msg)) => {
+                if let Some(v) = evaluator.pending_throw.take() {
+                    let rendered = evaluator.runtime_to_js_string(&v)?;
+                    return Err(ExprError::Thrown(rendered));
+                }
+                return Err(ExprError::Thrown(msg));
+            }
+            Err(err) => return Err(err),
+        };
+        match flow {
             Flow::Normal(v) => {
                 if !matches!(v, RuntimeValue::Empty) {
                     completion = v;
@@ -182,6 +193,18 @@ struct Closure<'ast> {
     name: Option<&'ast str>,
 }
 
+enum ResolvedTarget<'ast> {
+    Ident(&'ast str),
+    Member {
+        object: RuntimeValue,
+        prop: &'ast str,
+    },
+    Index {
+        object: RuntimeValue,
+        index: RuntimeValue,
+    },
+}
+
 struct Evaluator<'a, 'ast> {
     ctx: &'a dyn ExprContext,
     config: EvalConfig,
@@ -192,8 +215,13 @@ struct Evaluator<'a, 'ast> {
     arrays: Vec<Vec<RuntimeValue>>,
     objects: Vec<BTreeMap<String, RuntimeValue>>,
     closures: Vec<Closure<'ast>>,
-    literal_strings: HashMap<String, JsStr>,
+    literal_strings: HashMap<(usize, usize), JsStr>,
     rng: Option<DetRng>,
+    rng_explicitly_seeded: bool,
+    wiggle_seed_offset: f64,
+    cached_value: Option<RuntimeValue>,
+    cached_properties: Option<RuntimeValue>,
+    pending_throw: Option<RuntimeValue>,
     stringifying_arrays: Vec<usize>,
 }
 
@@ -211,6 +239,11 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             closures: Vec::new(),
             literal_strings: HashMap::new(),
             rng: None,
+            rng_explicitly_seeded: false,
+            wiggle_seed_offset: 0.0,
+            cached_value: None,
+            cached_properties: None,
+            pending_throw: None,
             stringifying_arrays: Vec::new(),
         }
     }
@@ -233,13 +266,14 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         self.charge_work((bytes / 8).max(1))
     }
 
-    fn intern_literal_string(&mut self, s: &str) -> Result<RuntimeValue, ExprError> {
-        if let Some(js) = self.literal_strings.get(s) {
+    fn intern_literal_string(&mut self, s: &'ast str) -> Result<RuntimeValue, ExprError> {
+        let key = (s.as_ptr() as usize, s.len());
+        if let Some(js) = self.literal_strings.get(&key) {
             return Ok(RuntimeValue::String(js.clone()));
         }
         self.check_string_alloc(s.len())?;
         let js = JsStr::from(s);
-        self.literal_strings.insert(s.to_owned(), js.clone());
+        self.literal_strings.insert(key, js.clone());
         Ok(RuntimeValue::String(js))
     }
 
@@ -781,6 +815,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
     }
 
     fn keyframe_to_object(&mut self, kf: KeyframeRecord) -> Result<RuntimeValue, ExprError> {
+        self.check_array_alloc(3)?;
+        self.charge_alloc_bytes("index".len() + "time".len() + "value".len())?;
         let mut map = BTreeMap::new();
         map.insert("index".to_string(), RuntimeValue::Number(kf.index as f64));
         map.insert("time".to_string(), RuntimeValue::Number(kf.time));
@@ -810,7 +846,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                         params: &f.params,
                         body: ClosureBody::Block(&f.body),
                         captured_env: fn_scope,
-                        name: Some(f.name.as_str()),
+                        name: None,
                     })?;
                     self.define_binding(
                         fn_scope,
@@ -1470,7 +1506,13 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         env: usize,
     ) -> Result<Flow, ExprError> {
         let try_env = self.push_env(Some(env))?;
-        let try_res = self.exec_stmt_list(&try_stmt.block, try_env);
+        let try_res = match self.exec_stmt_list(&try_stmt.block, try_env) {
+            Err(ExprError::Thrown(_)) if self.pending_throw.is_some() => {
+                let thrown = self.pending_throw.take().unwrap_or(RuntimeValue::Undefined);
+                Ok(Flow::Throw(thrown))
+            }
+            other => other,
+        };
 
         let mut outcome: Result<Flow, ExprError> = match try_res {
             Ok(Flow::Throw(thrown)) => {
@@ -1506,6 +1548,16 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             other => other,
         };
+
+        if matches!(&outcome, Err(ExprError::Thrown(_)))
+            && let Some(thrown) = self.pending_throw.take()
+        {
+            outcome = Ok(Flow::Throw(thrown));
+        }
+
+        if matches!(&outcome, Err(err) if !is_catchable_error(err)) {
+            return outcome;
+        }
 
         if let Some(finally_body) = &try_stmt.finally_body {
             let finally_env = self.push_env(Some(env))?;
@@ -1792,12 +1844,22 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             "time" => return Ok(RuntimeValue::Number(self.ctx.time())),
             "fps" => return Ok(RuntimeValue::Number(self.ctx.fps())),
             "value" => {
+                if let Some(v) = &self.cached_value {
+                    return Ok(v.clone());
+                }
                 let v = self.ctx.value();
-                return self.intern_value(v);
+                let interned = self.intern_value(v)?;
+                self.cached_value = Some(interned.clone());
+                return Ok(interned);
             }
             "properties" => {
+                if let Some(p) = &self.cached_properties {
+                    return Ok(p.clone());
+                }
                 let props = self.ctx.properties();
-                return self.intern_value(Value::Object(props));
+                let interned = self.intern_value(Value::Object(props))?;
+                self.cached_properties = Some(interned.clone());
+                return Ok(interned);
             }
             "Math" => return Ok(RuntimeValue::Namespace(NamespaceKind::Math)),
             "isNaN" | "isFinite" | "parseInt" | "parseFloat" => {
@@ -1981,10 +2043,11 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             UpdateOp::Inc => 1.0,
             UpdateOp::Dec => -1.0,
         };
-        let old_val = self.read_target(target, env)?;
+        let resolved = self.resolve_target(target, env)?;
+        let old_val = self.read_resolved_target(&resolved, env)?;
         let old_num = self.runtime_to_number(&old_val)?;
         let new_num = old_num + delta;
-        self.write_target(target, RuntimeValue::Number(new_num), env)?;
+        self.write_resolved_target(&resolved, RuntimeValue::Number(new_num), env)?;
         Ok(RuntimeValue::Number(if prefix { new_num } else { old_num }))
     }
 
@@ -1995,134 +2058,133 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         value_expr: &'ast Expr,
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
-        let rhs = self.eval_expr(value_expr, env)?;
+        let resolved = self.resolve_target(target, env)?;
         let final_val = match op {
-            AssignOp::Assign => rhs,
-            AssignOp::AddAssign => {
-                let lhs = self.read_target(target, env)?;
-                self.eval_binary(BinaryOp::Add, lhs, rhs)?
-            }
-            AssignOp::SubAssign => {
-                let lhs = self.read_target(target, env)?;
-                self.eval_binary(BinaryOp::Sub, lhs, rhs)?
-            }
-            AssignOp::MulAssign => {
-                let lhs = self.read_target(target, env)?;
-                self.eval_binary(BinaryOp::Mul, lhs, rhs)?
-            }
-            AssignOp::DivAssign => {
-                let lhs = self.read_target(target, env)?;
-                self.eval_binary(BinaryOp::Div, lhs, rhs)?
-            }
-            AssignOp::RemAssign => {
-                let lhs = self.read_target(target, env)?;
-                self.eval_binary(BinaryOp::Rem, lhs, rhs)?
-            }
-            AssignOp::PowAssign => {
-                let lhs = self.read_target(target, env)?;
-                self.eval_binary(BinaryOp::Pow, lhs, rhs)?
+            AssignOp::Assign => self.eval_expr(value_expr, env)?,
+            _ => {
+                let lhs = self.read_resolved_target(&resolved, env)?;
+                let rhs = self.eval_expr(value_expr, env)?;
+                let bin_op = match op {
+                    AssignOp::AddAssign => BinaryOp::Add,
+                    AssignOp::SubAssign => BinaryOp::Sub,
+                    AssignOp::MulAssign => BinaryOp::Mul,
+                    AssignOp::DivAssign => BinaryOp::Div,
+                    AssignOp::RemAssign => BinaryOp::Rem,
+                    AssignOp::PowAssign => BinaryOp::Pow,
+                    AssignOp::Assign => unreachable!(),
+                };
+                self.eval_binary(bin_op, lhs, rhs)?
             }
         };
-        self.write_target(target, final_val.clone(), env)?;
+        self.write_resolved_target(&resolved, final_val.clone(), env)?;
         Ok(final_val)
     }
 
-    fn read_target(
+    fn resolve_target(
         &mut self,
         target: &'ast AssignTarget,
         env: usize,
-    ) -> Result<RuntimeValue, ExprError> {
+    ) -> Result<ResolvedTarget<'ast>, ExprError> {
         match target {
-            AssignTarget::Ident(name) => self.resolve_ident(name, env),
+            AssignTarget::Ident(name) => Ok(ResolvedTarget::Ident(name.as_str())),
             AssignTarget::Member { object, prop } => {
-                let obj = self.eval_expr(object, env)?;
-                self.get_property(&obj, prop)
+                let object = self.eval_expr(object, env)?;
+                Ok(ResolvedTarget::Member {
+                    object,
+                    prop: prop.as_str(),
+                })
             }
             AssignTarget::Index { object, index } => {
-                let obj = self.eval_expr(object, env)?;
-                let idx = self.eval_expr(index, env)?;
-                self.get_computed(&obj, &idx)
+                let object = self.eval_expr(object, env)?;
+                let index = self.eval_expr(index, env)?;
+                Ok(ResolvedTarget::Index { object, index })
             }
         }
     }
 
-    fn write_target(
+    fn read_resolved_target(
         &mut self,
-        target: &'ast AssignTarget,
+        target: &ResolvedTarget<'ast>,
+        env: usize,
+    ) -> Result<RuntimeValue, ExprError> {
+        match target {
+            ResolvedTarget::Ident(name) => self.resolve_ident(name, env),
+            ResolvedTarget::Member { object, prop } => self.get_property(object, prop),
+            ResolvedTarget::Index { object, index } => self.get_computed(object, index),
+        }
+    }
+
+    fn write_resolved_target(
+        &mut self,
+        target: &ResolvedTarget<'ast>,
         val: RuntimeValue,
         env: usize,
     ) -> Result<(), ExprError> {
         match target {
-            AssignTarget::Ident(name) => self.assign_local(env, name, val),
-            AssignTarget::Member { object, prop } => {
-                let obj = self.eval_expr(object, env)?;
-                match obj {
-                    RuntimeValue::Object(id) => {
-                        if !self.objects[id].contains_key(prop) {
-                            if self.objects[id].len() >= MAX_ARRAY_LEN {
-                                return Err(ExprError::RangeError(format!(
-                                    "object property count exceeds {MAX_ARRAY_LEN} limit"
-                                )));
-                            }
-                            self.charge_alloc_bytes(
-                                prop.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES),
-                            )?;
-                        }
-                        self.objects[id].insert(prop.clone(), val);
-                        Ok(())
-                    }
-                    RuntimeValue::Handle(_) | RuntimeValue::Namespace(_) => Err(
-                        ExprError::TypeError(format!("cannot mutate read-only property '{prop}'")),
-                    ),
-                    _ => Err(ExprError::TypeError(format!(
-                        "cannot set property '{prop}' on non-object"
-                    ))),
-                }
-            }
-            AssignTarget::Index { object, index } => {
-                let obj = self.eval_expr(object, env)?;
-                let idx = self.eval_expr(index, env)?;
-                match obj {
-                    RuntimeValue::Array(id) => {
-                        let i = self.runtime_to_number(&idx)?;
-                        if i < 0.0 || i.fract() != 0.0 || !i.is_finite() {
-                            return Err(ExprError::RangeError("invalid array index".to_string()));
-                        }
-                        let ui = i as usize;
-                        if ui >= MAX_ARRAY_LEN {
+            ResolvedTarget::Ident(name) => self.assign_local(env, name, val),
+            ResolvedTarget::Member { object, prop } => match object {
+                RuntimeValue::Object(id) => {
+                    let id = *id;
+                    if !self.objects[id].contains_key(*prop) {
+                        if self.objects[id].len() >= MAX_ARRAY_LEN {
                             return Err(ExprError::RangeError(format!(
-                                "array index {ui} exceeds {MAX_ARRAY_LEN} limit"
+                                "object property count exceeds {MAX_ARRAY_LEN} limit"
                             )));
                         }
-                        let cur_len = self.arrays[id].len();
-                        if ui >= cur_len {
-                            let added = ui + 1 - cur_len;
-                            self.check_array_alloc(added)?;
-                            self.arrays[id].resize(ui + 1, RuntimeValue::Undefined);
-                        }
-                        self.arrays[id][ui] = val;
-                        Ok(())
+                        self.charge_alloc_bytes(
+                            prop.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES),
+                        )?;
                     }
-                    RuntimeValue::Object(id) => {
-                        let key = self.runtime_to_js_string(&idx)?;
-                        if !self.objects[id].contains_key(&key) {
-                            if self.objects[id].len() >= MAX_ARRAY_LEN {
-                                return Err(ExprError::RangeError(format!(
-                                    "object property count exceeds {MAX_ARRAY_LEN} limit"
-                                )));
-                            }
-                            self.charge_alloc_bytes(
-                                key.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES),
-                            )?;
-                        }
-                        self.objects[id].insert(key, val);
-                        Ok(())
-                    }
-                    _ => Err(ExprError::TypeError(
-                        "cannot assign indexed property on non-object".to_string(),
-                    )),
+                    self.objects[id].insert((*prop).to_string(), val);
+                    Ok(())
                 }
-            }
+                RuntimeValue::Handle(_) | RuntimeValue::Namespace(_) => Err(ExprError::TypeError(
+                    format!("cannot mutate read-only property '{prop}'"),
+                )),
+                _ => Err(ExprError::TypeError(format!(
+                    "cannot set property '{prop}' on non-object"
+                ))),
+            },
+            ResolvedTarget::Index { object, index } => match object {
+                RuntimeValue::Array(id) => {
+                    let id = *id;
+                    let i = self.runtime_to_number(index)?;
+                    if i < 0.0 || i.fract() != 0.0 || !i.is_finite() {
+                        return Err(ExprError::RangeError("invalid array index".to_string()));
+                    }
+                    let ui = i as usize;
+                    if ui >= MAX_ARRAY_LEN {
+                        return Err(ExprError::RangeError(format!(
+                            "array index {ui} exceeds {MAX_ARRAY_LEN} limit"
+                        )));
+                    }
+                    let cur_len = self.arrays[id].len();
+                    if ui >= cur_len {
+                        let added = ui + 1 - cur_len;
+                        self.check_array_alloc(added)?;
+                        self.arrays[id].resize(ui + 1, RuntimeValue::Undefined);
+                    }
+                    self.arrays[id][ui] = val;
+                    Ok(())
+                }
+                RuntimeValue::Object(id) => {
+                    let id = *id;
+                    let key = self.runtime_to_js_string(index)?;
+                    if !self.objects[id].contains_key(&key) {
+                        if self.objects[id].len() >= MAX_ARRAY_LEN {
+                            return Err(ExprError::RangeError(format!(
+                                "object property count exceeds {MAX_ARRAY_LEN} limit"
+                            )));
+                        }
+                        self.charge_alloc_bytes(key.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES))?;
+                    }
+                    self.objects[id].insert(key, val);
+                    Ok(())
+                }
+                _ => Err(ExprError::TypeError(
+                    "cannot assign indexed property on non-object".to_string(),
+                )),
+            },
         }
     }
 
@@ -2323,8 +2385,21 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 }
             }
             (RuntimeValue::Handle(x), RuntimeValue::Handle(y)) => x == y,
+            (RuntimeValue::Namespace(x), RuntimeValue::Namespace(y)) => x == y,
             _ => false,
         })
+    }
+
+    fn same_value_zero(&mut self, a: &RuntimeValue, b: &RuntimeValue) -> Result<bool, ExprError> {
+        let a = self.deref_property_handle(a.clone())?;
+        let b = self.deref_property_handle(b.clone())?;
+        if let (RuntimeValue::Number(x), RuntimeValue::Number(y)) = (&a, &b)
+            && x.is_nan()
+            && y.is_nan()
+        {
+            return Ok(true);
+        }
+        self.strict_eq(&a, &b)
     }
 
     fn loose_eq(&mut self, a: &RuntimeValue, b: &RuntimeValue) -> Result<bool, ExprError> {
@@ -2561,14 +2636,18 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         let mut current = self.eval_expr(base, env)?;
         let mut idx = 0;
         while idx < ops.len() {
-            let is_nullish = {
-                let derefed = self.deref_property_handle(current.clone())?;
-                matches!(derefed, RuntimeValue::Null | RuntimeValue::Undefined)
-            };
             match &ops[idx] {
                 ChainOp::Member { prop, optional } => {
-                    if *optional && is_nullish {
-                        return Ok(RuntimeValue::Undefined);
+                    if *optional {
+                        let derefed = self.deref_property_handle(current.clone())?;
+                        if matches!(derefed, RuntimeValue::Null | RuntimeValue::Undefined) {
+                            return Ok(RuntimeValue::Undefined);
+                        }
+                    } else if matches!(current, RuntimeValue::Null | RuntimeValue::Undefined) {
+                        return Err(ExprError::TypeError(format!(
+                            "cannot read property '{}' of null or undefined",
+                            truncate_diag(prop)
+                        )));
                     }
                     // Look ahead for method call `a?.b(args)` or `a?.b?.(args)`.
                     if let Some(ChainOp::Call {
@@ -2576,10 +2655,10 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                         optional: call_opt,
                     }) = ops.get(idx + 1)
                     {
-                        let eval_args = self.eval_call_args(args, env)?;
-                        if *call_opt && is_nullish {
+                        if *call_opt && self.member_is_nullish(&current, prop)? {
                             return Ok(RuntimeValue::Undefined);
                         }
+                        let eval_args = self.eval_call_args(args, env)?;
                         current = self.call_method_on(current, prop, eval_args, *call_opt)?;
                         idx += 2;
                         continue;
@@ -2587,15 +2666,21 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     current = self.get_property(&current, prop)?;
                 }
                 ChainOp::Index { index, optional } => {
-                    if *optional && is_nullish {
-                        return Ok(RuntimeValue::Undefined);
+                    if *optional {
+                        let derefed = self.deref_property_handle(current.clone())?;
+                        if matches!(derefed, RuntimeValue::Null | RuntimeValue::Undefined) {
+                            return Ok(RuntimeValue::Undefined);
+                        }
                     }
                     let key = self.eval_expr(index, env)?;
                     current = self.get_computed(&current, &key)?;
                 }
                 ChainOp::Call { args, optional } => {
-                    if *optional && is_nullish {
-                        return Ok(RuntimeValue::Undefined);
+                    if *optional {
+                        let derefed = self.deref_property_handle(current.clone())?;
+                        if matches!(derefed, RuntimeValue::Null | RuntimeValue::Undefined) {
+                            return Ok(RuntimeValue::Undefined);
+                        }
                     }
                     let eval_args = self.eval_call_args(args, env)?;
                     current = self.call_runtime_value(current, eval_args)?;
@@ -2604,6 +2689,157 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             idx += 1;
         }
         Ok(current)
+    }
+
+    /// Returns `true` when accessing `receiver.prop` yields `null` or `undefined`
+    /// (including absent built-in prototype/namespace/handle methods), used to
+    /// short-circuit optional calls `receiver.prop?.(args)` before evaluating `args`.
+    fn member_is_nullish(
+        &mut self,
+        receiver: &RuntimeValue,
+        prop: &str,
+    ) -> Result<bool, ExprError> {
+        if matches!(prop, "__proto__" | "constructor" | "prototype") {
+            return Ok(true);
+        }
+        match receiver {
+            RuntimeValue::Object(id) => {
+                let Some(val) = self.objects[*id].get(prop).cloned() else {
+                    return Ok(true);
+                };
+                let derefed = self.deref_property_handle(val)?;
+                Ok(matches!(
+                    derefed,
+                    RuntimeValue::Null | RuntimeValue::Undefined
+                ))
+            }
+            RuntimeValue::Namespace(ns) => match ns {
+                NamespaceKind::Math => {
+                    if prop == "random" {
+                        return Err(ExprError::Forbidden("Math.random".to_string()));
+                    }
+                    Ok(!is_top_level_math_fn(prop) && math_constant(prop).is_none())
+                }
+                NamespaceKind::Array => Ok(!matches!(prop, "isArray" | "from")),
+                NamespaceKind::Number => Ok(!matches!(
+                    prop,
+                    "isFinite"
+                        | "isNaN"
+                        | "isInteger"
+                        | "parseFloat"
+                        | "parseInt"
+                        | "MAX_SAFE_INTEGER"
+                        | "MIN_SAFE_INTEGER"
+                        | "EPSILON"
+                        | "POSITIVE_INFINITY"
+                        | "NEGATIVE_INFINITY"
+                        | "NaN"
+                )),
+                NamespaceKind::String => Ok(prop != "fromCharCode"),
+                NamespaceKind::Object => {
+                    Ok(!matches!(prop, "keys" | "values" | "entries" | "assign"))
+                }
+                NamespaceKind::Json => Ok(!matches!(prop, "stringify" | "parse")),
+                NamespaceKind::Boolean => Ok(true),
+            },
+            RuntimeValue::Array(id) => {
+                if matches!(
+                    prop,
+                    "push"
+                        | "pop"
+                        | "shift"
+                        | "unshift"
+                        | "reverse"
+                        | "slice"
+                        | "concat"
+                        | "join"
+                        | "indexOf"
+                        | "includes"
+                        | "map"
+                        | "filter"
+                        | "reduce"
+                        | "forEach"
+                        | "find"
+                        | "some"
+                        | "every"
+                        | "fill"
+                        | "length"
+                ) {
+                    return Ok(false);
+                }
+                if let Ok(idx) = prop.parse::<usize>()
+                    && let Some(elem) = self.arrays[*id].get(idx).cloned()
+                {
+                    let derefed = self.deref_property_handle(elem)?;
+                    return Ok(matches!(
+                        derefed,
+                        RuntimeValue::Null | RuntimeValue::Undefined
+                    ));
+                }
+                Ok(true)
+            }
+            RuntimeValue::String(s) => {
+                if matches!(
+                    prop,
+                    "toLowerCase"
+                        | "toUpperCase"
+                        | "trim"
+                        | "trimStart"
+                        | "trimEnd"
+                        | "slice"
+                        | "substring"
+                        | "indexOf"
+                        | "includes"
+                        | "startsWith"
+                        | "endsWith"
+                        | "split"
+                        | "replace"
+                        | "replaceAll"
+                        | "charAt"
+                        | "charCodeAt"
+                        | "repeat"
+                        | "length"
+                ) {
+                    return Ok(false);
+                }
+                if let Ok(idx) = prop.parse::<usize>() {
+                    return Ok(self.string_char_at(s, idx)?.is_none());
+                }
+                Ok(true)
+            }
+            RuntimeValue::Number(_) => Ok(!matches!(prop, "toFixed" | "toString")),
+            RuntimeValue::Handle(handle) => match handle {
+                HandleRef::Property(id) => match prop {
+                    "valueAtTime" | "velocityAtTime" | "speedAtTime" | "key" | "nearestKey"
+                    | "parent" | "value" | "velocity" | "speed" | "numKeys" | "length" => Ok(false),
+                    "name" => Ok(self.ctx.handle_name(id).is_none()),
+                    _ => {
+                        let val = self.ctx.property_value(id)?;
+                        let rv = self.intern_value(val)?;
+                        if matches!(rv, RuntimeValue::Null | RuntimeValue::Undefined) {
+                            Ok(true)
+                        } else {
+                            self.member_is_nullish(&rv, prop)
+                        }
+                    }
+                },
+                HandleRef::Effect(id) => match prop {
+                    "param" | "property" | "parent" => Ok(false),
+                    "name" => Ok(self.ctx.handle_name(id).is_none()),
+                    _ => Ok(true),
+                },
+                HandleRef::Object(id) | HandleRef::Layer(id) | HandleRef::Clip(id) => match prop {
+                    "parent" | "effect" | "object" | "property" | "layer" | "toWorld"
+                    | "fromWorld" | "worldPosition" | "worldRotation" | "toScreen"
+                    | "fromScreen" => Ok(false),
+                    "name" => Ok(self.ctx.handle_name(id).is_none()),
+                    _ => Ok(true),
+                },
+                HandleRef::Sequence => Ok(!matches!(prop, "layer" | "frameDuration" | "fps")),
+                HandleRef::Controls => Ok(true),
+            },
+            _ => Ok(true),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2869,8 +3105,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     Flow::Normal(_) => Ok(RuntimeValue::Undefined),
                     Flow::Return(v) => Ok(v),
                     Flow::Throw(v) => {
-                        let msg = self.runtime_to_js_string(&v)?;
-                        Err(ExprError::Thrown(msg))
+                        self.pending_throw = Some(v);
+                        Err(ExprError::Thrown(String::new()))
                     }
                     Flow::Break | Flow::Continue => Err(ExprError::SyntaxError {
                         offset: 0,
@@ -2951,25 +3187,31 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             },
             NamespaceKind::Number => match method {
                 "isFinite" => {
-                    let ok = matches!(
-                        args.first().cloned().map(|v| self.deref_property_handle(v)),
-                        Some(Ok(RuntimeValue::Number(n))) if n.is_finite()
-                    );
-                    Ok(RuntimeValue::Bool(ok))
+                    let Some(v) = args.first() else {
+                        return Ok(RuntimeValue::Bool(false));
+                    };
+                    let d = self.deref_property_handle(v.clone())?;
+                    Ok(RuntimeValue::Bool(
+                        matches!(d, RuntimeValue::Number(n) if n.is_finite()),
+                    ))
                 }
                 "isNaN" => {
-                    let ok = matches!(
-                        args.first().cloned().map(|v| self.deref_property_handle(v)),
-                        Some(Ok(RuntimeValue::Number(n))) if n.is_nan()
-                    );
-                    Ok(RuntimeValue::Bool(ok))
+                    let Some(v) = args.first() else {
+                        return Ok(RuntimeValue::Bool(false));
+                    };
+                    let d = self.deref_property_handle(v.clone())?;
+                    Ok(RuntimeValue::Bool(
+                        matches!(d, RuntimeValue::Number(n) if n.is_nan()),
+                    ))
                 }
                 "isInteger" => {
-                    let ok = matches!(
-                        args.first().cloned().map(|v| self.deref_property_handle(v)),
-                        Some(Ok(RuntimeValue::Number(n))) if n.is_finite() && n.fract() == 0.0
-                    );
-                    Ok(RuntimeValue::Bool(ok))
+                    let Some(v) = args.first() else {
+                        return Ok(RuntimeValue::Bool(false));
+                    };
+                    let d = self.deref_property_handle(v.clone())?;
+                    Ok(RuntimeValue::Bool(
+                        matches!(d, RuntimeValue::Number(n) if n.is_finite() && n.fract() == 0.0),
+                    ))
                 }
                 "parseFloat" => {
                     let s = match args.first() {
@@ -3156,7 +3398,9 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                             });
                         }
                     };
-                    let parsed = json_parse(&s)?;
+                    let parsed = json_parse_bounded(&s, MAX_ARRAY_LEN, &mut |bytes| {
+                        self.charge_alloc_bytes(bytes)
+                    })?;
                     self.intern_value(parsed)
                 }
                 _ => Err(ExprError::TypeError(format!(
@@ -3500,10 +3744,19 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             "indexOf" => {
                 let needle = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
-                self.charge_work(self.arrays[id].len())?;
-                let items = self.arrays[id].clone();
-                for (i, item) in items.iter().enumerate() {
-                    if self.strict_eq(item, &needle)? {
+                let len = self.arrays[id].len();
+                let start = match args.get(1) {
+                    Some(v) if !matches!(v, RuntimeValue::Undefined) => {
+                        normalize_slice_index(self.runtime_to_number(v)?, len as isize)
+                    }
+                    _ => 0,
+                };
+                self.charge_work(len.saturating_sub(start))?;
+                for i in start..len {
+                    let Some(item) = self.arrays[id].get(i).cloned() else {
+                        break;
+                    };
+                    if self.strict_eq(&item, &needle)? {
                         return Ok(RuntimeValue::Number(i as f64));
                     }
                 }
@@ -3511,10 +3764,19 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             "includes" => {
                 let needle = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
-                self.charge_work(self.arrays[id].len())?;
-                let items = self.arrays[id].clone();
-                for item in &items {
-                    if self.strict_eq(item, &needle)? {
+                let len = self.arrays[id].len();
+                let start = match args.get(1) {
+                    Some(v) if !matches!(v, RuntimeValue::Undefined) => {
+                        normalize_slice_index(self.runtime_to_number(v)?, len as isize)
+                    }
+                    _ => 0,
+                };
+                self.charge_work(len.saturating_sub(start))?;
+                for i in start..len {
+                    let Some(item) = self.arrays[id].get(i).cloned() else {
+                        break;
+                    };
+                    if self.same_value_zero(&item, &needle)? {
                         return Ok(RuntimeValue::Bool(true));
                     }
                 }
@@ -3525,9 +3787,11 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 let len = self.arrays[id].len();
                 self.check_array_alloc(len)?;
                 self.charge_work(len)?;
-                let items = self.arrays[id].clone();
-                let mut out = Vec::with_capacity(items.len());
-                for (i, item) in items.into_iter().enumerate() {
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    let Some(item) = self.arrays[id].get(i).cloned() else {
+                        break;
+                    };
                     let res = self.call_runtime_value(
                         cb.clone(),
                         vec![
@@ -3542,10 +3806,13 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             "filter" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
-                self.charge_work(self.arrays[id].len())?;
-                let items = self.arrays[id].clone();
+                let len = self.arrays[id].len();
+                self.charge_work(len)?;
                 let mut out = Vec::new();
-                for (i, item) in items.into_iter().enumerate() {
+                for i in 0..len {
+                    let Some(item) = self.arrays[id].get(i).cloned() else {
+                        break;
+                    };
                     let keep = self.call_runtime_value(
                         cb.clone(),
                         vec![
@@ -3555,26 +3822,29 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                         ],
                     )?;
                     if self.runtime_to_bool(&keep)? {
+                        self.charge_alloc_bytes(ARRAY_ELEM_BUDGET_BYTES)?;
                         out.push(item);
                     }
                 }
-                self.check_array_alloc(out.len())?;
                 Ok(self.alloc_array(out))
             }
             "reduce" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
-                self.charge_work(self.arrays[id].len())?;
-                let items = self.arrays[id].clone();
+                let len = self.arrays[id].len();
+                self.charge_work(len)?;
                 let (mut acc, start_idx) = if let Some(init) = args.get(1) {
                     (init.clone(), 0)
-                } else if !items.is_empty() {
-                    (items[0].clone(), 1)
+                } else if let Some(first) = self.arrays[id].first().cloned() {
+                    (first, 1)
                 } else {
                     return Err(ExprError::TypeError(
                         "reduce of empty array with no initial value".to_string(),
                     ));
                 };
-                for (i, item) in items.into_iter().enumerate().skip(start_idx) {
+                for i in start_idx..len {
+                    let Some(item) = self.arrays[id].get(i).cloned() else {
+                        break;
+                    };
                     acc = self.call_runtime_value(
                         cb.clone(),
                         vec![
@@ -3589,9 +3859,12 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             "forEach" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
-                self.charge_work(self.arrays[id].len())?;
-                let items = self.arrays[id].clone();
-                for (i, item) in items.into_iter().enumerate() {
+                let len = self.arrays[id].len();
+                self.charge_work(len)?;
+                for i in 0..len {
+                    let Some(item) = self.arrays[id].get(i).cloned() else {
+                        break;
+                    };
                     self.call_runtime_value(
                         cb.clone(),
                         vec![
@@ -3605,9 +3878,12 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             "find" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
-                self.charge_work(self.arrays[id].len())?;
-                let items = self.arrays[id].clone();
-                for (i, item) in items.into_iter().enumerate() {
+                let len = self.arrays[id].len();
+                self.charge_work(len)?;
+                for i in 0..len {
+                    let Some(item) = self.arrays[id].get(i).cloned() else {
+                        break;
+                    };
                     let hit = self.call_runtime_value(
                         cb.clone(),
                         vec![
@@ -3624,9 +3900,12 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             "some" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
-                self.charge_work(self.arrays[id].len())?;
-                let items = self.arrays[id].clone();
-                for (i, item) in items.into_iter().enumerate() {
+                let len = self.arrays[id].len();
+                self.charge_work(len)?;
+                for i in 0..len {
+                    let Some(item) = self.arrays[id].get(i).cloned() else {
+                        break;
+                    };
                     let hit = self.call_runtime_value(
                         cb.clone(),
                         vec![
@@ -3643,9 +3922,12 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             "every" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
-                self.charge_work(self.arrays[id].len())?;
-                let items = self.arrays[id].clone();
-                for (i, item) in items.into_iter().enumerate() {
+                let len = self.arrays[id].len();
+                self.charge_work(len)?;
+                for i in 0..len {
+                    let Some(item) = self.arrays[id].get(i).cloned() else {
+                        break;
+                    };
                     let hit = self.call_runtime_value(
                         cb.clone(),
                         vec![
@@ -3668,8 +3950,10 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     None => 0,
                 };
                 let end = match args.get(2) {
-                    Some(v) => normalize_slice_index(self.runtime_to_number(v)?, len),
-                    None => len as usize,
+                    Some(v) if !matches!(v, RuntimeValue::Undefined) => {
+                        normalize_slice_index(self.runtime_to_number(v)?, len)
+                    }
+                    _ => len as usize,
                 };
                 if start < end {
                     self.charge_work(end - start)?;
@@ -3865,14 +4149,19 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
-                let est = s
-                    .len()
-                    .saturating_sub(from.len())
+                self.charge_byte_work(s.len())?;
+                let Some(pos) = s.find(&from) else {
+                    return Ok(RuntimeValue::String(s.clone()));
+                };
+                let out_len = (s.len() - from.len())
                     .checked_add(to.len())
                     .ok_or_else(|| ExprError::RangeError("replace string overflow".to_string()))?;
-                self.check_string_alloc(est)?;
-                self.charge_byte_work(s.len())?;
-                Ok(RuntimeValue::String(JsStr::from(s.replacen(&from, &to, 1))))
+                self.check_string_alloc(out_len)?;
+                let mut out = String::with_capacity(out_len);
+                out.push_str(&s[..pos]);
+                out.push_str(&to);
+                out.push_str(&s[pos + from.len()..]);
+                Ok(RuntimeValue::String(JsStr::from(out)))
             }
             "replaceAll" => {
                 let from = match args.first() {
@@ -3961,18 +4250,49 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         match method {
             "toFixed" => {
                 let digits = match args.first() {
-                    Some(v) => self.runtime_to_number(v)?,
-                    None => 0.0,
+                    Some(v) if !matches!(v, RuntimeValue::Undefined) => {
+                        self.runtime_to_number(v)?
+                    }
+                    _ => 0.0,
                 };
-                if !(0.0..=100.0).contains(&digits) {
+                let digits_int = if digits.is_nan() { 0.0 } else { digits.trunc() };
+                if !(0.0..=100.0).contains(&digits_int) {
                     return Err(ExprError::RangeError(
                         "toFixed() digits argument must be between 0 and 100".to_string(),
                     ));
                 }
-                let prec = digits as usize;
+                if !n.is_finite() {
+                    return self.alloc_string(format_js_number(n));
+                }
+                let prec = digits_int as usize;
                 self.alloc_string(format!("{n:.prec$}"))
             }
-            "toString" => Ok(RuntimeValue::String(JsStr::from(format_js_number(n)))),
+            "toString" => {
+                let radix = match args.first() {
+                    Some(v) if !matches!(v, RuntimeValue::Undefined) => {
+                        let r = self.runtime_to_number(v)?;
+                        if r.is_nan() {
+                            return Err(ExprError::RangeError(
+                                "toString() radix must be between 2 and 36".to_string(),
+                            ));
+                        }
+                        let ri = r.trunc();
+                        if !(2.0..=36.0).contains(&ri) {
+                            return Err(ExprError::RangeError(
+                                "toString() radix must be between 2 and 36".to_string(),
+                            ));
+                        }
+                        ri as u32
+                    }
+                    _ => 10,
+                };
+                let formatted = if radix == 10 {
+                    format_js_number(n)
+                } else {
+                    format_js_number_radix(n, radix)
+                };
+                self.alloc_string(formatted)
+            }
             _ => Err(ExprError::TypeError(format!(
                 "Number.prototype.{method} is not a function"
             ))),
@@ -4169,7 +4489,10 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     Some(v) => self.runtime_to_bool(v)?,
                     None => false,
                 };
-                self.rng = Some(DetRng::from_seed(seed, self.ctx.frame(), timeless));
+                let rng = DetRng::from_seed(seed, self.ctx.frame(), timeless);
+                self.wiggle_seed_offset = rng.seed_offset();
+                self.rng = Some(rng);
+                self.rng_explicitly_seeded = true;
                 Ok(RuntimeValue::Undefined)
             }
             "wiggle" => {
@@ -4178,7 +4501,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 let octaves = self.number_arg(&args, 2, 1.0)?.max(1.0) as usize;
                 let amp_mult = self.number_arg(&args, 3, 0.5)?;
                 let t = self.number_arg(&args, 4, self.ctx.frame())?;
-                let seed_offset = self.rng.as_ref().map_or(0.0, DetRng::seed_offset);
+                let seed_offset = self.wiggle_seed_offset;
                 let base_val = self.ctx.value();
                 let res = eval_wiggle(&base_val, freq, &amp, octaves, amp_mult, t, seed_offset);
                 self.intern_value(res)
@@ -4391,7 +4714,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
 
     fn builtin_random(&mut self, args: &[RuntimeValue]) -> Result<RuntimeValue, ExprError> {
         // If `seedRandom()` has been invoked in Expressions+, advance the deterministic stream.
-        if self.config.mode == ExprMode::ExpressionsPlus && self.rng.is_some() {
+        if self.config.mode == ExprMode::ExpressionsPlus && self.rng_explicitly_seeded {
             return self.sample_rng_stream(args);
         }
 
@@ -4527,6 +4850,9 @@ fn is_catchable_error(err: &ExprError) -> bool {
 }
 
 fn normalize_slice_index(idx: f64, len: isize) -> usize {
+    if idx.is_nan() {
+        return 0;
+    }
     if !idx.is_finite() {
         return if idx.is_sign_positive() {
             len.max(0) as usize
