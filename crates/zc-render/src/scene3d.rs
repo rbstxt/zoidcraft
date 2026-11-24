@@ -693,6 +693,8 @@ pub struct Scene3DRenderer {
     mesh_pipelines: HashMap<MeshPipelineKey, wgpu::RenderPipeline>,
     lines_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     particle_pipelines: HashMap<ParticlePipelineKey, wgpu::RenderPipeline>,
+    dof_tile_bgl: wgpu::BindGroupLayout,
+    dof_composite_bgl: wgpu::BindGroupLayout,
     dof_tile_pipeline: wgpu::RenderPipeline,
     dof_dilate_pipeline: wgpu::RenderPipeline,
     dof_composite_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
@@ -707,6 +709,7 @@ pub struct Scene3DRenderer {
     linear_sampler: wgpu::Sampler,
     clamp_sampler: wgpu::Sampler,
     mirror_sampler: wgpu::Sampler,
+    depth_nearest_sampler: wgpu::Sampler,
     fallback_white: RenderTarget,
     fallback_normal: RenderTarget,
     fallback_particle: RenderTarget,
@@ -768,18 +771,29 @@ impl Scene3DRenderer {
             create_shadow_pipeline(ctx, &shadow_shader, CompatMode::Current);
         let shadow_pipeline_legacy =
             create_shadow_pipeline(ctx, &shadow_shader, CompatMode::Legacy);
+        let dof_tile_bgl = create_dof_tile_bind_group_layout(ctx);
+        let dof_tile_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zc-render dof tile pipeline layout"),
+                bind_group_layouts: &[Some(&dof_tile_bgl)],
+                immediate_size: 0,
+            });
         let dof_tile_pipeline = create_fullscreen_pipeline(
             ctx,
+            Some(&dof_tile_layout),
             &dof_tile_shader,
             wgpu::TextureFormat::Rgba8Unorm,
             "zc-render dof tile pipeline",
         );
         let dof_dilate_pipeline = create_fullscreen_pipeline(
             ctx,
+            None,
             &dof_dilate_shader,
             wgpu::TextureFormat::Rgba8Unorm,
             "zc-render dof dilate pipeline",
         );
+        let dof_composite_bgl = create_dof_composite_bind_group_layout(ctx);
 
         let (shadow_maps_2d_tex, shadow_maps_2d_array_view, shadow_maps_2d_layer_views) =
             create_depth_array_texture(
@@ -833,6 +847,17 @@ impl Scene3DRenderer {
             ..Default::default()
         });
 
+        let depth_nearest_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("zc-render depth nearest clamp sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            compare: None,
+            ..Default::default()
+        });
+
         let fallback_white =
             ctx.create_rgba8_texture("zc-render fallback white", 1, 1, &[255, 255, 255, 255])?;
         let fallback_normal =
@@ -862,6 +887,8 @@ impl Scene3DRenderer {
             mesh_pipelines: HashMap::new(),
             lines_pipelines: HashMap::new(),
             particle_pipelines: HashMap::new(),
+            dof_tile_bgl,
+            dof_composite_bgl,
             dof_tile_pipeline,
             dof_dilate_pipeline,
             dof_composite_pipelines: HashMap::new(),
@@ -876,6 +903,7 @@ impl Scene3DRenderer {
             linear_sampler,
             clamp_sampler,
             mirror_sampler,
+            depth_nearest_sampler,
             fallback_white,
             fallback_normal,
             fallback_particle,
@@ -1513,9 +1541,12 @@ impl Scene3DRenderer {
             encode_dof_passes(
                 ctx,
                 &mut encoder,
+                &self.dof_tile_bgl,
+                &self.dof_composite_bgl,
                 &self.dof_tile_pipeline,
                 &self.dof_dilate_pipeline,
                 composite_pipeline,
+                &self.depth_nearest_sampler,
                 dof_src,
                 depth_target,
                 tile_target,
@@ -1580,9 +1611,12 @@ impl Scene3DRenderer {
         encode_dof_passes(
             ctx,
             &mut encoder,
+            &self.dof_tile_bgl,
+            &self.dof_composite_bgl,
             &self.dof_tile_pipeline,
             &self.dof_dilate_pipeline,
             composite_pipeline,
+            &self.depth_nearest_sampler,
             color_src,
             depth_src,
             tile_target,
@@ -1644,8 +1678,16 @@ impl Scene3DRenderer {
         if self.dof_composite_pipelines.contains_key(&format) {
             return;
         }
+        let layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zc-render dof composite pipeline layout"),
+                bind_group_layouts: &[Some(&self.dof_composite_bgl)],
+                immediate_size: 0,
+            });
         let pipeline = create_fullscreen_pipeline(
             ctx,
+            Some(&layout),
             &self.dof_composite_shader,
             format,
             "zc-render dof composite pipeline",
@@ -1905,8 +1947,109 @@ fn create_depth_array_texture(
     (tex, array_view, layer_views)
 }
 
+fn create_dof_tile_bind_group_layout(ctx: &GpuContext) -> wgpu::BindGroupLayout {
+    ctx.device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("zc-render dof tile bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        })
+}
+
+fn create_dof_composite_bind_group_layout(ctx: &GpuContext) -> wgpu::BindGroupLayout {
+    ctx.device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("zc-render dof composite bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        })
+}
+
 fn create_fullscreen_pipeline(
     ctx: &GpuContext,
+    layout: Option<&wgpu::PipelineLayout>,
     shader: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
     label: &str,
@@ -1914,7 +2057,7 @@ fn create_fullscreen_pipeline(
     ctx.device
         .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(label),
-            layout: None,
+            layout,
             vertex: wgpu::VertexState {
                 module: shader,
                 entry_point: Some("vs_fullscreen"),
@@ -2024,9 +2167,12 @@ fn encode_shadow_layer_pass(
 fn encode_dof_passes(
     ctx: &GpuContext,
     encoder: &mut wgpu::CommandEncoder,
+    tile_bgl: &wgpu::BindGroupLayout,
+    comp_bgl: &wgpu::BindGroupLayout,
     tile_pipeline: &wgpu::RenderPipeline,
     dilate_pipeline: &wgpu::RenderPipeline,
     composite_pipeline: &wgpu::RenderPipeline,
+    depth_nearest_sampler: &wgpu::Sampler,
     color_src: &RenderTarget,
     depth_src: &RenderTarget,
     tile_target: &RenderTarget,
@@ -2057,10 +2203,9 @@ fn encode_dof_passes(
     let dof_ubo = create_uniform_buffer(ctx, "zc-render dof ubo", bytemuck::bytes_of(&dof_u));
 
     // Pass 1: 16x16 tile max blur radius.
-    let tile_bgl = tile_pipeline.get_bind_group_layout(0);
     let tile_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("zc-render dof tile bg"),
-        layout: &tile_bgl,
+        layout: tile_bgl,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -2073,6 +2218,10 @@ fn encode_dof_passes(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::TextureView(&depth_src.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(depth_nearest_sampler),
             },
         ],
     });
@@ -2137,10 +2286,9 @@ fn encode_dof_passes(
     }
 
     // Pass 3: 64-sample golden-angle foreground/background scatter-as-gather composite.
-    let comp_bgl = composite_pipeline.get_bind_group_layout(0);
     let comp_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("zc-render dof composite bg"),
-        layout: &comp_bgl,
+        layout: comp_bgl,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -2157,6 +2305,10 @@ fn encode_dof_passes(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::TextureView(&dilate_target.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(depth_nearest_sampler),
             },
         ],
     });
@@ -3989,7 +4141,8 @@ struct DofUniforms {
 
 @group(0) @binding(0) var<uniform> u_dof: DofUniforms;
 @group(0) @binding(1) var t_color: texture_2d<f32>;
-@group(0) @binding(2) var t_depth: texture_depth_2d;
+@group(0) @binding(2) var t_depth: texture_2d<f32>;
+@group(0) @binding(3) var s_depth: sampler;
 
 @vertex
 fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
@@ -4011,7 +4164,9 @@ fn linearize_depth(depth: f32) -> f32 {
 }
 
 fn scene_depth_at(px: vec2<i32>) -> f32 {
-    let depth = textureLoad(t_depth, px, 0);
+    let res = max(u_dof.resolution_tile_count.xy, vec2<f32>(1.0));
+    let uv = (vec2<f32>(px) + vec2<f32>(0.5)) / res;
+    let depth = textureSampleLevel(t_depth, s_depth, uv, 0.0).x;
     let far = u_dof.camera_depth_params.z;
     return select(linearize_depth(depth), far, depth >= 1.0);
 }
@@ -4118,8 +4273,9 @@ struct DofUniforms {
 
 @group(0) @binding(0) var<uniform> u_dof: DofUniforms;
 @group(0) @binding(1) var t_color: texture_2d<f32>;
-@group(0) @binding(2) var t_depth: texture_depth_2d;
+@group(0) @binding(2) var t_depth: texture_2d<f32>;
 @group(0) @binding(3) var t_tiles: texture_2d<f32>;
+@group(0) @binding(4) var s_depth: sampler;
 
 @vertex
 fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
@@ -4141,7 +4297,9 @@ fn linearize_depth(depth: f32) -> f32 {
 }
 
 fn scene_depth_at(px: vec2<i32>) -> f32 {
-    let depth = textureLoad(t_depth, px, 0);
+    let res = max(u_dof.resolution_tile_count.xy, vec2<f32>(1.0));
+    let uv = (vec2<f32>(px) + vec2<f32>(0.5)) / res;
+    let depth = textureSampleLevel(t_depth, s_depth, uv, 0.0).x;
     let far = u_dof.camera_depth_params.z;
     return select(linearize_depth(depth), far, depth >= 1.0);
 }
@@ -4547,6 +4705,71 @@ mod tests {
         let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "WGSL / pipeline validation error: {err:?}");
+    }
+
+    #[test]
+    fn all_scene3d_wgsl_shaders_compile_and_never_texture_load_depth_textures() {
+        let shaders = [
+            ("SHADOW_WGSL", SHADOW_WGSL),
+            ("SCENE3D_WGSL", SCENE3D_WGSL),
+            ("LINES_WGSL", LINES_WGSL),
+            ("PARTICLE_WGSL", PARTICLE_WGSL),
+            ("DOF_TILE_WGSL", DOF_TILE_WGSL),
+            ("DOF_DILATE_WGSL", DOF_DILATE_WGSL),
+            ("DOF_COMPOSITE_WGSL", DOF_COMPOSITE_WGSL),
+        ];
+
+        // Static OpenGL/GLES (Naga GLSL backend) guard:
+        // - Naga GLSL rejects `textureLoad` on any `texture_depth_*`.
+        // - Naga GLSL emits `sampler*Shadow` for `texture_depth_*`, so non-comparison
+        //   `textureSample` / `textureSampleLevel` on `texture_depth_*` is also invalid GLSL.
+        for (name, src) in shaders {
+            let mut depth_vars = Vec::new();
+            for line in src.lines() {
+                if let Some(after_var) = line.split("var ").nth(1)
+                    && let Some((ident, ty_part)) = after_var.split_once(':')
+                    && ty_part.trim_start().starts_with("texture_depth_")
+                {
+                    depth_vars.push(ident.trim());
+                }
+            }
+            for var_name in depth_vars {
+                let forbidden_load = format!("textureLoad({var_name}");
+                assert!(
+                    !src.contains(&forbidden_load),
+                    "{name} uses `{forbidden_load}` on a `texture_depth_*`, which fails on Naga GLSL / OpenGL"
+                );
+                let forbidden_sample = format!("textureSample({var_name}");
+                assert!(
+                    !src.contains(&forbidden_sample),
+                    "{name} uses non-comparison `{forbidden_sample}` on a `texture_depth_*`, which fails on Naga GLSL / OpenGL"
+                );
+                let forbidden_sample_level = format!("textureSampleLevel({var_name}");
+                assert!(
+                    !src.contains(&forbidden_sample_level),
+                    "{name} uses non-comparison `{forbidden_sample_level}` on a `texture_depth_*`, which fails on Naga GLSL / OpenGL"
+                );
+            }
+        }
+        assert!(!DOF_TILE_WGSL.contains("textureLoad(t_depth"));
+        assert!(!DOF_COMPOSITE_WGSL.contains("textureLoad(t_depth"));
+
+        // Verify every WGSL shader module compiles cleanly under wgpu.
+        let Some(ctx) = headless_ctx_or_skip() else {
+            return;
+        };
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        for (name, src) in shaders {
+            let _module = ctx
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(name),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(src)),
+                });
+        }
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "WGSL module compilation error: {err:?}");
     }
 
     #[test]

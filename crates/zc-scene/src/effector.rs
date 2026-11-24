@@ -1772,8 +1772,8 @@ pub fn apply_delay(
                 if qlen < 1e-8 {
                     t.rotation = c.rotation;
                 } else {
-                    for a in 0..4 {
-                        t.rotation[a] /= qlen;
+                    for r in &mut t.rotation {
+                        *r /= qlen;
                     }
                 }
             }

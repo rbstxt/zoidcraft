@@ -127,16 +127,54 @@ pub enum ExportContainer {
     WebM,
     Mkv,
     PngSequence,
+    Gif,
+    Wav,
+    M4a,
 }
 
 impl ExportContainer {
-    pub const ALL: [Self; 4] = [Self::Mp4, Self::WebM, Self::Mkv, Self::PngSequence];
-    pub const LABELS: [&'static str; 4] = [
+    pub const ALL: [Self; 7] = [
+        Self::Mp4,
+        Self::WebM,
+        Self::Mkv,
+        Self::PngSequence,
+        Self::Gif,
+        Self::Wav,
+        Self::M4a,
+    ];
+    pub const LABELS: [&'static str; 7] = [
         "MP4 (.mp4)",
         "WebM (.webm)",
         "MKV (.mkv)",
         "PNG Sequence (.png)",
+        "GIF (.gif)",
+        "WAV Audio (.wav)",
+        "M4A Audio (.m4a)",
     ];
+
+    /// Returns `true` for audio-only containers (`Wav`, `M4a`) that skip video rendering.
+    #[must_use]
+    pub const fn is_audio_only(self) -> bool {
+        matches!(self, Self::Wav | Self::M4a)
+    }
+
+    /// Returns `true` when this container exposes video codec and rate-control options.
+    #[must_use]
+    pub const fn uses_video_codec(self) -> bool {
+        matches!(self, Self::Mp4 | Self::WebM | Self::Mkv)
+    }
+
+    /// Returns `true` when this container supports an audio stream.
+    #[must_use]
+    pub const fn supports_audio(self) -> bool {
+        !matches!(self, Self::PngSequence | Self::Gif)
+    }
+
+    /// Returns `true` when this container requires FFmpeg to encode.
+    #[must_use]
+    pub const fn requires_ffmpeg(self) -> bool {
+        !matches!(self, Self::PngSequence | Self::Wav)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -310,6 +348,11 @@ impl Default for AppSettings {
 // Actions Emitted by Side Panels to the App Shell
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectAction {
+    ExportPz,
+}
+
 #[derive(Debug, Clone)]
 pub enum PanelAction {
     ImportMedia,
@@ -396,6 +439,7 @@ pub struct PanelsState {
     pub new_seq_control_name: String,
     pub new_shader_prop_name: String,
     pub new_shader_prop_kind: usize,
+    pub pending_project_actions: Vec<ProjectAction>,
     object_drag: Option<TreeDragState>,
     effect_drag: Option<TreeDragState>,
     rename_state: Option<InlineRenameState>,
@@ -444,6 +488,7 @@ impl Default for PanelsState {
             new_seq_control_name: String::from("ctl_value"),
             new_shader_prop_name: String::from("Amount"),
             new_shader_prop_kind: 0,
+            pending_project_actions: Vec::new(),
             object_drag: None,
             effect_drag: None,
             rename_state: None,
@@ -468,6 +513,12 @@ impl Default for PanelsState {
             inspector_tx_has_edits: false,
             inspector_tx_owner_seen: false,
         }
+    }
+}
+
+impl PanelsState {
+    pub fn take_project_actions(&mut self) -> Vec<ProjectAction> {
+        std::mem::take(&mut self.pending_project_actions)
     }
 }
 
@@ -636,7 +687,7 @@ pub fn show_side_panel(
         SideTab::Export => {
             show_export_tab(ui, viewport_rect, session, theme, state, actions);
         }
-        SideTab::Restore => show_restore_tab(ui, session, theme, actions),
+        SideTab::Restore => show_restore_tab(ui, session, theme, state, actions),
         SideTab::Plugins => show_plugins_tab(ui, session, theme, state),
         SideTab::Assets => show_assets_tab(ui, session, theme, state, actions),
         SideTab::About => show_about_tab(ui, session, theme),
@@ -7020,6 +7071,9 @@ fn container_label(c: ExportContainer) -> &'static str {
         ExportContainer::WebM => "WebM (.webm)",
         ExportContainer::Mkv => "MKV (.mkv)",
         ExportContainer::PngSequence => "PNG Sequence (.png)",
+        ExportContainer::Gif => "GIF (.gif)",
+        ExportContainer::Wav => "WAV Audio (.wav)",
+        ExportContainer::M4a => "M4A Audio (.m4a)",
     }
 }
 
@@ -7043,7 +7097,22 @@ fn audio_codec_label(c: ExportAudioCodec) -> &'static str {
     }
 }
 
-fn allowed_video_codecs(container: ExportContainer) -> &'static [ExportVideoCodec] {
+pub(crate) fn available_export_containers(mp4_enabled: bool) -> &'static [ExportContainer] {
+    if mp4_enabled {
+        &ExportContainer::ALL
+    } else {
+        &[
+            ExportContainer::WebM,
+            ExportContainer::Mkv,
+            ExportContainer::PngSequence,
+            ExportContainer::Gif,
+            ExportContainer::Wav,
+            ExportContainer::M4a,
+        ]
+    }
+}
+
+pub(crate) fn allowed_video_codecs(container: ExportContainer) -> &'static [ExportVideoCodec] {
     match container {
         ExportContainer::Mp4 => &[
             ExportVideoCodec::H264,
@@ -7064,10 +7133,11 @@ fn allowed_video_codecs(container: ExportContainer) -> &'static [ExportVideoCode
             ExportVideoCodec::Av1,
         ],
         ExportContainer::PngSequence => &[ExportVideoCodec::Png],
+        ExportContainer::Gif | ExportContainer::Wav | ExportContainer::M4a => &[],
     }
 }
 
-fn allowed_audio_codecs(container: ExportContainer) -> &'static [ExportAudioCodec] {
+pub(crate) fn allowed_audio_codecs(container: ExportContainer) -> &'static [ExportAudioCodec] {
     match container {
         ExportContainer::Mp4 => &[
             ExportAudioCodec::AacLc,
@@ -7081,8 +7151,44 @@ fn allowed_audio_codecs(container: ExportContainer) -> &'static [ExportAudioCode
             ExportAudioCodec::PcmS16Le,
             ExportAudioCodec::None,
         ],
-        ExportContainer::PngSequence => &[ExportAudioCodec::None],
+        ExportContainer::PngSequence | ExportContainer::Gif => &[ExportAudioCodec::None],
+        ExportContainer::Wav => &[ExportAudioCodec::PcmS16Le],
+        ExportContainer::M4a => &[ExportAudioCodec::AacLc],
     }
+}
+
+pub(crate) fn supports_transparent_alpha(
+    container: ExportContainer,
+    video_codec: ExportVideoCodec,
+) -> bool {
+    matches!(
+        container,
+        ExportContainer::PngSequence | ExportContainer::Gif
+    ) || (matches!(container, ExportContainer::WebM | ExportContainer::Mkv)
+        && video_codec == ExportVideoCodec::Vp9)
+}
+
+pub(crate) fn sanitize_export_settings(settings: &mut ExportSettings, mp4_enabled: bool) {
+    let available = available_export_containers(mp4_enabled);
+    if !available.contains(&settings.container) {
+        settings.container = available[0];
+    }
+    let valid_vcodecs = allowed_video_codecs(settings.container);
+    if !valid_vcodecs.is_empty() && !valid_vcodecs.contains(&settings.video_codec) {
+        settings.video_codec = valid_vcodecs[0];
+    }
+    let valid_acodecs = allowed_audio_codecs(settings.container);
+    if !valid_acodecs.contains(&settings.audio_codec) {
+        settings.audio_codec = valid_acodecs[0];
+    }
+    if !supports_transparent_alpha(settings.container, settings.video_codec) {
+        settings.transparent_alpha = false;
+    }
+    let max_crf: u32 = match settings.video_codec {
+        ExportVideoCodec::H264 | ExportVideoCodec::H265 => 51,
+        _ => 63,
+    };
+    settings.crf = settings.crf.min(max_crf);
 }
 
 fn paint_export_desktop_icon(painter: &Painter, rect: Rect, color: Color32, cutout: Color32) {
@@ -7138,6 +7244,30 @@ fn paint_export_frame_icon(painter: &Painter, rect: Rect, color: Color32, cutout
     painter.add(Shape::convex_polygon(m2, color, Stroke::NONE));
 }
 
+fn paint_export_pz_icon(painter: &Painter, rect: Rect, color: Color32, cutout: Color32) {
+    // 52x42 portable project archive box + downward export arrow icon
+    let pt = |nx: f32, ny: f32| {
+        Pos2::new(
+            rect.left() + rect.width() * nx,
+            rect.top() + rect.height() * ny,
+        )
+    };
+
+    // Archive box body
+    let outer = Rect::from_min_max(pt(0.08, 0.10), pt(0.92, 0.94));
+    painter.rect_filled(outer, CornerRadius::same(2), color);
+    let inner = Rect::from_min_max(pt(0.16, 0.30), pt(0.84, 0.86));
+    painter.rect_filled(inner, CornerRadius::ZERO, cutout);
+    // Top lid divider
+    let lid = Rect::from_min_max(pt(0.04, 0.06), pt(0.96, 0.24));
+    painter.rect_filled(lid, CornerRadius::same(2), color);
+    // Downward export arrow inside box
+    let shaft = Rect::from_min_max(pt(0.44, 0.36), pt(0.56, 0.62));
+    painter.rect_filled(shaft, CornerRadius::ZERO, color);
+    let head = vec![pt(0.32, 0.58), pt(0.68, 0.58), pt(0.50, 0.78)];
+    painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
+}
+
 fn show_export_tab(
     ui: &mut Ui,
     viewport_rect: Rect,
@@ -7147,39 +7277,10 @@ fn show_export_tab(
     actions: &mut Vec<PanelAction>,
 ) {
     let mp4_enabled = session.plugins.is_enabled("mp4-export");
-    let available_containers: &[ExportContainer] = if mp4_enabled {
-        &ExportContainer::ALL
-    } else {
-        &[
-            ExportContainer::WebM,
-            ExportContainer::Mkv,
-            ExportContainer::PngSequence,
-        ]
-    };
+    let available_containers = available_export_containers(mp4_enabled);
 
     // Auto-coerce container, video codec, audio codec, alpha, and CRF bounds
-    if !available_containers.contains(&state.export_settings.container) {
-        state.export_settings.container = available_containers[0];
-    }
-    let valid_vcodecs = allowed_video_codecs(state.export_settings.container);
-    if !valid_vcodecs.contains(&state.export_settings.video_codec) {
-        state.export_settings.video_codec = valid_vcodecs[0];
-    }
-    let valid_acodecs = allowed_audio_codecs(state.export_settings.container);
-    if !valid_acodecs.contains(&state.export_settings.audio_codec) {
-        state.export_settings.audio_codec = valid_acodecs[0];
-    }
-    let alpha_supported = state.export_settings.container == ExportContainer::PngSequence
-        || (state.export_settings.video_codec == ExportVideoCodec::Vp9
-            && state.export_settings.container != ExportContainer::Mp4);
-    if !alpha_supported {
-        state.export_settings.transparent_alpha = false;
-    }
-    let max_crf: u32 = match state.export_settings.video_codec {
-        ExportVideoCodec::H264 | ExportVideoCodec::H265 => 51,
-        _ => 63,
-    };
-    state.export_settings.crf = state.export_settings.crf.min(max_crf);
+    sanitize_export_settings(&mut state.export_settings, mp4_enabled);
 
     ScrollArea::vertical()
         .id_salt("export_tab_scroll")
@@ -7269,6 +7370,64 @@ fn show_export_tab(
                         state.export_view_mode = Some(mode);
                     }
                 }
+
+                // Portable `.pz` project archive export row
+                {
+                    let (row_rect, resp) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 77.0),
+                        Sense::click(),
+                    );
+                    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+                    let fill = if resp.hovered() { BG_HOVER } else { BG_PANEL };
+                    ui.painter().rect_filled(row_rect, CornerRadius::ZERO, fill);
+                    let div_y = (row_rect.bottom() - 1.0).round();
+                    ui.painter().rect_filled(
+                        Rect::from_min_max(
+                            Pos2::new(row_rect.left(), div_y),
+                            Pos2::new(row_rect.right(), div_y + 1.0),
+                        ),
+                        CornerRadius::ZERO,
+                        BORDER_ROW_SOFT,
+                    );
+
+                    let icon_rect = Rect::from_min_size(
+                        Pos2::new(row_rect.left() + 12.0, (row_rect.top() + 17.0).round()),
+                        Vec2::new(52.0, 42.0),
+                    );
+                    paint_export_pz_icon(ui.painter(), icon_rect, TEXT_PRIMARY, fill);
+
+                    let text_left = row_rect.left() + 78.0;
+                    let text_rect = Rect::from_min_max(
+                        Pos2::new(text_left, row_rect.top() + 9.0),
+                        Pos2::new(
+                            (row_rect.right() - 10.0).max(text_left + 20.0),
+                            row_rect.bottom() - 4.0,
+                        ),
+                    );
+                    let mut text_ui = ui.new_child(egui::UiBuilder::new().max_rect(text_rect));
+                    text_ui.spacing_mut().item_spacing.y = 3.0;
+                    text_ui.label(
+                        egui::RichText::new("Export .pz...")
+                            .font(theme.font(FONT_BODY))
+                            .color(if resp.hovered() {
+                                TEXT_BRIGHT
+                            } else {
+                                TEXT_PRIMARY
+                            }),
+                    );
+                    text_ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("Save the project as a portable .pz archive.")
+                                .font(theme.font(FONT_SMALL))
+                                .color(TEXT_OPTION_DESC),
+                        )
+                        .wrap(),
+                    );
+
+                    if resp.clicked() {
+                        state.pending_project_actions.push(ProjectAction::ExportPz);
+                    }
+                }
                 if state.export_status.exporting {
                     Frame::NONE
                         .inner_margin(egui::Margin::symmetric(8, 8))
@@ -7312,9 +7471,8 @@ fn show_export_tab(
 
             state.export_settings.mode = active_mode;
             let is_device = active_mode == ExportMode::Device;
-            let is_png_seq =
-                is_device && state.export_settings.container == ExportContainer::PngSequence;
-            let needs_ffmpeg = is_device && !is_png_seq;
+            let is_audio_only = is_device && state.export_settings.container.is_audio_only();
+            let needs_ffmpeg = is_device && state.export_settings.container.requires_ffmpeg();
 
             Frame::NONE
                 .inner_margin(egui::Margin::symmetric(8, 8))
@@ -7398,26 +7556,12 @@ fn show_export_tab(
                             },
                         );
                         if changed {
-                            let next = available_containers[c_idx];
-                            state.export_settings.container = next;
-                            let next_v = allowed_video_codecs(next);
-                            if !next_v.contains(&state.export_settings.video_codec) {
-                                state.export_settings.video_codec = next_v[0];
-                            }
-                            let next_a = allowed_audio_codecs(next);
-                            if !next_a.contains(&state.export_settings.audio_codec) {
-                                state.export_settings.audio_codec = next_a[0];
-                            }
-                            if next == ExportContainer::Mp4
-                                || (next != ExportContainer::PngSequence
-                                    && state.export_settings.video_codec != ExportVideoCodec::Vp9)
-                            {
-                                state.export_settings.transparent_alpha = false;
-                            }
+                            state.export_settings.container = available_containers[c_idx];
+                            sanitize_export_settings(&mut state.export_settings, mp4_enabled);
                         }
 
-                        // Video codec, rate control, and audio controls are hidden for PNG Sequence
-                        if state.export_settings.container != ExportContainer::PngSequence {
+                        // Video codec and rate control are hidden for PNG Sequence, GIF, WAV, and M4A
+                        if state.export_settings.container.uses_video_codec() {
                             let v_list = allowed_video_codecs(state.export_settings.container);
                             let v_labels: Vec<&str> =
                                 v_list.iter().map(|&c| video_codec_label(c)).collect();
@@ -7445,14 +7589,7 @@ fn show_export_tab(
                                 },
                             ) {
                                 state.export_settings.video_codec = v_list[vc_idx];
-                                let new_max = match state.export_settings.video_codec {
-                                    ExportVideoCodec::H264 | ExportVideoCodec::H265 => 51,
-                                    _ => 63,
-                                };
-                                state.export_settings.crf = state.export_settings.crf.min(new_max);
-                                if state.export_settings.video_codec != ExportVideoCodec::Vp9 {
-                                    state.export_settings.transparent_alpha = false;
-                                }
+                                sanitize_export_settings(&mut state.export_settings, mp4_enabled);
                             }
 
                             // Rate control
@@ -7572,11 +7709,11 @@ fn show_export_tab(
                             }
                         }
 
-                        // Transparent alpha (PNG Sequence or VP9 in WebM/MKV)
-                        let show_alpha =
-                            state.export_settings.container == ExportContainer::PngSequence
-                                || (state.export_settings.video_codec == ExportVideoCodec::Vp9
-                                    && state.export_settings.container != ExportContainer::Mp4);
+                        // Transparent alpha (PNG Sequence, GIF, or VP9 in WebM/MKV)
+                        let show_alpha = supports_transparent_alpha(
+                            state.export_settings.container,
+                            state.export_settings.video_codec,
+                        );
                         if show_alpha {
                             let mut alpha_idx = usize::from(state.export_settings.transparent_alpha);
                             if cm3_property_row_aligned(
@@ -7602,8 +7739,8 @@ fn show_export_tab(
                             }
                         }
 
-                        // Audio controls (hidden for PNG Sequence)
-                        if state.export_settings.container != ExportContainer::PngSequence {
+                        // Audio controls (hidden for PNG Sequence and GIF)
+                        if state.export_settings.container.supports_audio() {
                             let a_list = allowed_audio_codecs(state.export_settings.container);
                             let a_labels: Vec<&str> =
                                 a_list.iter().map(|&c| audio_codec_label(c)).collect();
@@ -7694,57 +7831,62 @@ fn show_export_tab(
                         }
                     }
 
-                    // Resolution (both Device & Single Frame, "x" separator)
-                    let mut res = [
-                        f64::from(state.export_settings.width),
-                        f64::from(state.export_settings.height),
-                    ];
-                    let ev = cm3_property_row_aligned(
-                        ui,
-                        "Resolution",
-                        false,
-                        state.prop_columns,
-                        theme,
-                        |_| {},
-                        |ui| {
-                            cm3_vector2_with_sep(
-                                ui,
-                                Id::unique("exp_res"),
-                                &mut res,
-                                &ScrubConfig::new(16.0, 7680.0, 10.0, 0),
-                                false,
-                                "x",
-                                theme,
-                            )
-                        },
-                    );
-                    if ev.changed || ev.committed {
-                        state.export_settings.width = res[0].round().clamp(16.0, 7680.0) as u32;
-                        state.export_settings.height = res[1].round().clamp(16.0, 7680.0) as u32;
-                    }
-
-                    // Frame rate (0 decimals) & Range only apply to Device Video / PNG Sequence
-                    if is_device {
-                        let mut fps = state.export_settings.fps;
+                    // Resolution (shown for Video, PNG Sequence, GIF, and Single Frame; hidden for audio-only)
+                    if !is_audio_only {
+                        let mut res = [
+                            f64::from(state.export_settings.width),
+                            f64::from(state.export_settings.height),
+                        ];
                         let ev = cm3_property_row_aligned(
                             ui,
-                            "Frame rate",
+                            "Resolution",
                             false,
                             state.prop_columns,
                             theme,
                             |_| {},
                             |ui| {
-                                cm3_scrub_number(
+                                cm3_vector2_with_sep(
                                     ui,
-                                    Id::unique("exp_fps"),
-                                    &mut fps,
-                                    ScrubConfig::new(1.0, 240.0, 1.0, 0),
+                                    Id::unique("exp_res"),
+                                    &mut res,
+                                    &ScrubConfig::new(16.0, 7680.0, 10.0, 0),
+                                    false,
+                                    "x",
                                     theme,
                                 )
                             },
                         );
                         if ev.changed || ev.committed {
-                            state.export_settings.fps = fps;
+                            state.export_settings.width = res[0].round().clamp(16.0, 7680.0) as u32;
+                            state.export_settings.height =
+                                res[1].round().clamp(16.0, 7680.0) as u32;
+                        }
+                    }
+
+                    // Frame rate (video/GIF/PNG Sequence) & Range (all Device exports including audio-only)
+                    if is_device {
+                        if !is_audio_only {
+                            let mut fps = state.export_settings.fps;
+                            let ev = cm3_property_row_aligned(
+                                ui,
+                                "Frame rate",
+                                false,
+                                state.prop_columns,
+                                theme,
+                                |_| {},
+                                |ui| {
+                                    cm3_scrub_number(
+                                        ui,
+                                        Id::unique("exp_fps"),
+                                        &mut fps,
+                                        ScrubConfig::new(1.0, 240.0, 1.0, 0),
+                                        theme,
+                                    )
+                                },
+                            );
+                            if ev.changed || ev.committed {
+                                state.export_settings.fps = fps;
+                            }
                         }
 
                         let mut range = [
@@ -7847,10 +7989,14 @@ fn show_export_tab(
                         }
                     } else {
                         let label = if is_device {
-                            if is_png_seq {
-                                "Start PNG sequence render"
-                            } else {
-                                "Start video render"
+                            match state.export_settings.container {
+                                ExportContainer::PngSequence => "Start PNG sequence render",
+                                ExportContainer::Gif => "Start GIF render",
+                                ExportContainer::Wav => "Start WAV audio export",
+                                ExportContainer::M4a => "Start M4A audio export",
+                                ExportContainer::Mp4
+                                | ExportContainer::WebM
+                                | ExportContainer::Mkv => "Start video render",
                             }
                         } else {
                             "Export current frame (PNG)"
@@ -7884,7 +8030,7 @@ fn show_export_tab(
                                 TEXT_DISABLED,
                             );
                             resp.on_hover_cursor(CursorIcon::NotAllowed)
-                                .on_hover_text("FFmpeg is not available; install FFmpeg or export PNG Sequence / Single Frame.");
+                                .on_hover_text("FFmpeg is not available; install FFmpeg or export PNG Sequence, WAV Audio, or Single Frame.");
                         }
                     }
                 });
@@ -7899,6 +8045,7 @@ fn show_restore_tab(
     ui: &mut Ui,
     session: &mut Session,
     theme: &Cm3Theme,
+    state: &mut PanelsState,
     actions: &mut Vec<PanelAction>,
 ) {
     ScrollArea::vertical()
@@ -7976,6 +8123,12 @@ fn show_restore_tab(
                         actions.push(PanelAction::StatusMessage(
                             "Restored previous snapshot".to_owned(),
                         ));
+                    }
+
+                    if cm3_prop_button(ui, "Export .pz...", ButtonVariant::Normal, true, theme)
+                        .clicked()
+                    {
+                        state.pending_project_actions.push(ProjectAction::ExportPz);
                     }
 
                     if cm3_prop_button(
@@ -13680,5 +13833,139 @@ mod tests {
             0.0,
         );
         assert!((a - 3.0).abs() < 1e-6 && (b - 7.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn export_containers_labels_codec_rules_and_transparent_alpha_cover_gif_wav_m4a() {
+        // Container ALL and LABELS remain 1-to-1 and include GIF, WAV, and M4A.
+        assert_eq!(ExportContainer::ALL.len(), ExportContainer::LABELS.len());
+        for (c, expected) in ExportContainer::ALL
+            .iter()
+            .zip(ExportContainer::LABELS.iter())
+        {
+            assert_eq!(container_label(*c), *expected);
+        }
+        assert_eq!(container_label(ExportContainer::Gif), "GIF (.gif)");
+        assert_eq!(container_label(ExportContainer::Wav), "WAV Audio (.wav)");
+        assert_eq!(container_label(ExportContainer::M4a), "M4A Audio (.m4a)");
+
+        // MP4 gating leaves GIF, WAV, and M4A available.
+        assert_eq!(available_export_containers(true), &ExportContainer::ALL);
+        let no_mp4 = available_export_containers(false);
+        assert!(!no_mp4.contains(&ExportContainer::Mp4));
+        assert!(no_mp4.contains(&ExportContainer::Gif));
+        assert!(no_mp4.contains(&ExportContainer::Wav));
+        assert!(no_mp4.contains(&ExportContainer::M4a));
+
+        // Capabilities & codec compatibility matrix.
+        assert!(ExportContainer::Wav.is_audio_only());
+        assert!(ExportContainer::M4a.is_audio_only());
+        assert!(!ExportContainer::Gif.is_audio_only());
+
+        assert!(!ExportContainer::Gif.uses_video_codec());
+        assert!(!ExportContainer::Wav.uses_video_codec());
+        assert!(!ExportContainer::M4a.uses_video_codec());
+        assert!(ExportContainer::Mp4.uses_video_codec());
+        assert!(ExportContainer::WebM.uses_video_codec());
+        assert!(ExportContainer::Mkv.uses_video_codec());
+
+        assert!(!ExportContainer::PngSequence.supports_audio());
+        assert!(!ExportContainer::Gif.supports_audio());
+        assert!(ExportContainer::Wav.supports_audio());
+        assert!(ExportContainer::M4a.supports_audio());
+
+        assert!(!ExportContainer::PngSequence.requires_ffmpeg());
+        assert!(!ExportContainer::Wav.requires_ffmpeg());
+        assert!(ExportContainer::Gif.requires_ffmpeg());
+        assert!(ExportContainer::M4a.requires_ffmpeg());
+
+        assert!(allowed_video_codecs(ExportContainer::Gif).is_empty());
+        assert!(allowed_video_codecs(ExportContainer::Wav).is_empty());
+        assert!(allowed_video_codecs(ExportContainer::M4a).is_empty());
+
+        assert_eq!(
+            allowed_audio_codecs(ExportContainer::Gif),
+            &[ExportAudioCodec::None]
+        );
+        assert_eq!(
+            allowed_audio_codecs(ExportContainer::Wav),
+            &[ExportAudioCodec::PcmS16Le]
+        );
+        assert_eq!(
+            allowed_audio_codecs(ExportContainer::M4a),
+            &[ExportAudioCodec::AacLc]
+        );
+
+        // Transparent alpha compatibility.
+        assert!(supports_transparent_alpha(
+            ExportContainer::PngSequence,
+            ExportVideoCodec::Png
+        ));
+        assert!(supports_transparent_alpha(
+            ExportContainer::Gif,
+            ExportVideoCodec::H264
+        ));
+        assert!(supports_transparent_alpha(
+            ExportContainer::WebM,
+            ExportVideoCodec::Vp9
+        ));
+        assert!(supports_transparent_alpha(
+            ExportContainer::Mkv,
+            ExportVideoCodec::Vp9
+        ));
+        assert!(!supports_transparent_alpha(
+            ExportContainer::Mp4,
+            ExportVideoCodec::Vp9
+        ));
+        assert!(!supports_transparent_alpha(
+            ExportContainer::WebM,
+            ExportVideoCodec::Av1
+        ));
+        assert!(!supports_transparent_alpha(
+            ExportContainer::Wav,
+            ExportVideoCodec::Vp9
+        ));
+        assert!(!supports_transparent_alpha(
+            ExportContainer::M4a,
+            ExportVideoCodec::Vp9
+        ));
+
+        // Sanitization transitions across GIF, WAV, M4A, and VP9.
+        let mut cfg = ExportSettings {
+            container: ExportContainer::Gif,
+            audio_codec: ExportAudioCodec::AacLc,
+            transparent_alpha: true,
+            ..ExportSettings::default()
+        };
+        sanitize_export_settings(&mut cfg, true);
+        assert_eq!(cfg.audio_codec, ExportAudioCodec::None);
+        assert!(cfg.transparent_alpha);
+
+        cfg.container = ExportContainer::Wav;
+        sanitize_export_settings(&mut cfg, true);
+        assert_eq!(cfg.audio_codec, ExportAudioCodec::PcmS16Le);
+        assert!(!cfg.transparent_alpha);
+
+        cfg.container = ExportContainer::M4a;
+        cfg.transparent_alpha = true;
+        sanitize_export_settings(&mut cfg, true);
+        assert_eq!(cfg.audio_codec, ExportAudioCodec::AacLc);
+        assert!(!cfg.transparent_alpha);
+
+        cfg.container = ExportContainer::Mp4;
+        sanitize_export_settings(&mut cfg, false);
+        assert_eq!(cfg.container, ExportContainer::WebM);
+        assert_eq!(cfg.video_codec, ExportVideoCodec::Vp9);
+        assert_eq!(cfg.audio_codec, ExportAudioCodec::Opus);
+    }
+
+    #[test]
+    fn panels_state_queues_and_drains_export_pz_project_action() {
+        let mut state = PanelsState::default();
+        assert!(state.take_project_actions().is_empty());
+
+        state.pending_project_actions.push(ProjectAction::ExportPz);
+        assert_eq!(state.take_project_actions(), vec![ProjectAction::ExportPz]);
+        assert!(state.take_project_actions().is_empty());
     }
 }

@@ -10,7 +10,7 @@
 
 mod ui;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,18 +24,20 @@ use egui::{Align2, Area, Color32, CornerRadius, Frame, Id, Key, Order, Pos2, Rec
 use serde_json::{Value, json};
 use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
 use zc_audio::{
-    AudioBuffer, AudioClipScheduleItem, AudioMixWindow, AudioOutputHandle, ClipAudioSampleParams,
-    MasterPlaybackClock, STANDARD_SAMPLE_RATE, WaveformPeaks, apply_gain_and_pan,
-    decode_audio_bytes, effective_playback_rate, try_mix_offline_stereo_animated,
+    AudioBuffer, AudioClipScheduleItem, AudioError, AudioMixWindow, AudioOutputHandle,
+    ClipAudioSampleParams, MasterPlaybackClock, STANDARD_SAMPLE_RATE, WaveformPeaks,
+    apply_gain_and_pan, decode_audio_bytes, effective_playback_rate,
+    try_mix_offline_stereo_animated,
 };
 use zc_export::{
     AudioCodec, ExportContainer as CoreExportContainer, ExportError, ExportProgress, ExportReport,
     ExportSettings as CoreExportSettings, QualityMode, VideoCodec, export_video_with_progress,
     probe_ffmpeg,
 };
-use zc_expr::{BasicContext, CompiledExpr, EvalConfig, ExprMode};
+use zc_expr::{CompiledExpr, EvalConfig, ExprContext, ExprError, ExprMode};
 use zc_project::{
-    AssetKind, LayerKind, MediaItem, Project, Uuid, import_pz, load_zcraft, save_zcraft,
+    AssetKind, LayerKind, MediaItem, Project, PropertyKeyframe, PropertyTrack, PropertyValue,
+    SequenceControl, SequenceControlKind, Uuid, export_pz, import_pz, load_zcraft, save_zcraft,
     write_atomic,
 };
 use zc_render::{
@@ -49,7 +51,7 @@ use ui::layout::{Cm3Workspace, PanelFocus, UiAction};
 use ui::panels::{
     ExportAudioCodec, ExportCm3Preset, ExportContainer as UiExportContainer, ExportMode,
     ExportRateControl, ExportSettings as UiExportSettings, ExportStatus, ExportVideoCodec,
-    PanelsState,
+    PanelsState, ProjectAction,
 };
 use ui::shortcuts::dispatch_shortcuts;
 use ui::theme::{
@@ -719,11 +721,7 @@ impl ZoidCraftApp {
         if self.session.playback.is_playing() {
             self.session.playback.set_speed(0.0);
         }
-        self.audio_clock.pause();
-        self.audio_output = None;
-        self.audio_failure_latch.on_playback_stopped();
-        self.last_audio_playing = false;
-        self.last_audio_speed = 0.0;
+        self.reset_live_audio_output();
         self.last_audio_epoch = self.session.playback.epoch_id;
     }
 
@@ -772,16 +770,16 @@ impl ZoidCraftApp {
                 let cur_f = self.session.playback.current_frame.max(0.0);
                 let total_u32 = seq_len.ceil().max(1.0) as u32;
                 let window_frames = (LIVE_AUDIO_WINDOW_SECS * fps).round().max(1.0) as u32;
-                let outside_window = self.audio_window_end <= self.audio_window_start
-                    || cur_f < f64::from(self.audio_window_start)
-                    || cur_f >= f64::from(self.audio_window_end);
-                let needs_mix = self.audio_mix_hash != mix_hash || outside_window;
 
-                if needs_mix
-                    && (self.audio_output.is_some()
-                        || self.audio_stream_attempted_hash != mix_hash
-                        || outside_window)
-                {
+                if live_audio_needs_rebuild(
+                    self.audio_mix_hash,
+                    self.audio_window_start,
+                    self.audio_window_end,
+                    self.audio_stream_attempted_hash,
+                    self.audio_output.is_some(),
+                    mix_hash,
+                    cur_f,
+                ) {
                     let (win_start, win_end) =
                         compute_live_audio_window(cur_f, speed, total_u32, window_frames);
                     self.audio_output = None;
@@ -934,11 +932,19 @@ impl ZoidCraftApp {
             match res {
                 Ok(report) => {
                     self.workspace.panels.export_status.progress = 1.0;
-                    let msg = format!(
-                        "Export complete: {} frames -> {}",
-                        report.frames_exported,
-                        report.output_path.display()
-                    );
+                    let msg = if report.frames_exported == 0 && report.audio_samples_written > 0 {
+                        format!(
+                            "Audio export complete: {} samples -> {}",
+                            report.audio_samples_written,
+                            report.output_path.display()
+                        )
+                    } else {
+                        format!(
+                            "Export complete: {} frames -> {}",
+                            report.frames_exported,
+                            report.output_path.display()
+                        )
+                    };
                     self.workspace.panels.export_status.status_message = msg.clone();
                     self.show_toast(msg);
                 }
@@ -1307,6 +1313,42 @@ impl ZoidCraftApp {
             }
             Err(err) => {
                 self.show_toast(format!("Failed to save project: {err}"));
+                false
+            }
+        }
+    }
+
+    fn handle_export_pz(&mut self) -> bool {
+        // Commit any active inspector/viewport drag transaction before exporting so the
+        // exported archive includes the latest edits cleanly.
+        if self.session.history.is_in_transaction() {
+            let _ = self.session.commit_transaction(true);
+        }
+
+        self.pause_playback_for_modal_dialog();
+        let base = sanitize_filename(&self.session.document().project_name);
+        let default_name = format!("{base}.pz");
+        let chosen = rfd::FileDialog::new()
+            .add_filter("Project Archive (.pz)", &["pz"])
+            .set_file_name(default_name)
+            .save_file();
+        self.last_tick = Instant::now();
+        let Some(target_path) = chosen else {
+            return false;
+        };
+
+        let project_to_export = prepare_project_for_pz_export(&self.session);
+        match export_pz(&project_to_export, &target_path) {
+            Ok(()) => {
+                let name = target_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("project.pz");
+                self.show_toast(format!("Exported .pz project: {name}"));
+                true
+            }
+            Err(err) => {
+                self.show_toast(format!("Failed to export .pz project: {err}"));
                 false
             }
         }
@@ -1890,7 +1932,7 @@ impl ZoidCraftApp {
         }
         let needs_ffmpeg = !matches!(
             core_settings.container,
-            zc_export::ExportContainer::PngSequence
+            CoreExportContainer::PngSequence | CoreExportContainer::Wav
         );
         if needs_ffmpeg && !self.workspace.panels.export_status.ffmpeg_available {
             let msg = if self.ffmpeg_probe_rx.is_some() {
@@ -1898,7 +1940,7 @@ impl ZoidCraftApp {
                     .to_owned()
             } else {
                 format!(
-                    "Cannot start video export: FFmpeg is unavailable ({}).",
+                    "Cannot start export: FFmpeg is unavailable ({}).",
                     self.workspace.panels.export_status.ffmpeg_version
                 )
             };
@@ -1916,12 +1958,7 @@ impl ZoidCraftApp {
             };
             dir
         } else {
-            let (label, ext) = match ui_cfg.container {
-                UiExportContainer::Mp4 => ("MP4 Video", "mp4"),
-                UiExportContainer::WebM => ("WebM Video", "webm"),
-                UiExportContainer::Mkv => ("MKV Video", "mkv"),
-                UiExportContainer::PngSequence => ("PNG Sequence", "png"),
-            };
+            let (label, ext) = export_file_dialog_filter(ui_cfg.container);
             let default_name = format!(
                 "{}.{ext}",
                 sanitize_filename(&self.session.document().project_name)
@@ -1979,13 +2016,31 @@ impl ZoidCraftApp {
                     }
                 };
 
+                // Audio-only fast path (WAV / M4A): skip headless GPU renderer initialization.
+                if core_settings.container.is_audio_only() {
+                    let result = export_video_with_progress(
+                        &core_settings,
+                        audio_mix.as_deref(),
+                        &cancel_worker,
+                        |_output_step, _rgba_out: &mut Vec<u8>| Ok(()),
+                        |progress| {
+                            let _ = tx.send(ExportWorkerEvent::Progress(progress));
+                        },
+                    )
+                    .map_err(|err| err.to_string());
+                    let _ = tx.send(ExportWorkerEvent::Finished(result));
+                    return;
+                }
+
                 // Spec 04 §4.1: sequence frame advance per output frame = seq_fps / export_fps.
                 let frame_advance = seq_fps / core_settings.fps.max(1.0);
                 let result = ProjectRenderEngine::new_headless()
                     .map_err(|err| ExportError::Render(err.to_string()))
-                    .and_then(|mut engine| {
+                    .and_then(|mut export_engine| {
+                        export_engine.set_transparent_background(core_settings.transparent_alpha);
                         let w = core_settings.width;
                         let h = core_settings.height;
+                        let transparent = core_settings.transparent_alpha;
                         export_video_with_progress(
                             &core_settings,
                             audio_mix.as_deref(),
@@ -1993,19 +2048,15 @@ impl ZoidCraftApp {
                             |output_step, rgba_out: &mut Vec<u8>| {
                                 let seq_frame = f64::from(start_seq_frame)
                                     + f64::from(output_step) * frame_advance;
-                                let premul = engine
-                                    .render_frame_rgba8(
-                                        &export_session.project,
-                                        &export_session.plugins,
-                                        seq_frame,
-                                        w,
-                                        h,
-                                    )
-                                    .map_err(|err| ExportError::Render(err.to_string()))?;
-                                let straight = unpremultiply_rgba8(&premul);
-                                rgba_out.clear();
-                                rgba_out.extend_from_slice(&straight);
-                                Ok(())
+                                render_export_frame_into(
+                                    &mut export_engine,
+                                    &export_session,
+                                    seq_frame,
+                                    w,
+                                    h,
+                                    transparent,
+                                    rgba_out,
+                                )
                             },
                             |progress| {
                                 let _ = tx.send(ExportWorkerEvent::Progress(progress));
@@ -2692,6 +2743,14 @@ impl eframe::App for ZoidCraftApp {
             }
         }
 
+        for project_action in self.workspace.panels.take_project_actions() {
+            match project_action {
+                ProjectAction::ExportPz => {
+                    let _ = self.handle_export_pz();
+                }
+            }
+        }
+
         // 7. Floating dual-mode Graph Editor / Graph Editor 2 + Easing+ window.
         let graph_open_before_window = self.graph_editor.open;
         if self.graph_editor.open {
@@ -3108,7 +3167,7 @@ fn eval_prop_f64(prop: Option<&SessionProperty>, local_frame: f64, fallback: f64
     if p.keyframes.is_empty() {
         return p.default_value.as_f64().unwrap_or(fallback);
     }
-    if !p.animated || p.keyframes.len() == 1 {
+    if p.keyframes.len() == 1 {
         return p.keyframes[0].value.as_f64().unwrap_or(fallback);
     }
     let kfs = &p.keyframes;
@@ -3165,6 +3224,51 @@ fn sync_export_settings_from_session(session: &Session, settings: &mut UiExportS
     settings.end_frame = session.document().sequence_length.max(1.0);
 }
 
+fn export_file_dialog_filter(container: UiExportContainer) -> (&'static str, &'static str) {
+    match container {
+        UiExportContainer::Mp4 => ("MP4 Video", "mp4"),
+        UiExportContainer::WebM => ("WebM Video", "webm"),
+        UiExportContainer::Mkv => ("MKV Video", "mkv"),
+        UiExportContainer::PngSequence => ("PNG Sequence", "png"),
+        UiExportContainer::Gif => ("GIF Animation", "gif"),
+        UiExportContainer::Wav => ("WAV Audio", "wav"),
+        UiExportContainer::M4a => ("M4A Audio", "m4a"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_export_frame_into(
+    export_engine: &mut ProjectRenderEngine,
+    export_session: &Session,
+    seq_frame: f64,
+    width: u32,
+    height: u32,
+    transparent_alpha: bool,
+    rgba_out: &mut Vec<u8>,
+) -> Result<(), ExportError> {
+    export_engine.set_transparent_background(transparent_alpha);
+    let premul = export_engine
+        .render_frame_rgba8(
+            &export_session.project,
+            &export_session.plugins,
+            seq_frame,
+            width,
+            height,
+        )
+        .map_err(|err| ExportError::Render(err.to_string()))?;
+    rgba_out.clear();
+    if transparent_alpha {
+        let straight = unpremultiply_rgba8(&premul);
+        rgba_out.extend_from_slice(&straight);
+    } else {
+        rgba_out.extend_from_slice(&premul);
+        for px in rgba_out.as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
+    }
+    Ok(())
+}
+
 fn convert_export_settings(
     ui: &UiExportSettings,
     seq_fps: f64,
@@ -3177,30 +3281,37 @@ fn convert_export_settings(
         UiExportContainer::WebM => CoreExportContainer::Webm,
         UiExportContainer::Mkv => CoreExportContainer::Mkv,
         UiExportContainer::PngSequence => CoreExportContainer::PngSequence,
+        UiExportContainer::Gif => CoreExportContainer::Gif,
+        UiExportContainer::Wav => CoreExportContainer::Wav,
+        UiExportContainer::M4a => CoreExportContainer::M4a,
     };
-    let video_codec = match ui.video_codec {
-        ExportVideoCodec::H264 => VideoCodec::H264,
-        ExportVideoCodec::H265 => VideoCodec::H265,
-        ExportVideoCodec::Vp9 => VideoCodec::Vp9,
-        ExportVideoCodec::Vp8 => VideoCodec::Vp8,
-        ExportVideoCodec::Av1 => VideoCodec::Av1,
-        ExportVideoCodec::Png => {
-            if ui.container != UiExportContainer::PngSequence {
+    let video_codec = if !ui.container.uses_video_codec() {
+        VideoCodec::H264
+    } else {
+        match ui.video_codec {
+            ExportVideoCodec::H264 => VideoCodec::H264,
+            ExportVideoCodec::H265 => VideoCodec::H265,
+            ExportVideoCodec::Vp9 => VideoCodec::Vp9,
+            ExportVideoCodec::Vp8 => VideoCodec::Vp8,
+            ExportVideoCodec::Av1 => VideoCodec::Av1,
+            ExportVideoCodec::Png => {
                 return Err(
                     "PNG video codec is only supported with the PNG Sequence container.".to_owned(),
                 );
             }
-            VideoCodec::H264
         }
     };
-    let audio_codec = if container == CoreExportContainer::PngSequence {
-        AudioCodec::None
-    } else {
-        match ui.audio_codec {
-            ExportAudioCodec::AacLc => AudioCodec::Aac,
-            ExportAudioCodec::Opus => AudioCodec::Opus,
-            ExportAudioCodec::PcmS16Le => AudioCodec::Pcm,
-            ExportAudioCodec::None => AudioCodec::None,
+    let audio_codec = match container {
+        CoreExportContainer::PngSequence | CoreExportContainer::Gif => AudioCodec::None,
+        CoreExportContainer::Wav => AudioCodec::Pcm,
+        CoreExportContainer::M4a => AudioCodec::Aac,
+        CoreExportContainer::Mp4 | CoreExportContainer::Webm | CoreExportContainer::Mkv => {
+            match ui.audio_codec {
+                ExportAudioCodec::AacLc => AudioCodec::Aac,
+                ExportAudioCodec::Opus => AudioCodec::Opus,
+                ExportAudioCodec::PcmS16Le => AudioCodec::Pcm,
+                ExportAudioCodec::None => AudioCodec::None,
+            }
         }
     };
     let quality = match ui.rate_control {
@@ -3220,11 +3331,22 @@ fn convert_export_settings(
         }
     };
 
-    let export_fps = ui.fps.max(1.0);
-    let seq_frame_span = f64::from(end_seq_frame.saturating_sub(start_seq_frame).max(1));
-    let output_frame_count = ((seq_frame_span * (export_fps / seq_fps.max(1.0)))
-        .round()
-        .max(1.0)) as u32;
+    let safe_seq_fps = seq_fps.max(1.0);
+    let seq_frame_span = end_seq_frame.saturating_sub(start_seq_frame).max(1);
+    let (export_fps, output_frame_count) = if container.is_audio_only() {
+        (safe_seq_fps, seq_frame_span)
+    } else {
+        let efps = ui.fps.max(1.0);
+        let count = ((f64::from(seq_frame_span) * (efps / safe_seq_fps))
+            .round()
+            .max(1.0)) as u32;
+        (efps, count)
+    };
+    let transparent_alpha = if container.is_audio_only() {
+        false
+    } else {
+        ui.transparent_alpha
+    };
 
     Ok(CoreExportSettings {
         width: ui.width.max(2),
@@ -3238,7 +3360,7 @@ fn convert_export_settings(
         quality,
         audio_bitrate_kbps: ui.audio_bitrate_kbps.max(32),
         sample_rate: ui.sample_rate_hz.max(8_000),
-        transparent_alpha: ui.transparent_alpha,
+        transparent_alpha,
         output_path,
         ffmpeg_binary: None,
     })
@@ -3301,15 +3423,17 @@ fn collect_in_range_audio_arcs(
     end_seq_frame: u32,
 ) -> HashMap<String, Arc<AudioBuffer>> {
     let mut selected = HashMap::new();
-    if settings.container == CoreExportContainer::PngSequence
-        || settings.audio_codec == AudioCodec::None
+    if matches!(
+        settings.container,
+        CoreExportContainer::PngSequence | CoreExportContainer::Gif
+    ) || (!settings.container.is_audio_only() && settings.audio_codec == AudioCodec::None)
         || cached_buffers.is_empty()
     {
         return selected;
     }
     let clip_assets = collect_clip_audio_assets(&session.project);
     let doc = session.document();
-    let any_solo = doc.audio_tracks.iter().any(|t| t.enabled && t.solo);
+    let any_solo = doc.audio_tracks.iter().any(|t| t.solo);
     let range_start = f64::from(start_seq_frame);
     let range_end = f64::from(end_seq_frame);
 
@@ -3339,6 +3463,23 @@ fn collect_in_range_audio_arcs(
         }
     }
     selected
+}
+
+/// Returns `true` when the live CPAL audio output window must be rebuilt and re-opened.
+fn live_audio_needs_rebuild(
+    audio_mix_hash: u64,
+    audio_window_start: u32,
+    audio_window_end: u32,
+    audio_stream_attempted_hash: u64,
+    has_audio_output: bool,
+    mix_hash: u64,
+    cur_f: f64,
+) -> bool {
+    let outside_window = audio_window_end <= audio_window_start
+        || cur_f < f64::from(audio_window_start)
+        || cur_f >= f64::from(audio_window_end);
+    let needs_mix = audio_mix_hash != mix_hash || outside_window;
+    needs_mix && (has_audio_output || audio_stream_attempted_hash != mix_hash || outside_window)
 }
 
 /// Computes a bounded `[start_frame, end_frame)` live audio mix window covering `current_frame`
@@ -3410,20 +3551,200 @@ fn compile_audio_prop_expr(prop: Option<&SessionProperty>, mode: ExprMode) -> Op
     CompiledExpr::compile(source, mode).ok()
 }
 
+fn eval_project_track_f64(track: &PropertyTrack, frame: f64, fallback: f64) -> f64 {
+    if track.keyframes.is_empty() {
+        return track.value.as_f64().unwrap_or(fallback);
+    }
+    if track.keyframes.len() == 1 {
+        return track.keyframes[0].value.as_f64().unwrap_or(fallback);
+    }
+    let mut kfs: Vec<&PropertyKeyframe> = track.keyframes.iter().collect();
+    kfs.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+    if frame <= kfs[0].frame {
+        return kfs[0].value.as_f64().unwrap_or(fallback);
+    }
+    let last = kfs[kfs.len() - 1];
+    if frame >= last.frame {
+        return last.value.as_f64().unwrap_or(fallback);
+    }
+    let idx = kfs
+        .partition_point(|k| k.frame <= frame)
+        .clamp(1, kfs.len() - 1);
+    let k0 = kfs[idx - 1];
+    let k1 = kfs[idx];
+    let v0 = k0.value.as_f64().unwrap_or(fallback);
+    let v1 = k1.value.as_f64().unwrap_or(v0);
+    let span = k1.frame - k0.frame;
+    if span <= 1e-9 {
+        return v0;
+    }
+    let ease_idx = (k1.tween & 0xFF) as u8;
+    let is_bezier = ease_idx != 0 && (k1.tween >> 8) == 1;
+    let tween_code = if is_bezier {
+        (1u16 << 8) | u16::from(ease_idx)
+    } else {
+        u16::from(ease_idx)
+    };
+    let (mode, easing) = InterpolationMode::from_cm3_tween_code(tween_code);
+    match mode {
+        InterpolationMode::Discrete => v0,
+        InterpolationMode::Interpolated => {
+            let u = ((frame - k0.frame) / span).clamp(0.0, 1.0);
+            let e = eval_easing(easing, u);
+            v0 + (v1 - v0) * e
+        }
+        InterpolationMode::Bezier => eval_segment_bezier(
+            BezierSegment {
+                start_frame: k0.frame,
+                start_value: v0,
+                out_tangent: k0.control_points[1],
+                end_frame: k1.frame,
+                end_value: v1,
+                in_tangent: k1.control_points[0],
+            },
+            frame,
+        ),
+    }
+}
+
+fn eval_sequence_control_expr_value(ctrl: &SequenceControl, seq_frame: f64) -> zc_expr::Value {
+    if !ctrl.track.channels.is_empty() {
+        let vals = ctrl
+            .track
+            .channels
+            .iter()
+            .map(|ch| zc_expr::Value::Number(eval_project_track_f64(ch, seq_frame, 0.0)))
+            .collect();
+        return zc_expr::Value::Array(vals);
+    }
+    let step_value = || -> &PropertyValue {
+        if ctrl.track.keyframes.is_empty() {
+            return &ctrl.track.value;
+        }
+        let mut best: Option<&PropertyKeyframe> = None;
+        for kf in &ctrl.track.keyframes {
+            if kf.frame <= seq_frame && best.is_none_or(|b| kf.frame >= b.frame) {
+                best = Some(kf);
+            }
+        }
+        best.or_else(|| {
+            ctrl.track
+                .keyframes
+                .iter()
+                .min_by(|a, b| a.frame.total_cmp(&b.frame))
+        })
+        .map_or(&ctrl.track.value, |kf| &kf.value)
+    };
+    match &ctrl.track.value {
+        PropertyValue::Number(_) => {
+            zc_expr::Value::Number(eval_project_track_f64(&ctrl.track, seq_frame, 0.0))
+        }
+        PropertyValue::Option(idx) => zc_expr::Value::Number(eval_project_track_f64(
+            &ctrl.track,
+            seq_frame,
+            f64::from(*idx),
+        )),
+        PropertyValue::Bool(_) => {
+            let active = match step_value() {
+                PropertyValue::Bool(b) => *b,
+                PropertyValue::Number(n) => *n != 0.0,
+                _ => false,
+            };
+            if ctrl.kind == SequenceControlKind::Checkbox {
+                zc_expr::Value::Number(if active { 1.0 } else { 0.0 })
+            } else {
+                zc_expr::Value::Bool(active)
+            }
+        }
+        PropertyValue::Text(_) => {
+            let text = step_value().as_str().unwrap_or("");
+            if ctrl.kind == SequenceControlKind::Checkbox {
+                zc_expr::Value::Number(text.trim().parse::<f64>().unwrap_or(0.0))
+            } else {
+                zc_expr::Value::String(text.to_owned())
+            }
+        }
+        PropertyValue::Vec2(v) => {
+            let arr = step_value().as_vec2().unwrap_or(*v);
+            zc_expr::Value::Array(arr.into_iter().map(zc_expr::Value::Number).collect())
+        }
+        PropertyValue::Vec3(v) | PropertyValue::Color(v) => {
+            let arr = step_value().as_vec3().unwrap_or(*v);
+            zc_expr::Value::Array(arr.into_iter().map(zc_expr::Value::Number).collect())
+        }
+        PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) => {
+            let arr = step_value().as_vec4().unwrap_or(*v);
+            zc_expr::Value::Array(arr.into_iter().map(zc_expr::Value::Number).collect())
+        }
+        _ => zc_expr::Value::Number(0.0),
+    }
+}
+
+struct GuiAudioExprContext<'a> {
+    frame: f64,
+    time: f64,
+    fps: f64,
+    value: zc_expr::Value,
+    seq_frame: f64,
+    controls: &'a [SequenceControl],
+}
+
+impl ExprContext for GuiAudioExprContext<'_> {
+    fn frame(&self) -> f64 {
+        self.frame
+    }
+
+    fn time(&self) -> f64 {
+        self.time
+    }
+
+    fn fps(&self) -> f64 {
+        self.fps
+    }
+
+    fn value(&self) -> zc_expr::Value {
+        self.value.clone()
+    }
+
+    fn properties(&self) -> BTreeMap<String, zc_expr::Value> {
+        BTreeMap::new()
+    }
+
+    fn control(&self, name: &str, stable_id: Option<&str>) -> Result<zc_expr::Value, ExprError> {
+        let ctrl_opt = if let Some(sid) = stable_id {
+            self.controls.iter().find(|c| c.id == sid)
+        } else {
+            self.controls.iter().find(|c| c.name == name)
+        };
+        let Some(ctrl) = ctrl_opt else {
+            return Err(ExprError::NotFound(match stable_id {
+                Some(sid) => format!("control '{name}' (id '{sid}')"),
+                None => format!("control '{name}'"),
+            }));
+        };
+        Ok(eval_sequence_control_expr_value(ctrl, self.seq_frame))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn eval_compiled_audio_expr(
     compiled: &CompiledExpr,
     local_frame: f64,
+    time_sec: f64,
     fps: f64,
     base_value: f64,
+    seq_frame: f64,
+    controls: &[SequenceControl],
     config: &EvalConfig,
 ) -> f64 {
     let safe_fps = fps.max(1.0);
-    let ctx = BasicContext {
+    let ctx = GuiAudioExprContext {
         frame: local_frame,
-        time: Some(local_frame / safe_fps),
+        time: time_sec,
         fps: safe_fps,
         value: zc_expr::Value::Number(base_value),
-        properties: BTreeMap::new(),
+        seq_frame,
+        controls,
     };
     let outcome = compiled.evaluate_with_fallback(&ctx, config);
     outcome
@@ -3441,7 +3762,7 @@ fn compute_audio_mix_hash(
 ) -> u64 {
     let clip_assets = collect_clip_audio_assets(&session.project);
     let doc = session.document();
-    let any_solo = doc.audio_tracks.iter().any(|t| t.enabled && t.solo);
+    let any_solo = doc.audio_tracks.iter().any(|t| t.solo);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut active_clips = 0_usize;
     let mut any_expr = false;
@@ -3521,8 +3842,10 @@ fn build_offline_export_audio(
     start_seq_frame: u32,
     end_seq_frame: u32,
 ) -> Result<Option<Vec<[f32; 2]>>, String> {
-    if settings.container == CoreExportContainer::PngSequence
-        || settings.audio_codec == AudioCodec::None
+    if matches!(
+        settings.container,
+        CoreExportContainer::PngSequence | CoreExportContainer::Gif
+    ) || (!settings.container.is_audio_only() && settings.audio_codec == AudioCodec::None)
     {
         return Ok(None);
     }
@@ -3538,6 +3861,7 @@ fn build_offline_export_audio(
 }
 
 struct PreparedAudioClipProps<'a> {
+    clip_start: f64,
     props: &'a BTreeMap<String, SessionProperty>,
     time_animated: bool,
     volume_expr: Option<CompiledExpr>,
@@ -3562,11 +3886,13 @@ fn mix_sequence_audio_stereo(
     } else {
         EvalConfig::vanilla()
     };
+    let controls = &session.project.sequence.controls;
     let safe_fps = seq_fps.max(1.0);
     // Share Arc references without copying PCM sample data.
     let mut buffers: HashMap<String, Arc<AudioBuffer>> = HashMap::new();
+    let mut silent_assets: HashSet<String> = HashSet::new();
     let doc = session.document();
-    let any_solo = doc.audio_tracks.iter().any(|t| t.enabled && t.solo);
+    let any_solo = doc.audio_tracks.iter().any(|t| t.solo);
     let mut items = Vec::new();
     let mut clip_props: Vec<PreparedAudioClipProps<'_>> = Vec::new();
     let range_start = f64::from(start_seq_frame);
@@ -3591,8 +3917,15 @@ fn mix_sequence_audio_stereo(
             let Some(asset_id) = clip_assets.get(&clip.id) else {
                 continue;
             };
+            if silent_assets.contains(asset_id) {
+                continue;
+            }
             if !buffers.contains_key(asset_id) {
                 if let Some(cached) = cached_buffers.get(asset_id) {
+                    if cached.is_empty() {
+                        silent_assets.insert(asset_id.clone());
+                        continue;
+                    }
                     buffers.insert(asset_id.clone(), Arc::clone(cached));
                 } else {
                     let Some(rec) = session.project.assets.get(asset_id) else {
@@ -3604,10 +3937,27 @@ fn mix_sequence_audio_stereo(
                     let ext = Path::new(&rec.filename)
                         .extension()
                         .and_then(|e| e.to_str());
-                    let decoded = decode_audio_bytes(bytes, ext).map_err(|err| {
-                        format!("failed to decode audio asset `{asset_id}`: {err}")
-                    })?;
-                    buffers.insert(asset_id.clone(), Arc::new(decoded));
+                    match decode_audio_bytes(bytes, ext) {
+                        Ok(decoded) => {
+                            if decoded.is_empty() {
+                                silent_assets.insert(asset_id.clone());
+                                continue;
+                            }
+                            buffers.insert(asset_id.clone(), Arc::new(decoded));
+                        }
+                        Err(AudioError::NoAudioTrack) => {
+                            tracing::debug!(
+                                "audio asset `{asset_id}` has no audio track; treating as silent"
+                            );
+                            silent_assets.insert(asset_id.clone());
+                            continue;
+                        }
+                        Err(err) => {
+                            return Err(format!(
+                                "failed to decode audio asset `{asset_id}`: {err}"
+                            ));
+                        }
+                    }
                 }
             }
             let rate =
@@ -3616,13 +3966,48 @@ fn mix_sequence_audio_stereo(
                 compile_audio_prop_expr(clip.properties.get("volume"), expr_config.mode);
             let pan_expr = compile_audio_prop_expr(clip.properties.get("pan"), expr_config.mode);
             let time_expr = compile_audio_prop_expr(clip.properties.get("time"), expr_config.mode);
+            let media_time_0 = if clip.time_animated || time_expr.is_some() {
+                let base_t0 = eval_prop_f64(clip.properties.get("time"), 0.0, clip.time_start);
+                time_expr.as_ref().map_or(base_t0, |e| {
+                    eval_compiled_audio_expr(
+                        e,
+                        0.0,
+                        base_t0,
+                        safe_fps,
+                        base_t0,
+                        clip.start,
+                        controls,
+                        &expr_config,
+                    )
+                })
+            } else {
+                clip.time_start
+            };
             let volume_base = eval_prop_f64(clip.properties.get("volume"), 0.0, 1.0);
             let volume = volume_expr.as_ref().map_or(volume_base, |e| {
-                eval_compiled_audio_expr(e, 0.0, safe_fps, volume_base, &expr_config)
+                eval_compiled_audio_expr(
+                    e,
+                    0.0,
+                    media_time_0,
+                    safe_fps,
+                    volume_base,
+                    clip.start,
+                    controls,
+                    &expr_config,
+                )
             }) as f32;
             let pan_base = eval_prop_f64(clip.properties.get("pan"), 0.0, 0.0);
             let pan = pan_expr.as_ref().map_or(pan_base, |e| {
-                eval_compiled_audio_expr(e, 0.0, safe_fps, pan_base, &expr_config)
+                eval_compiled_audio_expr(
+                    e,
+                    0.0,
+                    media_time_0,
+                    safe_fps,
+                    pan_base,
+                    clip.start,
+                    controls,
+                    &expr_config,
+                )
             }) as f32;
             items.push(AudioClipScheduleItem {
                 clip_start_frame: clip.start - range_start,
@@ -3634,6 +4019,7 @@ fn mix_sequence_audio_stereo(
                 buffer_id: asset_id.clone(),
             });
             clip_props.push(PreparedAudioClipProps {
+                clip_start: clip.start,
                 props: &clip.properties,
                 time_animated: clip.time_animated,
                 volume_expr,
@@ -3656,22 +4042,50 @@ fn mix_sequence_audio_stereo(
         &buffers,
         |clip_idx, clip, local_frame| {
             let prepared = &clip_props[clip_idx];
+            let seq_frame = prepared.clip_start + local_frame;
             let linear_time = clip.media_start_sec + (local_frame / safe_fps) * clip.playback_rate;
             let media_time_sec = if prepared.time_animated || prepared.time_expr.is_some() {
                 let base_t = eval_prop_f64(prepared.props.get("time"), local_frame, linear_time);
                 prepared.time_expr.as_ref().map_or(base_t, |e| {
-                    eval_compiled_audio_expr(e, local_frame, safe_fps, base_t, &expr_config)
+                    eval_compiled_audio_expr(
+                        e,
+                        local_frame,
+                        base_t,
+                        safe_fps,
+                        base_t,
+                        seq_frame,
+                        controls,
+                        &expr_config,
+                    )
                 })
             } else {
                 linear_time
             };
             let base_vol = eval_prop_f64(prepared.props.get("volume"), local_frame, 1.0);
             let volume = prepared.volume_expr.as_ref().map_or(base_vol, |e| {
-                eval_compiled_audio_expr(e, local_frame, safe_fps, base_vol, &expr_config)
+                eval_compiled_audio_expr(
+                    e,
+                    local_frame,
+                    media_time_sec,
+                    safe_fps,
+                    base_vol,
+                    seq_frame,
+                    controls,
+                    &expr_config,
+                )
             }) as f32;
             let base_pan = eval_prop_f64(prepared.props.get("pan"), local_frame, 0.0);
             let pan = prepared.pan_expr.as_ref().map_or(base_pan, |e| {
-                eval_compiled_audio_expr(e, local_frame, safe_fps, base_pan, &expr_config)
+                eval_compiled_audio_expr(
+                    e,
+                    local_frame,
+                    media_time_sec,
+                    safe_fps,
+                    base_pan,
+                    seq_frame,
+                    controls,
+                    &expr_config,
+                )
             }) as f32;
             ClipAudioSampleParams {
                 media_time_sec,
@@ -3699,9 +4113,10 @@ fn sample_live_audio_meter(
     } else {
         EvalConfig::vanilla()
     };
+    let controls = &session.project.sequence.controls;
     let clip_assets = collect_clip_audio_assets(&session.project);
     let doc = session.document();
-    let any_solo = doc.audio_tracks.iter().any(|t| t.enabled && t.solo);
+    let any_solo = doc.audio_tracks.iter().any(|t| t.solo);
     let safe_fps = fps.max(1.0);
     let mut mix_l = [0.0_f32; METER_WINDOW];
     let mut mix_r = [0.0_f32; METER_WINDOW];
@@ -3730,7 +4145,6 @@ fn sample_live_audio_meter(
             if total_frames == 0 {
                 continue;
             }
-            let ch = usize::from(buf.channels.max(1));
             let local_f = frame - clip.start;
             let rate =
                 effective_playback_rate(clip.time_start, clip.time_end, clip.length, safe_fps);
@@ -3742,7 +4156,16 @@ fn sample_live_audio_meter(
                     let lin = clip.time_start + (lf / safe_fps) * rate;
                     let base = eval_prop_f64(clip.properties.get("time"), lf, lin);
                     time_expr.as_ref().map_or(base, |e| {
-                        eval_compiled_audio_expr(e, lf, safe_fps, base, &expr_config)
+                        eval_compiled_audio_expr(
+                            e,
+                            lf,
+                            base,
+                            safe_fps,
+                            base,
+                            clip.start + lf,
+                            controls,
+                            &expr_config,
+                        )
                     })
                 };
                 let t0 = eval_time(local_f);
@@ -3759,14 +4182,32 @@ fn sample_live_audio_meter(
             let vol = compile_audio_prop_expr(clip.properties.get("volume"), expr_config.mode)
                 .as_ref()
                 .map_or(base_vol, |e| {
-                    eval_compiled_audio_expr(e, local_f, safe_fps, base_vol, &expr_config)
+                    eval_compiled_audio_expr(
+                        e,
+                        local_f,
+                        base_t,
+                        safe_fps,
+                        base_vol,
+                        frame,
+                        controls,
+                        &expr_config,
+                    )
                 })
                 .max(0.0) as f32;
             let base_pan = eval_prop_f64(clip.properties.get("pan"), local_f, 0.0);
             let pan = compile_audio_prop_expr(clip.properties.get("pan"), expr_config.mode)
                 .as_ref()
                 .map_or(base_pan, |e| {
-                    eval_compiled_audio_expr(e, local_f, safe_fps, base_pan, &expr_config)
+                    eval_compiled_audio_expr(
+                        e,
+                        local_f,
+                        base_t,
+                        safe_fps,
+                        base_pan,
+                        frame,
+                        controls,
+                        &expr_config,
+                    )
                 }) as f32;
 
             for i in 0..METER_WINDOW {
@@ -3778,14 +4219,8 @@ fn sample_live_audio_meter(
                 if fi >= total_frames {
                     break;
                 }
-                let base_idx = fi * ch;
-                let raw_l = buf.samples_interleaved_f32[base_idx];
-                let raw_r = if ch >= 2 {
-                    buf.samples_interleaved_f32[base_idx + 1]
-                } else {
-                    raw_l
-                };
-                let [out_l, out_r] = apply_gain_and_pan([raw_l, raw_r], vol, pan);
+                let stereo = buf.read_stereo_frame(fi);
+                let [out_l, out_r] = apply_gain_and_pan(stereo, vol, pan);
                 mix_l[i] += out_l;
                 mix_r[i] += out_r;
                 has_active_audio = true;
@@ -3808,6 +4243,14 @@ fn sample_live_audio_meter(
     let rms_l = (sum_sq_l / METER_WINDOW as f64).sqrt().clamp(0.0, 1.0) as f32;
     let rms_r = (sum_sq_r / METER_WINDOW as f64).sqrt().clamp(0.0, 1.0) as f32;
     (rms_l, rms_r)
+}
+
+fn prepare_project_for_pz_export(session: &Session) -> Project {
+    let mut project = session.project.clone();
+    for dep in session.active_plugin_dependencies() {
+        project.plugin_requirements.insert(dep);
+    }
+    project
 }
 
 fn sanitize_filename(raw: &str) -> String {
@@ -4420,6 +4863,894 @@ mod tests {
         assert_eq!(
             classify_dropped_path(Path::new("/tmp/readme.txt")),
             DroppedFileKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn convert_export_settings_maps_gif_wav_m4a_and_transparent_alpha() {
+        // GIF: maps to Gif, disables audio, preserves transparent_alpha, ignores stale video_codec
+        let gif_ui = UiExportSettings {
+            container: UiExportContainer::Gif,
+            video_codec: ExportVideoCodec::Png,
+            audio_codec: ExportAudioCodec::AacLc,
+            transparent_alpha: true,
+            width: 320,
+            height: 180,
+            fps: 15.0,
+            ..UiExportSettings::default()
+        };
+        let gif_core = convert_export_settings(&gif_ui, 30.0, 0, 60, PathBuf::from("anim.gif"))
+            .expect("gif settings convert");
+        assert_eq!(gif_core.container, CoreExportContainer::Gif);
+        assert_eq!(gif_core.audio_codec, AudioCodec::None);
+        assert!(gif_core.transparent_alpha);
+        assert_eq!(gif_core.end_frame, 30);
+        gif_core.validate().expect("gif settings validate");
+
+        // WAV: audio-only fast path, forces PCM, clears transparent_alpha, keeps exact sequence duration
+        let wav_ui = UiExportSettings {
+            container: UiExportContainer::Wav,
+            video_codec: ExportVideoCodec::Png,
+            audio_codec: ExportAudioCodec::None,
+            transparent_alpha: true,
+            fps: 60.0,
+            sample_rate_hz: 44_100,
+            ..UiExportSettings::default()
+        };
+        let wav_core = convert_export_settings(&wav_ui, 30.0, 10, 40, PathBuf::from("out.wav"))
+            .expect("wav settings convert");
+        assert_eq!(wav_core.container, CoreExportContainer::Wav);
+        assert!(wav_core.container.is_audio_only());
+        assert_eq!(wav_core.audio_codec, AudioCodec::Pcm);
+        assert!(!wav_core.transparent_alpha);
+        assert_eq!(wav_core.fps, 30.0);
+        assert_eq!(wav_core.end_frame, 30);
+        assert_eq!(wav_core.sample_rate, 44_100);
+        wav_core.validate().expect("wav settings validate");
+
+        // M4A: audio-only fast path, forces AAC, clears transparent_alpha, preserves bitrate & sample rate
+        let m4a_ui = UiExportSettings {
+            container: UiExportContainer::M4a,
+            video_codec: ExportVideoCodec::Png,
+            audio_codec: ExportAudioCodec::None,
+            audio_bitrate_kbps: 256,
+            sample_rate_hz: 48_000,
+            transparent_alpha: true,
+            ..UiExportSettings::default()
+        };
+        let m4a_core = convert_export_settings(&m4a_ui, 24.0, 0, 48, PathBuf::from("out.m4a"))
+            .expect("m4a settings convert");
+        assert_eq!(m4a_core.container, CoreExportContainer::M4a);
+        assert!(m4a_core.container.is_audio_only());
+        assert_eq!(m4a_core.audio_codec, AudioCodec::Aac);
+        assert!(!m4a_core.transparent_alpha);
+        assert_eq!(m4a_core.audio_bitrate_kbps, 256);
+        assert_eq!(m4a_core.fps, 24.0);
+        assert_eq!(m4a_core.end_frame, 48);
+        m4a_core.validate().expect("m4a settings validate");
+
+        // WebM/MKV VP9 transparent alpha propagates and validates cleanly
+        for (ui_c, core_c, ac) in [
+            (
+                UiExportContainer::WebM,
+                CoreExportContainer::Webm,
+                ExportAudioCodec::Opus,
+            ),
+            (
+                UiExportContainer::Mkv,
+                CoreExportContainer::Mkv,
+                ExportAudioCodec::PcmS16Le,
+            ),
+        ] {
+            let ui = UiExportSettings {
+                container: ui_c,
+                video_codec: ExportVideoCodec::Vp9,
+                audio_codec: ac,
+                transparent_alpha: true,
+                ..UiExportSettings::default()
+            };
+            let core = convert_export_settings(&ui, 30.0, 0, 30, PathBuf::from("alpha.out"))
+                .expect("vp9 alpha convert");
+            assert_eq!(core.container, core_c);
+            assert_eq!(core.video_codec, VideoCodec::Vp9);
+            assert!(core.transparent_alpha);
+            core.validate().expect("vp9 alpha validates");
+        }
+
+        // MP4 rejects PNG video codec and rejects transparent_alpha
+        let mp4_png = UiExportSettings {
+            container: UiExportContainer::Mp4,
+            video_codec: ExportVideoCodec::Png,
+            ..UiExportSettings::default()
+        };
+        assert!(convert_export_settings(&mp4_png, 30.0, 0, 30, PathBuf::from("bad.mp4")).is_err());
+
+        let mp4_alpha = UiExportSettings {
+            container: UiExportContainer::Mp4,
+            video_codec: ExportVideoCodec::Vp9,
+            transparent_alpha: true,
+            ..UiExportSettings::default()
+        };
+        let mp4_core = convert_export_settings(&mp4_alpha, 30.0, 0, 30, PathBuf::from("bad.mp4"))
+            .expect("convert mp4");
+        assert!(mp4_core.validate().is_err());
+
+        // File-save dialog filters for GIF / WAV / M4A
+        assert_eq!(
+            export_file_dialog_filter(UiExportContainer::Gif),
+            ("GIF Animation", "gif")
+        );
+        assert_eq!(
+            export_file_dialog_filter(UiExportContainer::Wav),
+            ("WAV Audio", "wav")
+        );
+        assert_eq!(
+            export_file_dialog_filter(UiExportContainer::M4a),
+            ("M4A Audio", "m4a")
+        );
+    }
+
+    #[test]
+    fn offline_export_audio_skips_gif_and_mixes_wav_and_m4a() {
+        let mut session = Session::new();
+        let sr = STANDARD_SAMPLE_RATE;
+        let samples: Vec<[f32; 2]> = (0..sr)
+            .map(|i| {
+                let s = (2.0 * std::f32::consts::PI * 440.0 * (i as f32) / (sr as f32)).sin() * 0.4;
+                [s, s]
+            })
+            .collect();
+        let wav_bytes = zc_audio::encode_wav_pcm16_stereo(&samples, sr);
+        let asset_id = session.project.insert_binary_asset(
+            AssetKind::Av,
+            "tone.wav".to_owned(),
+            wav_bytes.clone(),
+        );
+        let decoded = Arc::new(decode_audio_bytes(&wav_bytes, Some("wav")).expect("decode wav"));
+        let mut cache = HashMap::new();
+        cache.insert(asset_id.clone(), decoded);
+
+        let track_id = session.document().audio_tracks[0].id.clone();
+        let clip_id = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "audio".to_owned(),
+                name: Some("tone.wav".to_owned()),
+                start: 0.0,
+                length: 30.0,
+            })
+            .expect("add audio clip")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: clip_id,
+                property: "assetId".to_owned(),
+                value: json!(asset_id),
+            })
+            .expect("bind audio asset");
+
+        let gif_settings = convert_export_settings(
+            &UiExportSettings {
+                container: UiExportContainer::Gif,
+                ..UiExportSettings::default()
+            },
+            30.0,
+            0,
+            30,
+            PathBuf::from("out.gif"),
+        )
+        .expect("gif");
+        assert!(
+            collect_in_range_audio_arcs(&session, &cache, &gif_settings, 0, 30).is_empty(),
+            "GIF export must not collect audio arcs"
+        );
+        assert!(
+            build_offline_export_audio(&session, &cache, &gif_settings, 30.0, 0, 30)
+                .expect("gif audio mix")
+                .is_none(),
+            "GIF export must not mix audio"
+        );
+
+        for (container, path) in [
+            (UiExportContainer::Wav, "out.wav"),
+            (UiExportContainer::M4a, "out.m4a"),
+        ] {
+            let settings = convert_export_settings(
+                &UiExportSettings {
+                    container,
+                    sample_rate_hz: sr,
+                    ..UiExportSettings::default()
+                },
+                30.0,
+                0,
+                30,
+                PathBuf::from(path),
+            )
+            .expect("audio-only settings");
+            assert_eq!(
+                collect_in_range_audio_arcs(&session, &cache, &settings, 0, 30).len(),
+                1
+            );
+            let mixed = build_offline_export_audio(&session, &cache, &settings, 30.0, 0, 30)
+                .expect("audio-only mix")
+                .expect("non-empty stereo mix");
+            assert_eq!(mixed.len(), sr as usize);
+        }
+    }
+
+    #[test]
+    fn render_export_frame_propagates_transparent_alpha_background() {
+        let Ok(mut engine) = ProjectRenderEngine::new_headless() else {
+            // Skip GPU readback assertion on headless environments without an adapter.
+            return;
+        };
+        let mut session = Session::new();
+        // Clear video clips so the canvas background is directly visible.
+        session.project.sequence.video_tracks.clear();
+
+        let mut transparent_rgba = Vec::new();
+        render_export_frame_into(
+            &mut engine,
+            &session,
+            0.0,
+            16,
+            16,
+            true,
+            &mut transparent_rgba,
+        )
+        .expect("transparent frame render");
+        assert_eq!(transparent_rgba.len(), 16 * 16 * 4);
+        assert!(
+            transparent_rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|&px| px == [0, 0, 0, 0]),
+            "transparent export background must be [0, 0, 0, 0], got first px {:?}",
+            &transparent_rgba[..4]
+        );
+
+        let mut opaque_rgba = Vec::new();
+        render_export_frame_into(&mut engine, &session, 0.0, 16, 16, false, &mut opaque_rgba)
+            .expect("opaque frame render");
+        assert_eq!(opaque_rgba.len(), 16 * 16 * 4);
+        assert!(
+            opaque_rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 255),
+            "opaque export background must have alpha 255, got first px {:?}",
+            &opaque_rgba[..4]
+        );
+    }
+
+    #[test]
+    fn prepare_project_for_pz_export_round_trips_via_export_and_import_pz() {
+        let mut session = Session::new();
+        session
+            .execute(Command::SetProjectName {
+                name: "Export Demo".to_owned(),
+            })
+            .expect("rename project");
+
+        let prepared = prepare_project_for_pz_export(&session);
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "zoidcraft_gui_export_pz_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let out_path = tmp_dir.join(format!("{}.pz", sanitize_filename(&prepared.name)));
+
+        export_pz(&prepared, &out_path).expect("export_pz must succeed");
+        let reimported = import_pz(&out_path).expect("import_pz must read exported archive");
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        assert_eq!(reimported.project.name, "Export Demo");
+        assert_eq!(
+            reimported.project.sequence.resolution,
+            prepared.sequence.resolution
+        );
+        assert_eq!(reimported.project.sequence.fps, prepared.sequence.fps);
+    }
+
+    fn make_headless_app_for_test() -> ZoidCraftApp {
+        let session = Session::new();
+        let fps = session.document().fps.max(1.0);
+        let seq_len = session.document().sequence_length.max(1.0);
+        let init_epoch = session.playback.epoch_id;
+        let init_loop = session.playback.looping;
+        ZoidCraftApp {
+            session,
+            theme: Cm3Theme::default(),
+            applied_theme: None,
+            workspace: Cm3Workspace::new(),
+            timeline: TimelineViewState::new(),
+            graph_editor: GraphEditorState::new(),
+            viewport: ViewportState::new(),
+            renderer: None,
+            current_file: None,
+            decoded_audio: HashMap::new(),
+            asset_waveform_peaks: HashMap::new(),
+            audio_clock: MasterPlaybackClock::new(fps, seq_len),
+            audio_output: None,
+            audio_mix_hash: 0,
+            audio_window_start: 0,
+            audio_window_end: 0,
+            audio_stream_attempted_hash: 0,
+            audio_failure_latch: AudioOutputFailureLatch::default(),
+            last_audio_epoch: init_epoch,
+            last_audio_playing: false,
+            last_audio_speed: 0.0,
+            last_audio_frame: 0.0,
+            last_audio_loop: init_loop,
+            last_audio_fps: fps,
+            last_audio_seq_len: seq_len,
+            ffmpeg_probe_rx: None,
+            active_export: None,
+            retired_exports: Vec::new(),
+            pending_eyedropper: None,
+            eyedropper_swallow_pointer: false,
+            pending_unsaved_dialog: None,
+            allow_close_now: false,
+            last_canvas_rect: None,
+            last_viewport_rect: None,
+            force_single_render: true,
+            last_tick: Instant::now(),
+            last_title: String::new(),
+            status_toast: None,
+        }
+    }
+
+    #[test]
+    fn modal_dialog_audio_pause_clears_window_and_reopens_on_resume() {
+        let mut app = make_headless_app_for_test();
+        let mix_hash = 0x1234_5678_9abc_def0;
+        app.session.playback.current_frame = 15.0;
+        app.session.playback.set_speed(1.0);
+        app.audio_mix_hash = mix_hash;
+        app.audio_window_start = 0;
+        app.audio_window_end = 1800;
+        app.audio_stream_attempted_hash = mix_hash;
+        app.last_audio_playing = true;
+        app.last_audio_speed = 1.0;
+
+        // Sanity: if audio_output were dropped WITHOUT clearing the hash/window fields,
+        // live playback would refuse to rebuild/re-open CPAL on resume at the same frame.
+        assert!(
+            !live_audio_needs_rebuild(
+                app.audio_mix_hash,
+                app.audio_window_start,
+                app.audio_window_end,
+                app.audio_stream_attempted_hash,
+                false,
+                mix_hash,
+                15.0,
+            ),
+            "stale hash + valid window must reproduce the old silence bug"
+        );
+
+        app.pause_playback_for_modal_dialog();
+        assert!(!app.session.playback.is_playing());
+        assert!(app.audio_output.is_none());
+        assert_eq!(app.audio_mix_hash, 0);
+        assert_eq!(app.audio_window_start, 0);
+        assert_eq!(app.audio_window_end, 0);
+        assert_eq!(app.audio_stream_attempted_hash, 0);
+        assert!(!app.last_audio_playing);
+        assert_eq!(app.last_audio_speed, 0.0);
+        assert_eq!(app.last_audio_epoch, app.session.playback.epoch_id);
+
+        // Closing/cancelling the modal dialog and pressing Play at the exact same frame & hash
+        // must trigger rebuilding and re-opening CPAL audio.
+        assert!(
+            live_audio_needs_rebuild(
+                app.audio_mix_hash,
+                app.audio_window_start,
+                app.audio_window_end,
+                app.audio_stream_attempted_hash,
+                app.audio_output.is_some(),
+                mix_hash,
+                15.0,
+            ),
+            "resuming playback after modal dialog must rebuild and re-open live audio"
+        );
+    }
+
+    #[test]
+    fn eval_prop_f64_evaluates_multi_keyframe_tracks_with_animated_false() {
+        use zc_session::SessionKeyframe;
+
+        let mk_kf = |frame: f64, val: f64, tween: u16| SessionKeyframe {
+            frame,
+            value: json!(val),
+            tween,
+            control_points: [[-10.0, 0.0], [10.0, 0.0]],
+            continuous_tangent: true,
+            value_kind: None,
+        };
+        let prop = SessionProperty {
+            animated: false,
+            expression: None,
+            default_value: json!(0.0),
+            keyframes: vec![mk_kf(0.0, 0.0, 1), mk_kf(20.0, 1.0, 1)],
+        };
+        assert!(
+            (eval_prop_f64(Some(&prop), 10.0, 0.0) - 0.5).abs() < 1e-9,
+            "multi-keyframe track with animated=false must still interpolate"
+        );
+        assert!(
+            (eval_prop_f64(Some(&prop), 20.0, 0.0) - 1.0).abs() < 1e-9,
+            "multi-keyframe track with animated=false must reach final keyframe"
+        );
+
+        // Single-keyframe track still returns keyframes[0].
+        let single = SessionProperty {
+            animated: false,
+            expression: None,
+            default_value: json!(0.0),
+            keyframes: vec![mk_kf(0.0, 0.42, 1)],
+        };
+        assert!((eval_prop_f64(Some(&single), 10.0, 0.0) - 0.42).abs() < 1e-9);
+
+        // Also verify end-to-end audio mixing respects multi-keyframe volume with animated=false
+        // (matching imported CM3 projects loaded into Session).
+        let mut session = Session::new();
+        let sr = STANDARD_SAMPLE_RATE;
+        let wav = zc_audio::encode_wav_pcm16_stereo(&vec![[0.5, 0.5]; sr as usize], sr);
+        let asset_id =
+            session
+                .project
+                .insert_binary_asset(AssetKind::Av, "dc.wav".to_owned(), wav.clone());
+        let decoded = Arc::new(decode_audio_bytes(&wav, Some("wav")).expect("decode wav"));
+        let mut cache = HashMap::new();
+        cache.insert(asset_id.clone(), decoded);
+
+        let track_id = session.document().audio_tracks[0].id.clone();
+        let clip_id = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "audio".to_owned(),
+                name: Some("dc.wav".to_owned()),
+                start: 0.0,
+                length: 30.0,
+            })
+            .expect("add clip")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: clip_id.clone(),
+                property: "assetId".to_owned(),
+                value: json!(asset_id),
+            })
+            .expect("bind asset");
+
+        // Set volume keyframes [0 -> 0.0, 30 -> 1.0], then flip `animated = false` on the
+        // underlying project track and reload the session document.
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: "volume".to_owned(),
+                frame: 0.0,
+                value: json!(0.0),
+                tween: Some(1),
+            })
+            .expect("kf 0");
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id,
+                property: "volume".to_owned(),
+                frame: 30.0,
+                value: json!(1.0),
+                tween: Some(1),
+            })
+            .expect("kf 30");
+        let mut project = session.project.clone();
+        project.sequence.audio_tracks[0].clips[0]
+            .audio
+            .volume
+            .animated = false;
+        let reloaded = Session::from_project(project, session.plugins.clone());
+        assert!(
+            !reloaded.document().audio_tracks[0].clips[0]
+                .properties
+                .get("volume")
+                .unwrap()
+                .animated,
+            "volume property must have animated=false after reload"
+        );
+
+        let mixed = mix_sequence_audio_stereo(&reloaded, &cache, sr, 30.0, 0, 30)
+            .expect("mix ok")
+            .expect("non-empty");
+        let early = mixed[10][0].abs();
+        let late = mixed[mixed.len() - 10][0].abs();
+        assert!(
+            early < 0.05 && late > 0.4,
+            "multi-keyframe volume with animated=false must ramp (early={early}, late={late})"
+        );
+    }
+
+    #[test]
+    fn gui_audio_expressions_resolve_sequence_controls_and_media_time_sec() {
+        let mut session = Session::new();
+        session
+            .plugins
+            .enable("expressions-plus")
+            .expect("enable expressions-plus");
+        session.project.sequence.controls = vec![
+            SequenceControl {
+                id: "ctl-gain-1".to_owned(),
+                name: "Gain".to_owned(),
+                kind: SequenceControlKind::Slider,
+                track: PropertyTrack::number(0.25),
+                preserved: BTreeMap::new(),
+            },
+            SequenceControl {
+                id: "ctl-gain-2".to_owned(),
+                name: "Gain".to_owned(),
+                kind: SequenceControlKind::Slider,
+                track: PropertyTrack::number(0.75),
+                preserved: BTreeMap::new(),
+            },
+            SequenceControl {
+                id: "ctl-ramp".to_owned(),
+                name: "Ramp".to_owned(),
+                kind: SequenceControlKind::Slider,
+                track: PropertyTrack {
+                    animated: true,
+                    expression: None,
+                    static_behavior: zc_project::StaticBehavior::Constant,
+                    value: PropertyValue::Number(0.0),
+                    keyframes: vec![
+                        PropertyKeyframe::linear(0.0, PropertyValue::Number(0.0)),
+                        PropertyKeyframe::linear(30.0, PropertyValue::Number(1.0)),
+                    ],
+                    channels: Vec::new(),
+                },
+                preserved: BTreeMap::new(),
+            },
+            SequenceControl {
+                id: "ctl-check".to_owned(),
+                name: "Gate".to_owned(),
+                kind: SequenceControlKind::Checkbox,
+                track: PropertyTrack::constant(PropertyValue::Text("1".to_owned())),
+                preserved: BTreeMap::new(),
+            },
+        ];
+
+        let cfg = EvalConfig::expressions_plus();
+        let controls = &session.project.sequence.controls;
+
+        // Direct control() lookup by name, by stable id, animated control, checkbox, and missing id.
+        let e_name = CompiledExpr::compile("control('Gain')", cfg.mode).expect("compile");
+        assert!(
+            (eval_compiled_audio_expr(&e_name, 0.0, 0.0, 30.0, 9.0, 0.0, controls, &cfg) - 0.25)
+                .abs()
+                < 1e-9
+        );
+        let e_id =
+            CompiledExpr::compile("control('Gain', 'ctl-gain-2')", cfg.mode).expect("compile");
+        assert!(
+            (eval_compiled_audio_expr(&e_id, 0.0, 0.0, 30.0, 9.0, 0.0, controls, &cfg) - 0.75)
+                .abs()
+                < 1e-9
+        );
+        let e_bad_id =
+            CompiledExpr::compile("control('Gain', 'missing-id')", cfg.mode).expect("compile");
+        assert!(
+            (eval_compiled_audio_expr(&e_bad_id, 0.0, 0.0, 30.0, 0.42, 0.0, controls, &cfg) - 0.42)
+                .abs()
+                < 1e-9,
+            "missing stable_id must not fall back to name lookup"
+        );
+        let e_ramp = CompiledExpr::compile("control('Ramp')", cfg.mode).expect("compile");
+        assert!(
+            (eval_compiled_audio_expr(&e_ramp, 0.0, 0.0, 30.0, 0.0, 15.0, controls, &cfg) - 0.5)
+                .abs()
+                < 1e-9
+        );
+        let e_gate = CompiledExpr::compile("control('Gate')", cfg.mode).expect("compile");
+        assert!(
+            (eval_compiled_audio_expr(&e_gate, 0.0, 0.0, 30.0, 0.0, 0.0, controls, &cfg) - 1.0)
+                .abs()
+                < 1e-9
+        );
+
+        // End-to-end mix & VU meter: verify `time` receives evaluated `media_time_sec` (0.8s)
+        // instead of `local_frame / fps` (0.1s at frame 3), combined with `control('Gain', 'ctl-gain-2')`.
+        let sr = STANDARD_SAMPLE_RATE;
+        let wav = zc_audio::encode_wav_pcm16_stereo(&vec![[0.5, 0.5]; (sr as usize) * 2], sr);
+        let asset_id =
+            session
+                .project
+                .insert_binary_asset(AssetKind::Av, "dc.wav".to_owned(), wav.clone());
+        let decoded = Arc::new(decode_audio_bytes(&wav, Some("wav")).expect("decode wav"));
+        let mut cache = HashMap::new();
+        cache.insert(asset_id.clone(), decoded);
+
+        let track_id = session.document().audio_tracks[0].id.clone();
+        let clip_id = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "audio".to_owned(),
+                name: Some("dc.wav".to_owned()),
+                start: 0.0,
+                length: 30.0,
+            })
+            .expect("add clip")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: clip_id.clone(),
+                property: "assetId".to_owned(),
+                value: json!(asset_id),
+            })
+            .expect("bind asset");
+        session
+            .execute(Command::SetExpression {
+                target_id: clip_id.clone(),
+                property: "time".to_owned(),
+                expression: Some("0.8".to_owned()),
+            })
+            .expect("set time expr");
+        session
+            .execute(Command::SetExpression {
+                target_id: clip_id,
+                property: "volume".to_owned(),
+                expression: Some("time * control('Gain', 'ctl-gain-2')".to_owned()),
+            })
+            .expect("set volume expr");
+        // Re-populate `project.sequence.controls` after session commands (since `execute`
+        // re-syncs `project` from `document.sequence_properties`).
+        session.project.sequence.controls = vec![
+            SequenceControl {
+                id: "ctl-gain-1".to_owned(),
+                name: "Gain".to_owned(),
+                kind: SequenceControlKind::Slider,
+                track: PropertyTrack::number(0.25),
+                preserved: BTreeMap::new(),
+            },
+            SequenceControl {
+                id: "ctl-gain-2".to_owned(),
+                name: "Gain".to_owned(),
+                kind: SequenceControlKind::Slider,
+                track: PropertyTrack::number(0.75),
+                preserved: BTreeMap::new(),
+            },
+        ];
+
+        // Expected sample amplitude: 0.5 (source DC) * (0.8 * 0.75) = 0.30.
+        // If `time` had used `local_frame / fps` (0.1s at frame 3), it would be 0.5 * 0.075 = 0.0375.
+        let mixed = mix_sequence_audio_stereo(&session, &cache, sr, 30.0, 0, 10)
+            .expect("mix ok")
+            .expect("non-empty");
+        let sample_at_frame_3 = mixed[(sr as usize) / 10];
+        assert!(
+            (sample_at_frame_3[0] - 0.30).abs() < 0.02,
+            "mixed audio must use media_time_sec & sequence controls (~0.30), got {}",
+            sample_at_frame_3[0]
+        );
+
+        let (rms_l, rms_r) = sample_live_audio_meter(&session, &cache, 3.0, 30.0);
+        assert!(
+            (rms_l - 0.30).abs() < 0.02 && (rms_r - 0.30).abs() < 0.02,
+            "VU meter must use media_time_sec & sequence controls (~0.30), got ({rms_l}, {rms_r})"
+        );
+    }
+
+    #[test]
+    fn live_audio_vu_meter_downmixes_surround_center_and_rear_channels() {
+        let mut session = Session::new();
+        let sr = STANDARD_SAMPLE_RATE;
+        // 5.1 surround buffer (6 channels: FL, FR, C, LFE, RL, RR):
+        // FL=0, FR=0, Center=0.8, LFE=0, RL=0, RR=0 -> ITU-R BS.775 downmix puts ~0.8 * 0.7071 on L & R.
+        let frames = sr as usize;
+        let mut interleaved = Vec::with_capacity(frames * 6);
+        for _ in 0..frames {
+            interleaved.extend_from_slice(&[0.0, 0.0, 0.8, 0.0, 0.0, 0.0]);
+        }
+        let buf_51 = Arc::new(AudioBuffer {
+            sample_rate: sr,
+            channels: 6,
+            samples_interleaved_f32: interleaved,
+        });
+        let asset_id = "surround_51".to_owned();
+        let mut cache = HashMap::new();
+        cache.insert(asset_id.clone(), buf_51);
+
+        let track_id = session.document().audio_tracks[0].id.clone();
+        let clip_id = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "audio".to_owned(),
+                name: Some("dialogue_51.wav".to_owned()),
+                start: 0.0,
+                length: 30.0,
+            })
+            .expect("add clip")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: clip_id,
+                property: "assetId".to_owned(),
+                value: json!(asset_id),
+            })
+            .expect("bind 5.1 asset");
+
+        let (rms_l, rms_r) = sample_live_audio_meter(&session, &cache, 5.0, 30.0);
+        let expected = 0.8 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (rms_l - expected).abs() < 0.02 && (rms_r - expected).abs() < 0.02,
+            "5.1 center channel dialogue must register in VU meter (~{expected}), got ({rms_l}, {rms_r})"
+        );
+    }
+
+    #[test]
+    fn gui_no_audio_track_silences_clip_and_muted_solo_track_silences_all_paths() {
+        // Part A: AudioError::NoAudioTrack in mix_sequence_audio_stereo is treated as silence.
+        let mut session = Session::new();
+        // Minimal valid ISO-BMFF/MP4 (`ftyp` + `moov` containing a v0 `mvhd` and zero tracks).
+        let mut empty_mp4 = Vec::with_capacity(136);
+        // ftyp (20 bytes)
+        empty_mp4.extend_from_slice(&20u32.to_be_bytes());
+        empty_mp4.extend_from_slice(b"ftyp");
+        empty_mp4.extend_from_slice(b"isom");
+        empty_mp4.extend_from_slice(&0x200u32.to_be_bytes());
+        empty_mp4.extend_from_slice(b"isom");
+        // moov (8 + 108 = 116 bytes)
+        empty_mp4.extend_from_slice(&116u32.to_be_bytes());
+        empty_mp4.extend_from_slice(b"moov");
+        // mvhd v0 (108 bytes)
+        empty_mp4.extend_from_slice(&108u32.to_be_bytes());
+        empty_mp4.extend_from_slice(b"mvhd");
+        empty_mp4.extend_from_slice(&[0u8; 4]); // version + flags
+        empty_mp4.extend_from_slice(&[0u8; 8]); // creation + modification
+        empty_mp4.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+        empty_mp4.extend_from_slice(&1000u32.to_be_bytes()); // duration
+        empty_mp4.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
+        empty_mp4.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0
+        empty_mp4.extend_from_slice(&[0u8; 10]); // reserved
+        for entry in [0x0001_0000u32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] {
+            empty_mp4.extend_from_slice(&entry.to_be_bytes());
+        }
+        empty_mp4.extend_from_slice(&[0u8; 24]); // pre_defined
+        empty_mp4.extend_from_slice(&1u32.to_be_bytes()); // next_track_id
+        assert!(
+            matches!(
+                decode_audio_bytes(&empty_mp4, Some("mp4")),
+                Err(AudioError::NoAudioTrack)
+            ),
+            "synthetic container must trigger AudioError::NoAudioTrack"
+        );
+        let video_only_id = session.project.insert_binary_asset(
+            AssetKind::Av,
+            "video_only.mp4".to_owned(),
+            empty_mp4,
+        );
+        let track1_id = session.document().audio_tracks[0].id.clone();
+        let clip_id = session
+            .execute(Command::AddClip {
+                track_id: track1_id.clone(),
+                kind: "audio".to_owned(),
+                name: Some("video_only.mp4".to_owned()),
+                start: 0.0,
+                length: 15.0,
+            })
+            .expect("add video-only audio clip")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: clip_id,
+                property: "assetId".to_owned(),
+                value: json!(video_only_id),
+            })
+            .expect("bind video-only asset");
+
+        let empty_cache = HashMap::new();
+        let res =
+            mix_sequence_audio_stereo(&session, &empty_cache, STANDARD_SAMPLE_RATE, 30.0, 0, 15)
+                .expect("NoAudioTrack must not return Err");
+        assert!(res.is_none(), "NoAudioTrack clip must yield silence (None)");
+
+        // Part B: Soloed + muted track silences all 4 GUI audio paths instead of unmuting non-soloed tracks.
+        let mut solo_session = Session::new();
+        let sr = STANDARD_SAMPLE_RATE;
+        let wav = zc_audio::encode_wav_pcm16_stereo(&vec![[0.6, 0.6]; sr as usize], sr);
+        let tone_id = solo_session.project.insert_binary_asset(
+            AssetKind::Av,
+            "tone.wav".to_owned(),
+            wav.clone(),
+        );
+        let decoded = Arc::new(decode_audio_bytes(&wav, Some("wav")).expect("decode wav"));
+        let mut cache = HashMap::new();
+        cache.insert(tone_id.clone(), decoded);
+
+        let t1_id = solo_session.document().audio_tracks[0].id.clone();
+        let t2_id = solo_session
+            .execute(Command::AddAudioTrack {
+                name: Some("Audio 2".to_owned()),
+            })
+            .expect("add audio track 2")["track_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        for tid in [&t1_id, &t2_id] {
+            let cid = solo_session
+                .execute(Command::AddClip {
+                    track_id: tid.clone(),
+                    kind: "audio".to_owned(),
+                    name: Some("tone.wav".to_owned()),
+                    start: 0.0,
+                    length: 30.0,
+                })
+                .expect("add tone clip")["clip_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            solo_session
+                .execute(Command::SetPropertyValue {
+                    target_id: cid,
+                    property: "assetId".to_owned(),
+                    value: json!(tone_id),
+                })
+                .expect("bind tone");
+        }
+
+        // Solo Track 1 AND mute Track 1 (`enabled = false, solo = true`).
+        // Track 2 remains enabled and un-soloed (`enabled = true, solo = false`).
+        solo_session
+            .execute(Command::SetTrackSolo {
+                track_id: t1_id.clone(),
+                solo: true,
+            })
+            .expect("solo track 1");
+        solo_session
+            .execute(Command::SetTrackEnabled {
+                track_id: t1_id,
+                enabled: false,
+            })
+            .expect("mute track 1");
+
+        let wav_settings = convert_export_settings(
+            &UiExportSettings {
+                container: UiExportContainer::Wav,
+                sample_rate_hz: sr,
+                ..UiExportSettings::default()
+            },
+            30.0,
+            0,
+            30,
+            PathBuf::from("out.wav"),
+        )
+        .expect("wav settings");
+
+        assert!(
+            collect_in_range_audio_arcs(&solo_session, &cache, &wav_settings, 0, 30).is_empty(),
+            "muted solo track must silence collect_in_range_audio_arcs"
+        );
+        assert_eq!(
+            compute_audio_mix_hash(&solo_session, &cache, 30.0, 180.0),
+            0,
+            "muted solo track must produce zero audio mix hash"
+        );
+        assert!(
+            mix_sequence_audio_stereo(&solo_session, &cache, sr, 30.0, 0, 30)
+                .expect("mix ok")
+                .is_none(),
+            "muted solo track must silence mix_sequence_audio_stereo"
+        );
+        assert_eq!(
+            sample_live_audio_meter(&solo_session, &cache, 5.0, 30.0),
+            (0.0, 0.0),
+            "muted solo track must silence sample_live_audio_meter"
         );
     }
 }

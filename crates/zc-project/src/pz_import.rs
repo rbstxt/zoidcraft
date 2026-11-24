@@ -1599,13 +1599,25 @@ fn parse_sequence(
         if let Some(shutter) = props.get("motionBlurShutter") {
             seq.motion_blur.shutter = parse_property_track(shutter, PropertyValue::Number(0.5));
         }
-        if let Some(tf) = props.get("motionBlurTrackFrame").and_then(value_as_u32) {
-            seq.motion_blur.track_frame = tf;
-            plugins.insert("camera-plus".to_owned());
+        if let Some(tf_val) = props.get("motionBlurTrackFrame").filter(|v| !v.is_null()) {
+            let track = parse_property_track(tf_val, PropertyValue::Option(0));
+            let parsed_tf = match track.value {
+                PropertyValue::Option(v) => Some(v),
+                PropertyValue::Number(v) if v.is_finite() => Some(v.round().max(0.0) as u32),
+                PropertyValue::Bool(b) => Some(u32::from(b)),
+                _ => value_as_u32(tf_val),
+            };
+            if let Some(tf) = parsed_tf {
+                seq.motion_blur.track_frame = tf;
+                plugins.insert("camera-plus".to_owned());
+            }
         }
-        if let Some(sens) = prop_f64(props, "motionBlurSensitivity") {
-            seq.motion_blur.sensitivity = sens;
-            plugins.insert("camera-plus".to_owned());
+        if let Some(sens_val) = props.get("motionBlurSensitivity").filter(|v| !v.is_null()) {
+            let track = parse_property_track(sens_val, PropertyValue::Number(0.0));
+            if let Some(sens) = track.value.as_f64() {
+                seq.motion_blur.sensitivity = sens;
+                plugins.insert("camera-plus".to_owned());
+            }
         }
         if let Some(markers_val) = props.get("markers") {
             seq.markers = parse_markers(markers_val);
@@ -3821,6 +3833,7 @@ fn parse_string_typed_object3d(
     match type_str {
         "zoidium:camera-plus/camera" | "zoidium:camera-plus/camera_plus" => {
             plugins.insert("camera-plus".to_owned());
+            *plugin_object_type = Some("zoidium:camera-plus/camera".to_owned());
             let cam = parse_camera_data(props, 1, plugins);
             (
                 "Camera+",

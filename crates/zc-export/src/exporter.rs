@@ -270,41 +270,166 @@ fn export_m4a_audio_only(
 
     let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
     let mut cmd = Command::new(bin);
-    cmd.args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    configure_process_group(&mut cmd);
+    cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null());
 
-    let mut child = cmd.spawn().map_err(|err| {
-        if err.kind() == ErrorKind::NotFound {
-            ExportError::FfmpegNotFound(bin.display().to_string())
-        } else {
-            ExportError::Io(err)
-        }
-    })?;
-    let stderr_pipe = child.stderr.take();
+    // Mirror `export_ffmpeg`'s interruptible stderr setup so cancelling an M4A export
+    // or a descendant keeping stderr open can never detach or hang indefinitely.
+    #[cfg(unix)]
+    let (child, stderr_reader, stderr_cancel): (Child, Box<dyn Read + Send>, PipeCancelToken) = {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (stderr_read, stderr_write) = UnixStream::pair()?;
+        stderr_read.set_read_timeout(Some(Duration::from_millis(50)))?;
+        cmd.stderr(Stdio::from(OwnedFd::from(stderr_write)));
+        configure_process_group(&mut cmd);
+
+        let child = cmd.spawn().map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                ExportError::FfmpegNotFound(bin.display().to_string())
+            } else {
+                ExportError::Io(err)
+            }
+        })?;
+        drop(cmd);
+        (child, Box::new(stderr_read), PipeCancelToken::noop())
+    };
+
+    #[cfg(windows)]
+    let (child, stderr_reader, stderr_cancel): (Child, Box<dyn Read + Send>, PipeCancelToken) = {
+        cmd.stderr(Stdio::piped());
+        configure_process_group(&mut cmd);
+
+        let mut child = cmd.spawn().map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                ExportError::FfmpegNotFound(bin.display().to_string())
+            } else {
+                ExportError::Io(err)
+            }
+        })?;
+        drop(cmd);
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr"))
+        })?;
+        let (stderr_guarded, stderr_token) = GuardedPipe::new(stderr);
+        (child, Box::new(stderr_guarded), stderr_token)
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let (child, stderr_reader, stderr_cancel): (Child, Box<dyn Read + Send>, PipeCancelToken) = {
+        cmd.stderr(Stdio::piped());
+        configure_process_group(&mut cmd);
+
+        let mut child = cmd.spawn().map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                ExportError::FfmpegNotFound(bin.display().to_string())
+            } else {
+                ExportError::Io(err)
+            }
+        })?;
+        drop(cmd);
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr"))
+        })?;
+        (child, Box::new(stderr), PipeCancelToken::noop())
+    };
+
+    let stderr_abort = Arc::new(AtomicBool::new(false));
+    let stderr_abort_clone = Arc::clone(&stderr_abort);
     let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
     let stderr_handle = std::thread::spawn(move || {
         let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
-        if let Some(reader) = stderr_pipe {
-            ring.drain_reader(reader);
-        }
+        ring.drain_reader_interruptible(stderr_reader, &stderr_abort_clone);
         let _ = stderr_tx.send(ring.into_string_lossy());
     });
 
     let child_guard = SharedChildGuard::new(child);
-    let status = child_guard.wait_cancellable(cancel)?;
-    let _ = stderr_handle.join();
-    let stderr_text = stderr_rx.try_recv().unwrap_or_default();
-    drop(temp_audio_guard);
+    let mut stderr_finished = false;
 
-    if !status.success() {
-        return Err(ExportError::FfmpegFailed {
-            exit_code: status.code(),
-            stderr: stderr_text,
-        });
+    let result: Result<(), ExportError> = (|| {
+        let status = child_guard.wait_cancellable(cancel)?;
+        let stderr_text = {
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    stderr_abort.store(true, Ordering::Release);
+                    stderr_cancel.cancel_io();
+                    child_guard.kill_and_reap();
+                    return Err(ExportError::Cancelled);
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    // Child was already reaped; interrupt the stderr worker cleanly without
+                    // signaling a reaped PGID so its thread and descriptor are released and joined.
+                    stderr_abort.store(true, Ordering::Release);
+                    stderr_cancel.cancel_io();
+                    let abort_deadline = std::time::Instant::now() + Duration::from_millis(150);
+                    let mut captured = String::new();
+                    while std::time::Instant::now() < abort_deadline {
+                        match stderr_rx.recv_timeout(Duration::from_millis(10)) {
+                            Ok(text) => {
+                                stderr_finished = true;
+                                captured = text;
+                                break;
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                stderr_finished = true;
+                                break;
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                stderr_cancel.cancel_io();
+                            }
+                        }
+                    }
+                    break captured;
+                }
+                match stderr_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                    Ok(text) => {
+                        stderr_finished = true;
+                        break text;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        stderr_finished = true;
+                        break String::new();
+                    }
+                }
+            }
+        };
+
+        if cancel.load(Ordering::Acquire) {
+            return Err(ExportError::Cancelled);
+        }
+
+        if !status.success() {
+            return Err(ExportError::FfmpegFailed {
+                exit_code: status.code(),
+                stderr: stderr_text,
+            });
+        }
+
+        Ok(())
+    })();
+
+    // Signal stderr worker abort and kill the process tree ONLY if the child is still live.
+    if result.is_err() || !stderr_finished {
+        stderr_abort.store(true, Ordering::Release);
+        child_guard.kill_and_reap();
     }
+    if stderr_finished {
+        let _ = stderr_handle.join();
+    } else {
+        let _ = abort_and_join_worker(
+            &stderr_abort,
+            &stderr_cancel,
+            &stderr_rx,
+            stderr_handle,
+            Duration::from_millis(500),
+        );
+    }
+
+    drop(temp_audio_guard);
+    result?;
 
     publish_temp_output(temp_output_guard.path(), &settings.output_path)?;
     temp_output_guard.disarm();
@@ -1842,6 +1967,140 @@ mod tests {
             assert!(
                 (118..=138).contains(&a),
                 "expected preserved VP9 semi-transparent alpha ~128, got A={a}"
+            );
+        }
+    }
+
+    #[test]
+    fn m4a_cancellation_returns_bounded_and_cleans_up() {
+        let out_m4a = unique_test_path("cancelled_audio.m4a");
+        let _out_guard = TempFileGuard::new(out_m4a.clone());
+        let audio = vec![[0.1_f32, -0.1_f32]; 4_800];
+
+        // 1. Pre-set cancellation returns immediately without spawning FFmpeg.
+        let preset_settings = ExportSettings {
+            width: 0,
+            height: 0,
+            fps: 30.0,
+            start_frame: 0,
+            end_frame: 3,
+            container: ExportContainer::M4a,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Aac,
+            quality: QualityMode::Crf(18),
+            audio_bitrate_kbps: 128,
+            sample_rate: 48_000,
+            transparent_alpha: false,
+            output_path: out_m4a.clone(),
+            ffmpeg_binary: Some(PathBuf::from("/nonexistent/ffmpeg")),
+        };
+        let preset_cancel = Arc::new(AtomicBool::new(true));
+        let err = export_video(
+            &preset_settings,
+            Some(&audio),
+            &preset_cancel,
+            |_idx, _buf: &mut Vec<u8>| unreachable!("M4A export must not render frames"),
+        )
+        .expect_err("pre-cancelled M4A export must fail with Cancelled");
+        assert!(matches!(err, ExportError::Cancelled));
+        assert!(!out_m4a.exists());
+
+        // 2. Mid-run cancellation and inherited-stderr exit return promptly within bounded time.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let fake_ffmpeg = unique_test_path("fake_m4a_ffmpeg.sh");
+            let _script_guard = TempFileGuard::new(fake_ffmpeg.clone());
+            fs::write(
+                &fake_ffmpeg,
+                "#!/bin/sh\necho 'encoding m4a...' >&2\nsleep 30\n",
+            )
+            .expect("write fake ffmpeg script");
+            let mut perms = fs::metadata(&fake_ffmpeg)
+                .expect("stat script")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_ffmpeg, perms).expect("chmod script");
+
+            let mid_settings = ExportSettings {
+                ffmpeg_binary: Some(fake_ffmpeg.clone()),
+                ..preset_settings.clone()
+            };
+            let cancel_mid = Arc::new(AtomicBool::new(false));
+            let cancel_trigger = Arc::clone(&cancel_mid);
+            let trigger_thread = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                cancel_trigger.store(true, Ordering::Release);
+            });
+
+            let start = std::time::Instant::now();
+            let err = export_video(
+                &mid_settings,
+                Some(&audio),
+                &cancel_mid,
+                |_idx, _buf: &mut Vec<u8>| unreachable!("M4A export must not render frames"),
+            )
+            .expect_err("mid-run M4A cancel must fail with Cancelled");
+            let elapsed = start.elapsed();
+            let _ = trigger_thread.join();
+
+            assert!(
+                matches!(err, ExportError::Cancelled),
+                "expected Cancelled, got {err:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "M4A cancellation should complete within bounded time, took {elapsed:?}"
+            );
+            assert!(
+                !out_m4a.exists(),
+                "cancelled M4A export must not publish output file"
+            );
+
+            // Inherited stderr pipe held open by a short-lived background process after child exits
+            // must also return promptly rather than blocking indefinitely on stderr join.
+            let leaky_ffmpeg = unique_test_path("fake_m4a_leaky_stderr.sh");
+            let _leaky_guard = TempFileGuard::new(leaky_ffmpeg.clone());
+            fs::write(
+                &leaky_ffmpeg,
+                "#!/bin/sh\n(sleep 5) &\necho 'simulated failure' >&2\nexit 1\n",
+            )
+            .expect("write leaky stderr script");
+            let mut perms = fs::metadata(&leaky_ffmpeg)
+                .expect("stat leaky script")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&leaky_ffmpeg, perms).expect("chmod leaky script");
+
+            let leaky_settings = ExportSettings {
+                ffmpeg_binary: Some(leaky_ffmpeg),
+                ..preset_settings
+            };
+            let no_cancel = Arc::new(AtomicBool::new(false));
+            let start = std::time::Instant::now();
+            let err = export_video(
+                &leaky_settings,
+                Some(&audio),
+                &no_cancel,
+                |_idx, _buf: &mut Vec<u8>| unreachable!("M4A export must not render frames"),
+            )
+            .expect_err("failing M4A script must return FfmpegFailed");
+            let elapsed = start.elapsed();
+
+            assert!(
+                matches!(
+                    err,
+                    ExportError::FfmpegFailed {
+                        exit_code: Some(1),
+                        ..
+                    }
+                ),
+                "expected FfmpegFailed(exit_code=1), got {err:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "M4A export with inherited stderr pipe must not block until background sleep finishes, took {elapsed:?}"
             );
         }
     }

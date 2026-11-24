@@ -27,7 +27,7 @@ use zc_export::{
 use zc_plugin::PluginRegistry;
 use zc_project::{
     LayerKind, Project, PropertyTrack, PropertyValue, Sequence,
-    StaticBehavior as ProjectStaticBehavior, Uuid, import_pz, load_zcraft, save_zcraft,
+    StaticBehavior as ProjectStaticBehavior, Uuid, export_pz, import_pz, load_zcraft, save_zcraft,
 };
 use zc_render::ProjectRenderEngine;
 use zc_session::{Session, dispatch_json_lines};
@@ -57,13 +57,21 @@ enum Commands {
         project: PathBuf,
     },
 
-    /// Import a ClipMaker 3 `.pz` archive and atomically save it as `.zcraft`.
+    /// Import a `.pz` archive and atomically save it as `.zcraft`.
     ImportPz {
         /// Path to the input `.pz` file.
         input: PathBuf,
         /// Destination `.zcraft` output path.
         #[arg(long, short = 'o')]
         out: PathBuf,
+    },
+
+    /// Export a `.zcraft` or `.pz` project and atomically save it as a `.pz` archive.
+    ExportPz {
+        /// Path to the input `.zcraft` or `.pz` file.
+        input: PathBuf,
+        /// Destination `.pz` output path.
+        output: PathBuf,
     },
 
     /// Render a single frame headlessly on the GPU and save it as PNG, JPEG, or WebP.
@@ -184,6 +192,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Info { project } => cmd_info(&project),
         Commands::Validate { project } => cmd_validate(&project),
         Commands::ImportPz { input, out } => cmd_import_pz(&input, &out),
+        Commands::ExportPz { input, output } => cmd_export_pz(&input, &output),
         Commands::Render {
             project,
             frame,
@@ -396,6 +405,35 @@ fn cmd_import_pz(input: &Path, out: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_export_pz(input: &Path, output: &Path) -> Result<(), String> {
+    let (project, warnings) =
+        load_project_any(input).map_err(|e| format!("failed to load {}: {e}", input.display()))?;
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create output directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    export_pz(&project, output)
+        .map_err(|e| format!("failed to export {}: {e}", output.display()))?;
+    println!(
+        "Exported '{}' -> {} ({} video tracks, {} audio tracks, {} assets)",
+        project.name,
+        output.display(),
+        project.sequence.video_tracks.len(),
+        project.sequence.audio_tracks.len(),
+        project.assets.len(),
+    );
+    Ok(())
+}
+
 fn cmd_render(
     project_path: Option<&Path>,
     frame: f64,
@@ -598,9 +636,11 @@ fn build_scalar_property(track: &PropertyTrack, default: f64) -> DynamicProperty
         ProjectStaticBehavior::Linear => StaticBehavior::Linear,
         ProjectStaticBehavior::Constant => StaticBehavior::Constant,
     };
-    if (!track.animated && static_behavior == StaticBehavior::Constant)
-        || track.keyframes.is_empty()
-    {
+    let use_keyframes = !track.keyframes.is_empty()
+        && (track.animated
+            || static_behavior == StaticBehavior::Linear
+            || track.keyframes.len() > 1);
+    if !use_keyframes {
         return DynamicProperty::new_static(base);
     }
     let mut prop = DynamicProperty::new_static(base);
@@ -623,8 +663,11 @@ fn build_scalar_property(track: &PropertyTrack, default: f64) -> DynamicProperty
             key.interpolated = mode != InterpolationMode::Discrete;
             if mode == InterpolationMode::Bezier {
                 key.in_tangent = Some(kf.control_points[0]);
-                key.out_tangent = Some(kf.control_points[1]);
             }
+            // Always preserve `k0.out_tangent` even when `k0` itself is not Bezier, because
+            // CM3 stores `(tween >> 8) == 1` on the segment's end keyframe `k1` while `k0`
+            // supplies the segment's outgoing handle (`control_points[1]`).
+            key.out_tangent = Some(kf.control_points[1]);
             key.continuous_tangent = kf.continuous_tangent;
             prop.set_keyframe(key);
         }
@@ -1534,6 +1577,15 @@ mod tests {
                 ..
             }
         ));
+
+        let exp_pz =
+            Cli::try_parse_from(["zoidcraft-cli", "export-pz", "source.zcraft", "archive.pz"])
+                .expect("export-pz subcommand must parse");
+        assert!(matches!(
+            exp_pz.command,
+            Commands::ExportPz { ref input, ref output }
+                if input == Path::new("source.zcraft") && output == Path::new("archive.pz")
+        ));
     }
 
     #[test]
@@ -2042,5 +2094,161 @@ mod tests {
         let mixed = mix_project_audio(&project, 0, 10.0, fps, STANDARD_SAMPLE_RATE)
             .expect("video-only MP4 must not abort audio mixing");
         assert!(mixed.is_none());
+    }
+
+    #[test]
+    fn cli_export_pz_round_trips_zcraft_and_pz_through_import_pz() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("zoidcraft_cli_export_pz_rt_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).expect("create temp test dir");
+
+        let mut project = Project::new_cm3_default();
+        project.name = "CLI Roundtrip Demo".to_owned();
+        project.sequence.resolution = [1280, 720];
+        project.sequence.fps = 60;
+        project.sequence.length_frames = 120.0;
+        let payload = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+        let asset_id = project.insert_binary_asset(
+            zc_project::AssetKind::Image,
+            "badge.png".to_owned(),
+            payload.clone(),
+        );
+
+        let zcraft_path = tmp_dir.join("input.zcraft");
+        save_zcraft(&project, &zcraft_path).expect("save .zcraft input");
+
+        // 1. Export `.zcraft` -> `.pz` (also verifying nested output directory creation).
+        let pz_out = tmp_dir.join("nested").join("exported.pz");
+        cmd_export_pz(&zcraft_path, &pz_out).expect("cmd_export_pz from .zcraft must succeed");
+        assert!(pz_out.is_file(), "exported .pz file must exist");
+
+        let imported = import_pz(&pz_out).expect("import_pz must read exported .pz");
+        assert!(
+            imported.warnings.is_empty(),
+            "expected zero warnings on round-trip import, got: {:?}",
+            imported.warnings
+        );
+        assert_eq!(imported.project.name, "CLI Roundtrip Demo");
+        assert_eq!(imported.project.sequence.resolution, [1280, 720]);
+        assert_eq!(imported.project.sequence.fps, 60);
+        assert!((imported.project.sequence.length_frames - 120.0).abs() < 1e-6);
+        assert_eq!(
+            imported.project.sequence.video_tracks.len(),
+            project.sequence.video_tracks.len()
+        );
+        assert!(
+            imported.project.assets.values().any(
+                |a| a.filename == "badge.png" && a.bytes.as_deref() == Some(payload.as_slice())
+            ),
+            "embedded asset ({asset_id}) must survive .zcraft -> export-pz -> import_pz"
+        );
+
+        // 2. Re-export `.pz` -> `.pz` via CLI `run(...)` and re-import cleanly.
+        let pz_reout = tmp_dir.join("reexported.pz");
+        let cli = Cli::try_parse_from([
+            "zoidcraft-cli",
+            "export-pz",
+            pz_out.to_str().unwrap(),
+            pz_reout.to_str().unwrap(),
+        ])
+        .expect("parse export-pz with real paths");
+        run(cli).expect("run export-pz from .pz must succeed");
+
+        let reimported = import_pz(&pz_reout).expect("import_pz must read re-exported .pz");
+        assert!(
+            reimported.warnings.is_empty(),
+            "expected zero warnings on .pz -> .pz re-import, got: {:?}",
+            reimported.warnings
+        );
+        assert_eq!(reimported.project.name, "CLI Roundtrip Demo");
+        assert_eq!(reimported.project.sequence.resolution, [1280, 720]);
+        assert_eq!(reimported.project.sequence.fps, 60);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn build_scalar_property_evaluates_unanimated_multi_keyframes_and_preserves_k0_out_tangent() {
+        // 1. Multi-keyframe track with `animated: false` and `StaticBehavior::Constant`
+        //    must still evaluate all keyframes (matching CM3).
+        let mut unanimated = PropertyTrack::number(0.0);
+        unanimated.animated = false;
+        unanimated.static_behavior = ProjectStaticBehavior::Constant;
+        unanimated.keyframes = vec![
+            zc_project::PropertyKeyframe::linear(0.0, PropertyValue::Number(0.0)),
+            zc_project::PropertyKeyframe::linear(10.0, PropertyValue::Number(1.0)),
+        ];
+        assert!(
+            (eval_scalar_track(&unanimated, 5.0, 0.0) - 0.5).abs() < 1e-9,
+            "multi-keyframe track with animated=false must interpolate at midpoint"
+        );
+        assert!(
+            (eval_scalar_track(&unanimated, 10.0, 0.0) - 1.0).abs() < 1e-9,
+            "multi-keyframe track with animated=false must reach last keyframe"
+        );
+
+        // 2. Non-Bezier `k0` carrying a custom outgoing tangent `control_points[1]` into a
+        //    Bezier `k1` (`(tween >> 8) == 1`) must preserve `k0.out_tangent`.
+        let mut bezier_track = PropertyTrack::number(0.0);
+        bezier_track.animated = true;
+        bezier_track.keyframes = vec![
+            zc_project::PropertyKeyframe {
+                frame: 0.0,
+                value: PropertyValue::Number(0.0),
+                tween: 1, // Linear (NOT Bezier) on k0
+                easing_index: 1,
+                is_bezier: false,
+                control_points: [[0.0, 0.0], [2.0, 8.0]],
+                continuous_tangent: false,
+            },
+            zc_project::PropertyKeyframe {
+                frame: 10.0,
+                value: PropertyValue::Number(1.0),
+                tween: (1 << 8) | 1, // Bezier mode on segment end keyframe k1
+                easing_index: 1,
+                is_bezier: true,
+                control_points: [[-2.0, 0.0], [0.0, 0.0]],
+                continuous_tangent: false,
+            },
+        ];
+
+        let prop = build_scalar_property(&bezier_track, 0.0);
+        assert_eq!(prop.keyframes.len(), 2);
+        assert_eq!(prop.keyframes[0].in_tangent, None);
+        assert_eq!(prop.keyframes[0].out_tangent, Some([2.0, 8.0]));
+        assert_eq!(prop.keyframes[1].in_tangent, Some([-2.0, 0.0]));
+
+        let actual = prop.evaluate(5.0);
+        let expected = zc_anim::eval_segment_bezier(
+            zc_anim::BezierSegment {
+                start_frame: 0.0,
+                start_value: 0.0,
+                out_tangent: [2.0, 8.0],
+                end_frame: 10.0,
+                end_value: 1.0,
+                in_tangent: [-2.0, 0.0],
+            },
+            5.0,
+        );
+        let fallback_default_tangent = zc_anim::eval_segment_bezier(
+            zc_anim::BezierSegment {
+                start_frame: 0.0,
+                start_value: 0.0,
+                out_tangent: [10.0, 0.0],
+                end_frame: 10.0,
+                end_value: 1.0,
+                in_tangent: [-2.0, 0.0],
+            },
+            5.0,
+        );
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "Bezier evaluation must use k0.control_points[1] (got {actual}, expected {expected})"
+        );
+        assert!(
+            (actual - fallback_default_tangent).abs() > 1.0,
+            "k0 custom out_tangent must meaningfully differ from default [10.0, 0.0] tangent"
+        );
     }
 }

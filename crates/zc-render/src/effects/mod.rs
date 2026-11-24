@@ -505,9 +505,9 @@ fn composite_cm3_blend(
         return vec4<f32>(min(out_c.rgb, vec3<f32>(out_c.a)), out_c.a);
     }
     if (blend_mode == 17u) {
-        // BLEND_MINUS
+        // BLEND_MINUS: preserve bg.a matching compositor.rs so opaque overlays don't wipe bg to transparent.
         let s = src_in * op;
-        let out_a = clamp(bg.a - s.a, 0.0, 1.0);
+        let out_a = bg.a;
         let out_rgb = clamp(bg.rgb - s.rgb, vec3<f32>(0.0), vec3<f32>(out_a));
         return vec4<f32>(out_rgb, out_a);
     }
@@ -4251,6 +4251,35 @@ mod tests {
                 && (i32::from(px[3]) - 191).abs() <= 3,
             "echo Screen unpremultiplied math mismatch: expected ~(128,128,0,191), got {:?}",
             &px[..4]
+        );
+
+        // 9. coloroverlay with BLEND_MINUS must preserve bg.a instead of wiping opaque bg to (0,0,0,0).
+        let src_minus = ctx
+            .create_rgba8_texture("minus_bg", 8, 8, &[204, 153, 102, 255].repeat(64))
+            .expect("minus_bg");
+        let p_minus = EffectParams::new([8.0, 8.0], 0.0, 0.0)
+            .with_param("color", EffectParamValue::Vec3([0.3, 0.2, 0.1]))
+            .with_param("opacity", EffectParamValue::Float(1.0))
+            .with_param(
+                "blending",
+                EffectParamValue::String("BLEND_MINUS".to_owned()),
+            );
+        let px = run_and_read(&mut registry, "coloroverlay", &src_minus, None, &p_minus);
+        // bg=(0.8, 0.6, 0.4, 1.0), s=(0.3, 0.2, 0.1, 1.0) -> (0.5, 0.4, 0.3, 1.0) = ~(128, 102, 77, 255)
+        assert!(
+            (i32::from(px[0]) - 128).abs() <= 3
+                && (i32::from(px[1]) - 102).abs() <= 3
+                && (i32::from(px[2]) - 77).abs() <= 3
+                && px[3] == 255,
+            "coloroverlay BLEND_MINUS must preserve bg.a & subtract RGB, got {:?}",
+            &px[..4]
+        );
+        // Over transparent backdrop, BLEND_MINUS stays transparent.
+        let px_clear = run_and_read(&mut registry, "coloroverlay", &src_clear, None, &p_minus);
+        assert_eq!(
+            &px_clear[..4],
+            &[0, 0, 0, 0],
+            "coloroverlay BLEND_MINUS over transparent bg must remain transparent"
         );
     }
 }

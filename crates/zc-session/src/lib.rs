@@ -1991,9 +1991,15 @@ fn flatten_objects_3d(
         let kind = match &obj.kind {
             zc_project::Object3DKind::Group { .. } => obj
                 .preserved
-                .get("type")
+                .get("zoidiumPluginObjectType")
                 .and_then(Value::as_str)
                 .filter(|k| is_3d_repeater_kind(k))
+                .or_else(|| {
+                    obj.preserved
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .filter(|k| is_3d_repeater_kind(k))
+                })
                 .map_or_else(|| object_3d_kind_to_str(&obj.kind), str::to_owned),
             _ => object_3d_kind_to_str(&obj.kind),
         };
@@ -3494,7 +3500,11 @@ impl Session {
     fn sync_document_to_project(&mut self) {
         self.project.name = self.document.project_name.clone();
         self.project.sequence.resolution = self.document.resolution;
-        self.project.sequence.fps = self.document.fps.round().clamp(1.0, 240.0) as u32;
+        let next_fps = self.document.fps.round().clamp(1.0, 240.0) as u32;
+        if self.project.sequence.fps != next_fps {
+            self.project.sequence.fps = next_fps;
+            self.project.sequence.exact_fps = None;
+        }
         self.project.sequence.length_frames = self.document.sequence_length;
 
         // Sync sequence-level motion blur & Expressions+ sequence controls.
@@ -4056,6 +4066,7 @@ impl Session {
                     )));
                 }
                 self.document.fps = fps.round().clamp(1.0, 240.0);
+                self.project.sequence.exact_fps = None;
                 self.playback.bump_epoch();
                 Ok(json!({ "fps": self.document.fps }))
             }
@@ -6545,13 +6556,13 @@ fn build_object_3d_from_session(
         let mut created = zc_project::Object3D::new(&sobj.name, kind);
         created.id = parse_uuid_or_new(&sobj.id);
         created.material = default_material;
-        if is_3d_repeater_kind(&sobj.kind) {
-            created
-                .preserved
-                .insert("type".to_string(), json!(sobj.kind));
-        }
         created
     });
+    if is_3d_repeater_kind(&sobj.kind) {
+        obj.preserved
+            .insert("zoidiumPluginObjectType".to_string(), json!(sobj.kind));
+        obj.preserved.remove("type");
+    }
     obj.name = sobj.name.clone();
     if let Some(p) = sobj.properties.get("enabled") {
         obj.enabled = session_property_to_track(p, Some(&obj.enabled));
@@ -10142,9 +10153,13 @@ mod tests {
                 .find(|o| o.id.to_string() == rep_id)
                 .expect("repeater in project");
             assert_eq!(
-                proj_rep.preserved.get("type"),
+                proj_rep.preserved.get("zoidiumPluginObjectType"),
                 Some(&json!(repeater_kind)),
-                "repeater preserved[\"type\"] must record {repeater_kind}"
+                "repeater preserved[\"zoidiumPluginObjectType\"] must record {repeater_kind}"
+            );
+            assert!(
+                !proj_rep.preserved.contains_key("type"),
+                "repeater should not store stale preserved[\"type\"]"
             );
             let zc_project::Object3DKind::Group { children, .. } = &proj_rep.kind else {
                 panic!(
@@ -10166,6 +10181,10 @@ mod tests {
             .iter()
             .find(|o| o.id.to_string() == group_id)
             .expect("plain group in project");
+        assert!(
+            !proj_group.preserved.contains_key("zoidiumPluginObjectType"),
+            "plain group should not gain preserved[\"zoidiumPluginObjectType\"]"
+        );
         assert!(
             !proj_group.preserved.contains_key("type"),
             "plain group should not gain preserved[\"type\"]"
@@ -11287,5 +11306,186 @@ mod tests {
         assert!(sel.effect_ids.is_empty());
         assert!(sel.keyframes.is_empty());
         assert_eq!(sel.object_3d_ids, vec!["obj-2"]);
+    }
+
+    #[test]
+    fn repeater_zoidium_plugin_object_type_roundtrips_through_pz_and_migrates_legacy_type() {
+        let mut session = Session::new();
+        let scene_id = session.document().video_tracks[0].clips[0].id.clone();
+
+        let rep_id = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "zoidium:repeater/echo-repeater".to_string(),
+                name: Some("Echo Repeater".to_string()),
+            })
+            .expect("add echo repeater")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id,
+                parent_id: Some(rep_id),
+                kind: "sphere".to_string(),
+                name: Some("Echo Child".to_string()),
+            })
+            .expect("add child under echo repeater");
+
+        // Export to .pz and re-import: must emit the real repeater plugin type, not plain CM3 group 5.
+        let pz_bytes = zc_project::export_pz_to_bytes(&session.project).expect("export pz");
+        let imported = zc_project::import_pz_from_bytes(&pz_bytes).expect("import pz");
+        let zc_project::LayerKind::Scene3D { objects, .. } =
+            &imported.project.sequence.video_tracks[0].clips[0]
+                .layer
+                .kind
+        else {
+            panic!("expected Scene3D after pz import");
+        };
+        let imported_rep = objects
+            .iter()
+            .find(|o| o.name == "Echo Repeater")
+            .expect("re-imported echo repeater");
+        assert_eq!(
+            imported_rep.preserved.get("zoidiumPluginObjectType"),
+            Some(&json!("zoidium:repeater/echo-repeater")),
+            ".pz round-trip must preserve zoidiumPluginObjectType"
+        );
+        assert!(
+            !imported_rep.preserved.contains_key("type"),
+            ".pz round-trip must not leak stale preserved[\"type\"]"
+        );
+        let reloaded = Session::from_project(imported.project, zc_plugin::PluginRegistry::new());
+        let reloaded_objs = &reloaded.document().video_tracks[0].clips[0].objects_3d;
+        let doc_rep = reloaded_objs
+            .iter()
+            .find(|o| o.name == "Echo Repeater")
+            .expect("echo repeater in SessionDocument");
+        assert_eq!(doc_rep.kind, "zoidium:repeater/echo-repeater");
+        assert!(
+            reloaded_objs
+                .iter()
+                .any(|o| o.name == "Echo Child"
+                    && o.parent_id.as_deref() == Some(doc_rep.id.as_str())),
+            "child of echo repeater must survive .pz round-trip"
+        );
+
+        // Legacy fallback: an existing Group with preserved["type"] is recognized on load and
+        // migrated to preserved["zoidiumPluginObjectType"] without stale "type" on sync.
+        let mut legacy_project = zc_project::Project::new_cm3_default();
+        let mut legacy_rep = zc_project::Object3D::new(
+            "Legacy Linear Repeater",
+            zc_project::Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: Vec::new(),
+            },
+        );
+        legacy_rep.preserved.insert(
+            "type".to_string(),
+            json!("zoidium:repeater/linear-repeater"),
+        );
+        if let zc_project::LayerKind::Scene3D { objects, .. } =
+            &mut legacy_project.sequence.video_tracks[0].clips[0].layer.kind
+        {
+            objects.push(legacy_rep);
+        }
+        let mut legacy_session =
+            Session::from_project(legacy_project, zc_plugin::PluginRegistry::new());
+        assert!(
+            legacy_session.document().video_tracks[0].clips[0]
+                .objects_3d
+                .iter()
+                .any(|o| o.name == "Legacy Linear Repeater"
+                    && o.kind == "zoidium:repeater/linear-repeater"),
+            "SessionDocument::from_project must fall back to preserved[\"type\"]"
+        );
+        legacy_session
+            .execute(Command::SetProjectName {
+                name: "Migrated".to_string(),
+            })
+            .expect("trigger sync");
+        let zc_project::LayerKind::Scene3D { objects, .. } =
+            &legacy_session.project.sequence.video_tracks[0].clips[0]
+                .layer
+                .kind
+        else {
+            panic!("expected Scene3D");
+        };
+        let synced_legacy = objects
+            .iter()
+            .find(|o| o.name == "Legacy Linear Repeater")
+            .expect("synced legacy repeater");
+        assert_eq!(
+            synced_legacy.preserved.get("zoidiumPluginObjectType"),
+            Some(&json!("zoidium:repeater/linear-repeater")),
+            "sync must migrate legacy repeater to preserved[\"zoidiumPluginObjectType\"]"
+        );
+        assert!(
+            !synced_legacy.preserved.contains_key("type"),
+            "sync must remove stale preserved[\"type\"] on repeater"
+        );
+    }
+
+    #[test]
+    fn set_fps_clears_stale_exact_fps_and_undo_redo_restores_it() {
+        let mut project = zc_project::Project::new_cm3_default();
+        project.sequence.fps = 30;
+        project.sequence.exact_fps = Some(29.97);
+        let mut session = Session::from_project(project, zc_plugin::PluginRegistry::new());
+
+        // Unrelated edits must preserve fractional exact_fps.
+        session
+            .execute(Command::SetProjectName {
+                name: "NTSC Project".to_string(),
+            })
+            .expect("rename");
+        assert_eq!(session.project.sequence.fps, 30);
+        assert_eq!(session.project.sequence.exact_fps, Some(29.97));
+
+        // SetFps to a new integer FPS clears stale exact_fps so .pz export uses 60, not 29.97.
+        session
+            .execute(Command::SetFps { fps: 60.0 })
+            .expect("set fps 60");
+        assert_eq!(session.document().fps, 60.0);
+        assert_eq!(session.project.sequence.fps, 60);
+        assert_eq!(session.project.sequence.exact_fps, None);
+
+        let pz_bytes = zc_project::export_pz_to_bytes(&session.project).expect("export pz");
+        let reimported = zc_project::import_pz_from_bytes(&pz_bytes).expect("import pz");
+        assert_eq!(reimported.project.sequence.fps, 60);
+        assert!(
+            reimported
+                .project
+                .sequence
+                .exact_fps
+                .is_none_or(|r| (r - 60.0).abs() < 1e-9),
+            "exported .pz rate must be 60, not stale 29.97 (got {:?})",
+            reimported.project.sequence.exact_fps
+        );
+
+        // Undo restores exact_fps; Redo clears it again.
+        session.execute(Command::Undo).expect("undo SetFps");
+        assert_eq!(session.document().fps, 30.0);
+        assert_eq!(session.project.sequence.fps, 30);
+        assert_eq!(session.project.sequence.exact_fps, Some(29.97));
+
+        session.execute(Command::Redo).expect("redo SetFps");
+        assert_eq!(session.document().fps, 60.0);
+        assert_eq!(session.project.sequence.fps, 60);
+        assert_eq!(session.project.sequence.exact_fps, None);
+
+        // Explicitly setting integer 30 on a 29.97 project also clears exact_fps, and Undo restores it.
+        session.execute(Command::Undo).expect("undo back to 29.97");
+        assert_eq!(session.project.sequence.exact_fps, Some(29.97));
+        session
+            .execute(Command::SetFps { fps: 30.0 })
+            .expect("set fps 30");
+        assert_eq!(session.project.sequence.fps, 30);
+        assert_eq!(session.project.sequence.exact_fps, None);
+        session.execute(Command::Undo).expect("undo snap to 30");
+        assert_eq!(session.project.sequence.exact_fps, Some(29.97));
     }
 }

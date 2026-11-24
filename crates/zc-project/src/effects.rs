@@ -538,14 +538,23 @@ pub const fn zoidium_effect_catalog() -> &'static [EffectDescriptor] {
     &ZOIDIUM_EFFECTS
 }
 
+fn canonical_zoidium_effect_id(lower: &str) -> &str {
+    match lower {
+        "looks" => "magiclooks",
+        "sglow-hq-v2-preview" => "sglow",
+        _ => lower,
+    }
+}
+
 /// Looks up an effect descriptor by ID across standard CM3 and Zoidium plugin catalogs.
 #[must_use]
 pub fn find_effect_descriptor(id: &str) -> Option<&'static EffectDescriptor> {
     let lower = id.to_ascii_lowercase();
+    let canonical = canonical_zoidium_effect_id(&lower);
     STANDARD_EFFECTS
         .iter()
         .chain(ZOIDIUM_EFFECTS.iter())
-        .find(|desc| desc.id == lower)
+        .find(|desc| desc.id == lower || desc.id == canonical)
 }
 
 /// Instantiates a standard CM3 effect with exact Spec 04 default parameters.
@@ -568,7 +577,8 @@ pub fn create_standard_effect(id: &str) -> Option<EffectInstance> {
 #[must_use]
 pub fn create_zoidium_effect(id: &str) -> Option<EffectInstance> {
     let lower = id.to_ascii_lowercase();
-    let desc = ZOIDIUM_EFFECTS.iter().find(|d| d.id == lower)?;
+    let canonical = canonical_zoidium_effect_id(&lower);
+    let desc = ZOIDIUM_EFFECTS.iter().find(|d| d.id == canonical)?;
     let params = default_zoidium_params(desc.id)?;
     Some(EffectInstance {
         id: Uuid::new_v4(),

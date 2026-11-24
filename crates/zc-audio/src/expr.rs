@@ -10,7 +10,7 @@
 //! Any syntax or runtime error gracefully falls back to the caller's base keyframed `value`.
 
 use std::collections::HashMap;
-use std::f64::consts::{E, LN_2, LN_10, PI, SQRT_2, TAU};
+use std::f64::consts::{E, FRAC_PI_2, LN_2, LN_10, PI, SQRT_2};
 
 /// Maximum AST evaluation steps per call to prevent infinite loops or DoS expressions.
 const MAX_EVAL_STEPS: usize = 4_096;
@@ -823,14 +823,13 @@ impl<'a> EvalState<'a> {
                 let hi = arg_f64(args, 2)?;
                 Ok(Val::Num(v.max(lo).min(hi)))
             }
-            "linear" => eval_remap(args, |u| u).map(Val::Num),
-            "ease" => eval_remap(args, |u| u * u * (3.0 - 2.0 * u)).map(Val::Num),
+            "linear" => eval_linear(args).map(Val::Num),
+            "ease" => eval_ease(args).map(Val::Num),
             "easeIn" => eval_remap(args, |u| u * u).map(Val::Num),
             "easeOut" => eval_remap(args, |u| u * (2.0 - u)).map(Val::Num),
             "wave" => {
-                let x = arg_f64(args, 0)?;
-                let freq = args.get(1).map(val_to_f64).transpose()?.unwrap_or(1.0);
-                Ok(Val::Num((x * freq * TAU).sin()))
+                let x = args.first().map(val_to_f64).transpose()?.unwrap_or(0.0);
+                Ok(Val::Num(cm3_wave(to_i32(x))))
             }
             "random" => {
                 let seed = arg_f64(args, 0)?;
@@ -851,6 +850,57 @@ fn arg_f64(args: &[Val], idx: usize) -> Result<f64, String> {
         .get(idx)
         .ok_or_else(|| format!("missing argument at index {idx}"))?;
     val_to_f64(v)
+}
+
+fn arg_str(args: &[Val], idx: usize) -> Result<&str, String> {
+    match args.get(idx) {
+        Some(Val::Str(s)) => Ok(s.as_str()),
+        Some(_) => Err(format!("expected string argument at index {idx}")),
+        None => Err(format!("missing argument at index {idx}")),
+    }
+}
+
+fn eval_linear(args: &[Val]) -> Result<f64, String> {
+    match args.len() {
+        1 => Ok(arg_f64(args, 0)?.clamp(0.0, 1.0)),
+        // Vanilla CM3 3-argument form: `linear(a, b, t) = (b - a) * t + a`.
+        3 => {
+            let a = arg_f64(args, 0)?;
+            let b = arg_f64(args, 1)?;
+            let t = arg_f64(args, 2)?;
+            Ok((b - a) * t + a)
+        }
+        // Expressions+ 5-argument form: `linear(t, tMin, tMax, a, b)`.
+        5 => eval_remap(args, |u| u),
+        n => Err(format!("expected 1, 3, or 5 arguments, got {n}")),
+    }
+}
+
+fn eval_ease(args: &[Val]) -> Result<f64, String> {
+    match args.len() {
+        1 => {
+            let t = arg_f64(args, 0)?;
+            cm3_ease(t, "Quadratic", "InOut")
+        }
+        2 => {
+            let t = arg_f64(args, 0)?;
+            let family = arg_str(args, 1)?;
+            cm3_ease(t, family, "InOut")
+        }
+        3 => {
+            if matches!(args.get(1), Some(Val::Str(_))) || matches!(args.get(2), Some(Val::Str(_)))
+            {
+                let t = arg_f64(args, 0)?;
+                let family = arg_str(args, 1)?;
+                let dir = arg_str(args, 2)?;
+                cm3_ease(t, family, dir)
+            } else {
+                eval_remap(args, |u| u * u * (3.0 - 2.0 * u))
+            }
+        }
+        5 => eval_remap(args, |u| u * u * (3.0 - 2.0 * u)),
+        n => Err(format!("expected 1, 2, 3, or 5 arguments, got {n}")),
+    }
 }
 
 fn eval_remap<F: Fn(f64) -> f64>(args: &[Val], curve: F) -> Result<f64, String> {
@@ -885,11 +935,209 @@ fn eval_remap<F: Fn(f64) -> f64>(args: &[Val], curve: F) -> Result<f64, String> 
     }
 }
 
-/// Deterministic CM3 1-arg `random(x)` hash matching `PZ.expression` (`Math.sin(x) * 10000` frac).
+/// Deterministic CM3 1-arg `random(x)` hash matching `zc-expr` (`fract(10000 * sin(x))` in `[0, 1)`).
 #[inline]
 fn cm3_random(seed: f64) -> f64 {
-    let x = (seed * 12.9898 + 78.233).sin() * 43758.5453;
-    x - x.floor()
+    let v = 10_000.0 * seed.sin();
+    v - v.floor()
+}
+
+/// ECMAScript `ToInt32` matching `zc-expr/src/builtins.rs`.
+#[inline]
+fn to_i32(n: f64) -> i32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    let trunc = n.trunc().rem_euclid(4_294_967_296.0);
+    (trunc as u32) as i32
+}
+
+/// Exact CM3 square wave matching `zc-expr/src/builtins.rs`: `2 * (n & 1) - 1`.
+#[inline]
+fn cm3_wave(n: i32) -> f64 {
+    2.0 * ((n & 1) as f64) - 1.0
+}
+
+/// Evaluates CM3 easing families matching `zc-expr/src/builtins.rs::cm3_ease`.
+fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, String> {
+    let fam = family.to_ascii_lowercase();
+    let d = dir.to_ascii_lowercase();
+    if fam == "linear" {
+        return Ok(t);
+    }
+
+    let val = match (fam.as_str(), d.as_str()) {
+        ("quadratic" | "quad", "in") => t * t,
+        ("quadratic" | "quad", "out") => t * (2.0 - t),
+        ("quadratic" | "quad", "inout") => {
+            let k = t * 2.0;
+            if k < 1.0 {
+                0.5 * k * k
+            } else {
+                -0.5 * ((k - 1.0) * (k - 3.0) - 1.0)
+            }
+        }
+        ("cubic", "in") => t * t * t,
+        ("cubic", "out") => {
+            let k = t - 1.0;
+            k * k * k + 1.0
+        }
+        ("cubic", "inout") => {
+            let k = t * 2.0;
+            if k < 1.0 {
+                0.5 * k * k * k
+            } else {
+                let m = k - 2.0;
+                0.5 * (m * m * m + 2.0)
+            }
+        }
+        ("cubic", "outin") => {
+            let k = t - 0.5;
+            4.0 * k * k * k + 0.5
+        }
+        ("quartic" | "quart", "in") => t.powi(4),
+        ("quartic" | "quart", "out") => 1.0 - (t - 1.0).powi(4),
+        ("quartic" | "quart", "inout") => {
+            let k = t * 2.0;
+            if k < 1.0 {
+                0.5 * k.powi(4)
+            } else {
+                -0.5 * ((k - 2.0).powi(4) - 2.0)
+            }
+        }
+        ("quintic" | "quint", "in") => t.powi(5),
+        ("quintic" | "quint", "out") => (t - 1.0).powi(5) + 1.0,
+        ("quintic" | "quint", "inout") => {
+            let k = t * 2.0;
+            if k < 1.0 {
+                0.5 * k.powi(5)
+            } else {
+                0.5 * ((k - 2.0).powi(5) + 2.0)
+            }
+        }
+        ("sinusoidal" | "sine", "in") => 1.0 - (t * FRAC_PI_2).cos(),
+        ("sinusoidal" | "sine", "out") => (t * FRAC_PI_2).sin(),
+        ("sinusoidal" | "sine", "inout") => 0.5 * (1.0 - (PI * t).cos()),
+        ("exponential" | "expo", "in") => {
+            if t == 0.0 {
+                0.0
+            } else {
+                2.0_f64.powf(10.0 * (t - 1.0))
+            }
+        }
+        ("exponential" | "expo", "out") => {
+            if t == 1.0 {
+                1.0
+            } else {
+                1.0 - 2.0_f64.powf(-10.0 * t)
+            }
+        }
+        ("exponential" | "expo", "inout") => {
+            if t == 0.0 {
+                0.0
+            } else if t == 1.0 {
+                1.0
+            } else {
+                let k = t * 2.0;
+                if k < 1.0 {
+                    0.5 * 2.0_f64.powf(10.0 * (k - 1.0))
+                } else {
+                    0.5 * (2.0 - 2.0_f64.powf(-10.0 * (k - 1.0)))
+                }
+            }
+        }
+        ("circular" | "circ", "in") => 1.0 - (1.0 - t * t).max(0.0).sqrt(),
+        ("circular" | "circ", "out") => {
+            let k = t - 1.0;
+            (1.0 - k * k).max(0.0).sqrt()
+        }
+        ("circular" | "circ", "inout") => {
+            let k = t * 2.0;
+            if k < 1.0 {
+                -0.5 * ((1.0 - k * k).max(0.0).sqrt() - 1.0)
+            } else {
+                let m = k - 2.0;
+                0.5 * ((1.0 - m * m).max(0.0).sqrt() + 1.0)
+            }
+        }
+        ("elastic", "in") => {
+            if t == 0.0 {
+                0.0
+            } else if t == 1.0 {
+                1.0
+            } else {
+                -(2.0_f64.powf(10.0 * (t - 1.0))) * ((t - 1.1) * 5.0 * PI).sin()
+            }
+        }
+        ("elastic", "out") => {
+            if t == 0.0 {
+                0.0
+            } else if t == 1.0 {
+                1.0
+            } else {
+                2.0_f64.powf(-10.0 * t) * ((t - 0.1) * 5.0 * PI).sin() + 1.0
+            }
+        }
+        ("elastic", "inout") => {
+            if t == 0.0 {
+                0.0
+            } else if t == 1.0 {
+                1.0
+            } else {
+                let k = t * 2.0;
+                if k < 1.0 {
+                    -0.5 * 2.0_f64.powf(10.0 * (k - 1.0)) * ((k - 1.1) * 5.0 * PI).sin()
+                } else {
+                    0.5 * 2.0_f64.powf(-10.0 * (k - 1.0)) * ((k - 1.1) * 5.0 * PI).sin() + 1.0
+                }
+            }
+        }
+        ("back", "in") => {
+            let s = 1.70158;
+            t * t * ((s + 1.0) * t - s)
+        }
+        ("back", "out") => {
+            let s = 1.70158;
+            let k = t - 1.0;
+            k * k * ((s + 1.0) * k + s) + 1.0
+        }
+        ("back", "inout") => {
+            let s = 1.70158 * 1.525;
+            let k = t * 2.0;
+            if k < 1.0 {
+                0.5 * (k * k * ((s + 1.0) * k - s))
+            } else {
+                let m = k - 2.0;
+                0.5 * (m * m * ((s + 1.0) * m + s) + 2.0)
+            }
+        }
+        ("bounce", "in") => 1.0 - bounce_out(1.0 - t),
+        ("bounce", "out") => bounce_out(t),
+        ("bounce", "inout") => {
+            if t < 0.5 {
+                (1.0 - bounce_out(1.0 - t * 2.0)) * 0.5
+            } else {
+                bounce_out(t * 2.0 - 1.0) * 0.5 + 0.5
+            }
+        }
+        _ => return Err(format!("unknown easing curve '{family}.{dir}'")),
+    };
+    Ok(val)
+}
+
+fn bounce_out(k: f64) -> f64 {
+    if k < 1.0 / 2.75 {
+        7.5625 * k * k
+    } else if k < 2.0 / 2.75 {
+        let m = k - 1.5 / 2.75;
+        7.5625 * m * m + 0.75
+    } else if k < 2.5 / 2.75 {
+        let m = k - 2.25 / 2.75;
+        7.5625 * m * m + 0.9375
+    } else {
+        let m = k - 2.625 / 2.75;
+        7.5625 * m * m + 0.984375
+    }
 }
 
 fn eval_math_call(method: &str, args: &[Val]) -> Result<f64, String> {
@@ -1008,5 +1256,97 @@ mod tests {
         // Invalid expression gracefully falls back to `ctx.value`
         let fb = eval_audio_expression_or_fallback("thisLayer.toWorld([0,0,0])", &ctx);
         assert!((fb - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cm3_parity_for_random_wave_linear_and_ease() {
+        let empty = HashMap::new();
+        let ctx = AudioExprContext {
+            frame: 15.0,
+            time: 0.5,
+            fps: 30.0,
+            value: 0.0,
+            controls_by_name: &empty,
+            controls_by_id: &empty,
+        };
+
+        // 1. random(seed): fract(10000 * sin(seed)) in [0, 1), including negative sin(seed).
+        for seed in [0.0_f64, 1.0, 4.0, 42.0, -1.5, 123.456] {
+            let v = 10_000.0 * seed.sin();
+            let expected = v - v.floor();
+            let got = eval_audio_expression(&format!("random({seed})"), &ctx).unwrap();
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "random({seed}): got {got}, expected {expected}"
+            );
+            assert!(
+                (0.0..1.0).contains(&got),
+                "random({seed}) out of [0, 1): {got}"
+            );
+        }
+
+        // 2. wave(x): CM3 square wave `2 * ((trunc(x) as i32) & 1) - 1`.
+        for (expr, expected) in [
+            ("wave(0)", -1.0),
+            ("wave(1)", 1.0),
+            ("wave(2)", -1.0),
+            ("wave(3.9)", 1.0),
+            ("wave(2.9)", -1.0),
+            ("wave(-1.5)", 1.0),
+            ("wave(-2.5)", -1.0),
+        ] {
+            let got = eval_audio_expression(expr, &ctx).unwrap();
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "{expr}: got {got}, expected {expected}"
+            );
+        }
+
+        // 3. 3-arg linear(a, b, t): CM3 parameter order `(b - a) * t + a` (unclamped), plus 5-arg AE remap.
+        assert!(
+            (eval_audio_expression("linear(10, 20, 0.25)", &ctx).unwrap() - 12.5).abs() < 1e-12
+        );
+        assert!((eval_audio_expression("linear(10, 20, 2.0)", &ctx).unwrap() - 30.0).abs() < 1e-12);
+        assert!(
+            (eval_audio_expression("linear(0.5, 0, 1, 100, 200)", &ctx).unwrap() - 150.0).abs()
+                < 1e-12
+        );
+
+        // 4. ease(t, family, dir): CM3 string easing curves (including Cubic OutIn).
+        assert!(
+            (eval_audio_expression("ease(0.25, \"Cubic\", \"OutIn\")", &ctx).unwrap() - 0.4375)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (eval_audio_expression("ease(0.5, 'Quadratic', 'In')", &ctx).unwrap() - 0.25).abs()
+                < 1e-12
+        );
+        assert!(
+            (eval_audio_expression("ease(0.5, 'Quadratic', 'InOut')", &ctx).unwrap() - 0.5).abs()
+                < 1e-12
+        );
+        assert!(
+            (eval_audio_expression("ease(0.5, 'Cubic', 'Out')", &ctx).unwrap() - 0.875).abs()
+                < 1e-12
+        );
+        assert!(
+            (eval_audio_expression("ease(0.25, 'Linear', 'In')", &ctx).unwrap() - 0.25).abs()
+                < 1e-12
+        );
+        assert!(
+            (eval_audio_expression("ease(0.25, 'Sinusoidal', 'InOut')", &ctx).unwrap()
+                - 0.5 * (1.0 - (PI * 0.25).cos()))
+            .abs()
+                < 1e-12
+        );
+        // 1-arg default Quadratic.InOut and 5-arg AE smoothstep still work.
+        assert!((eval_audio_expression("ease(0.25)", &ctx).unwrap() - 0.125).abs() < 1e-12);
+        assert!(
+            (eval_audio_expression("ease(0.25, 0, 1, 0, 100)", &ctx).unwrap() - 15.625).abs()
+                < 1e-12
+        );
+        // Unknown curve returns error (and fallback returns ctx.value).
+        assert!(eval_audio_expression("ease(0.5, 'NoSuchCurve', 'In')", &ctx).is_err());
     }
 }

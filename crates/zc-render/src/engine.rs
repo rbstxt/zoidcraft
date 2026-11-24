@@ -11,6 +11,12 @@ use std::sync::Arc;
 
 use tracing::{debug, warn};
 use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
+use zc_expr::expresstext::{
+    EffectorKind as ExpressTextEffectorKind, EffectorLayer as ExpressTextLayer, EtPropReader,
+    EtValue, EvalAux as ExpressTextEvalAux, LetterList as ExpressTextLetterList,
+    TextTransform as ExpressTextTransform, evaluate_stack as evaluate_expresstext_stack,
+    world_base_of as expresstext_world_base_of,
+};
 use zc_expr::{
     EvalConfig, ExprContext, ExprError, HandleId, HandleRef, KeyframeRecord, NameOrIndex,
     Value as ExprValue,
@@ -29,14 +35,21 @@ use zc_project::{
     StaticBehavior as ProjectStaticBehavior, Text3DAlign, Uuid, VideoClip,
 };
 use zc_scene::{
-    CameraShakeMode, CameraShakeParams as SceneCameraShakeParams, DeformAxis,
-    GradientStop as ParticleGradientStop, MeshData, ParticleBlending, ParticleSystemParams,
-    PositionDistribution, Text3DParams, TextAlignMode, UvMode, VelocityDistribution, Vertex3D,
-    apply_repeater, apply_twist, apply_voronoi_fracture, apply_warp, build_box, build_capsule,
-    build_circle, build_cylinder, build_dodecahedron, build_donut, build_fallback_text_mesh,
-    build_icosahedron, build_octahedron, build_rectangle, build_rounded_box, build_sphere,
-    build_tetrahedron, build_text3d_mesh, build_wire, evaluate_camera_shake, evaluate_particles,
-    parse_obj,
+    BevelProfile, BevelSide, CameraShakeMode, CameraShakeParams as SceneCameraShakeParams,
+    DeformAxis, DelayMode, DelayParams, EffectorField, EffectorFieldType, FieldFalloffCurve,
+    FractureDistribution, GradientStop as ParticleGradientStop, MAX_REPEATS, MeshData,
+    ParticleBlending, ParticleSystemParams, PlainParams, PositionDistribution, RepeaterMode,
+    RepeaterParams, SPRING_CYCLES, SPRING_DAMPING, Text3DExtendedOptions, Text3DParams,
+    TextAlignMode, TextScaleMode, TwistParams, UvMode, VelocityDistribution, Vertex3D,
+    VoronoiFractureParams, WarpAxis, WarpParams, apply_delay, apply_plain,
+    apply_repeater_with_params, apply_twist_with_params, apply_voronoi_fracture_with_params,
+    apply_warp_with_params, build_box, build_capsule, build_circle, build_cylinder,
+    build_dodecahedron, build_donut, build_fallback_text_mesh,
+    build_fallback_text_mesh_with_options, build_icosahedron, build_octahedron, build_rectangle,
+    build_rounded_box, build_sphere, build_tetrahedron, build_text3d_character_meshes,
+    build_text3d_mesh, build_text3d_mesh_with_options, build_wire, compute_deformer_frame,
+    compute_shared_deformer_bounds, evaluate_camera_shake, evaluate_particles, parse_obj,
+    repeater_echo_frames, repeater_instance_transform,
 };
 use zc_shader::{CompileOptions, CompiledCustomShader, UniformType, UniformValue, pack_uniforms};
 
@@ -51,11 +64,12 @@ use crate::effects::{
     fnv1a_hash64, lookup_effect_shader,
 };
 use crate::scene3d::{
-    CameraParams, CompatMode as RenderCompatMode, CullSide, GpuMesh, LightKind as RenderLightKind,
-    LineVertex, MAX_SCENE_LIGHTS, MaterialBlend, MaterialParams, MeshDrawCall, MeshVertex,
-    ParticleBlend, ParticleDrawCall, ParticleInstance as RenderParticleInstance, Scene3DPassInput,
-    Scene3DRenderer, SceneLight, ShadingModel, build_camera_helper_lines, build_light_helper_lines,
-    mat4_identity, mat4_mul, mat4_orthographic_rh, mat4_perspective_rh,
+    CameraParams, CompatMode as RenderCompatMode, CullSide, DofPassParams, GpuMesh,
+    LightKind as RenderLightKind, LineVertex, MAX_SCENE_LIGHTS, MaterialBlend, MaterialParams,
+    MeshDrawCall, MeshExtraMaps, MeshVertex, ParticleBlend, ParticleDrawCall,
+    ParticleInstance as RenderParticleInstance, Scene3DPassInput, Scene3DRenderOptions,
+    Scene3DRenderer, SceneLight, ShadingModel, TextureWrap, build_camera_helper_lines,
+    build_light_helper_lines, mat4_identity, mat4_mul, mat4_orthographic_rh, mat4_perspective_rh,
 };
 
 /// Built-in OFL TrueType fallback font (`Geist-Regular.ttf`) used for 3D Text and 2D Text
@@ -427,7 +441,10 @@ impl ProjectRenderEngine {
     /// Configures whether the root sequence canvas clears to transparent `[0, 0, 0, 0]`
     /// (for transparent PNG / VP9 yuva420p export) instead of `sequence.background_color`.
     pub fn set_transparent_background(&mut self, enabled: bool) {
-        self.transparent_background = enabled;
+        if self.transparent_background != enabled {
+            self.transparent_background = enabled;
+            self.cache.invalidate_all();
+        }
     }
 
     /// Returns whether transparent root background clearing is currently enabled.
@@ -659,7 +676,8 @@ impl ProjectRenderEngine {
         height: u32,
         revision: u64,
     ) -> Result<Arc<[u8]>, RenderError> {
-        let key = FrameCacheKey::new((frame * 1000.0).round() as i64, width, height, revision);
+        let key = FrameCacheKey::new((frame * 1000.0).round() as i64, width, height, revision)
+            .with_salt(u64::from(self.transparent_background));
         if let Some(cached) = self.cache.get(&key) {
             return Ok(cached.pixels);
         }
@@ -1377,8 +1395,18 @@ impl ProjectRenderEngine {
             };
         }
 
-        if run_masks && let Some(masks_val) = clip.layer.preserved.get("zoidiumMasks") {
-            match self.apply_zoidium_layer_masks(target, clip.layer.id, masks_val, &clip_env) {
+        if run_masks {
+            let mask_res = if let Some(typed_masks) =
+                clip_env.sequence.layer_masks.get(&clip.layer.id)
+                && !typed_masks.is_empty()
+            {
+                self.apply_typed_layer_masks(target, clip.layer.id, typed_masks, &clip_env)
+            } else if let Some(masks_val) = clip.layer.preserved.get("zoidiumMasks") {
+                self.apply_zoidium_layer_masks(target, clip.layer.id, masks_val, &clip_env)
+            } else {
+                Ok(target)
+            };
+            match mask_res {
                 Ok(t) => target = t,
                 Err(err) => {
                     visited_tracks.pop();
@@ -1415,10 +1443,31 @@ impl ProjectRenderEngine {
                 shadow_mode,
             } => {
                 let shadows_enabled = parse_preserved_shadows(layer.preserved.get("shadows"));
-                let scene_bg = layer
-                    .preserved
-                    .get("backgroundColor")
-                    .and_then(parse_json_rgba);
+                let scene_bg = match env.sequence.scene_backdrops.get(&layer.id) {
+                    Some(bd) => {
+                        if bd.mode == 0 {
+                            None
+                        } else {
+                            let opacity = eval_f32(&bd.opacity, env).clamp(0.0, 1.0);
+                            let scale =
+                                if bd.color[0] > 1.0 || bd.color[1] > 1.0 || bd.color[2] > 1.0 {
+                                    1.0 / 255.0
+                                } else {
+                                    1.0
+                                };
+                            Some([
+                                (bd.color[0] as f32 * scale).clamp(0.0, 1.0),
+                                (bd.color[1] as f32 * scale).clamp(0.0, 1.0),
+                                (bd.color[2] as f32 * scale).clamp(0.0, 1.0),
+                                opacity,
+                            ])
+                        }
+                    }
+                    None => layer
+                        .preserved
+                        .get("backgroundColor")
+                        .and_then(parse_json_rgba),
+                };
                 let target = self.render_scene_3d(
                     objects,
                     *shadow_mode,
@@ -1786,6 +1835,18 @@ impl ProjectRenderEngine {
             })
             .collect();
 
+        let mesh_extra_maps: Vec<MeshExtraMaps<'_>> = collected
+            .meshes
+            .iter()
+            .map(|spec| MeshExtraMaps {
+                emissive_view: spec.emissive_map.as_deref().map(|t| &t.view),
+                roughness_view: spec.roughness_map.as_deref().map(|t| &t.view),
+                metalness_view: spec.metalness_map.as_deref().map(|t| &t.view),
+                alpha_view: spec.alpha_map.as_deref().map(|t| &t.view),
+                env_view: spec.env_map.as_deref().map(|t| &t.view),
+            })
+            .collect();
+
         let particle_draws: Vec<ParticleDrawCall<'_>> = collected
             .particles
             .iter()
@@ -1808,7 +1869,7 @@ impl ProjectRenderEngine {
             ProjectCompatMode::Legacy => RenderCompatMode::Legacy,
         };
 
-        let render_res = self.scene3d.render_with_extra_lines(
+        let render_res = self.scene3d.render_with_options(
             &self.ctx,
             &color,
             &depth,
@@ -1821,7 +1882,17 @@ impl ProjectRenderEngine {
                 editing_camera: scene_override.is_some(),
                 selection_aabb,
             },
-            &extra_wireframe_lines,
+            &Scene3DRenderOptions {
+                extra_lines: &extra_wireframe_lines,
+                mesh_extra_maps: &mesh_extra_maps,
+                dof: if scene_override.is_some() {
+                    None
+                } else {
+                    collected.dof
+                },
+                linear_lighting: false,
+                particle_sprites_straight_alpha: true,
+            },
         );
         self.targets.release(depth);
 
@@ -1884,7 +1955,31 @@ impl ProjectRenderEngine {
         out: &mut CollectedScene3D,
     ) {
         let eval_graph = evaluate_scene_graph_3d(objects, parent_world, env);
-        for node in &eval_graph.nodes {
+        let effectors_active =
+            env.plugins.is_enabled("repeater") || env.plugins.is_enabled("effector-plus");
+        let expresstext_active =
+            env.plugins.is_enabled("expresstext-plus") || env.plugins.is_enabled("text-plus");
+
+        let mut effector_kinds: Vec<Option<SceneEffectorKind>> = vec![None; eval_graph.nodes.len()];
+        let mut has_mesh_descendant: Vec<bool> = vec![false; eval_graph.nodes.len()];
+        for (idx, node) in eval_graph.nodes.iter().enumerate() {
+            if effectors_active && node.render_enabled {
+                effector_kinds[idx] = detect_scene_effector_kind(node.obj);
+            }
+            if matches!(
+                node.obj.kind,
+                Object3DKind::Shape3D(_) | Object3DKind::Text3D(_) | Object3DKind::Model(_)
+            ) && node.render_enabled
+            {
+                let mut cur = Some(idx);
+                while let Some(c) = cur {
+                    has_mesh_descendant[c] = true;
+                    cur = eval_graph.nodes[c].parent;
+                }
+            }
+        }
+
+        for (node_idx, node) in eval_graph.nodes.iter().enumerate() {
             if !node.render_enabled {
                 continue;
             }
@@ -1910,8 +2005,19 @@ impl ProjectRenderEngine {
                         &node_env,
                         out.viewport_dims,
                     );
-                    if out.camera.is_none() {
+                    let is_cam_plus = is_camera_plus_object(obj, env.plugins);
+                    let should_select = if cam.active && is_cam_plus {
+                        !out.camera_is_camera_plus
+                    } else if cam.active {
+                        !out.camera_is_active
+                    } else {
+                        out.camera.is_none()
+                    };
+                    if should_select {
                         out.camera = Some(cam_params);
+                        out.camera_is_active = cam.active;
+                        out.camera_is_camera_plus = cam.active && is_cam_plus;
+                        out.dof = eval_camera_dof(cam, &node_env);
                     }
                     let zoom = eval_f32(&cam.zoom, &node_env).max(1e-4);
                     let fov_deg = match cam.kind {
@@ -1976,59 +2082,301 @@ impl ProjectRenderEngine {
                     });
                 }
                 Object3DKind::Shape3D(shape) => {
-                    if let Some((mesh, bounds)) = self.ensure_shape_mesh(obj, shape, &node_env) {
-                        let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
-                        out.meshes.push(PreparedMeshSpec {
-                            object_id: obj.id,
-                            world_aabb: transform_aabb_world(bounds, world),
-                            mesh,
-                            model: world.to_cols_array_2d(),
-                            normal_matrix: compute_normal_matrix(world),
-                            material: mat_eval.params,
-                            albedo: mat_eval.albedo,
-                            normal: mat_eval.normal,
-                            matcap: mat_eval.matcap,
-                            cast_shadow: true,
-                            receive_shadow: true,
-                        });
+                    let effector_chain = collect_node_effector_chain(
+                        &eval_graph,
+                        node_idx,
+                        &effector_kinds,
+                        &has_mesh_descendant,
+                    );
+                    let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
+                    if effector_chain.is_empty() {
+                        if let Some((mesh, bounds)) = self.ensure_shape_mesh(obj, shape, &node_env)
+                        {
+                            push_prepared_mesh(out, obj.id, mesh, bounds, world, &mat_eval);
+                        }
+                    } else {
+                        let base_mesh = apply_object_effectors(
+                            build_shape_mesh_cpu(shape, &node_env),
+                            obj,
+                            &node_env,
+                        );
+                        self.emit_effected_mesh(
+                            objects,
+                            parent_world,
+                            &eval_graph,
+                            node_idx,
+                            obj.id,
+                            base_mesh,
+                            world,
+                            &effector_chain,
+                            &effector_kinds,
+                            &mat_eval,
+                            env,
+                            0,
+                            out,
+                        );
                     }
                 }
                 Object3DKind::Text3D(text_data) => {
-                    if let Some((mesh, bounds)) = self.ensure_text3d_mesh(obj, text_data, &node_env)
-                    {
-                        let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
-                        out.meshes.push(PreparedMeshSpec {
-                            object_id: obj.id,
-                            world_aabb: transform_aabb_world(bounds, world),
-                            mesh,
-                            model: world.to_cols_array_2d(),
-                            normal_matrix: compute_normal_matrix(world),
-                            material: mat_eval.params,
-                            albedo: mat_eval.albedo,
-                            normal: mat_eval.normal,
-                            matcap: mat_eval.matcap,
-                            cast_shadow: true,
-                            receive_shadow: true,
-                        });
+                    let effector_chain = collect_node_effector_chain(
+                        &eval_graph,
+                        node_idx,
+                        &effector_kinds,
+                        &has_mesh_descendant,
+                    );
+                    let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
+
+                    let et_layers_owned = if expresstext_active {
+                        collect_expresstext_layers_for_node(&eval_graph, node_idx)
+                    } else {
+                        Vec::new()
+                    };
+
+                    if !et_layers_owned.is_empty() {
+                        let (text_params, ext_opts) =
+                            build_text3d_params_and_options(text_data, obj);
+                        let char_meshes = build_text3d_character_meshes_with_fallback(
+                            env.project,
+                            text_data,
+                            &text_params,
+                            &ext_opts,
+                            node.local_scale,
+                        );
+                        if !char_meshes.is_empty() {
+                            let parent_mat = node
+                                .parent
+                                .map_or(parent_world, |p| eval_graph.nodes[p].world_mat);
+                            let container_world = match ext_opts.text_scale_mode {
+                                TextScaleMode::Current => {
+                                    parent_mat
+                                        * Mat4::from_scale_rotation_translation(
+                                            Vec3::ONE,
+                                            node.local_rot,
+                                            node.local_pos,
+                                        )
+                                }
+                                TextScaleMode::Legacy => world,
+                            };
+
+                            let index_offset =
+                                eval_f64(&text_data.character_index_offset, &node_env).round()
+                                    as isize;
+                            let count_override =
+                                eval_f64(&text_data.character_count_override, &node_env)
+                                    .round()
+                                    .max(0.0) as usize;
+                            let total = if count_override > 0 {
+                                count_override
+                            } else {
+                                char_meshes.len()
+                            };
+                            let list = ExpressTextLetterList {
+                                total,
+                                order: (0..total).collect(),
+                            };
+
+                            let self_world_tf =
+                                decompose_mat4_trs(container_world).map(|(p, q, s)| {
+                                    let e = zc_geom::quat_to_euler(q, GeomEulerOrder::XYZ);
+                                    ExpressTextTransform {
+                                        position: [f64::from(p.x), f64::from(p.y), f64::from(p.z)],
+                                        rotation: [f64::from(e.x), f64::from(e.y), f64::from(e.z)],
+                                        scale: [f64::from(s.x), f64::from(s.y), f64::from(s.z)],
+                                    }
+                                });
+
+                            let mut min_x = f64::INFINITY;
+                            let mut max_x = f64::NEG_INFINITY;
+                            let mut world_bases = Vec::with_capacity(char_meshes.len());
+                            for ch in &char_meshes {
+                                let b = [
+                                    f64::from(ch.anchor_pos.x),
+                                    f64::from(ch.anchor_pos.y),
+                                    f64::from(ch.anchor_pos.z),
+                                ];
+                                min_x = min_x.min(b[0]);
+                                max_x = max_x.max(b[0]);
+                                world_bases.push(match self_world_tf {
+                                    Some(sw) => expresstext_world_base_of(b, sw),
+                                    None => b,
+                                });
+                            }
+                            let extent =
+                                (min_x.is_finite() && max_x.is_finite()).then_some((min_x, max_x));
+                            let aux = ExpressTextEvalAux {
+                                rate: env.fps.max(1.0),
+                                extent,
+                                bases: Some(world_bases),
+                                self_world: self_world_tf,
+                            };
+
+                            let readers: Vec<SceneEtPropReader<'_>> = et_layers_owned
+                                .iter()
+                                .map(|layer| SceneEtPropReader {
+                                    base_env: &node_env,
+                                    prefix: layer.kind.as_str(),
+                                    props: &layer.props,
+                                })
+                                .collect();
+                            let et_layers: Vec<ExpressTextLayer<'_>> = et_layers_owned
+                                .iter()
+                                .zip(readers.iter())
+                                .map(|(layer, reader)| ExpressTextLayer {
+                                    kind: layer.kind,
+                                    props: reader,
+                                })
+                                .collect();
+
+                            for ch in char_meshes {
+                                if ch.mesh.indices.is_empty() {
+                                    continue;
+                                }
+                                let eff_idx = (ch.index as isize + index_offset)
+                                    .clamp(0, total.saturating_sub(1) as isize)
+                                    as usize;
+                                let base_local = [
+                                    f64::from(ch.anchor_pos.x),
+                                    f64::from(ch.anchor_pos.y),
+                                    f64::from(ch.anchor_pos.z),
+                                ];
+                                let ctrl = evaluate_expresstext_stack(
+                                    &et_layers, env.frame, eff_idx, &list, base_local, &aux,
+                                );
+                                let char_pos = ch.anchor_pos
+                                    + Vec3::new(
+                                        ctrl.position[0] as f32,
+                                        ctrl.position[1] as f32,
+                                        ctrl.position[2] as f32,
+                                    );
+                                let char_rot = euler_to_quat(
+                                    Vec3::new(
+                                        ctrl.rotation[0] as f32,
+                                        ctrl.rotation[1] as f32,
+                                        ctrl.rotation[2] as f32,
+                                    ),
+                                    GeomEulerOrder::XYZ,
+                                );
+                                let char_scale = Vec3::new(
+                                    ctrl.scale[0] as f32,
+                                    ctrl.scale[1] as f32,
+                                    ctrl.scale[2] as f32,
+                                );
+                                let anchor_mat = Mat4::from_scale_rotation_translation(
+                                    char_scale, char_rot, char_pos,
+                                );
+                                let glyph_mat = Mat4::from_translation(ch.mesh_offset)
+                                    * Mat4::from_scale(ch.mesh_scale);
+                                let char_world = container_world * anchor_mat * glyph_mat;
+                                let ch_mesh = apply_object_effectors(ch.mesh, obj, &node_env);
+                                let char_salt = (ch.index as u64).wrapping_add(1);
+                                if effector_chain.is_empty() {
+                                    if !ch_mesh.indices.is_empty() {
+                                        let mut h =
+                                            hash_text3d_and_effectors(text_data, obj, &node_env);
+                                        h = hash_u64(h, 0xE7_0001);
+                                        h = hash_u64(h, char_salt);
+                                        let key = MeshCacheKey {
+                                            object_id: obj.id,
+                                            content_hash: h,
+                                        };
+                                        let (gpu_mesh, bounds) =
+                                            self.touch_cached_mesh(key).unwrap_or_else(|| {
+                                                self.insert_cached_mesh(
+                                                    key,
+                                                    &ch_mesh,
+                                                    "zc-expresstext-char-mesh",
+                                                )
+                                            });
+                                        push_prepared_mesh(
+                                            out, obj.id, gpu_mesh, bounds, char_world, &mat_eval,
+                                        );
+                                    }
+                                } else {
+                                    self.emit_effected_mesh(
+                                        objects,
+                                        parent_world,
+                                        &eval_graph,
+                                        node_idx,
+                                        obj.id,
+                                        ch_mesh,
+                                        char_world,
+                                        &effector_chain,
+                                        &effector_kinds,
+                                        &mat_eval,
+                                        env,
+                                        char_salt,
+                                        out,
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    if effector_chain.is_empty() {
+                        if let Some((mesh, bounds)) =
+                            self.ensure_text3d_mesh(obj, text_data, &node_env)
+                        {
+                            push_prepared_mesh(out, obj.id, mesh, bounds, world, &mat_eval);
+                        }
+                    } else {
+                        let base_mesh = apply_object_effectors(
+                            build_text3d_mesh_cpu(obj, text_data, &node_env),
+                            obj,
+                            &node_env,
+                        );
+                        self.emit_effected_mesh(
+                            objects,
+                            parent_world,
+                            &eval_graph,
+                            node_idx,
+                            obj.id,
+                            base_mesh,
+                            world,
+                            &effector_chain,
+                            &effector_kinds,
+                            &mat_eval,
+                            env,
+                            0,
+                            out,
+                        );
                     }
                 }
                 Object3DKind::Model(model_data) => {
-                    if let Some((mesh, bounds)) = self.ensure_model_mesh(obj, model_data, &node_env)
-                    {
-                        let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
-                        out.meshes.push(PreparedMeshSpec {
-                            object_id: obj.id,
-                            world_aabb: transform_aabb_world(bounds, world),
-                            mesh,
-                            model: world.to_cols_array_2d(),
-                            normal_matrix: compute_normal_matrix(world),
-                            material: mat_eval.params,
-                            albedo: mat_eval.albedo,
-                            normal: mat_eval.normal,
-                            matcap: mat_eval.matcap,
-                            cast_shadow: true,
-                            receive_shadow: true,
-                        });
+                    let effector_chain = collect_node_effector_chain(
+                        &eval_graph,
+                        node_idx,
+                        &effector_kinds,
+                        &has_mesh_descendant,
+                    );
+                    let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
+                    if effector_chain.is_empty() {
+                        if let Some((mesh, bounds)) =
+                            self.ensure_model_mesh(obj, model_data, &node_env)
+                        {
+                            push_prepared_mesh(out, obj.id, mesh, bounds, world, &mat_eval);
+                        }
+                    } else {
+                        let base_mesh = apply_object_effectors(
+                            build_model_mesh_cpu(model_data, &node_env),
+                            obj,
+                            &node_env,
+                        );
+                        self.emit_effected_mesh(
+                            objects,
+                            parent_world,
+                            &eval_graph,
+                            node_idx,
+                            obj.id,
+                            base_mesh,
+                            world,
+                            &effector_chain,
+                            &effector_kinds,
+                            &mat_eval,
+                            env,
+                            0,
+                            out,
+                        );
                     }
                 }
                 Object3DKind::Particles(pdata) => {
@@ -2144,6 +2492,86 @@ impl ProjectRenderEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn emit_effected_mesh(
+        &mut self,
+        objects: &[Object3D],
+        parent_world: Mat4,
+        eval_graph: &EvaluatedSceneGraph3D<'_>,
+        node_idx: usize,
+        object_id: Uuid,
+        base_mesh: MeshData,
+        world: Mat4,
+        effector_chain: &[usize],
+        effector_kinds: &[Option<SceneEffectorKind>],
+        mat_eval: &EvaluatedMaterial,
+        env: &EvalEnv<'_>,
+        salt: u64,
+        out: &mut CollectedScene3D,
+    ) {
+        if base_mesh.indices.is_empty() {
+            return;
+        }
+        let rest_mesh = Arc::new(base_mesh);
+        let instances = apply_scene_effector_chain(
+            objects,
+            parent_world,
+            eval_graph,
+            node_idx,
+            Arc::clone(&rest_mesh),
+            world,
+            effector_chain,
+            effector_kinds,
+            env,
+        );
+        if instances.is_empty() {
+            return;
+        }
+
+        let mut uploaded: HashMap<usize, (Arc<GpuMesh>, Aabb3)> = HashMap::new();
+        for (inst_idx, inst) in instances.into_iter().enumerate() {
+            if inst.mesh.indices.is_empty() {
+                continue;
+            }
+            let ptr_key = Arc::as_ptr(&inst.mesh) as usize;
+            let (gpu_mesh, bounds) = if let Some(cached) = uploaded.get(&ptr_key) {
+                (Arc::clone(&cached.0), cached.1)
+            } else {
+                let mut h = fnv1a_hash64(b"effected_mesh_v1");
+                h = hash_u64(h, salt);
+                h = hash_u64(h, inst_idx as u64);
+                h = hash_u64(h, inst.mesh.vertices.len() as u64);
+                h = hash_u64(h, inst.mesh.indices.len() as u64);
+                for v in inst
+                    .mesh
+                    .vertices
+                    .iter()
+                    .step_by((inst.mesh.vertices.len() / 64).max(1))
+                {
+                    h = hash_u64(h, u64::from(v.position[0].to_bits()));
+                    h = hash_u64(h, u64::from(v.position[1].to_bits()));
+                    h = hash_u64(h, u64::from(v.position[2].to_bits()));
+                }
+                h = hash_u64(h, u64::from(inst.mesh.bounds.min.x.to_bits()));
+                h = hash_u64(h, u64::from(inst.mesh.bounds.min.y.to_bits()));
+                h = hash_u64(h, u64::from(inst.mesh.bounds.min.z.to_bits()));
+                h = hash_u64(h, u64::from(inst.mesh.bounds.max.x.to_bits()));
+                h = hash_u64(h, u64::from(inst.mesh.bounds.max.y.to_bits()));
+                h = hash_u64(h, u64::from(inst.mesh.bounds.max.z.to_bits()));
+                let key = MeshCacheKey {
+                    object_id,
+                    content_hash: h,
+                };
+                let pair = self.touch_cached_mesh(key).unwrap_or_else(|| {
+                    self.insert_cached_mesh(key, &inst.mesh, "zc-effected-mesh")
+                });
+                uploaded.insert(ptr_key, (Arc::clone(&pair.0), pair.1));
+                pair
+            };
+            push_prepared_mesh(out, object_id, gpu_mesh, bounds, inst.world, mat_eval);
+        }
+    }
+
     fn ensure_shape_mesh(
         &mut self,
         obj: &Object3D,
@@ -2159,111 +2587,7 @@ impl ProjectRenderEngine {
             return Some(cached);
         }
 
-        let mut mesh = match shape {
-            Shape3DKind::Box { size } => build_box(size[0] as f32, size[1] as f32, size[2] as f32),
-            Shape3DKind::Cylinder {
-                top_radius,
-                bottom_radius,
-                height,
-                detail,
-                open_ended,
-            } => build_cylinder(
-                *top_radius as f32,
-                *bottom_radius as f32,
-                *height as f32,
-                *detail,
-                *open_ended,
-            ),
-            Shape3DKind::Rectangle { size } => build_rectangle(size[0] as f32, size[1] as f32),
-            Shape3DKind::Circle { radius, detail } => build_circle(*radius as f32, *detail),
-            Shape3DKind::Sphere {
-                radius,
-                width_segments,
-                height_segments,
-            } => build_sphere(*radius as f32, *width_segments, *height_segments),
-            Shape3DKind::Donut {
-                radius,
-                tube,
-                radial_segments,
-                tubular_segments,
-            } => build_donut(
-                *radius as f32,
-                *tube as f32,
-                *radial_segments,
-                *tubular_segments,
-            ),
-            Shape3DKind::Wire {
-                size,
-                thickness,
-                loops,
-                inner_segments,
-                outer_segments,
-            } => build_wire(
-                Vec3::new(size[0] as f32, size[1] as f32, size[2] as f32),
-                *thickness as f32,
-                *loops,
-                *inner_segments,
-                *outer_segments,
-            ),
-            Shape3DKind::Cone {
-                radius,
-                height,
-                detail,
-                open_ended,
-            } => build_cylinder(0.0, *radius as f32, *height as f32, *detail, *open_ended),
-            Shape3DKind::RoundedBox {
-                size,
-                radius,
-                segments,
-            } => build_rounded_box(
-                size[0] as f32,
-                size[1] as f32,
-                size[2] as f32,
-                *radius as f32,
-                *segments,
-            ),
-            Shape3DKind::Tetrahedron { radius, detail } => {
-                build_tetrahedron(*radius as f32, *detail)
-            }
-            Shape3DKind::Octahedron { radius, detail } => build_octahedron(*radius as f32, *detail),
-            Shape3DKind::Dodecahedron { radius, detail } => {
-                build_dodecahedron(*radius as f32, *detail)
-            }
-            Shape3DKind::Icosahedron { radius, detail } => {
-                build_icosahedron(*radius as f32, *detail)
-            }
-            Shape3DKind::Capsule {
-                radius,
-                length,
-                cap_segments,
-                radial_segments,
-            } => build_capsule(
-                *radius as f32,
-                *length as f32,
-                *cap_segments,
-                *radial_segments,
-            ),
-            Shape3DKind::TorusKnot {
-                radius,
-                tube,
-                tubular_segments,
-                radial_segments,
-                p,
-                q,
-            } => build_torus_knot(
-                *radius as f32,
-                *tube as f32,
-                *tubular_segments,
-                *radial_segments,
-                *p,
-                *q,
-            ),
-            Shape3DKind::CustomGeometry { asset_id } => asset_id
-                .as_deref()
-                .and_then(|id| load_obj_from_project(env.project, id))
-                .unwrap_or_else(|| build_box(10.0, 10.0, 10.0)),
-        };
-
+        let mut mesh = build_shape_mesh_cpu(shape, env);
         mesh = apply_object_effectors(mesh, obj, env);
         if mesh.indices.is_empty() {
             return None;
@@ -2286,38 +2610,7 @@ impl ProjectRenderEngine {
             return Some(cached);
         }
 
-        let params = Text3DParams {
-            text: data.text.clone(),
-            height: data.size[0].max(0.1) as f32,
-            thickness: data.size[1].max(0.0) as f32,
-            curve_segments: data.detail.max(1),
-            bevel_enabled: data.bevel,
-            bevel_thickness: data.bevel_thickness as f32,
-            bevel_size: data.bevel_size as f32,
-            bevel_segments: 3,
-            align: map_text_align(data.position_mode),
-            uv_mode: match obj.zoidium_uv_mode {
-                ProjectCompatMode::Current => UvMode::Current,
-                ProjectCompatMode::Legacy => UvMode::Legacy,
-            },
-            letter_spacing: 0.0,
-            line_height: 1.2,
-        };
-
-        let mut mesh = data
-            .font
-            .as_deref()
-            .and_then(|font_id| env.project.assets.get(font_id))
-            .and_then(|rec| rec.bytes.as_deref())
-            .and_then(|bytes| build_text3d_mesh(bytes, &params).ok())
-            .filter(|m| !m.indices.is_empty())
-            .or_else(|| {
-                build_text3d_mesh(DEFAULT_TTF_FONT_BYTES, &params)
-                    .ok()
-                    .filter(|m| !m.indices.is_empty())
-            })
-            .unwrap_or_else(|| build_fallback_text_mesh(&params));
-
+        let mut mesh = build_text3d_mesh_cpu(obj, data, env);
         mesh = apply_object_effectors(mesh, obj, env);
         if mesh.indices.is_empty() {
             return None;
@@ -2351,11 +2644,7 @@ impl ProjectRenderEngine {
             return Some(cached);
         }
 
-        let mut mesh = data
-            .asset_id
-            .as_deref()
-            .and_then(|id| load_obj_from_project(env.project, id))
-            .unwrap_or_else(|| build_box(12.0, 12.0, 12.0));
+        let mut mesh = build_model_mesh_cpu(data, env);
         mesh = apply_object_effectors(mesh, obj, env);
         if mesh.indices.is_empty() {
             return None;
@@ -2426,12 +2715,7 @@ impl ProjectRenderEngine {
         env: &EvalEnv<'_>,
     ) -> EvaluatedMaterial {
         let Some(spec) = spec else {
-            return EvaluatedMaterial {
-                params: MaterialParams::default(),
-                albedo: None,
-                normal: None,
-                matcap: None,
-            };
+            return EvaluatedMaterial::default();
         };
 
         match spec {
@@ -2441,17 +2725,16 @@ impl ProjectRenderEngine {
                     base_color: eval_color_rgb(color, env, [1.0, 1.0, 1.0]),
                     side: map_cull_side(*side),
                     blend: MaterialBlend::Opaque,
+                    albedo_premultiplied: false,
                     ..Default::default()
                 },
-                albedo: None,
-                normal: None,
-                matcap: None,
+                ..Default::default()
             },
             MaterialSpec::Texture(m) => {
                 let albedo = m
                     .texture
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::Basic,
@@ -2462,11 +2745,12 @@ impl ProjectRenderEngine {
                         uv_offset: eval_vec2(&m.offset, env),
                         uv_center: eval_vec2(&m.center, env),
                         uv_rotation: eval_f32(&m.rotation, env),
+                        wrap: TextureWrap::from_cm3(m.wrap),
+                        albedo_premultiplied: false,
                         ..Default::default()
                     },
                     albedo,
-                    normal: None,
-                    matcap: None,
+                    ..Default::default()
                 }
             }
             MaterialSpec::Video(m) => {
@@ -2474,18 +2758,18 @@ impl ProjectRenderEngine {
                 let albedo = m
                     .video
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::Basic,
                         base_color: eval_color_rgb(&m.color, env, [1.0, 1.0, 1.0]),
                         opacity,
                         blend: map_material_blend(m.blending, m.transparent, opacity),
+                        albedo_premultiplied: false,
                         ..Default::default()
                     },
                     albedo,
-                    normal: None,
-                    matcap: None,
+                    ..Default::default()
                 }
             }
             MaterialSpec::CustomPbr(m) => {
@@ -2493,7 +2777,7 @@ impl ProjectRenderEngine {
                 let albedo = m
                     .texture
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
                 let normal = m
                     .normal_map
                     .as_deref()
@@ -2513,23 +2797,61 @@ impl ProjectRenderEngine {
                         uv_offset: eval_vec2(&m.offset, env),
                         uv_center: eval_vec2(&m.center, env),
                         uv_rotation: eval_f32(&m.rotation, env),
+                        wrap: TextureWrap::from_cm3(m.wrap),
+                        albedo_premultiplied: false,
                         ..Default::default()
                     },
                     albedo,
                     normal,
-                    matcap: None,
+                    ..Default::default()
                 }
             }
             MaterialSpec::PbrPlus(m) => {
                 let opacity = eval_f32(&m.opacity, env).clamp(0.0, 1.0);
+                let normal_scale = m
+                    .normal_scale_track
+                    .as_ref()
+                    .map_or(m.normal_scale as f32, |t| eval_f32(t, env));
+                let reflection_intensity = m
+                    .reflection_intensity_track
+                    .as_ref()
+                    .map_or(m.reflection_intensity as f32, |t| eval_f32(t, env))
+                    .max(0.0);
+                let emissive_intensity = eval_f32(&m.emissive_intensity, env).max(0.0);
+                let alpha_test = (m.alpha_test as f32).clamp(0.0, 1.0);
+
                 let albedo = m
                     .base_color_map
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
                 let normal = m
                     .normal_map
                     .as_deref()
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                let emissive_map = m
+                    .emissive_map
+                    .as_deref()
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                let roughness_map = m
+                    .roughness_map
+                    .as_deref()
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                let metalness_map = m
+                    .metalness_map
+                    .as_deref()
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                let alpha_map = m
+                    .alpha_map
+                    .as_deref()
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                let env_map = m
+                    .preserved
+                    .get("envMap")
+                    .or_else(|| m.preserved.get("environmentMap"))
+                    .or_else(|| m.preserved.get("env_map"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::StandardPbr,
@@ -2538,18 +2860,28 @@ impl ProjectRenderEngine {
                         opacity,
                         roughness: eval_f32(&m.roughness, env).clamp(0.04, 1.0),
                         metalness: eval_f32(&m.metalness, env).clamp(0.0, 1.0),
-                        normal_scale: m.normal_scale as f32,
+                        normal_scale,
                         side: map_cull_side(m.side),
                         blend: map_material_blend(m.blending, m.transparent, opacity),
                         uv_repeat: eval_vec2(&m.repeat, env),
                         uv_offset: eval_vec2(&m.offset, env),
                         uv_center: eval_vec2(&m.center, env),
                         uv_rotation: eval_f32(&m.rotation, env),
+                        wrap: TextureWrap::from_cm3(m.wrap),
+                        emissive_intensity,
+                        alpha_test,
+                        reflection_intensity,
+                        albedo_premultiplied: false,
                         ..Default::default()
                     },
                     albedo,
                     normal,
                     matcap: None,
+                    emissive_map,
+                    roughness_map,
+                    metalness_map,
+                    alpha_map,
+                    env_map,
                 }
             }
             MaterialSpec::Matcap(m) => {
@@ -2571,11 +2903,11 @@ impl ProjectRenderEngine {
                         opacity,
                         side: map_cull_side(m.side),
                         blend: map_material_blend(m.blending, m.transparent, opacity),
+                        albedo_premultiplied: false,
                         ..Default::default()
                     },
-                    albedo: None,
-                    normal: None,
                     matcap,
+                    ..Default::default()
                 }
             }
             MaterialSpec::ImagePlus(m) => {
@@ -2583,7 +2915,7 @@ impl ProjectRenderEngine {
                 let albedo = m
                     .texture
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::Basic,
@@ -2595,21 +2927,17 @@ impl ProjectRenderEngine {
                         uv_offset: eval_vec2(&m.offset, env),
                         uv_center: eval_vec2(&m.center, env),
                         uv_rotation: eval_f32(&m.rotation, env),
+                        wrap: TextureWrap::from_cm3(m.wrap),
+                        albedo_premultiplied: false,
                         ..Default::default()
                     },
                     albedo,
-                    normal: None,
-                    matcap: None,
+                    ..Default::default()
                 }
             }
             MaterialSpec::CustomShader { .. }
             | MaterialSpec::NodeMaterial { .. }
-            | MaterialSpec::Unknown { .. } => EvaluatedMaterial {
-                params: MaterialParams::default(),
-                albedo: None,
-                normal: None,
-                matcap: None,
-            },
+            | MaterialSpec::Unknown { .. } => EvaluatedMaterial::default(),
         }
     }
 
@@ -3622,6 +3950,7 @@ impl ProjectRenderEngine {
         env: &EvalEnv<'_>,
         temporal_ctx: Option<&mut TemporalEffectContext<'_>>,
     ) -> Result<RenderTarget, RenderError> {
+        let canonical_id = crate::effects::canonical_effect_id(effect_id);
         let width = source.width;
         let height = source.height;
         let mut reg_params = RegEffectParams::new(
@@ -3900,7 +4229,7 @@ impl ProjectRenderEngine {
             };
         }
 
-        if effect_id == "echo"
+        if canonical_id == "echo"
             && let Some(tctx) = temporal_ctx
         {
             const MAX_ECHO_TAPS: u32 = 32;
@@ -4028,10 +4357,10 @@ impl ProjectRenderEngine {
             return Ok(accum);
         }
 
-        if effect_id == "smartmotionblur"
+        if canonical_id == "smartmotionblur"
             && let Some(tctx) = temporal_ctx
         {
-            if crate::effects::should_bypass(effect_id, &reg_params) {
+            if crate::effects::should_bypass(canonical_id, &reg_params) {
                 return Ok(source);
             }
             // Honor `analysis` mode: 0 = Both, 1 = Previous only, 2 = Next only.
@@ -4194,10 +4523,47 @@ impl ProjectRenderEngine {
             return Ok(source);
         }
 
+        // Rewrite Shader+ `zCurve`/`zCurves` and `zGradientCycle` helper calls with
+        // `<Name>_range` / `<Name>_repetitions` uniforms before translation (matching
+        // Zoidium `plugins/shader-plus/runtime.js:190-197`).
+        let mut curve_names: Vec<String> = Vec::new();
+        let mut gradient_names: Vec<String> = Vec::new();
+        for cp in custom_properties {
+            let shader_kind = cp
+                .metadata
+                .get("type")
+                .and_then(|t| t.get("zoidiumShader"))
+                .and_then(|s| s.get("kind"))
+                .and_then(serde_json::Value::as_str);
+            if shader_kind == Some("curve") || matches!(cp.track.value, PropertyValue::Curve(_)) {
+                curve_names.push(fix_property_name(&cp.name));
+            }
+            if shader_kind == Some("gradient")
+                || matches!(cp.track.value, PropertyValue::Gradient(_))
+            {
+                gradient_names.push(fix_property_name(&cp.name));
+            }
+        }
+        let transformed_source: Cow<'_, str> =
+            if curve_names.is_empty() && gradient_names.is_empty() {
+                Cow::Borrowed(frag_shader)
+            } else {
+                let mut src = frag_shader.to_owned();
+                if !curve_names.is_empty() {
+                    src = zc_shader::bind_curve_ranges(&src, &curve_names);
+                }
+                if !gradient_names.is_empty() {
+                    src = zc_shader::bind_gradient_cycles(&src, &gradient_names);
+                }
+                Cow::Owned(src)
+            };
+        let effective_shader = transformed_source.as_ref();
+
         // Build CompileOptions from custom_properties (static defines, Dropdown constants,
         // ZOIDIUM_TIME_SAMPLES) and include defines in the pipeline cache hash (P8 P0-3).
-        let compile_opts = build_custom_shader_compile_options(frag_shader, custom_properties, env);
-        let mut shader_hash = fnv1a_hash64(frag_shader.as_bytes());
+        let compile_opts =
+            build_custom_shader_compile_options(effective_shader, custom_properties, env);
+        let mut shader_hash = fnv1a_hash64(effective_shader.as_bytes());
         for (k, v) in &compile_opts.defines {
             shader_hash = hash_u64(shader_hash, fnv1a_hash64(k.as_bytes()));
             shader_hash = hash_u64(shader_hash, fnv1a_hash64(v.as_bytes()));
@@ -4210,7 +4576,8 @@ impl ProjectRenderEngine {
             entry.last_used = tick;
         } else {
             let compiled =
-                match zc_shader::translate_glsl_es100_with_options(frag_shader, &compile_opts) {
+                match zc_shader::translate_glsl_es100_with_options(effective_shader, &compile_opts)
+                {
                     Ok(c) => c,
                     Err(err) => {
                         self.targets.release(source);
@@ -4474,6 +4841,31 @@ impl ProjectRenderEngine {
                 continue;
             }
 
+            // Handle Shader+ `text` property rasterization & uniform binding
+            // (`<Name>`, `<Name>_size`, `<Name>_grid`, `<Name>_aspect`, `<Name>_count`).
+            if shader_kind == Some("text") {
+                let text_opts = parse_shader_plus_text_options(&val);
+                if let Ok((tex, size_px, grid, count)) =
+                    self.rasterize_shader_plus_text(&text_opts, env)
+                {
+                    let idx = owned_temp_targets.len();
+                    owned_temp_targets.push(tex);
+                    temp_texture_indices.insert(norm_name.clone(), idx);
+                    let aspect = size_px[0] / size_px[1].max(1.0);
+                    uniform_values.insert(format!("{norm_name}_size"), UniformValue::Vec2(size_px));
+                    uniform_values.insert(format!("{norm_name}_grid"), UniformValue::Vec2(grid));
+                    uniform_values
+                        .insert(format!("{norm_name}_aspect"), UniformValue::Float(aspect));
+                    let count_name = format!("{norm_name}_count");
+                    if uniform_field_types.get(&count_name).copied() == Some(UniformType::Int) {
+                        uniform_values.insert(count_name, UniformValue::Int(count.round() as i32));
+                    } else {
+                        uniform_values.insert(count_name, UniformValue::Float(count));
+                    }
+                }
+                continue;
+            }
+
             // Handle Layer Input track source (`track:id:<id>` or `_zoidiumShaderLayerSource`).
             if let Some(s) = val.as_str()
                 && (is_layer_source || s.starts_with("track:id:"))
@@ -4625,6 +5017,44 @@ impl ProjectRenderEngine {
                             .insert(format!("{norm_name}_count"), UniformValue::Int(count));
                     }
                 }
+                PropertyValue::Text(ref s) if shader_kind == Some("gradient") => {
+                    let parsed = serde_json::from_str::<serde_json::Value>(s)
+                        .unwrap_or(serde_json::Value::Null);
+                    let (raw, cyclic, reps) = bake_shader_plus_gradient_json(&parsed, cp);
+                    if let Ok(tex) =
+                        self.ctx
+                            .create_rgba8_texture("zc-custom-gradient-lut", 256, 1, &raw)
+                    {
+                        let idx = owned_temp_targets.len();
+                        owned_temp_targets.push(tex);
+                        temp_texture_indices.insert(norm_name.clone(), idx);
+                    }
+                    if cyclic {
+                        repeat_textures.insert(norm_name.clone());
+                    }
+                    uniform_values.insert(
+                        format!("{norm_name}_repetitions"),
+                        UniformValue::Float(reps),
+                    );
+                }
+                PropertyValue::Json(ref j) if shader_kind == Some("gradient") => {
+                    let (raw, cyclic, reps) = bake_shader_plus_gradient_json(j, cp);
+                    if let Ok(tex) =
+                        self.ctx
+                            .create_rgba8_texture("zc-custom-gradient-lut", 256, 1, &raw)
+                    {
+                        let idx = owned_temp_targets.len();
+                        owned_temp_targets.push(tex);
+                        temp_texture_indices.insert(norm_name.clone(), idx);
+                    }
+                    if cyclic {
+                        repeat_textures.insert(norm_name.clone());
+                    }
+                    uniform_values.insert(
+                        format!("{norm_name}_repetitions"),
+                        UniformValue::Float(reps),
+                    );
+                }
                 PropertyValue::Text(ref s) if shader_kind == Some("curve") => {
                     let parsed = serde_json::from_str::<serde_json::Value>(s)
                         .unwrap_or(serde_json::Value::Null);
@@ -4755,6 +5185,327 @@ impl ProjectRenderEngine {
         self.targets.release(source);
         Ok(dst)
     }
+
+    /// Rasterizes a Shader+ `Text` custom property (Layout or Atlas mode, Coverage or SDF)
+    /// into a top-down white-RGB RGBA8 texture (`alpha` = coverage or SDF with 0.5 edge),
+    /// returning `(target, size_px, grid, count)` matching Zoidium `plugins/shader-plus/text-raster.js`.
+    fn rasterize_shader_plus_text(
+        &mut self,
+        opts: &ShaderPlusTextOptions,
+        env: &EvalEnv<'_>,
+    ) -> Result<(RenderTarget, [f32; 2], [f32; 2], f32), RenderError> {
+        let max_side = self
+            .ctx
+            .device
+            .limits()
+            .max_texture_dimension_2d
+            .clamp(16, 2048);
+        let font_bytes =
+            resolve_font_bytes(env.project, opts.font.as_deref()).unwrap_or(DEFAULT_TTF_FONT_BYTES);
+
+        let build_glyph_mesh = |text: &str,
+                                height: f32,
+                                align: TextAlignMode,
+                                letter_spacing: f32,
+                                line_height: f32|
+         -> MeshData {
+            let curve_segments = (height / 8.0).clamp(6.0, 16.0).round() as u32;
+            let params = Text3DParams {
+                text: text.to_owned(),
+                height,
+                thickness: 0.0,
+                curve_segments,
+                bevel_enabled: false,
+                bevel_thickness: 0.0,
+                bevel_size: 0.0,
+                bevel_segments: 1,
+                align,
+                uv_mode: UvMode::Current,
+                letter_spacing,
+                line_height,
+            };
+            build_text3d_mesh(font_bytes, &params)
+                .ok()
+                .filter(|m| !m.indices.is_empty())
+                .or_else(|| {
+                    build_text3d_mesh(DEFAULT_TTF_FONT_BYTES, &params)
+                        .ok()
+                        .filter(|m| !m.indices.is_empty())
+                })
+                .unwrap_or_else(|| build_fallback_text_mesh(&params))
+        };
+
+        let (mesh, width, height, pad, grid, count) = if opts.atlas {
+            let mut chars: Vec<char> = Vec::new();
+            let mut seen: HashSet<char> = HashSet::new();
+            for ch in opts.text.chars() {
+                if ch == '\n' || ch == '\r' {
+                    continue;
+                }
+                if seen.insert(ch) {
+                    chars.push(ch);
+                    if chars.len() >= 256 {
+                        break;
+                    }
+                }
+            }
+            let count_u32 = chars.len().max(1) as u32;
+            let cols = (count_u32 as f32).sqrt().ceil().max(1.0) as u32;
+            let rows = count_u32.div_ceil(cols).max(1);
+            let mut size = opts.size;
+            let mut pad = (size * 0.25).ceil().max(2.0);
+            let mut cell = (size * 1.25 + pad * 2.0).ceil().max(4.0);
+            let max_cells = cols.max(rows) as f32;
+            if max_cells * cell > max_side as f32 {
+                let scale = ((max_side as f32 - 2.0) / (max_cells * cell)).clamp(0.01, 1.0);
+                size = (size * scale).max(2.0);
+                pad = (size * 0.25).ceil().max(1.0);
+                cell = (size * 1.25 + pad * 2.0)
+                    .ceil()
+                    .min((max_side as f32 / max_cells).floor())
+                    .max(2.0);
+            }
+            let width = ((cols as f32) * cell).round().clamp(1.0, max_side as f32) as u32;
+            let height = ((rows as f32) * cell).round().clamp(1.0, max_side as f32) as u32;
+
+            let mut vertices: Vec<Vertex3D> = Vec::new();
+            let mut indices: Vec<u32> = Vec::new();
+            let inner_limit = (cell - pad * 1.5).max(1.0);
+            for (index, ch) in chars.iter().enumerate() {
+                let s = ch.to_string();
+                let char_mesh = build_glyph_mesh(&s, size, TextAlignMode::Center, 0.0, 1.2);
+                if char_mesh.indices.is_empty() {
+                    continue;
+                }
+                let (mut min_x, mut max_x, mut min_y, mut max_y) = (
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                );
+                for v in &char_mesh.vertices {
+                    min_x = min_x.min(v.position[0]);
+                    max_x = max_x.max(v.position[0]);
+                    min_y = min_y.min(v.position[1]);
+                    max_y = max_y.max(v.position[1]);
+                }
+                let cx = 0.5 * (min_x + max_x);
+                let cy = 0.5 * (min_y + max_y);
+                let span = (max_x - min_x).max(max_y - min_y).max(1e-3);
+                let fit_scale = if span > inner_limit {
+                    inner_limit / span
+                } else {
+                    1.0
+                };
+                let col = (index as u32) % cols;
+                let row = (index as u32) / cols;
+                let tx = -(width as f32) * 0.5 + (col as f32 + 0.5) * cell;
+                let ty = (height as f32) * 0.5 - (row as f32 + 0.5) * cell;
+                let base_idx = vertices.len() as u32;
+                for v in &char_mesh.vertices {
+                    vertices.push(Vertex3D {
+                        position: [
+                            (v.position[0] - cx) * fit_scale + tx,
+                            (v.position[1] - cy) * fit_scale + ty,
+                            0.0,
+                        ],
+                        normal: v.normal,
+                        uv: v.uv,
+                        material_slot: 0,
+                    });
+                }
+                for &idx in &char_mesh.indices {
+                    indices.push(base_idx + idx);
+                }
+            }
+            let combined = MeshData {
+                vertices,
+                indices,
+                bounds: Aabb3::new(
+                    Vec3::new(-(width as f32) * 0.5, -(height as f32) * 0.5, -1.0),
+                    Vec3::new((width as f32) * 0.5, (height as f32) * 0.5, 1.0),
+                ),
+            };
+            (
+                combined,
+                width,
+                height,
+                pad,
+                [cols as f32, rows as f32],
+                count_u32 as f32,
+            )
+        } else {
+            if opts.text.is_empty() {
+                let tex = self.ctx.create_rgba8_texture(
+                    "zc-shader-plus-text-empty",
+                    1,
+                    1,
+                    &[255, 255, 255, 0],
+                )?;
+                return Ok((tex, [1.0, 1.0], [1.0, 1.0], 1.0));
+            }
+            let mut mesh = build_glyph_mesh(
+                &opts.text,
+                opts.size,
+                opts.align,
+                opts.letter_spacing * opts.size,
+                opts.line_height,
+            );
+            if mesh.indices.is_empty() {
+                let tex = self.ctx.create_rgba8_texture(
+                    "zc-shader-plus-text-empty",
+                    1,
+                    1,
+                    &[255, 255, 255, 0],
+                )?;
+                return Ok((tex, [1.0, 1.0], [1.0, 1.0], 1.0));
+            }
+            let (mut min_x, mut max_x, mut min_y, mut max_y) = (
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            );
+            for v in &mesh.vertices {
+                min_x = min_x.min(v.position[0]);
+                max_x = max_x.max(v.position[0]);
+                min_y = min_y.min(v.position[1]);
+                max_y = max_y.max(v.position[1]);
+            }
+            let mut pad = (opts.size * 0.25).ceil().max(2.0);
+            let raw_w = (max_x - min_x).max(1.0) + pad * 2.0;
+            let raw_h = (max_y - min_y).max(1.0) + pad * 2.0;
+            let fit_scale = if raw_w.max(raw_h) > max_side as f32 {
+                ((max_side as f32 - 2.0) / raw_w.max(raw_h)).clamp(0.01, 1.0)
+            } else {
+                1.0
+            };
+            pad *= fit_scale;
+            let width = (raw_w * fit_scale).ceil().clamp(1.0, max_side as f32) as u32;
+            let height = (raw_h * fit_scale).ceil().clamp(1.0, max_side as f32) as u32;
+            let cx = 0.5 * (min_x + max_x);
+            let cy = 0.5 * (min_y + max_y);
+            for v in &mut mesh.vertices {
+                v.position[0] = (v.position[0] - cx) * fit_scale;
+                v.position[1] = (v.position[1] - cy) * fit_scale;
+                v.position[2] = 0.0;
+            }
+            (mesh, width, height, pad, [1.0, 1.0], 1.0)
+        };
+
+        if mesh.indices.is_empty() {
+            let raw = [255u8, 255, 255, 0].repeat((width * height) as usize);
+            let tex = self
+                .ctx
+                .create_rgba8_texture("zc-shader-plus-text", width, height, &raw)?;
+            return Ok((tex, [width as f32, height as f32], grid, count));
+        }
+
+        let gpu_verts: Vec<MeshVertex> = mesh
+            .vertices
+            .iter()
+            .map(|v| MeshVertex {
+                position: v.position,
+                normal: v.normal,
+                uv: v.uv,
+                material_slot: v.material_slot,
+            })
+            .collect();
+        let gpu_mesh = GpuMesh::from_slices(
+            &self.ctx,
+            &gpu_verts,
+            &mesh.indices,
+            Some("zc-shader-plus-text-mesh"),
+        );
+
+        let raw_target =
+            self.targets
+                .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+        let depth =
+            self.targets
+                .acquire(&self.ctx, width, height, wgpu::TextureFormat::Depth32Float)?;
+        let half_w = (width as f32) * 0.5;
+        let half_h = (height as f32) * 0.5;
+        let view = Mat4::from_translation(Vec3::new(0.0, 0.0, -10.0)).to_cols_array_2d();
+        let proj = mat4_orthographic_rh(-half_w, half_w, -half_h, half_h, 0.1, 100.0);
+        let camera = CameraParams {
+            view,
+            proj,
+            view_proj: mat4_mul(proj, view),
+            eye_position: [0.0, 0.0, 10.0],
+        };
+        let draw = [MeshDrawCall {
+            mesh: &gpu_mesh,
+            model: mat4_identity(),
+            normal_matrix: mat4_identity(),
+            material: MaterialParams {
+                shading: ShadingModel::Basic,
+                base_color: [1.0, 1.0, 1.0],
+                opacity: 1.0,
+                side: CullSide::Both,
+                blend: MaterialBlend::Opaque,
+                ..Default::default()
+            },
+            albedo_view: None,
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+        let render_res = self.scene3d.render(
+            &self.ctx,
+            &raw_target,
+            &depth,
+            &Scene3DPassInput {
+                camera,
+                lights: &[],
+                meshes: &draw,
+                particles: &[],
+                compat_mode: RenderCompatMode::Current,
+                editing_camera: false,
+                selection_aabb: None,
+            },
+        );
+        self.targets.release(depth);
+        if let Err(err) = render_res {
+            self.targets.release(raw_target);
+            return Err(err);
+        }
+
+        let mut silhouette_rgba = Vec::new();
+        let rb_res = readback_rgba8(&self.ctx, &raw_target, &mut silhouette_rgba);
+        self.targets.release(raw_target);
+        rb_res?;
+
+        let pixel_count = (width as usize) * (height as usize);
+        let mut out_rgba = vec![255u8; pixel_count * 4];
+        if opts.sdf {
+            let inside: Vec<bool> = silhouette_rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|px| px[3] >= 128)
+                .collect();
+            let outside: Vec<bool> = inside.iter().map(|&b| !b).collect();
+            let dist_to_inside = compute_edt_2d(&inside, width as usize, height as usize);
+            let dist_to_outside = compute_edt_2d(&outside, width as usize, height as usize);
+            let spread = (pad * 0.8).max(2.0);
+            for i in 0..pixel_count {
+                let distance = dist_to_inside[i] - dist_to_outside[i];
+                let a = ((0.5 - distance / (2.0 * spread)).clamp(0.0, 1.0) * 255.0).round() as u8;
+                out_rgba[i * 4 + 3] = a;
+            }
+        } else {
+            for (i, px) in silhouette_rgba.as_chunks::<4>().0.iter().enumerate() {
+                out_rgba[i * 4 + 3] = px[3];
+            }
+        }
+
+        let tex = self
+            .ctx
+            .create_rgba8_texture("zc-shader-plus-text", width, height, &out_rgba)?;
+        Ok((tex, [width as f32, height as f32], grid, count))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4771,6 +5522,11 @@ struct PreparedMeshSpec {
     albedo: Option<Arc<RenderTarget>>,
     normal: Option<Arc<RenderTarget>>,
     matcap: Option<Arc<RenderTarget>>,
+    emissive_map: Option<Arc<RenderTarget>>,
+    roughness_map: Option<Arc<RenderTarget>>,
+    metalness_map: Option<Arc<RenderTarget>>,
+    alpha_map: Option<Arc<RenderTarget>>,
+    env_map: Option<Arc<RenderTarget>>,
     cast_shadow: bool,
     receive_shadow: bool,
 }
@@ -4803,11 +5559,17 @@ struct PreparedParticlesSpec {
     blend: ParticleBlend,
 }
 
+#[derive(Clone, Default)]
 struct EvaluatedMaterial {
     params: MaterialParams,
     albedo: Option<Arc<RenderTarget>>,
     normal: Option<Arc<RenderTarget>>,
     matcap: Option<Arc<RenderTarget>>,
+    emissive_map: Option<Arc<RenderTarget>>,
+    roughness_map: Option<Arc<RenderTarget>>,
+    metalness_map: Option<Arc<RenderTarget>>,
+    alpha_map: Option<Arc<RenderTarget>>,
+    env_map: Option<Arc<RenderTarget>>,
 }
 
 struct CollectedCameraHelper {
@@ -4831,6 +5593,9 @@ struct CollectedLightHelper {
 
 struct CollectedScene3D {
     camera: Option<CameraParams>,
+    camera_is_active: bool,
+    camera_is_camera_plus: bool,
+    dof: Option<DofPassParams>,
     lights: Vec<SceneLight>,
     meshes: Vec<PreparedMeshSpec>,
     particles: Vec<PreparedParticlesSpec>,
@@ -4843,6 +5608,9 @@ impl Default for CollectedScene3D {
     fn default() -> Self {
         Self {
             camera: None,
+            camera_is_active: false,
+            camera_is_camera_plus: false,
+            dof: None,
             lights: Vec::new(),
             meshes: Vec::new(),
             particles: Vec::new(),
@@ -5726,7 +6494,18 @@ fn build_camera_params_from_node(
         euler_order,
     };
     let base_world = parent_world * local_tf.to_matrix();
-    build_camera_params_without_vibrate(cam, base_world, env, viewport_dims)
+    let is_camera_plus = is_camera_plus_object(obj, env.plugins);
+    build_camera_params_without_vibrate(cam, base_world, env, viewport_dims, is_camera_plus)
+}
+
+fn is_camera_plus_object(obj: &Object3D, plugins: &PluginRegistry) -> bool {
+    plugins.is_enabled("camera-plus")
+        && matches!(
+            obj.preserved
+                .get("zoidiumPluginObjectType")
+                .and_then(serde_json::Value::as_str),
+            Some("zoidium:camera-plus/camera" | "zoidium:camera-plus/camera_plus")
+        )
 }
 
 fn eval_camera_shake_matrix(cam: &zc_project::CameraData, env: &EvalEnv<'_>) -> Mat4 {
@@ -5777,9 +6556,10 @@ fn build_camera_params_without_vibrate(
     base_world: Mat4,
     env: &EvalEnv<'_>,
     viewport_dims: [f32; 2],
+    is_camera_plus: bool,
 ) -> CameraParams {
     let world = base_world * eval_camera_shake_matrix(cam, env);
-    build_camera_params_from_world(cam, world, env, viewport_dims)
+    build_camera_params_from_world(cam, world, env, viewport_dims, is_camera_plus)
 }
 
 fn build_camera_params_from_world(
@@ -5787,6 +6567,7 @@ fn build_camera_params_from_world(
     world: Mat4,
     env: &EvalEnv<'_>,
     viewport_dims: [f32; 2],
+    is_camera_plus: bool,
 ) -> CameraParams {
     let view_mat = if world.determinant().abs() > 1e-10 {
         world.inverse()
@@ -5820,28 +6601,110 @@ fn build_camera_params_from_world(
     let w = viewport_dims[0].max(1.0);
     let h = viewport_dims[1].max(1.0);
     let aspect = w / h;
+    let film_offset_x = eval_f32(&cam.film_offset_x, env);
+    let film_offset_y = eval_f32(&cam.film_offset_y, env);
 
-    let proj = match cam.kind {
+    match cam.kind {
         CameraKind::Perspective => {
-            let fov_rad = eval_f32(&cam.fov, env).clamp(1.0, 179.0).to_radians();
-            let effective_fov = (2.0 * ((fov_rad * 0.5).tan() / zoom.max(1e-4)).atan())
-                .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians());
-            mat4_perspective_rh(effective_fov, aspect, near, far)
+            let focal_length = eval_f32(&cam.focal_length, env).max(1e-3);
+            let film_gate = (cam.film_gate as f32).max(1e-3);
+            let uses_film_gate = is_camera_plus
+                || (cam.film_gate - 36.0).abs() > 1e-4
+                || cam.focal_length.animated
+                || cam.focal_length.expression.is_some()
+                || cam.focal_length.keyframes.len() > 1
+                || (focal_length - 35.0).abs() > 1e-4;
+            let has_film_offset = film_offset_x.abs() > 1e-6 || film_offset_y.abs() > 1e-6;
+            if uses_film_gate {
+                CameraParams::perspective_film_gate(
+                    view,
+                    eye_position,
+                    focal_length,
+                    film_gate,
+                    aspect,
+                    zoom,
+                    film_offset_x,
+                    film_offset_y,
+                    near,
+                    far,
+                )
+            } else if has_film_offset {
+                let fov_rad = eval_f32(&cam.fov, env).clamp(1.0, 179.0).to_radians();
+                let film_height = film_gate / aspect.max(1.0);
+                let equiv_focal = (film_height * 0.5) / (fov_rad * 0.5).tan().max(1e-5);
+                CameraParams::perspective_film_gate(
+                    view,
+                    eye_position,
+                    equiv_focal,
+                    film_gate,
+                    aspect,
+                    zoom,
+                    film_offset_x,
+                    film_offset_y,
+                    near,
+                    far,
+                )
+            } else {
+                let fov_rad = eval_f32(&cam.fov, env).clamp(1.0, 179.0).to_radians();
+                let effective_fov = (2.0 * ((fov_rad * 0.5).tan() / zoom.max(1e-4)).atan())
+                    .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians());
+                let proj = mat4_perspective_rh(effective_fov, aspect, near, far);
+                CameraParams {
+                    view,
+                    proj,
+                    view_proj: mat4_mul(proj, view),
+                    eye_position,
+                }
+            }
         }
         CameraKind::Orthographic => {
             let seq_h = env.sequence_resolution[1].max(1) as f32;
-            let half_h = (0.05 * seq_h) / zoom;
-            let half_w = half_h * aspect;
-            mat4_orthographic_rh(-half_w, half_w, -half_h, half_h, near, far)
+            let seq_w = seq_h * aspect;
+            CameraParams::orthographic_film_offset(
+                view,
+                eye_position,
+                seq_w,
+                seq_h,
+                zoom,
+                film_offset_x,
+                film_offset_y,
+                near,
+                far,
+            )
         }
-    };
-
-    CameraParams {
-        view,
-        proj,
-        view_proj: mat4_mul(proj, view),
-        eye_position,
     }
+}
+
+fn eval_camera_dof(cam: &zc_project::CameraData, env: &EvalEnv<'_>) -> Option<DofPassParams> {
+    if !env.plugins.is_enabled("camera-plus") {
+        return None;
+    }
+    let dof = cam.dof.as_ref()?;
+    let enabled = match dof.enabled_track.as_ref() {
+        Some(track) => eval_bool(track, env, dof.enabled),
+        None => dof.enabled,
+    };
+    if !enabled {
+        return None;
+    }
+    let near = (cam.near as f32).max(1e-4);
+    let far = (cam.far as f32).max(near + 1.0);
+    let aperture = eval_f32(&dof.aperture, env).clamp(0.0, 40.0);
+    let focus_distance = eval_f32(&dof.focus_distance, env).max(0.0);
+    let focus_area_width = eval_f32(&dof.focus_area_width, env).max(0.0);
+    let near_blur_level = (eval_f32(&dof.near_blur, env) / 100.0).clamp(0.0, 4.0);
+    let far_blur_level = (eval_f32(&dof.far_blur, env) / 100.0).clamp(0.0, 4.0);
+    Some(DofPassParams {
+        enabled: true,
+        orthographic: matches!(cam.kind, CameraKind::Orthographic),
+        near,
+        far,
+        aperture,
+        focus_distance,
+        focus_area_width,
+        near_blur_level,
+        far_blur_level,
+    })
 }
 
 fn compute_normal_matrix(model: Mat4) -> [[f32; 4]; 4] {
@@ -5887,6 +6750,7 @@ fn map_material_blend(blending: u32, transparent: bool, opacity: f32) -> Materia
     }
     match blending {
         2 => MaterialBlend::Additive,
+        3 => MaterialBlend::Subtractive,
         4 => MaterialBlend::Multiply,
         _ => MaterialBlend::Normal,
     }
@@ -7846,6 +8710,1403 @@ fn build_torus_knot(
     MeshData::new(vertices, indices)
 }
 
+fn push_prepared_mesh(
+    out: &mut CollectedScene3D,
+    object_id: Uuid,
+    mesh: Arc<GpuMesh>,
+    bounds: Aabb3,
+    world: Mat4,
+    mat_eval: &EvaluatedMaterial,
+) {
+    out.meshes.push(PreparedMeshSpec {
+        object_id,
+        world_aabb: transform_aabb_world(bounds, world),
+        mesh,
+        model: world.to_cols_array_2d(),
+        normal_matrix: compute_normal_matrix(world),
+        material: mat_eval.params,
+        albedo: mat_eval.albedo.clone(),
+        normal: mat_eval.normal.clone(),
+        matcap: mat_eval.matcap.clone(),
+        emissive_map: mat_eval.emissive_map.clone(),
+        roughness_map: mat_eval.roughness_map.clone(),
+        metalness_map: mat_eval.metalness_map.clone(),
+        alpha_map: mat_eval.alpha_map.clone(),
+        env_map: mat_eval.env_map.clone(),
+        cast_shadow: true,
+        receive_shadow: true,
+    });
+}
+
+fn build_shape_mesh_cpu(shape: &Shape3DKind, env: &EvalEnv<'_>) -> MeshData {
+    match shape {
+        Shape3DKind::Box { size } => build_box(size[0] as f32, size[1] as f32, size[2] as f32),
+        Shape3DKind::Cylinder {
+            top_radius,
+            bottom_radius,
+            height,
+            detail,
+            open_ended,
+        } => build_cylinder(
+            *top_radius as f32,
+            *bottom_radius as f32,
+            *height as f32,
+            *detail,
+            *open_ended,
+        ),
+        Shape3DKind::Rectangle { size } => build_rectangle(size[0] as f32, size[1] as f32),
+        Shape3DKind::Circle { radius, detail } => build_circle(*radius as f32, *detail),
+        Shape3DKind::Sphere {
+            radius,
+            width_segments,
+            height_segments,
+        } => build_sphere(*radius as f32, *width_segments, *height_segments),
+        Shape3DKind::Donut {
+            radius,
+            tube,
+            radial_segments,
+            tubular_segments,
+        } => build_donut(
+            *radius as f32,
+            *tube as f32,
+            *radial_segments,
+            *tubular_segments,
+        ),
+        Shape3DKind::Wire {
+            size,
+            thickness,
+            loops,
+            inner_segments,
+            outer_segments,
+        } => build_wire(
+            Vec3::new(size[0] as f32, size[1] as f32, size[2] as f32),
+            *thickness as f32,
+            *loops,
+            *inner_segments,
+            *outer_segments,
+        ),
+        Shape3DKind::Cone {
+            radius,
+            height,
+            detail,
+            open_ended,
+        } => build_cylinder(0.0, *radius as f32, *height as f32, *detail, *open_ended),
+        Shape3DKind::RoundedBox {
+            size,
+            radius,
+            segments,
+        } => build_rounded_box(
+            size[0] as f32,
+            size[1] as f32,
+            size[2] as f32,
+            *radius as f32,
+            *segments,
+        ),
+        Shape3DKind::Tetrahedron { radius, detail } => build_tetrahedron(*radius as f32, *detail),
+        Shape3DKind::Octahedron { radius, detail } => build_octahedron(*radius as f32, *detail),
+        Shape3DKind::Dodecahedron { radius, detail } => build_dodecahedron(*radius as f32, *detail),
+        Shape3DKind::Icosahedron { radius, detail } => build_icosahedron(*radius as f32, *detail),
+        Shape3DKind::Capsule {
+            radius,
+            length,
+            cap_segments,
+            radial_segments,
+        } => build_capsule(
+            *radius as f32,
+            *length as f32,
+            *cap_segments,
+            *radial_segments,
+        ),
+        Shape3DKind::TorusKnot {
+            radius,
+            tube,
+            tubular_segments,
+            radial_segments,
+            p,
+            q,
+        } => build_torus_knot(
+            *radius as f32,
+            *tube as f32,
+            *tubular_segments,
+            *radial_segments,
+            *p,
+            *q,
+        ),
+        Shape3DKind::CustomGeometry { asset_id } => asset_id
+            .as_deref()
+            .and_then(|id| load_obj_from_project(env.project, id))
+            .unwrap_or_else(|| build_box(10.0, 10.0, 10.0)),
+    }
+}
+
+fn parse_preserved_bool_flag(val: Option<&serde_json::Value>, default: bool) -> bool {
+    match val {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(n)) => n.as_f64().is_some_and(|v| v.abs() > 1e-6),
+        Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => true,
+            "0" | "false" | "off" | "no" => false,
+            _ => default,
+        },
+        Some(serde_json::Value::Object(map)) => map
+            .get("value")
+            .or_else(|| map.get("v"))
+            .map_or(default, |v| parse_preserved_bool_flag(Some(v), default)),
+        _ => default,
+    }
+}
+
+fn build_text3d_params_and_options(
+    data: &zc_project::Text3DData,
+    obj: &Object3D,
+) -> (Text3DParams, Text3DExtendedOptions) {
+    let params = Text3DParams {
+        text: data.text.clone(),
+        height: data.size[0].max(0.1) as f32,
+        thickness: data.size[1].max(0.0) as f32,
+        curve_segments: data.detail.max(1),
+        bevel_enabled: data.bevel,
+        bevel_thickness: data.bevel_thickness as f32,
+        bevel_size: data.bevel_size as f32,
+        bevel_segments: data.bevel_detail.max(1),
+        align: map_text_align(data.position_mode),
+        uv_mode: match obj.zoidium_uv_mode {
+            ProjectCompatMode::Current => UvMode::Current,
+            ProjectCompatMode::Legacy => UvMode::Legacy,
+        },
+        letter_spacing: data.spacing as f32,
+        line_height: 1.2,
+    };
+    let kerning = parse_preserved_bool_flag(
+        obj.preserved
+            .get("kerning")
+            .or_else(|| obj.preserved.get("property.kerning")),
+        false,
+    );
+    let options = Text3DExtendedOptions {
+        bevel_side: BevelSide::from_u32(data.bevel_side),
+        bevel_profile: BevelProfile::from_u32(data.bevel_profile),
+        bevel_tension: (data.bevel_tension as f32).clamp(0.0, 1.0),
+        kerning,
+        use_font_line_height: true,
+        text_scale_mode: match data.text_scale_mode {
+            ProjectCompatMode::Current => TextScaleMode::Current,
+            ProjectCompatMode::Legacy => TextScaleMode::Legacy,
+        },
+    };
+    (params, options)
+}
+
+fn build_text3d_mesh_cpu(
+    obj: &Object3D,
+    data: &zc_project::Text3DData,
+    env: &EvalEnv<'_>,
+) -> MeshData {
+    let (params, options) = build_text3d_params_and_options(data, obj);
+    data.font
+        .as_deref()
+        .and_then(|font_id| env.project.assets.get(font_id))
+        .and_then(|rec| rec.bytes.as_deref())
+        .and_then(|bytes| build_text3d_mesh_with_options(bytes, &params, &options).ok())
+        .filter(|m| !m.indices.is_empty())
+        .or_else(|| {
+            build_text3d_mesh_with_options(DEFAULT_TTF_FONT_BYTES, &params, &options)
+                .ok()
+                .filter(|m| !m.indices.is_empty())
+        })
+        .unwrap_or_else(|| build_fallback_text_mesh_with_options(&params, &options))
+}
+
+fn build_text3d_character_meshes_with_fallback(
+    project: &Project,
+    data: &zc_project::Text3DData,
+    params: &Text3DParams,
+    options: &Text3DExtendedOptions,
+    text_scale: Vec3,
+) -> Vec<zc_scene::Text3DCharacterMesh> {
+    data.font
+        .as_deref()
+        .and_then(|font_id| project.assets.get(font_id))
+        .and_then(|rec| rec.bytes.as_deref())
+        .and_then(|bytes| build_text3d_character_meshes(bytes, params, options, text_scale).ok())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            build_text3d_character_meshes(DEFAULT_TTF_FONT_BYTES, params, options, text_scale)
+                .ok()
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn build_model_mesh_cpu(data: &zc_project::ModelData, env: &EvalEnv<'_>) -> MeshData {
+    data.asset_id
+        .as_deref()
+        .and_then(|id| load_obj_from_project(env.project, id))
+        .unwrap_or_else(|| build_box(12.0, 12.0, 12.0))
+}
+
+// ---------------------------------------------------------------------------
+// Effector+, Repeater & ExpressText+ Scene Runtime
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SceneEffectorKind {
+    Repeater(RepeaterMode),
+    Twist,
+    Warp,
+    Plain,
+    Delay,
+    VoronoiFracture,
+}
+
+fn detect_scene_effector_kind(obj: &Object3D) -> Option<SceneEffectorKind> {
+    let raw = obj
+        .preserved
+        .get("zoidiumPluginObjectType")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            obj.preserved
+                .get("effectorType")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or(match &obj.kind {
+            Object3DKind::Dummy { original_type, .. } => original_type.as_deref(),
+            _ => None,
+        })?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "zoidium:repeater/repeater" | "repeater" | "step-repeater" | "step_repeater" => {
+            Some(SceneEffectorKind::Repeater(RepeaterMode::Step))
+        }
+        "zoidium:repeater/linear-repeater" | "linear-repeater" | "linear_repeater" => {
+            Some(SceneEffectorKind::Repeater(RepeaterMode::Linear))
+        }
+        "zoidium:repeater/random-repeater" | "random-repeater" | "random_repeater" => {
+            Some(SceneEffectorKind::Repeater(RepeaterMode::Random))
+        }
+        "zoidium:repeater/echo-repeater" | "echo-repeater" | "echo_repeater" => {
+            Some(SceneEffectorKind::Repeater(RepeaterMode::Echo))
+        }
+        "zoidium:repeater/twist" | "twist" | "7" => Some(SceneEffectorKind::Twist),
+        "zoidium:repeater/warp" | "warp" | "8" => Some(SceneEffectorKind::Warp),
+        "zoidium:repeater/voronoi-fracture"
+        | "voronoi-fracture"
+        | "voronoi_fracture"
+        | "fracture"
+        | "9" => Some(SceneEffectorKind::VoronoiFracture),
+        "zoidium:repeater/plain" | "plain" | "plain-effector" | "plain_effector" => {
+            Some(SceneEffectorKind::Plain)
+        }
+        "zoidium:repeater/delay" | "delay" | "delay-effector" | "delay_effector" => {
+            Some(SceneEffectorKind::Delay)
+        }
+        _ => None,
+    }
+}
+
+fn collect_node_effector_chain(
+    eval_graph: &EvaluatedSceneGraph3D<'_>,
+    node_idx: usize,
+    effector_kinds: &[Option<SceneEffectorKind>],
+    has_mesh_descendant: &[bool],
+) -> Vec<usize> {
+    let mut chain = Vec::new();
+    let parent = eval_graph.nodes[node_idx].parent;
+    // 1. Sibling childless deformers sharing the same parent (C4D / sibling convention).
+    for (s_idx, s_node) in eval_graph.nodes.iter().enumerate() {
+        if s_idx != node_idx
+            && s_node.parent == parent
+            && s_node.render_enabled
+            && effector_kinds[s_idx].is_some()
+            && !has_mesh_descendant[s_idx]
+        {
+            chain.push(s_idx);
+        }
+    }
+    // 2. Ancestor deformers/repeaters walking innermost -> outermost (Zoidium Group hierarchy).
+    let mut cur = parent;
+    let mut guard = 0usize;
+    while let Some(anc) = cur {
+        if guard >= 256 {
+            break;
+        }
+        if eval_graph.nodes[anc].render_enabled && effector_kinds[anc].is_some() {
+            chain.push(anc);
+        }
+        cur = eval_graph.nodes[anc].parent;
+        guard += 1;
+    }
+    chain
+}
+
+struct DeformedInstance {
+    mesh: Arc<MeshData>,
+    world: Mat4,
+}
+
+fn env_at_frame<'a>(env: &EvalEnv<'a>, target_frame: f64) -> EvalEnv<'a> {
+    let clamped = target_frame.max(0.0);
+    let delta = clamped - env.frame;
+    EvalEnv {
+        frame: clamped,
+        abs_frame: (env.abs_frame + delta).max(0.0),
+        time: clamped / env.fps.max(1.0),
+        ..env.clone()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_scene_effector_chain(
+    objects: &[Object3D],
+    parent_world: Mat4,
+    eval_graph: &EvaluatedSceneGraph3D<'_>,
+    node_idx: usize,
+    rest_mesh: Arc<MeshData>,
+    initial_world: Mat4,
+    effector_chain: &[usize],
+    effector_kinds: &[Option<SceneEffectorKind>],
+    env: &EvalEnv<'_>,
+) -> Vec<DeformedInstance> {
+    let mut instances = vec![DeformedInstance {
+        mesh: Arc::clone(&rest_mesh),
+        world: initial_world,
+    }];
+    let mut upstream_deformers: Vec<usize> = Vec::new();
+    let mut curved_upstream = false;
+
+    for &e_idx in effector_chain {
+        let Some(kind) = effector_kinds[e_idx] else {
+            continue;
+        };
+        let e_node = &eval_graph.nodes[e_idx];
+        let e_obj_env = env.with_object(e_node.obj.id);
+        let e_env = e_obj_env.with_parent_props(&e_node.parent_props);
+        let e_world = e_node.world_mat;
+
+        match kind {
+            SceneEffectorKind::Repeater(mode) => {
+                let rep = parse_repeater_params(e_node.obj, mode, &e_env);
+                if rep.mode == RepeaterMode::Echo {
+                    let frames = repeater_echo_frames(env.frame, rep.count, rep.delay_frames);
+                    let mut next = Vec::with_capacity(frames.len() * instances.len());
+                    for ef in frames {
+                        if (ef - env.frame).abs() < 1e-6 {
+                            for inst in &instances {
+                                next.push(DeformedInstance {
+                                    mesh: Arc::clone(&inst.mesh),
+                                    world: inst.world,
+                                });
+                            }
+                        } else {
+                            let echo_env = env_at_frame(env, ef);
+                            let echo_graph =
+                                evaluate_scene_graph_3d(objects, parent_world, &echo_env);
+                            let target_uuid = eval_graph.nodes[node_idx].obj.id;
+                            let echo_world = echo_graph
+                                .by_uuid
+                                .get(&target_uuid)
+                                .map_or(initial_world, |&i| echo_graph.nodes[i].world_mat);
+                            if upstream_deformers.is_empty() {
+                                next.push(DeformedInstance {
+                                    mesh: Arc::clone(&rest_mesh),
+                                    world: echo_world,
+                                });
+                            } else {
+                                let echo_upstream: Vec<usize> = upstream_deformers
+                                    .iter()
+                                    .filter_map(|&u_idx| {
+                                        echo_graph
+                                            .by_uuid
+                                            .get(&eval_graph.nodes[u_idx].obj.id)
+                                            .copied()
+                                    })
+                                    .collect();
+                                let echo_kinds: Vec<Option<SceneEffectorKind>> = echo_graph
+                                    .nodes
+                                    .iter()
+                                    .map(|n| detect_scene_effector_kind(n.obj))
+                                    .collect();
+                                let echo_node_idx =
+                                    echo_graph.by_uuid.get(&target_uuid).copied().unwrap_or(0);
+                                let echo_insts = apply_scene_effector_chain(
+                                    objects,
+                                    parent_world,
+                                    &echo_graph,
+                                    echo_node_idx,
+                                    Arc::clone(&rest_mesh),
+                                    echo_world,
+                                    &echo_upstream,
+                                    &echo_kinds,
+                                    &echo_env,
+                                );
+                                next.extend(echo_insts);
+                            }
+                        }
+                    }
+                    instances = next;
+                } else {
+                    let count = rep.count.clamp(1, MAX_REPEATS);
+                    let inv_r = if e_world.determinant().abs() > 1e-9 {
+                        e_world.inverse()
+                    } else {
+                        Mat4::IDENTITY
+                    };
+                    let mut next = Vec::with_capacity(instances.len() * count as usize);
+                    for inst in &instances {
+                        let rel = inv_r * inst.world;
+                        for copy_i in 0..count {
+                            let tr = repeater_instance_transform(&rep, copy_i);
+                            let copy_local = Transform3D {
+                                position: tr.position,
+                                rotation: tr.rotation_rad,
+                                scale: tr.scale,
+                                euler_order: rep.euler_order,
+                            }
+                            .to_matrix();
+                            next.push(DeformedInstance {
+                                mesh: Arc::clone(&inst.mesh),
+                                world: e_world * copy_local * rel,
+                            });
+                        }
+                    }
+                    instances = next;
+                }
+            }
+            SceneEffectorKind::Twist => {
+                let params = parse_twist_params(e_node.obj, &e_env);
+                let shared_bounds = compute_instances_shared_bounds(&instances, e_world);
+                for inst in &mut instances {
+                    let df = compute_deformer_frame(e_world, inst.world);
+                    let deformed =
+                        apply_twist_with_params(&inst.mesh, &params, shared_bounds, df.as_ref());
+                    inst.mesh = Arc::new(deformed);
+                }
+                upstream_deformers.push(e_idx);
+                curved_upstream = true;
+            }
+            SceneEffectorKind::Warp => {
+                let params = parse_warp_params(e_node.obj, &e_env);
+                let shared_bounds = compute_instances_shared_bounds(&instances, e_world);
+                for inst in &mut instances {
+                    let df = compute_deformer_frame(e_world, inst.world);
+                    let deformed =
+                        apply_warp_with_params(&inst.mesh, &params, shared_bounds, df.as_ref());
+                    inst.mesh = Arc::new(deformed);
+                }
+                upstream_deformers.push(e_idx);
+                curved_upstream = true;
+            }
+            SceneEffectorKind::Plain => {
+                let params = parse_plain_params(e_node.obj, &e_env);
+                let shared_bounds = compute_instances_shared_bounds(&instances, e_world);
+                for inst in &mut instances {
+                    let df = compute_deformer_frame(e_world, inst.world);
+                    let deformed = apply_plain(&inst.mesh, &params, shared_bounds, df.as_ref());
+                    inst.mesh = Arc::new(deformed);
+                }
+                upstream_deformers.push(e_idx);
+            }
+            SceneEffectorKind::VoronoiFracture => {
+                let params = parse_voronoi_params(e_node.obj, &e_env);
+                let shared_bounds = compute_instances_shared_bounds(&instances, e_world);
+                for inst in &mut instances {
+                    let df = compute_deformer_frame(e_world, inst.world);
+                    let deformed = apply_voronoi_fracture_with_params(
+                        &inst.mesh,
+                        &params,
+                        shared_bounds,
+                        df.as_ref(),
+                    );
+                    inst.mesh = Arc::new(deformed);
+                }
+                upstream_deformers.push(e_idx);
+            }
+            SceneEffectorKind::Delay => {
+                let params = parse_delay_params(e_node.obj, &e_env);
+                let window = params.window.clamp(1, 120);
+                if params.strength > 0.0 && env.frame > 0.0 && !upstream_deformers.is_empty() {
+                    let target_uuid = eval_graph.nodes[node_idx].obj.id;
+                    let mut history_by_inst: Vec<Vec<MeshData>> =
+                        vec![Vec::with_capacity(window as usize); instances.len()];
+                    for step in 1..=window {
+                        let hf = (env.frame - f64::from(step)).max(0.0);
+                        let h_env = env_at_frame(env, hf);
+                        let h_graph = evaluate_scene_graph_3d(objects, parent_world, &h_env);
+                        let h_world = h_graph
+                            .by_uuid
+                            .get(&target_uuid)
+                            .map_or(initial_world, |&i| h_graph.nodes[i].world_mat);
+                        let h_upstream: Vec<usize> = upstream_deformers
+                            .iter()
+                            .filter_map(|&u_idx| {
+                                h_graph
+                                    .by_uuid
+                                    .get(&eval_graph.nodes[u_idx].obj.id)
+                                    .copied()
+                            })
+                            .collect();
+                        let h_kinds: Vec<Option<SceneEffectorKind>> = h_graph
+                            .nodes
+                            .iter()
+                            .map(|n| detect_scene_effector_kind(n.obj))
+                            .collect();
+                        let h_node_idx = h_graph.by_uuid.get(&target_uuid).copied().unwrap_or(0);
+                        let h_insts = apply_scene_effector_chain(
+                            objects,
+                            parent_world,
+                            &h_graph,
+                            h_node_idx,
+                            Arc::clone(&rest_mesh),
+                            h_world,
+                            &h_upstream,
+                            &h_kinds,
+                            &h_env,
+                        );
+                        for (slot, hi) in history_by_inst.iter_mut().zip(h_insts) {
+                            slot.push((*hi.mesh).clone());
+                        }
+                    }
+                    for (inst, hist) in instances.iter_mut().zip(history_by_inst.iter()) {
+                        let hist_refs: Vec<&MeshData> = hist.iter().collect();
+                        let ref_rest = if rest_mesh.vertices.len() == inst.mesh.vertices.len() {
+                            rest_mesh.as_ref()
+                        } else {
+                            inst.mesh.as_ref()
+                        };
+                        let delayed = apply_delay(
+                            ref_rest,
+                            inst.mesh.as_ref(),
+                            &hist_refs,
+                            &params,
+                            curved_upstream,
+                        );
+                        inst.mesh = Arc::new(delayed);
+                    }
+                }
+            }
+        }
+    }
+
+    instances
+}
+
+fn compute_instances_shared_bounds(
+    instances: &[DeformedInstance],
+    deformer_world: Mat4,
+) -> Option<Aabb3> {
+    if instances.len() <= 1 {
+        return None;
+    }
+    let pairs: Vec<(&MeshData, Mat4)> = instances
+        .iter()
+        .map(|i| (i.mesh.as_ref(), i.world))
+        .collect();
+    compute_shared_deformer_bounds(&pairs, deformer_world)
+}
+
+fn json_to_property_track(val: &serde_json::Value, default: PropertyValue) -> PropertyTrack {
+    match val {
+        serde_json::Value::Number(n) => PropertyTrack::number(
+            n.as_f64()
+                .unwrap_or_else(|| default.as_f64().unwrap_or(0.0)),
+        ),
+        serde_json::Value::Bool(b) => PropertyTrack::constant(PropertyValue::Bool(*b)),
+        serde_json::Value::String(s) => PropertyTrack::text(s.clone()),
+        serde_json::Value::Array(arr) => {
+            if arr.len() >= 3 {
+                PropertyTrack::vec3([
+                    arr[0].as_f64().unwrap_or(0.0),
+                    arr[1].as_f64().unwrap_or(0.0),
+                    arr[2].as_f64().unwrap_or(0.0),
+                ])
+            } else if arr.len() == 2 {
+                PropertyTrack::vec2([
+                    arr[0].as_f64().unwrap_or(0.0),
+                    arr[1].as_f64().unwrap_or(0.0),
+                ])
+            } else if let Some(v) = arr.first().and_then(serde_json::Value::as_f64) {
+                PropertyTrack::number(v)
+            } else {
+                PropertyTrack::constant(default)
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Ok(track) = serde_json::from_value::<PropertyTrack>(val.clone()) {
+                return track;
+            }
+            if let (Some(x), Some(y), Some(z)) = (
+                map.get("x").and_then(serde_json::Value::as_f64),
+                map.get("y").and_then(serde_json::Value::as_f64),
+                map.get("z").and_then(serde_json::Value::as_f64),
+            ) {
+                return PropertyTrack::vec3([x, y, z]);
+            }
+            let base_val = map
+                .get("value")
+                .or_else(|| map.get("v"))
+                .map_or_else(|| default.clone(), |v| json_to_property_value(v, &default));
+            let animated = map
+                .get("animated")
+                .or_else(|| map.get("a"))
+                .is_some_and(|v| parse_preserved_bool_flag(Some(v), false));
+            let expression = map
+                .get("expression")
+                .or_else(|| map.get("e"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(ToOwned::to_owned);
+            let mut keyframes = Vec::new();
+            if let Some(kf_arr) = map
+                .get("keyframes")
+                .or_else(|| map.get("k"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for kf in kf_arr {
+                    if let Some(kobj) = kf.as_object()
+                        && let Some(frame) = kobj
+                            .get("frame")
+                            .or_else(|| kobj.get("t"))
+                            .and_then(serde_json::Value::as_f64)
+                    {
+                        let kv = kobj.get("value").or_else(|| kobj.get("v")).map_or_else(
+                            || base_val.clone(),
+                            |v| json_to_property_value(v, &default),
+                        );
+                        let tween = kobj
+                            .get("tween")
+                            .or_else(|| kobj.get("e"))
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(1) as u32;
+                        let mut cp = [[-10.0, 0.0], [10.0, 0.0]];
+                        if let Some(cparr) = kobj
+                            .get("controlPoints")
+                            .or_else(|| kobj.get("cp"))
+                            .and_then(serde_json::Value::as_array)
+                            && cparr.len() >= 2
+                        {
+                            for i in 0..2 {
+                                if let Some(pair) = cparr[i].as_array()
+                                    && pair.len() >= 2
+                                {
+                                    cp[i][0] = pair[0].as_f64().unwrap_or(cp[i][0]);
+                                    cp[i][1] = pair[1].as_f64().unwrap_or(cp[i][1]);
+                                }
+                            }
+                        }
+                        keyframes
+                            .push(PropertyKeyframe::from_cm3_tween(frame, kv, tween, cp, true));
+                    }
+                }
+            }
+            let mut channels = Vec::new();
+            if let Some(ch_arr) = map
+                .get("channels")
+                .or_else(|| map.get("p"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for ch in ch_arr {
+                    channels.push(json_to_property_track(ch, PropertyValue::Number(0.0)));
+                }
+            }
+            PropertyTrack {
+                animated: animated || expression.is_some() || !keyframes.is_empty(),
+                expression,
+                static_behavior: ProjectStaticBehavior::Constant,
+                value: base_val,
+                keyframes,
+                channels,
+            }
+        }
+        serde_json::Value::Null => PropertyTrack::constant(default),
+    }
+}
+
+fn json_to_property_value(val: &serde_json::Value, default: &PropertyValue) -> PropertyValue {
+    match val {
+        serde_json::Value::Number(n) => PropertyValue::Number(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::Bool(b) => PropertyValue::Bool(*b),
+        serde_json::Value::String(s) => PropertyValue::Text(s.clone()),
+        serde_json::Value::Array(arr) if arr.len() >= 3 => PropertyValue::Vec3([
+            arr[0].as_f64().unwrap_or(0.0),
+            arr[1].as_f64().unwrap_or(0.0),
+            arr[2].as_f64().unwrap_or(0.0),
+        ]),
+        serde_json::Value::Array(arr) if arr.len() == 2 => PropertyValue::Vec2([
+            arr[0].as_f64().unwrap_or(0.0),
+            arr[1].as_f64().unwrap_or(0.0),
+        ]),
+        _ => default.clone(),
+    }
+}
+
+fn lookup_obj_prop_value(obj: &Object3D, keys: &[&str]) -> Option<PropertyTrack> {
+    if let Object3DKind::Group {
+        custom_properties, ..
+    } = &obj.kind
+    {
+        for &key in keys {
+            if let Some(cp) = custom_properties
+                .iter()
+                .find(|cp| cp.name.eq_ignore_ascii_case(key))
+            {
+                return Some(cp.track.clone());
+            }
+        }
+    }
+    for &key in keys {
+        let prop_key = format!("property.{key}");
+        if let Some(v) = obj.preserved.get(&prop_key) {
+            return Some(json_to_property_track(v, PropertyValue::Number(0.0)));
+        }
+        for container in ["repeaterProperties", "effectorProperties", "properties"] {
+            if let Some(v) = obj
+                .preserved
+                .get(container)
+                .and_then(serde_json::Value::as_object)
+                .and_then(|m| m.get(key))
+            {
+                return Some(json_to_property_track(v, PropertyValue::Number(0.0)));
+            }
+        }
+        if let Some(v) = obj.preserved.get(key) {
+            return Some(json_to_property_track(v, PropertyValue::Number(0.0)));
+        }
+    }
+    None
+}
+
+fn eval_obj_f32(obj: &Object3D, keys: &[&str], default: f32, env: &EvalEnv<'_>) -> f32 {
+    lookup_obj_prop_value(obj, keys)
+        .and_then(|t| eval_property_track(&t, env).as_f64())
+        .map_or(default, |v| v as f32)
+}
+
+fn eval_obj_f64(obj: &Object3D, keys: &[&str], default: f64, env: &EvalEnv<'_>) -> f64 {
+    lookup_obj_prop_value(obj, keys)
+        .and_then(|t| eval_property_track(&t, env).as_f64())
+        .unwrap_or(default)
+}
+
+fn eval_obj_u32(obj: &Object3D, keys: &[&str], default: u32, env: &EvalEnv<'_>) -> u32 {
+    lookup_obj_prop_value(obj, keys)
+        .and_then(|t| eval_property_track(&t, env).as_f64())
+        .map_or(default, |v| v.round().max(0.0) as u32)
+}
+
+fn eval_obj_i32(obj: &Object3D, keys: &[&str], default: i32, env: &EvalEnv<'_>) -> i32 {
+    lookup_obj_prop_value(obj, keys)
+        .and_then(|t| eval_property_track(&t, env).as_f64())
+        .map_or(default, |v| v.round() as i32)
+}
+
+fn eval_obj_bool(obj: &Object3D, keys: &[&str], default: bool, env: &EvalEnv<'_>) -> bool {
+    lookup_obj_prop_value(obj, keys).map_or(default, |t| eval_bool(&t, env, default))
+}
+
+fn eval_obj_vec3(obj: &Object3D, keys: &[&str], default: Vec3, env: &EvalEnv<'_>) -> Vec3 {
+    lookup_obj_prop_value(obj, keys)
+        .and_then(|t| eval_property_track(&t, env).as_vec3())
+        .map_or(default, |v| {
+            Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32)
+        })
+}
+
+fn eval_obj_str(obj: &Object3D, keys: &[&str], env: &EvalEnv<'_>) -> Option<String> {
+    lookup_obj_prop_value(obj, keys).and_then(|t| match eval_property_track(&t, env) {
+        PropertyValue::Text(s) | PropertyValue::List(s) => Some(s),
+        _ => None,
+    })
+}
+
+fn parse_deform_axis_from_obj(
+    obj: &Object3D,
+    keys: &[&str],
+    default: DeformAxis,
+    env: &EvalEnv<'_>,
+) -> DeformAxis {
+    if let Some(s) = eval_obj_str(obj, keys, env) {
+        return match s.trim().to_ascii_lowercase().as_str() {
+            "x" | "0" => DeformAxis::X,
+            "y" | "1" => DeformAxis::Y,
+            "z" | "2" => DeformAxis::Z,
+            _ => default,
+        };
+    }
+    if let Some(t) = lookup_obj_prop_value(obj, keys)
+        && let Some(n) = eval_property_track(&t, env).as_f64()
+    {
+        return match n.round() as i32 {
+            0 => DeformAxis::X,
+            1 => DeformAxis::Y,
+            2 => DeformAxis::Z,
+            _ => default,
+        };
+    }
+    default
+}
+
+fn parse_warp_axis_from_obj(obj: &Object3D, keys: &[&str], env: &EvalEnv<'_>) -> WarpAxis {
+    if let Some(s) = eval_obj_str(obj, keys, env) {
+        return match s.trim().to_ascii_lowercase().as_str() {
+            "z" | "1" | "into_z" | "intoz" => WarpAxis::IntoZ,
+            _ => WarpAxis::IntoY,
+        };
+    }
+    WarpAxis::from_u32(eval_obj_u32(obj, keys, 0, env))
+}
+
+fn parse_subdivision_from_obj(obj: &Object3D, env: &EvalEnv<'_>) -> u32 {
+    if obj
+        .preserved
+        .get("zoidiumSubdivisionMode")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("legacy"))
+        && let Some(lvl) = obj
+            .preserved
+            .get("zoidiumLegacySubdivisionLevel")
+            .and_then(serde_json::Value::as_u64)
+    {
+        return 4_u32.pow((lvl as u32).min(4));
+    }
+    eval_obj_u32(obj, &["subdivision", "subdivide", "polygons"], 1, env).max(1)
+}
+
+fn parse_effector_field_from_obj(obj: &Object3D, env: &EvalEnv<'_>) -> Option<EffectorField> {
+    let field_type = if let Some(s) = eval_obj_str(obj, &["field", "fieldType", "field_type"], env)
+    {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "linear" | "1" => EffectorFieldType::Linear,
+            "box" | "2" => EffectorFieldType::Box,
+            "sphere" | "3" => EffectorFieldType::Sphere,
+            "cylinder" | "4" => EffectorFieldType::Cylinder,
+            "noise" | "5" => EffectorFieldType::Noise,
+            _ => EffectorFieldType::Infinite,
+        }
+    } else {
+        EffectorFieldType::from_u32(eval_obj_u32(
+            obj,
+            &["field", "fieldType", "field_type"],
+            0,
+            env,
+        ))
+    };
+    let invert = eval_obj_bool(obj, &["fieldInvert", "field_invert"], false, env);
+    if field_type == EffectorFieldType::Infinite && !invert {
+        return None;
+    }
+    let curve = if let Some(s) = eval_obj_str(
+        obj,
+        &["fieldCurve", "field_curve", "fieldFalloffCurve"],
+        env,
+    ) {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "smooth" | "1" => FieldFalloffCurve::Smooth,
+            "easein" | "ease_in" | "ease-in" | "2" => FieldFalloffCurve::EaseIn,
+            "easeout" | "ease_out" | "ease-out" | "3" => FieldFalloffCurve::EaseOut,
+            _ => FieldFalloffCurve::Linear,
+        }
+    } else {
+        FieldFalloffCurve::from_u32(eval_obj_u32(
+            obj,
+            &["fieldCurve", "field_curve", "fieldFalloffCurve"],
+            0,
+            env,
+        ))
+    };
+    Some(EffectorField {
+        field_type,
+        position: eval_obj_vec3(obj, &["fieldPosition", "field_position"], Vec3::ZERO, env),
+        rotation_deg: eval_obj_vec3(obj, &["fieldRotation", "field_rotation"], Vec3::ZERO, env),
+        scale: eval_obj_vec3(obj, &["fieldScale", "field_scale"], Vec3::splat(100.0), env),
+        falloff: eval_obj_f32(obj, &["fieldFalloff", "field_falloff"], 100.0, env),
+        curve,
+        invert,
+        sweep: eval_obj_f32(obj, &["fieldSweep", "field_sweep"], 100.0, env),
+        noise_scale: eval_obj_f32(obj, &["fieldNoiseScale", "field_noise_scale"], 100.0, env),
+        evolution: eval_obj_f32(obj, &["fieldEvolution", "field_evolution"], 0.0, env),
+        seed: eval_obj_i32(obj, &["fieldSeed", "field_seed"], 1, env),
+        legacy: eval_obj_bool(obj, &["fieldLegacy", "legacyField"], false, env),
+    })
+}
+
+fn parse_twist_params(obj: &Object3D, env: &EvalEnv<'_>) -> TwistParams {
+    TwistParams {
+        angle: eval_obj_f32(obj, &["angle", "twistAngle"], 0.0, env),
+        axis: parse_deform_axis_from_obj(obj, &["axis", "twistAxis"], DeformAxis::Y, env),
+        offset: eval_obj_f32(obj, &["offset", "twistOffset"], 0.0, env),
+        subdivision: parse_subdivision_from_obj(obj, env),
+        field: parse_effector_field_from_obj(obj, env),
+    }
+}
+
+fn parse_warp_params(obj: &Object3D, env: &EvalEnv<'_>) -> WarpParams {
+    WarpParams {
+        strength: eval_obj_f32(
+            obj,
+            &["strength", "bend", "angle", "warpStrength"],
+            0.0,
+            env,
+        ),
+        axis: parse_warp_axis_from_obj(obj, &["axis", "warpAxis"], env),
+        offset: eval_obj_f32(obj, &["offset", "warpOffset"], 0.0, env),
+        subdivision: parse_subdivision_from_obj(obj, env),
+        field: parse_effector_field_from_obj(obj, env),
+    }
+}
+
+fn parse_plain_params(obj: &Object3D, env: &EvalEnv<'_>) -> PlainParams {
+    PlainParams {
+        position_offset: eval_obj_vec3(
+            obj,
+            &[
+                "positionOffset",
+                "position_offset",
+                "offset",
+                "plainPosition",
+            ],
+            Vec3::ZERO,
+            env,
+        ),
+        rotation_offset_deg: eval_obj_vec3(
+            obj,
+            &[
+                "rotationOffset",
+                "rotation_offset",
+                "rotationOffsetDeg",
+                "plainRotation",
+            ],
+            Vec3::ZERO,
+            env,
+        ),
+        scale_offset: eval_obj_vec3(
+            obj,
+            &["scaleOffset", "scale_offset", "plainScale"],
+            Vec3::ZERO,
+            env,
+        ),
+        uniform_scale: eval_obj_f32(obj, &["uniformScale", "uniform_scale"], 0.0, env),
+        field: parse_effector_field_from_obj(obj, env),
+    }
+}
+
+fn parse_delay_params(obj: &Object3D, env: &EvalEnv<'_>) -> DelayParams {
+    let mode = if let Some(s) = eval_obj_str(obj, &["mode", "delayMode"], env) {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "average" | "1" => DelayMode::Average,
+            "spring" | "2" => DelayMode::Spring,
+            _ => DelayMode::Blend,
+        }
+    } else {
+        DelayMode::from_u32(eval_obj_u32(obj, &["mode", "delayMode"], 0, env))
+    };
+    let raw_strength = eval_obj_f32(obj, &["strength", "delayStrength"], 75.0, env);
+    let strength = if raw_strength > 1.0 {
+        (raw_strength / 100.0).clamp(0.0, 1.0)
+    } else {
+        raw_strength.clamp(0.0, 1.0)
+    };
+    DelayParams {
+        mode,
+        strength,
+        window: eval_obj_u32(obj, &["window", "delayWindow", "frames"], 12, env).clamp(1, 120),
+        spring_damping: eval_obj_f32(
+            obj,
+            &["springDamping", "spring_damping", "damping"],
+            SPRING_DAMPING,
+            env,
+        ),
+        spring_cycles: eval_obj_f32(
+            obj,
+            &["springCycles", "spring_cycles", "cycles"],
+            SPRING_CYCLES,
+            env,
+        ),
+    }
+}
+
+fn parse_voronoi_params(obj: &Object3D, env: &EvalEnv<'_>) -> VoronoiFractureParams {
+    let distribution =
+        if let Some(s) = eval_obj_str(obj, &["distribution", "siteDistribution"], env) {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "surface" | "1" => FractureDistribution::Surface,
+                "center" | "2" => FractureDistribution::Center,
+                "edges" | "3" => FractureDistribution::Edges,
+                _ => FractureDistribution::Uniform,
+            }
+        } else {
+            FractureDistribution::from_u32(eval_obj_u32(
+                obj,
+                &["distribution", "siteDistribution"],
+                0,
+                env,
+            ))
+        };
+    VoronoiFractureParams {
+        cells: eval_obj_u32(
+            obj,
+            &["cells", "cellCount", "cell_count", "pieces"],
+            24,
+            env,
+        )
+        .clamp(1, 1000),
+        seed: eval_obj_i32(obj, &["seed"], 1, env),
+        closed: eval_obj_bool(obj, &["closed", "cap", "caps"], true, env),
+        distribution,
+        cell_scale: eval_obj_vec3(obj, &["cellScale", "cell_scale"], Vec3::splat(100.0), env),
+        distance: eval_obj_f32(obj, &["distance", "explode", "explosion"], 0.0, env),
+        scatter: eval_obj_f32(obj, &["scatter"], 0.0, env),
+        offset: eval_obj_f32(obj, &["offset", "shrink"], 0.0, env),
+        spin_rad: eval_obj_f32(obj, &["spin", "spinRad", "spin_rad"], 0.0, env),
+        direction: eval_obj_vec3(obj, &["direction"], Vec3::ZERO, env),
+        rotation_deg: eval_obj_vec3(
+            obj,
+            &["fragmentRotation", "rotationDeg", "rotation_deg"],
+            Vec3::ZERO,
+            env,
+        ),
+        fragment_scale: eval_obj_f32(obj, &["fragmentScale", "fragment_scale"], 100.0, env),
+        gravity: eval_obj_f32(obj, &["gravity"], 0.0, env),
+        randomness: eval_obj_f32(obj, &["randomness"], 0.0, env),
+        field: parse_effector_field_from_obj(obj, env),
+    }
+}
+
+fn parse_repeater_params(
+    obj: &Object3D,
+    default_mode: RepeaterMode,
+    env: &EvalEnv<'_>,
+) -> RepeaterParams {
+    let mode = if let Some(s) = eval_obj_str(obj, &["mode", "repeaterMode"], env) {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "linear" | "1" => RepeaterMode::Linear,
+            "random" | "2" => RepeaterMode::Random,
+            "echo" | "3" => RepeaterMode::Echo,
+            "step" | "0" => RepeaterMode::Step,
+            _ => default_mode,
+        }
+    } else {
+        default_mode
+    };
+    RepeaterParams {
+        mode,
+        count: eval_obj_u32(obj, &["count", "copies", "repeats"], 5, env).clamp(1, MAX_REPEATS),
+        euler_order: map_euler_order(obj.euler_order),
+        position_step: eval_obj_vec3(
+            obj,
+            &["positionStep", "position_step", "offset", "positionOffset"],
+            Vec3::new(10.0, 0.0, 0.0),
+            env,
+        ),
+        rotation_step_rad: eval_obj_vec3(
+            obj,
+            &["rotationStep", "rotation_step", "rotationOffset"],
+            Vec3::ZERO,
+            env,
+        ),
+        scale_step: eval_obj_vec3(
+            obj,
+            &["scaleStep", "scale_step", "scaleOffset"],
+            Vec3::ONE,
+            env,
+        ),
+        position_end: eval_obj_vec3(
+            obj,
+            &["positionEnd", "position_end", "endPosition", "offset"],
+            Vec3::new(40.0, 0.0, 0.0),
+            env,
+        ),
+        rotation_end_rad: eval_obj_vec3(
+            obj,
+            &["rotationEnd", "rotation_end", "endRotation"],
+            Vec3::new(0.0, 0.0, std::f32::consts::FRAC_PI_2),
+            env,
+        ),
+        scale_end: eval_obj_vec3(obj, &["scaleEnd", "scale_end", "endScale"], Vec3::ONE, env),
+        position_min: eval_obj_vec3(
+            obj,
+            &["positionMin", "position_min"],
+            Vec3::splat(-10.0),
+            env,
+        ),
+        position_max: eval_obj_vec3(
+            obj,
+            &["positionMax", "position_max"],
+            Vec3::splat(10.0),
+            env,
+        ),
+        rotation_min_rad: eval_obj_vec3(obj, &["rotationMin", "rotation_min"], Vec3::ZERO, env),
+        rotation_max_rad: eval_obj_vec3(obj, &["rotationMax", "rotation_max"], Vec3::ZERO, env),
+        scale_min: eval_obj_vec3(obj, &["scaleMin", "scale_min"], Vec3::ONE, env),
+        scale_max: eval_obj_vec3(obj, &["scaleMax", "scale_max"], Vec3::ONE, env),
+        seed: eval_obj_i32(obj, &["seed"], 1, env),
+        delay_frames: eval_obj_f64(
+            obj,
+            &["delay", "delayFrames", "delay_frames", "frameDelay"],
+            5.0,
+            env,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExpressText+ Runtime Adapter (`zc-expr::expresstext`)
+// ---------------------------------------------------------------------------
+
+struct OwnedExpressTextLayer {
+    kind: ExpressTextEffectorKind,
+    props: BTreeMap<String, PropertyTrack>,
+}
+
+struct SceneEtPropReader<'a> {
+    base_env: &'a EvalEnv<'a>,
+    prefix: &'static str,
+    props: &'a BTreeMap<String, PropertyTrack>,
+}
+
+impl EtPropReader for SceneEtPropReader<'_> {
+    fn read(&self, key: &str, frame: f64) -> Option<EtValue> {
+        let track = self.props.get(key).or_else(|| {
+            let stripped = key.strip_prefix(self.prefix)?;
+            let mut chars = stripped.chars();
+            let first = chars.next()?;
+            let lower = format!("{}{}", first.to_ascii_lowercase(), chars.as_str());
+            self.props.get(&lower).or_else(|| self.props.get(stripped))
+        })?;
+        let env_f = env_at_frame(self.base_env, frame);
+        let val = eval_property_track(track, &env_f);
+        match val {
+            PropertyValue::Number(n) => Some(EtValue::Number(n)),
+            PropertyValue::Option(o) => Some(EtValue::Number(f64::from(o))),
+            PropertyValue::Bool(b) => Some(EtValue::Number(if b { 1.0 } else { 0.0 })),
+            PropertyValue::Vec3(v) | PropertyValue::Color(v) => Some(EtValue::Vec3(v)),
+            PropertyValue::Text(s) | PropertyValue::List(s) => Some(EtValue::Text(s)),
+            _ => None,
+        }
+    }
+}
+
+fn parse_expresstext_kind(token: &str) -> Option<ExpressTextEffectorKind> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "shake" => Some(ExpressTextEffectorKind::Shake),
+        "plain" => Some(ExpressTextEffectorKind::Plain),
+        "random" => Some(ExpressTextEffectorKind::Random),
+        "formula" => Some(ExpressTextEffectorKind::Formula),
+        "twist" => Some(ExpressTextEffectorKind::Twist),
+        "wrap" => Some(ExpressTextEffectorKind::Wrap),
+        "orbit" => Some(ExpressTextEffectorKind::Orbit),
+        "spline" => Some(ExpressTextEffectorKind::Spline),
+        "delay" => Some(ExpressTextEffectorKind::Delay),
+        _ => None,
+    }
+}
+
+fn extract_expresstext_layers_from_obj(obj: &Object3D) -> Vec<OwnedExpressTextLayer> {
+    let mut out = Vec::new();
+
+    // 1. Explicit array in preserved["expressTextEffectors" | "expresstextEffectors" | "expressText" | "expresstext"]
+    for key in [
+        "expressTextEffectors",
+        "expresstextEffectors",
+        "expressText",
+        "expresstext",
+    ] {
+        let Some(val) = obj.preserved.get(key) else {
+            continue;
+        };
+        let arr_opt = val.as_array().or_else(|| {
+            val.as_object()
+                .and_then(|m| m.get("effectors").or_else(|| m.get("layers")))
+                .and_then(serde_json::Value::as_array)
+        });
+        if let Some(arr) = arr_opt {
+            for item in arr {
+                let Some(map) = item.as_object() else {
+                    continue;
+                };
+                let Some(kind_str) = map
+                    .get("kind")
+                    .or_else(|| map.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(kind) = parse_expresstext_kind(kind_str) else {
+                    continue;
+                };
+                let mut props = BTreeMap::new();
+                if let Some(sub) = map.get("props").and_then(serde_json::Value::as_object) {
+                    for (pk, pv) in sub {
+                        props.insert(
+                            pk.clone(),
+                            json_to_property_track(pv, PropertyValue::Number(0.0)),
+                        );
+                    }
+                }
+                for (pk, pv) in map {
+                    if !matches!(pk.as_str(), "kind" | "type" | "props") {
+                        props.insert(
+                            pk.clone(),
+                            json_to_property_track(pv, PropertyValue::Number(0.0)),
+                        );
+                    }
+                }
+                out.push(OwnedExpressTextLayer { kind, props });
+            }
+        } else if let Some(map) = val.as_object() {
+            extract_flat_expresstext_props_from_map(map, &mut out);
+        }
+    }
+
+    // 2. Zoidium ExpressText+ container Group properties (`custom_properties` + `preserved["property.*"]`).
+    let is_et_plugin = obj
+        .preserved
+        .get("zoidiumPluginObjectType")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| {
+            let low = s.to_ascii_lowercase();
+            low.starts_with("zoidium:expresstext") || low.starts_with("expresstext")
+        });
+    if is_et_plugin && out.is_empty() {
+        let mut flat: BTreeMap<String, PropertyTrack> = BTreeMap::new();
+        if let Object3DKind::Group {
+            custom_properties, ..
+        } = &obj.kind
+        {
+            for cp in custom_properties {
+                flat.insert(cp.name.clone(), cp.track.clone());
+            }
+        }
+        for (k, v) in &obj.preserved {
+            if let Some(stripped) = k.strip_prefix("property.") {
+                flat.entry(stripped.to_owned())
+                    .or_insert_with(|| json_to_property_track(v, PropertyValue::Number(0.0)));
+            }
+        }
+        extract_flat_expresstext_tracks(&flat, &mut out);
+    }
+
+    out
+}
+
+fn extract_flat_expresstext_props_from_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+    out: &mut Vec<OwnedExpressTextLayer>,
+) {
+    let mut flat = BTreeMap::new();
+    for (k, v) in map {
+        flat.insert(
+            k.clone(),
+            json_to_property_track(v, PropertyValue::Number(0.0)),
+        );
+    }
+    extract_flat_expresstext_tracks(&flat, out);
+}
+
+fn extract_flat_expresstext_tracks(
+    flat: &BTreeMap<String, PropertyTrack>,
+    out: &mut Vec<OwnedExpressTextLayer>,
+) {
+    const KINDS: [ExpressTextEffectorKind; 9] = [
+        ExpressTextEffectorKind::Shake,
+        ExpressTextEffectorKind::Plain,
+        ExpressTextEffectorKind::Random,
+        ExpressTextEffectorKind::Formula,
+        ExpressTextEffectorKind::Twist,
+        ExpressTextEffectorKind::Wrap,
+        ExpressTextEffectorKind::Orbit,
+        ExpressTextEffectorKind::Spline,
+        ExpressTextEffectorKind::Delay,
+    ];
+    for kind in KINDS {
+        let prefix = kind.as_str();
+        let mut props = BTreeMap::new();
+        for (k, v) in flat {
+            if k.starts_with(prefix) && k.len() > prefix.len() {
+                props.insert(k.clone(), v.clone());
+            }
+        }
+        if !props.is_empty() {
+            out.push(OwnedExpressTextLayer { kind, props });
+        }
+    }
+}
+
+fn collect_expresstext_layers_for_node(
+    eval_graph: &EvaluatedSceneGraph3D<'_>,
+    node_idx: usize,
+) -> Vec<OwnedExpressTextLayer> {
+    let mut layers = extract_expresstext_layers_from_obj(eval_graph.nodes[node_idx].obj);
+    let mut cur = eval_graph.nodes[node_idx].parent;
+    let mut guard = 0usize;
+    while let Some(anc) = cur {
+        if guard >= 256 {
+            break;
+        }
+        if eval_graph.nodes[anc].render_enabled {
+            layers.extend(extract_expresstext_layers_from_obj(
+                eval_graph.nodes[anc].obj,
+            ));
+        }
+        cur = eval_graph.nodes[anc].parent;
+        guard += 1;
+    }
+    layers
+}
+
+fn parse_inline_field(item: &serde_json::Value) -> Option<EffectorField> {
+    let field_val = item.get("field").or_else(|| item.get("fieldType"));
+    let field_type = match field_val {
+        Some(serde_json::Value::Number(n)) => {
+            EffectorFieldType::from_u32(n.as_u64().unwrap_or(0) as u32)
+        }
+        Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "linear" | "1" => EffectorFieldType::Linear,
+            "box" | "2" => EffectorFieldType::Box,
+            "sphere" | "3" => EffectorFieldType::Sphere,
+            "cylinder" | "4" => EffectorFieldType::Cylinder,
+            "noise" | "5" => EffectorFieldType::Noise,
+            _ => EffectorFieldType::Infinite,
+        },
+        _ => EffectorFieldType::Infinite,
+    };
+    let invert = parse_preserved_bool_flag(item.get("fieldInvert"), false);
+    if field_type == EffectorFieldType::Infinite && !invert {
+        return None;
+    }
+    Some(EffectorField {
+        field_type,
+        position: json_vec3(item.get("fieldPosition"), Vec3::ZERO),
+        rotation_deg: json_vec3(item.get("fieldRotation"), Vec3::ZERO),
+        scale: json_vec3(item.get("fieldScale"), Vec3::splat(100.0)),
+        falloff: item
+            .get("fieldFalloff")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(100.0) as f32,
+        curve: FieldFalloffCurve::from_u32(
+            item.get("fieldCurve")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+        ),
+        invert,
+        sweep: item
+            .get("fieldSweep")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(100.0) as f32,
+        noise_scale: item
+            .get("fieldNoiseScale")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(100.0) as f32,
+        evolution: item
+            .get("fieldEvolution")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        seed: item
+            .get("fieldSeed")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(1) as i32,
+        legacy: parse_preserved_bool_flag(item.get("fieldLegacy"), false),
+    })
+}
+
 fn apply_object_effectors(mut mesh: MeshData, obj: &Object3D, env: &EvalEnv<'_>) -> MeshData {
     if !(env.plugins.is_enabled("repeater") || env.plugins.is_enabled("effector-plus")) {
         return mesh;
@@ -7874,51 +10135,192 @@ fn apply_object_effectors(mut mesh: MeshData, obj: &Object3D, env: &EvalEnv<'_>)
             "z" => DeformAxis::Z,
             _ => DeformAxis::Y,
         };
-        match kind {
-            "repeater" => {
+        let field = parse_inline_field(item);
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "repeater" | "linear_repeater" | "linear-repeater" | "random_repeater"
+            | "random-repeater" => {
+                let mode = match kind.trim().to_ascii_lowercase().as_str() {
+                    "linear_repeater" | "linear-repeater" => RepeaterMode::Linear,
+                    "random_repeater" | "random-repeater" => RepeaterMode::Random,
+                    _ => match item
+                        .get("mode")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("step")
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "linear" => RepeaterMode::Linear,
+                        "random" => RepeaterMode::Random,
+                        _ => RepeaterMode::Step,
+                    },
+                };
                 let count = item
                     .get("count")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(1) as u32;
-                let offset = json_vec3(item.get("offset"), Vec3::ZERO);
-                let rotation = json_vec3(item.get("rotation"), Vec3::ZERO);
-                let scale = json_vec3(item.get("scale"), Vec3::ONE);
-                mesh = apply_repeater(&mesh, count.clamp(1, 64), offset, rotation, scale);
+                let offset = json_vec3(
+                    item.get("positionStep").or_else(|| item.get("offset")),
+                    Vec3::ZERO,
+                );
+                let rotation = json_vec3(
+                    item.get("rotationStep").or_else(|| item.get("rotation")),
+                    Vec3::ZERO,
+                );
+                let scale = json_vec3(
+                    item.get("scaleStep").or_else(|| item.get("scale")),
+                    Vec3::ONE,
+                );
+                let params = RepeaterParams {
+                    mode,
+                    count: count.clamp(1, MAX_REPEATS),
+                    euler_order: map_euler_order(obj.euler_order),
+                    position_step: offset,
+                    rotation_step_rad: rotation,
+                    scale_step: scale,
+                    position_end: json_vec3(
+                        item.get("positionEnd").or_else(|| item.get("offset")),
+                        Vec3::new(40.0, 0.0, 0.0),
+                    ),
+                    rotation_end_rad: json_vec3(
+                        item.get("rotationEnd").or_else(|| item.get("rotation")),
+                        Vec3::ZERO,
+                    ),
+                    scale_end: json_vec3(
+                        item.get("scaleEnd").or_else(|| item.get("scale")),
+                        Vec3::ONE,
+                    ),
+                    position_min: json_vec3(item.get("positionMin"), Vec3::splat(-10.0)),
+                    position_max: json_vec3(item.get("positionMax"), Vec3::splat(10.0)),
+                    rotation_min_rad: json_vec3(item.get("rotationMin"), Vec3::ZERO),
+                    rotation_max_rad: json_vec3(item.get("rotationMax"), Vec3::ZERO),
+                    scale_min: json_vec3(item.get("scaleMin"), Vec3::ONE),
+                    scale_max: json_vec3(item.get("scaleMax"), Vec3::ONE),
+                    seed: item
+                        .get("seed")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(1) as i32,
+                    delay_frames: 5.0,
+                };
+                mesh = apply_repeater_with_params(&mesh, &params);
             }
             "twist" => {
-                let angle = item
-                    .get("angle")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0) as f32;
+                let params = TwistParams {
+                    angle: item
+                        .get("angle")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    axis,
+                    offset: item
+                        .get("offset")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    subdivision: item
+                        .get("subdivision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1) as u32,
+                    field,
+                };
                 let bounds = mesh.bounds;
-                mesh = apply_twist(&mesh, angle, axis, bounds);
+                mesh = apply_twist_with_params(&mesh, &params, Some(bounds), None);
             }
             "warp" => {
-                let bend = item
-                    .get("bend")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0) as f32;
-                let bulge = item
-                    .get("bulge")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0) as f32;
-                mesh = apply_warp(&mesh, bend, bulge, axis);
+                let warp_axis = match item.get("axis") {
+                    Some(serde_json::Value::Number(n)) => {
+                        WarpAxis::from_u32(n.as_u64().unwrap_or(0) as u32)
+                    }
+                    _ => match axis {
+                        DeformAxis::Z => WarpAxis::IntoZ,
+                        DeformAxis::X | DeformAxis::Y => WarpAxis::IntoY,
+                    },
+                };
+                let params = WarpParams {
+                    strength: item
+                        .get("strength")
+                        .or_else(|| item.get("bend"))
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    axis: warp_axis,
+                    offset: item
+                        .get("offset")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    subdivision: item
+                        .get("subdivision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1) as u32,
+                    field,
+                };
+                mesh = apply_warp_with_params(&mesh, &params, None, None);
             }
-            "voronoi_fracture" | "fracture" => {
-                let cells = item
-                    .get("cell_count")
-                    .or_else(|| item.get("cells"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(8) as u32;
-                let seed = item
-                    .get("seed")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(1) as u32;
-                let explode = item
-                    .get("explode")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0) as f32;
-                mesh = apply_voronoi_fracture(&mesh, cells, seed, explode);
+            "plain" => {
+                let params = PlainParams {
+                    position_offset: json_vec3(
+                        item.get("positionOffset").or_else(|| item.get("offset")),
+                        Vec3::ZERO,
+                    ),
+                    rotation_offset_deg: json_vec3(
+                        item.get("rotationOffset").or_else(|| item.get("rotation")),
+                        Vec3::ZERO,
+                    ),
+                    scale_offset: json_vec3(
+                        item.get("scaleOffset").or_else(|| item.get("scale")),
+                        Vec3::ZERO,
+                    ),
+                    uniform_scale: item
+                        .get("uniformScale")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    field,
+                };
+                mesh = apply_plain(&mesh, &params, None, None);
+            }
+            "voronoi_fracture" | "voronoi-fracture" | "fracture" => {
+                let params = VoronoiFractureParams {
+                    cells: item
+                        .get("cell_count")
+                        .or_else(|| item.get("cells"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(8) as u32,
+                    seed: item
+                        .get("seed")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(1) as i32,
+                    closed: parse_preserved_bool_flag(item.get("closed"), true),
+                    distance: item
+                        .get("distance")
+                        .or_else(|| item.get("explode"))
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    scatter: item
+                        .get("scatter")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    offset: item
+                        .get("offset")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    spin_rad: item
+                        .get("spin")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    direction: json_vec3(item.get("direction"), Vec3::ZERO),
+                    rotation_deg: json_vec3(item.get("rotationDeg"), Vec3::ZERO),
+                    fragment_scale: item
+                        .get("fragmentScale")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(100.0) as f32,
+                    gravity: item
+                        .get("gravity")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    randomness: item
+                        .get("randomness")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    field,
+                    ..VoronoiFractureParams::default()
+                };
+                mesh = apply_voronoi_fracture_with_params(&mesh, &params, None, None);
             }
             _ => {}
         }
@@ -7990,7 +10392,7 @@ fn hash_text3d_and_effectors(
     obj: &Object3D,
     env: &EvalEnv<'_>,
 ) -> u64 {
-    let mut h = fnv1a_hash64(b"text3d");
+    let mut h = fnv1a_hash64(b"text3d_v2");
     h = hash_u64(h, fnv1a_hash64(data.text.as_bytes()));
     if let Some(font) = data.font.as_deref() {
         h = hash_u64(h, fnv1a_hash64(font.as_bytes()));
@@ -8004,8 +10406,21 @@ fn hash_text3d_and_effectors(
     h = hash_u64(h, u64::from(data.bevel));
     h = hash_f64(h, data.bevel_thickness);
     h = hash_f64(h, data.bevel_size);
+    h = hash_u64(h, u64::from(data.bevel_side));
+    h = hash_u64(h, u64::from(data.bevel_detail));
+    h = hash_u64(h, u64::from(data.bevel_profile));
+    h = hash_f64(h, data.bevel_tension);
+    h = hash_f64(h, data.spacing);
+    h = hash_u64(h, data.text_scale_mode as u64);
     h = hash_u64(h, data.position_mode as u64);
     h = hash_u64(h, obj.zoidium_uv_mode as u64);
+    let kerning = parse_preserved_bool_flag(
+        obj.preserved
+            .get("kerning")
+            .or_else(|| obj.preserved.get("property.kerning")),
+        false,
+    );
+    h = hash_u64(h, u64::from(kerning));
     hash_effectors(h, obj, env)
 }
 
@@ -8306,6 +10721,152 @@ fn parse_palette_colors_json(val: &serde_json::Value) -> Vec<[f32; 4]> {
         }
     }
     out
+}
+
+#[derive(Debug, Clone)]
+struct ShaderPlusTextOptions {
+    text: String,
+    font: Option<String>,
+    size: f32,
+    align: TextAlignMode,
+    line_height: f32,
+    letter_spacing: f32,
+    atlas: bool,
+    sdf: bool,
+}
+
+fn parse_shader_plus_text_options(val: &PropertyValue) -> ShaderPlusTextOptions {
+    let parsed_owned;
+    let obj_opt = match val {
+        PropertyValue::Json(v) => v.as_object(),
+        PropertyValue::Text(s) => {
+            parsed_owned = serde_json::from_str::<serde_json::Value>(s).ok();
+            parsed_owned.as_ref().and_then(serde_json::Value::as_object)
+        }
+        _ => None,
+    };
+
+    if let Some(obj) = obj_opt {
+        let num = |key: &str, default: f32, lo: f32, hi: f32| -> f32 {
+            obj.get(key)
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                })
+                .filter(|v| v.is_finite())
+                .map_or(default, |v| (v as f32).clamp(lo, hi))
+        };
+        let text: String = obj
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(2000)
+            .collect();
+        let font = obj
+            .get("font")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let align = match obj.get("align").and_then(serde_json::Value::as_str) {
+            Some("left") => TextAlignMode::Left,
+            Some("right") => TextAlignMode::Right,
+            _ => TextAlignMode::Center,
+        };
+        let atlas = obj.get("mode").and_then(serde_json::Value::as_str) == Some("atlas");
+        let sdf = obj
+            .get("sdf")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        return ShaderPlusTextOptions {
+            text,
+            font,
+            size: num("size", 128.0, 4.0, 512.0),
+            align,
+            line_height: num("lineHeight", 1.2, 0.5, 4.0),
+            letter_spacing: num("letterSpacing", 0.0, -0.5, 2.0),
+            atlas,
+            sdf,
+        };
+    }
+
+    let plain_text = match val {
+        PropertyValue::Text(s) => s.chars().take(2000).collect(),
+        _ => String::new(),
+    };
+    ShaderPlusTextOptions {
+        text: plain_text,
+        font: None,
+        size: 128.0,
+        align: TextAlignMode::Center,
+        line_height: 1.2,
+        letter_spacing: 0.0,
+        atlas: false,
+        sdf: false,
+    }
+}
+
+fn bake_shader_plus_gradient_json(
+    val: &serde_json::Value,
+    cp: &CustomProperty,
+) -> (Vec<u8>, bool, f32) {
+    let stops_arr = val
+        .get("stops")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| val.as_array());
+    let mut stops: Vec<ProjectGradientStop> = Vec::new();
+    if let Some(arr) = stops_arr {
+        for item in arr {
+            let pos = item
+                .get("position")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let rgba = item
+                .get("color")
+                .and_then(parse_json_rgba)
+                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            stops.push(ProjectGradientStop {
+                position: pos,
+                color: format!(
+                    "rgba({},{},{},{})",
+                    (rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (rgba[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    rgba[3].clamp(0.0, 1.0)
+                ),
+            });
+        }
+    }
+    if stops.is_empty() {
+        stops = ProjectGradientStop::white_default();
+    }
+    let lut = bake_project_gradient_lut_rgba8(&stops);
+    let raw: Vec<u8> = lut.iter().flat_map(|px| *px).collect();
+    let cyclic = val
+        .get("cyclic")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            cp.metadata
+                .get("type")
+                .and_then(|t| t.get("zoidiumShader"))
+                .and_then(|s| s.get("cyclic"))
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false);
+    let reps = val
+        .get("repetitions")
+        .and_then(serde_json::Value::as_f64)
+        .or_else(|| {
+            cp.metadata
+                .get("type")
+                .and_then(|t| t.get("zoidiumShader"))
+                .and_then(|s| s.get("repetitions"))
+                .and_then(serde_json::Value::as_f64)
+        })
+        .filter(|v| v.is_finite())
+        .map_or(1.0, |v| (v as f32).max(1.0));
+    (raw, cyclic, reps)
 }
 
 /// Evaluates Fritsch-Butland monotone cubic Hermite spline (matching Zoidium `graph-curves.js:102-148`).
@@ -11221,7 +13782,7 @@ DOMAIN_MAX 0.9 0.8 0.7
             ..Default::default()
         };
         let params =
-            build_camera_params_without_vibrate(&cam, Mat4::IDENTITY, &env, [200.0, 100.0]);
+            build_camera_params_without_vibrate(&cam, Mat4::IDENTITY, &env, [200.0, 100.0], false);
         // half_h = 0.05 * 500 = 25.0 -> proj[1][1] = 1 / 25.0
         // aspect = 2.0 -> half_w = 50.0 -> proj[0][0] = 1 / 50.0
         assert!((params.proj[1][1] - (1.0 / 25.0)).abs() < 1e-5);
@@ -12023,6 +14584,1427 @@ DOMAIN_MAX 0.9 0.8 0.7
         assert!(
             m_left[0] > 240 && m_right[0] < 10,
             "zoidiumMasks must keep left half white {m_left:?} and mask right half black {m_right:?}"
+        );
+    }
+
+    fn encode_test_png(width: u32, height: u32, rgba: Vec<u8>) -> Vec<u8> {
+        let img = image::RgbaImage::from_raw(width, height, rgba).expect("valid rgba dims");
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("encode test png");
+        out
+    }
+
+    fn make_test_scene_project(objects: Vec<Object3D>, resolution: [u32; 2]) -> Project {
+        let mut proj = Project::new_cm3_default();
+        proj.sequence.resolution = resolution;
+        proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        proj.sequence.video_tracks[0].clips[0].layer.resolution = resolution;
+        proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Scene3D {
+            objects,
+            shadow_mode: ProjectCompatMode::Current,
+        };
+        proj
+    }
+
+    #[test]
+    fn gpu_wave_b_camera_plus_film_gate_offset_and_dof() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        plugins.enable("camera-plus").expect("enable camera-plus");
+
+        // 1. Camera+ filmGate & filmOffsetX shift rendered projection horizontally.
+        let mut cam_base = Object3D::new_perspective_camera();
+        cam_base.position = PropertyTrack::vec3([0.0, 0.0, 80.0]);
+        if let Object3DKind::Camera(ref mut c) = cam_base.kind {
+            c.focal_length = PropertyTrack::number(50.0);
+            c.film_gate = 36.0;
+        }
+        let mut box_obj = Object3D::new_shape_3d(
+            "CenterBox",
+            Shape3DKind::Box {
+                size: [12.0, 12.0, 12.0],
+            },
+        );
+        box_obj.material = Some(MaterialSpec::SingleColor {
+            color: PropertyTrack::color([1.0, 0.2, 0.2]),
+            side: 2,
+        });
+
+        let proj_center =
+            make_test_scene_project(vec![cam_base.clone(), box_obj.clone()], [96, 96]);
+        let px_center = engine
+            .render_frame_rgba8(&proj_center, &plugins, 0.0, 96, 96)
+            .expect("render centered camera+");
+
+        let mut cam_shifted = cam_base.clone();
+        if let Object3DKind::Camera(ref mut c) = cam_shifted.kind {
+            c.film_offset_x = PropertyTrack::number(35.0);
+        }
+        let proj_shifted = make_test_scene_project(vec![cam_shifted, box_obj.clone()], [96, 96]);
+        let px_shifted = engine
+            .render_frame_rgba8(&proj_shifted, &plugins, 0.0, 96, 96)
+            .expect("render shifted camera+");
+
+        let centroid_x = |pixels: &[u8]| -> f64 {
+            let mut sum_x = 0.0;
+            let mut weight = 0.0;
+            for y in 0..96usize {
+                for x in 0..96usize {
+                    let r = f64::from(pixels[(y * 96 + x) * 4]);
+                    if r > 40.0 {
+                        sum_x += (x as f64) * r;
+                        weight += r;
+                    }
+                }
+            }
+            assert!(weight > 0.0, "expected visible red box pixels");
+            sum_x / weight
+        };
+        let cx_base = centroid_x(&px_center);
+        let cx_shift = centroid_x(&px_shifted);
+        assert!(
+            (cx_shift - cx_base).abs() > 8.0,
+            "filmOffsetX must visibly shift rendered projection (base={cx_base:.2}, shifted={cx_shift:.2})"
+        );
+
+        // 2. Camera+ 3-pass Bokeh DOF blurs out-of-focus geometry (with enabled_track).
+        let mut cam_sharp = Object3D::new_perspective_camera();
+        cam_sharp.position = PropertyTrack::vec3([0.0, 0.0, 80.0]);
+        let mut rect =
+            Object3D::new_shape_3d("FarQuad", Shape3DKind::Rectangle { size: [26.0, 26.0] });
+        rect.position = PropertyTrack::vec3([0.0, 0.0, -40.0]);
+        rect.material = Some(MaterialSpec::SingleColor {
+            color: PropertyTrack::color([1.0, 1.0, 1.0]),
+            side: 2,
+        });
+
+        let proj_sharp = make_test_scene_project(vec![cam_sharp.clone(), rect.clone()], [96, 96]);
+        let px_sharp = engine
+            .render_frame_rgba8(&proj_sharp, &plugins, 0.0, 96, 96)
+            .expect("render sharp quad");
+
+        let mut cam_dof = cam_sharp;
+        if let Object3DKind::Camera(ref mut c) = cam_dof.kind {
+            c.dof = Some(zc_project::CameraDofParams {
+                enabled: false,
+                enabled_track: Some(PropertyTrack::option(1)),
+                focus_distance: PropertyTrack::number(15.0),
+                aperture: PropertyTrack::number(16.0),
+                focus_area_width: PropertyTrack::number(0.0),
+                near_blur: PropertyTrack::number(100.0),
+                far_blur: PropertyTrack::number(300.0),
+            });
+        }
+        let proj_dof = make_test_scene_project(vec![cam_dof, rect], [96, 96]);
+        let px_dof = engine
+            .render_frame_rgba8(&proj_dof, &plugins, 0.0, 96, 96)
+            .expect("render dof quad");
+
+        let mid_alpha_or_gray_count = |pixels: &[u8]| -> usize {
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[0] > 10 && p[0] < 245)
+                .count()
+        };
+        let sharp_soft = mid_alpha_or_gray_count(&px_sharp);
+        let dof_soft = mid_alpha_or_gray_count(&px_dof);
+        assert!(
+            dof_soft > sharp_soft + 30,
+            "DOF must blur out-of-focus quad edges (sharp soft px={sharp_soft}, dof soft px={dof_soft})"
+        );
+    }
+
+    #[test]
+    fn gpu_wave_b_pbr_plus_extra_maps_wrap_subtractive_and_scene_backdrop() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        plugins
+            .enable("material-plus")
+            .expect("enable material-plus");
+
+        // 1. PbrPlus emissive_map + emissive_intensity + alpha_map + alpha_test + SceneBackdrop.
+        // Build a 4x4 alpha map where left half is transparent (0) and right half is opaque (255).
+        let mut alpha_rgba = vec![0u8; 4 * 4 * 4];
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let v = if x < 2 { 0u8 } else { 255u8 };
+                let idx = (y * 4 + x) * 4;
+                alpha_rgba[idx..idx + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        // Build a 2x2 bright green emissive map.
+        let emissive_rgba = [0u8, 255, 0, 255].repeat(4);
+
+        let mut cam = Object3D::new_perspective_camera();
+        cam.position = PropertyTrack::vec3([0.0, 0.0, 40.0]);
+        let mut quad =
+            Object3D::new_shape_3d("PbrQuad", Shape3DKind::Rectangle { size: [40.0, 40.0] });
+        let mut proj = make_test_scene_project(vec![cam.clone()], [64, 64]);
+        let alpha_id = proj.insert_binary_asset(
+            zc_project::AssetKind::Image,
+            "alpha.png",
+            encode_test_png(4, 4, alpha_rgba),
+        );
+        let emissive_id = proj.insert_binary_asset(
+            zc_project::AssetKind::Image,
+            "emissive.png",
+            encode_test_png(2, 2, emissive_rgba),
+        );
+
+        let pbr = zc_project::PbrPlusMaterial {
+            base_color: PropertyTrack::color([0.0, 0.0, 0.0]),
+            emissive: PropertyTrack::color([0.0, 1.0, 0.0]),
+            emissive_intensity: PropertyTrack::number(1.0),
+            emissive_map: Some(emissive_id),
+            alpha_map: Some(alpha_id),
+            alpha_test: 0.5,
+            side: 2,
+            ..Default::default()
+        };
+        quad.material = Some(MaterialSpec::PbrPlus(Box::new(pbr)));
+        let scene_layer_id = proj.sequence.video_tracks[0].clips[0].layer.id;
+        proj.sequence.scene_backdrops.insert(
+            scene_layer_id,
+            zc_project::SceneBackdrop {
+                mode: 1,
+                color: [0.0, 0.0, 1.0],
+                opacity: PropertyTrack::number(1.0),
+            },
+        );
+        proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Scene3D {
+            objects: vec![cam.clone(), quad],
+            shadow_mode: ProjectCompatMode::Current,
+        };
+
+        let px = engine
+            .render_frame_rgba8(&proj, &plugins, 0.0, 64, 64)
+            .expect("render pbrplus + backdrop");
+        let left = &px[(32 * 64 + 18) * 4..(32 * 64 + 18) * 4 + 4];
+        let right = &px[(32 * 64 + 46) * 4..(32 * 64 + 46) * 4 + 4];
+        assert!(
+            left[2] > 200 && left[1] < 30,
+            "alpha_test must discard left half to reveal blue SceneBackdrop, got {left:?}"
+        );
+        assert!(
+            right[1] > 200 && right[2] < 30,
+            "right half must show green PbrPlus emissive_map, got {right:?}"
+        );
+
+        // 2. TextureWrap::ClampToEdge vs TextureWrap::Repeat with uv_repeat = [2, 1].
+        let mut stripe_rgba = vec![0u8; 4 * 2 * 4];
+        for y in 0..2usize {
+            for x in 0..4usize {
+                let idx = (y * 4 + x) * 4;
+                if x < 2 {
+                    stripe_rgba[idx..idx + 4].copy_from_slice(&[255, 0, 0, 255]);
+                } else {
+                    stripe_rgba[idx..idx + 4].copy_from_slice(&[0, 0, 255, 255]);
+                }
+            }
+        }
+        let mut wrap_proj = make_test_scene_project(vec![cam.clone()], [64, 64]);
+        let stripe_id = wrap_proj.insert_binary_asset(
+            zc_project::AssetKind::Image,
+            "stripe.png",
+            encode_test_png(4, 2, stripe_rgba),
+        );
+        let make_wrap_quad = |wrap: u32| {
+            let mut q =
+                Object3D::new_shape_3d("WrapQuad", Shape3DKind::Rectangle { size: [40.0, 40.0] });
+            q.material = Some(MaterialSpec::Texture(Box::new(
+                zc_project::TextureMaterial {
+                    texture: Some(stripe_id.clone()),
+                    wrap,
+                    repeat: PropertyTrack::vec2([2.0, 1.0]),
+                    side: 2,
+                    ..Default::default()
+                },
+            )));
+            q
+        };
+        wrap_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Scene3D {
+            objects: vec![cam.clone(), make_wrap_quad(0)], // ClampToEdge
+            shadow_mode: ProjectCompatMode::Current,
+        };
+        let px_clamp = engine
+            .render_frame_rgba8(&wrap_proj, &plugins, 0.0, 64, 64)
+            .expect("render clamp wrap");
+        wrap_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Scene3D {
+            objects: vec![cam.clone(), make_wrap_quad(1)], // Repeat
+            shadow_mode: ProjectCompatMode::Current,
+        };
+        let px_repeat = engine
+            .render_frame_rgba8(&wrap_proj, &plugins, 0.0, 64, 64)
+            .expect("render repeat wrap");
+        // At ~62% across the quad (u_tiled ~ 1.25): Clamp stays blue (edge), Repeat wraps to red!
+        let sample_idx = (32 * 64 + 38) * 4;
+        assert!(
+            px_clamp[sample_idx + 2] > 180 && px_repeat[sample_idx] > 180,
+            "TextureWrap must distinguish Clamp (blue {:?}) vs Repeat (red {:?})",
+            &px_clamp[sample_idx..sample_idx + 4],
+            &px_repeat[sample_idx..sample_idx + 4]
+        );
+
+        // 3. MaterialBlend::Subtractive (blending == 3) subtracts foreground color from background quad.
+        let mut bg_quad =
+            Object3D::new_shape_3d("WhiteBg", Shape3DKind::Rectangle { size: [40.0, 40.0] });
+        bg_quad.position = PropertyTrack::vec3([0.0, 0.0, -2.0]);
+        bg_quad.material = Some(MaterialSpec::SingleColor {
+            color: PropertyTrack::color([1.0, 1.0, 1.0]),
+            side: 2,
+        });
+        let mut sub_quad =
+            Object3D::new_shape_3d("SubFg", Shape3DKind::Rectangle { size: [24.0, 24.0] });
+        sub_quad.position = PropertyTrack::vec3([0.0, 0.0, 0.0]);
+        sub_quad.material = Some(MaterialSpec::PbrPlus(Box::new(
+            zc_project::PbrPlusMaterial {
+                base_color: PropertyTrack::color([0.0, 0.0, 0.0]),
+                emissive: PropertyTrack::color([1.0, 0.0, 0.0]),
+                emissive_intensity: PropertyTrack::number(1.0),
+                transparent: true,
+                blending: 3, // Subtractive
+                side: 2,
+                ..Default::default()
+            },
+        )));
+        let sub_proj = make_test_scene_project(vec![cam, bg_quad, sub_quad], [64, 64]);
+        let px_sub = engine
+            .render_frame_rgba8(&sub_proj, &plugins, 0.0, 64, 64)
+            .expect("render subtractive blend");
+        let center_sub = &px_sub[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4];
+        assert!(
+            center_sub[0] < 40 && center_sub[1] > 200 && center_sub[2] > 200,
+            "Subtractive red over white must yield cyan, got {center_sub:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_wave_b_text3d_extended_options_and_expresstext_plus() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let plugins = PluginRegistry::new(); // text-plus & expresstext-plus enabled by default
+
+        let mut cam = Object3D::new_perspective_camera();
+        cam.position = PropertyTrack::vec3([0.0, 0.0, 70.0]);
+
+        let make_text = |spacing: f64, bevel: bool, bevel_side: u32, bevel_detail: u32| {
+            let mut t = Object3D::new_text_3d("HI");
+            if let Object3DKind::Text3D(ref mut d) = t.kind {
+                d.size = [20.0, 4.0];
+                d.spacing = spacing;
+                d.bevel = bevel;
+                d.bevel_thickness = 1.2;
+                d.bevel_size = 1.5;
+                d.bevel_side = bevel_side;
+                d.bevel_detail = bevel_detail;
+                d.bevel_profile = 1;
+                d.bevel_tension = 0.8;
+            }
+            t.material = Some(MaterialSpec::SingleColor {
+                color: PropertyTrack::color([1.0, 1.0, 1.0]),
+                side: 2,
+            });
+            t
+        };
+
+        let span_x = |pixels: &[u8]| -> usize {
+            let mut min_x = 128usize;
+            let mut max_x = 0usize;
+            for y in 0..64usize {
+                for x in 0..128usize {
+                    if pixels[(y * 128 + x) * 4] > 40 {
+                        min_x = min_x.min(x);
+                        max_x = max_x.max(x);
+                    }
+                }
+            }
+            max_x.saturating_sub(min_x)
+        };
+
+        let proj_tight =
+            make_test_scene_project(vec![cam.clone(), make_text(0.0, false, 0, 3)], [128, 64]);
+        let px_tight = engine
+            .render_frame_rgba8(&proj_tight, &plugins, 0.0, 128, 64)
+            .expect("render tight text3d");
+
+        let proj_wide =
+            make_test_scene_project(vec![cam.clone(), make_text(18.0, true, 0, 6)], [128, 64]);
+        let px_wide = engine
+            .render_frame_rgba8(&proj_wide, &plugins, 0.0, 128, 64)
+            .expect("render spaced + beveled text3d");
+
+        let w_tight = span_x(&px_tight);
+        let w_wide = span_x(&px_wide);
+        assert!(
+            w_wide > w_tight + 15,
+            "Text3DExtendedOptions spacing+bevel must widen rendered text (tight={w_tight}, wide={w_wide})"
+        );
+
+        // ExpressText+ per-character animation lifts letters upward via Plain effector.
+        let mut et_text = make_text(0.0, false, 0, 3);
+        et_text.preserved.insert(
+            "expressTextEffectors".to_owned(),
+            serde_json::json!([
+                {
+                    "kind": "plain",
+                    "plainPosition": [0.0, 18.0, 0.0]
+                }
+            ]),
+        );
+        let proj_et = make_test_scene_project(vec![cam, et_text], [128, 64]);
+        let px_et = engine
+            .render_frame_rgba8(&proj_et, &plugins, 0.0, 128, 64)
+            .expect("render expresstext+");
+
+        let centroid_y = |pixels: &[u8]| -> f64 {
+            let mut sum_y = 0.0;
+            let mut cnt = 0.0;
+            for y in 0..64usize {
+                for x in 0..128usize {
+                    if pixels[(y * 128 + x) * 4] > 40 {
+                        sum_y += y as f64;
+                        cnt += 1.0;
+                    }
+                }
+            }
+            assert!(cnt > 0.0, "expected visible text pixels");
+            sum_y / cnt
+        };
+        let cy_base = centroid_y(&px_tight);
+        let cy_et = centroid_y(&px_et);
+        assert!(
+            cy_et < cy_base - 8.0,
+            "ExpressText+ Plain +Y must shift letters upward in screen space (base={cy_base:.2}, et={cy_et:.2})"
+        );
+    }
+
+    #[test]
+    fn gpu_wave_b_effector_plus_and_repeater_end_to_end() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let plugins = PluginRegistry::new(); // repeater is enabled by default
+
+        let mut cam = Object3D::new_perspective_camera();
+        cam.position = PropertyTrack::vec3([0.0, 0.0, 80.0]);
+
+        let lit_bar = || {
+            let mut b = Object3D::new_shape_3d(
+                "Bar",
+                Shape3DKind::Box {
+                    size: [36.0, 6.0, 6.0],
+                },
+            );
+            b.material = Some(MaterialSpec::SingleColor {
+                color: PropertyTrack::color([1.0, 1.0, 1.0]),
+                side: 2,
+            });
+            b
+        };
+
+        let lit_pixel_count = |pixels: &[u8]| -> usize {
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[0] > 40)
+                .count()
+        };
+
+        // 1. Warp deformer Group bends horizontal bar upward into +Y.
+        let proj_plain = make_test_scene_project(vec![cam.clone(), lit_bar()], [96, 96]);
+        let px_plain = engine
+            .render_frame_rgba8(&proj_plain, &plugins, 0.0, 96, 96)
+            .expect("render unwarped bar");
+
+        let mut warp_grp = Object3D::new(
+            "Warp",
+            Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: vec![lit_bar()],
+            },
+        );
+        warp_grp.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:repeater/warp"),
+        );
+        warp_grp
+            .preserved
+            .insert("property.strength".to_owned(), serde_json::json!(2.4));
+        warp_grp
+            .preserved
+            .insert("property.subdivision".to_owned(), serde_json::json!(16));
+        let proj_warp = make_test_scene_project(vec![cam.clone(), warp_grp], [96, 96]);
+        let px_warp = engine
+            .render_frame_rgba8(&proj_warp, &plugins, 0.0, 96, 96)
+            .expect("render warped bar");
+        let warp_diff: usize = px_plain
+            .iter()
+            .zip(px_warp.iter())
+            .filter(|(a, b)| a.abs_diff(**b) > 30)
+            .count();
+        assert!(
+            warp_diff > 200,
+            "Warp deformer must visibly bend child mesh (diff bytes={warp_diff})"
+        );
+
+        // 2. Twist deformer Group twists child bar around X.
+        let mut twist_grp = Object3D::new(
+            "Twist",
+            Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: vec![lit_bar()],
+            },
+        );
+        twist_grp.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:repeater/twist"),
+        );
+        twist_grp
+            .preserved
+            .insert("property.angle".to_owned(), serde_json::json!(2.0));
+        twist_grp
+            .preserved
+            .insert("property.axis".to_owned(), serde_json::json!(0));
+        twist_grp
+            .preserved
+            .insert("property.subdivision".to_owned(), serde_json::json!(16));
+        let proj_twist = make_test_scene_project(vec![cam.clone(), twist_grp], [96, 96]);
+        let px_twist = engine
+            .render_frame_rgba8(&proj_twist, &plugins, 0.0, 96, 96)
+            .expect("render twisted bar");
+        assert!(lit_pixel_count(&px_twist) > 50);
+
+        // 3. Voronoi Fracture Group shatters and explodes a box outward.
+        let mut small_box = Object3D::new_shape_3d(
+            "SmallBox",
+            Shape3DKind::Box {
+                size: [12.0, 12.0, 12.0],
+            },
+        );
+        small_box.material = Some(MaterialSpec::SingleColor {
+            color: PropertyTrack::color([1.0, 1.0, 1.0]),
+            side: 2,
+        });
+        let proj_box = make_test_scene_project(vec![cam.clone(), small_box.clone()], [96, 96]);
+        let px_box = engine
+            .render_frame_rgba8(&proj_box, &plugins, 0.0, 96, 96)
+            .expect("render intact box");
+
+        let mut voronoi_grp = Object3D::new(
+            "Voronoi",
+            Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: vec![small_box.clone()],
+            },
+        );
+        voronoi_grp.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:repeater/voronoi-fracture"),
+        );
+        voronoi_grp
+            .preserved
+            .insert("property.cells".to_owned(), serde_json::json!(8));
+        voronoi_grp
+            .preserved
+            .insert("property.distance".to_owned(), serde_json::json!(10.0));
+        let proj_voronoi = make_test_scene_project(vec![cam.clone(), voronoi_grp], [96, 96]);
+        let px_voronoi = engine
+            .render_frame_rgba8(&proj_voronoi, &plugins, 0.0, 96, 96)
+            .expect("render fractured box");
+        let voronoi_diff: usize = px_box
+            .iter()
+            .zip(px_voronoi.iter())
+            .filter(|(a, b)| a.abs_diff(**b) > 30)
+            .count();
+        assert!(
+            voronoi_diff > 200,
+            "Voronoi Fracture must visibly shatter/explode child mesh (diff bytes={voronoi_diff})"
+        );
+
+        // 4. Repeater (Linear & Step) clones a small cube across the viewport.
+        let mut tiny_cube = Object3D::new_shape_3d(
+            "Cube",
+            Shape3DKind::Box {
+                size: [6.0, 6.0, 6.0],
+            },
+        );
+        tiny_cube.position = PropertyTrack::vec3([-24.0, 0.0, 0.0]);
+        tiny_cube.material = Some(MaterialSpec::SingleColor {
+            color: PropertyTrack::color([1.0, 1.0, 1.0]),
+            side: 2,
+        });
+        let proj_one = make_test_scene_project(vec![cam.clone(), tiny_cube.clone()], [96, 96]);
+        let px_one = engine
+            .render_frame_rgba8(&proj_one, &plugins, 0.0, 96, 96)
+            .expect("render single cube");
+
+        let mut linear_rep = Object3D::new(
+            "LinearRep",
+            Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: vec![tiny_cube.clone()],
+            },
+        );
+        linear_rep.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:repeater/linear-repeater"),
+        );
+        linear_rep.preserved.insert(
+            "repeaterProperties".to_owned(),
+            serde_json::json!({
+                "count": 5,
+                "positionEnd": [48.0, 0.0, 0.0],
+                "rotationEnd": [0.0, 0.0, 0.0]
+            }),
+        );
+        let proj_lin = make_test_scene_project(vec![cam.clone(), linear_rep], [96, 96]);
+        let px_lin = engine
+            .render_frame_rgba8(&proj_lin, &plugins, 0.0, 96, 96)
+            .expect("render linear repeater");
+
+        let mut step_rep = Object3D::new(
+            "StepRep",
+            Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: vec![tiny_cube],
+            },
+        );
+        step_rep.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:repeater/repeater"),
+        );
+        step_rep.preserved.insert(
+            "repeaterProperties".to_owned(),
+            serde_json::json!({
+                "count": 4,
+                "positionStep": [14.0, 0.0, 0.0]
+            }),
+        );
+        let proj_step = make_test_scene_project(vec![cam, step_rep], [96, 96]);
+        let px_step = engine
+            .render_frame_rgba8(&proj_step, &plugins, 0.0, 96, 96)
+            .expect("render step repeater");
+
+        let one_px = lit_pixel_count(&px_one);
+        let lin_px = lit_pixel_count(&px_lin);
+        let step_px = lit_pixel_count(&px_step);
+        assert!(
+            lin_px >= one_px * 3 && step_px >= one_px * 3,
+            "Linear & Step Repeaters must clone cube across screen (single={one_px}, linear={lin_px}, step={step_px})"
+        );
+    }
+
+    #[test]
+    fn gpu_c5_camera_plus_priority_default_film_gate_and_dof_gating() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+
+        // 1. Verify pz_import populates `zoidiumPluginObjectType = "zoidium:camera-plus/camera"`
+        //    on a real `.pz` archive containing a Camera+ object after a native CM3 camera.
+        let mut cam_plus_export = Object3D::new_perspective_camera();
+        cam_plus_export.name = "CamPlus".to_owned();
+        cam_plus_export.position = PropertyTrack::vec3([0.0, 0.0, 40.0]);
+        cam_plus_export.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:camera-plus/camera"),
+        );
+        let mut native_export = Object3D::new_perspective_camera();
+        native_export.name = "NativeCam".to_owned();
+        native_export.position = PropertyTrack::vec3([0.0, 0.0, 200.0]);
+        let roundtrip_src =
+            make_test_scene_project(vec![native_export, cam_plus_export], [128, 128]);
+        let pz_bytes = zc_project::export_pz_to_bytes(&roundtrip_src).expect("export pz");
+        let imported = zc_project::import_pz_from_bytes(&pz_bytes).expect("import pz");
+        let LayerKind::Scene3D { ref objects, .. } = imported.project.sequence.video_tracks[0]
+            .clips[0]
+            .layer
+            .kind
+        else {
+            panic!("expected Scene3D layer");
+        };
+        assert_eq!(
+            objects[1]
+                .preserved
+                .get("zoidiumPluginObjectType")
+                .and_then(serde_json::Value::as_str),
+            Some("zoidium:camera-plus/camera"),
+            "pz_import must tag Camera+ with zoidiumPluginObjectType"
+        );
+
+        // 2. Active Camera+ placed AFTER an active native CM3 camera must override the native camera,
+        //    while a second active Camera+ after the first active Camera+ must NOT override the first.
+        let mut plugins_on = PluginRegistry::new();
+        plugins_on
+            .enable("camera-plus")
+            .expect("enable camera-plus");
+        let mut plugins_off = PluginRegistry::new();
+        plugins_off.disable_all_optional();
+
+        let mut cube = Object3D::new_shape_3d(
+            "Cube",
+            Shape3DKind::Box {
+                size: [14.0, 14.0, 14.0],
+            },
+        );
+        cube.material = Some(MaterialSpec::SingleColor {
+            color: PropertyTrack::color([1.0, 1.0, 1.0]),
+            side: 2,
+        });
+
+        let mut native_far = Object3D::new_perspective_camera();
+        native_far.position = PropertyTrack::vec3([0.0, 0.0, 200.0]);
+
+        let mut cam_plus_close = Object3D::new_perspective_camera();
+        cam_plus_close.position = PropertyTrack::vec3([0.0, 0.0, 35.0]);
+        cam_plus_close.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:camera-plus/camera"),
+        );
+
+        let mut cam_plus_far = Object3D::new_perspective_camera();
+        cam_plus_far.position = PropertyTrack::vec3([0.0, 0.0, 260.0]);
+        cam_plus_far.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:camera-plus/camera"),
+        );
+
+        let count_lit =
+            |px: &[u8]| -> usize { px.as_chunks::<4>().0.iter().filter(|p| p[0] > 200).count() };
+
+        let proj = make_test_scene_project(
+            vec![
+                native_far,
+                cam_plus_close.clone(),
+                cam_plus_far,
+                cube.clone(),
+            ],
+            [96, 96],
+        );
+        let px_on = engine
+            .render_frame_rgba8(&proj, &plugins_on, 0.0, 96, 96)
+            .expect("render with camera-plus enabled");
+        let px_off = engine
+            .render_frame_rgba8(&proj, &plugins_off, 0.0, 96, 96)
+            .expect("render with camera-plus disabled");
+        let lit_on = count_lit(&px_on);
+        let lit_off = count_lit(&px_off);
+        assert!(
+            lit_on > lit_off * 4,
+            "Active Camera+ (first active) must override active native camera when plugin is enabled (on={lit_on}, off={lit_off})"
+        );
+
+        // 3. Default Camera+ (filmGate=36, focalLength=35) must render at exact 32.27° on 16:9
+        //    and 54.43° on 1:1 (NOT fixed 60° native FOV!).
+        let controls = RefCell::new(BTreeMap::new());
+        let parent_props = BTreeMap::new();
+        let stack = RefCell::new(HashSet::new());
+        let env_on = test_eval_env(
+            &proj,
+            &plugins_on,
+            &controls,
+            &parent_props,
+            &stack,
+            0.0,
+            0.0,
+            30.0,
+        );
+        let Object3DKind::Camera(ref default_cam_plus_data) = cam_plus_close.kind else {
+            panic!("expected camera");
+        };
+        let p_16_9 = build_camera_params_from_node(
+            default_cam_plus_data,
+            &cam_plus_close,
+            Mat4::IDENTITY,
+            Vec3::new(0.0, 0.0, 35.0),
+            Quat::IDENTITY,
+            Vec3::ONE,
+            GeomEulerOrder::XYZ,
+            &env_on,
+            [1920.0, 1080.0],
+        );
+        let fov_16_9 = 2.0 * (1.0 / p_16_9.proj[1][1]).atan().to_degrees();
+        assert!(
+            (fov_16_9 - 32.269).abs() < 0.05,
+            "Default Camera+ (36/35) on 16:9 must have ~32.27° vertical FOV, got {fov_16_9:.3}°"
+        );
+        let p_1_1 = build_camera_params_from_node(
+            default_cam_plus_data,
+            &cam_plus_close,
+            Mat4::IDENTITY,
+            Vec3::new(0.0, 0.0, 35.0),
+            Quat::IDENTITY,
+            Vec3::ONE,
+            GeomEulerOrder::XYZ,
+            &env_on,
+            [512.0, 512.0],
+        );
+        let fov_1_1 = 2.0 * (1.0 / p_1_1.proj[1][1]).atan().to_degrees();
+        assert!(
+            (fov_1_1 - 54.432).abs() < 0.05,
+            "Default Camera+ (36/35) on 1:1 must have ~54.43° vertical FOV, got {fov_1_1:.3}°"
+        );
+
+        // GPU check on 1:1 canvas: default Camera+ (54.43°) shows cube larger than native 60° camera.
+        let mut native_60 = Object3D::new_perspective_camera();
+        native_60.position = PropertyTrack::vec3([0.0, 0.0, 35.0]);
+        let proj_nat_1_1 = make_test_scene_project(vec![native_60, cube.clone()], [96, 96]);
+        let proj_cp_1_1 = make_test_scene_project(vec![cam_plus_close, cube], [96, 96]);
+        let lit_nat_1_1 = count_lit(
+            &engine
+                .render_frame_rgba8(&proj_nat_1_1, &plugins_on, 0.0, 96, 96)
+                .expect("native 1:1"),
+        );
+        let lit_cp_1_1 = count_lit(
+            &engine
+                .render_frame_rgba8(&proj_cp_1_1, &plugins_on, 0.0, 96, 96)
+                .expect("camera+ 1:1"),
+        );
+        assert!(
+            lit_cp_1_1 > lit_nat_1_1 + 40,
+            "Default Camera+ on 1:1 (54.43°) must render larger than native 60° (cp={lit_cp_1_1}, nat={lit_nat_1_1})"
+        );
+
+        // 4. DOF must be gated on `camera-plus` plugin enablement.
+        let dof_cam = zc_project::CameraData {
+            dof: Some(zc_project::CameraDofParams {
+                enabled: true,
+                enabled_track: None,
+                aperture: PropertyTrack::number(12.0),
+                focus_distance: PropertyTrack::number(80.0),
+                focus_area_width: PropertyTrack::number(5.0),
+                near_blur: PropertyTrack::number(100.0),
+                far_blur: PropertyTrack::number(100.0),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            eval_camera_dof(&dof_cam, &env_on).is_some(),
+            "eval_camera_dof must return Some when camera-plus plugin is enabled"
+        );
+        let env_off = test_eval_env(
+            &proj,
+            &plugins_off,
+            &controls,
+            &parent_props,
+            &stack,
+            0.0,
+            0.0,
+            30.0,
+        );
+        assert!(
+            eval_camera_dof(&dof_cam, &env_off).is_none(),
+            "eval_camera_dof must return None when camera-plus plugin is disabled"
+        );
+    }
+
+    #[test]
+    fn gpu_c5_layer_input_honors_typed_sequence_layer_masks() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let plugins = PluginRegistry::new();
+
+        let mut project = Project::new_cm3_default();
+        project.sequence.resolution = [64, 64];
+        project.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+
+        // Hidden source track 0: solid red layer with a typed LayerMask covering only the left half [0..32, 0..64].
+        let src_layer = Layer::new(
+            "RedMasked",
+            LayerKind::PresetShape2D {
+                preset: PresetShapeKind::Rectangle,
+                shapes: vec![Shape2DNode {
+                    id: Uuid::new_v4(),
+                    name: "FullRect".to_owned(),
+                    kind: Shape2DKind::Group {
+                        children: Vec::new(),
+                    },
+                    position: PropertyTrack::vec2([0.0, 0.0]),
+                    rotation: PropertyTrack::number(0.0),
+                    scale: PropertyTrack::vec2([1.0, 1.0]),
+                    operations: vec![DrawOp::Fill {
+                        color: PropertyTrack::constant(PropertyValue::ColorRgba([
+                            1.0, 0.0, 0.0, 1.0,
+                        ])),
+                    }],
+                    preserved: BTreeMap::new(),
+                }],
+            },
+            [64, 64],
+        );
+        let src_layer_id = src_layer.id;
+        let src_track = zc_project::VideoTrack {
+            id: Uuid::new_v4(),
+            name: "MaskSource".to_owned(),
+            enabled: false,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![VideoClip {
+                id: Uuid::new_v4(),
+                name: "SrcClip".to_owned(),
+                start: 0.0,
+                length: 60.0,
+                link: None,
+                media: None,
+                time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                layer: src_layer,
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        };
+        let src_track_id = src_track.id;
+
+        // Typed mask in `sequence.layer_masks` (left half x in [0, 32], y in [0, 64] in sequence space).
+        project.sequence.layer_masks.insert(
+            src_layer_id,
+            vec![zc_project::LayerMask {
+                id: "mask-left-half".to_owned(),
+                name: "LeftHalf".to_owned(),
+                enabled: true,
+                mode: zc_project::MaskMode::Add,
+                invert: false,
+                feather: 0.0,
+                expansion: 0.0,
+                opacity: 1.0,
+                closed: true,
+                vertex_ids: vec![
+                    "v0".to_owned(),
+                    "v1".to_owned(),
+                    "v2".to_owned(),
+                    "v3".to_owned(),
+                ],
+                vertex_modes: BTreeMap::new(),
+                path: PropertyTrack::constant(PropertyValue::Json(serde_json::json!([
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 32.0, 0.0, 0.0, 0.0, 0.0, 0.0, 32.0, 64.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 64.0, 0.0, 0.0, 0.0, 0.0
+                ]))),
+                preserved: BTreeMap::new(),
+            }],
+        );
+
+        let make_consumer = |stage: &str| {
+            let mut p = project.clone();
+            let mut dst_layer = Layer::new("Canvas", LayerKind::Generator, [64, 64]);
+            let mut params = BTreeMap::new();
+            params.insert(
+                "source".to_owned(),
+                PropertyTrack::text(format!("track:id:{src_track_id}")),
+            );
+            params.insert("stage".to_owned(), PropertyTrack::text(stage));
+            params.insert("opacity".to_owned(), PropertyTrack::number(1.0));
+            dst_layer.effects.push(EffectInstance {
+                id: Uuid::new_v4(),
+                name: "LayerInput".to_owned(),
+                kind: EffectKind::Standard("layer-input".to_owned()),
+                enabled: PropertyTrack::option(1),
+                params,
+                preserved: BTreeMap::new(),
+            });
+            let dst_track = zc_project::VideoTrack {
+                id: Uuid::new_v4(),
+                name: "Consumer".to_owned(),
+                enabled: true,
+                solo: false,
+                locked: false,
+                is_3d: false,
+                clips: vec![VideoClip {
+                    id: Uuid::new_v4(),
+                    name: "DstClip".to_owned(),
+                    start: 0.0,
+                    length: 60.0,
+                    link: None,
+                    media: None,
+                    time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                    layer: dst_layer,
+                    preserved: BTreeMap::new(),
+                }],
+                preserved: BTreeMap::new(),
+            };
+            p.sequence.video_tracks = vec![src_track.clone(), dst_track];
+            p
+        };
+
+        for stage in ["masks", "effects-masks"] {
+            let proj_stage = make_consumer(stage);
+            let px = engine
+                .render_frame_rgba8(&proj_stage, &plugins, 0.0, 64, 64)
+                .expect("render layer-input masked");
+            let left_r = px[(32 * 64 + 12) * 4];
+            let right_r = px[(32 * 64 + 52) * 4];
+            assert!(
+                left_r > 200 && right_r < 20,
+                "LayerInput stage `{stage}` must honor typed sequence.layer_masks (left_r={left_r}, right_r={right_r})"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_c5_shader_plus_curve_range_gradient_cycle_and_text_property() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let plugins = PluginRegistry::new();
+
+        let make_shader_proj = |glsl: &str, custom_properties: Vec<CustomProperty>| {
+            let mut project = Project::new_cm3_default();
+            project.sequence.resolution = [64, 64];
+            project.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+            let mut layer = Layer::new(
+                "Solid",
+                LayerKind::PresetShape2D {
+                    preset: PresetShapeKind::Rectangle,
+                    shapes: vec![Shape2DNode {
+                        id: Uuid::new_v4(),
+                        name: "BG".to_owned(),
+                        kind: Shape2DKind::Group {
+                            children: Vec::new(),
+                        },
+                        position: PropertyTrack::vec2([0.0, 0.0]),
+                        rotation: PropertyTrack::number(0.0),
+                        scale: PropertyTrack::vec2([1.0, 1.0]),
+                        operations: vec![DrawOp::Fill {
+                            color: PropertyTrack::constant(PropertyValue::ColorRgba([
+                                0.5, 0.5, 0.5, 1.0,
+                            ])),
+                        }],
+                        preserved: BTreeMap::new(),
+                    }],
+                },
+                [64, 64],
+            );
+            layer.effects.push(EffectInstance {
+                id: Uuid::new_v4(),
+                name: "CustomShader".to_owned(),
+                kind: EffectKind::CustomShader {
+                    frag_shader: glsl.to_owned(),
+                    custom_properties,
+                },
+                enabled: PropertyTrack::option(1),
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            });
+            project.sequence.video_tracks = vec![zc_project::VideoTrack {
+                id: Uuid::new_v4(),
+                name: "Shader".to_owned(),
+                enabled: true,
+                solo: false,
+                locked: false,
+                is_3d: false,
+                clips: vec![VideoClip {
+                    id: Uuid::new_v4(),
+                    name: "ShaderClip".to_owned(),
+                    start: 0.0,
+                    length: 60.0,
+                    link: None,
+                    media: None,
+                    time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                    layer,
+                    preserved: BTreeMap::new(),
+                }],
+                preserved: BTreeMap::new(),
+            }];
+            project
+        };
+
+        // 1. bind_curve_ranges: two-arg `zCurve(Remap, 0.5)` with `range: [0.4, 0.8]` on identity
+        //    curve (0.5 -> 0.5 in [0,1]) must evaluate to mix(0.4, 0.8, 0.5) = 0.6 (~153), NOT 0.5 (~128)!
+        let curve_glsl = r#"
+            precision highp float;
+            // #include <zoidium/curve>
+            uniform sampler2D Remap;
+            varying vec2 vUv;
+            void main() {
+                float v = zCurve(Remap, 0.5);
+                gl_FragColor = vec4(vec3(v), 1.0);
+            }
+        "#;
+        let mut curve_meta = BTreeMap::new();
+        curve_meta.insert(
+            "type".to_owned(),
+            serde_json::json!({ "zoidiumShader": { "kind": "curve" } }),
+        );
+        let curve_prop = CustomProperty {
+            name: "Remap".to_owned(),
+            prop_type: Some(10),
+            track: PropertyTrack::constant(PropertyValue::Curve(serde_json::json!({
+                "range": [0.4, 0.8],
+                "points": [[0.0, 0.0], [1.0, 1.0]]
+            }))),
+            metadata: curve_meta,
+        };
+        let px_curve = engine
+            .render_frame_rgba8(
+                &make_shader_proj(curve_glsl, vec![curve_prop]),
+                &plugins,
+                0.0,
+                64,
+                64,
+            )
+            .expect("render curve range");
+        assert!(
+            (i32::from(px_curve[0]) - 153).abs() <= 4,
+            "bind_curve_ranges must rewrite zCurve(Remap, 0.5) with Remap_range=[0.4,0.8] -> ~153, got {}",
+            px_curve[0]
+        );
+
+        // 2. bind_gradient_cycles: two-arg `zGradientCycle(Ramp, vUv.x)` with `repetitions = 4.0`
+        //    must cycle 4 times across X (so x=0.125 and x=0.375 both hit t=0.5 = green/mid,
+        //    and x=0.26 wraps back near red at t~0.04, unlike repetitions=1!).
+        let grad_glsl = r#"
+            precision highp float;
+            // #include <zoidium/gradient>
+            uniform sampler2D Ramp;
+            varying vec2 vUv;
+            void main() {
+                gl_FragColor = zGradientCycle(Ramp, vUv.x);
+            }
+        "#;
+        let mut grad_meta = BTreeMap::new();
+        grad_meta.insert(
+            "type".to_owned(),
+            serde_json::json!({ "zoidiumShader": { "kind": "gradient", "cyclic": true, "repetitions": 4.0 } }),
+        );
+        let grad_prop = CustomProperty {
+            name: "Ramp".to_owned(),
+            prop_type: Some(5),
+            track: PropertyTrack::gradient(vec![
+                ProjectGradientStop {
+                    position: 0.0,
+                    color: "rgba(255,0,0,1.0)".to_owned(),
+                },
+                ProjectGradientStop {
+                    position: 1.0,
+                    color: "rgba(0,0,255,1.0)".to_owned(),
+                },
+            ]),
+            metadata: grad_meta,
+        };
+        let px_grad = engine
+            .render_frame_rgba8(
+                &make_shader_proj(grad_glsl, vec![grad_prop]),
+                &plugins,
+                0.0,
+                64,
+                64,
+            )
+            .expect("render gradient cycle");
+        // At x = 17/64 (~0.2656): fract(0.2656 * 4) = 0.0625 -> strongly red (R >> B)!
+        // Without bind_gradient_cycles (repetitions=1), t=0.2656 would have B~68; at x=33/64 (~0.5156):
+        // fract(0.5156 * 4) = 0.0625 -> strongly red (R > 200, B < 40), whereas without rewrite R~B~128!
+        let mid_idx = (32 * 64 + 33) * 4;
+        assert!(
+            px_grad[mid_idx] > 200 && px_grad[mid_idx + 2] < 45,
+            "bind_gradient_cycles with repetitions=4 must wrap at x~0.516 to red, got {:?}",
+            &px_grad[mid_idx..mid_idx + 4]
+        );
+
+        // 3. Shader+ `text` property: Layout mode (`zText` + `_size` + `_aspect`) AND Atlas mode (`zGlyph` + `_grid` + `_count`).
+        let text_layout_glsl = r#"
+            precision highp float;
+            // #include <zoidium/text>
+            uniform sampler2D Title;
+            uniform vec2 Title_size;
+            uniform vec2 Title_grid;
+            uniform float Title_aspect;
+            uniform float Title_count;
+            varying vec2 vUv;
+            void main() {
+                float cov = zText(Title, vUv);
+                float ok = step(4.0, Title_size.x) * step(4.0, Title_size.y)
+                    * step(0.1, Title_aspect) * step(0.5, Title_grid.x) * step(0.5, Title_count);
+                gl_FragColor = vec4(cov, ok, 0.0, 1.0);
+            }
+        "#;
+        let mut text_meta = BTreeMap::new();
+        text_meta.insert(
+            "type".to_owned(),
+            serde_json::json!({ "zoidiumShader": { "kind": "text" } }),
+        );
+        let text_layout_prop = CustomProperty {
+            name: "Title".to_owned(),
+            prop_type: Some(7),
+            track: PropertyTrack::text(
+                serde_json::json!({ "text": "HI", "size": 64, "mode": "layout", "sdf": false })
+                    .to_string(),
+            ),
+            metadata: text_meta.clone(),
+        };
+        let px_text = engine
+            .render_frame_rgba8(
+                &make_shader_proj(text_layout_glsl, vec![text_layout_prop]),
+                &plugins,
+                0.0,
+                64,
+                64,
+            )
+            .expect("render shader+ text layout");
+        let cov_pixels = px_text
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 128)
+            .count();
+        assert!(
+            cov_pixels > 40 && px_text[1] > 200,
+            "Shader+ text layout must rasterize glyphs and bind _size/_grid/_aspect/_count (cov={cov_pixels}, ok_g={})",
+            px_text[1]
+        );
+
+        let text_atlas_glsl = r#"
+            precision highp float;
+            // #include <zoidium/text>
+            uniform sampler2D Atlas;
+            uniform vec2 Atlas_grid;
+            uniform float Atlas_count;
+            varying vec2 vUv;
+            void main() {
+                float g0 = zGlyph(Atlas, Atlas_grid, 0.0, vUv);
+                float ok = step(1.5, Atlas_grid.x) * step(3.5, Atlas_count);
+                gl_FragColor = vec4(g0, ok, 0.0, 1.0);
+            }
+        "#;
+        let text_atlas_prop = CustomProperty {
+            name: "Atlas".to_owned(),
+            prop_type: Some(7),
+            track: PropertyTrack::text(
+                serde_json::json!({ "text": "ABCD", "size": 48, "mode": "atlas", "sdf": true })
+                    .to_string(),
+            ),
+            metadata: text_meta,
+        };
+        let px_atlas = engine
+            .render_frame_rgba8(
+                &make_shader_proj(text_atlas_glsl, vec![text_atlas_prop]),
+                &plugins,
+                0.0,
+                64,
+                64,
+            )
+            .expect("render shader+ text atlas");
+        let atlas_inside = px_atlas
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 135)
+            .count();
+        assert!(
+            atlas_inside > 40 && px_atlas[1] > 200,
+            "Shader+ text atlas+SDF must rasterize grid cells and bind Atlas_grid/Atlas_count (inside={atlas_inside}, ok_g={})",
+            px_atlas[1]
+        );
+    }
+
+    #[test]
+    fn gpu_c5_temporal_aliases_echo_legacy_and_smart_motion_blur_lite() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        plugins.enable("native-fx").expect("enable native-fx");
+
+        let make_moving_box_proj = |effect: Option<EffectInstance>| {
+            let mut project = Project::new_cm3_default();
+            project.sequence.resolution = [64, 64];
+            project.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+            let mut pos_track = PropertyTrack::vec2([-20.0, 0.0]);
+            pos_track.animated = true;
+            pos_track.keyframes = vec![
+                PropertyKeyframe::linear(0.0, PropertyValue::Vec2([-20.0, 0.0])),
+                PropertyKeyframe::linear(10.0, PropertyValue::Vec2([20.0, 0.0])),
+            ];
+            let mut layer = Layer::new(
+                "Mover",
+                LayerKind::PresetShape2D {
+                    preset: PresetShapeKind::Rectangle,
+                    shapes: vec![Shape2DNode {
+                        id: Uuid::new_v4(),
+                        name: "Square".to_owned(),
+                        kind: Shape2DKind::Group {
+                            children: Vec::new(),
+                        },
+                        position: pos_track,
+                        rotation: PropertyTrack::number(0.0),
+                        scale: PropertyTrack::vec2([0.06, 0.06]),
+                        operations: vec![DrawOp::Fill {
+                            color: PropertyTrack::constant(PropertyValue::ColorRgba([
+                                1.0, 1.0, 1.0, 1.0,
+                            ])),
+                        }],
+                        preserved: BTreeMap::new(),
+                    }],
+                },
+                [64, 64],
+            );
+            if let Some(fx) = effect {
+                layer.effects.push(fx);
+            }
+            project.sequence.video_tracks = vec![zc_project::VideoTrack {
+                id: Uuid::new_v4(),
+                name: "Moving".to_owned(),
+                enabled: true,
+                solo: false,
+                locked: false,
+                is_3d: false,
+                clips: vec![VideoClip {
+                    id: Uuid::new_v4(),
+                    name: "MovingClip".to_owned(),
+                    start: 0.0,
+                    length: 60.0,
+                    link: None,
+                    media: None,
+                    time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                    layer,
+                    preserved: BTreeMap::new(),
+                }],
+                preserved: BTreeMap::new(),
+            }];
+            project
+        };
+
+        let px_base = engine
+            .render_frame_rgba8(&make_moving_box_proj(None), &plugins, 5.0, 64, 64)
+            .expect("render baseline moving box");
+        let count_lit =
+            |px: &[u8]| -> usize { px.as_chunks::<4>().0.iter().filter(|p| p[0] > 20).count() };
+        let base_lit = count_lit(&px_base);
+
+        // 1. `echo-legacy` must run full temporal multi-frame echo sampling (trailing ghost copies).
+        let mut echo_params = BTreeMap::new();
+        echo_params.insert("echoes".to_owned(), PropertyTrack::number(3.0));
+        echo_params.insert("delay".to_owned(), PropertyTrack::number(1.0));
+        echo_params.insert("decay".to_owned(), PropertyTrack::number(0.8));
+        echo_params.insert("opacity".to_owned(), PropertyTrack::number(0.9));
+        let px_echo = engine
+            .render_frame_rgba8(
+                &make_moving_box_proj(Some(EffectInstance {
+                    id: Uuid::new_v4(),
+                    name: "EchoLegacy".to_owned(),
+                    kind: EffectKind::Plugin {
+                        plugin_id: "native-fx".to_owned(),
+                        effect_id: "echo-legacy".to_owned(),
+                    },
+                    enabled: PropertyTrack::option(1),
+                    params: echo_params,
+                    preserved: BTreeMap::new(),
+                })),
+                &plugins,
+                5.0,
+                64,
+                64,
+            )
+            .expect("render echo-legacy");
+        let echo_lit = count_lit(&px_echo);
+        assert!(
+            echo_lit > base_lit + 50,
+            "echo-legacy must sample temporal echo taps (base_lit={base_lit}, echo_lit={echo_lit})"
+        );
+
+        // 2. `smart-motion-blur-lite` must sample prev/next neighbor frames and smear motion!
+        let mut smb_params = BTreeMap::new();
+        smb_params.insert("strength".to_owned(), PropertyTrack::number(2.0));
+        smb_params.insert("samples".to_owned(), PropertyTrack::number(8.0));
+        let px_smb = engine
+            .render_frame_rgba8(
+                &make_moving_box_proj(Some(EffectInstance {
+                    id: Uuid::new_v4(),
+                    name: "SMBLite".to_owned(),
+                    kind: EffectKind::Plugin {
+                        plugin_id: "native-fx".to_owned(),
+                        effect_id: "smart-motion-blur-lite".to_owned(),
+                    },
+                    enabled: PropertyTrack::option(1),
+                    params: smb_params,
+                    preserved: BTreeMap::new(),
+                })),
+                &plugins,
+                5.0,
+                64,
+                64,
+            )
+            .expect("render smart-motion-blur-lite");
+        let smb_diff: usize = px_base
+            .iter()
+            .zip(px_smb.iter())
+            .filter(|(a, b)| a.abs_diff(**b) > 15)
+            .count();
+        assert!(
+            smb_diff > 20,
+            "smart-motion-blur-lite must perform temporal frame sampling and differ from static frame (diff={smb_diff})"
+        );
+    }
+
+    #[test]
+    fn gpu_c5_transparent_background_cache_separation() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let plugins = PluginRegistry::new();
+        let mut project = Project::new_cm3_default();
+        project.sequence.resolution = [32, 32];
+        project.sequence.background_color = [0.2, 0.5, 0.8, 1.0];
+        project.sequence.video_tracks.clear();
+
+        // Render cached with opaque background first.
+        engine.set_transparent_background(false);
+        let px_opaque = engine
+            .render_frame_rgba8_cached(&project, &plugins, 0.0, 32, 32, 42)
+            .expect("cached opaque");
+        assert_eq!(px_opaque[3], 255, "opaque render must have alpha=255");
+        assert!(px_opaque[2] > 180, "opaque render must have blue bg");
+
+        // Toggle transparent background on the SAME engine, frame, dimensions, and revision.
+        engine.set_transparent_background(true);
+        let px_transparent = engine
+            .render_frame_rgba8_cached(&project, &plugins, 0.0, 32, 32, 42)
+            .expect("cached transparent");
+        assert_eq!(
+            &px_transparent[..4],
+            &[0, 0, 0, 0],
+            "toggling set_transparent_background(true) must NOT return stale cached opaque pixels"
+        );
+
+        // Toggle back to opaque on the SAME revision.
+        engine.set_transparent_background(false);
+        let px_opaque_again = engine
+            .render_frame_rgba8_cached(&project, &plugins, 0.0, 32, 32, 42)
+            .expect("cached opaque again");
+        assert_eq!(
+            px_opaque_again[3], 255,
+            "toggling set_transparent_background(false) must NOT return stale cached transparent pixels"
         );
     }
 }

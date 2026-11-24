@@ -8,6 +8,7 @@
 pub mod atomic;
 pub mod effects;
 pub mod model;
+pub mod pz_export;
 pub mod pz_import;
 pub mod sha256;
 pub mod zcraft;
@@ -33,6 +34,7 @@ pub use model::{
     TextureMaterial, TrackToConstraint, VideoClip, VideoMaterial, VideoTrack,
     cm3_blend_mode_from_index, normalize_blend_mode_token,
 };
+pub use pz_export::{export_pz, export_pz_to_bytes};
 pub use pz_import::{PzImportResult, import_pz, import_pz_from_bytes};
 pub use sha256::{cm3_asset_key, sha256_bytes, sha256_hex};
 pub use uuid::Uuid;

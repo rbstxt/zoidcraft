@@ -983,13 +983,17 @@ fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
 
         // 33..42: Extended, Arithmetic, OpenVG, Channel modes
         case 33u: {
+            // CM3 BLEND_INVERT (blend.glsl:190-192): coeff = (1, 0, 1), f = 1 - Cd, out_a = dst.a.
+            let a = clamp(dst.a, 0.0, 1.0);
             let rgb = (vec3<f32>(1.0) - cd_col) * src.a * dst.a + dst.rgb * (1.0 - src.a);
-            let a = src.a + dst.a * (1.0 - src.a);
-            blended = vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(a, 0.0, 1.0));
+            blended = vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(a)), a);
         }
         case 34u: {
-            let b = cs_col * (vec3<f32>(1.0) - cd_col) + (vec3<f32>(1.0) - cs_col) * cd_col;
-            blended = compose_sep(src, dst, b);
+            // CM3 BLEND_INVERT_RGB (blend.glsl:193-195): coeff = (1, 0, 1), f = Cs * (1 - Cd), out_a = dst.a.
+            let a = clamp(dst.a, 0.0, 1.0);
+            let f = cs_col * (vec3<f32>(1.0) - cd_col);
+            let rgb = f * src.a * dst.a + dst.rgb * (1.0 - src.a);
+            blended = vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(a)), a);
         }
         case 35u: { blended = min(vec4<f32>(1.0), src + dst); }
         case 36u: {
@@ -1226,6 +1230,64 @@ mod tests {
             &px[..4],
             &[0, 0, 0, 0],
             "BLEND_MINUS over transparent backdrop must remain transparent"
+        );
+
+        // 6. BLEND_INVERT & BLEND_INVERT_RGB over transparent backdrop must stay transparent
+        // (CM3 blend.glsl:190-195: coeff = (1, 0, 1), out_a = dst.a), and invert properly over opaque bg.
+        for mode in [BlendMode::Invert, BlendMode::InvertRgb] {
+            comp.composite_layer(
+                &ctx,
+                &clear_bg,
+                &full_layer,
+                &dst,
+                LayerTransform2D::default(),
+                1.0,
+                mode,
+            );
+            crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback invert transparent");
+            assert_eq!(
+                &px[..4],
+                &[0, 0, 0, 0],
+                "{mode:?} over transparent backdrop must stay transparent (out_a = dst.a)"
+            );
+        }
+
+        // Over opaque blue backdrop (0.2, 0.4, 0.8, 1.0) with red src (1.0, 0.0, 0.0, 1.0):
+        // BLEND_INVERT -> f = 1 - Cd = (0.8, 0.6, 0.2), out_a = 1.0 -> ~(204, 153, 51, 255)
+        comp.composite_layer(
+            &ctx,
+            &bg,
+            &full_layer,
+            &dst,
+            LayerTransform2D::default(),
+            1.0,
+            BlendMode::Invert,
+        );
+        crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback invert opaque");
+        assert!(
+            (i32::from(px[0]) - 204).abs() <= 2
+                && (i32::from(px[1]) - 153).abs() <= 2
+                && (i32::from(px[2]) - 51).abs() <= 2
+                && px[3] == 255,
+            "BLEND_INVERT over opaque bg mismatch, got {:?}",
+            &px[..4]
+        );
+
+        // BLEND_INVERT_RGB -> f = Cs * (1 - Cd) = (0.8, 0.0, 0.0), out_a = 1.0 -> ~(204, 0, 0, 255)
+        comp.composite_layer(
+            &ctx,
+            &bg,
+            &full_layer,
+            &dst,
+            LayerTransform2D::default(),
+            1.0,
+            BlendMode::InvertRgb,
+        );
+        crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback invert_rgb opaque");
+        assert!(
+            (i32::from(px[0]) - 204).abs() <= 2 && px[1] <= 2 && px[2] <= 2 && px[3] == 255,
+            "BLEND_INVERT_RGB over opaque bg mismatch, got {:?}",
+            &px[..4]
         );
     }
 }
