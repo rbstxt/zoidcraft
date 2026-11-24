@@ -1,0 +1,29 @@
+[package]
+name = "zoidcraft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zc-time = { workspace = true }
+zc-geom = { workspace = true }
+zc-color = { workspace = true }
+zc-anim = { workspace = true }
+zc-plugin = { workspace = true }
+zc-project = { workspace = true }
+zc-scene = { workspace = true }
+zc-render = { workspace = true }
+zc-audio = { workspace = true }
+zc-export = { workspace = true }
+zc-session = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true }
+egui-wgpu = { workspace = true }
+wgpu = { workspace = true }
+rfd = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

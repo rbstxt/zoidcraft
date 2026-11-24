@@ -1,0 +1,17 @@
+[package]
+name = "zc-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zc-time = { workspace = true }
+zc-project = { workspace = true }
+symphonia = { workspace = true }
+cpal = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

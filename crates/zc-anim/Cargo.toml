@@ -1,0 +1,15 @@
+[package]
+name = "zc-anim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zc-time = { workspace = true }
+zc-geom = { workspace = true }
+zc-color = { workspace = true }
+serde = { workspace = true }

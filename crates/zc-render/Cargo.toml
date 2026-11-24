@@ -1,0 +1,24 @@
+[package]
+name = "zc-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zc-time = { workspace = true }
+zc-geom = { workspace = true }
+zc-color = { workspace = true }
+zc-anim = { workspace = true }
+zc-project = { workspace = true }
+zc-scene = { workspace = true }
+zc-shader = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
+image = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
