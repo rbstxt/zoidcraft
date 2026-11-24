@@ -97,12 +97,11 @@ impl<T> Keyframe<T> {
         }
     }
 
-    /// Returns the CM3 interpolation mode represented by this keyframe.
+    /// Returns the CM3 interpolation mode represented by this keyframe's incoming segment.
     pub fn interpolation_mode(&self) -> InterpolationMode {
         if !self.interpolated || self.easing == EasingKind::Hold {
             InterpolationMode::Discrete
         } else if self.in_tangent.is_some()
-            || self.out_tangent.is_some()
             || matches!(self.easing, EasingKind::CustomBezier { .. })
         {
             InterpolationMode::Bezier
@@ -535,9 +534,8 @@ impl<T: Animatable> DynamicProperty<T> {
             return k0.value.clone();
         }
 
-        if k0.out_tangent.is_some() || k1.in_tangent.is_some() {
+        if let Some(in_h) = k1.in_tangent {
             let out_h = k0.out_tangent.unwrap_or([10.0, 0.0]);
-            let in_h = k1.in_tangent.unwrap_or([-10.0, 0.0]);
             return T::eval_bezier_segment(
                 k0.frame, &k0.value, out_h, k1.frame, &k1.value, in_h, frame,
             );
@@ -979,5 +977,27 @@ mod tests {
         // S-curve should be slower near start and faster in the middle than linear.
         assert!(prop.evaluate(5.0) < 100.0 * (5.0 / 30.0));
         assert!(prop.velocity(15.0, 30.0) > 100.0);
+    }
+
+    #[test]
+    fn bezier_left_key_does_not_override_linear_or_preset_right_key() {
+        // Spec 02 §3.1: right key owns the incoming segment's interpolation mode.
+        let prop_linear = DynamicProperty::new_animated(vec![
+            Keyframe::bezier(0.0, 0.0, [-10.0, 0.0], [10.0, 50.0]),
+            Keyframe::new(30.0, 100.0),
+        ]);
+        // Must be strictly linear (5.0 / 30.0 * 100), unaffected by k0's outgoing handle.
+        assert!(approx_eq(
+            prop_linear.evaluate(5.0),
+            100.0 * (5.0 / 30.0),
+            1e-9
+        ));
+        assert!(approx_eq(prop_linear.evaluate(15.0), 50.0, 1e-9));
+
+        let prop_quad = DynamicProperty::new_animated(vec![
+            Keyframe::bezier(0.0, 0.0, [-10.0, 0.0], [10.0, 50.0]),
+            Keyframe::with_easing(10.0, 100.0, EasingKind::QuadIn),
+        ]);
+        assert!(approx_eq(prop_quad.evaluate(5.0), 25.0, 1e-9));
     }
 }

@@ -498,17 +498,34 @@ pub fn is_vanilla_global(name: &str) -> bool {
     )
 }
 
+const MAX_VALIDATION_DEPTH: usize = 256;
+
 /// Validates security invariants and mode-specific static rules on a parsed AST.
 pub fn validate_program(program: &Program, mode: ExprMode) -> Result<(), ExprError> {
     let mut declared = BTreeSet::new();
-    collect_hoisted_decls(&program.body, &mut declared);
+    collect_hoisted_decls(&program.body, &mut declared, 0)?;
     for stmt in &program.body {
-        validate_stmt(stmt, mode, &declared, false, false)?;
+        validate_stmt(stmt, mode, &declared, false, false, 0)?;
     }
     Ok(())
 }
 
-fn collect_hoisted_decls(stmts: &[Stmt], out: &mut BTreeSet<String>) {
+fn check_validation_depth(depth: usize) -> Result<usize, ExprError> {
+    let next = depth + 1;
+    if next > MAX_VALIDATION_DEPTH {
+        return Err(ExprError::RecursionLimitExceeded {
+            limit: MAX_VALIDATION_DEPTH,
+        });
+    }
+    Ok(next)
+}
+
+fn collect_hoisted_decls(
+    stmts: &[Stmt],
+    out: &mut BTreeSet<String>,
+    depth: usize,
+) -> Result<(), ExprError> {
+    let next = check_validation_depth(depth)?;
     for stmt in stmts {
         match stmt {
             Stmt::VarDecl { decls, .. } => {
@@ -519,19 +536,19 @@ fn collect_hoisted_decls(stmts: &[Stmt], out: &mut BTreeSet<String>) {
             Stmt::FunctionDecl(f) => {
                 out.insert(f.name.clone());
             }
-            Stmt::Block(inner) => collect_hoisted_decls(inner, out),
+            Stmt::Block(inner) => collect_hoisted_decls(inner, out, next)?,
             Stmt::If {
                 consequent,
                 alternate,
                 ..
             } => {
-                collect_hoisted_decls(std::slice::from_ref(consequent.as_ref()), out);
+                collect_hoisted_decls(std::slice::from_ref(consequent.as_ref()), out, next)?;
                 if let Some(alt) = alternate {
-                    collect_hoisted_decls(std::slice::from_ref(alt.as_ref()), out);
+                    collect_hoisted_decls(std::slice::from_ref(alt.as_ref()), out, next)?;
                 }
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
-                collect_hoisted_decls(std::slice::from_ref(body.as_ref()), out);
+                collect_hoisted_decls(std::slice::from_ref(body.as_ref()), out, next)?;
             }
             Stmt::For(f) => {
                 if let Some(ForInit::VarDecl { decls, .. }) = &f.init {
@@ -539,32 +556,32 @@ fn collect_hoisted_decls(stmts: &[Stmt], out: &mut BTreeSet<String>) {
                         collect_pattern_names(&d.pattern, out);
                     }
                 }
-                collect_hoisted_decls(std::slice::from_ref(&f.body), out);
+                collect_hoisted_decls(std::slice::from_ref(&f.body), out, next)?;
             }
             Stmt::ForOf(f) => {
                 if f.kind.is_some() {
                     collect_pattern_names(&f.target, out);
                 }
-                collect_hoisted_decls(std::slice::from_ref(&f.body), out);
+                collect_hoisted_decls(std::slice::from_ref(&f.body), out, next)?;
             }
             Stmt::ForIn(f) => {
                 if f.kind.is_some() {
                     collect_pattern_names(&f.target, out);
                 }
-                collect_hoisted_decls(std::slice::from_ref(&f.body), out);
+                collect_hoisted_decls(std::slice::from_ref(&f.body), out, next)?;
             }
             Stmt::Switch { cases, .. } => {
                 for c in cases {
-                    collect_hoisted_decls(&c.consequent, out);
+                    collect_hoisted_decls(&c.consequent, out, next)?;
                 }
             }
             Stmt::Try(t) => {
-                collect_hoisted_decls(&t.block, out);
+                collect_hoisted_decls(&t.block, out, next)?;
                 if let Some(cb) = &t.catch_body {
-                    collect_hoisted_decls(cb, out);
+                    collect_hoisted_decls(cb, out, next)?;
                 }
                 if let Some(fb) = &t.finally_body {
-                    collect_hoisted_decls(fb, out);
+                    collect_hoisted_decls(fb, out, next)?;
                 }
             }
             Stmt::Empty
@@ -575,6 +592,7 @@ fn collect_hoisted_decls(stmts: &[Stmt], out: &mut BTreeSet<String>) {
             | Stmt::Throw(_) => {}
         }
     }
+    Ok(())
 }
 
 fn collect_pattern_names(pattern: &Pattern, out: &mut BTreeSet<String>) {
@@ -614,7 +632,9 @@ fn validate_pattern(
     pattern: &Pattern,
     mode: ExprMode,
     locals: &BTreeSet<String>,
+    depth: usize,
 ) -> Result<(), ExprError> {
+    let next = check_validation_depth(depth)?;
     match pattern {
         Pattern::Ident(name) => {
             if is_forbidden_ident(name) {
@@ -627,9 +647,9 @@ fn validate_pattern(
                 match elem {
                     ArrayPatternElem::Hole => {}
                     ArrayPatternElem::Binding { pattern, default } => {
-                        validate_pattern(pattern, mode, locals)?;
+                        validate_pattern(pattern, mode, locals, next)?;
                         if let Some(d) = default {
-                            validate_expr(d, mode, locals)?;
+                            validate_expr(d, mode, locals, next)?;
                         }
                     }
                     ArrayPatternElem::Rest(name) => {
@@ -647,9 +667,9 @@ fn validate_pattern(
                     ObjectPatternProp::Prop {
                         pattern, default, ..
                     } => {
-                        validate_pattern(pattern, mode, locals)?;
+                        validate_pattern(pattern, mode, locals, next)?;
                         if let Some(d) = default {
-                            validate_expr(d, mode, locals)?;
+                            validate_expr(d, mode, locals, next)?;
                         }
                     }
                     ObjectPatternProp::Rest(name) => {
@@ -670,21 +690,23 @@ fn validate_stmt(
     locals: &BTreeSet<String>,
     in_loop: bool,
     in_switch: bool,
+    depth: usize,
 ) -> Result<(), ExprError> {
+    let next = check_validation_depth(depth)?;
     match stmt {
         Stmt::Empty => Ok(()),
-        Stmt::Expr(e) => validate_expr(e, mode, locals),
+        Stmt::Expr(e) => validate_expr(e, mode, locals, next),
         Stmt::Block(stmts) => {
             for s in stmts {
-                validate_stmt(s, mode, locals, in_loop, in_switch)?;
+                validate_stmt(s, mode, locals, in_loop, in_switch, next)?;
             }
             Ok(())
         }
         Stmt::VarDecl { decls, .. } => {
             for d in decls {
-                validate_pattern(&d.pattern, mode, locals)?;
+                validate_pattern(&d.pattern, mode, locals, next)?;
                 if let Some(init) = &d.init {
-                    validate_expr(init, mode, locals)?;
+                    validate_expr(init, mode, locals, next)?;
                 }
             }
             Ok(())
@@ -696,15 +718,15 @@ fn validate_stmt(
             let mut inner_locals = locals.clone();
             inner_locals.insert(f.name.clone());
             for p in &f.params {
-                validate_pattern(&p.pattern, mode, &inner_locals)?;
+                validate_pattern(&p.pattern, mode, &inner_locals, next)?;
                 collect_pattern_names(&p.pattern, &mut inner_locals);
                 if let Some(d) = &p.default {
-                    validate_expr(d, mode, &inner_locals)?;
+                    validate_expr(d, mode, &inner_locals, next)?;
                 }
             }
-            collect_hoisted_decls(&f.body, &mut inner_locals);
+            collect_hoisted_decls(&f.body, &mut inner_locals, next)?;
             for s in &f.body {
-                validate_stmt(s, mode, &inner_locals, false, false)?;
+                validate_stmt(s, mode, &inner_locals, false, false, next)?;
             }
             Ok(())
         }
@@ -713,64 +735,64 @@ fn validate_stmt(
             consequent,
             alternate,
         } => {
-            validate_expr(test, mode, locals)?;
-            validate_stmt(consequent, mode, locals, in_loop, in_switch)?;
+            validate_expr(test, mode, locals, next)?;
+            validate_stmt(consequent, mode, locals, in_loop, in_switch, next)?;
             if let Some(alt) = alternate {
-                validate_stmt(alt, mode, locals, in_loop, in_switch)?;
+                validate_stmt(alt, mode, locals, in_loop, in_switch, next)?;
             }
             Ok(())
         }
         Stmt::While { test, body } => {
-            validate_expr(test, mode, locals)?;
-            validate_stmt(body, mode, locals, true, in_switch)
+            validate_expr(test, mode, locals, next)?;
+            validate_stmt(body, mode, locals, true, in_switch, next)
         }
         Stmt::DoWhile { body, test } => {
-            validate_stmt(body, mode, locals, true, in_switch)?;
-            validate_expr(test, mode, locals)
+            validate_stmt(body, mode, locals, true, in_switch, next)?;
+            validate_expr(test, mode, locals, next)
         }
         Stmt::For(f) => {
             if let Some(init) = &f.init {
                 match init {
                     ForInit::VarDecl { decls, .. } => {
                         for d in decls {
-                            validate_pattern(&d.pattern, mode, locals)?;
+                            validate_pattern(&d.pattern, mode, locals, next)?;
                             if let Some(init_e) = &d.init {
-                                validate_expr(init_e, mode, locals)?;
+                                validate_expr(init_e, mode, locals, next)?;
                             }
                         }
                     }
-                    ForInit::Expr(e) => validate_expr(e, mode, locals)?,
+                    ForInit::Expr(e) => validate_expr(e, mode, locals, next)?,
                 }
             }
             if let Some(t) = &f.test {
-                validate_expr(t, mode, locals)?;
+                validate_expr(t, mode, locals, next)?;
             }
             if let Some(u) = &f.update {
-                validate_expr(u, mode, locals)?;
+                validate_expr(u, mode, locals, next)?;
             }
-            validate_stmt(&f.body, mode, locals, true, in_switch)
+            validate_stmt(&f.body, mode, locals, true, in_switch, next)
         }
         Stmt::ForOf(f) => {
-            validate_pattern(&f.target, mode, locals)?;
-            validate_expr(&f.iterable, mode, locals)?;
-            validate_stmt(&f.body, mode, locals, true, in_switch)
+            validate_pattern(&f.target, mode, locals, next)?;
+            validate_expr(&f.iterable, mode, locals, next)?;
+            validate_stmt(&f.body, mode, locals, true, in_switch, next)
         }
         Stmt::ForIn(f) => {
-            validate_pattern(&f.target, mode, locals)?;
-            validate_expr(&f.object, mode, locals)?;
-            validate_stmt(&f.body, mode, locals, true, in_switch)
+            validate_pattern(&f.target, mode, locals, next)?;
+            validate_expr(&f.object, mode, locals, next)?;
+            validate_stmt(&f.body, mode, locals, true, in_switch, next)
         }
         Stmt::Switch {
             discriminant,
             cases,
         } => {
-            validate_expr(discriminant, mode, locals)?;
+            validate_expr(discriminant, mode, locals, next)?;
             for c in cases {
                 if let Some(t) = &c.test {
-                    validate_expr(t, mode, locals)?;
+                    validate_expr(t, mode, locals, next)?;
                 }
                 for s in &c.consequent {
-                    validate_stmt(s, mode, locals, in_loop, true)?;
+                    validate_stmt(s, mode, locals, in_loop, true, next)?;
                 }
             }
             Ok(())
@@ -795,28 +817,28 @@ fn validate_stmt(
         }
         Stmt::Return(opt) => {
             if let Some(e) = opt {
-                validate_expr(e, mode, locals)?;
+                validate_expr(e, mode, locals, next)?;
             }
             Ok(())
         }
-        Stmt::Throw(e) => validate_expr(e, mode, locals),
+        Stmt::Throw(e) => validate_expr(e, mode, locals, next),
         Stmt::Try(t) => {
             for s in &t.block {
-                validate_stmt(s, mode, locals, in_loop, in_switch)?;
+                validate_stmt(s, mode, locals, in_loop, in_switch, next)?;
             }
             if let Some(cb) = &t.catch_body {
                 let mut catch_locals = locals.clone();
                 if let Some(p) = &t.catch_param {
-                    validate_pattern(p, mode, &catch_locals)?;
+                    validate_pattern(p, mode, &catch_locals, next)?;
                     collect_pattern_names(p, &mut catch_locals);
                 }
                 for s in cb {
-                    validate_stmt(s, mode, &catch_locals, in_loop, in_switch)?;
+                    validate_stmt(s, mode, &catch_locals, in_loop, in_switch, next)?;
                 }
             }
             if let Some(fb) = &t.finally_body {
                 for s in fb {
-                    validate_stmt(s, mode, locals, in_loop, in_switch)?;
+                    validate_stmt(s, mode, locals, in_loop, in_switch, next)?;
                 }
             }
             Ok(())
@@ -828,7 +850,9 @@ fn validate_target(
     target: &AssignTarget,
     mode: ExprMode,
     locals: &BTreeSet<String>,
+    depth: usize,
 ) -> Result<(), ExprError> {
+    let next = check_validation_depth(depth)?;
     match target {
         AssignTarget::Ident(name) => {
             if is_forbidden_ident(name) {
@@ -843,7 +867,7 @@ fn validate_target(
             if matches!(object, Expr::Ident(n) if n == "Math") && prop == "random" {
                 return Err(ExprError::Forbidden("Math.random".to_string()));
             }
-            validate_expr(object, mode, locals)
+            validate_expr(object, mode, locals, next)
         }
         AssignTarget::Index { object, index } => {
             if matches!(object, Expr::Ident(n) if n == "Math")
@@ -851,13 +875,19 @@ fn validate_target(
             {
                 return Err(ExprError::Forbidden("Math.random".to_string()));
             }
-            validate_expr(object, mode, locals)?;
-            validate_expr(index, mode, locals)
+            validate_expr(object, mode, locals, next)?;
+            validate_expr(index, mode, locals, next)
         }
     }
 }
 
-fn validate_expr(expr: &Expr, mode: ExprMode, locals: &BTreeSet<String>) -> Result<(), ExprError> {
+fn validate_expr(
+    expr: &Expr,
+    mode: ExprMode,
+    locals: &BTreeSet<String>,
+    depth: usize,
+) -> Result<(), ExprError> {
+    let next = check_validation_depth(depth)?;
     match expr {
         Expr::Literal(_) => Ok(()),
         Expr::Ident(name) => {
@@ -872,7 +902,7 @@ fn validate_expr(expr: &Expr, mode: ExprMode, locals: &BTreeSet<String>) -> Resu
         Expr::Template(parts) => {
             for p in parts {
                 if let TemplatePart::Expr(e) = p {
-                    validate_expr(e, mode, locals)?;
+                    validate_expr(e, mode, locals, next)?;
                 }
             }
             Ok(())
@@ -880,7 +910,9 @@ fn validate_expr(expr: &Expr, mode: ExprMode, locals: &BTreeSet<String>) -> Resu
         Expr::Array(elems) => {
             for elem in elems {
                 match elem {
-                    ArrayElem::Expr(e) | ArrayElem::Spread(e) => validate_expr(e, mode, locals)?,
+                    ArrayElem::Expr(e) | ArrayElem::Spread(e) => {
+                        validate_expr(e, mode, locals, next)?;
+                    }
                 }
             }
             Ok(())
@@ -890,39 +922,39 @@ fn validate_expr(expr: &Expr, mode: ExprMode, locals: &BTreeSet<String>) -> Resu
                 match prop {
                     ObjectProp::KeyValue { key, value } => {
                         if let ObjectKey::Computed(k) = key {
-                            validate_expr(k, mode, locals)?;
+                            validate_expr(k, mode, locals, next)?;
                         }
-                        validate_expr(value, mode, locals)?;
+                        validate_expr(value, mode, locals, next)?;
                     }
-                    ObjectProp::Spread(e) => validate_expr(e, mode, locals)?,
+                    ObjectProp::Spread(e) => validate_expr(e, mode, locals, next)?,
                 }
             }
             Ok(())
         }
-        Expr::Unary { expr, .. } => validate_expr(expr, mode, locals),
-        Expr::Update { target, .. } => validate_target(target, mode, locals),
+        Expr::Unary { expr, .. } => validate_expr(expr, mode, locals, next),
+        Expr::Update { target, .. } => validate_target(target, mode, locals, next),
         Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
-            validate_expr(left, mode, locals)?;
-            validate_expr(right, mode, locals)
+            validate_expr(left, mode, locals, next)?;
+            validate_expr(right, mode, locals, next)
         }
         Expr::Conditional {
             test,
             consequent,
             alternate,
         } => {
-            validate_expr(test, mode, locals)?;
-            validate_expr(consequent, mode, locals)?;
-            validate_expr(alternate, mode, locals)
+            validate_expr(test, mode, locals, next)?;
+            validate_expr(consequent, mode, locals, next)?;
+            validate_expr(alternate, mode, locals, next)
         }
         Expr::Assign { target, value, .. } => {
-            validate_target(target, mode, locals)?;
-            validate_expr(value, mode, locals)
+            validate_target(target, mode, locals, next)?;
+            validate_expr(value, mode, locals, next)
         }
         Expr::Member { object, prop } => {
             if matches!(object.as_ref(), Expr::Ident(n) if n == "Math") && prop == "random" {
                 return Err(ExprError::Forbidden("Math.random".to_string()));
             }
-            validate_expr(object, mode, locals)
+            validate_expr(object, mode, locals, next)
         }
         Expr::Index { object, index } => {
             if matches!(object.as_ref(), Expr::Ident(n) if n == "Math")
@@ -930,14 +962,14 @@ fn validate_expr(expr: &Expr, mode: ExprMode, locals: &BTreeSet<String>) -> Resu
             {
                 return Err(ExprError::Forbidden("Math.random".to_string()));
             }
-            validate_expr(object, mode, locals)?;
-            validate_expr(index, mode, locals)
+            validate_expr(object, mode, locals, next)?;
+            validate_expr(index, mode, locals, next)
         }
         Expr::Call { callee, args } => {
-            validate_expr(callee, mode, locals)?;
+            validate_expr(callee, mode, locals, next)?;
             for arg in args {
                 match arg {
-                    CallArg::Expr(e) | CallArg::Spread(e) => validate_expr(e, mode, locals)?,
+                    CallArg::Expr(e) | CallArg::Spread(e) => validate_expr(e, mode, locals, next)?,
                 }
             }
             Ok(())
@@ -959,16 +991,16 @@ fn validate_expr(expr: &Expr, mode: ExprMode, locals: &BTreeSet<String>) -> Resu
                     _ => {}
                 }
             }
-            validate_expr(base, mode, locals)?;
+            validate_expr(base, mode, locals, next)?;
             for op in ops {
                 match op {
                     ChainOp::Member { .. } => {}
-                    ChainOp::Index { index, .. } => validate_expr(index, mode, locals)?,
+                    ChainOp::Index { index, .. } => validate_expr(index, mode, locals, next)?,
                     ChainOp::Call { args, .. } => {
                         for arg in args {
                             match arg {
                                 CallArg::Expr(e) | CallArg::Spread(e) => {
-                                    validate_expr(e, mode, locals)?;
+                                    validate_expr(e, mode, locals, next)?;
                                 }
                             }
                         }
@@ -986,26 +1018,26 @@ fn validate_expr(expr: &Expr, mode: ExprMode, locals: &BTreeSet<String>) -> Resu
                 inner_locals.insert(name.clone());
             }
             for p in &f.params {
-                validate_pattern(&p.pattern, mode, &inner_locals)?;
+                validate_pattern(&p.pattern, mode, &inner_locals, next)?;
                 collect_pattern_names(&p.pattern, &mut inner_locals);
                 if let Some(d) = &p.default {
-                    validate_expr(d, mode, &inner_locals)?;
+                    validate_expr(d, mode, &inner_locals, next)?;
                 }
             }
             match &f.body {
                 FunctionBody::Block(stmts) => {
-                    collect_hoisted_decls(stmts, &mut inner_locals);
+                    collect_hoisted_decls(stmts, &mut inner_locals, next)?;
                     for s in stmts {
-                        validate_stmt(s, mode, &inner_locals, false, false)?;
+                        validate_stmt(s, mode, &inner_locals, false, false, next)?;
                     }
                 }
-                FunctionBody::Expr(e) => validate_expr(e, mode, &inner_locals)?,
+                FunctionBody::Expr(e) => validate_expr(e, mode, &inner_locals, next)?,
             }
             Ok(())
         }
         Expr::Sequence(items) => {
             for item in items {
-                validate_expr(item, mode, locals)?;
+                validate_expr(item, mode, locals, next)?;
             }
             Ok(())
         }

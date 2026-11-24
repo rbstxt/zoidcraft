@@ -164,13 +164,17 @@ pub fn import_pz_from_bytes(bytes: &[u8]) -> Result<PzImportResult, ProjectError
         preserved.insert("zoidium_manifest".to_owned(), zoidium);
     }
 
-    let assets = parse_assets(root_obj.get("assets"), &mut binary_entries, &mut warnings);
-    let media = parse_media(root_obj.get("media"));
-    let sequence = parse_sequence(
+    let (assets, asset_key_remap) =
+        parse_assets(root_obj.get("assets"), &mut binary_entries, &mut warnings);
+    let mut media = parse_media(root_obj.get("media"));
+    let mut sequence = parse_sequence(
         root_obj.get("sequence"),
         &mut plugin_requirements,
         &mut warnings,
     );
+    if !asset_key_remap.is_empty() {
+        remap_media_and_sequence_asset_keys(&mut media, &mut sequence, &asset_key_remap);
+    }
 
     let project_name = root_obj
         .get("name")
@@ -209,14 +213,19 @@ fn map_limit(err: ProjectError, exceeded: &std::sync::atomic::AtomicBool) -> Pro
     }
 }
 
+fn is_full_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn parse_assets(
     assets_val: Option<&Value>,
     binary_entries: &mut BTreeMap<String, Vec<u8>>,
     warnings: &mut Vec<String>,
-) -> BTreeMap<String, AssetRecord> {
+) -> (BTreeMap<String, AssetRecord>, BTreeMap<String, String>) {
     let mut out = BTreeMap::new();
+    let mut remap = BTreeMap::new();
     let Some(map) = assets_val.and_then(Value::as_object) else {
-        return out;
+        return (out, remap);
     };
 
     for (key, val) in map {
@@ -260,11 +269,24 @@ fn parse_assets(
             let full_sha = sha256_hex(&data);
             (Some(data), sz, full_sha, false)
         } else if external {
-            (None, declared_size, declared_sha, false)
+            let normalized_sha = if is_full_sha256_hex(&declared_sha) {
+                declared_sha.to_ascii_lowercase()
+            } else {
+                sha256_hex(format!("pz-external:{key}:{filename}").as_bytes())
+            };
+            (None, declared_size, normalized_sha, false)
         } else {
             warnings.push(format!("missing binary asset {key:?} ({filename})"));
-            (None, declared_size, declared_sha, true)
+            let normalized_sha = if is_full_sha256_hex(&declared_sha) {
+                declared_sha.to_ascii_lowercase()
+            } else {
+                sha256_hex(format!("pz-missing:{key}:{filename}").as_bytes())
+            };
+            (None, declared_size, normalized_sha, true)
         };
+
+        // Spec 03 §7.3: native `.zcraft` assets are keyed by full 64-hex SHA-256.
+        let canonical_key = sha256.clone();
 
         let mut preserved = BTreeMap::new();
         for (k, v) in obj {
@@ -275,11 +297,15 @@ fn parse_assets(
                 preserved.insert(k.clone(), v.clone());
             }
         }
+        if canonical_key != *key {
+            preserved.insert("legacy_pz_asset_key".to_owned(), Value::String(key.clone()));
+            remap.insert(key.clone(), canonical_key.clone());
+        }
 
         out.insert(
-            key.clone(),
+            canonical_key.clone(),
             AssetRecord {
-                id: key.clone(),
+                id: canonical_key,
                 kind,
                 source,
                 filename,
@@ -294,7 +320,201 @@ fn parse_assets(
         );
     }
 
-    out
+    (out, remap)
+}
+
+fn remap_opt_key(slot: &mut Option<String>, remap: &BTreeMap<String, String>) {
+    if let Some(current) = slot.as_mut()
+        && let Some(new_key) = remap.get(current.as_str())
+    {
+        *current = new_key.clone();
+    }
+}
+
+fn remap_json_value(val: &mut Value, remap: &BTreeMap<String, String>) {
+    match val {
+        Value::String(s) => {
+            if let Some(new_key) = remap.get(s.as_str()) {
+                *s = new_key.clone();
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                remap_json_value(item, remap);
+            }
+        }
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                remap_json_value(child, remap);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remap_property_value(val: &mut PropertyValue, remap: &BTreeMap<String, String>) {
+    match val {
+        PropertyValue::Asset(slot) => remap_opt_key(slot, remap),
+        PropertyValue::Text(s) | PropertyValue::List(s) | PropertyValue::Shader(s) => {
+            if let Some(new_key) = remap.get(s.as_str()) {
+                *s = new_key.clone();
+            }
+        }
+        PropertyValue::Curve(v) | PropertyValue::Json(v) => remap_json_value(v, remap),
+        _ => {}
+    }
+}
+
+fn remap_property_track(track: &mut PropertyTrack, remap: &BTreeMap<String, String>) {
+    remap_property_value(&mut track.value, remap);
+    for kf in &mut track.keyframes {
+        remap_property_value(&mut kf.value, remap);
+    }
+    for ch in &mut track.channels {
+        remap_property_track(ch, remap);
+    }
+}
+
+fn remap_material(mat: &mut MaterialSpec, remap: &BTreeMap<String, String>) {
+    match mat {
+        MaterialSpec::SingleColor { .. } => {}
+        MaterialSpec::Texture(m) => remap_opt_key(&mut m.texture, remap),
+        MaterialSpec::Video(m) => remap_opt_key(&mut m.video, remap),
+        MaterialSpec::CustomPbr(m) => {
+            remap_opt_key(&mut m.texture, remap);
+            remap_opt_key(&mut m.normal_map, remap);
+        }
+        MaterialSpec::CustomShader {
+            custom_properties, ..
+        } => {
+            for cp in custom_properties {
+                remap_property_track(&mut cp.track, remap);
+            }
+        }
+        MaterialSpec::PbrPlus(m) => {
+            remap_opt_key(&mut m.base_color_map, remap);
+            remap_opt_key(&mut m.emissive_map, remap);
+            remap_opt_key(&mut m.roughness_map, remap);
+            remap_opt_key(&mut m.metalness_map, remap);
+            remap_opt_key(&mut m.normal_map, remap);
+            remap_opt_key(&mut m.alpha_map, remap);
+        }
+        MaterialSpec::Matcap(m) => remap_opt_key(&mut m.texture, remap),
+        MaterialSpec::ImagePlus(m) => remap_opt_key(&mut m.texture, remap),
+        MaterialSpec::NodeMaterial { graph, .. } => remap_json_value(graph, remap),
+        MaterialSpec::Unknown { payload, .. } => remap_json_value(payload, remap),
+    }
+}
+
+fn remap_object_3d(obj: &mut Object3D, remap: &BTreeMap<String, String>) {
+    if let Some(mat) = obj.material.as_mut() {
+        remap_material(mat, remap);
+    }
+    for mat in obj.material_slots.values_mut() {
+        remap_material(mat, remap);
+    }
+    match &mut obj.kind {
+        Object3DKind::Group {
+            custom_properties,
+            children,
+            ..
+        } => {
+            for cp in custom_properties {
+                remap_property_track(&mut cp.track, remap);
+            }
+            for child in children {
+                remap_object_3d(child, remap);
+            }
+        }
+        Object3DKind::Text3D(t) => remap_opt_key(&mut t.font, remap),
+        Object3DKind::Shape3D(Shape3DKind::CustomGeometry { asset_id }) => {
+            remap_opt_key(asset_id, remap);
+        }
+        Object3DKind::Particles(p) => remap_opt_key(&mut p.texture, remap),
+        Object3DKind::Model(m) => remap_opt_key(&mut m.asset_id, remap),
+        Object3DKind::Dummy { payload, .. } => remap_json_value(payload, remap),
+        _ => {}
+    }
+    for v in obj.preserved.values_mut() {
+        remap_json_value(v, remap);
+    }
+}
+
+fn remap_effect(fx: &mut EffectInstance, remap: &BTreeMap<String, String>) {
+    for track in fx.params.values_mut() {
+        remap_property_track(track, remap);
+    }
+    match &mut fx.kind {
+        EffectKind::CustomShader {
+            custom_properties, ..
+        } => {
+            for cp in custom_properties {
+                remap_property_track(&mut cp.track, remap);
+            }
+        }
+        EffectKind::EffectGroup {
+            custom_properties,
+            children,
+        } => {
+            for cp in custom_properties {
+                remap_property_track(&mut cp.track, remap);
+            }
+            for child in children {
+                remap_effect(child, remap);
+            }
+        }
+        EffectKind::Standard(_) | EffectKind::Plugin { .. } => {}
+    }
+    for v in fx.preserved.values_mut() {
+        remap_json_value(v, remap);
+    }
+}
+
+fn remap_layer(layer: &mut Layer, remap: &BTreeMap<String, String>) {
+    match &mut layer.kind {
+        LayerKind::Video { media } => remap_opt_key(media, remap),
+        LayerKind::Image { image } => remap_opt_key(image, remap),
+        LayerKind::Text2D { font, .. } => remap_opt_key(font, remap),
+        LayerKind::Composite { layers } => {
+            for child in layers {
+                remap_layer(child, remap);
+            }
+        }
+        LayerKind::Scene3D { objects, .. } => {
+            for obj in objects {
+                remap_object_3d(obj, remap);
+            }
+        }
+        LayerKind::Plugin { payload, .. } => remap_json_value(payload, remap),
+        _ => {}
+    }
+    for fx in &mut layer.effects {
+        remap_effect(fx, remap);
+    }
+    for v in layer.preserved.values_mut() {
+        remap_json_value(v, remap);
+    }
+}
+
+fn remap_media_and_sequence_asset_keys(
+    media: &mut [MediaItem],
+    sequence: &mut Sequence,
+    remap: &BTreeMap<String, String>,
+) {
+    for item in media {
+        remap_opt_key(&mut item.asset_id, remap);
+    }
+    for vt in &mut sequence.video_tracks {
+        for clip in &mut vt.clips {
+            remap_opt_key(&mut clip.media, remap);
+            remap_layer(&mut clip.layer, remap);
+        }
+    }
+    for at in &mut sequence.audio_tracks {
+        for clip in &mut at.clips {
+            remap_opt_key(&mut clip.media, remap);
+        }
+    }
 }
 
 fn parse_media(media_val: Option<&Value>) -> Vec<MediaItem> {
@@ -2720,20 +2940,18 @@ mod tests {
         assert!(project.plugin_requirements.contains("expressions-plus"));
         assert!(project.plugin_requirements.contains("constraints"));
 
-        // Present vs missing assets
-        assert!(!project.assets["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"].missing);
+        // Present vs missing assets (normalized to full 64-hex SHA-256 keys per Spec 03 §7.3)
+        let expected_present_key = sha256_hex(present_asset_bytes);
+        let expected_missing_key =
+            sha256_hex(b"pz-missing:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:missing.png");
+        assert_eq!(expected_present_key.len(), 64);
+        assert!(!project.assets[&expected_present_key].missing);
         assert_eq!(
-            project.assets["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
-                .bytes
-                .as_deref(),
+            project.assets[&expected_present_key].bytes.as_deref(),
             Some(present_asset_bytes.as_slice())
         );
-        assert!(project.assets["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"].missing);
-        assert!(
-            project.assets["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
-                .bytes
-                .is_none()
-        );
+        assert!(project.assets[&expected_missing_key].missing);
+        assert!(project.assets[&expected_missing_key].bytes.is_none());
         assert!(imported.warnings.iter().any(|w| w.contains("missing.png")));
 
         // Sequence & controls

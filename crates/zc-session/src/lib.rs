@@ -4,6 +4,7 @@ pub mod history;
 pub mod selection;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -349,14 +350,62 @@ pub struct SessionClip {
     pub name: String,
     pub start: f64,
     pub length: f64,
+    #[serde(default)]
+    pub time_start: f64,
+    #[serde(default)]
+    pub time_end: f64,
+    #[serde(default)]
+    pub time_animated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_length: Option<f64>,
     pub properties: BTreeMap<String, SessionProperty>,
     pub objects_3d: Vec<SessionObject3D>,
     pub effects: Vec<SessionEffect>,
 }
 
 impl SessionClip {
+    fn eval_time_at(&self, local_frame: f64) -> f64 {
+        if self.length <= 0.0 {
+            return self.time_start;
+        }
+        let u = (local_frame / self.length).clamp(0.0, 1.0);
+        self.time_start + (self.time_end - self.time_start) * u
+    }
+
+    fn sync_time_property(&mut self) {
+        if self.time_animated {
+            return;
+        }
+        self.properties.insert(
+            "time".to_string(),
+            SessionProperty {
+                animated: false,
+                expression: self
+                    .properties
+                    .get("time")
+                    .and_then(|p| p.expression.clone()),
+                default_value: json!(0.0),
+                keyframes: vec![
+                    SessionKeyframe {
+                        frame: 0.0,
+                        value: json!(self.time_start),
+                        tween: 1,
+                    },
+                    SessionKeyframe {
+                        frame: self.length,
+                        value: json!(self.time_end),
+                        tween: 1,
+                    },
+                ],
+            },
+        );
+    }
+
     fn shift_all_keyframes(&mut self, offset: f64) {
-        for prop in self.properties.values_mut() {
+        for (name, prop) in &mut self.properties {
+            if name == "time" && !self.time_animated {
+                continue;
+            }
             prop.shift_keyframes(offset);
         }
         for obj in &mut self.objects_3d {
@@ -372,7 +421,10 @@ impl SessionClip {
     }
 
     fn scale_all_keyframes(&mut self, scale: f64) {
-        for prop in self.properties.values_mut() {
+        for (name, prop) in &mut self.properties {
+            if name == "time" && !self.time_animated {
+                continue;
+            }
             prop.scale_keyframes(scale);
         }
         for obj in &mut self.objects_3d {
@@ -410,63 +462,379 @@ pub struct SessionDocument {
     pub sequence_properties: BTreeMap<String, SessionProperty>,
 }
 
-impl SessionDocument {
-    fn from_project(project: &zc_project::Project) -> Self {
-        let mut doc = Self {
-            project_name: String::from("Untitled"),
-            resolution: [1920, 1080],
-            fps: 30.0,
-            sequence_length: 300.0,
-            video_tracks: Vec::new(),
-            audio_tracks: Vec::new(),
-            sequence_properties: BTreeMap::new(),
-        };
+fn prop_value_to_json(v: &zc_project::PropertyValue) -> Value {
+    match v {
+        zc_project::PropertyValue::Number(n) => json!(n),
+        zc_project::PropertyValue::Bool(b) => json!(b),
+        zc_project::PropertyValue::Option(o) => json!(o),
+        zc_project::PropertyValue::Text(s)
+        | zc_project::PropertyValue::List(s)
+        | zc_project::PropertyValue::Shader(s) => json!(s),
+        zc_project::PropertyValue::Asset(a) => json!(a),
+        zc_project::PropertyValue::Vec2(a) => json!(a),
+        zc_project::PropertyValue::Vec3(a) => json!(a),
+        zc_project::PropertyValue::Vec4(a) => json!(a),
+        zc_project::PropertyValue::Color(a) => json!(a),
+        zc_project::PropertyValue::ColorRgba(a) => json!(a),
+        zc_project::PropertyValue::Gradient(stops) => {
+            serde_json::to_value(stops).unwrap_or(Value::Null)
+        }
+        zc_project::PropertyValue::Curve(v) | zc_project::PropertyValue::Json(v) => v.clone(),
+    }
+}
 
-        if let Ok(val) = serde_json::to_value(project) {
-            if let Some(name) = val
-                .get("name")
-                .or_else(|| val.get("project_name"))
-                .or_else(|| val.pointer("/manifest/project_name"))
-                .and_then(Value::as_str)
-            {
-                doc.project_name = name.to_string();
+fn json_to_prop_value(v: &Value) -> zc_project::PropertyValue {
+    if let Some(b) = v.as_bool() {
+        return zc_project::PropertyValue::Bool(b);
+    }
+    if let Some(n) = v.as_f64() {
+        return zc_project::PropertyValue::Number(n);
+    }
+    if let Some(s) = v.as_str() {
+        return zc_project::PropertyValue::Text(s.to_owned());
+    }
+    if let Some(arr) = v.as_array() {
+        let nums: Option<Vec<f64>> = arr.iter().map(Value::as_f64).collect();
+        if let Some(nums) = nums {
+            if nums.len() == 2 {
+                return zc_project::PropertyValue::Vec2([nums[0], nums[1]]);
             }
-
-            if let Some(seq) = val.get("sequence") {
-                if let Some(res) = seq
-                    .get("resolution")
-                    .or_else(|| seq.pointer("/properties/resolution"))
-                    .and_then(Value::as_array)
-                    && res.len() == 2
-                    && let (Some(w), Some(h)) = (res[0].as_u64(), res[1].as_u64())
-                    && w > 0
-                    && h > 0
-                {
-                    doc.resolution = [w.min(7680) as u32, h.min(7680) as u32];
-                }
-                if let Some(rate) = seq
-                    .get("rate")
-                    .or_else(|| seq.get("fps"))
-                    .or_else(|| seq.pointer("/properties/rate"))
-                    .and_then(Value::as_f64)
-                    && rate.is_finite()
-                    && rate > 0.0
-                {
-                    doc.fps = rate;
-                }
-                if let Some(len) = seq
-                    .get("length")
-                    .or_else(|| seq.get("duration_frames"))
-                    .and_then(Value::as_f64)
-                    && len.is_finite()
-                    && len >= 0.0
-                {
-                    doc.sequence_length = len;
-                }
+            if nums.len() == 3 {
+                return zc_project::PropertyValue::Vec3([nums[0], nums[1], nums[2]]);
+            }
+            if nums.len() == 4 {
+                return zc_project::PropertyValue::Vec4([nums[0], nums[1], nums[2], nums[3]]);
             }
         }
+    }
+    zc_project::PropertyValue::Json(v.clone())
+}
 
-        doc
+fn property_track_to_session(track: &zc_project::PropertyTrack) -> SessionProperty {
+    let default_value = prop_value_to_json(&track.value);
+    let keyframes = if track.keyframes.is_empty() {
+        vec![SessionKeyframe {
+            frame: 0.0,
+            value: default_value.clone(),
+            tween: 1,
+        }]
+    } else {
+        track
+            .keyframes
+            .iter()
+            .map(|kf| SessionKeyframe {
+                frame: kf.frame,
+                value: prop_value_to_json(&kf.value),
+                tween: kf.tween as u16,
+            })
+            .collect()
+    };
+    SessionProperty {
+        animated: track.animated,
+        expression: track.expression.clone(),
+        default_value,
+        keyframes,
+    }
+}
+
+fn session_property_to_track(
+    prop: &SessionProperty,
+    fallback: Option<&zc_project::PropertyTrack>,
+) -> zc_project::PropertyTrack {
+    let value = prop
+        .keyframes
+        .first()
+        .map(|k| json_to_prop_value(&k.value))
+        .unwrap_or_else(|| json_to_prop_value(&prop.default_value));
+    let keyframes = prop
+        .keyframes
+        .iter()
+        .map(|kf| {
+            let (cp, cont) = fallback
+                .and_then(|t| {
+                    t.keyframes
+                        .iter()
+                        .find(|existing| (existing.frame - kf.frame).abs() < 1e-6)
+                })
+                .map_or(([[-10.0, 0.0], [10.0, 0.0]], true), |existing| {
+                    (existing.control_points, existing.continuous_tangent)
+                });
+            zc_project::PropertyKeyframe::from_cm3_tween(
+                kf.frame,
+                json_to_prop_value(&kf.value),
+                u32::from(kf.tween),
+                cp,
+                cont,
+            )
+        })
+        .collect();
+    zc_project::PropertyTrack {
+        animated: prop.animated,
+        expression: prop.expression.clone(),
+        static_behavior: fallback
+            .map_or(zc_project::StaticBehavior::Constant, |t| t.static_behavior),
+        value,
+        keyframes,
+        channels: fallback.map_or_else(Vec::new, |t| t.channels.clone()),
+    }
+}
+
+fn layer_kind_to_session_kind(kind: &zc_project::LayerKind) -> String {
+    match kind {
+        zc_project::LayerKind::Video { .. } => "video".to_string(),
+        zc_project::LayerKind::Adjustment => "adjustment".to_string(),
+        zc_project::LayerKind::Composite { .. } => "composite".to_string(),
+        zc_project::LayerKind::Image { .. } => "image".to_string(),
+        zc_project::LayerKind::Scene3D { .. } => "scene".to_string(),
+        zc_project::LayerKind::Generator => "generator".to_string(),
+        zc_project::LayerKind::Shape2D { .. } => "shape".to_string(),
+        zc_project::LayerKind::Text2D { .. } => "text_2d".to_string(),
+        zc_project::LayerKind::PresetShape2D { .. } => "preset_shape".to_string(),
+        zc_project::LayerKind::CameraLayer { .. } => "zoidium:camera-plus/camera-layer".to_string(),
+        zc_project::LayerKind::PrecompRef { .. } => "zoidium:precomp-plus/precomp".to_string(),
+        zc_project::LayerKind::Plugin { plugin_type, .. } => plugin_type.clone(),
+    }
+}
+
+fn object_3d_kind_to_str(kind: &zc_project::Object3DKind) -> String {
+    match kind {
+        zc_project::Object3DKind::Group { .. } => "group".to_string(),
+        zc_project::Object3DKind::Text3D(_) => "text_3d".to_string(),
+        zc_project::Object3DKind::Shape3D(s) => match s {
+            zc_project::Shape3DKind::Box { .. } => "shape.box".to_string(),
+            zc_project::Shape3DKind::Cylinder { .. } => "shape.cylinder".to_string(),
+            zc_project::Shape3DKind::Rectangle { .. } => "shape.rectangle".to_string(),
+            zc_project::Shape3DKind::Circle { .. } => "shape.circle".to_string(),
+            zc_project::Shape3DKind::Sphere { .. } => "shape.sphere".to_string(),
+            zc_project::Shape3DKind::Donut { .. } => "shape.donut".to_string(),
+            zc_project::Shape3DKind::Wire { .. } => "shape.wire".to_string(),
+            zc_project::Shape3DKind::CustomGeometry { .. } => "shape.custom".to_string(),
+            _ => "zoidium:geometry-plus/shape".to_string(),
+        },
+        zc_project::Object3DKind::Light(_) => "light".to_string(),
+        zc_project::Object3DKind::Camera(_) => "camera".to_string(),
+        zc_project::Object3DKind::Particles(_) => "particles".to_string(),
+        zc_project::Object3DKind::Model(_) => "model".to_string(),
+        zc_project::Object3DKind::Dummy { original_type, .. } => {
+            original_type.clone().unwrap_or_else(|| "dummy".to_string())
+        }
+    }
+}
+
+fn flatten_objects_3d(
+    objects: &[zc_project::Object3D],
+    parent_id: Option<String>,
+    out: &mut Vec<SessionObject3D>,
+) {
+    for obj in objects {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "enabled".to_string(),
+            property_track_to_session(&obj.enabled),
+        );
+        properties.insert(
+            "position".to_string(),
+            property_track_to_session(&obj.position),
+        );
+        properties.insert(
+            "rotation".to_string(),
+            property_track_to_session(&obj.rotation),
+        );
+        properties.insert("scale".to_string(), property_track_to_session(&obj.scale));
+
+        let obj_id = obj.id.to_string();
+        out.push(SessionObject3D {
+            id: obj_id.clone(),
+            parent_id: parent_id.clone(),
+            kind: object_3d_kind_to_str(&obj.kind),
+            name: obj.name.clone(),
+            properties,
+        });
+        if let zc_project::Object3DKind::Group { children, .. } = &obj.kind {
+            flatten_objects_3d(children, Some(obj_id), out);
+        }
+    }
+}
+
+fn effect_kind_to_session_id(kind: &zc_project::EffectKind) -> String {
+    match kind {
+        zc_project::EffectKind::Standard(id) => id.clone(),
+        zc_project::EffectKind::CustomShader { .. } => "customshader".to_string(),
+        zc_project::EffectKind::EffectGroup { .. } => "group".to_string(),
+        zc_project::EffectKind::Plugin {
+            plugin_id,
+            effect_id,
+        } => format!("zoidium:{plugin_id}/{effect_id}"),
+    }
+}
+
+fn effect_to_session(fx: &zc_project::EffectInstance) -> SessionEffect {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "enabled".to_string(),
+        property_track_to_session(&fx.enabled),
+    );
+    for (k, track) in &fx.params {
+        properties.insert(k.clone(), property_track_to_session(track));
+    }
+    SessionEffect {
+        id: fx.id.to_string(),
+        kind: effect_kind_to_session_id(&fx.kind),
+        name: fx.name.clone(),
+        properties,
+    }
+}
+
+fn parse_uuid_or_new(raw: &str) -> zc_project::Uuid {
+    zc_project::Uuid::parse_str(raw).unwrap_or_else(|_| zc_project::Uuid::new_v4())
+}
+
+fn extract_time_bounds(
+    time_curve: &zc_project::PropertyTrack,
+    length: f64,
+    fps: f64,
+) -> (f64, f64, bool) {
+    let default_end = if fps > 0.0 { length / fps } else { 0.0 };
+    if time_curve.keyframes.len() >= 2 {
+        let t0 = match time_curve.keyframes.first().map(|k| &k.value) {
+            Some(zc_project::PropertyValue::Number(n)) => *n,
+            _ => 0.0,
+        };
+        let t1 = match time_curve.keyframes.last().map(|k| &k.value) {
+            Some(zc_project::PropertyValue::Number(n)) => *n,
+            _ => default_end,
+        };
+        // Standard CM3 linear clip time uses StaticBehavior::Linear with 2 linear keyframes.
+        let is_standard_linear = !time_curve.animated
+            || (time_curve.static_behavior == zc_project::StaticBehavior::Linear
+                && time_curve.keyframes.len() == 2
+                && time_curve.expression.is_none());
+        (t0, t1, !is_standard_linear)
+    } else {
+        (0.0, default_end, time_curve.animated)
+    }
+}
+
+impl SessionDocument {
+    fn from_project(project: &zc_project::Project) -> Self {
+        let fps = f64::from(project.sequence.fps.max(1));
+        let mut video_tracks = Vec::with_capacity(project.sequence.video_tracks.len());
+        for vt in &project.sequence.video_tracks {
+            let mut clips = Vec::with_capacity(vt.clips.len());
+            for vc in &vt.clips {
+                let (time_start, time_end, time_animated) =
+                    extract_time_bounds(&vc.time_curve, vc.length, fps);
+                let mut properties = BTreeMap::new();
+                properties.insert(
+                    "position".to_string(),
+                    property_track_to_session(&vc.layer.position),
+                );
+                properties.insert(
+                    "scale".to_string(),
+                    property_track_to_session(&vc.layer.scale),
+                );
+                properties.insert(
+                    "rotation".to_string(),
+                    property_track_to_session(&vc.layer.rotation),
+                );
+                properties.insert(
+                    "anchor".to_string(),
+                    property_track_to_session(&vc.layer.anchor),
+                );
+                properties.insert(
+                    "opacity".to_string(),
+                    property_track_to_session(&vc.layer.opacity),
+                );
+                properties.insert(
+                    "time".to_string(),
+                    property_track_to_session(&vc.time_curve),
+                );
+                let mut objects_3d = Vec::new();
+                if let zc_project::LayerKind::Scene3D { objects, .. } = &vc.layer.kind {
+                    flatten_objects_3d(objects, None, &mut objects_3d);
+                }
+                let effects = vc.layer.effects.iter().map(effect_to_session).collect();
+                let mut clip = SessionClip {
+                    id: vc.id.to_string(),
+                    kind: layer_kind_to_session_kind(&vc.layer.kind),
+                    name: vc.name.clone(),
+                    start: vc.start,
+                    length: vc.length,
+                    time_start,
+                    time_end,
+                    time_animated,
+                    media_length: None,
+                    properties,
+                    objects_3d,
+                    effects,
+                };
+                clip.sync_time_property();
+                clips.push(clip);
+            }
+            video_tracks.push(SessionTrack {
+                id: vt.id.to_string(),
+                kind: TrackKind::Video,
+                name: vt.name.clone(),
+                enabled: vt.enabled,
+                solo: vt.solo,
+                locked: vt.locked,
+                clips,
+            });
+        }
+
+        let mut audio_tracks = Vec::with_capacity(project.sequence.audio_tracks.len());
+        for at in &project.sequence.audio_tracks {
+            let mut clips = Vec::with_capacity(at.clips.len());
+            for ac in &at.clips {
+                let (time_start, time_end, time_animated) =
+                    extract_time_bounds(&ac.time_curve, ac.length, fps);
+                let mut properties = BTreeMap::new();
+                properties.insert(
+                    "volume".to_string(),
+                    property_track_to_session(&ac.audio.volume),
+                );
+                properties.insert("pan".to_string(), property_track_to_session(&ac.audio.pan));
+                properties.insert(
+                    "time".to_string(),
+                    property_track_to_session(&ac.time_curve),
+                );
+                let mut clip = SessionClip {
+                    id: ac.id.to_string(),
+                    kind: "audio".to_string(),
+                    name: ac.name.clone(),
+                    start: ac.start,
+                    length: ac.length,
+                    time_start,
+                    time_end,
+                    time_animated,
+                    media_length: None,
+                    properties,
+                    objects_3d: Vec::new(),
+                    effects: Vec::new(),
+                };
+                clip.sync_time_property();
+                clips.push(clip);
+            }
+            audio_tracks.push(SessionTrack {
+                id: at.id.to_string(),
+                kind: TrackKind::Audio,
+                name: at.name.clone(),
+                enabled: at.enabled,
+                solo: at.solo,
+                locked: false,
+                clips,
+            });
+        }
+
+        Self {
+            project_name: project.name.clone(),
+            resolution: project.sequence.resolution,
+            fps,
+            sequence_length: project.sequence.length_frames,
+            video_tracks,
+            audio_tracks,
+            sequence_properties: BTreeMap::new(),
+        }
     }
 
     fn all_tracks(&self) -> impl Iterator<Item = &SessionTrack> {
@@ -479,7 +847,9 @@ impl SessionDocument {
             .chain(self.audio_tracks.iter_mut())
     }
 
-    fn find_track(&self, track_id: &str) -> Option<&SessionTrack> {
+    /// Finds a video or audio track by ID.
+    #[must_use]
+    pub fn find_track(&self, track_id: &str) -> Option<&SessionTrack> {
         self.all_tracks().find(|t| t.id == track_id)
     }
 
@@ -617,10 +987,18 @@ pub struct SessionSnapshot {
 
 impl ByteSized for SessionSnapshot {
     fn estimated_bytes(&self) -> usize {
-        let project_bytes = serde_json::to_vec(&self.project).map_or(0, |b| b.len());
+        let project_json_bytes = serde_json::to_vec(&self.project).map_or(0, |b| b.len());
+        let asset_blob_bytes: usize = self
+            .project
+            .assets
+            .values()
+            .filter_map(|record| record.bytes.as_ref())
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
         let doc_bytes = serde_json::to_vec(&self.document).map_or(0, |b| b.len());
         let sel_bytes = serde_json::to_vec(&self.selection).map_or(0, |b| b.len());
-        project_bytes
+        project_json_bytes
+            .saturating_add(asset_blob_bytes)
             .saturating_add(doc_bytes)
             .saturating_add(sel_bytes)
     }
@@ -636,6 +1014,9 @@ pub struct Session {
     pub history: UndoStack<SessionSnapshot>,
     pub registry: CommandRegistry,
     document: SessionDocument,
+    /// Shared immutable asset binary blobs deduplicated outside undo snapshots so
+    /// undo history never duplicates multi-megabyte embedded media in memory.
+    asset_blobs: BTreeMap<String, Arc<Vec<u8>>>,
     next_id: u64,
 }
 
@@ -657,23 +1038,21 @@ impl Session {
     pub fn with_history_limits(max_entries: usize, max_bytes: usize) -> Self {
         let project = zc_project::Project::new_cm3_default();
         let plugins = zc_plugin::PluginRegistry::new();
-        let document = SessionDocument::from_project(&project);
-        Self {
-            project,
-            plugins,
-            selection: SelectionState::default(),
-            playback: PlaybackState::default(),
-            history: UndoStack::with_limits(max_entries, max_bytes),
-            registry: CommandRegistry::new_default(),
-            document,
-            next_id: 1,
-        }
+        let mut session = Self::from_project(project, plugins);
+        session.history = UndoStack::with_limits(max_entries, max_bytes);
+        session
     }
 
     /// Builds a session around an existing project and plugin registry.
     #[must_use]
     pub fn from_project(project: zc_project::Project, plugins: zc_plugin::PluginRegistry) -> Self {
         let document = SessionDocument::from_project(&project);
+        let mut asset_blobs = BTreeMap::new();
+        for (key, rec) in &project.assets {
+            if let Some(bytes) = rec.bytes.as_ref() {
+                asset_blobs.insert(key.clone(), Arc::new(bytes.clone()));
+            }
+        }
         Self {
             project,
             plugins,
@@ -682,6 +1061,7 @@ impl Session {
             history: UndoStack::new(),
             registry: CommandRegistry::new_default(),
             document,
+            asset_blobs,
             next_id: 1,
         }
     }
@@ -703,7 +1083,7 @@ impl Session {
         self.history.mark_saved();
     }
 
-    /// Captures a complete undo snapshot of the current session.
+    /// Captures a complete undo snapshot of the current session (including any embedded asset bytes).
     #[must_use]
     pub fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
@@ -713,11 +1093,38 @@ impl Session {
         }
     }
 
+    /// Captures a lightweight undo snapshot for history storage: any embedded asset binary
+    /// buffers are deduplicated into `self.asset_blobs` and stripped from the snapshot clone
+    /// so repeated edits never duplicate megabytes of media in undo memory.
+    fn capture_history_snapshot(&mut self) -> SessionSnapshot {
+        for (key, rec) in &self.project.assets {
+            if let Some(bytes) = rec.bytes.as_ref() {
+                let needs_update = match self.asset_blobs.get(key) {
+                    Some(existing) => existing.as_slice() != bytes.as_slice(),
+                    None => true,
+                };
+                if needs_update {
+                    self.asset_blobs
+                        .insert(key.clone(), Arc::new(bytes.clone()));
+                }
+            }
+        }
+        let mut lightweight_project = self.project.clone();
+        for rec in lightweight_project.assets.values_mut() {
+            rec.bytes = None;
+        }
+        SessionSnapshot {
+            project: lightweight_project,
+            document: self.document.clone(),
+            selection: self.selection.clone(),
+        }
+    }
+
     /// Begins a live edit transaction (e.g. slider scrub or clip drag) that will commit
     /// as one single undo step on [`Self::commit_transaction`] or roll back cleanly on
     /// [`Self::cancel_transaction`].
     pub fn begin_transaction(&mut self, label: impl Into<String>) -> Result<(), SessionError> {
-        let baseline = self.snapshot();
+        let baseline = self.capture_history_snapshot();
         self.history.begin_transaction(label, baseline)?;
         Ok(())
     }
@@ -739,6 +1146,11 @@ impl Session {
     #[must_use]
     pub fn active_plugin_dependencies(&self) -> BTreeSet<String> {
         let mut deps = self.document.collect_plugin_dependencies();
+        for req in &self.project.plugin_requirements {
+            if !req.is_empty() {
+                deps.insert(req.clone());
+            }
+        }
         if let Ok(val) = serde_json::to_value(&self.project) {
             collect_plugin_deps_from_json(&val, &mut deps);
         }
@@ -786,7 +1198,7 @@ impl Session {
             let before = if self.history.is_in_transaction() {
                 None
             } else {
-                Some(self.snapshot())
+                Some(self.capture_history_snapshot())
             };
             let result = self.execute_inner(command)?;
             if let Some(before_snapshot) = before {
@@ -794,7 +1206,7 @@ impl Session {
             } else {
                 self.history.record_transaction_edit();
             }
-            self.try_sync_to_project();
+            self.sync_document_to_project();
             Ok(result)
         } else {
             self.execute_inner(command)
@@ -822,65 +1234,271 @@ impl Session {
         format!("00000000-0000-4000-8000-{id:012x}")
     }
 
-    fn restore_snapshot(&mut self, snapshot: SessionSnapshot) {
+    fn restore_snapshot(&mut self, mut snapshot: SessionSnapshot) {
+        for (key, rec) in &mut snapshot.project.assets {
+            if rec.bytes.is_none()
+                && let Some(blob) = self.asset_blobs.get(key)
+            {
+                rec.bytes = Some((**blob).clone());
+            }
+        }
         self.project = snapshot.project;
         self.document = snapshot.document;
         self.selection = snapshot.selection;
+        self.sync_document_to_project();
         let max_frame = (self.document.sequence_length - 1.0).max(0.0);
         self.playback.current_frame = self.playback.current_frame.clamp(0.0, max_frame);
         self.playback.bump_epoch();
     }
 
-    /// Best-effort synchronization of top-level sequence metadata back into `zc_project::Project`
-    /// using its `Serialize`/`Deserialize` representation.
-    fn try_sync_to_project(&mut self) {
-        let Ok(mut val) = serde_json::to_value(&self.project) else {
-            return;
-        };
+    /// Synchronizes all edits from `self.document` directly into `self.project` in place
+    /// without lossy JSON round-tripping and without disturbing embedded asset binary buffers.
+    fn sync_document_to_project(&mut self) {
+        self.project.name = self.document.project_name.clone();
+        self.project.sequence.resolution = self.document.resolution;
+        self.project.sequence.fps = self.document.fps.round().clamp(1.0, 240.0) as u32;
+        self.project.sequence.length_frames = self.document.sequence_length;
 
-        if let Some(obj) = val.as_object_mut() {
-            if obj.contains_key("name") {
-                obj.insert(
-                    "name".to_string(),
-                    Value::String(self.document.project_name.clone()),
-                );
-            }
-            if obj.contains_key("project_name") {
-                obj.insert(
-                    "project_name".to_string(),
-                    Value::String(self.document.project_name.clone()),
-                );
-            }
-            if let Some(manifest) = obj.get_mut("manifest").and_then(Value::as_object_mut)
-                && manifest.contains_key("project_name")
-            {
-                manifest.insert(
-                    "project_name".to_string(),
-                    Value::String(self.document.project_name.clone()),
-                );
-            }
-            if let Some(seq) = obj.get_mut("sequence").and_then(Value::as_object_mut) {
-                if seq.contains_key("resolution") {
-                    seq.insert("resolution".to_string(), json!(self.document.resolution));
-                }
-                if seq.contains_key("rate") {
-                    seq.insert("rate".to_string(), json!(self.document.fps));
-                } else if seq.contains_key("fps") {
-                    seq.insert("fps".to_string(), json!(self.document.fps));
-                }
-                if seq.contains_key("length") {
-                    seq.insert("length".to_string(), json!(self.document.sequence_length));
-                } else if seq.contains_key("duration_frames") {
-                    seq.insert(
-                        "duration_frames".to_string(),
-                        json!(self.document.sequence_length),
-                    );
-                }
+        let fps_u32 = self.project.sequence.fps.max(1);
+        let resolution = self.document.resolution;
+
+        // Index existing tracks and clips by UUID string so preserved metadata survives sync.
+        let mut existing_vtracks: BTreeMap<String, zc_project::VideoTrack> = self
+            .project
+            .sequence
+            .video_tracks
+            .drain(..)
+            .map(|t| (t.id.to_string(), t))
+            .collect();
+        let mut existing_vclips: BTreeMap<String, zc_project::VideoClip> = BTreeMap::new();
+        for vt in existing_vtracks.values_mut() {
+            for vc in vt.clips.drain(..) {
+                existing_vclips.insert(vc.id.to_string(), vc);
             }
         }
 
-        if let Ok(updated) = serde_json::from_value::<zc_project::Project>(val) {
-            self.project = updated;
+        let mut synced_vtracks = Vec::with_capacity(self.document.video_tracks.len());
+        for strack in &self.document.video_tracks {
+            let mut vt =
+                existing_vtracks
+                    .remove(&strack.id)
+                    .unwrap_or_else(|| zc_project::VideoTrack {
+                        id: parse_uuid_or_new(&strack.id),
+                        name: strack.name.clone(),
+                        enabled: strack.enabled,
+                        solo: strack.solo,
+                        locked: strack.locked,
+                        is_3d: false,
+                        clips: Vec::new(),
+                        preserved: BTreeMap::new(),
+                    });
+            vt.name = strack.name.clone();
+            vt.enabled = strack.enabled;
+            vt.solo = strack.solo;
+            vt.locked = strack.locked;
+            vt.clips = strack
+                .clips
+                .iter()
+                .map(|sclip| {
+                    sync_video_clip_from_session(
+                        sclip,
+                        existing_vclips.remove(&sclip.id),
+                        resolution,
+                        fps_u32,
+                    )
+                })
+                .collect();
+            synced_vtracks.push(vt);
+        }
+        self.project.sequence.video_tracks = synced_vtracks;
+
+        let mut existing_atracks: BTreeMap<String, zc_project::AudioTrack> = self
+            .project
+            .sequence
+            .audio_tracks
+            .drain(..)
+            .map(|t| (t.id.to_string(), t))
+            .collect();
+        let mut existing_aclips: BTreeMap<String, zc_project::AudioClip> = BTreeMap::new();
+        for at in existing_atracks.values_mut() {
+            for ac in at.clips.drain(..) {
+                existing_aclips.insert(ac.id.to_string(), ac);
+            }
+        }
+
+        let mut synced_atracks = Vec::with_capacity(self.document.audio_tracks.len());
+        for strack in &self.document.audio_tracks {
+            let mut at =
+                existing_atracks
+                    .remove(&strack.id)
+                    .unwrap_or_else(|| zc_project::AudioTrack {
+                        id: parse_uuid_or_new(&strack.id),
+                        name: strack.name.clone(),
+                        enabled: strack.enabled,
+                        muted: false,
+                        solo: strack.solo,
+                        clips: Vec::new(),
+                        preserved: BTreeMap::new(),
+                    });
+            at.name = strack.name.clone();
+            at.enabled = strack.enabled;
+            at.solo = strack.solo;
+            at.clips = strack
+                .clips
+                .iter()
+                .map(|sclip| {
+                    sync_audio_clip_from_session(sclip, existing_aclips.remove(&sclip.id), fps_u32)
+                })
+                .collect();
+            synced_atracks.push(at);
+        }
+        self.project.sequence.audio_tracks = synced_atracks;
+
+        for dep in self.document.collect_plugin_dependencies() {
+            self.project.plugin_requirements.insert(dep);
+        }
+    }
+
+    /// Spec 02 §2.5 Step B: enforces strict non-overlap on `track` around `placed_clip_id`.
+    /// Splits straddled left neighbors, right-trims partially overlapped left neighbors,
+    /// removes engulfed neighbors, and left-trims partially overlapped right neighbors
+    /// (updating both keyframes and non-animated media-time endpoints).
+    fn resolve_track_overlaps(&mut self, kind: TrackKind, track_idx: usize, placed_clip_id: &str) {
+        let fps = self.document.fps.max(1.0);
+
+        let (placed_start, placed_end) = {
+            let track = match kind {
+                TrackKind::Video => &self.document.video_tracks[track_idx],
+                TrackKind::Audio => &self.document.audio_tracks[track_idx],
+            };
+            let Some(placed) = track.clips.iter().find(|c| c.id == placed_clip_id) else {
+                return;
+            };
+            (placed.start, placed.start + placed.length)
+        };
+
+        let existing_clips = {
+            let track = match kind {
+                TrackKind::Video => &mut self.document.video_tracks[track_idx],
+                TrackKind::Audio => &mut self.document.audio_tracks[track_idx],
+            };
+            std::mem::take(&mut track.clips)
+        };
+
+        let mut kept: Vec<SessionClip> = Vec::with_capacity(existing_clips.len() + 1);
+        let mut removed_for_selection: Vec<SessionClip> = Vec::new();
+
+        for mut other in existing_clips {
+            if other.id == placed_clip_id {
+                kept.push(other);
+                continue;
+            }
+            let other_start = other.start;
+            let other_end = other.start + other.length;
+
+            // Completely disjoint: no overlap.
+            if other_end <= placed_start || other_start >= placed_end {
+                kept.push(other);
+                continue;
+            }
+
+            // Completely engulfed by placed clip.
+            if other_start >= placed_start && other_end <= placed_end {
+                removed_for_selection.push(other);
+                continue;
+            }
+
+            // Straddle split: other starts strictly before placed_start and ends strictly after placed_end.
+            if other_start < placed_start && other_end > placed_end {
+                let mut right_rem = other.clone();
+                let right_id = self.alloc_uuid_id();
+                right_rem.id = right_id;
+                let cut_right = placed_end - other_start;
+                right_rem.start = placed_end;
+                right_rem.length = other_end - placed_end;
+                right_rem.shift_all_keyframes(-cut_right);
+                if !right_rem.time_animated {
+                    right_rem.time_start = other.eval_time_at(cut_right);
+                    right_rem.sync_time_property();
+                }
+                self.remap_cloned_clip_children(&mut right_rem);
+
+                let new_left_len = placed_start - other_start;
+                if !other.time_animated {
+                    other.time_end = other.eval_time_at(new_left_len);
+                }
+                other.length = new_left_len;
+                other.sync_time_property();
+
+                kept.push(other);
+                kept.push(right_rem);
+                continue;
+            }
+
+            // Left neighbor partially overlapped on its right edge.
+            if other_start < placed_start {
+                let new_len = placed_start - other_start;
+                if new_len < 1e-6 {
+                    removed_for_selection.push(other);
+                } else {
+                    if !other.time_animated {
+                        other.time_end = other.eval_time_at(new_len);
+                    }
+                    other.length = new_len;
+                    other.sync_time_property();
+                    kept.push(other);
+                }
+                continue;
+            }
+
+            // Right neighbor partially overlapped on its left edge (other_start >= placed_start && other_end > placed_end).
+            let cut = placed_end - other_start;
+            let new_len = other_end - placed_end;
+            if new_len < 1e-6 {
+                removed_for_selection.push(other);
+            } else {
+                if !other.time_animated {
+                    let old_rate = if other.length > 0.0 {
+                        (other.time_end - other.time_start) / other.length
+                    } else {
+                        1.0 / fps
+                    };
+                    other.time_start += cut * old_rate;
+                }
+                other.start = placed_end;
+                other.length = new_len;
+                other.shift_all_keyframes(-cut);
+                other.sync_time_property();
+                kept.push(other);
+            }
+        }
+
+        kept.sort_by(|a, b| a.start.total_cmp(&b.start));
+        match kind {
+            TrackKind::Video => self.document.video_tracks[track_idx].clips = kept,
+            TrackKind::Audio => self.document.audio_tracks[track_idx].clips = kept,
+        }
+        for removed in &removed_for_selection {
+            self.prune_clip_selection(removed);
+        }
+    }
+
+    fn remap_cloned_clip_children(&mut self, clip: &mut SessionClip) {
+        let mut obj_remap = BTreeMap::new();
+        for obj in &mut clip.objects_3d {
+            let new_id = self.alloc_uuid_id();
+            obj_remap.insert(obj.id.clone(), new_id.clone());
+            obj.id = new_id;
+        }
+        for obj in &mut clip.objects_3d {
+            if let Some(pid) = obj.parent_id.as_ref()
+                && let Some(mapped) = obj_remap.get(pid)
+            {
+                obj.parent_id = Some(mapped.clone());
+            }
+        }
+        for fx in &mut clip.effects {
+            fx.id = self.alloc_uuid_id();
         }
     }
 
@@ -890,6 +1508,7 @@ impl Session {
             Command::NewProject => {
                 self.project = zc_project::Project::new_cm3_default();
                 self.document = SessionDocument::from_project(&self.project);
+                self.asset_blobs.clear();
                 self.selection.clear_all();
                 self.playback = PlaybackState::default();
                 self.history.clear();
@@ -945,7 +1564,7 @@ impl Session {
                         HistoryError::TransactionAlreadyActive,
                     ));
                 }
-                let current = self.snapshot();
+                let current = self.capture_history_snapshot();
                 match self.history.undo(current) {
                     Some((label, prev)) => {
                         self.restore_snapshot(prev);
@@ -969,7 +1588,7 @@ impl Session {
                         HistoryError::TransactionAlreadyActive,
                     ));
                 }
-                let current = self.snapshot();
+                let current = self.capture_history_snapshot();
                 match self.history.redo(current) {
                     Some((label, next)) => {
                         self.restore_snapshot(next);
@@ -1137,33 +1756,54 @@ impl Session {
                         "clip length must be finite and >= 1".to_string(),
                     ));
                 }
-                if let Some(track) = self.document.find_track(&track_id) {
-                    if track.locked {
+                let (track_kind, track_idx) = if let Some(idx) = self
+                    .document
+                    .video_tracks
+                    .iter()
+                    .position(|t| t.id == track_id)
+                {
+                    if self.document.video_tracks[idx].locked {
                         return Err(SessionError::TrackLocked(track_id));
                     }
+                    (TrackKind::Video, idx)
+                } else if let Some(idx) = self
+                    .document
+                    .audio_tracks
+                    .iter()
+                    .position(|t| t.id == track_id)
+                {
+                    if self.document.audio_tracks[idx].locked {
+                        return Err(SessionError::TrackLocked(track_id));
+                    }
+                    (TrackKind::Audio, idx)
                 } else {
                     return Err(SessionError::NotFound(format!("track '{track_id}'")));
-                }
+                };
 
                 let clip_id = self.alloc_uuid_id();
                 let clip_name = name.unwrap_or_else(|| kind.clone());
-                let clip = SessionClip {
+                let fps = self.document.fps.max(1.0);
+                let mut clip = SessionClip {
                     id: clip_id.clone(),
                     kind: kind.clone(),
                     name: clip_name.clone(),
                     start,
                     length,
+                    time_start: 0.0,
+                    time_end: length / fps,
+                    time_animated: false,
+                    media_length: None,
                     properties: BTreeMap::new(),
                     objects_3d: Vec::new(),
                     effects: Vec::new(),
                 };
+                clip.sync_time_property();
 
-                let track = self
-                    .document
-                    .find_track_mut(&track_id)
-                    .ok_or_else(|| SessionError::NotFound(format!("track '{track_id}'")))?;
-                track.clips.push(clip);
-                track.clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+                match track_kind {
+                    TrackKind::Video => self.document.video_tracks[track_idx].clips.push(clip),
+                    TrackKind::Audio => self.document.audio_tracks[track_idx].clips.push(clip),
+                }
+                self.resolve_track_overlaps(track_kind, track_idx, &clip_id);
                 self.document.recompute_sequence_length_if_extended();
                 self.playback.bump_epoch();
                 Ok(json!({
@@ -1200,14 +1840,30 @@ impl Session {
                 }
 
                 let dest_track_id = target_track_id.unwrap_or_else(|| src_track.id.clone());
-                let dest_track = self
+                let (dest_kind, dest_track_idx) = if let Some(idx) = self
                     .document
-                    .find_track(&dest_track_id)
-                    .ok_or_else(|| SessionError::NotFound(format!("track '{dest_track_id}'")))?;
-                if dest_track.locked {
-                    return Err(SessionError::TrackLocked(dest_track_id));
-                }
-                if dest_track.kind != src_kind {
+                    .video_tracks
+                    .iter()
+                    .position(|t| t.id == dest_track_id)
+                {
+                    if self.document.video_tracks[idx].locked {
+                        return Err(SessionError::TrackLocked(dest_track_id));
+                    }
+                    (TrackKind::Video, idx)
+                } else if let Some(idx) = self
+                    .document
+                    .audio_tracks
+                    .iter()
+                    .position(|t| t.id == dest_track_id)
+                {
+                    if self.document.audio_tracks[idx].locked {
+                        return Err(SessionError::TrackLocked(dest_track_id));
+                    }
+                    (TrackKind::Audio, idx)
+                } else {
+                    return Err(SessionError::NotFound(format!("track '{dest_track_id}'")));
+                };
+                if dest_kind != src_kind {
                     return Err(SessionError::InvalidOperation(
                         "cannot move a clip across video and audio track domains".to_string(),
                     ));
@@ -1223,12 +1879,11 @@ impl Session {
                 };
                 clip.start = start;
 
-                let dest = self
-                    .document
-                    .find_track_mut(&dest_track_id)
-                    .ok_or_else(|| SessionError::NotFound(format!("track '{dest_track_id}'")))?;
-                dest.clips.push(clip);
-                dest.clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+                match dest_kind {
+                    TrackKind::Video => self.document.video_tracks[dest_track_idx].clips.push(clip),
+                    TrackKind::Audio => self.document.audio_tracks[dest_track_idx].clips.push(clip),
+                }
+                self.resolve_track_overlaps(dest_kind, dest_track_idx, &clip_id);
                 self.document.recompute_sequence_length_if_extended();
                 self.playback.bump_epoch();
                 Ok(json!({
@@ -1247,16 +1902,26 @@ impl Session {
                         "delta_frames must be finite".to_string(),
                     ));
                 }
-                let (track, clip_idx) = self
+                let fps = self.document.fps.max(1.0);
+                let (kind, track_idx, clip_idx) = self
                     .document
-                    .find_clip_mut(&clip_id)
+                    .find_clip_location(&clip_id)
                     .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
+                let track = match kind {
+                    TrackKind::Video => &mut self.document.video_tracks[track_idx],
+                    TrackKind::Audio => &mut self.document.audio_tracks[track_idx],
+                };
                 if track.locked {
                     return Err(SessionError::TrackLocked(track.id.clone()));
                 }
                 let clip = &mut track.clips[clip_idx];
-                // Spec 02 §2.6: clamp start >= 0 and minimum clip length == 1 frame.
-                let min_delta = -clip.start;
+                let adjust_time = !rate_stretch && !clip.time_animated;
+                // Spec 02 §2.6: clamp start >= 0, media time_start >= 0 when adjusting time,
+                // and minimum clip length == 1 frame.
+                let mut min_delta = -clip.start;
+                if adjust_time {
+                    min_delta = min_delta.max(-clip.time_start * fps);
+                }
                 let max_delta = (clip.length - 1.0).max(0.0);
                 let applied_delta = delta_frames.clamp(min_delta, max_delta);
                 let old_length = clip.length;
@@ -1265,18 +1930,25 @@ impl Session {
 
                 if rate_stretch && old_length > 0.0 {
                     clip.scale_all_keyframes(clip.length / old_length);
-                } else {
+                    clip.sync_time_property();
+                } else if adjust_time {
                     clip.shift_all_keyframes(-applied_delta);
+                    clip.time_start = (clip.time_start + applied_delta / fps).max(0.0);
+                    clip.sync_time_property();
                 }
 
                 let start = clip.start;
                 let length = clip.length;
-                track.clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+                let time_start = clip.time_start;
+                let time_end = clip.time_end;
+                self.resolve_track_overlaps(kind, track_idx, &clip_id);
                 self.playback.bump_epoch();
                 Ok(json!({
                     "clip_id": clip_id,
                     "start": start,
                     "length": length,
+                    "time_start": time_start,
+                    "time_end": time_end,
                     "rate_stretch": rate_stretch,
                 }))
             }
@@ -1290,29 +1962,50 @@ impl Session {
                         "delta_frames must be finite".to_string(),
                     ));
                 }
-                let (track, clip_idx) = self
+                let fps = self.document.fps.max(1.0);
+                let (kind, track_idx, clip_idx) = self
                     .document
-                    .find_clip_mut(&clip_id)
+                    .find_clip_location(&clip_id)
                     .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
+                let track = match kind {
+                    TrackKind::Video => &mut self.document.video_tracks[track_idx],
+                    TrackKind::Audio => &mut self.document.audio_tracks[track_idx],
+                };
                 if track.locked {
                     return Err(SessionError::TrackLocked(track.id.clone()));
                 }
                 let clip = &mut track.clips[clip_idx];
+                let adjust_time = !rate_stretch && !clip.time_animated;
                 let old_length = clip.length;
-                let new_length = (old_length + delta_frames).max(1.0);
+                let mut clamped_delta = delta_frames;
+                if adjust_time && let Some(media_len) = clip.media_length {
+                    let max_delta = media_len - clip.time_end * fps;
+                    clamped_delta = clamped_delta.min(max_delta);
+                }
+                let new_length = (old_length + clamped_delta).max(1.0);
+                let applied_delta = new_length - old_length;
                 clip.length = new_length;
 
                 if rate_stretch && old_length > 0.0 {
                     clip.scale_all_keyframes(new_length / old_length);
+                    clip.sync_time_property();
+                } else if adjust_time {
+                    clip.time_end = (clip.time_end + applied_delta / fps).max(clip.time_start);
+                    clip.sync_time_property();
                 }
 
                 let start = clip.start;
+                let time_start = clip.time_start;
+                let time_end = clip.time_end;
+                self.resolve_track_overlaps(kind, track_idx, &clip_id);
                 self.document.recompute_sequence_length_if_extended();
                 self.playback.bump_epoch();
                 Ok(json!({
                     "clip_id": clip_id,
                     "start": start,
                     "length": new_length,
+                    "time_start": time_start,
+                    "time_end": time_end,
                     "rate_stretch": rate_stretch,
                 }))
             }
@@ -1345,6 +2038,8 @@ impl Session {
                     )));
                 }
 
+                let t_split = orig.eval_time_at(local_offset);
+                let orig_time_animated = orig.time_animated;
                 let mut right_clip = orig.clone();
                 let orig_start = orig.start;
                 let orig_length = orig.length;
@@ -1352,41 +2047,39 @@ impl Session {
                 right_clip.id = right_clip_id.clone();
                 right_clip.start = orig_start + local_offset;
                 right_clip.length = orig_length - local_offset;
-                // Spec 02 §2.7: shift all dynamic keyframes on right half by -local_offset.
+                // Spec 02 §2.7: shift all dynamic keyframes on right half by -local_offset
+                // and update non-animated media-time endpoints to [t_split, old_time_end].
                 right_clip.shift_all_keyframes(-local_offset);
-                // Reassign distinct IDs to cloned child objects and effects.
-                let mut obj_id_remap = BTreeMap::new();
-                for obj in &mut right_clip.objects_3d {
-                    let new_id = self.alloc_uuid_id();
-                    obj_id_remap.insert(obj.id.clone(), new_id.clone());
-                    obj.id = new_id;
+                if !orig_time_animated {
+                    right_clip.time_start = t_split;
+                    right_clip.sync_time_property();
                 }
-                for obj in &mut right_clip.objects_3d {
-                    if let Some(pid) = obj.parent_id.as_ref()
-                        && let Some(mapped) = obj_id_remap.get(pid)
-                    {
-                        obj.parent_id = Some(mapped.clone());
-                    }
-                }
-                for fx in &mut right_clip.effects {
-                    fx.id = self.alloc_uuid_id();
-                }
+                self.remap_cloned_clip_children(&mut right_clip);
 
                 let track_mut = match kind {
                     TrackKind::Video => &mut self.document.video_tracks[track_idx],
                     TrackKind::Audio => &mut self.document.audio_tracks[track_idx],
                 };
                 track_mut.clips[clip_idx].length = local_offset;
+                if !orig_time_animated {
+                    track_mut.clips[clip_idx].time_end = t_split;
+                    track_mut.clips[clip_idx].sync_time_property();
+                }
                 let right_start = right_clip.start;
                 let right_length = right_clip.length;
+                let right_time_start = right_clip.time_start;
+                let right_time_end = right_clip.time_end;
                 track_mut.clips.insert(clip_idx + 1, right_clip);
                 self.playback.bump_epoch();
                 Ok(json!({
                     "left_clip_id": clip_id,
                     "left_length": local_offset,
+                    "left_time_end": t_split,
                     "right_clip_id": right_clip_id,
                     "right_start": right_start,
                     "right_length": right_length,
+                    "right_time_start": right_time_start,
+                    "right_time_end": right_time_end,
                 }))
             }
             Command::DuplicateClip { clip_id } => {
@@ -1406,30 +2099,14 @@ impl Session {
                 let new_clip_id = self.alloc_uuid_id();
                 cloned.id = new_clip_id.clone();
                 cloned.start += cloned.length;
-                let mut obj_remap = BTreeMap::new();
-                for obj in &mut cloned.objects_3d {
-                    let new_id = self.alloc_uuid_id();
-                    obj_remap.insert(obj.id.clone(), new_id.clone());
-                    obj.id = new_id;
-                }
-                for obj in &mut cloned.objects_3d {
-                    if let Some(pid) = obj.parent_id.as_ref()
-                        && let Some(mapped) = obj_remap.get(pid)
-                    {
-                        obj.parent_id = Some(mapped.clone());
-                    }
-                }
-                for fx in &mut cloned.effects {
-                    fx.id = self.alloc_uuid_id();
-                }
+                self.remap_cloned_clip_children(&mut cloned);
 
                 let new_start = cloned.start;
-                let track_mut = match kind {
-                    TrackKind::Video => &mut self.document.video_tracks[track_idx],
-                    TrackKind::Audio => &mut self.document.audio_tracks[track_idx],
-                };
-                track_mut.clips.push(cloned);
-                track_mut.clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+                match kind {
+                    TrackKind::Video => self.document.video_tracks[track_idx].clips.push(cloned),
+                    TrackKind::Audio => self.document.audio_tracks[track_idx].clips.push(cloned),
+                }
+                self.resolve_track_overlaps(kind, track_idx, &new_clip_id);
                 self.document.recompute_sequence_length_if_extended();
                 self.playback.bump_epoch();
                 Ok(json!({
@@ -2051,6 +2728,305 @@ impl ControlTarget for Session {
     }
 }
 
+fn build_object_3d_from_session(
+    sobj: &SessionObject3D,
+    existing: Option<zc_project::Object3D>,
+    children: Vec<zc_project::Object3D>,
+) -> zc_project::Object3D {
+    let mut obj = existing.unwrap_or_else(|| {
+        let kind = match sobj.kind.as_str() {
+            "group" => zc_project::Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: Vec::new(),
+            },
+            "text_3d" => zc_project::Object3DKind::Text3D(Box::default()),
+            "light" => zc_project::Object3DKind::Light(Box::new(zc_project::LightData::spot())),
+            "camera" => zc_project::Object3DKind::Camera(Box::default()),
+            "particles" => zc_project::Object3DKind::Particles(Box::default()),
+            "model" => zc_project::Object3DKind::Model(Box::default()),
+            "shape.sphere" => zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Sphere {
+                radius: 5.0,
+                width_segments: 16,
+                height_segments: 16,
+            }),
+            "shape.cylinder" => {
+                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Cylinder {
+                    top_radius: 5.0,
+                    bottom_radius: 5.0,
+                    height: 10.0,
+                    detail: 16,
+                    open_ended: false,
+                })
+            }
+            "shape.rectangle" => {
+                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Rectangle {
+                    size: [10.0, 10.0],
+                })
+            }
+            "shape.circle" => zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Circle {
+                radius: 5.0,
+                detail: 24,
+            }),
+            "shape.donut" => zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Donut {
+                radius: 5.0,
+                tube: 2.0,
+                radial_segments: 12,
+                tubular_segments: 24,
+            }),
+            _ => zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Box {
+                size: [10.0, 10.0, 10.0],
+            }),
+        };
+        let mut created = zc_project::Object3D::new(&sobj.name, kind);
+        created.id = parse_uuid_or_new(&sobj.id);
+        created
+    });
+    obj.name = sobj.name.clone();
+    if let Some(p) = sobj.properties.get("enabled") {
+        obj.enabled = session_property_to_track(p, Some(&obj.enabled));
+    }
+    if let Some(p) = sobj.properties.get("position") {
+        obj.position = session_property_to_track(p, Some(&obj.position));
+    }
+    if let Some(p) = sobj.properties.get("rotation") {
+        obj.rotation = session_property_to_track(p, Some(&obj.rotation));
+    }
+    if let Some(p) = sobj.properties.get("scale") {
+        obj.scale = session_property_to_track(p, Some(&obj.scale));
+    }
+    if let zc_project::Object3DKind::Group {
+        children: ref mut slot,
+        ..
+    } = obj.kind
+    {
+        *slot = children;
+    }
+    obj
+}
+
+fn collect_existing_objects(
+    objects: Vec<zc_project::Object3D>,
+    out: &mut BTreeMap<String, zc_project::Object3D>,
+) {
+    for mut obj in objects {
+        if let zc_project::Object3DKind::Group {
+            children: ref mut c,
+            ..
+        } = obj.kind
+        {
+            let nested = std::mem::take(c);
+            collect_existing_objects(nested, out);
+        }
+        out.insert(obj.id.to_string(), obj);
+    }
+}
+
+fn rebuild_object_tree(
+    flat: &[SessionObject3D],
+    parent_id: Option<&str>,
+    existing: &mut BTreeMap<String, zc_project::Object3D>,
+    depth: usize,
+) -> Vec<zc_project::Object3D> {
+    if depth > 64 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for sobj in flat {
+        if sobj.parent_id.as_deref() == parent_id {
+            let children = rebuild_object_tree(flat, Some(&sobj.id), existing, depth + 1);
+            let prev = existing.remove(&sobj.id);
+            out.push(build_object_3d_from_session(sobj, prev, children));
+        }
+    }
+    out
+}
+
+fn sync_effect_from_session(
+    sfx: &SessionEffect,
+    existing: Option<zc_project::EffectInstance>,
+) -> zc_project::EffectInstance {
+    let mut fx = existing.unwrap_or_else(|| {
+        let mut created = zc_project::create_effect_by_id(&sfx.kind).unwrap_or_else(|| {
+            let (plugin_id, effect_id) = sfx
+                .kind
+                .strip_prefix("zoidium:")
+                .and_then(|rest| rest.split_once('/'))
+                .map_or_else(
+                    || ("custom".to_string(), sfx.kind.clone()),
+                    |(p, e)| (p.to_string(), e.to_string()),
+                );
+            zc_project::EffectInstance {
+                id: parse_uuid_or_new(&sfx.id),
+                name: sfx.name.clone(),
+                kind: zc_project::EffectKind::Plugin {
+                    plugin_id,
+                    effect_id,
+                },
+                enabled: zc_project::PropertyTrack::option(1),
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            }
+        });
+        created.id = parse_uuid_or_new(&sfx.id);
+        created
+    });
+    fx.name = sfx.name.clone();
+    for (k, prop) in &sfx.properties {
+        if k == "enabled" {
+            fx.enabled = session_property_to_track(prop, Some(&fx.enabled));
+        } else {
+            let prev = fx.params.get(k);
+            let track = session_property_to_track(prop, prev);
+            fx.params.insert(k.clone(), track);
+        }
+    }
+    fx
+}
+
+fn sync_video_clip_from_session(
+    sclip: &SessionClip,
+    existing: Option<zc_project::VideoClip>,
+    resolution: [u32; 2],
+    fps: u32,
+) -> zc_project::VideoClip {
+    let mut vc = existing.unwrap_or_else(|| {
+        let layer_kind = match sclip.kind.as_str() {
+            "video" => zc_project::LayerKind::Video { media: None },
+            "adjustment" => zc_project::LayerKind::Adjustment,
+            "composite" => zc_project::LayerKind::Composite { layers: Vec::new() },
+            "image" => zc_project::LayerKind::Image { image: None },
+            "generator" => zc_project::LayerKind::Generator,
+            "shape" => zc_project::LayerKind::Shape2D { shapes: Vec::new() },
+            "text_2d" => zc_project::LayerKind::Text2D {
+                text: "text".to_owned(),
+                font: None,
+                size: 64,
+                shapes: Vec::new(),
+            },
+            "preset_shape" => zc_project::LayerKind::PresetShape2D {
+                preset: zc_project::PresetShapeKind::Rectangle,
+                shapes: Vec::new(),
+            },
+            "scene" => zc_project::LayerKind::Scene3D {
+                objects: Vec::new(),
+                shadow_mode: zc_project::CompatMode::Current,
+            },
+            other => zc_project::LayerKind::Plugin {
+                plugin_type: other.to_owned(),
+                payload: Value::Object(serde_json::Map::new()),
+            },
+        };
+        zc_project::VideoClip {
+            id: parse_uuid_or_new(&sclip.id),
+            name: sclip.name.clone(),
+            start: sclip.start,
+            length: sclip.length,
+            link: None,
+            media: None,
+            time_curve: zc_project::PropertyTrack::linear_time_curve(sclip.length, fps),
+            layer: zc_project::Layer::new(&sclip.name, layer_kind, resolution),
+            preserved: BTreeMap::new(),
+        }
+    });
+
+    vc.name = sclip.name.clone();
+    vc.start = sclip.start;
+    vc.length = sclip.length;
+    vc.layer.name = sclip.name.clone();
+    vc.layer.resolution = resolution;
+
+    if let Some(prop) = sclip.properties.get("time") {
+        vc.time_curve = session_property_to_track(prop, Some(&vc.time_curve));
+    } else if !sclip.time_animated {
+        vc.time_curve = zc_project::PropertyTrack {
+            animated: false,
+            expression: None,
+            static_behavior: zc_project::StaticBehavior::Linear,
+            value: zc_project::PropertyValue::Number(sclip.time_start),
+            keyframes: vec![
+                zc_project::PropertyKeyframe::linear(
+                    0.0,
+                    zc_project::PropertyValue::Number(sclip.time_start),
+                ),
+                zc_project::PropertyKeyframe::linear(
+                    sclip.length,
+                    zc_project::PropertyValue::Number(sclip.time_end),
+                ),
+            ],
+            channels: Vec::new(),
+        };
+    }
+
+    if let Some(p) = sclip.properties.get("position") {
+        vc.layer.position = session_property_to_track(p, Some(&vc.layer.position));
+    }
+    if let Some(p) = sclip.properties.get("scale") {
+        vc.layer.scale = session_property_to_track(p, Some(&vc.layer.scale));
+    }
+    if let Some(p) = sclip.properties.get("rotation") {
+        vc.layer.rotation = session_property_to_track(p, Some(&vc.layer.rotation));
+    }
+    if let Some(p) = sclip.properties.get("anchor") {
+        vc.layer.anchor = session_property_to_track(p, Some(&vc.layer.anchor));
+    }
+    if let Some(p) = sclip.properties.get("opacity") {
+        vc.layer.opacity = session_property_to_track(p, Some(&vc.layer.opacity));
+    }
+
+    if let zc_project::LayerKind::Scene3D { objects, .. } = &mut vc.layer.kind {
+        let mut existing_objs = BTreeMap::new();
+        collect_existing_objects(std::mem::take(objects), &mut existing_objs);
+        *objects = rebuild_object_tree(&sclip.objects_3d, None, &mut existing_objs, 0);
+    }
+
+    let mut existing_fx: BTreeMap<String, zc_project::EffectInstance> = vc
+        .layer
+        .effects
+        .drain(..)
+        .map(|fx| (fx.id.to_string(), fx))
+        .collect();
+    vc.layer.effects = sclip
+        .effects
+        .iter()
+        .map(|sfx| sync_effect_from_session(sfx, existing_fx.remove(&sfx.id)))
+        .collect();
+
+    vc
+}
+
+fn sync_audio_clip_from_session(
+    sclip: &SessionClip,
+    existing: Option<zc_project::AudioClip>,
+    fps: u32,
+) -> zc_project::AudioClip {
+    let mut ac = existing.unwrap_or_else(|| zc_project::AudioClip {
+        id: parse_uuid_or_new(&sclip.id),
+        name: sclip.name.clone(),
+        start: sclip.start,
+        length: sclip.length,
+        link: None,
+        media: None,
+        time_curve: zc_project::PropertyTrack::linear_time_curve(sclip.length, fps),
+        audio: zc_project::AudioClipData::default(),
+        preserved: BTreeMap::new(),
+    });
+    ac.name = sclip.name.clone();
+    ac.start = sclip.start;
+    ac.length = sclip.length;
+    ac.audio.name = sclip.name.clone();
+    if let Some(prop) = sclip.properties.get("time") {
+        ac.time_curve = session_property_to_track(prop, Some(&ac.time_curve));
+    }
+    if let Some(p) = sclip.properties.get("volume") {
+        ac.audio.volume = session_property_to_track(p, Some(&ac.audio.volume));
+    }
+    if let Some(p) = sclip.properties.get("pan") {
+        ac.audio.pan = session_property_to_track(p, Some(&ac.audio.pan));
+    }
+    ac
+}
+
 fn collect_plugin_deps_from_json(value: &Value, deps: &mut BTreeSet<String>) {
     match value {
         Value::String(s) => {
@@ -2067,14 +3043,16 @@ fn collect_plugin_deps_from_json(value: &Value, deps: &mut BTreeSet<String>) {
             }
         }
         Value::Object(map) => {
-            if let Some(req) = map.get("required_plugins").and_then(Value::as_array) {
-                for item in req {
-                    if let Some(id) = item
-                        .as_str()
-                        .or_else(|| item.get("id").and_then(Value::as_str))
-                        && !id.is_empty()
-                    {
-                        deps.insert(id.to_string());
+            for field in ["required_plugins", "plugin_requirements"] {
+                if let Some(req) = map.get(field).and_then(Value::as_array) {
+                    for item in req {
+                        if let Some(id) = item
+                            .as_str()
+                            .or_else(|| item.get("id").and_then(Value::as_str))
+                            && !id.is_empty()
+                        {
+                            deps.insert(id.to_string());
+                        }
                     }
                 }
             }
@@ -2410,14 +3388,199 @@ mod tests {
             .get("right_clip_id")
             .and_then(Value::as_str)
             .expect("right id");
-        let right_clip = session.document().video_tracks[0]
+        let track = session
+            .document()
+            .video_tracks
+            .iter()
+            .find(|t| t.clips.iter().any(|c| c.id == right_id))
+            .expect("track containing right clip");
+        let left_clip = track
+            .clips
+            .iter()
+            .find(|c| c.id == clip_id)
+            .expect("left clip exists");
+        let right_clip = track
             .clips
             .iter()
             .find(|c| c.id == right_id)
             .expect("right clip exists");
+        assert!((left_clip.length - 40.0).abs() < 1e-9);
+        assert!((left_clip.time_end - (40.0 / 30.0)).abs() < 1e-9);
         assert!((right_clip.start - 50.0).abs() < 1e-9);
         assert!((right_clip.length - 60.0).abs() < 1e-9);
+        assert!((right_clip.time_start - (40.0 / 30.0)).abs() < 1e-9);
+        assert!((right_clip.time_end - (100.0 / 30.0)).abs() < 1e-9);
         let shifted_frame = right_clip.properties["opacity"].keyframes[0].frame;
         assert!((shifted_frame - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_edits_persist_to_project_and_preserve_embedded_assets_and_undo_budget() {
+        let mut project = zc_project::Project::new_cm3_default();
+        let asset_bytes = vec![0xABu8; 1024 * 1024]; // 1 MiB embedded media
+        let asset_key = project.insert_binary_asset(
+            zc_project::AssetKind::Image,
+            "hero.png",
+            asset_bytes.clone(),
+        );
+        project
+            .plugin_requirements
+            .insert("expressions-plus".to_string());
+
+        let mut session = Session::from_project(project, zc_plugin::PluginRegistry::new());
+        // Default project has 1 video track with 1 Scene clip and length 300.
+        assert_eq!(session.document().video_tracks.len(), 1);
+        assert_eq!(session.document().video_tracks[0].clips.len(), 1);
+        assert!((session.document().sequence_length - 300.0).abs() < 1e-9);
+
+        // Plugin lock must honor project.plugin_requirements ("expressions-plus").
+        assert!(
+            session
+                .active_plugin_dependencies()
+                .contains("expressions-plus")
+        );
+        let disable_err = session.execute(Command::DisablePlugin {
+            plugin_id: "expressions-plus".to_string(),
+        });
+        assert!(disable_err.is_err(), "in-use plugin cannot be disabled");
+
+        // Perform edits and verify they write back to session.project without dropping asset bytes.
+        session
+            .execute(Command::SetProjectName {
+                name: "Persisted Edit".to_string(),
+            })
+            .expect("rename");
+        session
+            .execute(Command::SetFps { fps: 60.0 })
+            .expect("set fps");
+        assert_eq!(session.project.name, "Persisted Edit");
+        assert_eq!(session.project.sequence.fps, 60);
+        assert_eq!(
+            session.project.assets[&asset_key].bytes.as_deref(),
+            Some(asset_bytes.as_slice())
+        );
+
+        // History snapshots deduplicate asset blobs instead of cloning 1 MiB per edit,
+        // while a direct snapshot carrying raw bytes accurately reports >= 1 MiB.
+        assert!(session.history.total_bytes() < 256 * 1024);
+        assert!(session.snapshot().estimated_bytes() >= asset_bytes.len());
+
+        // Round-trip save/load preserves edits AND embedded asset bytes AND undo restores cleanly.
+        let archive = zc_project::save_zcraft_to_bytes(&session.project).expect("save zcraft");
+        let reloaded = zc_project::load_zcraft_from_bytes(&archive).expect("load zcraft");
+        assert_eq!(reloaded.name, "Persisted Edit");
+        assert_eq!(reloaded.sequence.fps, 60);
+        assert_eq!(
+            reloaded.assets[&asset_key].bytes.as_deref(),
+            Some(asset_bytes.as_slice())
+        );
+
+        // Undo restores FPS and rehydrates embedded asset bytes cleanly.
+        session.execute(Command::Undo).expect("undo fps");
+        assert_eq!(session.project.sequence.fps, 30);
+        assert_eq!(
+            session.project.assets[&asset_key].bytes.as_deref(),
+            Some(asset_bytes.as_slice())
+        );
+    }
+
+    #[test]
+    fn timeline_enforces_non_overlap_and_updates_media_time_endpoints() {
+        let mut session = Session::new();
+        let track_id = session
+            .execute(Command::AddVideoTrack {
+                name: Some("V2".to_string()),
+            })
+            .expect("add track")
+            .get("track_id")
+            .and_then(Value::as_str)
+            .expect("id")
+            .to_string();
+
+        // Place clip A at [0, 10) and clip B at [5, 15) -> A is right-trimmed to [0, 5), no overlap.
+        let clip_a = session
+            .execute(Command::AddClip {
+                track_id: track_id.clone(),
+                kind: "video".to_string(),
+                name: Some("A".to_string()),
+                start: 0.0,
+                length: 10.0,
+            })
+            .expect("add A")
+            .get("clip_id")
+            .and_then(Value::as_str)
+            .expect("id")
+            .to_string();
+        let clip_b = session
+            .execute(Command::AddClip {
+                track_id: track_id.clone(),
+                kind: "video".to_string(),
+                name: Some("B".to_string()),
+                start: 5.0,
+                length: 10.0,
+            })
+            .expect("add B")
+            .get("clip_id")
+            .and_then(Value::as_str)
+            .expect("id")
+            .to_string();
+
+        let track = session
+            .document()
+            .video_tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .expect("track");
+        assert_eq!(track.clips.len(), 2);
+        assert!((track.clips[0].start - 0.0).abs() < 1e-9);
+        assert!((track.clips[0].length - 5.0).abs() < 1e-9);
+        assert!((track.clips[0].time_end - (5.0 / 30.0)).abs() < 1e-9);
+        assert!((track.clips[1].start - 5.0).abs() < 1e-9);
+        assert!((track.clips[1].length - 10.0).abs() < 1e-9);
+        assert!(track.clips[0].start + track.clips[0].length <= track.clips[1].start + 1e-9);
+
+        // Trim B left by +3 frames -> start=8, length=7, time_start advances by 3/30s.
+        session
+            .execute(Command::TrimClipLeft {
+                clip_id: clip_b.clone(),
+                delta_frames: 3.0,
+                rate_stretch: false,
+            })
+            .expect("trim left");
+        let b_after_left = session
+            .document()
+            .video_tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .unwrap()
+            .clips
+            .iter()
+            .find(|c| c.id == clip_b)
+            .unwrap();
+        assert!((b_after_left.start - 8.0).abs() < 1e-9);
+        assert!((b_after_left.length - 7.0).abs() < 1e-9);
+        assert!((b_after_left.time_start - (3.0 / 30.0)).abs() < 1e-9);
+        assert!((b_after_left.time_end - (10.0 / 30.0)).abs() < 1e-9);
+
+        // Trim A right by +5 frames into [0, 10) -> overwrites B's left edge cleanly with zero overlap.
+        session
+            .execute(Command::TrimClipRight {
+                clip_id: clip_a,
+                delta_frames: 5.0,
+                rate_stretch: false,
+            })
+            .expect("trim right");
+        let clips = &session
+            .document()
+            .video_tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .unwrap()
+            .clips;
+        assert_eq!(clips.len(), 2);
+        assert!((clips[0].length - 10.0).abs() < 1e-9);
+        assert!((clips[1].start - 10.0).abs() < 1e-9);
+        assert!((clips[1].length - 5.0).abs() < 1e-9);
+        assert!(clips[0].start + clips[0].length <= clips[1].start + 1e-9);
     }
 }

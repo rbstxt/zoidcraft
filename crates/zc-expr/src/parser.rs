@@ -10,7 +10,7 @@ use crate::ast::{
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::{ExprError, ExprMode};
 
-const MAX_PARSE_DEPTH: usize = 256;
+const MAX_PARSE_DEPTH: usize = 128;
 
 /// Parses and validates an expression source string in the requested [`ExprMode`].
 pub fn parse_source(source: &str, mode: ExprMode) -> Result<Program, ExprError> {
@@ -769,86 +769,171 @@ impl Parser {
 
     fn parse_nullish_expr(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_logical_or()?;
+        let mut chain = 0usize;
         while self.check(&TokenKind::Nullish) {
             self.require_expressions_plus("nullish coalescing '??'")?;
             self.bump();
-            let right = self.parse_logical_or()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_logical_or() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Logical {
                 op: LogicalOp::Nullish,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
+        for _ in 0..chain {
+            self.leave_depth();
+        }
         Ok(left)
     }
 
     fn parse_logical_or(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_logical_and()?;
+        let mut chain = 0usize;
         while self.eat(&TokenKind::PipePipe) {
-            let right = self.parse_logical_and()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_logical_and() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Logical {
                 op: LogicalOp::Or,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
+        for _ in 0..chain {
+            self.leave_depth();
+        }
         Ok(left)
     }
 
     fn parse_logical_and(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_bit_or()?;
+        let mut chain = 0usize;
         while self.eat(&TokenKind::AmpAmp) {
-            let right = self.parse_bit_or()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_bit_or() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Logical {
                 op: LogicalOp::And,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
+        for _ in 0..chain {
+            self.leave_depth();
+        }
         Ok(left)
     }
 
     fn parse_bit_or(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_bit_xor()?;
+        let mut chain = 0usize;
         while self.eat(&TokenKind::Pipe) {
-            let right = self.parse_bit_xor()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_bit_xor() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Binary {
                 op: BinaryOp::BitOr,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
+        for _ in 0..chain {
+            self.leave_depth();
+        }
         Ok(left)
     }
 
     fn parse_bit_xor(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_bit_and()?;
+        let mut chain = 0usize;
         while self.eat(&TokenKind::Caret) {
-            let right = self.parse_bit_and()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_bit_and() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Binary {
                 op: BinaryOp::BitXor,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
+        for _ in 0..chain {
+            self.leave_depth();
+        }
         Ok(left)
     }
 
     fn parse_bit_and(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_equality()?;
+        let mut chain = 0usize;
         while self.eat(&TokenKind::Amp) {
-            let right = self.parse_equality()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_equality() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Binary {
                 op: BinaryOp::BitAnd,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
+        for _ in 0..chain {
+            self.leave_depth();
+        }
         Ok(left)
     }
 
     fn parse_equality(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_relational()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek_kind() {
                 TokenKind::EqEq => BinaryOp::Eq,
@@ -858,18 +943,32 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let right = self.parse_relational()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_relational() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
+        for _ in 0..chain {
+            self.leave_depth();
+        }
         Ok(left)
     }
 
     fn parse_relational(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_shift()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek_kind() {
                 TokenKind::Lt => BinaryOp::Lt,
@@ -879,18 +978,32 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let right = self.parse_shift()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_shift() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
+        for _ in 0..chain {
+            self.leave_depth();
+        }
         Ok(left)
     }
 
     fn parse_shift(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_additive()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek_kind() {
                 TokenKind::LtLt => BinaryOp::Shl,
@@ -899,18 +1012,32 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let right = self.parse_additive()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_additive() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
+        for _ in 0..chain {
+            self.leave_depth();
+        }
         Ok(left)
     }
 
     fn parse_additive(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_multiplicative()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek_kind() {
                 TokenKind::Plus => BinaryOp::Add,
@@ -918,18 +1045,32 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let right = self.parse_multiplicative()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_multiplicative() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
+        for _ in 0..chain {
+            self.leave_depth();
+        }
         Ok(left)
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr, ExprError> {
         let mut left = self.parse_exponentiation()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek_kind() {
                 TokenKind::Star => BinaryOp::Mul,
@@ -938,32 +1079,51 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let right = self.parse_exponentiation()?;
+            self.enter_depth()?;
+            chain += 1;
+            let right = match self.parse_exponentiation() {
+                Ok(r) => r,
+                Err(e) => {
+                    for _ in 0..chain {
+                        self.leave_depth();
+                    }
+                    return Err(e);
+                }
+            };
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
             };
         }
-        Ok(left)
-    }
-
-    fn parse_exponentiation(&mut self) -> Result<Expr, ExprError> {
-        let left = self.parse_unary()?;
-        if self.eat(&TokenKind::StarStar) {
-            // Right-associative: `2 ** 3 ** 2 == 2 ** (3 ** 2)`.
-            let right = self.parse_exponentiation()?;
-            return Ok(Expr::Binary {
-                op: BinaryOp::Pow,
-                left: Box::new(left),
-                right: Box::new(right),
-            });
+        for _ in 0..chain {
+            self.leave_depth();
         }
         Ok(left)
     }
 
+    fn parse_exponentiation(&mut self) -> Result<Expr, ExprError> {
+        self.enter_depth()?;
+        let res = (|| {
+            let left = self.parse_unary()?;
+            if self.eat(&TokenKind::StarStar) {
+                // Right-associative: `2 ** 3 ** 2 == 2 ** (3 ** 2)`.
+                let right = self.parse_exponentiation()?;
+                return Ok(Expr::Binary {
+                    op: BinaryOp::Pow,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                });
+            }
+            Ok(left)
+        })();
+        self.leave_depth();
+        res
+    }
+
     fn parse_unary(&mut self) -> Result<Expr, ExprError> {
-        match self.peek_kind() {
+        self.enter_depth()?;
+        let res = match self.peek_kind() {
             TokenKind::Bang => {
                 self.bump();
                 Ok(Expr::Unary {
@@ -1038,7 +1198,9 @@ impl Parser {
                 Err(ExprError::Forbidden("new".to_string()))
             }
             _ => self.parse_postfix(),
-        }
+        };
+        self.leave_depth();
+        res
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, ExprError> {
@@ -1068,6 +1230,7 @@ impl Parser {
     fn parse_call_and_member(&mut self) -> Result<Expr, ExprError> {
         let mut expr = self.parse_primary()?;
         let mut chain_ops: Option<Vec<ChainOp>> = None;
+        let mut member_chain = 0usize;
 
         loop {
             match self.peek_kind() {
@@ -1105,6 +1268,8 @@ impl Parser {
                             optional: false,
                         });
                     } else {
+                        self.enter_depth()?;
+                        member_chain += 1;
                         expr = Expr::Member {
                             object: Box::new(expr),
                             prop,
@@ -1121,6 +1286,8 @@ impl Parser {
                             optional: false,
                         });
                     } else {
+                        self.enter_depth()?;
+                        member_chain += 1;
                         expr = Expr::Index {
                             object: Box::new(expr),
                             index: Box::new(index),
@@ -1135,6 +1302,8 @@ impl Parser {
                             optional: false,
                         });
                     } else {
+                        self.enter_depth()?;
+                        member_chain += 1;
                         expr = Expr::Call {
                             callee: Box::new(expr),
                             args,
@@ -1143,6 +1312,10 @@ impl Parser {
                 }
                 _ => break,
             }
+        }
+
+        for _ in 0..member_chain {
+            self.leave_depth();
         }
 
         if let Some(ops) = chain_ops {

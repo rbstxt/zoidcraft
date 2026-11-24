@@ -1436,4 +1436,35 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn hostile_deep_nesting_and_cyclic_arrays_do_not_overflow_host_stack() {
+        // Deep unary recursion (`!!!!...1`) must hit RecursionLimitExceeded cleanly.
+        let deep_unary = format!("{}1", "!".repeat(400));
+        assert!(matches!(
+            compile(&deep_unary, ExprMode::ExpressionsPlus),
+            Err(ExprError::RecursionLimitExceeded { .. })
+        ));
+
+        // Deep right-associative exponentiation (`2 ** 2 ** ...`) must hit RecursionLimitExceeded.
+        let deep_pow = vec!["2"; 400].join(" ** ");
+        assert!(matches!(
+            compile(&deep_pow, ExprMode::ExpressionsPlus),
+            Err(ExprError::RecursionLimitExceeded { .. })
+        ));
+
+        // Deep left-skewed binary chain (`1 + 1 + ...`) must hit RecursionLimitExceeded.
+        let deep_add = vec!["1"; 400].join(" + ");
+        assert!(matches!(
+            compile(&deep_add, ExprMode::ExpressionsPlus),
+            Err(ExprError::RecursionLimitExceeded { .. })
+        ));
+
+        // Self-referential array stringification and join must terminate cleanly (ECMAScript yields "").
+        let cyclic_str = eval_plus("let a = [1]; a.push(a); String(a)");
+        assert_eq!(cyclic_str, Value::String("1,".to_string()));
+
+        let cyclic_join = eval_plus("let a = [2]; a[1] = a; a.join('-')");
+        assert_eq!(cyclic_join, Value::String("2-".to_string()));
+    }
 }

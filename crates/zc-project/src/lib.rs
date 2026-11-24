@@ -33,10 +33,11 @@ pub use model::{
 };
 pub use pz_import::{PzImportResult, import_pz, import_pz_from_bytes};
 pub use sha256::{cm3_asset_key, sha256_bytes, sha256_hex};
+pub use uuid::Uuid;
 pub use zcraft::{
     IntegrityEntry, MAX_ARCHIVE_ENTRIES, MAX_JSON_ENTRY_BYTES, MAX_JSON_NESTING_DEPTH,
-    MAX_UNCOMPRESSED_ARCHIVE_BYTES, ZcraftMeta, load_zcraft, load_zcraft_from_bytes, save_zcraft,
-    save_zcraft_to_bytes,
+    MAX_UNCOMPRESSED_ARCHIVE_BYTES, ManifestPluginRequirement, ZcraftMeta, load_zcraft,
+    load_zcraft_from_bytes, save_zcraft, save_zcraft_to_bytes,
 };
 
 /// Errors produced by project serialization, atomic I/O, archive validation, and `.pz` import.

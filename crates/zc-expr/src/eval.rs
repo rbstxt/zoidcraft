@@ -132,6 +132,7 @@ struct Evaluator<'a> {
     objects: Vec<BTreeMap<String, RuntimeValue>>,
     closures: Vec<Closure>,
     rng: Option<DetRng>,
+    stringifying_arrays: Vec<usize>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -146,6 +147,7 @@ impl<'a> Evaluator<'a> {
             objects: Vec::new(),
             closures: Vec::new(),
             rng: None,
+            stringifying_arrays: Vec::new(),
         }
     }
 
@@ -369,6 +371,7 @@ impl<'a> Evaluator<'a> {
     }
 
     fn runtime_to_js_string(&mut self, rv: &RuntimeValue) -> Result<String, ExprError> {
+        self.tick()?;
         let rv = self.deref_property_handle(rv.clone())?;
         Ok(match rv {
             RuntimeValue::Empty | RuntimeValue::Undefined => "undefined".to_string(),
@@ -376,22 +379,39 @@ impl<'a> Evaluator<'a> {
             RuntimeValue::Bool(b) => b.to_string(),
             RuntimeValue::Number(n) => format_js_number(n),
             RuntimeValue::String(s) => s,
-            RuntimeValue::Array(id) => {
-                let items = self.arrays[id].clone();
-                let mut parts = Vec::with_capacity(items.len());
-                for item in &items {
-                    match item {
-                        RuntimeValue::Null | RuntimeValue::Undefined => parts.push(String::new()),
-                        other => parts.push(self.runtime_to_js_string(other)?),
-                    }
-                }
-                parts.join(",")
-            }
+            RuntimeValue::Array(id) => self.join_array_to_string(id, ",")?,
             RuntimeValue::Object(_) | RuntimeValue::Namespace(_) | RuntimeValue::Handle(_) => {
                 "[object Object]".to_string()
             }
             RuntimeValue::Closure(_) | RuntimeValue::BuiltinFn(_) => "[Function]".to_string(),
         })
+    }
+
+    fn join_array_to_string(&mut self, id: usize, sep: &str) -> Result<String, ExprError> {
+        // Per ECMAScript Array.prototype.join, cyclic array references yield "".
+        if self.stringifying_arrays.contains(&id) {
+            return Ok(String::new());
+        }
+        if self.stringifying_arrays.len() >= self.config.max_recursion {
+            return Err(ExprError::RecursionLimitExceeded {
+                limit: self.config.max_recursion,
+            });
+        }
+        self.stringifying_arrays.push(id);
+        let items = self.arrays[id].clone();
+        let mut parts = Vec::with_capacity(items.len());
+        let res = (|| -> Result<String, ExprError> {
+            for item in &items {
+                self.tick()?;
+                match item {
+                    RuntimeValue::Null | RuntimeValue::Undefined => parts.push(String::new()),
+                    other => parts.push(self.runtime_to_js_string(other)?),
+                }
+            }
+            Ok(parts.join(sep))
+        })();
+        self.stringifying_arrays.pop();
+        res
     }
 
     fn runtime_to_vec3(&mut self, rv: &RuntimeValue) -> Result<[f64; 3], ExprError> {
@@ -2724,15 +2744,7 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => ",".to_string(),
                 };
-                let items = self.arrays[id].clone();
-                let mut parts = Vec::with_capacity(items.len());
-                for item in &items {
-                    match item {
-                        RuntimeValue::Null | RuntimeValue::Undefined => parts.push(String::new()),
-                        other => parts.push(self.runtime_to_js_string(other)?),
-                    }
-                }
-                Ok(RuntimeValue::String(parts.join(&sep)))
+                Ok(RuntimeValue::String(self.join_array_to_string(id, &sep)?))
             }
             "indexOf" => {
                 let needle = args.first().cloned().unwrap_or(RuntimeValue::Undefined);

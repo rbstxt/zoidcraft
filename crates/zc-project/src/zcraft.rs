@@ -1,11 +1,11 @@
 //! Native `.zcraft` gzip-compressed TAR archive reader and writer.
 //!
-//! Layout:
-//! - `meta.json` (format metadata, plugin requirements, missing asset list, SHA-256 integrity table)
+//! Layout (Spec 03 §7.3):
+//! - `manifest.json` (format metadata, timestamps, `{id, features}` plugin requirements, missing asset list, SHA-256 integrity table)
 //! - `project.json` (serialized [`Project`] document)
-//! - `assets/<id>` (raw binary asset blobs)
+//! - `assets/<64-hex-sha256>` (raw binary asset blobs)
 //!
-//! Also accepts `manifest.json` on read for Spec 03 forward compatibility.
+//! Also accepts legacy `meta.json` on read for backward compatibility.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -13,11 +13,12 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ProjectError;
 use crate::atomic::write_atomic;
@@ -43,21 +44,93 @@ pub struct IntegrityEntry {
     pub sha256: String,
 }
 
-/// Archive metadata written to `meta.json` inside `.zcraft` files.
+/// Plugin dependency entry in `manifest.json` (Spec 03 §7.3).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ManifestPluginRequirement {
+    pub id: String,
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+fn deserialize_required_plugins<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ManifestPluginRequirement>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Obj(ManifestPluginRequirement),
+        Str(String),
+    }
+
+    let entries = Vec::<Entry>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .map(|e| match e {
+            Entry::Obj(req) => req,
+            Entry::Str(id) => ManifestPluginRequirement {
+                id,
+                features: Vec::new(),
+            },
+        })
+        .collect())
+}
+
+/// Formats `SystemTime::now()` as an RFC-3339 / ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`)
+/// without external date/time dependencies.
+fn current_utc_iso8601() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3_600;
+    let min = (rem % 3_600) / 60;
+    let sec = rem % 60;
+
+    // Howard Hinnant's civil_from_days algorithm (days since 1970-01-01).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = y + i64::from(m <= 2);
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Archive manifest written to `manifest.json` inside `.zcraft` files (Spec 03 §7.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZcraftMeta {
     pub format: String,
     pub schema_version: u32,
     pub app_version: String,
     pub project_name: String,
+    #[serde(default)]
+    pub created_utc: String,
+    #[serde(default)]
+    pub modified_utc: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imported_from_pz_version: Option<u32>,
-    #[serde(default)]
-    pub required_plugins: BTreeSet<String>,
+    #[serde(default, deserialize_with = "deserialize_required_plugins")]
+    pub required_plugins: Vec<ManifestPluginRequirement>,
     #[serde(default)]
     pub missing_assets: Vec<String>,
     #[serde(default)]
     pub integrity: BTreeMap<String, IntegrityEntry>,
+}
+
+impl ZcraftMeta {
+    /// Returns the set of required plugin IDs declared in this manifest.
+    #[must_use]
+    pub fn required_plugin_ids(&self) -> BTreeSet<String> {
+        self.required_plugins.iter().map(|p| p.id.clone()).collect()
+    }
 }
 
 /// Reader wrapper that enforces a hard byte limit across an uncompressed archive stream.
@@ -215,9 +288,43 @@ fn append_tar_file<W: Write>(
     Ok(())
 }
 
+fn tar_padded_entry_size(data_len: u64) -> u64 {
+    // 512-byte header (or up to 2048 bytes with GNU longname) + 512-byte-aligned payload.
+    let blocks = data_len.div_ceil(512);
+    512u64.saturating_add(blocks.saturating_mul(512))
+}
+
 /// Serializes `project` into an in-memory `.zcraft` (gzip + TAR) archive byte vector.
+///
+/// Validates all reader security bounds (JSON entry size, JSON nesting depth, entry count,
+/// archive paths, and uncompressed stream size) before producing archive bytes so a save
+/// can never overwrite a readable file with an unreadable archive.
 pub fn save_zcraft_to_bytes(project: &Project) -> Result<Vec<u8>, ProjectError> {
+    save_zcraft_to_bytes_with_limits(
+        project,
+        MAX_UNCOMPRESSED_ARCHIVE_BYTES,
+        MAX_JSON_ENTRY_BYTES,
+        MAX_ARCHIVE_ENTRIES,
+        MAX_JSON_NESTING_DEPTH,
+    )
+}
+
+fn save_zcraft_to_bytes_with_limits(
+    project: &Project,
+    max_uncompressed: u64,
+    max_json_bytes: u64,
+    max_entries: usize,
+    max_json_depth: usize,
+) -> Result<Vec<u8>, ProjectError> {
     let project_json = serde_json::to_vec_pretty(project)?;
+    if (project_json.len() as u64) > max_json_bytes {
+        return Err(ProjectError::JsonEntryTooLarge {
+            entry: "project.json".to_owned(),
+            limit_bytes: max_json_bytes,
+        });
+    }
+    check_json_depth(&project_json, max_json_depth)?;
+
     let mut integrity = BTreeMap::new();
     integrity.insert(
         "project.json".to_owned(),
@@ -246,22 +353,67 @@ pub fn save_zcraft_to_bytes(project: &Project) -> Result<Vec<u8>, ProjectError> 
         }
     }
 
-    let meta = ZcraftMeta {
+    let total_entries = 2usize.saturating_add(embedded_assets.len());
+    if total_entries > max_entries {
+        return Err(ProjectError::TooManyEntries { limit: max_entries });
+    }
+
+    let now_utc = current_utc_iso8601();
+    let created_utc = project
+        .preserved
+        .get("created_utc")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| now_utc.clone(), ToOwned::to_owned);
+
+    let required_plugins: Vec<ManifestPluginRequirement> = project
+        .plugin_requirements
+        .iter()
+        .map(|id| ManifestPluginRequirement {
+            id: id.clone(),
+            features: Vec::new(),
+        })
+        .collect();
+
+    let manifest = ZcraftMeta {
         format: "zoidcraft".to_owned(),
         schema_version: PROJECT_SCHEMA_VERSION,
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
         project_name: project.name.clone(),
+        created_utc,
+        modified_utc: now_utc,
         imported_from_pz_version: project.imported_from_pz_version,
-        required_plugins: project.plugin_requirements.clone(),
+        required_plugins,
         missing_assets,
         integrity,
     };
-    let meta_json = serde_json::to_vec_pretty(&meta)?;
+    let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+    if (manifest_json.len() as u64) > max_json_bytes {
+        return Err(ProjectError::JsonEntryTooLarge {
+            entry: "manifest.json".to_owned(),
+            limit_bytes: max_json_bytes,
+        });
+    }
+    check_json_depth(&manifest_json, max_json_depth)?;
+
+    // Check total uncompressed TAR stream size before writing (entries + 1024-byte TAR EOF trailer).
+    let mut uncompressed_tar_bytes = 1024u64
+        .saturating_add(tar_padded_entry_size(manifest_json.len() as u64))
+        .saturating_add(tar_padded_entry_size(project_json.len() as u64));
+    for (_, bytes) in &embedded_assets {
+        uncompressed_tar_bytes =
+            uncompressed_tar_bytes.saturating_add(tar_padded_entry_size(bytes.len() as u64));
+    }
+    if uncompressed_tar_bytes > max_uncompressed {
+        return Err(ProjectError::ArchiveTooLarge {
+            limit_bytes: max_uncompressed,
+        });
+    }
 
     let encoder = GzEncoder::new(Vec::new(), Compression::default());
     let mut builder = tar::Builder::new(encoder);
 
-    append_tar_file(&mut builder, "meta.json", &meta_json)?;
+    append_tar_file(&mut builder, "manifest.json", &manifest_json)?;
     append_tar_file(&mut builder, "project.json", &project_json)?;
     for (entry_path, bytes) in embedded_assets {
         append_tar_file(&mut builder, &entry_path, bytes)?;
@@ -364,7 +516,7 @@ fn load_zcraft_with_limits(
                         parsed.format
                     )));
                 }
-                if meta.is_none() || normalized == "meta.json" {
+                if meta.is_none() || normalized == "manifest.json" {
                     meta = Some(parsed);
                 }
             }
@@ -602,14 +754,16 @@ mod tests {
             schema_version: 1,
             app_version: "0.1.0".into(),
             project_name: "Bad".into(),
+            created_utc: "2026-11-24T00:00:00Z".into(),
+            modified_utc: "2026-11-24T00:00:00Z".into(),
             imported_from_pz_version: None,
-            required_plugins: BTreeSet::new(),
+            required_plugins: Vec::new(),
             missing_assets: Vec::new(),
             integrity,
         };
         let meta_json = serde_json::to_vec(&meta).expect("meta");
         let corrupted = build_raw_tgz(&[
-            ("meta.json", tar::EntryType::Regular, &meta_json),
+            ("manifest.json", tar::EntryType::Regular, &meta_json),
             ("project.json", tar::EntryType::Regular, &project_json),
         ]);
         assert!(matches!(
@@ -628,5 +782,66 @@ mod tests {
             load_zcraft_with_limits(&valid_bytes, 64, MAX_JSON_ENTRY_BYTES, MAX_ARCHIVE_ENTRIES),
             Err(ProjectError::ArchiveTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn writer_emits_spec03_manifest_and_validates_before_clobbering_existing_file() {
+        let dir = TestDir::new();
+        let archive_path = dir.0.join("guarded.zcraft");
+
+        let mut project = Project::new_cm3_default();
+        project.name = "SafeOriginal".to_owned();
+        project
+            .plugin_requirements
+            .insert("expressions-plus".to_owned());
+        save_zcraft(&project, &archive_path).expect("initial save");
+
+        // Verify manifest.json is written with {id, features} objects and UTC timestamps.
+        let raw = fs::read(&archive_path).expect("read archive");
+        let mut tar_archive = tar::Archive::new(GzDecoder::new(raw.as_slice()));
+        let mut manifest_raw = None;
+        for entry in tar_archive.entries().expect("entries") {
+            let mut e = entry.expect("entry");
+            if e.path().expect("path").to_string_lossy() == "manifest.json" {
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf).expect("read manifest");
+                manifest_raw = Some(buf);
+            }
+        }
+        let manifest_bytes = manifest_raw.expect("manifest.json must exist in archive");
+        let manifest_val: serde_json::Value =
+            serde_json::from_slice(&manifest_bytes).expect("parse manifest json");
+        assert!(
+            manifest_val["created_utc"]
+                .as_str()
+                .is_some_and(|s| s.ends_with('Z'))
+        );
+        assert!(
+            manifest_val["modified_utc"]
+                .as_str()
+                .is_some_and(|s| s.ends_with('Z'))
+        );
+        assert_eq!(
+            manifest_val["required_plugins"][0]["id"],
+            "expressions-plus"
+        );
+        assert!(manifest_val["required_plugins"][0]["features"].is_array());
+
+        // Pre-write validation rejects oversized JSON before touching disk.
+        let too_small_limit = save_zcraft_to_bytes_with_limits(
+            &project,
+            MAX_UNCOMPRESSED_ARCHIVE_BYTES,
+            128,
+            MAX_ARCHIVE_ENTRIES,
+            MAX_JSON_NESTING_DEPTH,
+        );
+        assert!(matches!(
+            too_small_limit,
+            Err(ProjectError::JsonEntryTooLarge { .. })
+        ));
+
+        // Existing readable archive on disk remains untouched and readable.
+        let reloaded = load_zcraft(&archive_path).expect("original archive intact");
+        assert_eq!(reloaded.name, "SafeOriginal");
     }
 }
