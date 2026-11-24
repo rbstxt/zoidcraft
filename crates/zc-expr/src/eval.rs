@@ -22,6 +22,18 @@ use crate::{
 };
 
 const MAX_EXPORT_DEPTH: usize = 128;
+/// Maximum byte length of any single runtime string in an expression evaluation (4 MiB).
+const MAX_STRING_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum cumulative heap budget (strings + array elements) per expression evaluation (16 MiB).
+const MAX_HEAP_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum element count of any single runtime array.
+const MAX_ARRAY_LEN: usize = 65_536;
+/// Maximum aggregate nodes expanded when converting an expression result to [`Value`].
+const MAX_EXPORT_NODES: usize = 65_536;
+/// Maximum aggregate string/container bytes materialized when converting an expression result.
+const MAX_EXPORT_BYTES: usize = 16 * 1024 * 1024;
+/// Estimated heap overhead per array element for allocation budgeting.
+const ARRAY_ELEM_BUDGET_BYTES: usize = 32;
 
 /// Evaluates a parsed [`Program`] against `ctx` using `config`.
 pub fn evaluate_program(
@@ -64,7 +76,9 @@ pub fn evaluate_program(
         }
     }
 
-    evaluator.export_value(&completion, 0)
+    let mut export_nodes = 0_usize;
+    let mut export_bytes = 0_usize;
+    evaluator.export_value(&completion, 0, &mut export_nodes, &mut export_bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +141,7 @@ struct Evaluator<'a> {
     config: EvalConfig,
     steps: u64,
     recursion_depth: usize,
+    allocated_bytes: usize,
     envs: Vec<EnvFrame>,
     arrays: Vec<Vec<RuntimeValue>>,
     objects: Vec<BTreeMap<String, RuntimeValue>>,
@@ -142,6 +157,7 @@ impl<'a> Evaluator<'a> {
             config,
             steps: 0,
             recursion_depth: 0,
+            allocated_bytes: 0,
             envs: Vec::new(),
             arrays: Vec::new(),
             objects: Vec::new(),
@@ -149,6 +165,38 @@ impl<'a> Evaluator<'a> {
             rng: None,
             stringifying_arrays: Vec::new(),
         }
+    }
+
+    fn charge_alloc_bytes(&mut self, bytes: usize) -> Result<(), ExprError> {
+        let next = self.allocated_bytes.saturating_add(bytes);
+        if next > MAX_HEAP_BYTES {
+            return Err(ExprError::RangeError(format!(
+                "expression memory budget exceeded ({MAX_HEAP_BYTES} bytes)"
+            )));
+        }
+        self.allocated_bytes = next;
+        Ok(())
+    }
+
+    fn check_string_alloc(&mut self, byte_len: usize) -> Result<(), ExprError> {
+        if byte_len > MAX_STRING_BYTES {
+            return Err(ExprError::RangeError(format!(
+                "string length {byte_len} exceeds {MAX_STRING_BYTES} byte limit"
+            )));
+        }
+        self.charge_alloc_bytes(byte_len)
+    }
+
+    fn check_array_alloc(&mut self, elem_count: usize) -> Result<(), ExprError> {
+        if elem_count > MAX_ARRAY_LEN {
+            return Err(ExprError::RangeError(format!(
+                "array length {elem_count} exceeds {MAX_ARRAY_LEN} limit"
+            )));
+        }
+        let bytes = elem_count
+            .checked_mul(ARRAY_ELEM_BUDGET_BYTES)
+            .ok_or_else(|| ExprError::RangeError("array allocation overflow".to_string()))?;
+        self.charge_alloc_bytes(bytes)
     }
 
     fn tick(&mut self) -> Result<(), ExprError> {
@@ -267,31 +315,81 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn export_value(&mut self, rv: &RuntimeValue, depth: usize) -> Result<Value, ExprError> {
+    fn export_root_value(&mut self, rv: &RuntimeValue) -> Result<Value, ExprError> {
+        let mut nodes = 0_usize;
+        let mut bytes = 0_usize;
+        self.export_value(rv, 0, &mut nodes, &mut bytes)
+    }
+
+    fn export_value(
+        &mut self,
+        rv: &RuntimeValue,
+        depth: usize,
+        nodes: &mut usize,
+        bytes: &mut usize,
+    ) -> Result<Value, ExprError> {
         if depth > MAX_EXPORT_DEPTH {
             return Err(ExprError::RangeError(
                 "circular or overly deep value cannot be returned".to_string(),
             ));
+        }
+        *nodes = nodes.saturating_add(1);
+        if *nodes > MAX_EXPORT_NODES {
+            return Err(ExprError::RangeError(format!(
+                "returned value exceeds {MAX_EXPORT_NODES} element budget"
+            )));
+        }
+        *bytes = bytes.saturating_add(ARRAY_ELEM_BUDGET_BYTES);
+        if *bytes > MAX_EXPORT_BYTES {
+            return Err(ExprError::RangeError(format!(
+                "returned value exceeds {MAX_EXPORT_BYTES} byte budget"
+            )));
         }
         match rv {
             RuntimeValue::Empty | RuntimeValue::Undefined => Ok(Value::Undefined),
             RuntimeValue::Null => Ok(Value::Null),
             RuntimeValue::Bool(b) => Ok(Value::Bool(*b)),
             RuntimeValue::Number(n) => Ok(Value::Number(*n)),
-            RuntimeValue::String(s) => Ok(Value::String(s.clone())),
+            RuntimeValue::String(s) => {
+                *bytes = bytes.saturating_add(s.len());
+                if *bytes > MAX_EXPORT_BYTES {
+                    return Err(ExprError::RangeError(format!(
+                        "returned value exceeds {MAX_EXPORT_BYTES} byte budget"
+                    )));
+                }
+                Ok(Value::String(s.clone()))
+            }
             RuntimeValue::Array(id) => {
+                let len = self.arrays[*id].len();
+                if nodes.saturating_add(len) > MAX_EXPORT_NODES {
+                    return Err(ExprError::RangeError(format!(
+                        "returned value exceeds {MAX_EXPORT_NODES} element budget"
+                    )));
+                }
                 let items = self.arrays[*id].clone();
                 let mut out = Vec::with_capacity(items.len());
                 for item in &items {
-                    out.push(self.export_value(item, depth + 1)?);
+                    out.push(self.export_value(item, depth + 1, nodes, bytes)?);
                 }
                 Ok(Value::Array(out))
             }
             RuntimeValue::Object(id) => {
+                let len = self.objects[*id].len();
+                if nodes.saturating_add(len) > MAX_EXPORT_NODES {
+                    return Err(ExprError::RangeError(format!(
+                        "returned value exceeds {MAX_EXPORT_NODES} element budget"
+                    )));
+                }
                 let entries = self.objects[*id].clone();
                 let mut out = BTreeMap::new();
                 for (k, v) in &entries {
-                    out.insert(k.clone(), self.export_value(v, depth + 1)?);
+                    *bytes = bytes.saturating_add(k.len());
+                    if *bytes > MAX_EXPORT_BYTES {
+                        return Err(ExprError::RangeError(format!(
+                            "returned value exceeds {MAX_EXPORT_BYTES} byte budget"
+                        )));
+                    }
+                    out.insert(k.clone(), self.export_value(v, depth + 1, nodes, bytes)?);
                 }
                 Ok(Value::Object(out))
             }
@@ -401,13 +499,28 @@ impl<'a> Evaluator<'a> {
         let items = self.arrays[id].clone();
         let mut parts = Vec::with_capacity(items.len());
         let res = (|| -> Result<String, ExprError> {
-            for item in &items {
+            let mut total_bytes = 0_usize;
+            for (idx, item) in items.iter().enumerate() {
                 self.tick()?;
-                match item {
-                    RuntimeValue::Null | RuntimeValue::Undefined => parts.push(String::new()),
-                    other => parts.push(self.runtime_to_js_string(other)?),
+                let piece = match item {
+                    RuntimeValue::Null | RuntimeValue::Undefined => String::new(),
+                    other => self.runtime_to_js_string(other)?,
+                };
+                let add = piece
+                    .len()
+                    .checked_add(if idx > 0 { sep.len() } else { 0 })
+                    .ok_or_else(|| ExprError::RangeError("joined string overflow".to_string()))?;
+                total_bytes = total_bytes
+                    .checked_add(add)
+                    .ok_or_else(|| ExprError::RangeError("joined string overflow".to_string()))?;
+                if total_bytes > MAX_STRING_BYTES {
+                    return Err(ExprError::RangeError(format!(
+                        "joined string length exceeds {MAX_STRING_BYTES} byte limit"
+                    )));
                 }
+                parts.push(piece);
             }
+            self.check_string_alloc(total_bytes)?;
             Ok(parts.join(sep))
         })();
         self.stringifying_arrays.pop();
@@ -1083,13 +1196,23 @@ impl<'a> Evaluator<'a> {
             Expr::Template(parts) => {
                 let mut out = String::new();
                 for part in parts {
-                    match part {
-                        TemplatePart::Text(t) => out.push_str(t),
+                    let piece: std::borrow::Cow<'_, str> = match part {
+                        TemplatePart::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
                         TemplatePart::Expr(e) => {
                             let v = self.eval_expr(e, env)?;
-                            out.push_str(&self.runtime_to_js_string(&v)?);
+                            std::borrow::Cow::Owned(self.runtime_to_js_string(&v)?)
                         }
+                    };
+                    let new_len = out.len().checked_add(piece.len()).ok_or_else(|| {
+                        ExprError::RangeError("template string overflow".to_string())
+                    })?;
+                    if new_len > MAX_STRING_BYTES {
+                        return Err(ExprError::RangeError(format!(
+                            "template string length exceeds {MAX_STRING_BYTES} byte limit"
+                        )));
                     }
+                    self.charge_alloc_bytes(piece.len())?;
+                    out.push_str(&piece);
                 }
                 Ok(RuntimeValue::String(out))
             }
@@ -1097,16 +1220,40 @@ impl<'a> Evaluator<'a> {
                 let mut items = Vec::with_capacity(elems.len());
                 for elem in elems {
                     match elem {
-                        ArrayElem::Expr(e) => items.push(self.eval_expr(e, env)?),
+                        ArrayElem::Expr(e) => {
+                            let v = self.eval_expr(e, env)?;
+                            if items.len() >= MAX_ARRAY_LEN {
+                                return Err(ExprError::RangeError(format!(
+                                    "array length exceeds {MAX_ARRAY_LEN} limit"
+                                )));
+                            }
+                            items.push(v);
+                        }
                         ArrayElem::Spread(e) => {
                             let val = self.eval_expr(e, env)?;
                             let val = self.deref_property_handle(val)?;
                             match val {
                                 RuntimeValue::Array(id) => {
+                                    let add = self.arrays[id].len();
+                                    let next_len =
+                                        items.len().checked_add(add).ok_or_else(|| {
+                                            ExprError::RangeError(
+                                                "array length overflow".to_string(),
+                                            )
+                                        })?;
+                                    self.check_array_alloc(next_len)?;
                                     let spread_items = self.arrays[id].clone();
                                     items.extend(spread_items);
                                 }
                                 RuntimeValue::String(s) => {
+                                    let add = s.chars().count();
+                                    let next_len =
+                                        items.len().checked_add(add).ok_or_else(|| {
+                                            ExprError::RangeError(
+                                                "array length overflow".to_string(),
+                                            )
+                                        })?;
+                                    self.check_array_alloc(next_len)?;
                                     items.extend(
                                         s.chars().map(|c| RuntimeValue::String(c.to_string())),
                                     );
@@ -1120,6 +1267,7 @@ impl<'a> Evaluator<'a> {
                         }
                     }
                 }
+                self.check_array_alloc(items.len())?;
                 Ok(self.alloc_array(items))
             }
             Expr::Object(props) => {
@@ -1573,7 +1721,14 @@ impl<'a> Evaluator<'a> {
                 {
                     let ls = self.runtime_to_js_string(&left)?;
                     let rs = self.runtime_to_js_string(&right)?;
-                    return Ok(RuntimeValue::String(format!("{ls}{rs}")));
+                    let total = ls.len().checked_add(rs.len()).ok_or_else(|| {
+                        ExprError::RangeError("string concatenation overflow".to_string())
+                    })?;
+                    self.check_string_alloc(total)?;
+                    let mut combined = String::with_capacity(total);
+                    combined.push_str(&ls);
+                    combined.push_str(&rs);
+                    return Ok(RuntimeValue::String(combined));
                 }
                 // Vector arithmetic (component-wise + scalar broadcast).
                 if let Some(res) = self.try_vector_arith(&left, &right, BinaryOp::Add)? {
@@ -2155,12 +2310,15 @@ impl<'a> Evaluator<'a> {
             RuntimeValue::Namespace(NamespaceKind::Array) => {
                 if args.len() == 1
                     && let RuntimeValue::Number(n) = args[0]
-                    && n >= 0.0
-                    && n.fract() == 0.0
-                    && n <= 100_000.0
                 {
-                    return Ok(self.alloc_array(vec![RuntimeValue::Undefined; n as usize]));
+                    if n < 0.0 || !n.is_finite() || n.fract() != 0.0 || n > (MAX_ARRAY_LEN as f64) {
+                        return Err(ExprError::RangeError("invalid array length".to_string()));
+                    }
+                    let count = n as usize;
+                    self.check_array_alloc(count)?;
+                    return Ok(self.alloc_array(vec![RuntimeValue::Undefined; count]));
                 }
+                self.check_array_alloc(args.len())?;
                 Ok(self.alloc_array(args))
             }
             _ => Err(ExprError::TypeError("value is not callable".to_string())),
@@ -2436,7 +2594,7 @@ impl<'a> Evaluator<'a> {
             NamespaceKind::Json => match method {
                 "stringify" => {
                     let val = match args.first() {
-                        Some(v) => self.export_value(v, 0)?,
+                        Some(v) => self.export_root_value(v)?,
                         None => return Ok(RuntimeValue::Undefined),
                     };
                     if matches!(val, Value::Undefined) {
@@ -2684,6 +2842,16 @@ impl<'a> Evaluator<'a> {
     ) -> Result<RuntimeValue, ExprError> {
         match method {
             "push" => {
+                let next_len = self.arrays[id]
+                    .len()
+                    .checked_add(args.len())
+                    .ok_or_else(|| ExprError::RangeError("array length overflow".to_string()))?;
+                if next_len > MAX_ARRAY_LEN {
+                    return Err(ExprError::RangeError(format!(
+                        "array length {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                    )));
+                }
+                self.check_array_alloc(args.len())?;
                 self.arrays[id].extend(args);
                 Ok(RuntimeValue::Number(self.arrays[id].len() as f64))
             }
@@ -2696,6 +2864,16 @@ impl<'a> Evaluator<'a> {
                 }
             }
             "unshift" => {
+                let next_len = self.arrays[id]
+                    .len()
+                    .checked_add(args.len())
+                    .ok_or_else(|| ExprError::RangeError("array length overflow".to_string()))?;
+                if next_len > MAX_ARRAY_LEN {
+                    return Err(ExprError::RangeError(format!(
+                        "array length {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                    )));
+                }
+                self.check_array_alloc(args.len())?;
                 let mut new_vec = args;
                 new_vec.append(&mut self.arrays[id]);
                 self.arrays[id] = new_vec;
@@ -2717,6 +2895,8 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => len as usize,
                 };
+                let slice_len = end.saturating_sub(start);
+                self.check_array_alloc(slice_len)?;
                 let slice = if start < end {
                     self.arrays[id][start..end].to_vec()
                 } else {
@@ -2725,12 +2905,31 @@ impl<'a> Evaluator<'a> {
                 Ok(self.alloc_array(slice))
             }
             "concat" => {
-                let mut out = self.arrays[id].clone();
+                let mut total_len = self.arrays[id].len();
+                let mut resolved = Vec::with_capacity(args.len());
                 for a in args {
                     let d = self.deref_property_handle(a)?;
+                    let add = match &d {
+                        RuntimeValue::Array(other_id) => self.arrays[*other_id].len(),
+                        _ => 1,
+                    };
+                    total_len = total_len.checked_add(add).ok_or_else(|| {
+                        ExprError::RangeError("array length overflow".to_string())
+                    })?;
+                    if total_len > MAX_ARRAY_LEN {
+                        return Err(ExprError::RangeError(format!(
+                            "array length {total_len} exceeds {MAX_ARRAY_LEN} limit"
+                        )));
+                    }
+                    resolved.push(d);
+                }
+                self.check_array_alloc(total_len)?;
+                let mut out = Vec::with_capacity(total_len);
+                out.extend(self.arrays[id].iter().cloned());
+                for d in resolved {
                     match d {
                         RuntimeValue::Array(other_id) => {
-                            out.extend(self.arrays[other_id].clone());
+                            out.extend(self.arrays[other_id].iter().cloned());
                         }
                         other => out.push(other),
                     }
@@ -3003,8 +3202,18 @@ impl<'a> Evaluator<'a> {
                     Some(v) if !matches!(v, RuntimeValue::Undefined) => {
                         self.runtime_to_js_string(v)?
                     }
-                    _ => return Ok(self.alloc_array(vec![RuntimeValue::String(s.to_string())])),
+                    _ => {
+                        self.check_string_alloc(s.len())?;
+                        return Ok(self.alloc_array(vec![RuntimeValue::String(s.to_string())]));
+                    }
                 };
+                let part_count = if sep.is_empty() {
+                    chars.len()
+                } else {
+                    s.matches(&sep).count().saturating_add(1)
+                };
+                self.check_array_alloc(part_count)?;
+                self.check_string_alloc(s.len())?;
                 let parts: Vec<RuntimeValue> = if sep.is_empty() {
                     chars
                         .into_iter()
@@ -3026,6 +3235,12 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                let est = s
+                    .len()
+                    .saturating_sub(from.len())
+                    .checked_add(to.len())
+                    .ok_or_else(|| ExprError::RangeError("replace string overflow".to_string()))?;
+                self.check_string_alloc(est)?;
                 Ok(RuntimeValue::String(s.replacen(&from, &to, 1)))
             }
             "replaceAll" => {
@@ -3037,6 +3252,23 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                let matches = if from.is_empty() {
+                    chars.len().saturating_add(1)
+                } else {
+                    s.matches(&from).count()
+                };
+                let added = matches.checked_mul(to.len()).ok_or_else(|| {
+                    ExprError::RangeError("replaceAll string overflow".to_string())
+                })?;
+                let removed = matches.saturating_mul(from.len());
+                let est = s
+                    .len()
+                    .saturating_sub(removed)
+                    .checked_add(added)
+                    .ok_or_else(|| {
+                        ExprError::RangeError("replaceAll string overflow".to_string())
+                    })?;
+                self.check_string_alloc(est)?;
                 Ok(RuntimeValue::String(s.replace(&from, &to)))
             }
             "charAt" => {
@@ -3071,7 +3303,12 @@ impl<'a> Evaluator<'a> {
                 if count < 0.0 || !count.is_finite() || count > 10_000.0 {
                     return Err(ExprError::RangeError("invalid repeat count".to_string()));
                 }
-                Ok(RuntimeValue::String(s.repeat(count as usize)))
+                let count_usize = count as usize;
+                let total_bytes = s.len().checked_mul(count_usize).ok_or_else(|| {
+                    ExprError::RangeError("string repeat length overflow".to_string())
+                })?;
+                self.check_string_alloc(total_bytes)?;
+                Ok(RuntimeValue::String(s.repeat(count_usize)))
             }
             _ => Err(ExprError::TypeError(format!(
                 "String.prototype.{method} is not a function"
@@ -3625,7 +3862,7 @@ impl<'a> Evaluator<'a> {
 
     fn export_arg(&mut self, args: &[RuntimeValue], index: usize) -> Result<Value, ExprError> {
         match args.get(index) {
-            Some(v) => self.export_value(v, 0),
+            Some(v) => self.export_root_value(v),
             None => Ok(Value::Number(0.0)),
         }
     }

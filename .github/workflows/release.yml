@@ -70,6 +70,11 @@ jobs:
           cp "target/${{ matrix.target }}/release/zoidcraft-cli" "$STAGE/"
           cp LICENSE README.md THIRD_PARTY_LICENSES.md "$STAGE/"
           tar -czf "${STAGE}.tar.gz" "$STAGE"
+          tar -tzf "${STAGE}.tar.gz" | grep -q "${STAGE}/zoidcraft$"
+          tar -tzf "${STAGE}.tar.gz" | grep -q "${STAGE}/zoidcraft-cli$"
+          tar -tzf "${STAGE}.tar.gz" | grep -q "${STAGE}/LICENSE$"
+          tar -tzf "${STAGE}.tar.gz" | grep -q "${STAGE}/README.md$"
+          tar -tzf "${STAGE}.tar.gz" | grep -q "${STAGE}/THIRD_PARTY_LICENSES.md$"
       - name: Package zip (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -80,6 +85,16 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/zoidcraft-cli.exe" "$stage/"
           Copy-Item LICENSE, README.md, THIRD_PARTY_LICENSES.md "$stage/"
           Compress-Archive -Path "$stage/*" -DestinationPath "${stage}.zip" -Force
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("${stage}.zip")
+          try {
+            $names = $zip.Entries | ForEach-Object { $_.Name }
+            foreach ($req in @("zoidcraft.exe", "zoidcraft-cli.exe", "LICENSE", "README.md", "THIRD_PARTY_LICENSES.md")) {
+              if ($names -notcontains $req) { throw "Missing required archive entry: $req" }
+            }
+          } finally {
+            $zip.Dispose()
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: zoidcraft-${{ matrix.name }}

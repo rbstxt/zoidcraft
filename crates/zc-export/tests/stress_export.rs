@@ -261,3 +261,143 @@ fn repeated_ffmpeg_exports_and_cancellations_leave_zero_leaks_and_preserve_targe
         );
     }
 }
+
+#[test]
+fn png_sequence_cancellation_preserves_existing_directory_contents() {
+    let root = TempDirGuard::new("png-preserve");
+    let out_dir = root.path().join("existing_seq");
+    fs::create_dir_all(&out_dir).expect("create out_dir");
+    let sentinel = out_dir.join("frame_000001.png");
+    let sentinel_bytes = b"ORIGINAL-GOOD-FRAME-1".to_vec();
+    fs::write(&sentinel, &sentinel_bytes).expect("write sentinel");
+
+    let settings = ExportSettings {
+        width: 32,
+        height: 32,
+        fps: 30.0,
+        start_frame: 0,
+        end_frame: 10,
+        container: ExportContainer::PngSequence,
+        video_codec: VideoCodec::H264,
+        audio_codec: AudioCodec::None,
+        quality: QualityMode::Crf(18),
+        audio_bitrate_kbps: 192,
+        sample_rate: 48_000,
+        transparent_alpha: true,
+        output_path: out_dir.clone(),
+        ffmpeg_binary: None,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_clone = Arc::clone(&cancel);
+    let err = export_video(
+        &settings,
+        None,
+        &cancel,
+        move |frame_idx: u32, buf: &mut Vec<u8>| {
+            if frame_idx == 2 {
+                cancel_clone.store(true, Ordering::Release);
+            }
+            fill_gradient(buf, 32, 32, frame_idx);
+            Ok(())
+        },
+    )
+    .expect_err("cancelled png export must fail");
+    assert!(matches!(err, ExportError::Cancelled));
+
+    assert_eq!(
+        fs::read(&sentinel).expect("sentinel frame must remain intact"),
+        sentinel_bytes
+    );
+    let entries: Vec<String> = fs::read_dir(&out_dir)
+        .expect("read out_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, vec!["frame_000001.png".to_owned()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn early_zero_exit_ffmpeg_wrapper_fails_and_preserves_destination() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDirGuard::new("early-exit");
+    let wrapper = root.path().join("fake_ffmpeg.sh");
+    // Script reads 1 byte and exits 0 after writing a bogus output file (last CLI arg).
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nfor last; do :; done\nprintf 'TRUNCATED' > \"$last\"\nexit 0\n",
+    )
+    .expect("write wrapper");
+    let mut perms = fs::metadata(&wrapper).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&wrapper, perms).expect("chmod");
+
+    let dest = root.path().join("final.mp4");
+    let original = b"EXISTING-GOOD-MP4".to_vec();
+    fs::write(&dest, &original).expect("write sentinel");
+
+    let settings = ExportSettings {
+        width: 32,
+        height: 32,
+        fps: 30.0,
+        start_frame: 0,
+        end_frame: 30,
+        container: ExportContainer::Mp4,
+        video_codec: VideoCodec::H264,
+        audio_codec: AudioCodec::None,
+        quality: QualityMode::Crf(23),
+        audio_bitrate_kbps: 128,
+        sample_rate: 48_000,
+        transparent_alpha: false,
+        output_path: dest.clone(),
+        ffmpeg_binary: Some(wrapper),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let err = export_video(
+        &settings,
+        None,
+        &cancel,
+        |frame_idx: u32, buf: &mut Vec<u8>| {
+            // Give the wrapper time to exit early while frames are still streaming.
+            if frame_idx > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            fill_gradient(buf, 32, 32, frame_idx);
+            Ok(())
+        },
+    )
+    .expect_err("early zero-exit ffmpeg must NOT publish a truncated video");
+    assert!(
+        matches!(err, ExportError::FfmpegFailed { .. }),
+        "expected FfmpegFailed, got {err:?}"
+    );
+    assert_eq!(
+        fs::read(&dest).expect("sentinel mp4 must remain untouched"),
+        original
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stalled_ffmpeg_probe_times_out_cleanly() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDirGuard::new("probe-timeout");
+    let stalled = root.path().join("stalled_ffmpeg.sh");
+    fs::write(&stalled, "#!/bin/sh\nsleep 30\n").expect("write stalled script");
+    let mut perms = fs::metadata(&stalled).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&stalled, perms).expect("chmod");
+
+    let start = std::time::Instant::now();
+    let err = probe_ffmpeg(Some(&stalled)).expect_err("stalled probe must time out");
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(err, ExportError::FfmpegFailed { .. }),
+        "expected FfmpegFailed timeout, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "probe took too long: {elapsed:?}"
+    );
+}

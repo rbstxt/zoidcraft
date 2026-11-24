@@ -32,6 +32,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check Engine-First layer boundaries
         run: cargo run --locked -p xtask -- layers
+      - name: Check dependency licenses & THIRD_PARTY_LICENSES.md
+        run: cargo run --locked -p xtask -- licenses
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 

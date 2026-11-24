@@ -14,7 +14,8 @@ use image::{ExtendedColorType, ImageEncoder};
 
 use crate::ExportError;
 use crate::ffmpeg::{
-    BoundedStderrBuffer, MAX_STDERR_BYTES, build_ffmpeg_args_with_output, resolve_ffmpeg_binary,
+    BoundedStderrBuffer, MAX_STDERR_BYTES, build_ffmpeg_os_args_with_output,
+    configure_process_group, kill_process_tree_and_reap, resolve_ffmpeg_binary,
 };
 use crate::padding::pad_rgba_frame_into;
 use crate::settings::{
@@ -36,15 +37,14 @@ impl SharedChildGuard {
         }
     }
 
-    /// Terminates and reaps the child immediately if still running.
+    /// Terminates the entire process tree (wrapper + descendants) and reaps the child immediately.
     fn kill_and_reap(&self) {
         let mut guard = self
             .child
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_process_tree_and_reap(&mut child);
         }
     }
 
@@ -118,6 +118,26 @@ where
     }
 }
 
+struct TempDirGuard {
+    path: std::path::PathBuf,
+}
+
+impl TempDirGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 fn export_png_sequence<F, P>(
     settings: &ExportSettings,
     cancel: &Arc<AtomicBool>,
@@ -128,11 +148,21 @@ where
     F: FrameProvider,
     P: FnMut(ExportProgress),
 {
-    fs::create_dir_all(&settings.output_path)?;
+    if let Some(parent) = settings.output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Stage all encoded PNG frames into a unique sibling temporary directory so a failed
+    // or cancelled export never overwrites or leaves truncated files in `settings.output_path`.
+    let staging_dir = TempDirGuard::new(unique_sibling_temp_path(&settings.output_path));
+    fs::create_dir_all(staging_dir.path())?;
 
     let expected_bytes = checked_rgba_len(settings.width, settings.height)?;
     let mut frame_buf = vec![0_u8; expected_bytes];
     let total_frames = settings.total_frames();
+    let mut staged_names = Vec::with_capacity(total_frames as usize);
 
     for (offset, frame_index) in (settings.start_frame..settings.end_frame).enumerate() {
         if cancel.load(Ordering::Acquire) {
@@ -153,24 +183,39 @@ where
         }
 
         let file_name = format!("frame_{:06}.png", offset + 1);
-        let frame_path = settings.output_path.join(file_name);
-        let file = File::create(&frame_path)?;
-        let writer = BufWriter::new(file);
-        let encoder = PngEncoder::new(writer);
-        encoder
-            .write_image(
-                &frame_buf,
-                settings.width,
-                settings.height,
-                ExtendedColorType::Rgba8,
-            )
-            .map_err(|err| ExportError::ImageEncode(err.to_string()))?;
+        let staged_path = staging_dir.path().join(&file_name);
+        let file = File::create(&staged_path)?;
+        let mut writer = BufWriter::new(file);
+        {
+            let encoder = PngEncoder::new(&mut writer);
+            encoder
+                .write_image(
+                    &frame_buf,
+                    settings.width,
+                    settings.height,
+                    ExtendedColorType::Rgba8,
+                )
+                .map_err(|err| ExportError::ImageEncode(err.to_string()))?;
+        }
+        writer.flush()?;
+        staged_names.push(file_name);
 
         on_progress(ExportProgress {
             completed_frames: (offset as u32) + 1,
             total_frames,
             frame_index,
         });
+    }
+
+    if cancel.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
+
+    fs::create_dir_all(&settings.output_path)?;
+    for file_name in &staged_names {
+        let src = staging_dir.path().join(file_name);
+        let dst = settings.output_path.join(file_name);
+        publish_temp_output(&src, &dst)?;
     }
 
     Ok(ExportReport {
@@ -223,26 +268,27 @@ where
     let temp_output_path = unique_sibling_temp_path(&settings.output_path);
     let mut temp_output_guard = TempFileGuard::new(temp_output_path.clone());
 
-    let args = build_ffmpeg_args_with_output(
+    let args = build_ffmpeg_os_args_with_output(
         settings,
         temp_audio_guard.as_ref().map(|g| g.path()),
         temp_output_guard.path(),
     )?;
 
     let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
-    let mut child = Command::new(bin)
-        .args(&args)
+    let mut cmd = Command::new(bin);
+    cmd.args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            if err.kind() == ErrorKind::NotFound {
-                ExportError::FfmpegNotFound(bin.display().to_string())
-            } else {
-                ExportError::Io(err)
-            }
-        })?;
+        .stderr(Stdio::piped());
+    configure_process_group(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            ExportError::FfmpegNotFound(bin.display().to_string())
+        } else {
+            ExportError::Io(err)
+        }
+    })?;
 
     let stdin = child
         .stdin
@@ -256,20 +302,19 @@ where
     let total_frames = settings.total_frames();
 
     // Stage B: Stream frames to FFmpeg over a dedicated stdin writer thread and drain stderr
-    // on a dedicated reader thread. Neither thread is tied to `std::thread::scope`, so even if
-    // a wrapper FFmpeg binary spawns a descendant that inherits stdin/stderr, cancelling kills
-    // and reaps the immediate child and returns `ExportError::Cancelled` immediately without
-    // hanging on an orphaned pipe.
+    // on a dedicated reader thread. Because the child leads its own process group (Unix) or is
+    // terminated with `/T` (Windows), killing the process tree closes all inherited pipes so
+    // both worker threads exit cleanly and are joined before returning.
     let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
+    let stderr_handle = std::thread::spawn(move || {
         let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
         ring.drain_reader(stderr);
         let _ = stderr_tx.send(ring.into_string_lossy());
     });
 
     enum WriterOutcome {
-        Ok,
-        BrokenPipe,
+        Ok(u32),
+        BrokenPipe(u32),
         Io(std::io::Error),
     }
 
@@ -286,9 +331,10 @@ where
     let _ = recycle_tx.send(vec![0_u8; payload_bytes]);
     let _ = recycle_tx.send(vec![0_u8; payload_bytes]);
 
-    std::thread::spawn(move || {
+    let writer_handle = std::thread::spawn(move || {
         let mut stdin_pipe = stdin;
         let mut broken_pipe = false;
+        let mut frames_written = 0_u32;
         while let Ok(buf) = frame_rx.recv() {
             if let Err(err) = stdin_pipe.write_all(&buf) {
                 if err.kind() == ErrorKind::BrokenPipe {
@@ -298,16 +344,22 @@ where
                 let _ = writer_done_tx.send(WriterOutcome::Io(err));
                 return;
             }
+            frames_written = frames_written.saturating_add(1);
             let _ = recycle_tx.try_send(buf);
         }
-        if !broken_pipe {
-            let _ = stdin_pipe.flush();
+        if !broken_pipe && let Err(err) = stdin_pipe.flush() {
+            if err.kind() == ErrorKind::BrokenPipe {
+                broken_pipe = true;
+            } else {
+                let _ = writer_done_tx.send(WriterOutcome::Io(err));
+                return;
+            }
         }
         drop(stdin_pipe);
         let outcome = if broken_pipe {
-            WriterOutcome::BrokenPipe
+            WriterOutcome::BrokenPipe(frames_written)
         } else {
-            WriterOutcome::Ok
+            WriterOutcome::Ok(frames_written)
         };
         let _ = writer_done_tx.send(outcome);
     });
@@ -317,6 +369,7 @@ where
 
     let result = (|| -> Result<(), ExportError> {
         let mut frame_tx_opt = Some(frame_tx);
+        let mut writer_outcome: Option<WriterOutcome> = None;
 
         for (offset, frame_index) in (settings.start_frame..settings.end_frame).enumerate() {
             if cancel.load(Ordering::Acquire) {
@@ -359,16 +412,16 @@ where
                     Err(RecvTimeoutError::Timeout) => {
                         if let Ok(outcome) = writer_done_rx.try_recv() {
                             drop(frame_tx_opt.take());
-                            return match outcome {
+                            match outcome {
                                 WriterOutcome::Io(err) => {
                                     child_guard.kill_and_reap();
-                                    Err(ExportError::Io(err))
+                                    return Err(ExportError::Io(err));
                                 }
-                                WriterOutcome::BrokenPipe | WriterOutcome::Ok => {
-                                    // FFmpeg exited early; wait for status & stderr below.
+                                other => {
+                                    writer_outcome = Some(other);
                                     break Vec::new();
                                 }
-                            };
+                            }
                         }
                     }
                     Err(RecvTimeoutError::Disconnected) => break Vec::new(),
@@ -431,21 +484,31 @@ where
         drop(frame_tx_opt.take());
 
         // Wait cooperatively for the writer thread to finish flushing stdin while honoring `cancel`.
-        loop {
-            if cancel.load(Ordering::Acquire) {
-                child_guard.kill_and_reap();
-                return Err(ExportError::Cancelled);
-            }
-            match writer_done_rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(WriterOutcome::Ok | WriterOutcome::BrokenPipe) => break,
-                Ok(WriterOutcome::Io(err)) => {
+        if writer_outcome.is_none() {
+            loop {
+                if cancel.load(Ordering::Acquire) {
                     child_guard.kill_and_reap();
-                    return Err(ExportError::Io(err));
+                    return Err(ExportError::Cancelled);
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+                match writer_done_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(WriterOutcome::Io(err)) => {
+                        child_guard.kill_and_reap();
+                        return Err(ExportError::Io(err));
+                    }
+                    Ok(other) => {
+                        writer_outcome = Some(other);
+                        break;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
             }
         }
+
+        let frames_written = match writer_outcome {
+            Some(WriterOutcome::Ok(n) | WriterOutcome::BrokenPipe(n)) => n,
+            _ => 0,
+        };
 
         let status = child_guard.wait_cancellable(cancel)?;
         let stderr_text = {
@@ -477,8 +540,34 @@ where
             });
         }
 
+        if frames_written != total_frames {
+            let detail = if stderr_text.trim().is_empty() {
+                format!(
+                    "ffmpeg exited after writing only {frames_written} of {total_frames} frames"
+                )
+            } else {
+                format!(
+                    "ffmpeg exited after writing only {frames_written} of {total_frames} frames: {stderr_text}"
+                )
+            };
+            return Err(ExportError::FfmpegFailed {
+                exit_code: status.code(),
+                stderr: detail,
+            });
+        }
+
         Ok(())
     })();
+
+    // Ensure the process tree is terminated/reaped on any error/cancel path so both pipe
+    // worker threads unblock and join cleanly without leaking threads or descriptors.
+    if result.is_err() {
+        child_guard.kill_and_reap();
+    }
+    let _ = writer_done_rx.recv_timeout(Duration::from_millis(500));
+    let _ = stderr_rx.recv_timeout(Duration::from_millis(500));
+    let _ = writer_handle.join();
+    let _ = stderr_handle.join();
 
     // Explicitly keep `temp_audio_guard` alive until FFmpeg has completely exited, then drop it.
     drop(temp_audio_guard);

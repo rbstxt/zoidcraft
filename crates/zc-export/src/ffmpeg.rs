@@ -1,9 +1,12 @@
 //! FFmpeg binary probing, CLI argument builder (Spec 04 §4.3), and bounded stderr ring buffer.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::ExportError;
 use crate::settings::{AudioCodec, ExportContainer, ExportSettings, QualityMode, VideoCodec};
@@ -11,38 +14,141 @@ use crate::settings::{AudioCodec, ExportContainer, ExportSettings, QualityMode, 
 /// Maximum bytes retained from FFmpeg `stderr` (64 KiB ring buffer, zero unbounded growth).
 pub const MAX_STDERR_BYTES: usize = 64 * 1024;
 
+/// Maximum time allowed for `ffmpeg -version` probing before terminating and reaping the child.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Configures `cmd` so its spawned child leads its own process group on Unix, allowing
+/// safe, complete process-tree termination on cancel or timeout.
+pub(crate) fn configure_process_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Terminates the entire process tree rooted at `child` (wrapper + descendants) and reaps `child`.
+pub(crate) fn kill_process_tree_and_reap(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Resolves the FFmpeg executable path (`binary` if supplied, otherwise `"ffmpeg"` on `PATH`).
 #[must_use]
 pub fn resolve_ffmpeg_binary(binary: Option<&Path>) -> &Path {
     binary.unwrap_or_else(|| Path::new("ffmpeg"))
 }
 
-/// Probes whether `ffmpeg` is available and returns its version banner line.
+/// Probes whether `ffmpeg` is available and returns its version banner line, enforcing
+/// bounded stdout/stderr buffering and a hard timeout so a stalled executable can never hang.
 pub fn probe_ffmpeg(binary: Option<&Path>) -> Result<String, ExportError> {
+    probe_ffmpeg_with_timeout(binary, PROBE_TIMEOUT)
+}
+
+pub(crate) fn probe_ffmpeg_with_timeout(
+    binary: Option<&Path>,
+    timeout: Duration,
+) -> Result<String, ExportError> {
     let bin = resolve_ffmpeg_binary(binary);
-    let output = Command::new(bin)
-        .arg("-version")
+    let mut cmd = Command::new(bin);
+    cmd.arg("-version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                ExportError::FfmpegNotFound(bin.display().to_string())
-            } else {
-                ExportError::Io(err)
-            }
-        })?;
+        .stderr(Stdio::piped());
+    configure_process_group(&mut cmd);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut child = cmd.spawn().map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ExportError::FfmpegNotFound(bin.display().to_string())
+        } else {
+            ExportError::Io(err)
+        }
+    })?;
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let (out_tx, out_rx) = mpsc::channel::<String>();
+    let out_handle = std::thread::spawn(move || {
+        let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
+        if let Some(pipe) = stdout_pipe {
+            ring.drain_reader(pipe);
+        }
+        let _ = out_tx.send(ring.into_string_lossy());
+    });
+
+    let (err_tx, err_rx) = mpsc::channel::<String>();
+    let err_handle = std::thread::spawn(move || {
+        let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
+        if let Some(pipe) = stderr_pipe {
+            ring.drain_reader(pipe);
+        }
+        let _ = err_tx.send(ring.into_string_lossy());
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => {
+                if Instant::now() >= deadline {
+                    kill_process_tree_and_reap(&mut child);
+                    let _ = out_rx.recv_timeout(Duration::from_millis(200));
+                    let _ = err_rx.recv_timeout(Duration::from_millis(200));
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
+                    return Err(ExportError::FfmpegFailed {
+                        exit_code: None,
+                        stderr: format!(
+                            "ffmpeg -version probe timed out after {:.1}s",
+                            timeout.as_secs_f64()
+                        ),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+
+    let stdout = out_rx
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap_or_default();
+    let stderr = err_rx
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap_or_default();
+    let _ = out_handle.join();
+    let _ = err_handle.join();
+
+    if !status.success() {
         return Err(ExportError::FfmpegFailed {
-            exit_code: output.status.code(),
-            stderr,
+            exit_code: status.code(),
+            stderr: stderr.trim().to_string(),
         });
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let first_line = stdout
         .lines()
         .next()
@@ -71,16 +177,20 @@ pub fn build_ffmpeg_args(
     settings: &ExportSettings,
     temp_audio_wav: Option<&Path>,
 ) -> Result<Vec<String>, ExportError> {
-    build_ffmpeg_args_with_output(settings, temp_audio_wav, &settings.output_path)
+    build_ffmpeg_os_args_with_output(settings, temp_audio_wav, &settings.output_path).map(|args| {
+        args.into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    })
 }
 
-/// Builds deterministic FFmpeg CLI arguments targeting an explicit `output_path` (such as a
-/// sibling staging file) with an explicit `-f <muxer>` container flag.
-pub(crate) fn build_ffmpeg_args_with_output(
+/// Builds deterministic FFmpeg CLI arguments as raw [`OsString`] values targeting an explicit
+/// `output_path` (preserving non-UTF-8 Unix paths losslessly).
+pub(crate) fn build_ffmpeg_os_args_with_output(
     settings: &ExportSettings,
     temp_audio_wav: Option<&Path>,
     output_path: &Path,
-) -> Result<Vec<String>, ExportError> {
+) -> Result<Vec<OsString>, ExportError> {
     settings.validate()?;
     if matches!(settings.container, ExportContainer::PngSequence) {
         return Err(ExportError::InvalidSettings(
@@ -93,28 +203,28 @@ pub(crate) fn build_ffmpeg_args_with_output(
     let gop = (settings.fps * 2.0).round().max(1.0) as u32;
     let has_audio = temp_audio_wav.is_some() && settings.audio_codec != AudioCodec::None;
 
-    let mut args = vec![
-        "-y".to_string(),
-        "-hide_banner".to_string(),
-        "-loglevel".to_string(),
-        "error".to_string(),
-        "-f".to_string(),
-        "rawvideo".to_string(),
-        "-pix_fmt".to_string(),
-        "rgba".to_string(),
-        "-s".to_string(),
-        format!("{enc_w}x{enc_h}"),
-        "-r".to_string(),
-        fps_str,
-        "-i".to_string(),
-        "pipe:0".to_string(),
+    let mut args: Vec<OsString> = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-pix_fmt".into(),
+        "rgba".into(),
+        "-s".into(),
+        format!("{enc_w}x{enc_h}").into(),
+        "-r".into(),
+        fps_str.into(),
+        "-i".into(),
+        "pipe:0".into(),
     ];
 
     if let Some(audio_path) = temp_audio_wav
         && has_audio
     {
-        args.push("-i".to_string());
-        args.push(audio_path.to_string_lossy().into_owned());
+        args.push("-i".into());
+        args.push(audio_path.as_os_str().to_os_string());
     }
 
     match settings.video_codec {
@@ -128,7 +238,7 @@ pub(crate) fn build_ffmpeg_args_with_output(
             push_quality_args(&mut args, settings.quality, 51, false);
             args.extend([
                 "-g".into(),
-                gop.to_string(),
+                gop.to_string().into(),
                 "-pix_fmt".into(),
                 "yuv420p".into(),
                 "-colorspace".into(),
@@ -149,7 +259,7 @@ pub(crate) fn build_ffmpeg_args_with_output(
             push_quality_args(&mut args, settings.quality, 51, false);
             args.extend([
                 "-g".into(),
-                gop.to_string(),
+                gop.to_string().into(),
                 "-pix_fmt".into(),
                 "yuv420p".into(),
                 "-colorspace".into(),
@@ -172,7 +282,7 @@ pub(crate) fn build_ffmpeg_args_with_output(
                 "-row-mt".into(),
                 "1".into(),
                 "-g".into(),
-                gop.to_string(),
+                gop.to_string().into(),
                 "-pix_fmt".into(),
                 pix_fmt.into(),
             ]);
@@ -183,18 +293,18 @@ pub(crate) fn build_ffmpeg_args_with_output(
                 QualityMode::Crf(crf) => {
                     args.extend([
                         "-crf".into(),
-                        crf.min(63).to_string(),
+                        crf.min(63).to_string().into(),
                         "-b:v".into(),
                         "10000k".into(),
                     ]);
                 }
                 QualityMode::BitrateKbps(kbps) => {
-                    args.extend(["-b:v".into(), format!("{kbps}k")]);
+                    args.extend(["-b:v".into(), format!("{kbps}k").into()]);
                 }
             }
             args.extend([
                 "-g".into(),
-                gop.to_string(),
+                gop.to_string().into(),
                 "-pix_fmt".into(),
                 "yuv420p".into(),
             ]);
@@ -209,7 +319,7 @@ pub(crate) fn build_ffmpeg_args_with_output(
             push_quality_args(&mut args, settings.quality, 63, false);
             args.extend([
                 "-g".into(),
-                gop.to_string(),
+                gop.to_string().into(),
                 "-pix_fmt".into(),
                 "yuv420p".into(),
                 "-colorspace".into(),
@@ -229,9 +339,9 @@ pub(crate) fn build_ffmpeg_args_with_output(
                     "-c:a".into(),
                     "aac".into(),
                     "-b:a".into(),
-                    format!("{}k", settings.audio_bitrate_kbps),
+                    format!("{}k", settings.audio_bitrate_kbps).into(),
                     "-ar".into(),
-                    settings.sample_rate.to_string(),
+                    settings.sample_rate.to_string().into(),
                     "-ac".into(),
                     "2".into(),
                 ]);
@@ -245,9 +355,9 @@ pub(crate) fn build_ffmpeg_args_with_output(
                     "-c:a".into(),
                     "libopus".into(),
                     "-b:a".into(),
-                    format!("{}k", settings.audio_bitrate_kbps),
+                    format!("{}k", settings.audio_bitrate_kbps).into(),
                     "-ar".into(),
-                    opus_rate.to_string(),
+                    opus_rate.to_string().into(),
                     "-ac".into(),
                     "2".into(),
                 ]);
@@ -257,7 +367,7 @@ pub(crate) fn build_ffmpeg_args_with_output(
                     "-c:a".into(),
                     "pcm_s16le".into(),
                     "-ar".into(),
-                    settings.sample_rate.to_string(),
+                    settings.sample_rate.to_string().into(),
                     "-ac".into(),
                     "2".into(),
                 ]);
@@ -288,15 +398,15 @@ pub(crate) fn build_ffmpeg_args_with_output(
         ExportContainer::PngSequence => {}
     }
 
-    args.push(output_path.to_string_lossy().into_owned());
+    args.push(output_path.as_os_str().to_os_string());
     Ok(args)
 }
 
-fn push_quality_args(args: &mut Vec<String>, quality: QualityMode, max_crf: u8, vp9_cq: bool) {
+fn push_quality_args(args: &mut Vec<OsString>, quality: QualityMode, max_crf: u8, vp9_cq: bool) {
     match quality {
         QualityMode::Crf(crf) => {
             args.push("-crf".into());
-            args.push(crf.min(max_crf).to_string());
+            args.push(crf.min(max_crf).to_string().into());
             if vp9_cq {
                 args.push("-b:v".into());
                 args.push("0".into());
@@ -304,7 +414,7 @@ fn push_quality_args(args: &mut Vec<String>, quality: QualityMode, max_crf: u8, 
         }
         QualityMode::BitrateKbps(kbps) => {
             args.push("-b:v".into());
-            args.push(format!("{kbps}k"));
+            args.push(format!("{kbps}k").into());
         }
     }
 }

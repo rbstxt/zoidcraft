@@ -8,8 +8,8 @@
 //! and lossless preservation of unknown/Zoidium fields.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::Read;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -34,8 +34,8 @@ use crate::model::{
 };
 use crate::sha256::sha256_hex;
 use crate::zcraft::{
-    LimitedReader, MAX_ARCHIVE_ENTRIES, MAX_JSON_ENTRY_BYTES, MAX_UNCOMPRESSED_ARCHIVE_BYTES,
-    read_bounded_json_entry, validate_archive_path,
+    LimitedReader, MAX_ARCHIVE_ENTRIES, MAX_JSON_ENTRY_BYTES, MAX_RETAINED_ASSET_BYTES,
+    MAX_UNCOMPRESSED_ARCHIVE_BYTES, read_bounded_json_entry, validate_archive_path,
 };
 
 /// Result of importing a `.pz` archive, including non-fatal compatibility warnings.
@@ -45,15 +45,26 @@ pub struct PzImportResult {
     pub warnings: Vec<String>,
 }
 
-/// Imports a `.pz` archive from disk.
+/// Imports a `.pz` archive from disk by streaming directly through bounded decoders.
 pub fn import_pz(path: &Path) -> Result<PzImportResult, ProjectError> {
-    let bytes = fs::read(path)?;
-    import_pz_from_bytes(&bytes)
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
+    if meta.len() > MAX_UNCOMPRESSED_ARCHIVE_BYTES {
+        return Err(ProjectError::ArchiveTooLarge {
+            limit_bytes: MAX_UNCOMPRESSED_ARCHIVE_BYTES,
+        });
+    }
+    import_pz_from_reader(BufReader::new(file))
 }
 
 /// Imports a `.pz` archive from raw gzip+tar bytes with strict safety limits.
 pub fn import_pz_from_bytes(bytes: &[u8]) -> Result<PzImportResult, ProjectError> {
-    let decoder = GzDecoder::new(bytes);
+    import_pz_from_reader(bytes)
+}
+
+fn import_pz_from_reader<R: Read>(reader: R) -> Result<PzImportResult, ProjectError> {
+    let (limited_raw, raw_exceeded) = LimitedReader::new(reader, MAX_UNCOMPRESSED_ARCHIVE_BYTES);
+    let decoder = GzDecoder::new(limited_raw);
     let (limited, exceeded) = LimitedReader::new(decoder, MAX_UNCOMPRESSED_ARCHIVE_BYTES);
     let mut archive = tar::Archive::new(limited);
 
@@ -61,10 +72,11 @@ pub fn import_pz_from_bytes(bytes: &[u8]) -> Result<PzImportResult, ProjectError
     let mut project_val: Option<Value> = None;
     let mut zoidium_val: Option<Value> = None;
     let mut binary_entries: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut retained_asset_bytes = 0_u64;
     let mut entry_count = 0usize;
 
     let entries = archive.entries().map_err(|err| {
-        if exceeded.load(Ordering::SeqCst) {
+        if exceeded.load(Ordering::SeqCst) || raw_exceeded.load(Ordering::SeqCst) {
             ProjectError::ArchiveTooLarge {
                 limit_bytes: MAX_UNCOMPRESSED_ARCHIVE_BYTES,
             }
@@ -82,7 +94,7 @@ pub fn import_pz_from_bytes(bytes: &[u8]) -> Result<PzImportResult, ProjectError
         }
 
         let mut entry = entry_res.map_err(|err| {
-            if exceeded.load(Ordering::SeqCst) {
+            if exceeded.load(Ordering::SeqCst) || raw_exceeded.load(Ordering::SeqCst) {
                 ProjectError::ArchiveTooLarge {
                     limit_bytes: MAX_UNCOMPRESSED_ARCHIVE_BYTES,
                 }
@@ -126,10 +138,25 @@ pub fn import_pz_from_bytes(bytes: &[u8]) -> Result<PzImportResult, ProjectError
                 zoidium_val = Some(serde_json::from_slice(&raw)?);
             }
             _ => {
+                let declared_size = entry.header().size().unwrap_or(0);
+                let remaining_budget =
+                    MAX_RETAINED_ASSET_BYTES.saturating_sub(retained_asset_bytes);
+                if declared_size > remaining_budget {
+                    return Err(ProjectError::ArchiveTooLarge {
+                        limit_bytes: MAX_RETAINED_ASSET_BYTES,
+                    });
+                }
                 let mut data = Vec::new();
-                entry
+                let mut bounded = (&mut entry).take(remaining_budget.saturating_add(1));
+                bounded
                     .read_to_end(&mut data)
                     .map_err(|err| map_limit(ProjectError::Io(err), &exceeded))?;
+                if (data.len() as u64) > remaining_budget {
+                    return Err(ProjectError::ArchiveTooLarge {
+                        limit_bytes: MAX_RETAINED_ASSET_BYTES,
+                    });
+                }
+                retained_asset_bytes = retained_asset_bytes.saturating_add(data.len() as u64);
                 binary_entries.insert(normalized, data);
             }
         }
@@ -833,14 +860,24 @@ fn parse_video_clip(
     warnings: &mut Vec<String>,
 ) -> VideoClip {
     let obj = val.as_object();
-    let start = obj
+    let raw_start = obj
         .and_then(|o| o.get("start"))
         .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
         .unwrap_or(0.0);
-    let length = obj
+    let raw_length = obj
         .and_then(|o| o.get("length"))
         .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
         .unwrap_or(0.0);
+    let (start, length) = if raw_start < 0.0 {
+        warnings.push(format!(
+            "normalized negative video clip start ({raw_start}) to 0.0"
+        ));
+        (0.0, (raw_length + raw_start).max(1.0))
+    } else {
+        (raw_start, raw_length.max(0.0))
+    };
     let link = obj.and_then(|o| o.get("link")).and_then(value_as_u32);
     let props = obj
         .and_then(|o| o.get("properties"))
@@ -891,14 +928,21 @@ fn parse_video_clip(
 
 fn parse_audio_clip(val: &Value, fps: u32) -> AudioClip {
     let obj = val.as_object();
-    let start = obj
+    let raw_start = obj
         .and_then(|o| o.get("start"))
         .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
         .unwrap_or(0.0);
-    let length = obj
+    let raw_length = obj
         .and_then(|o| o.get("length"))
         .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
         .unwrap_or(0.0);
+    let (start, length) = if raw_start < 0.0 {
+        (0.0, (raw_length + raw_start).max(1.0))
+    } else {
+        (raw_start, raw_length.max(0.0))
+    };
     let link = obj.and_then(|o| o.get("link")).and_then(value_as_u32);
     let props = obj
         .and_then(|o| o.get("properties"))

@@ -422,7 +422,7 @@ fn cmd_render(
             )
         })?;
     }
-    img.save(out)
+    img.save_with_format(out, image::ImageFormat::Png)
         .map_err(|e| format!("failed to save PNG {}: {e}", out.display()))?;
 
     let non_black = img

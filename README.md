@@ -66,4 +66,12 @@ zoidcraft-cli control
 
 ## Licensing & third-party notices
 
-ZoidCraft is authored from clean-room specifications and licensed under the MIT License (`LICENSE`). Bundled third-party assets (including Geist Mono under the SIL Open Font License 1.1) are documented in `THIRD_PARTY_LICENSES.md`.
+ZoidCraft is authored from clean-room specifications and licensed under the MIT License (`LICENSE`). Bundled fonts (Geist Mono under SIL OFL 1.1 and egui default fallback fonts) and all statically linked Rust crates are documented with full license texts in `THIRD_PARTY_LICENSES.md`, which is shipped inside every release archive.
+
+### macOS unsigned binaries
+
+Prebuilt macOS release archives are not Apple-notarized. If Gatekeeper blocks launching `zoidcraft` or `zoidcraft-cli` after extraction, clear the quarantine attribute on the extracted folder:
+
+```bash
+xattr -dr com.apple.quarantine ./zoidcraft-macOS-arm64
+```

@@ -24,8 +24,9 @@ use egui::{Align2, Area, Color32, CornerRadius, Frame, Id, Key, Order, Pos2, Rec
 use serde_json::{Value, json};
 use zc_anim::{InterpolationMode, eval_easing};
 use zc_audio::{
-    AudioBuffer, AudioClipScheduleItem, ClipAudioSampleParams, STANDARD_SAMPLE_RATE, WaveformPeaks,
-    decode_audio_bytes, effective_playback_rate, try_mix_offline_stereo_animated,
+    AudioBuffer, AudioClipScheduleItem, AudioOutputHandle, ClipAudioSampleParams,
+    MasterPlaybackClock, STANDARD_SAMPLE_RATE, WaveformPeaks, decode_audio_bytes,
+    effective_playback_rate, try_mix_offline_stereo_animated,
 };
 use zc_export::{
     AudioCodec, ExportContainer as CoreExportContainer, ExportError, ExportProgress, ExportReport,
@@ -352,6 +353,22 @@ struct ZoidCraftApp {
     decoded_audio: HashMap<String, Arc<AudioBuffer>>,
     /// Precomputed waveform peaks keyed by project `asset_id`.
     asset_waveform_peaks: HashMap<String, AudioWaveformPeaks>,
+    /// Sample-accurate playback clock driving live CPAL audio output when available.
+    audio_clock: MasterPlaybackClock,
+    /// Active OS audio output stream (kept alive while audio playback is active).
+    audio_output: Option<AudioOutputHandle>,
+    /// Fingerprint of the timeline audio mix currently loaded into `audio_output`.
+    audio_mix_hash: u64,
+    /// Last mix fingerprint for which opening `audio_output` was attempted (avoids retry storms on headless devices).
+    audio_stream_attempted_hash: u64,
+    last_audio_epoch: u64,
+    last_audio_playing: bool,
+    last_audio_speed: f64,
+    last_audio_loop: bool,
+    last_audio_fps: f64,
+    last_audio_seq_len: f64,
+    /// Non-blocking startup `ffmpeg -version` probe channel.
+    ffmpeg_probe_rx: Option<Receiver<Result<String, ExportError>>>,
     active_export: Option<ActiveExportJob>,
     pending_eyedropper: Option<(String, String)>,
     pending_unsaved_dialog: Option<PendingUnsavedAction>,
@@ -385,17 +402,18 @@ impl ZoidCraftApp {
         let mut workspace = Cm3Workspace::new();
         sync_export_settings_from_session(&session, &mut workspace.panels.export_settings);
 
-        // Probe FFmpeg once at startup so the Export panel reflects exact local availability.
-        match probe_ffmpeg(None) {
-            Ok(version) => {
-                workspace.panels.export_status.ffmpeg_available = true;
-                workspace.panels.export_status.ffmpeg_version = version;
-            }
-            Err(err) => {
-                workspace.panels.export_status.ffmpeg_available = false;
-                workspace.panels.export_status.ffmpeg_version = format!("unavailable ({err})");
-            }
-        }
+        // Probe FFmpeg asynchronously off the UI thread so startup can never hang if `ffmpeg` stalls.
+        workspace.panels.export_status.ffmpeg_available = false;
+        workspace.panels.export_status.ffmpeg_version = "checking...".to_owned();
+        let (probe_tx, probe_rx) = mpsc::channel::<Result<String, ExportError>>();
+        thread::spawn(move || {
+            let _ = probe_tx.send(probe_ffmpeg(None));
+        });
+
+        let init_fps = session.document().fps.max(1.0);
+        let init_seq_len = session.document().sequence_length.max(1.0);
+        let audio_clock = MasterPlaybackClock::new(init_fps, init_seq_len);
+        audio_clock.set_loop(session.playback.looping);
 
         let renderer = match cc.wgpu_render_state.clone() {
             Some(render_state) => match ViewportGpuPresenter::from_eframe(render_state) {
@@ -411,6 +429,9 @@ impl ZoidCraftApp {
             }
         };
 
+        let init_epoch = session.playback.epoch_id;
+        let init_loop = session.playback.looping;
+
         Self {
             session,
             theme: theme.clone(),
@@ -423,6 +444,17 @@ impl ZoidCraftApp {
             current_file: None,
             decoded_audio: HashMap::new(),
             asset_waveform_peaks: HashMap::new(),
+            audio_clock,
+            audio_output: None,
+            audio_mix_hash: 0,
+            audio_stream_attempted_hash: 0,
+            last_audio_epoch: init_epoch,
+            last_audio_playing: false,
+            last_audio_speed: 0.0,
+            last_audio_loop: init_loop,
+            last_audio_fps: init_fps,
+            last_audio_seq_len: init_seq_len,
+            ffmpeg_probe_rx: Some(probe_rx),
             active_export: None,
             pending_eyedropper: None,
             pending_unsaved_dialog: None,
@@ -458,6 +490,42 @@ impl ZoidCraftApp {
         }
     }
 
+    fn poll_ffmpeg_probe(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.ffmpeg_probe_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(version)) => {
+                self.workspace.panels.export_status.ffmpeg_available = true;
+                self.workspace.panels.export_status.ffmpeg_version = version;
+                self.ffmpeg_probe_rx = None;
+            }
+            Ok(Err(err)) => {
+                self.workspace.panels.export_status.ffmpeg_available = false;
+                self.workspace.panels.export_status.ffmpeg_version = format!("unavailable ({err})");
+                self.ffmpeg_probe_rx = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.workspace.panels.export_status.ffmpeg_available = false;
+                self.workspace.panels.export_status.ffmpeg_version =
+                    "unavailable (probe aborted)".to_owned();
+                self.ffmpeg_probe_rx = None;
+            }
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+    }
+
+    fn reset_live_audio_output(&mut self) {
+        self.audio_clock.pause();
+        self.audio_output = None;
+        self.audio_mix_hash = 0;
+        self.audio_stream_attempted_hash = 0;
+        self.last_audio_playing = false;
+        self.last_audio_speed = 0.0;
+    }
+
     fn tick_playback_and_meter(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let dt = now
@@ -467,10 +535,89 @@ impl ZoidCraftApp {
         self.last_tick = now;
 
         let fps = self.session.document().fps.max(1.0);
-        let seq_len = self.session.document().sequence_length;
+        let seq_len = self.session.document().sequence_length.max(1.0);
+        let loop_enabled = self.session.playback.looping;
 
-        if self.session.playback.is_playing() {
-            self.session.playback.advance(dt, fps, seq_len);
+        if (fps - self.last_audio_fps).abs() > 1e-6
+            || (seq_len - self.last_audio_seq_len).abs() > 1e-6
+        {
+            self.audio_clock.set_timeline_config(fps, seq_len);
+            self.last_audio_fps = fps;
+            self.last_audio_seq_len = seq_len;
+        }
+        if loop_enabled != self.last_audio_loop {
+            self.audio_clock.set_loop(loop_enabled);
+            self.last_audio_loop = loop_enabled;
+        }
+
+        let is_playing = self.session.playback.is_playing();
+        let speed = self.session.playback.speed;
+        let epoch = self.session.playback.epoch_id;
+
+        // Lazily build and attach the CPAL live audio output stream when playing with audio clips.
+        if is_playing {
+            let mix_hash = compute_audio_mix_hash(&self.session, &self.decoded_audio, fps, seq_len);
+            if mix_hash == 0 {
+                if self.audio_output.is_some() {
+                    self.reset_live_audio_output();
+                }
+            } else if self.audio_mix_hash != mix_hash
+                && (self.audio_output.is_some() || self.audio_stream_attempted_hash != mix_hash)
+            {
+                self.audio_output = None;
+                self.audio_stream_attempted_hash = mix_hash;
+                let end_frame = seq_len.ceil().max(1.0) as u32;
+                if let Ok(Some(mix)) = mix_sequence_audio_stereo(
+                    &self.session,
+                    &self.decoded_audio,
+                    STANDARD_SAMPLE_RATE,
+                    fps,
+                    0,
+                    end_frame,
+                ) {
+                    self.audio_clock
+                        .seek_preserving_playback(self.session.playback.current_frame);
+                    self.audio_clock.set_speed(speed);
+                    if let Some(handle) =
+                        self.audio_clock.try_start_audio_output(Some(Arc::new(mix)))
+                    {
+                        self.audio_output = Some(handle);
+                        self.audio_mix_hash = mix_hash;
+                    }
+                }
+            }
+        }
+
+        // Propagate transport changes (play, pause, speed, user seek) into the master audio clock.
+        let transport_changed = epoch != self.last_audio_epoch
+            || is_playing != self.last_audio_playing
+            || (speed - self.last_audio_speed).abs() > 1e-6;
+        if transport_changed {
+            if is_playing {
+                self.audio_clock
+                    .seek_preserving_playback(self.session.playback.current_frame);
+                self.audio_clock.set_speed(speed);
+            } else {
+                self.audio_clock
+                    .set_frame(self.session.playback.current_frame);
+            }
+            self.last_audio_epoch = epoch;
+            self.last_audio_playing = is_playing;
+            self.last_audio_speed = speed;
+        }
+
+        if is_playing {
+            if self.audio_output.is_some() && self.audio_clock.snapshot().hardware_clock_active {
+                let exact = self.audio_clock.exact_frame();
+                self.session.playback.current_frame = exact;
+                if !self.audio_clock.is_playing() {
+                    self.session.playback.speed = 0.0;
+                    self.last_audio_playing = false;
+                    self.last_audio_speed = 0.0;
+                }
+            } else {
+                self.session.playback.advance(dt, fps, seq_len);
+            }
             let (rms, peak) = sample_live_audio_meter(
                 &self.session,
                 &self.decoded_audio,
@@ -708,6 +855,7 @@ impl ZoidCraftApp {
             let _ = self.session.selection.select_clip(cid, Some(&ckind), false);
         }
         self.current_file = path;
+        self.reset_live_audio_output();
         self.rebuild_audio_caches();
         self.viewport.camera.reset();
         sync_export_settings_from_session(
@@ -723,10 +871,12 @@ impl ZoidCraftApp {
         let target_path = if include_assets && let Some(existing) = self.current_file.clone() {
             existing
         } else {
-            let default_name = format!(
-                "{}.zcraft",
-                sanitize_filename(&self.session.document().project_name)
-            );
+            let base = sanitize_filename(&self.session.document().project_name);
+            let default_name = if include_assets {
+                format!("{base}.zcraft")
+            } else {
+                format!("{base}-no-assets.zcraft")
+            };
             let Some(chosen) = rfd::FileDialog::new()
                 .add_filter("ZoidCraft Project", &["zcraft"])
                 .set_file_name(default_name)
@@ -736,6 +886,14 @@ impl ZoidCraftApp {
             };
             chosen
         };
+
+        if !include_assets
+            && let Err(msg) =
+                validate_save_without_assets_target(self.current_file.as_deref(), &target_path)
+        {
+            self.show_toast(msg);
+            return false;
+        }
 
         let mut project_to_save = self.session.project.clone();
         for dep in self.session.active_plugin_dependencies() {
@@ -821,10 +979,23 @@ impl ZoidCraftApp {
             None
         };
 
+        let source_url = fs::canonicalize(&path)
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .into_owned();
+
+        let tx_started = self
+            .session
+            .begin_transaction(format!("Import {filename}"))
+            .is_ok();
+
         let asset_id = self
             .session
             .project
             .insert_binary_asset(kind, filename.clone(), bytes);
+        if let Some(rec) = self.session.project.assets.get_mut(&asset_id) {
+            rec.url = Some(source_url);
+        }
         self.session.project.media.push(MediaItem {
             id: Uuid::new_v4(),
             name: filename.clone(),
@@ -839,43 +1010,49 @@ impl ZoidCraftApp {
                 .round()
                 .max(1.0);
             let track_id = if let Some(first_a) = self.session.document().audio_tracks.first() {
-                first_a.id.clone()
+                Some(first_a.id.clone())
             } else if let Ok(res) = self.session.execute(Command::AddAudioTrack { name: None })
                 && let Some(tid) = res.get("track_id").and_then(Value::as_str)
             {
-                tid.to_owned()
+                Some(tid.to_owned())
             } else {
-                self.show_toast(format!("Imported audio asset {filename}"));
-                return;
+                None
             };
 
-            let start = self.session.playback.current_frame.round().max(0.0);
-            if let Ok(res) = self.session.execute(Command::AddClip {
-                track_id,
-                kind: "audio".to_owned(),
-                name: Some(filename.clone()),
-                start,
-                length: dur_frames,
-            }) && let Some(clip_id) = res.get("clip_id").and_then(Value::as_str)
-            {
-                // Associate audio asset ID on the synchronized project AudioClip.
-                for at in &mut self.session.project.sequence.audio_tracks {
-                    if let Some(ac) = at.clips.iter_mut().find(|c| c.id.to_string() == clip_id) {
-                        ac.media = Some(asset_id.clone());
+            if let Some(track_id) = track_id {
+                let start = self.session.playback.current_frame.round().max(0.0);
+                if let Ok(res) = self.session.execute(Command::AddClip {
+                    track_id,
+                    kind: "audio".to_owned(),
+                    name: Some(filename.clone()),
+                    start,
+                    length: dur_frames,
+                }) && let Some(clip_id) = res.get("clip_id").and_then(Value::as_str)
+                {
+                    // Associate audio asset ID on the synchronized project AudioClip.
+                    for at in &mut self.session.project.sequence.audio_tracks {
+                        if let Some(ac) = at.clips.iter_mut().find(|c| c.id.to_string() == clip_id)
+                        {
+                            ac.media = Some(asset_id.clone());
+                        }
                     }
+                    let ui_peaks = AudioWaveformPeaks {
+                        points_per_sec: f64::from(peaks.points_per_sec()),
+                        min_buf: peaks.min_peaks().to_vec(),
+                        max_buf: peaks.max_peaks().to_vec(),
+                    };
+                    self.asset_waveform_peaks
+                        .insert(asset_id.clone(), ui_peaks.clone());
+                    self.timeline
+                        .audio_peaks
+                        .insert(clip_id.to_owned(), ui_peaks);
+                    self.decoded_audio.insert(asset_id, Arc::new(audio_buf));
                 }
-                let ui_peaks = AudioWaveformPeaks {
-                    points_per_sec: f64::from(peaks.points_per_sec()),
-                    min_buf: peaks.min_peaks().to_vec(),
-                    max_buf: peaks.max_peaks().to_vec(),
-                };
-                self.asset_waveform_peaks
-                    .insert(asset_id.clone(), ui_peaks.clone());
-                self.timeline
-                    .audio_peaks
-                    .insert(clip_id.to_owned(), ui_peaks);
-                self.decoded_audio.insert(asset_id, Arc::new(audio_buf));
             }
+        }
+
+        if tx_started {
+            let _ = self.session.commit_transaction(true);
         }
 
         self.show_toast(format!("Imported {filename}"));
@@ -894,13 +1071,13 @@ impl ZoidCraftApp {
                     let Some(rec) = self.session.project.assets.get(asset_key) else {
                         continue;
                     };
-                    let Some(bytes) = rec.bytes.as_deref() else {
+                    let Some(bytes) = resolve_asset_bytes(rec) else {
                         continue;
                     };
                     let ext = Path::new(&rec.filename)
                         .extension()
                         .and_then(|e| e.to_str());
-                    if let Ok(buf) = decode_audio_bytes(bytes, ext) {
+                    if let Ok(buf) = decode_audio_bytes(&bytes, ext) {
                         let peaks = WaveformPeaks::from_audio_buffer(&buf);
                         self.asset_waveform_peaks.insert(
                             asset_key.to_owned(),
@@ -1340,6 +1517,7 @@ impl ZoidCraftApp {
 
 impl Drop for ZoidCraftApp {
     fn drop(&mut self) {
+        self.reset_live_audio_output();
         if let Some(mut job) = self.active_export.take() {
             job.cancel_and_join();
         }
@@ -1388,6 +1566,7 @@ impl eframe::App for ZoidCraftApp {
             self.pending_unsaved_dialog = Some(PendingUnsavedAction::CloseWindow);
         }
         self.workspace.suppress_shortcuts = self.pending_unsaved_dialog.is_some();
+        self.poll_ffmpeg_probe(&ctx);
         self.sync_timeline_audio_peaks();
         self.tick_playback_and_meter(&ctx);
         self.poll_export_worker(&ctx);
@@ -1903,6 +2082,131 @@ fn collect_in_range_audio_arcs(
     selected
 }
 
+fn resolve_asset_bytes(rec: &zc_project::AssetRecord) -> Option<std::borrow::Cow<'_, [u8]>> {
+    if let Some(bytes) = rec.bytes.as_deref() {
+        return Some(std::borrow::Cow::Borrowed(bytes));
+    }
+    let raw_url = rec.url.as_deref()?;
+    let path_str = raw_url.strip_prefix("file://").unwrap_or(raw_url);
+    let path = Path::new(path_str);
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > 256 * 1024 * 1024 {
+        return None;
+    }
+    fs::read(path).ok().map(std::borrow::Cow::Owned)
+}
+
+fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Ok(ca), Ok(cb)) = (fs::canonicalize(a), fs::canonicalize(b))
+        && ca == cb
+    {
+        return true;
+    }
+    // Also check canonical parent + exact filename in case one path does not exist yet.
+    if let (Some(ap), Some(af), Some(bp), Some(bf)) =
+        (a.parent(), a.file_name(), b.parent(), b.file_name())
+        && af == bf
+        && let (Ok(cap), Ok(cbp)) = (fs::canonicalize(ap), fs::canonicalize(bp))
+        && cap == cbp
+    {
+        return true;
+    }
+    false
+}
+
+fn validate_save_without_assets_target(
+    current_file: Option<&Path>,
+    target_path: &Path,
+) -> Result<(), String> {
+    if let Some(current) = current_file
+        && paths_refer_to_same_file(current, target_path)
+    {
+        return Err(
+            "Choose a separate output path when saving without assets so embedded media in the current project is preserved."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn compute_audio_mix_hash(
+    session: &Session,
+    decoded_audio: &HashMap<String, Arc<AudioBuffer>>,
+    fps: f64,
+    seq_len: f64,
+) -> u64 {
+    let clip_assets = collect_clip_audio_assets(&session.project);
+    let doc = session.document();
+    let any_solo = doc.audio_tracks.iter().any(|t| t.enabled && t.solo);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut active_clips = 0_usize;
+
+    let mut mix_u64 = |v: u64| {
+        hash ^= v;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+
+    mix_u64(fps.to_bits());
+    mix_u64(seq_len.to_bits());
+
+    for track in &doc.audio_tracks {
+        let audible = if any_solo {
+            track.enabled && track.solo
+        } else {
+            track.enabled
+        };
+        if !audible {
+            continue;
+        }
+        for clip in &track.clips {
+            if clip.length <= 0.0 {
+                continue;
+            }
+            let Some(asset_id) = clip_assets.get(&clip.id) else {
+                continue;
+            };
+            let has_audio = decoded_audio.contains_key(asset_id)
+                || session
+                    .project
+                    .assets
+                    .get(asset_id)
+                    .is_some_and(|r| r.bytes.is_some() || r.url.is_some());
+            if !has_audio {
+                continue;
+            }
+            active_clips += 1;
+            for b in asset_id.as_bytes() {
+                mix_u64(u64::from(*b));
+            }
+            mix_u64(clip.start.to_bits());
+            mix_u64(clip.length.to_bits());
+            mix_u64(clip.time_start.to_bits());
+            mix_u64(clip.time_end.to_bits());
+            for prop_name in ["volume", "pan"] {
+                if let Some(prop) = clip.properties.get(prop_name) {
+                    mix_u64(u64::from(prop.animated));
+                    if let Some(n) = prop.default_value.as_f64() {
+                        mix_u64(n.to_bits());
+                    }
+                    mix_u64(prop.keyframes.len() as u64);
+                    for kf in &prop.keyframes {
+                        mix_u64(kf.frame.to_bits());
+                        if let Some(n) = kf.value.as_f64() {
+                            mix_u64(n.to_bits());
+                        }
+                        mix_u64(u64::from(kf.tween));
+                    }
+                }
+            }
+        }
+    }
+
+    if active_clips == 0 { 0 } else { hash.max(1) }
+}
+
 fn build_offline_export_audio(
     session: &Session,
     cached_buffers: &HashMap<String, Arc<AudioBuffer>>,
@@ -1916,6 +2220,25 @@ fn build_offline_export_audio(
     {
         return Ok(None);
     }
+    let sr = settings.sample_rate.max(STANDARD_SAMPLE_RATE);
+    mix_sequence_audio_stereo(
+        session,
+        cached_buffers,
+        sr,
+        seq_fps,
+        start_seq_frame,
+        end_seq_frame,
+    )
+}
+
+fn mix_sequence_audio_stereo(
+    session: &Session,
+    cached_buffers: &HashMap<String, Arc<AudioBuffer>>,
+    sample_rate: u32,
+    seq_fps: f64,
+    start_seq_frame: u32,
+    end_seq_frame: u32,
+) -> Result<Option<Vec<[f32; 2]>>, String> {
     let clip_assets = collect_clip_audio_assets(&session.project);
     if clip_assets.is_empty() && cached_buffers.is_empty() {
         return Ok(None);
@@ -1955,13 +2278,13 @@ fn build_offline_export_audio(
                     let Some(rec) = session.project.assets.get(asset_id) else {
                         continue;
                     };
-                    let Some(bytes) = rec.bytes.as_deref() else {
+                    let Some(bytes) = resolve_asset_bytes(rec) else {
                         continue;
                     };
                     let ext = Path::new(&rec.filename)
                         .extension()
                         .and_then(|e| e.to_str());
-                    let decoded = decode_audio_bytes(bytes, ext).map_err(|err| {
+                    let decoded = decode_audio_bytes(&bytes, ext).map_err(|err| {
                         format!("failed to decode audio asset `{asset_id}`: {err}")
                     })?;
                     buffers.insert(asset_id.clone(), Arc::new(decoded));
@@ -1988,7 +2311,7 @@ fn build_offline_export_audio(
         return Ok(None);
     }
     let seq_span_frames = f64::from(end_seq_frame.saturating_sub(start_seq_frame).max(1));
-    let sr = settings.sample_rate.max(STANDARD_SAMPLE_RATE);
+    let sr = sample_rate.max(STANDARD_SAMPLE_RATE);
     try_mix_offline_stereo_animated(
         seq_span_frames,
         seq_fps,
@@ -2007,7 +2330,7 @@ fn build_offline_export_audio(
         },
     )
     .map(Some)
-    .map_err(|err| format!("failed to mix export audio: {err}"))
+    .map_err(|err| format!("failed to mix sequence audio: {err}"))
 }
 
 fn sample_live_audio_meter(
@@ -2253,5 +2576,58 @@ mod tests {
             matches!(res, Some(Err(ref msg)) if msg.contains("terminated unexpectedly")),
             "expected disconnected worker error, got {res:?}"
         );
+    }
+
+    #[test]
+    fn save_without_assets_rejects_overwriting_current_project_file() {
+        let dir = std::env::temp_dir();
+        let current = dir.join("zoidcraft_current_test.zcraft");
+        let separate = dir.join("zoidcraft_current_test-no-assets.zcraft");
+
+        assert!(
+            validate_save_without_assets_target(Some(&current), &current).is_err(),
+            "saving without assets over the active project file must be refused"
+        );
+        assert!(
+            validate_save_without_assets_target(Some(&current), &separate).is_ok(),
+            "saving without assets to a distinct path must be allowed"
+        );
+        assert!(
+            validate_save_without_assets_target(None, &current).is_ok(),
+            "saving without assets when no current file exists must be allowed"
+        );
+    }
+
+    #[test]
+    fn media_import_transaction_marks_session_dirty_and_undoes_cleanly() {
+        let mut session = Session::new();
+        session.mark_saved();
+        assert!(!session.is_dirty());
+
+        session
+            .begin_transaction("Import logo.png")
+            .expect("begin import tx");
+        let asset_id =
+            session
+                .project
+                .insert_binary_asset(AssetKind::Image, "logo.png", vec![1, 2, 3, 4]);
+        session.project.media.push(MediaItem {
+            id: Uuid::new_v4(),
+            name: "logo.png".to_owned(),
+            asset_id: Some(asset_id.clone()),
+            kind: AssetKind::Image,
+            preserved: BTreeMap::new(),
+        });
+        assert!(session.commit_transaction(true).expect("commit import tx"));
+
+        assert!(
+            session.is_dirty(),
+            "media-only import must mark session dirty so unsaved-changes prompt triggers"
+        );
+        assert!(session.project.assets.contains_key(&asset_id));
+
+        session.execute(Command::Undo).expect("undo media import");
+        assert!(!session.is_dirty());
+        assert!(!session.project.assets.contains_key(&asset_id));
     }
 }

@@ -159,3 +159,68 @@ fn rapid_600_edits_undo_redo_and_transactions_respect_memory_and_entry_bounds() 
     }
     assert_eq!(redone, undone);
 }
+
+#[test]
+fn reopened_project_allocates_unique_ids_without_collision() {
+    let mut session1 = Session::new();
+    let t1 = session1
+        .execute(Command::AddVideoTrack {
+            name: Some("Track A".to_owned()),
+        })
+        .expect("add track 1");
+    let t1_id = t1["track_id"].as_str().expect("track_id").to_owned();
+    let c1 = session1
+        .execute(Command::AddClip {
+            track_id: t1_id.clone(),
+            kind: "scene".to_owned(),
+            name: Some("Clip A".to_owned()),
+            start: 0.0,
+            length: 30.0,
+        })
+        .expect("add clip 1");
+    let c1_id = c1["clip_id"].as_str().expect("clip_id").to_owned();
+
+    let saved = zc_project::save_zcraft_to_bytes(&session1.project).expect("save zcraft");
+    let loaded = zc_project::load_zcraft_from_bytes(&saved).expect("load zcraft");
+
+    let mut session2 = Session::from_project(loaded, zc_plugin::PluginRegistry::new());
+    let t2 = session2
+        .execute(Command::AddVideoTrack {
+            name: Some("Track B".to_owned()),
+        })
+        .expect("add track 2");
+    let t2_id = t2["track_id"].as_str().expect("track_id").to_owned();
+    let c2 = session2
+        .execute(Command::AddClip {
+            track_id: t2_id.clone(),
+            kind: "scene".to_owned(),
+            name: Some("Clip B".to_owned()),
+            start: 0.0,
+            length: 30.0,
+        })
+        .expect("add clip 2");
+    let c2_id = c2["clip_id"].as_str().expect("clip_id").to_owned();
+
+    assert_ne!(t1_id, t2_id, "reopened project reused existing track ID");
+    assert_ne!(c1_id, c2_id, "reopened project reused existing clip ID");
+    assert_eq!(session2.project.sequence.video_tracks.len(), 3);
+}
+
+#[test]
+fn left_trim_negative_start_clip_returns_error_instead_of_panicking() {
+    let mut project = zc_project::Project::new_cm3_default();
+    project.sequence.video_tracks[0].clips[0].start = -5.0;
+    project.sequence.video_tracks[0].clips[0].length = 3.0;
+    let clip_id = project.sequence.video_tracks[0].clips[0].id.to_string();
+
+    let mut session = Session::from_project(project, zc_plugin::PluginRegistry::new());
+    let res = session.execute(Command::TrimClipLeft {
+        clip_id,
+        delta_frames: 1.0,
+        rate_stretch: false,
+    });
+    assert!(
+        res.is_err(),
+        "left-trimming an inverted-range negative-start clip must return Err instead of panicking"
+    );
+}

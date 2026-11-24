@@ -340,6 +340,33 @@ pub fn translate_glsl_es100(source: &str) -> Result<CompiledCustomShader, Shader
     translate_glsl_es100_with_options(source, &CompileOptions::default())
 }
 
+/// Maximum allowed GLSL source size before or after preprocessing (512 KiB).
+pub const MAX_GLSL_SOURCE_BYTES: usize = 512 * 1024;
+/// Maximum allowed call/rewrite recursion depth in the GLSL ES 1.00 shim.
+pub const MAX_REWRITE_DEPTH: usize = 64;
+/// Maximum allowed tokens emitted during GLSL rewriting.
+pub const MAX_REWRITE_TOKENS: usize = 200_000;
+
+struct RewriteBudget {
+    tokens_emitted: usize,
+}
+
+impl RewriteBudget {
+    const fn new() -> Self {
+        Self { tokens_emitted: 0 }
+    }
+
+    fn charge(&mut self, count: usize) -> Result<(), ShaderError> {
+        self.tokens_emitted = self.tokens_emitted.saturating_add(count);
+        if self.tokens_emitted > MAX_REWRITE_TOKENS {
+            return Err(ShaderError::GlslParse(format!(
+                "shader rewrite exceeded {MAX_REWRITE_TOKENS} token budget"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Translates a Panzoid GLSL ES 1.00 fragment shader into validated WGSL with custom defines/includes.
 pub fn translate_glsl_es100_with_options(
     source: &str,
@@ -348,12 +375,33 @@ pub fn translate_glsl_es100_with_options(
     if source.trim().is_empty() {
         return Err(ShaderError::EmptySource);
     }
+    if source.len() > MAX_GLSL_SOURCE_BYTES {
+        return Err(ShaderError::GlslParse(format!(
+            "shader source ({} bytes) exceeds {} byte limit",
+            source.len(),
+            MAX_GLSL_SOURCE_BYTES
+        )));
+    }
 
     let mut included = HashSet::new();
     let mut int_defines = harvest_option_int_defines(&options.defines);
     let preprocessed = preprocess_lines(source, options, &mut included, &mut int_defines, 0)?;
+    if preprocessed.len() > MAX_GLSL_SOURCE_BYTES {
+        return Err(ShaderError::GlslParse(format!(
+            "preprocessed shader ({} bytes) exceeds {} byte limit",
+            preprocessed.len(),
+            MAX_GLSL_SOURCE_BYTES
+        )));
+    }
 
     let tokens = tokenize(&preprocessed);
+    if tokens.len() > MAX_REWRITE_TOKENS {
+        return Err(ShaderError::GlslParse(format!(
+            "shader token count ({}) exceeds {} limit",
+            tokens.len(),
+            MAX_REWRITE_TOKENS
+        )));
+    }
     reject_unsupported_features(&tokens)?;
 
     let extracted = extract_declarations(&tokens, &int_defines)?;
@@ -367,8 +415,10 @@ pub fn translate_glsl_es100_with_options(
         .collect();
     let sampler_set: HashSet<&str> = extracted.samplers.iter().map(String::as_str).collect();
 
-    let body_tokens = expand_builtin_include_helpers(&extracted.body_tokens, &included);
-    let rewritten_tokens = rewrite_body(&body_tokens, &uniform_map, &sampler_set);
+    let mut budget = RewriteBudget::new();
+    let body_tokens =
+        expand_builtin_include_helpers(&extracted.body_tokens, &included, 0, &mut budget)?;
+    let rewritten_tokens = rewrite_body(&body_tokens, &uniform_map, &sampler_set, &mut budget)?;
     let body_glsl = render_tokens(&rewritten_tokens);
 
     let glsl450_source = assemble_glsl450(
@@ -1421,9 +1471,14 @@ fn build_texture_bindings(samplers: &[String]) -> Vec<TextureBinding> {
 // Stage 5: Rewrite Include Sampling Helpers, texture2D, gl_FragColor & Uniforms
 // ---------------------------------------------------------------------------
 
-fn parse_call_args(tokens: &[Token], open_paren_idx: usize) -> Option<(Vec<Vec<Token>>, usize)> {
+type CallArgRanges = (Vec<(usize, usize)>, usize);
+
+fn parse_call_arg_ranges(
+    tokens: &[Token],
+    open_paren_idx: usize,
+) -> Result<Option<CallArgRanges>, ShaderError> {
     let mut args = Vec::new();
-    let mut current = Vec::new();
+    let mut arg_start = open_paren_idx + 1;
     let mut depth: usize = 1;
     let mut i = open_paren_idx + 1;
 
@@ -1431,34 +1486,48 @@ fn parse_call_args(tokens: &[Token], open_paren_idx: usize) -> Option<(Vec<Vec<T
         match &tokens[i] {
             Token::Punct(p) if p == "(" => {
                 depth += 1;
-                current.push(tokens[i].clone());
+                if depth > MAX_REWRITE_DEPTH {
+                    return Err(ShaderError::GlslParse(format!(
+                        "parenthesis nesting depth exceeds {MAX_REWRITE_DEPTH} limit"
+                    )));
+                }
             }
             Token::Punct(p) if p == ")" => {
                 depth -= 1;
                 if depth == 0 {
-                    if !current.is_empty() || !args.is_empty() {
-                        args.push(current);
+                    if arg_start < i || !args.is_empty() {
+                        args.push((arg_start, i));
                     }
-                    return Some((args, i + 1));
+                    return Ok(Some((args, i + 1)));
                 }
-                current.push(tokens[i].clone());
             }
             Token::Punct(p) if p == "," && depth == 1 => {
-                args.push(std::mem::take(&mut current));
+                args.push((arg_start, i));
+                arg_start = i + 1;
             }
-            _ => current.push(tokens[i].clone()),
+            _ => {}
         }
         i += 1;
     }
-    None
+    Ok(None)
 }
 
-fn expand_builtin_include_helpers(tokens: &[Token], included: &HashSet<String>) -> Vec<Token> {
+fn expand_builtin_include_helpers(
+    tokens: &[Token],
+    included: &HashSet<String>,
+    depth: usize,
+    budget: &mut RewriteBudget,
+) -> Result<Vec<Token>, ShaderError> {
+    if depth > MAX_REWRITE_DEPTH {
+        return Err(ShaderError::GlslParse(format!(
+            "helper call nesting depth exceeds {MAX_REWRITE_DEPTH} limit"
+        )));
+    }
     let has_grad = included.contains("zoidium/gradient");
     let has_curve = included.contains("zoidium/curve");
     let has_text = included.contains("zoidium/text");
     if !has_grad && !has_curve && !has_text {
-        return tokens.to_vec();
+        return Ok(tokens.to_vec());
     }
 
     let mut out = Vec::with_capacity(tokens.len());
@@ -1466,16 +1535,26 @@ fn expand_builtin_include_helpers(tokens: &[Token], included: &HashSet<String>) 
 
     while i < tokens.len() {
         if let Token::Ident(name) = &tokens[i] {
+            let is_helper = (has_grad && name == "zSampleGradient")
+                || (has_curve && (name == "zSampleCurve" || name == "zSampleCurveValue"))
+                || (has_text && name == "zSampleText");
             let next_i = next_non_newline(tokens, i + 1);
-            if matches!(tokens.get(next_i), Some(Token::Punct(p)) if p == "(")
-                && let Some((raw_args, after_call)) = parse_call_args(tokens, next_i)
+            if is_helper
+                && matches!(tokens.get(next_i), Some(Token::Punct(p)) if p == "(")
+                && let Some((arg_ranges, after_call)) = parse_call_arg_ranges(tokens, next_i)?
             {
-                let args: Vec<Vec<Token>> = raw_args
-                    .iter()
-                    .map(|a| expand_builtin_include_helpers(a, included))
-                    .collect();
+                let mut args = Vec::with_capacity(arg_ranges.len());
+                for (lo, hi) in arg_ranges {
+                    args.push(expand_builtin_include_helpers(
+                        &tokens[lo..hi],
+                        included,
+                        depth + 1,
+                        budget,
+                    )?);
+                }
 
                 if has_grad && name == "zSampleGradient" && (args.len() == 2 || args.len() == 3) {
+                    let before_len = out.len();
                     out.push(Token::Ident("texture2D".to_string()));
                     out.push(Token::Punct("(".to_string()));
                     out.extend(args[0].iter().cloned());
@@ -1499,6 +1578,7 @@ fn expand_builtin_include_helpers(tokens: &[Token], included: &HashSet<String>) 
                     out.push(Token::Number("0.5".to_string()));
                     out.push(Token::Punct(")".to_string()));
                     out.push(Token::Punct(")".to_string()));
+                    budget.charge(out.len().saturating_sub(before_len))?;
                     i = after_call;
                     continue;
                 }
@@ -1507,6 +1587,7 @@ fn expand_builtin_include_helpers(tokens: &[Token], included: &HashSet<String>) 
                     && (name == "zSampleCurve" || name == "zSampleCurveValue")
                     && args.len() == 2
                 {
+                    let before_len = out.len();
                     out.push(Token::Ident("texture2D".to_string()));
                     out.push(Token::Punct("(".to_string()));
                     out.extend(args[0].iter().cloned());
@@ -1525,11 +1606,13 @@ fn expand_builtin_include_helpers(tokens: &[Token], included: &HashSet<String>) 
                         out.push(Token::Punct(".".to_string()));
                         out.push(Token::Ident("r".to_string()));
                     }
+                    budget.charge(out.len().saturating_sub(before_len))?;
                     i = after_call;
                     continue;
                 }
 
                 if has_text && name == "zSampleText" && args.len() == 2 {
+                    let before_len = out.len();
                     out.push(Token::Ident("texture2D".to_string()));
                     out.push(Token::Punct("(".to_string()));
                     out.extend(args[0].iter().cloned());
@@ -1549,17 +1632,19 @@ fn expand_builtin_include_helpers(tokens: &[Token], included: &HashSet<String>) 
                     out.push(Token::Punct(")".to_string()));
                     out.push(Token::Punct(")".to_string()));
                     out.push(Token::Punct(")".to_string()));
+                    budget.charge(out.len().saturating_sub(before_len))?;
                     i = after_call;
                     continue;
                 }
             }
         }
 
+        budget.charge(1)?;
         out.push(tokens[i].clone());
         i += 1;
     }
 
-    out
+    Ok(out)
 }
 
 fn is_glsl_builtin_type(ident: &str) -> bool {
@@ -1635,10 +1720,19 @@ fn rewrite_body(
     tokens: &[Token],
     uniforms: &HashMap<&str, &UniformDecl>,
     samplers: &HashSet<&str>,
-) -> Vec<Token> {
+    budget: &mut RewriteBudget,
+) -> Result<Vec<Token>, ShaderError> {
     let mut scopes: Vec<HashSet<String>> = vec![HashSet::new()];
     let mut user_types: HashSet<String> = HashSet::new();
-    rewrite_slice(tokens, uniforms, samplers, &mut scopes, &mut user_types)
+    rewrite_slice(
+        tokens,
+        uniforms,
+        samplers,
+        &mut scopes,
+        &mut user_types,
+        0,
+        budget,
+    )
 }
 
 fn rewrite_slice(
@@ -1647,7 +1741,14 @@ fn rewrite_slice(
     samplers: &HashSet<&str>,
     scopes: &mut Vec<HashSet<String>>,
     user_types: &mut HashSet<String>,
-) -> Vec<Token> {
+    depth: usize,
+    budget: &mut RewriteBudget,
+) -> Result<Vec<Token>, ShaderError> {
+    if depth > MAX_REWRITE_DEPTH {
+        return Err(ShaderError::GlslParse(format!(
+            "expression rewrite nesting depth exceeds {MAX_REWRITE_DEPTH} limit"
+        )));
+    }
     let mut out = Vec::with_capacity(tokens.len());
     let mut pending_scope_vars: Vec<String> = Vec::new();
     let mut decl_in_progress = false;
@@ -1658,6 +1759,7 @@ fn rewrite_slice(
     let mut i = 0;
 
     while i < tokens.len() {
+        budget.charge(1)?;
         let prev_is_dot = out
             .iter()
             .rev()
@@ -1667,8 +1769,12 @@ fn rewrite_slice(
         match &tokens[i] {
             Token::Preprocessor(line) => {
                 out.push(Token::Preprocessor(rewrite_preprocessor_line(
-                    line, uniforms, samplers,
-                )));
+                    line,
+                    uniforms,
+                    samplers,
+                    depth + 1,
+                    budget,
+                )?));
                 i += 1;
                 continue;
             }
@@ -1805,13 +1911,15 @@ fn rewrite_slice(
             {
                 let next_i = next_non_newline(tokens, i + 1);
                 if matches!(tokens.get(next_i), Some(Token::Punct(p)) if p == "(")
-                    && let Some((raw_args, after_call)) = parse_call_args(tokens, next_i)
-                    && raw_args.len() >= 2
-                    && let Some(tex_ident) = first_single_ident(&raw_args[0])
+                    && let Some((arg_ranges, after_call)) = parse_call_arg_ranges(tokens, next_i)?
+                    && arg_ranges.len() >= 2
+                    && let Some(tex_ident) =
+                        first_single_ident(&tokens[arg_ranges[0].0..arg_ranges[0].1])
                     && samplers.contains(tex_ident)
                 {
                     let is_proj = name == "texture2DProj";
                     let fn_name = if is_proj { "textureProj" } else { "texture" };
+                    let before_len = out.len();
                     out.push(Token::Ident(fn_name.to_string()));
                     out.push(Token::Punct("(".to_string()));
                     out.push(Token::Ident("sampler2D".to_string()));
@@ -1820,10 +1928,17 @@ fn rewrite_slice(
                     out.push(Token::Punct(",".to_string()));
                     out.push(Token::Ident(format!("{tex_ident}_sampler")));
                     out.push(Token::Punct(")".to_string()));
-                    for (arg_idx, arg) in raw_args[1..].iter().enumerate() {
+                    for (arg_idx, &(lo, hi)) in arg_ranges[1..].iter().enumerate() {
                         out.push(Token::Punct(",".to_string()));
-                        let rewritten_arg =
-                            rewrite_slice(arg, uniforms, samplers, scopes, user_types);
+                        let rewritten_arg = rewrite_slice(
+                            &tokens[lo..hi],
+                            uniforms,
+                            samplers,
+                            scopes,
+                            user_types,
+                            depth + 1,
+                            budget,
+                        )?;
                         if arg_idx == 0 {
                             // Convert logical CM3 bottom-left UV to WebGPU top-left texture UV at the sampling boundary.
                             let helper = if is_proj {
@@ -1840,6 +1955,7 @@ fn rewrite_slice(
                         }
                     }
                     out.push(Token::Punct(")".to_string()));
+                    budget.charge(out.len().saturating_sub(before_len))?;
                     i = after_call;
                     continue;
                 }
@@ -1860,8 +1976,15 @@ fn rewrite_slice(
                         && let Some((idx_tokens, after_bracket)) =
                             parse_bracket_expr(tokens, next_i)
                     {
-                        let rewritten_idx =
-                            rewrite_slice(&idx_tokens, uniforms, samplers, scopes, user_types);
+                        let rewritten_idx = rewrite_slice(
+                            &idx_tokens,
+                            uniforms,
+                            samplers,
+                            scopes,
+                            user_types,
+                            depth + 1,
+                            budget,
+                        )?;
                         if decl.ty == UniformType::Bool {
                             out.push(Token::Punct("(".to_string()));
                         }
@@ -1907,24 +2030,26 @@ fn rewrite_slice(
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn rewrite_preprocessor_line(
     line: &str,
     uniforms: &HashMap<&str, &UniformDecl>,
     samplers: &HashSet<&str>,
-) -> String {
+    depth: usize,
+    budget: &mut RewriteBudget,
+) -> Result<String, ShaderError> {
     let trimmed = line.trim();
     let Some(after_hash) = trimmed.strip_prefix('#') else {
-        return line.to_string();
+        return Ok(line.to_string());
     };
     let directive = after_hash.trim_start();
     let Some(after_define) = directive.strip_prefix("define") else {
-        return line.to_string();
+        return Ok(line.to_string());
     };
     if !after_define.starts_with(char::is_whitespace) {
-        return line.to_string();
+        return Ok(line.to_string());
     }
 
     let rest = after_define.trim_start();
@@ -1937,7 +2062,7 @@ fn rewrite_preprocessor_line(
         }
     }
     if name_end == 0 {
-        return line.to_string();
+        return Ok(line.to_string());
     }
 
     let macro_name = &rest[..name_end];
@@ -1954,14 +2079,14 @@ fn rewrite_preprocessor_line(
             }
             (&after_name[..=close_idx + 1], &after_open[close_idx + 1..])
         } else {
-            return line.to_string();
+            return Ok(line.to_string());
         }
     } else {
         ("", after_name)
     };
 
     if body.trim().is_empty() {
-        return line.to_string();
+        return Ok(line.to_string());
     }
 
     let body_tokens = tokenize(body);
@@ -1973,9 +2098,11 @@ fn rewrite_preprocessor_line(
         samplers,
         &mut scopes,
         &mut user_types,
-    );
+        depth,
+        budget,
+    )?;
     let rendered = render_tokens(&rewritten).trim().to_string();
-    format!("#define {macro_name}{header_suffix} {rendered}")
+    Ok(format!("#define {macro_name}{header_suffix} {rendered}"))
 }
 
 fn render_tokens(tokens: &[Token]) -> String {

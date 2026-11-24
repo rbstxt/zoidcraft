@@ -8,8 +8,8 @@
 //! Also accepts legacy `meta.json` on read for backward compatibility.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +27,9 @@ use crate::sha256::sha256_hex;
 
 /// Maximum uncompressed TAR stream size (2 GiB).
 pub const MAX_UNCOMPRESSED_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Maximum retained binary asset bytes loaded into RAM from a single archive (512 MiB).
+pub const MAX_RETAINED_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Maximum uncompressed size of any single JSON archive entry (32 MiB).
 pub const MAX_JSON_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
@@ -468,37 +471,71 @@ pub fn save_zcraft(project: &Project, path: &Path) -> Result<(), ProjectError> {
 
 /// Loads a `.zcraft` archive from raw bytes using default security bounds.
 pub fn load_zcraft_from_bytes(bytes: &[u8]) -> Result<Project, ProjectError> {
-    load_zcraft_with_limits(
+    load_zcraft_from_reader_with_limits(
         bytes,
         MAX_UNCOMPRESSED_ARCHIVE_BYTES,
         MAX_JSON_ENTRY_BYTES,
         MAX_ARCHIVE_ENTRIES,
+        MAX_RETAINED_ASSET_BYTES,
     )
 }
 
-/// Loads a `.zcraft` archive from disk.
+/// Loads a `.zcraft` archive from disk by streaming directly through bounded decoders
+/// (never allocating the entire compressed file into memory upfront).
 pub fn load_zcraft(path: &Path) -> Result<Project, ProjectError> {
-    let bytes = fs::read(path)?;
-    load_zcraft_from_bytes(&bytes)
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
+    if meta.len() > MAX_UNCOMPRESSED_ARCHIVE_BYTES {
+        return Err(ProjectError::ArchiveTooLarge {
+            limit_bytes: MAX_UNCOMPRESSED_ARCHIVE_BYTES,
+        });
+    }
+    let reader = BufReader::new(file);
+    load_zcraft_from_reader_with_limits(
+        reader,
+        MAX_UNCOMPRESSED_ARCHIVE_BYTES,
+        MAX_JSON_ENTRY_BYTES,
+        MAX_ARCHIVE_ENTRIES,
+        MAX_RETAINED_ASSET_BYTES,
+    )
 }
 
+#[cfg(test)]
 fn load_zcraft_with_limits(
     bytes: &[u8],
     max_uncompressed: u64,
     max_json_bytes: u64,
     max_entries: usize,
 ) -> Result<Project, ProjectError> {
-    let decoder = GzDecoder::new(bytes);
+    load_zcraft_from_reader_with_limits(
+        bytes,
+        max_uncompressed,
+        max_json_bytes,
+        max_entries,
+        max_uncompressed.min(MAX_RETAINED_ASSET_BYTES),
+    )
+}
+
+fn load_zcraft_from_reader_with_limits<R: Read>(
+    reader: R,
+    max_uncompressed: u64,
+    max_json_bytes: u64,
+    max_entries: usize,
+    max_retained_assets: u64,
+) -> Result<Project, ProjectError> {
+    let (limited_raw, raw_exceeded) = LimitedReader::new(reader, max_uncompressed);
+    let decoder = GzDecoder::new(limited_raw);
     let (limited, exceeded) = LimitedReader::new(decoder, max_uncompressed);
     let mut archive = tar::Archive::new(limited);
 
     let mut meta: Option<ZcraftMeta> = None;
     let mut project_bytes: Option<Vec<u8>> = None;
     let mut asset_blobs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut retained_asset_bytes = 0_u64;
     let mut entry_count = 0usize;
 
     let entries = archive.entries().map_err(|err| {
-        if exceeded.load(Ordering::SeqCst) {
+        if exceeded.load(Ordering::SeqCst) || raw_exceeded.load(Ordering::SeqCst) {
             ProjectError::ArchiveTooLarge {
                 limit_bytes: max_uncompressed,
             }
@@ -514,7 +551,7 @@ fn load_zcraft_with_limits(
         }
 
         let mut entry = entry_result.map_err(|err| {
-            if exceeded.load(Ordering::SeqCst) {
+            if exceeded.load(Ordering::SeqCst) || raw_exceeded.load(Ordering::SeqCst) {
                 ProjectError::ArchiveTooLarge {
                     limit_bytes: max_uncompressed,
                 }
@@ -566,10 +603,24 @@ fn load_zcraft_with_limits(
                 if asset_id.is_empty() {
                     return Err(ProjectError::InvalidArchivePath(normalized));
                 }
+                let declared_size = entry.header().size().unwrap_or(0);
+                let remaining_budget = max_retained_assets.saturating_sub(retained_asset_bytes);
+                if declared_size > remaining_budget {
+                    return Err(ProjectError::ArchiveTooLarge {
+                        limit_bytes: max_retained_assets,
+                    });
+                }
                 let mut data = Vec::new();
-                entry.read_to_end(&mut data).map_err(|err| {
+                let mut bounded = (&mut entry).take(remaining_budget.saturating_add(1));
+                bounded.read_to_end(&mut data).map_err(|err| {
                     map_limit_err(ProjectError::Io(err), &exceeded, max_uncompressed)
                 })?;
+                if (data.len() as u64) > remaining_budget {
+                    return Err(ProjectError::ArchiveTooLarge {
+                        limit_bytes: max_retained_assets,
+                    });
+                }
+                retained_asset_bytes = retained_asset_bytes.saturating_add(data.len() as u64);
                 asset_blobs.insert(asset_id.to_owned(), data);
             }
             _ => {
@@ -658,6 +709,13 @@ fn load_zcraft_with_limits(
         }
     }
 
+    project.sequence.fps = project.sequence.fps.clamp(1, 240);
+    project.sequence.resolution[0] = project.sequence.resolution[0].max(1);
+    project.sequence.resolution[1] = project.sequence.resolution[1].max(1);
+    if !project.sequence.length_frames.is_finite() || project.sequence.length_frames < 1.0 {
+        project.sequence.length_frames = 1.0;
+    }
+
     Ok(project)
 }
 
@@ -675,6 +733,7 @@ fn map_limit_err(err: ProjectError, exceeded: &AtomicBool, max_uncompressed: u64
 mod tests {
     use super::*;
     use crate::model::{AssetKind, AssetRecord, AssetSource};
+    use std::fs;
 
     struct TestDir(std::path::PathBuf);
 
