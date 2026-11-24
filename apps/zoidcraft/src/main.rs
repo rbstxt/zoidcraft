@@ -1013,7 +1013,9 @@ impl ZoidCraftApp {
             .filter_map(|r| r.bytes.as_ref())
             .map(|b| b.len() as u64)
             .fold(0_u64, u64::saturating_add);
-        if existing_asset_bytes.saturating_add(file_len) > zc_project::MAX_RETAINED_ASSET_BYTES {
+        let remaining_budget =
+            zc_project::MAX_RETAINED_ASSET_BYTES.saturating_sub(existing_asset_bytes);
+        if file_len > remaining_budget {
             self.show_toast(format!(
                 "Cannot import media: total embedded assets would exceed {} MiB project limit",
                 zc_project::MAX_RETAINED_ASSET_BYTES / (1024 * 1024)
@@ -1021,8 +1023,21 @@ impl ZoidCraftApp {
             return;
         }
 
-        let bytes = match fs::read(&path) {
-            Ok(b) => b,
+        let bytes = match fs::File::open(&path).and_then(|file| {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            file.take(remaining_budget.saturating_add(1))
+                .read_to_end(&mut buf)?;
+            Ok(buf)
+        }) {
+            Ok(b) if (b.len() as u64) <= remaining_budget => b,
+            Ok(_) => {
+                self.show_toast(format!(
+                    "Cannot import media: file grew beyond {} MiB project limit",
+                    zc_project::MAX_RETAINED_ASSET_BYTES / (1024 * 1024)
+                ));
+                return;
+            }
             Err(err) => {
                 self.show_toast(format!("Failed to read media file: {err}"));
                 return;

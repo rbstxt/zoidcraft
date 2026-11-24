@@ -15,8 +15,7 @@ use image::{ExtendedColorType, ImageEncoder};
 use crate::ExportError;
 use crate::ffmpeg::{
     BoundedStderrBuffer, MAX_STDERR_BYTES, build_ffmpeg_os_args_with_output,
-    configure_process_group, kill_lingering_unix_process_group, kill_process_tree_and_reap,
-    resolve_ffmpeg_binary,
+    configure_process_group, kill_process_tree_and_reap, resolve_ffmpeg_binary,
 };
 use crate::padding::pad_rgba_frame_into;
 use crate::settings::{
@@ -28,21 +27,18 @@ use crate::temp_audio::{TempFileGuard, unique_sibling_temp_path, write_temp_ster
 /// to kill a stalled child while guaranteeing the child is always reaped (`wait()`) on
 /// drop/error/cancel/panic (zero zombies, zero leaked descriptors).
 struct SharedChildGuard {
-    pid: u32,
     child: Arc<Mutex<Option<Child>>>,
 }
 
 impl SharedChildGuard {
     fn new(child: Child) -> Self {
-        let pid = child.id();
         Self {
-            pid,
             child: Arc::new(Mutex::new(Some(child))),
         }
     }
 
     /// Terminates the entire process tree (wrapper + descendants) and reaps the child if still live.
-    /// Does nothing if the child was already reaped (never killing a potentially reused PID on Windows/Unix).
+    /// Never signals any numeric PID/PGID after the child has been reaped (preventing PID/PGID reuse kills).
     fn kill_and_reap(&self) {
         let mut guard = self
             .child
@@ -50,20 +46,6 @@ impl SharedChildGuard {
             .unwrap_or_else(|poison| poison.into_inner());
         if let Some(mut child) = guard.take() {
             kill_process_tree_and_reap(&mut child);
-        }
-    }
-
-    /// Terminates the live child if still running, or (on Unix only) signals the process group
-    /// when inherited pipes are provably still held open by a lingering descendant.
-    fn kill_live_or_lingering_pipes(&self) {
-        let mut guard = self
-            .child
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(mut child) = guard.take() {
-            kill_process_tree_and_reap(&mut child);
-        } else {
-            kill_lingering_unix_process_group(self.pid);
         }
     }
 
@@ -616,21 +598,13 @@ where
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
             loop {
                 if cancel.load(Ordering::Acquire) {
-                    child_guard.kill_live_or_lingering_pipes();
+                    child_guard.kill_and_reap();
                     return Err(ExportError::Cancelled);
                 }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    // A descendant may still hold stderr open after the wrapper exited;
-                    // terminate lingering Unix process-group descendants so pipes close promptly.
-                    child_guard.kill_live_or_lingering_pipes();
-                    match stderr_rx.recv_timeout(Duration::from_millis(200)) {
-                        Ok(text) => {
-                            stderr_finished = true;
-                            break text;
-                        }
-                        Err(_) => break String::new(),
-                    }
+                    // Child was already reaped; stop waiting on stderr without signaling a reaped PGID.
+                    break String::new();
                 }
                 match stderr_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
                     Ok(text) => {
@@ -676,11 +650,8 @@ where
         Ok(())
     })();
 
-    // Only kill live children on error, or (on Unix) lingering descendants if pipes are still open.
-    // Never signal an already-reaped PID when pipes have already closed cleanly.
-    if !writer_finished || !stderr_finished {
-        child_guard.kill_live_or_lingering_pipes();
-    } else if result.is_err() {
+    // Kill the process tree ONLY if the child is still live (unreaped); never signal a reaped PID/PGID.
+    if result.is_err() || !writer_finished || !stderr_finished {
         child_guard.kill_and_reap();
     }
     if !writer_finished {

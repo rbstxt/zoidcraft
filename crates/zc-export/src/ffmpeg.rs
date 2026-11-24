@@ -33,8 +33,8 @@ pub(crate) fn configure_process_group(cmd: &mut Command) {
 
 /// Terminates every process in the Unix process group (or Windows process tree) rooted at `pid`.
 ///
-/// SAFETY INVARIANT: On Windows, this MUST ONLY be called while the parent still holds an open
-/// `Child` handle to `pid` (never after reaping), preventing PID-reuse kills of unrelated processes.
+/// SAFETY INVARIANT: This MUST ONLY be called while the parent still holds an open, unreaped
+/// `Child` handle to `pid` (never after reaping), preventing PID/PGID-reuse kills on any OS.
 pub(crate) fn kill_process_tree_by_pid(pid: u32) {
     #[cfg(unix)]
     {
@@ -57,20 +57,6 @@ pub(crate) fn kill_process_tree_by_pid(pid: u32) {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
-    }
-}
-
-/// Terminates lingering Unix process-group descendants after the immediate wrapper has exited,
-/// ONLY when an inherited pipe is still open (proving a descendant still occupies `pgid`).
-/// On Windows, never calls `taskkill` on an already-reaped PID to avoid PID-reuse hazards.
-pub(crate) fn kill_lingering_unix_process_group(pgid: u32) {
-    #[cfg(unix)]
-    {
-        kill_process_tree_by_pid(pgid);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pgid;
     }
 }
 
@@ -113,7 +99,6 @@ pub(crate) fn probe_ffmpeg_with_timeout(
         }
     })?;
 
-    let child_pid = child.id();
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
@@ -163,24 +148,20 @@ pub(crate) fn probe_ffmpeg_with_timeout(
         }
     };
 
-    // Wait up to the remaining deadline for stdout/stderr EOF. If a descendant is still
-    // holding a pipe open after the wrapper exited, terminate the process group first.
-    let mut stdout_opt = out_rx
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    // Wait up to a bounded grace window (capped by the overall deadline) for stdout/stderr EOF.
+    // Once the child has been reaped, never signal its numeric PID/PGID (preventing PID/PGID reuse
+    // hazards); simply detach any pipe reader thread that outlives the bounded wait.
+    let pipe_grace = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_millis(500));
+    let stdout_opt = out_rx.recv_timeout(pipe_grace).ok();
+    let stderr_opt = err_rx
+        .recv_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(200)),
+        )
         .ok();
-    let mut stderr_opt = err_rx
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .ok();
-
-    if stdout_opt.is_none() || stderr_opt.is_none() {
-        kill_lingering_unix_process_group(child_pid);
-        if stdout_opt.is_none() {
-            stdout_opt = out_rx.recv_timeout(Duration::from_millis(200)).ok();
-        }
-        if stderr_opt.is_none() {
-            stderr_opt = err_rx.recv_timeout(Duration::from_millis(200)).ok();
-        }
-    }
     if stdout_opt.is_some() {
         let _ = out_handle.join();
     }

@@ -183,4 +183,88 @@ fn rejects_string_repeat_concat_array_and_dag_export_memory_bombs() {
         "O(N) scan loop took too long before tripping step limit: {:?}",
         scan_start.elapsed()
     );
+
+    // 13. Computed property lookup, numeric coercion, and non-pointer-equal string comparison
+    // on 4 MiB strings must charge proportional work steps and hit StepLimitExceeded promptly.
+    for (label, expr) in [
+        (
+            "computed key lookup",
+            r#"var s = "x".repeat(10000).repeat(400); var o = {}; var n = 0; for (var i = 0; i < 1000000; i++) { if (o[s] === undefined) n++; } n"#,
+        ),
+        (
+            "string numeric coercion",
+            r#"var t = " ".repeat(10000).repeat(400); var n = 0; for (var i = 0; i < 1000000; i++) { n += +t; } n"#,
+        ),
+        (
+            "distinct 4 MiB string equality",
+            r#"var a = "x".repeat(10000).repeat(400); var b = "x".repeat(10000).repeat(400); var n = 0; for (var i = 0; i < 1000000; i++) { if (a === b) n++; } n"#,
+        ),
+    ] {
+        let t0 = std::time::Instant::now();
+        let err = eval(expr, &ctx, &cfg)
+            .expect_err(&format!("{label} must trip StepLimitExceeded quickly"));
+        assert!(
+            matches!(err, ExprError::StepLimitExceeded { .. }),
+            "expected StepLimitExceeded for {label}, got {err:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "{label} took too long: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    // 14. Object.assign / Object.entries / object rest destructuring copying large computed keys
+    // must charge key byte sizes.
+    let err = eval(
+        r#"var k = "k".repeat(10000).repeat(300); var src = {}; src[k] = 1; var xs = []; for (var i = 0; i < 40; i++) { var dst = {}; Object.assign(dst, src); xs.push(dst); } xs.length"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("Object.assign copying 3 MiB key 40 times must exceed 64 MiB heap budget");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for Object.assign key copy bomb, got {err:?}"
+    );
+
+    let err = eval(
+        r#"var k = "k".repeat(10000).repeat(300); var src = {}; src[k] = 1; var xs = []; for (var i = 0; i < 40; i++) { var {...dst} = src; xs.push(dst); } xs.length"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("object rest destructuring copying 3 MiB key 40 times must exceed 64 MiB heap budget");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for object rest key copy bomb, got {err:?}"
+    );
+
+    // 15. Vector math allocation (-a) must charge heap budget and O(N) array reverse/includes
+    // loops must charge proportional steps.
+    let err = eval(
+        r#"var a = Array(20000).fill(1); var xs = []; for (var i = 0; i < 120; i++) { xs.push(-a); } xs.length"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("repeated 20k vector negation must exceed 64 MiB heap budget");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for vector negation bomb, got {err:?}"
+    );
+
+    let arr_t0 = std::time::Instant::now();
+    let err = eval(
+        r#"var a = Array(20000).fill(1); for (var i = 0; i < 100000; i++) { a.reverse(); } a.length"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("100k reversals of 20k array must hit StepLimitExceeded promptly");
+    assert!(
+        matches!(err, ExprError::StepLimitExceeded { .. }),
+        "expected StepLimitExceeded for array reverse loop, got {err:?}"
+    );
+    assert!(
+        arr_t0.elapsed() < std::time::Duration::from_secs(2),
+        "array reverse loop took too long: {:?}",
+        arr_t0.elapsed()
+    );
 }
