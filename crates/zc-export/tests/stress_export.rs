@@ -540,3 +540,82 @@ fn wrapper_leaving_descendant_holding_pipes_does_not_hang_probe_or_export() {
         original
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_wrapper_leaving_descendant_holding_handles_does_not_hang_probe_or_export() {
+    let root = TempDirGuard::new("win-descendant");
+    let probe_wrapper = root.path().join("probe_descendant.cmd");
+    // Starts a background descendant inheriting stdout/stderr, prints version, and exits 0.
+    fs::write(
+        &probe_wrapper,
+        "@echo off\r\necho ffmpeg version 9.9.9-win-test\r\nstart \"\" /b ping -n 10 127.0.0.1 >nul\r\nexit /b 0\r\n",
+    )
+    .expect("write windows probe wrapper");
+
+    let start = std::time::Instant::now();
+    let res = probe_ffmpeg(Some(&probe_wrapper));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "Windows probe hung waiting on descendant handle: {elapsed:?}"
+    );
+    assert!(
+        res.is_ok(),
+        "Windows probe should succeed after cancelling descendant pipe I/O: {res:?}"
+    );
+
+    let export_wrapper = root.path().join("export_descendant.cmd");
+    // Descendant inherits stdin/stderr and stays alive without reading stdin while wrapper exits 0.
+    fs::write(
+        &export_wrapper,
+        "@echo off\r\nstart \"\" /b ping -n 10 127.0.0.1 >nul\r\nexit /b 0\r\n",
+    )
+    .expect("write windows export wrapper");
+
+    let dest = root.path().join("win_blocked.mp4");
+    let original = b"EXISTING-WIN-MP4".to_vec();
+    fs::write(&dest, &original).expect("write sentinel");
+
+    let settings = ExportSettings {
+        width: 256,
+        height: 256,
+        fps: 30.0,
+        start_frame: 0,
+        end_frame: 4,
+        container: ExportContainer::Mp4,
+        video_codec: VideoCodec::H264,
+        audio_codec: AudioCodec::None,
+        quality: QualityMode::Crf(23),
+        audio_bitrate_kbps: 128,
+        sample_rate: 48_000,
+        transparent_alpha: false,
+        output_path: dest.clone(),
+        ffmpeg_binary: Some(export_wrapper),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let exp_start = std::time::Instant::now();
+    let err = export_video(
+        &settings,
+        None,
+        &cancel,
+        |frame_idx: u32, buf: &mut Vec<u8>| {
+            fill_gradient(buf, 256, 256, frame_idx);
+            Ok(())
+        },
+    )
+    .expect_err("Windows export with early-exiting wrapper whose descendant holds stdin must fail");
+    let exp_elapsed = exp_start.elapsed();
+    assert!(
+        exp_elapsed < std::time::Duration::from_secs(5),
+        "Windows export hung waiting on stdin held by descendant: {exp_elapsed:?}"
+    );
+    assert!(
+        matches!(err, ExportError::FfmpegFailed { .. }),
+        "expected FfmpegFailed for incomplete Windows export, got {err:?}"
+    );
+    assert_eq!(
+        fs::read(&dest).expect("existing destination must remain intact"),
+        original
+    );
+}

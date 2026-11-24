@@ -13,9 +13,11 @@ use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder};
 
 use crate::ExportError;
+#[cfg(windows)]
+use crate::ffmpeg::GuardedPipe;
 use crate::ffmpeg::{
-    BoundedStderrBuffer, MAX_STDERR_BYTES, abort_and_join_worker, build_ffmpeg_os_args_with_output,
-    cancel_thread_sync_io, configure_process_group, kill_process_tree_and_reap,
+    BoundedStderrBuffer, MAX_STDERR_BYTES, PipeCancelToken, abort_and_join_worker,
+    build_ffmpeg_os_args_with_output, configure_process_group, kill_process_tree_and_reap,
     resolve_ffmpeg_binary,
 };
 use crate::padding::pad_rgba_frame_into;
@@ -383,10 +385,12 @@ where
     // 50 ms timeouts and drop `cmd` immediately after spawn (closing parent copies of child fds)
     // so both worker threads can always interrupt blocked I/O, release descriptors/buffers, and join.
     #[cfg(unix)]
-    let (child, stdin_writer, stderr_reader): (
+    let (child, stdin_writer, stdin_cancel, stderr_reader, stderr_cancel): (
         Child,
         Box<dyn Write + Send>,
+        PipeCancelToken,
         Box<dyn Read + Send>,
+        PipeCancelToken,
     ) = {
         use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
@@ -407,14 +411,22 @@ where
             }
         })?;
         drop(cmd);
-        (child, Box::new(stdin_write), Box::new(stderr_read))
+        (
+            child,
+            Box::new(stdin_write),
+            PipeCancelToken::noop(),
+            Box::new(stderr_read),
+            PipeCancelToken::noop(),
+        )
     };
 
-    #[cfg(not(unix))]
-    let (child, stdin_writer, stderr_reader): (
+    #[cfg(windows)]
+    let (child, stdin_writer, stdin_cancel, stderr_reader, stderr_cancel): (
         Child,
         Box<dyn Write + Send>,
+        PipeCancelToken,
         Box<dyn Read + Send>,
+        PipeCancelToken,
     ) = {
         cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
         configure_process_group(&mut cmd);
@@ -433,7 +445,49 @@ where
         let stderr = child.stderr.take().ok_or_else(|| {
             ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr"))
         })?;
-        (child, Box::new(stdin), Box::new(stderr))
+        let (stdin_guarded, stdin_token) = GuardedPipe::new(stdin);
+        let (stderr_guarded, stderr_token) = GuardedPipe::new(stderr);
+        (
+            child,
+            Box::new(stdin_guarded),
+            stdin_token,
+            Box::new(stderr_guarded),
+            stderr_token,
+        )
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let (child, stdin_writer, stdin_cancel, stderr_reader, stderr_cancel): (
+        Child,
+        Box<dyn Write + Send>,
+        PipeCancelToken,
+        Box<dyn Read + Send>,
+        PipeCancelToken,
+    ) = {
+        cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
+        configure_process_group(&mut cmd);
+
+        let mut child = cmd.spawn().map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                ExportError::FfmpegNotFound(bin.display().to_string())
+            } else {
+                ExportError::Io(err)
+            }
+        })?;
+        drop(cmd);
+        let stdin = child.stdin.take().ok_or_else(|| {
+            ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdin"))
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr"))
+        })?;
+        (
+            child,
+            Box::new(stdin),
+            PipeCancelToken::noop(),
+            Box::new(stderr),
+            PipeCancelToken::noop(),
+        )
     };
 
     let total_frames = settings.total_frames();
@@ -722,7 +776,7 @@ where
                                 *child_exited_at.get_or_insert_with(std::time::Instant::now);
                             if exited_at.elapsed() >= CHILD_EXIT_WRITER_GRACE {
                                 writer_abort.store(true, Ordering::Release);
-                                cancel_thread_sync_io(&writer_handle);
+                                stdin_cancel.cancel_io();
                                 // Give the interruptible writer a short window to release its fd/buffer.
                                 let abort_deadline =
                                     std::time::Instant::now() + Duration::from_millis(150);
@@ -738,7 +792,7 @@ where
                                             break;
                                         }
                                         Err(RecvTimeoutError::Timeout) => {
-                                            cancel_thread_sync_io(&writer_handle);
+                                            stdin_cancel.cancel_io();
                                         }
                                     }
                                 }
@@ -766,7 +820,7 @@ where
             loop {
                 if cancel.load(Ordering::Acquire) {
                     stderr_abort.store(true, Ordering::Release);
-                    cancel_thread_sync_io(&stderr_handle);
+                    stderr_cancel.cancel_io();
                     child_guard.kill_and_reap();
                     return Err(ExportError::Cancelled);
                 }
@@ -775,7 +829,7 @@ where
                     // Child was already reaped; interrupt the stderr worker cleanly without signaling
                     // a reaped PGID so its thread and descriptor are released and joined.
                     stderr_abort.store(true, Ordering::Release);
-                    cancel_thread_sync_io(&stderr_handle);
+                    stderr_cancel.cancel_io();
                     let abort_deadline = std::time::Instant::now() + Duration::from_millis(150);
                     let mut captured = String::new();
                     while std::time::Instant::now() < abort_deadline {
@@ -790,7 +844,7 @@ where
                                 break;
                             }
                             Err(RecvTimeoutError::Timeout) => {
-                                cancel_thread_sync_io(&stderr_handle);
+                                stderr_cancel.cancel_io();
                             }
                         }
                     }
@@ -851,6 +905,7 @@ where
     } else {
         let _ = abort_and_join_worker(
             &writer_abort,
+            &stdin_cancel,
             &writer_done_rx,
             writer_handle,
             Duration::from_millis(500),
@@ -861,6 +916,7 @@ where
     } else {
         let _ = abort_and_join_worker(
             &stderr_abort,
+            &stderr_cancel,
             &stderr_rx,
             stderr_handle,
             Duration::from_millis(500),

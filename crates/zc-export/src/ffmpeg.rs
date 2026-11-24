@@ -69,41 +69,131 @@ pub(crate) fn kill_process_tree_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Cancels any pending synchronous OS I/O on a worker thread on Windows so blocked pipe
-/// readers/writers wake up with `ERROR_OPERATION_ABORTED`, release their handles/buffers,
-/// and join cleanly without signaling any reaped child PID.
-#[cfg(windows)]
-#[allow(unsafe_code)]
-pub(crate) fn cancel_thread_sync_io<T>(handle: &std::thread::JoinHandle<T>) {
-    use std::os::windows::io::AsRawHandle;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CancelSynchronousIo(h_thread: *mut core::ffi::c_void) -> i32;
-    }
-
-    let raw = handle.as_raw_handle();
-    // SAFETY: `handle` is a live `JoinHandle` whose OS thread handle remains valid while
-    // `handle` is alive. `CancelSynchronousIo` is thread-safe and cancels only pending
-    // synchronous I/O on that thread (returning 0 / ERROR_NOT_FOUND when idle).
-    let _ = unsafe { CancelSynchronousIo(raw) };
+/// Safe, handle-reuse-free I/O cancellation token for a worker thread's OS pipe/socket.
+///
+/// On Windows, Rust's `ChildStdin`/`ChildStdout`/`ChildStderr` use overlapped `WriteFileEx` /
+/// `ReadFileEx`, which require `CancelIoEx(pipe_handle, NULL)` on the pipe handle rather than
+/// `CancelSynchronousIo`. `live` is locked around both `CancelIoEx` and `GuardedPipe`'s drop
+/// transition before closing the OS handle, making handle-reuse races impossible.
+#[derive(Clone)]
+pub(crate) struct PipeCancelToken {
+    #[cfg(windows)]
+    raw_handle: usize,
+    #[cfg(windows)]
+    live: Arc<std::sync::Mutex<bool>>,
 }
 
-/// No-op on non-Windows platforms, where Unix pipes/sockets use bounded read/write timeouts.
-#[cfg(not(windows))]
-pub(crate) fn cancel_thread_sync_io<T>(_handle: &std::thread::JoinHandle<T>) {}
+impl PipeCancelToken {
+    #[cfg(not(windows))]
+    pub(crate) fn noop() -> Self {
+        Self {}
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    pub(crate) fn cancel_io(&self) {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CancelIoEx(
+                h_file: *mut core::ffi::c_void,
+                lp_overlapped: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+        let guard = self
+            .live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *guard {
+            // SAFETY: While `*guard == true`, `GuardedPipe`'s `_live_guard` has not dropped yet,
+            // so the underlying OS pipe handle is guaranteed open and cannot be closed or recycled
+            // until `guard` is released. Passing `null_mut()` cancels all pending overlapped and
+            // synchronous I/O on `h_file`.
+            let _ = unsafe {
+                CancelIoEx(
+                    self.raw_handle as *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                )
+            };
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn cancel_io(&self) {}
+}
+
+#[cfg(windows)]
+struct PipeLiveGuard {
+    live: Arc<std::sync::Mutex<bool>>,
+}
+
+#[cfg(windows)]
+impl Drop for PipeLiveGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = false;
+    }
+}
+
+/// Pipe wrapper that guarantees `_live_guard` clears the shared liveness flag BEFORE `inner`
+/// drops and closes the underlying Windows OS handle (Rust drops struct fields in declaration order).
+#[cfg(windows)]
+pub(crate) struct GuardedPipe<P> {
+    _live_guard: PipeLiveGuard,
+    inner: P,
+}
+
+#[cfg(windows)]
+impl<P: std::os::windows::io::AsRawHandle> GuardedPipe<P> {
+    pub(crate) fn new(inner: P) -> (Self, PipeCancelToken) {
+        let raw_handle = inner.as_raw_handle() as usize;
+        let live = Arc::new(std::sync::Mutex::new(true));
+        let token = PipeCancelToken {
+            raw_handle,
+            live: Arc::clone(&live),
+        };
+        (
+            Self {
+                _live_guard: PipeLiveGuard { live },
+                inner,
+            },
+            token,
+        )
+    }
+}
+
+#[cfg(windows)]
+impl<P: Read> Read for GuardedPipe<P> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+#[cfg(windows)]
+impl<P: std::io::Write> std::io::Write for GuardedPipe<P> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Cooperatively aborts a worker thread and waits up to `timeout` for its completion channel,
-/// retrying Windows synchronous I/O cancellation every 10 ms so the worker always releases its
-/// descriptor/buffers and joins cleanly.
+/// retrying Windows `CancelIoEx` on the worker's pipe handle every 10 ms so the worker always
+/// releases its descriptor/buffers and joins cleanly without signaling any reaped child PID.
 pub(crate) fn abort_and_join_worker<T, R>(
     abort: &AtomicBool,
+    cancel_token: &PipeCancelToken,
     rx: &mpsc::Receiver<R>,
     handle: std::thread::JoinHandle<T>,
     timeout: Duration,
 ) -> Option<R> {
     abort.store(true, Ordering::Release);
-    cancel_thread_sync_io(&handle);
+    cancel_token.cancel_io();
     let deadline = Instant::now() + timeout;
     let mut received: Option<R> = None;
     let mut finished = false;
@@ -123,7 +213,7 @@ pub(crate) fn abort_and_join_worker<T, R>(
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                cancel_thread_sync_io(&handle);
+                cancel_token.cancel_io();
             }
         }
     }
@@ -154,10 +244,12 @@ pub(crate) fn probe_ffmpeg_with_timeout(
     cmd.arg("-version").stdin(Stdio::null());
 
     #[cfg(unix)]
-    let (mut child, stdout_reader, stderr_reader): (
+    let (mut child, stdout_reader, stdout_cancel, stderr_reader, stderr_cancel): (
         Child,
         Box<dyn Read + Send>,
+        PipeCancelToken,
         Box<dyn Read + Send>,
+        PipeCancelToken,
     ) = {
         use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
@@ -178,14 +270,22 @@ pub(crate) fn probe_ffmpeg_with_timeout(
             }
         })?;
         drop(cmd);
-        (child, Box::new(out_read), Box::new(err_read))
+        (
+            child,
+            Box::new(out_read),
+            PipeCancelToken::noop(),
+            Box::new(err_read),
+            PipeCancelToken::noop(),
+        )
     };
 
-    #[cfg(not(unix))]
-    let (mut child, stdout_reader, stderr_reader): (
+    #[cfg(windows)]
+    let (mut child, stdout_reader, stdout_cancel, stderr_reader, stderr_cancel): (
         Child,
         Box<dyn Read + Send>,
+        PipeCancelToken,
         Box<dyn Read + Send>,
+        PipeCancelToken,
     ) =
         {
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -205,7 +305,50 @@ pub(crate) fn probe_ffmpeg_with_timeout(
             let err = child.stderr.take().ok_or_else(|| {
                 ExportError::Io(std::io::Error::other("failed to capture stderr"))
             })?;
-            (child, Box::new(out), Box::new(err))
+            let (out_guarded, out_token) = GuardedPipe::new(out);
+            let (err_guarded, err_token) = GuardedPipe::new(err);
+            (
+                child,
+                Box::new(out_guarded),
+                out_token,
+                Box::new(err_guarded),
+                err_token,
+            )
+        };
+
+    #[cfg(not(any(unix, windows)))]
+    let (mut child, stdout_reader, stdout_cancel, stderr_reader, stderr_cancel): (
+        Child,
+        Box<dyn Read + Send>,
+        PipeCancelToken,
+        Box<dyn Read + Send>,
+        PipeCancelToken,
+    ) =
+        {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            configure_process_group(&mut cmd);
+
+            let mut child = cmd.spawn().map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    ExportError::FfmpegNotFound(bin.display().to_string())
+                } else {
+                    ExportError::Io(err)
+                }
+            })?;
+            drop(cmd);
+            let out = child.stdout.take().ok_or_else(|| {
+                ExportError::Io(std::io::Error::other("failed to capture stdout"))
+            })?;
+            let err = child.stderr.take().ok_or_else(|| {
+                ExportError::Io(std::io::Error::other("failed to capture stderr"))
+            })?;
+            (
+                child,
+                Box::new(out),
+                PipeCancelToken::noop(),
+                Box::new(err),
+                PipeCancelToken::noop(),
+            )
         };
 
     let io_abort = Arc::new(AtomicBool::new(false));
@@ -235,12 +378,14 @@ pub(crate) fn probe_ffmpeg_with_timeout(
                     kill_process_tree_and_reap(&mut child);
                     let _ = abort_and_join_worker(
                         &io_abort,
+                        &stdout_cancel,
                         &out_rx,
                         out_handle,
                         Duration::from_millis(250),
                     );
                     let _ = abort_and_join_worker(
                         &io_abort,
+                        &stderr_cancel,
                         &err_rx,
                         err_handle,
                         Duration::from_millis(250),
@@ -268,8 +413,14 @@ pub(crate) fn probe_ffmpeg_with_timeout(
             let _ = out_handle.join();
             text
         }
-        Err(_) => abort_and_join_worker(&io_abort, &out_rx, out_handle, Duration::from_millis(250))
-            .unwrap_or_default(),
+        Err(_) => abort_and_join_worker(
+            &io_abort,
+            &stdout_cancel,
+            &out_rx,
+            out_handle,
+            Duration::from_millis(250),
+        )
+        .unwrap_or_default(),
     };
     let err_grace = deadline
         .saturating_duration_since(Instant::now())
@@ -279,8 +430,14 @@ pub(crate) fn probe_ffmpeg_with_timeout(
             let _ = err_handle.join();
             text
         }
-        Err(_) => abort_and_join_worker(&io_abort, &err_rx, err_handle, Duration::from_millis(250))
-            .unwrap_or_default(),
+        Err(_) => abort_and_join_worker(
+            &io_abort,
+            &stderr_cancel,
+            &err_rx,
+            err_handle,
+            Duration::from_millis(250),
+        )
+        .unwrap_or_default(),
     };
 
     if !status.success() {
@@ -602,9 +759,16 @@ impl BoundedStderrBuffer {
     }
 
     /// Drains an entire [`Read`] stream into this bounded buffer.
-    pub fn drain_reader<R: Read>(&mut self, reader: R) {
-        let never_abort = AtomicBool::new(false);
-        self.drain_reader_interruptible(reader, &never_abort);
+    pub fn drain_reader<R: Read>(&mut self, mut reader: R) {
+        let mut chunk = [0_u8; 4_096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => self.push_bytes(&chunk[..n]),
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
     }
 
     /// Drains a [`Read`] stream into this bounded buffer, stopping cleanly when `abort` is set

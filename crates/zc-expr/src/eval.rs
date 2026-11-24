@@ -168,14 +168,21 @@ struct EnvFrame {
     bindings: BTreeMap<String, Binding>,
 }
 
-struct Closure {
-    params: Vec<Param>,
-    body: FunctionBody,
-    captured_env: usize,
-    name: Option<String>,
+#[derive(Clone, Copy)]
+enum ClosureBody<'ast> {
+    Expr(&'ast Expr),
+    Block(&'ast [Stmt]),
 }
 
-struct Evaluator<'a> {
+#[derive(Clone, Copy)]
+struct Closure<'ast> {
+    params: &'ast [Param],
+    body: ClosureBody<'ast>,
+    captured_env: usize,
+    name: Option<&'ast str>,
+}
+
+struct Evaluator<'a, 'ast> {
     ctx: &'a dyn ExprContext,
     config: EvalConfig,
     steps: u64,
@@ -184,13 +191,13 @@ struct Evaluator<'a> {
     envs: Vec<EnvFrame>,
     arrays: Vec<Vec<RuntimeValue>>,
     objects: Vec<BTreeMap<String, RuntimeValue>>,
-    closures: Vec<Closure>,
+    closures: Vec<Closure<'ast>>,
     literal_strings: HashMap<String, JsStr>,
     rng: Option<DetRng>,
     stringifying_arrays: Vec<usize>,
 }
 
-impl<'a> Evaluator<'a> {
+impl<'a, 'ast> Evaluator<'a, 'ast> {
     fn new(ctx: &'a dyn ExprContext, config: EvalConfig) -> Self {
         Self {
             ctx,
@@ -345,12 +352,21 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn define_binding(&mut self, env: usize, name: String, value: RuntimeValue, kind: VarKind) {
+    fn define_binding(
+        &mut self,
+        env: usize,
+        name: String,
+        value: RuntimeValue,
+        kind: VarKind,
+    ) -> Result<(), ExprError> {
         let target_env = if kind == VarKind::Var {
             self.function_scope_of(env)
         } else {
             env
         };
+        if !self.envs[target_env].bindings.contains_key(&name) {
+            self.charge_alloc_bytes(ARRAY_ELEM_BUDGET_BYTES.saturating_add(name.len()))?;
+        }
         self.envs[target_env].bindings.insert(
             name,
             Binding {
@@ -359,6 +375,14 @@ impl<'a> Evaluator<'a> {
                 is_var: kind == VarKind::Var,
             },
         );
+        Ok(())
+    }
+
+    fn alloc_closure(&mut self, closure: Closure<'ast>) -> Result<usize, ExprError> {
+        self.charge_alloc_bytes(64)?;
+        let cid = self.closures.len();
+        self.closures.push(closure);
+        Ok(cid)
     }
 
     fn lookup_local(&self, mut env: usize, name: &str) -> Option<RuntimeValue> {
@@ -749,7 +773,7 @@ impl<'a> Evaluator<'a> {
     // Hoisting & Pattern Binding
     // -----------------------------------------------------------------------
 
-    fn hoist_decls(&mut self, stmts: &[Stmt], env: usize) -> Result<(), ExprError> {
+    fn hoist_decls(&mut self, stmts: &'ast [Stmt], env: usize) -> Result<(), ExprError> {
         let fn_scope = self.function_scope_of(env);
         for stmt in stmts {
             match stmt {
@@ -758,23 +782,22 @@ impl<'a> Evaluator<'a> {
                     decls,
                 } => {
                     for d in decls {
-                        self.hoist_pattern_var(&d.pattern, fn_scope);
+                        self.hoist_pattern_var(&d.pattern, fn_scope)?;
                     }
                 }
                 Stmt::FunctionDecl(f) => {
-                    let cid = self.closures.len();
-                    self.closures.push(Closure {
-                        params: f.params.clone(),
-                        body: FunctionBody::Block(f.body.clone()),
+                    let cid = self.alloc_closure(Closure {
+                        params: &f.params,
+                        body: ClosureBody::Block(&f.body),
                         captured_env: fn_scope,
-                        name: Some(f.name.clone()),
-                    });
+                        name: Some(f.name.as_str()),
+                    })?;
                     self.define_binding(
                         fn_scope,
                         f.name.clone(),
                         RuntimeValue::Closure(cid),
                         VarKind::Var,
-                    );
+                    )?;
                 }
                 Stmt::Block(inner) => self.hoist_decls(inner, fn_scope)?,
                 Stmt::If {
@@ -797,20 +820,20 @@ impl<'a> Evaluator<'a> {
                     }) = &f.init
                     {
                         for d in decls {
-                            self.hoist_pattern_var(&d.pattern, fn_scope);
+                            self.hoist_pattern_var(&d.pattern, fn_scope)?;
                         }
                     }
                     self.hoist_decls(std::slice::from_ref(&f.body), fn_scope)?;
                 }
                 Stmt::ForOf(f) => {
                     if f.kind == Some(VarKind::Var) {
-                        self.hoist_pattern_var(&f.target, fn_scope);
+                        self.hoist_pattern_var(&f.target, fn_scope)?;
                     }
                     self.hoist_decls(std::slice::from_ref(&f.body), fn_scope)?;
                 }
                 Stmt::ForIn(f) => {
                     if f.kind == Some(VarKind::Var) {
-                        self.hoist_pattern_var(&f.target, fn_scope);
+                        self.hoist_pattern_var(&f.target, fn_scope)?;
                     }
                     self.hoist_decls(std::slice::from_ref(&f.body), fn_scope)?;
                 }
@@ -834,27 +857,30 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
-    fn hoist_pattern_var(&mut self, pattern: &Pattern, fn_scope: usize) {
+    fn hoist_pattern_var(&mut self, pattern: &Pattern, fn_scope: usize) -> Result<(), ExprError> {
         match pattern {
             Pattern::Ident(name) => {
-                self.envs[fn_scope]
-                    .bindings
-                    .entry(name.clone())
-                    .or_insert(Binding {
-                        value: RuntimeValue::Undefined,
-                        mutable: true,
-                        is_var: true,
-                    });
+                if !self.envs[fn_scope].bindings.contains_key(name) {
+                    self.charge_alloc_bytes(ARRAY_ELEM_BUDGET_BYTES.saturating_add(name.len()))?;
+                    self.envs[fn_scope].bindings.insert(
+                        name.clone(),
+                        Binding {
+                            value: RuntimeValue::Undefined,
+                            mutable: true,
+                            is_var: true,
+                        },
+                    );
+                }
             }
             Pattern::Array(elems) => {
                 for e in elems {
                     match e {
                         ArrayPatternElem::Hole => {}
                         ArrayPatternElem::Binding { pattern, .. } => {
-                            self.hoist_pattern_var(pattern, fn_scope);
+                            self.hoist_pattern_var(pattern, fn_scope)?;
                         }
                         ArrayPatternElem::Rest(name) => {
-                            self.hoist_pattern_var(&Pattern::Ident(name.clone()), fn_scope);
+                            self.hoist_pattern_var(&Pattern::Ident(name.clone()), fn_scope)?;
                         }
                     }
                 }
@@ -863,20 +889,21 @@ impl<'a> Evaluator<'a> {
                 for p in props {
                     match p {
                         ObjectPatternProp::Prop { pattern, .. } => {
-                            self.hoist_pattern_var(pattern, fn_scope);
+                            self.hoist_pattern_var(pattern, fn_scope)?;
                         }
                         ObjectPatternProp::Rest(name) => {
-                            self.hoist_pattern_var(&Pattern::Ident(name.clone()), fn_scope);
+                            self.hoist_pattern_var(&Pattern::Ident(name.clone()), fn_scope)?;
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn bind_pattern(
         &mut self,
-        pattern: &Pattern,
+        pattern: &'ast Pattern,
         val: RuntimeValue,
         env: usize,
         kind: VarKind,
@@ -884,7 +911,7 @@ impl<'a> Evaluator<'a> {
         let val = self.deref_property_handle(val)?;
         match pattern {
             Pattern::Ident(name) => {
-                self.define_binding(env, name.clone(), val, kind);
+                self.define_binding(env, name.clone(), val, kind)?;
                 Ok(())
             }
             Pattern::Array(elems) => {
@@ -915,7 +942,7 @@ impl<'a> Evaluator<'a> {
                                         Vec::new()
                                     };
                                     let arr = self.alloc_array(rest_items);
-                                    self.define_binding(env, name.clone(), arr, kind);
+                                    self.define_binding(env, name.clone(), arr, kind)?;
                                 }
                             }
                         }
@@ -963,7 +990,7 @@ impl<'a> Evaluator<'a> {
                                         .collect();
                                     byte_pos = s.len();
                                     let arr = self.alloc_array(rest_items);
-                                    self.define_binding(env, name.clone(), arr, kind);
+                                    self.define_binding(env, name.clone(), arr, kind)?;
                                 }
                             }
                         }
@@ -1019,7 +1046,7 @@ impl<'a> Evaluator<'a> {
                                 }
                             }
                             let obj = self.alloc_object(rest);
-                            self.define_binding(env, name.clone(), obj, kind);
+                            self.define_binding(env, name.clone(), obj, kind)?;
                         }
                     }
                 }
@@ -1032,7 +1059,7 @@ impl<'a> Evaluator<'a> {
     // Statement Execution
     // -----------------------------------------------------------------------
 
-    fn exec_stmt(&mut self, stmt: &Stmt, env: usize) -> Result<Flow, ExprError> {
+    fn exec_stmt(&mut self, stmt: &'ast Stmt, env: usize) -> Result<Flow, ExprError> {
         self.tick()?;
         match stmt {
             Stmt::Empty => Ok(Flow::Normal(RuntimeValue::Empty)),
@@ -1166,7 +1193,7 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn exec_stmt_list(&mut self, stmts: &[Stmt], env: usize) -> Result<Flow, ExprError> {
+    fn exec_stmt_list(&mut self, stmts: &'ast [Stmt], env: usize) -> Result<Flow, ExprError> {
         let mut last = RuntimeValue::Empty;
         for stmt in stmts {
             match self.exec_stmt(stmt, env)? {
@@ -1183,7 +1210,7 @@ impl<'a> Evaluator<'a> {
 
     fn exec_for_stmt(
         &mut self,
-        for_stmt: &crate::ast::ForStmt,
+        for_stmt: &'ast crate::ast::ForStmt,
         env: usize,
     ) -> Result<Flow, ExprError> {
         let mut is_lexical = false;
@@ -1282,7 +1309,7 @@ impl<'a> Evaluator<'a> {
 
     fn exec_for_of_stmt(
         &mut self,
-        for_of: &crate::ast::ForOfStmt,
+        for_of: &'ast crate::ast::ForOfStmt,
         env: usize,
     ) -> Result<Flow, ExprError> {
         let iter_val = self.eval_expr(&for_of.iterable, env)?;
@@ -1347,7 +1374,7 @@ impl<'a> Evaluator<'a> {
 
     fn exec_for_in_stmt(
         &mut self,
-        for_in: &crate::ast::ForInStmt,
+        for_in: &'ast crate::ast::ForInStmt,
         env: usize,
     ) -> Result<Flow, ExprError> {
         let obj_val = self.eval_expr(&for_in.object, env)?;
@@ -1419,7 +1446,7 @@ impl<'a> Evaluator<'a> {
 
     fn exec_try_stmt(
         &mut self,
-        try_stmt: &crate::ast::TryStmt,
+        try_stmt: &'ast crate::ast::TryStmt,
         env: usize,
     ) -> Result<Flow, ExprError> {
         let try_env = self.push_env(Some(env))?;
@@ -1472,7 +1499,7 @@ impl<'a> Evaluator<'a> {
     // Expression Evaluation
     // -----------------------------------------------------------------------
 
-    fn eval_expr(&mut self, expr: &Expr, env: usize) -> Result<RuntimeValue, ExprError> {
+    fn eval_expr(&mut self, expr: &'ast Expr, env: usize) -> Result<RuntimeValue, ExprError> {
         self.tick()?;
         match expr {
             Expr::Literal(lit) => Ok(match lit {
@@ -1678,13 +1705,16 @@ impl<'a> Evaluator<'a> {
             Expr::Call { callee, args } => self.eval_call_expr(callee, args, env),
             Expr::OptionalChain { base, ops } => self.eval_optional_chain(base, ops, env),
             Expr::Function(f) => {
-                let cid = self.closures.len();
-                self.closures.push(Closure {
-                    params: f.params.clone(),
-                    body: f.body.clone(),
+                let body = match &f.body {
+                    FunctionBody::Expr(expr) => ClosureBody::Expr(expr.as_ref()),
+                    FunctionBody::Block(stmts) => ClosureBody::Block(stmts.as_slice()),
+                };
+                let cid = self.alloc_closure(Closure {
+                    params: &f.params,
+                    body,
                     captured_env: env,
-                    name: f.name.clone(),
-                });
+                    name: f.name.as_deref(),
+                })?;
                 Ok(RuntimeValue::Closure(cid))
             }
             Expr::Sequence(items) => {
@@ -1796,7 +1826,7 @@ impl<'a> Evaluator<'a> {
     fn eval_unary(
         &mut self,
         op: UnaryOp,
-        expr: &Expr,
+        expr: &'ast Expr,
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         match op {
@@ -1896,7 +1926,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         op: UpdateOp,
         prefix: bool,
-        target: &AssignTarget,
+        target: &'ast AssignTarget,
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         let delta = match op {
@@ -1913,8 +1943,8 @@ impl<'a> Evaluator<'a> {
     fn eval_assign(
         &mut self,
         op: AssignOp,
-        target: &AssignTarget,
-        value_expr: &Expr,
+        target: &'ast AssignTarget,
+        value_expr: &'ast Expr,
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         let rhs = self.eval_expr(value_expr, env)?;
@@ -1951,7 +1981,7 @@ impl<'a> Evaluator<'a> {
 
     fn read_target(
         &mut self,
-        target: &AssignTarget,
+        target: &'ast AssignTarget,
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         match target {
@@ -1970,7 +2000,7 @@ impl<'a> Evaluator<'a> {
 
     fn write_target(
         &mut self,
-        target: &AssignTarget,
+        target: &'ast AssignTarget,
         val: RuntimeValue,
         env: usize,
     ) -> Result<(), ExprError> {
@@ -2466,8 +2496,8 @@ impl<'a> Evaluator<'a> {
 
     fn eval_optional_chain(
         &mut self,
-        base: &Expr,
-        ops: &[ChainOp],
+        base: &'ast Expr,
+        ops: &'ast [ChainOp],
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         let mut current = self.eval_expr(base, env)?;
@@ -2524,7 +2554,7 @@ impl<'a> Evaluator<'a> {
 
     fn eval_call_args(
         &mut self,
-        args: &[CallArg],
+        args: &'ast [CallArg],
         env: usize,
     ) -> Result<Vec<RuntimeValue>, ExprError> {
         let mut out = Vec::with_capacity(args.len());
@@ -2588,8 +2618,8 @@ impl<'a> Evaluator<'a> {
 
     fn eval_call_expr(
         &mut self,
-        callee: &Expr,
-        args: &[CallArg],
+        callee: &'ast Expr,
+        args: &'ast [CallArg],
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         if let Expr::Member { object, prop } = callee {
@@ -2738,17 +2768,19 @@ impl<'a> Evaluator<'a> {
         cid: usize,
         args: Vec<RuntimeValue>,
     ) -> Result<RuntimeValue, ExprError> {
-        let params = self.closures[cid].params.clone();
-        let body = self.closures[cid].body.clone();
-        let captured_env = self.closures[cid].captured_env;
-        let fn_name = self.closures[cid].name.clone();
+        let closure = self.closures[cid];
 
-        let call_env = self.push_fn_env(captured_env)?;
-        if let Some(name) = fn_name {
-            self.define_binding(call_env, name, RuntimeValue::Closure(cid), VarKind::Const);
+        let call_env = self.push_fn_env(closure.captured_env)?;
+        if let Some(name) = closure.name {
+            self.define_binding(
+                call_env,
+                name.to_string(),
+                RuntimeValue::Closure(cid),
+                VarKind::Const,
+            )?;
         }
 
-        for (i, param) in params.iter().enumerate() {
+        for (i, param) in closure.params.iter().enumerate() {
             if param.is_rest {
                 let rest_len = args.len().saturating_sub(i);
                 self.check_array_alloc(rest_len)?;
@@ -2771,11 +2803,11 @@ impl<'a> Evaluator<'a> {
             }
         }
 
-        match body {
-            FunctionBody::Expr(expr) => self.eval_expr(&expr, call_env),
-            FunctionBody::Block(stmts) => {
-                self.hoist_decls(&stmts, call_env)?;
-                match self.exec_stmt_list(&stmts, call_env)? {
+        match closure.body {
+            ClosureBody::Expr(expr) => self.eval_expr(expr, call_env),
+            ClosureBody::Block(stmts) => {
+                self.hoist_decls(stmts, call_env)?;
+                match self.exec_stmt_list(stmts, call_env)? {
                     Flow::Normal(_) => Ok(RuntimeValue::Undefined),
                     Flow::Return(v) => Ok(v),
                     Flow::Throw(v) => {

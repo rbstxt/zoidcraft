@@ -390,4 +390,30 @@ fn rejects_string_repeat_concat_array_and_dag_export_memory_bombs() {
         matches!(err, ExprError::RangeError(_)),
         "expected RangeError for lexical loop identifier bomb, got {err:?}"
     );
+
+    // 23. Ordinary block `let <64 KiB ident> = 0` inside a loop must charge identifier bytes.
+    let block_ident_expr = format!("for (var i = 0; i < 4000; i++) {{ let {long_ident} = 0; }} i");
+    let err = eval(&block_ident_expr, &ctx, &cfg).expect_err(
+        "binding 64 KiB identifier in 4000 block scopes must exceed 64 MiB heap budget",
+    );
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for block lexical identifier bomb, got {err:?}"
+    );
+
+    // 24. Creating thousands of closures referencing a 256 KiB literal must share the AST body
+    // (zero deep-clone OOM) and finish quickly within budget.
+    let payload = "p".repeat(256 * 1024);
+    let closure_expr = format!(
+        r#"var fns = []; for (var i = 0; i < 4096; i++) {{ fns.push(function () {{ return "{payload}"; }}); }} fns.length"#
+    );
+    let closure_t0 = std::time::Instant::now();
+    let res = eval(&closure_expr, &ctx, &cfg)
+        .expect("4096 closures sharing one AST body should succeed without cloning 1 GiB");
+    assert_eq!(res, zc_expr::Value::Number(4096.0));
+    assert!(
+        closure_t0.elapsed() < std::time::Duration::from_secs(2),
+        "closure creation loop was unexpectedly slow: {:?}",
+        closure_t0.elapsed()
+    );
 }
