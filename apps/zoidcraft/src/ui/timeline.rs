@@ -2341,7 +2341,12 @@ fn process_active_drag_state(
                 }
                 let min_delta = -trim.orig_start;
                 let max_delta = (trim.orig_length - 1.0).max(0.0);
-                trim.preview_delta_frames = (snapped - trim.orig_start).clamp(min_delta, max_delta);
+                trim.preview_delta_frames =
+                    if min_delta.is_finite() && max_delta.is_finite() && min_delta <= max_delta {
+                        (snapped - trim.orig_start).clamp(min_delta, max_delta)
+                    } else {
+                        0.0
+                    };
             }
 
             paint_trim_proxy(

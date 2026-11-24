@@ -14,6 +14,8 @@ struct Metadata {
 struct Package {
     id: String,
     name: String,
+    version: String,
+    license: Option<String>,
     dependencies: Vec<Dependency>,
 }
 
@@ -224,6 +226,130 @@ fn check_layers() -> Result<(), Vec<String>> {
     }
 }
 
+fn is_acceptable_license_expr(expr: &str) -> bool {
+    // Allow permissive, font, and file-level weak-copyleft (MPL-2.0) licenses.
+    // For OR expressions, at least one branch must be acceptable; for AND expressions,
+    // all branches must be acceptable.
+    const ALLOWED: &[&str] = &[
+        "MIT",
+        "Apache-2.0",
+        "Apache-2.0 WITH LLVM-exception",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "BSL-1.0",
+        "ISC",
+        "Zlib",
+        "Unlicense",
+        "0BSD",
+        "Unicode-3.0",
+        "OFL-1.1",
+        "Ubuntu-font-1.0",
+        "MPL-2.0",
+    ];
+
+    fn eval_and(part: &str) -> bool {
+        part.split(" AND ")
+            .all(|atom| eval_or(atom.trim().trim_start_matches('(').trim_end_matches(')')))
+    }
+
+    fn eval_or(part: &str) -> bool {
+        let normalized = part.replace(" / ", " OR ").replace('/', " OR ");
+        normalized.split(" OR ").any(|branch| {
+            let trimmed = branch.trim().trim_start_matches('(').trim_end_matches(')');
+            if trimmed.contains(" AND ") {
+                eval_and(trimmed)
+            } else {
+                ALLOWED.contains(&trimmed)
+            }
+        })
+    }
+
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains(" AND ") {
+        eval_and(trimmed)
+    } else {
+        eval_or(trimmed)
+    }
+}
+
+fn check_licenses() -> Result<(), Vec<String>> {
+    let output = Command::new("cargo")
+        .args([
+            "metadata",
+            "--locked",
+            "--all-features",
+            "--format-version",
+            "1",
+        ])
+        .output()
+        .map_err(|e| vec![format!("failed to execute cargo metadata: {e}")])?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(vec![format!("cargo metadata failed:\n{stderr}")]);
+    }
+
+    let meta: Metadata = serde_json::from_slice(&output.stdout)
+        .map_err(|e| vec![format!("failed to parse cargo metadata: {e}")])?;
+    let ws_ids: BTreeSet<&str> = meta.workspace_members.iter().map(String::as_str).collect();
+
+    let notices_text = std::fs::read_to_string("THIRD_PARTY_LICENSES.md").map_err(|e| {
+        vec![format!(
+            "failed to read THIRD_PARTY_LICENSES.md (must be shipped with every release): {e}"
+        )]
+    })?;
+
+    let mut violations = Vec::new();
+    for required_font in [
+        "Geist Mono",
+        "Hack-Regular.ttf",
+        "Ubuntu-Light.ttf",
+        "NotoEmoji-Regular.ttf",
+        "emoji-icon-font.ttf",
+        "egui-icons.ttf",
+    ] {
+        if !notices_text.contains(required_font) {
+            violations.push(format!(
+                "THIRD_PARTY_LICENSES.md is missing notice for bundled font `{required_font}`"
+            ));
+        }
+    }
+
+    let mut checked_crates = 0usize;
+    for pkg in &meta.packages {
+        if ws_ids.contains(pkg.id.as_str()) {
+            continue;
+        }
+        checked_crates += 1;
+        let lic = pkg.license.as_deref().unwrap_or("");
+        if !is_acceptable_license_expr(lic) {
+            violations.push(format!(
+                "disallowed or missing license on `{}` {}: `{lic}`",
+                pkg.name, pkg.version
+            ));
+        }
+        let needle = format!("| `{}` | `{}` |", pkg.name, pkg.version);
+        if !notices_text.contains(&needle) {
+            violations.push(format!(
+                "THIRD_PARTY_LICENSES.md is missing entry for `{}` {}",
+                pkg.name, pkg.version
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        println!(
+            "License & THIRD_PARTY_LICENSES.md check PASSED ({checked_crates} external crates + 6 bundled fonts verified)."
+        );
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -237,11 +363,24 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("licenses") => match check_licenses() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(errors) => {
+                eprintln!("License check FAILED ({} violation(s)):", errors.len());
+                for err in errors {
+                    eprintln!("  - {err}");
+                }
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!("Usage: cargo xtask <command>");
             eprintln!("Commands:");
             eprintln!(
-                "  layers    Verify strict Engine-First crate layer & transitive GUI boundaries"
+                "  layers      Verify strict Engine-First crate layer & transitive GUI boundaries"
+            );
+            eprintln!(
+                "  licenses    Verify dependency license allowlist and THIRD_PARTY_LICENSES.md completeness"
             );
             ExitCode::FAILURE
         }

@@ -16,6 +16,15 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::AudioError;
 use crate::decode::STANDARD_SAMPLE_RATE;
 
+/// Bounded pre-mixed 48 kHz stereo audio window anchored at timeline frame `origin_frame`.
+#[derive(Debug, Clone)]
+pub struct AudioMixWindow {
+    /// Timeline frame corresponding to sample index `0` of `samples`.
+    pub origin_frame: f64,
+    /// Interleaved stereo `[L, R]` samples at `STANDARD_SAMPLE_RATE` (48 kHz).
+    pub samples: Arc<Vec<[f32; 2]>>,
+}
+
 /// Atomic, tear-free snapshot of the master playback clock state.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlaybackSnapshot {
@@ -524,7 +533,19 @@ impl MasterPlaybackClock {
         &self,
         stereo_mix_48k: Option<Arc<Vec<[f32; 2]>>>,
     ) -> Option<AudioOutputHandle> {
-        match self.start_audio_output(stereo_mix_48k) {
+        self.try_start_audio_output_windowed(stereo_mix_48k.map(|samples| AudioMixWindow {
+            origin_frame: 0.0,
+            samples,
+        }))
+    }
+
+    /// Attempts to open a live `cpal` audio output stream backed by a bounded timeline window.
+    #[must_use]
+    pub fn try_start_audio_output_windowed(
+        &self,
+        window: Option<AudioMixWindow>,
+    ) -> Option<AudioOutputHandle> {
+        match self.start_audio_output_windowed(window) {
             Ok(handle) => Some(handle),
             Err(err) => {
                 tracing::warn!(
@@ -542,6 +563,19 @@ impl MasterPlaybackClock {
     pub fn start_audio_output(
         &self,
         stereo_mix_48k: Option<Arc<Vec<[f32; 2]>>>,
+    ) -> Result<AudioOutputHandle, AudioError> {
+        self.start_audio_output_windowed(stereo_mix_48k.map(|samples| AudioMixWindow {
+            origin_frame: 0.0,
+            samples,
+        }))
+    }
+
+    /// Opens a live `cpal` audio output stream backed by a bounded [`AudioMixWindow`] anchored
+    /// at `window.origin_frame`, allowing arbitrarily long timelines to stream audio without
+    /// exceeding the mixer sample cap.
+    pub fn start_audio_output_windowed(
+        &self,
+        window: Option<AudioMixWindow>,
     ) -> Result<AudioOutputHandle, AudioError> {
         let host = cpal::default_host();
         let device = host
@@ -578,14 +612,19 @@ impl MasterPlaybackClock {
 
         let ch_usize = usize::from(device_channels);
         let mix_sr = f64::from(STANDARD_SAMPLE_RATE);
+        let (mix_origin_frame, stereo_mix_48k) = match window {
+            Some(w) => (w.origin_frame, Some(w.samples)),
+            None => (0.0, None),
+        };
 
         let stream_result = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
                 config,
                 move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                    render_callback_frames(
+                    render_callback_frames_windowed(
                         &shared_cb,
                         stereo_mix_48k.as_deref(),
+                        mix_origin_frame,
                         mix_sr,
                         ch_usize,
                         Some(info),
@@ -599,9 +638,10 @@ impl MasterPlaybackClock {
             SampleFormat::I16 => device.build_output_stream(
                 config,
                 move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
-                    render_callback_frames(
+                    render_callback_frames_windowed(
                         &shared_cb,
                         stereo_mix_48k.as_deref(),
+                        mix_origin_frame,
                         mix_sr,
                         ch_usize,
                         Some(info),
@@ -615,9 +655,10 @@ impl MasterPlaybackClock {
             SampleFormat::U16 => device.build_output_stream(
                 config,
                 move |data: &mut [u16], info: &cpal::OutputCallbackInfo| {
-                    render_callback_frames(
+                    render_callback_frames_windowed(
                         &shared_cb,
                         stereo_mix_48k.as_deref(),
+                        mix_origin_frame,
                         mix_sr,
                         ch_usize,
                         Some(info),
@@ -659,9 +700,35 @@ impl MasterPlaybackClock {
     }
 }
 
+#[cfg(test)]
 fn render_callback_frames<T, F>(
     shared: &ClockShared,
     mix: Option<&Vec<[f32; 2]>>,
+    mix_sample_rate: f64,
+    channels: usize,
+    info: Option<&cpal::OutputCallbackInfo>,
+    output: &mut [T],
+    convert: F,
+) where
+    F: Fn(f32) -> T,
+{
+    render_callback_frames_windowed(
+        shared,
+        mix,
+        0.0,
+        mix_sample_rate,
+        channels,
+        info,
+        output,
+        convert,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_callback_frames_windowed<T, F>(
+    shared: &ClockShared,
+    mix: Option<&Vec<[f32; 2]>>,
+    mix_origin_frame: f64,
     mix_sample_rate: f64,
     channels: usize,
     info: Option<&cpal::OutputCallbackInfo>,
@@ -713,7 +780,7 @@ fn render_callback_frames<T, F>(
                 let sample_pair = if hit_stop || mix_len == 0 {
                     [0.0_f32, 0.0_f32]
                 } else {
-                    let timeline_sec = exact_frame / snap.fps;
+                    let timeline_sec = (exact_frame - mix_origin_frame) / snap.fps;
                     let pos = timeline_sec * mix_sample_rate;
                     if pos >= 0.0 && (pos.floor() as usize) < mix_len {
                         let idx0 = pos.floor() as usize;

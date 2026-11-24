@@ -1,9 +1,14 @@
 //! FFmpeg binary probing, CLI argument builder (Spec 04 §4.3), and bounded stderr ring buffer.
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::ffi::OsString;
+use std::io::{ErrorKind, Read};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::ExportError;
 use crate::settings::{AudioCodec, ExportContainer, ExportSettings, QualityMode, VideoCodec};
@@ -11,38 +16,437 @@ use crate::settings::{AudioCodec, ExportContainer, ExportSettings, QualityMode, 
 /// Maximum bytes retained from FFmpeg `stderr` (64 KiB ring buffer, zero unbounded growth).
 pub const MAX_STDERR_BYTES: usize = 64 * 1024;
 
+/// Maximum time allowed for `ffmpeg -version` probing before terminating and reaping the child.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Configures `cmd` so its spawned child leads its own process group on Unix, allowing
+/// safe, complete process-tree termination on cancel or timeout.
+pub(crate) fn configure_process_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Terminates every process in the Unix process group (or Windows process tree) rooted at `pid`.
+///
+/// SAFETY INVARIANT: This MUST ONLY be called while the parent still holds an open, unreaped
+/// `Child` handle to `pid` (never after reaping), preventing PID/PGID-reuse kills on any OS.
+pub(crate) fn kill_process_tree_by_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Terminates the entire process tree rooted at `child` (wrapper + descendants) and reaps `child`.
+pub(crate) fn kill_process_tree_and_reap(child: &mut Child) {
+    kill_process_tree_by_pid(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Safe, handle-reuse-free I/O cancellation token for a worker thread's OS pipe/socket.
+///
+/// On Windows, Rust's `ChildStdin`/`ChildStdout`/`ChildStderr` use overlapped `WriteFileEx` /
+/// `ReadFileEx`, which require `CancelIoEx(pipe_handle, NULL)` on the pipe handle rather than
+/// `CancelSynchronousIo`. `live` is locked around both `CancelIoEx` and `GuardedPipe`'s drop
+/// transition before closing the OS handle, making handle-reuse races impossible.
+#[derive(Clone)]
+pub(crate) struct PipeCancelToken {
+    #[cfg(windows)]
+    raw_handle: usize,
+    #[cfg(windows)]
+    live: Arc<std::sync::Mutex<bool>>,
+}
+
+impl PipeCancelToken {
+    #[cfg(not(windows))]
+    pub(crate) fn noop() -> Self {
+        Self {}
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    pub(crate) fn cancel_io(&self) {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CancelIoEx(
+                h_file: *mut core::ffi::c_void,
+                lp_overlapped: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+        let guard = self
+            .live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *guard {
+            // SAFETY: While `*guard == true`, `GuardedPipe`'s `_live_guard` has not dropped yet,
+            // so the underlying OS pipe handle is guaranteed open and cannot be closed or recycled
+            // until `guard` is released. Passing `null_mut()` cancels all pending overlapped and
+            // synchronous I/O on `h_file`.
+            let _ = unsafe {
+                CancelIoEx(
+                    self.raw_handle as *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                )
+            };
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn cancel_io(&self) {}
+}
+
+#[cfg(windows)]
+struct PipeLiveGuard {
+    live: Arc<std::sync::Mutex<bool>>,
+}
+
+#[cfg(windows)]
+impl Drop for PipeLiveGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = false;
+    }
+}
+
+/// Pipe wrapper that guarantees `_live_guard` clears the shared liveness flag BEFORE `inner`
+/// drops and closes the underlying Windows OS handle (Rust drops struct fields in declaration order).
+#[cfg(windows)]
+pub(crate) struct GuardedPipe<P> {
+    _live_guard: PipeLiveGuard,
+    inner: P,
+}
+
+#[cfg(windows)]
+impl<P: std::os::windows::io::AsRawHandle> GuardedPipe<P> {
+    pub(crate) fn new(inner: P) -> (Self, PipeCancelToken) {
+        let raw_handle = inner.as_raw_handle() as usize;
+        let live = Arc::new(std::sync::Mutex::new(true));
+        let token = PipeCancelToken {
+            raw_handle,
+            live: Arc::clone(&live),
+        };
+        (
+            Self {
+                _live_guard: PipeLiveGuard { live },
+                inner,
+            },
+            token,
+        )
+    }
+}
+
+#[cfg(windows)]
+impl<P: Read> Read for GuardedPipe<P> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+#[cfg(windows)]
+impl<P: std::io::Write> std::io::Write for GuardedPipe<P> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Cooperatively aborts a worker thread and waits up to `timeout` for its completion channel,
+/// retrying Windows `CancelIoEx` on the worker's pipe handle every 10 ms so the worker always
+/// releases its descriptor/buffers and joins cleanly without signaling any reaped child PID.
+pub(crate) fn abort_and_join_worker<T, R>(
+    abort: &AtomicBool,
+    cancel_token: &PipeCancelToken,
+    rx: &mpsc::Receiver<R>,
+    handle: std::thread::JoinHandle<T>,
+    timeout: Duration,
+) -> Option<R> {
+    abort.store(true, Ordering::Release);
+    cancel_token.cancel_io();
+    let deadline = Instant::now() + timeout;
+    let mut received: Option<R> = None;
+    let mut finished = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(val) => {
+                received = Some(val);
+                finished = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                finished = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cancel_token.cancel_io();
+            }
+        }
+    }
+    if finished {
+        let _ = handle.join();
+    }
+    received
+}
+
 /// Resolves the FFmpeg executable path (`binary` if supplied, otherwise `"ffmpeg"` on `PATH`).
 #[must_use]
 pub fn resolve_ffmpeg_binary(binary: Option<&Path>) -> &Path {
     binary.unwrap_or_else(|| Path::new("ffmpeg"))
 }
 
-/// Probes whether `ffmpeg` is available and returns its version banner line.
+/// Probes whether `ffmpeg` is available and returns its version banner line, enforcing
+/// bounded stdout/stderr buffering and a hard timeout so a stalled executable can never hang.
 pub fn probe_ffmpeg(binary: Option<&Path>) -> Result<String, ExportError> {
+    probe_ffmpeg_with_timeout(binary, PROBE_TIMEOUT)
+}
+
+pub(crate) fn probe_ffmpeg_with_timeout(
+    binary: Option<&Path>,
+    timeout: Duration,
+) -> Result<String, ExportError> {
     let bin = resolve_ffmpeg_binary(binary);
-    let output = Command::new(bin)
-        .arg("-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
+    let mut cmd = Command::new(bin);
+    cmd.arg("-version").stdin(Stdio::null());
+
+    #[cfg(unix)]
+    let (mut child, stdout_reader, stdout_cancel, stderr_reader, stderr_cancel): (
+        Child,
+        Box<dyn Read + Send>,
+        PipeCancelToken,
+        Box<dyn Read + Send>,
+        PipeCancelToken,
+    ) = {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (out_read, out_write) = UnixStream::pair()?;
+        let (err_read, err_write) = UnixStream::pair()?;
+        out_read.set_read_timeout(Some(Duration::from_millis(50)))?;
+        err_read.set_read_timeout(Some(Duration::from_millis(50)))?;
+        cmd.stdout(Stdio::from(OwnedFd::from(out_write)))
+            .stderr(Stdio::from(OwnedFd::from(err_write)));
+        configure_process_group(&mut cmd);
+
+        let child = cmd.spawn().map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
                 ExportError::FfmpegNotFound(bin.display().to_string())
             } else {
                 ExportError::Io(err)
             }
         })?;
+        drop(cmd);
+        (
+            child,
+            Box::new(out_read),
+            PipeCancelToken::noop(),
+            Box::new(err_read),
+            PipeCancelToken::noop(),
+        )
+    };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    #[cfg(windows)]
+    let (mut child, stdout_reader, stdout_cancel, stderr_reader, stderr_cancel): (
+        Child,
+        Box<dyn Read + Send>,
+        PipeCancelToken,
+        Box<dyn Read + Send>,
+        PipeCancelToken,
+    ) =
+        {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            configure_process_group(&mut cmd);
+
+            let mut child = cmd.spawn().map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    ExportError::FfmpegNotFound(bin.display().to_string())
+                } else {
+                    ExportError::Io(err)
+                }
+            })?;
+            drop(cmd);
+            let out = child.stdout.take().ok_or_else(|| {
+                ExportError::Io(std::io::Error::other("failed to capture stdout"))
+            })?;
+            let err = child.stderr.take().ok_or_else(|| {
+                ExportError::Io(std::io::Error::other("failed to capture stderr"))
+            })?;
+            let (out_guarded, out_token) = GuardedPipe::new(out);
+            let (err_guarded, err_token) = GuardedPipe::new(err);
+            (
+                child,
+                Box::new(out_guarded),
+                out_token,
+                Box::new(err_guarded),
+                err_token,
+            )
+        };
+
+    #[cfg(not(any(unix, windows)))]
+    let (mut child, stdout_reader, stdout_cancel, stderr_reader, stderr_cancel): (
+        Child,
+        Box<dyn Read + Send>,
+        PipeCancelToken,
+        Box<dyn Read + Send>,
+        PipeCancelToken,
+    ) =
+        {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            configure_process_group(&mut cmd);
+
+            let mut child = cmd.spawn().map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    ExportError::FfmpegNotFound(bin.display().to_string())
+                } else {
+                    ExportError::Io(err)
+                }
+            })?;
+            drop(cmd);
+            let out = child.stdout.take().ok_or_else(|| {
+                ExportError::Io(std::io::Error::other("failed to capture stdout"))
+            })?;
+            let err = child.stderr.take().ok_or_else(|| {
+                ExportError::Io(std::io::Error::other("failed to capture stderr"))
+            })?;
+            (
+                child,
+                Box::new(out),
+                PipeCancelToken::noop(),
+                Box::new(err),
+                PipeCancelToken::noop(),
+            )
+        };
+
+    let io_abort = Arc::new(AtomicBool::new(false));
+    let out_abort = Arc::clone(&io_abort);
+    let err_abort = Arc::clone(&io_abort);
+
+    let (out_tx, out_rx) = mpsc::channel::<String>();
+    let out_handle = std::thread::spawn(move || {
+        let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
+        ring.drain_reader_interruptible(stdout_reader, &out_abort);
+        let _ = out_tx.send(ring.into_string_lossy());
+    });
+
+    let (err_tx, err_rx) = mpsc::channel::<String>();
+    let err_handle = std::thread::spawn(move || {
+        let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
+        ring.drain_reader_interruptible(stderr_reader, &err_abort);
+        let _ = err_tx.send(ring.into_string_lossy());
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => {
+                if Instant::now() >= deadline {
+                    kill_process_tree_and_reap(&mut child);
+                    let _ = abort_and_join_worker(
+                        &io_abort,
+                        &stdout_cancel,
+                        &out_rx,
+                        out_handle,
+                        Duration::from_millis(250),
+                    );
+                    let _ = abort_and_join_worker(
+                        &io_abort,
+                        &stderr_cancel,
+                        &err_rx,
+                        err_handle,
+                        Duration::from_millis(250),
+                    );
+                    return Err(ExportError::FfmpegFailed {
+                        exit_code: None,
+                        stderr: format!(
+                            "ffmpeg -version probe timed out after {:.1}s",
+                            timeout.as_secs_f64()
+                        ),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+
+    // Wait up to a bounded grace window for normal EOF, then interrupt and join both workers
+    // cleanly without signaling any reaped numeric PID/PGID.
+    let pipe_grace = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_millis(500));
+    let stdout = match out_rx.recv_timeout(pipe_grace) {
+        Ok(text) => {
+            let _ = out_handle.join();
+            text
+        }
+        Err(_) => abort_and_join_worker(
+            &io_abort,
+            &stdout_cancel,
+            &out_rx,
+            out_handle,
+            Duration::from_millis(250),
+        )
+        .unwrap_or_default(),
+    };
+    let err_grace = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_millis(200));
+    let stderr = match err_rx.recv_timeout(err_grace) {
+        Ok(text) => {
+            let _ = err_handle.join();
+            text
+        }
+        Err(_) => abort_and_join_worker(
+            &io_abort,
+            &stderr_cancel,
+            &err_rx,
+            err_handle,
+            Duration::from_millis(250),
+        )
+        .unwrap_or_default(),
+    };
+
+    if !status.success() {
         return Err(ExportError::FfmpegFailed {
-            exit_code: output.status.code(),
-            stderr,
+            exit_code: status.code(),
+            stderr: stderr.trim().to_string(),
         });
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let first_line = stdout
         .lines()
         .next()
@@ -71,16 +475,20 @@ pub fn build_ffmpeg_args(
     settings: &ExportSettings,
     temp_audio_wav: Option<&Path>,
 ) -> Result<Vec<String>, ExportError> {
-    build_ffmpeg_args_with_output(settings, temp_audio_wav, &settings.output_path)
+    build_ffmpeg_os_args_with_output(settings, temp_audio_wav, &settings.output_path).map(|args| {
+        args.into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    })
 }
 
-/// Builds deterministic FFmpeg CLI arguments targeting an explicit `output_path` (such as a
-/// sibling staging file) with an explicit `-f <muxer>` container flag.
-pub(crate) fn build_ffmpeg_args_with_output(
+/// Builds deterministic FFmpeg CLI arguments as raw [`OsString`] values targeting an explicit
+/// `output_path` (preserving non-UTF-8 Unix paths losslessly).
+pub(crate) fn build_ffmpeg_os_args_with_output(
     settings: &ExportSettings,
     temp_audio_wav: Option<&Path>,
     output_path: &Path,
-) -> Result<Vec<String>, ExportError> {
+) -> Result<Vec<OsString>, ExportError> {
     settings.validate()?;
     if matches!(settings.container, ExportContainer::PngSequence) {
         return Err(ExportError::InvalidSettings(
@@ -93,28 +501,28 @@ pub(crate) fn build_ffmpeg_args_with_output(
     let gop = (settings.fps * 2.0).round().max(1.0) as u32;
     let has_audio = temp_audio_wav.is_some() && settings.audio_codec != AudioCodec::None;
 
-    let mut args = vec![
-        "-y".to_string(),
-        "-hide_banner".to_string(),
-        "-loglevel".to_string(),
-        "error".to_string(),
-        "-f".to_string(),
-        "rawvideo".to_string(),
-        "-pix_fmt".to_string(),
-        "rgba".to_string(),
-        "-s".to_string(),
-        format!("{enc_w}x{enc_h}"),
-        "-r".to_string(),
-        fps_str,
-        "-i".to_string(),
-        "pipe:0".to_string(),
+    let mut args: Vec<OsString> = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-pix_fmt".into(),
+        "rgba".into(),
+        "-s".into(),
+        format!("{enc_w}x{enc_h}").into(),
+        "-r".into(),
+        fps_str.into(),
+        "-i".into(),
+        "pipe:0".into(),
     ];
 
     if let Some(audio_path) = temp_audio_wav
         && has_audio
     {
-        args.push("-i".to_string());
-        args.push(audio_path.to_string_lossy().into_owned());
+        args.push("-i".into());
+        args.push(audio_path.as_os_str().to_os_string());
     }
 
     match settings.video_codec {
@@ -128,7 +536,7 @@ pub(crate) fn build_ffmpeg_args_with_output(
             push_quality_args(&mut args, settings.quality, 51, false);
             args.extend([
                 "-g".into(),
-                gop.to_string(),
+                gop.to_string().into(),
                 "-pix_fmt".into(),
                 "yuv420p".into(),
                 "-colorspace".into(),
@@ -149,7 +557,7 @@ pub(crate) fn build_ffmpeg_args_with_output(
             push_quality_args(&mut args, settings.quality, 51, false);
             args.extend([
                 "-g".into(),
-                gop.to_string(),
+                gop.to_string().into(),
                 "-pix_fmt".into(),
                 "yuv420p".into(),
                 "-colorspace".into(),
@@ -172,7 +580,7 @@ pub(crate) fn build_ffmpeg_args_with_output(
                 "-row-mt".into(),
                 "1".into(),
                 "-g".into(),
-                gop.to_string(),
+                gop.to_string().into(),
                 "-pix_fmt".into(),
                 pix_fmt.into(),
             ]);
@@ -183,18 +591,18 @@ pub(crate) fn build_ffmpeg_args_with_output(
                 QualityMode::Crf(crf) => {
                     args.extend([
                         "-crf".into(),
-                        crf.min(63).to_string(),
+                        crf.min(63).to_string().into(),
                         "-b:v".into(),
                         "10000k".into(),
                     ]);
                 }
                 QualityMode::BitrateKbps(kbps) => {
-                    args.extend(["-b:v".into(), format!("{kbps}k")]);
+                    args.extend(["-b:v".into(), format!("{kbps}k").into()]);
                 }
             }
             args.extend([
                 "-g".into(),
-                gop.to_string(),
+                gop.to_string().into(),
                 "-pix_fmt".into(),
                 "yuv420p".into(),
             ]);
@@ -209,7 +617,7 @@ pub(crate) fn build_ffmpeg_args_with_output(
             push_quality_args(&mut args, settings.quality, 63, false);
             args.extend([
                 "-g".into(),
-                gop.to_string(),
+                gop.to_string().into(),
                 "-pix_fmt".into(),
                 "yuv420p".into(),
                 "-colorspace".into(),
@@ -229,9 +637,9 @@ pub(crate) fn build_ffmpeg_args_with_output(
                     "-c:a".into(),
                     "aac".into(),
                     "-b:a".into(),
-                    format!("{}k", settings.audio_bitrate_kbps),
+                    format!("{}k", settings.audio_bitrate_kbps).into(),
                     "-ar".into(),
-                    settings.sample_rate.to_string(),
+                    settings.sample_rate.to_string().into(),
                     "-ac".into(),
                     "2".into(),
                 ]);
@@ -245,9 +653,9 @@ pub(crate) fn build_ffmpeg_args_with_output(
                     "-c:a".into(),
                     "libopus".into(),
                     "-b:a".into(),
-                    format!("{}k", settings.audio_bitrate_kbps),
+                    format!("{}k", settings.audio_bitrate_kbps).into(),
                     "-ar".into(),
-                    opus_rate.to_string(),
+                    opus_rate.to_string().into(),
                     "-ac".into(),
                     "2".into(),
                 ]);
@@ -257,7 +665,7 @@ pub(crate) fn build_ffmpeg_args_with_output(
                     "-c:a".into(),
                     "pcm_s16le".into(),
                     "-ar".into(),
-                    settings.sample_rate.to_string(),
+                    settings.sample_rate.to_string().into(),
                     "-ac".into(),
                     "2".into(),
                 ]);
@@ -288,15 +696,15 @@ pub(crate) fn build_ffmpeg_args_with_output(
         ExportContainer::PngSequence => {}
     }
 
-    args.push(output_path.to_string_lossy().into_owned());
+    args.push(output_path.as_os_str().to_os_string());
     Ok(args)
 }
 
-fn push_quality_args(args: &mut Vec<String>, quality: QualityMode, max_crf: u8, vp9_cq: bool) {
+fn push_quality_args(args: &mut Vec<OsString>, quality: QualityMode, max_crf: u8, vp9_cq: bool) {
     match quality {
         QualityMode::Crf(crf) => {
             args.push("-crf".into());
-            args.push(crf.min(max_crf).to_string());
+            args.push(crf.min(max_crf).to_string().into());
             if vp9_cq {
                 args.push("-b:v".into());
                 args.push("0".into());
@@ -304,7 +712,7 @@ fn push_quality_args(args: &mut Vec<String>, quality: QualityMode, max_crf: u8, 
         }
         QualityMode::BitrateKbps(kbps) => {
             args.push("-b:v".into());
-            args.push(format!("{kbps}k"));
+            args.push(format!("{kbps}k").into());
         }
     }
 }
@@ -357,7 +765,33 @@ impl BoundedStderrBuffer {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => self.push_bytes(&chunk[..n]),
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Drains a [`Read`] stream into this bounded buffer, stopping cleanly when `abort` is set
+    /// and a bounded read timeout (`WouldBlock`/`TimedOut`) or OS I/O cancellation occurs.
+    pub fn drain_reader_interruptible<R: Read>(&mut self, mut reader: R, abort: &AtomicBool) {
+        let mut chunk = [0_u8; 4_096];
+        loop {
+            if abort.load(Ordering::Acquire) {
+                break;
+            }
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => self.push_bytes(&chunk[..n]),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                    ) =>
+                {
+                    if abort.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }

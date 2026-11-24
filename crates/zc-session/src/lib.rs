@@ -1170,6 +1170,122 @@ impl ByteSized for SessionSnapshot {
     }
 }
 
+fn record_uuid_str(id: &str, used_ids: &mut BTreeSet<String>, max_counter: &mut u64) {
+    if id.is_empty() {
+        return;
+    }
+    used_ids.insert(id.to_owned());
+    if let Some(hex) = id.strip_prefix("00000000-0000-4000-8000-")
+        && hex.len() == 12
+        && let Ok(val) = u64::from_str_radix(hex, 16)
+        && val > *max_counter
+    {
+        *max_counter = val;
+    }
+}
+
+fn collect_object_uuids(
+    objects: &[zc_project::Object3D],
+    used_ids: &mut BTreeSet<String>,
+    max_counter: &mut u64,
+) {
+    for obj in objects {
+        record_uuid_str(&obj.id.to_string(), used_ids, max_counter);
+        if let zc_project::Object3DKind::Group { children, .. } = &obj.kind {
+            collect_object_uuids(children, used_ids, max_counter);
+        }
+    }
+}
+
+fn collect_effect_uuids(
+    effects: &[zc_project::EffectInstance],
+    used_ids: &mut BTreeSet<String>,
+    max_counter: &mut u64,
+) {
+    for eff in effects {
+        record_uuid_str(&eff.id.to_string(), used_ids, max_counter);
+        if let zc_project::EffectKind::EffectGroup { children, .. } = &eff.kind {
+            collect_effect_uuids(children, used_ids, max_counter);
+        }
+    }
+}
+
+fn collect_layer_uuids(
+    layer: &zc_project::Layer,
+    used_ids: &mut BTreeSet<String>,
+    max_counter: &mut u64,
+) {
+    record_uuid_str(&layer.id.to_string(), used_ids, max_counter);
+    collect_effect_uuids(&layer.effects, used_ids, max_counter);
+    match &layer.kind {
+        zc_project::LayerKind::Scene3D { objects, .. } => {
+            collect_object_uuids(objects, used_ids, max_counter);
+        }
+        zc_project::LayerKind::Composite { layers, .. } => {
+            for child in layers {
+                collect_layer_uuids(child, used_ids, max_counter);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_sequence_uuids(
+    seq: &zc_project::Sequence,
+    used_ids: &mut BTreeSet<String>,
+    max_counter: &mut u64,
+) {
+    record_uuid_str(&seq.id.to_string(), used_ids, max_counter);
+    for vt in &seq.video_tracks {
+        record_uuid_str(&vt.id.to_string(), used_ids, max_counter);
+        for vc in &vt.clips {
+            record_uuid_str(&vc.id.to_string(), used_ids, max_counter);
+            collect_layer_uuids(&vc.layer, used_ids, max_counter);
+        }
+    }
+    for at in &seq.audio_tracks {
+        record_uuid_str(&at.id.to_string(), used_ids, max_counter);
+        for ac in &at.clips {
+            record_uuid_str(&ac.id.to_string(), used_ids, max_counter);
+        }
+    }
+}
+
+fn seed_id_allocator(
+    project: &zc_project::Project,
+    document: &SessionDocument,
+) -> (BTreeSet<String>, u64) {
+    let mut used_ids = BTreeSet::new();
+    let mut max_counter = 0_u64;
+
+    collect_sequence_uuids(&project.sequence, &mut used_ids, &mut max_counter);
+    for comp in project.compositions.values() {
+        collect_sequence_uuids(comp, &mut used_ids, &mut max_counter);
+    }
+    for media in &project.media {
+        record_uuid_str(&media.id.to_string(), &mut used_ids, &mut max_counter);
+    }
+
+    for track in document
+        .video_tracks
+        .iter()
+        .chain(document.audio_tracks.iter())
+    {
+        record_uuid_str(&track.id, &mut used_ids, &mut max_counter);
+        for clip in &track.clips {
+            record_uuid_str(&clip.id, &mut used_ids, &mut max_counter);
+            for obj in &clip.objects_3d {
+                record_uuid_str(&obj.id, &mut used_ids, &mut max_counter);
+            }
+            for eff in &clip.effects {
+                record_uuid_str(&eff.id, &mut used_ids, &mut max_counter);
+            }
+        }
+    }
+
+    (used_ids, max_counter.saturating_add(1))
+}
+
 /// L4 Engine-First Session owning project state, plugin registry, selection, playback,
 /// bounded undo/redo history, and command registry.
 pub struct Session {
@@ -1183,6 +1299,9 @@ pub struct Session {
     /// Shared immutable asset binary blobs deduplicated outside undo snapshots so
     /// undo history never duplicates multi-megabyte embedded media in memory.
     asset_blobs: BTreeMap<String, Arc<Vec<u8>>>,
+    /// Set of UUIDs already present in the project or allocated by this session so
+    /// reopening a saved project can never collide with existing IDs.
+    used_ids: BTreeSet<String>,
     next_id: u64,
 }
 
@@ -1213,15 +1332,7 @@ impl Session {
     #[must_use]
     pub fn from_project(project: zc_project::Project, plugins: zc_plugin::PluginRegistry) -> Self {
         let document = SessionDocument::from_project(&project);
-        let mut asset_blobs = BTreeMap::new();
-        for rec in project.assets.values() {
-            if let Some(bytes) = rec.bytes.as_ref() {
-                let digest = zc_project::sha256_hex(bytes);
-                asset_blobs
-                    .entry(digest)
-                    .or_insert_with(|| Arc::new(bytes.clone()));
-            }
-        }
+        let (used_ids, next_id) = seed_id_allocator(&project, &document);
         Self {
             project,
             plugins,
@@ -1230,8 +1341,9 @@ impl Session {
             history: UndoStack::new(),
             registry: CommandRegistry::new_default(),
             document,
-            asset_blobs,
-            next_id: 1,
+            asset_blobs: BTreeMap::new(),
+            used_ids,
+            next_id,
         }
     }
 
@@ -1644,9 +1756,23 @@ impl Session {
     }
 
     fn alloc_uuid_id(&mut self) -> String {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-        format!("00000000-0000-4000-8000-{id:012x}")
+        loop {
+            let id = self.next_id;
+            self.next_id = self.next_id.saturating_add(1);
+            let candidate = format!("00000000-0000-4000-8000-{id:012x}");
+            if self.used_ids.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Ensures the session's ID allocator knows about any IDs restored via undo/redo.
+    fn record_snapshot_ids(&mut self) {
+        let (ids, next) = seed_id_allocator(&self.project, &self.document);
+        self.used_ids.extend(ids);
+        if next > self.next_id {
+            self.next_id = next;
+        }
     }
 
     fn restore_snapshot(&mut self, mut snapshot: SessionSnapshot) {
@@ -1663,6 +1789,7 @@ impl Session {
         self.project = snapshot.project;
         self.document = snapshot.document;
         self.selection = snapshot.selection;
+        self.record_snapshot_ids();
         let max_frame = (self.document.sequence_length - 1.0).max(0.0);
         self.playback.current_frame = self.playback.current_frame.clamp(0.0, max_frame);
         self.playback.bump_epoch();
@@ -2400,6 +2527,11 @@ impl Session {
                     min_delta = min_delta.max(-clip.time_start * fps);
                 }
                 let max_delta = (clip.length - 1.0).max(0.0);
+                if !min_delta.is_finite() || !max_delta.is_finite() || min_delta > max_delta {
+                    return Err(SessionError::InvalidOperation(
+                        "clip cannot be left-trimmed within valid timeline bounds".to_string(),
+                    ));
+                }
                 let applied_delta = delta_frames.clamp(min_delta, max_delta);
                 let old_length = clip.length;
                 clip.start += applied_delta;

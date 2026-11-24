@@ -1,8 +1,9 @@
 //! Deterministic tree-walking evaluator with arena-allocated environments,
 //! strict step and recursion budgets, vector arithmetic, and host scene handles.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::f64::consts::PI;
+use std::rc::Rc;
 
 use crate::ast::{
     ArrayElem, ArrayPatternElem, AssignOp, AssignTarget, BinaryOp, CallArg, ChainOp, Expr, ForInit,
@@ -12,9 +13,10 @@ use crate::ast::{
 use crate::builtins::{
     DetRng, ae_ease, ae_ease_in, ae_ease_out, ae_linear, catmull_rom_value, clamp_f64, cm3_ease,
     cm3_gauss_random, cm3_random, cm3_shake, cm3_wave, eval_math_fn, eval_wiggle, format_js_number,
-    js_parse_float, js_parse_int, json_parse, json_stringify, lerp_value, look_at_xyz_euler,
-    math_constant, to_i32, to_u32, vec_add, vec_cross, vec_div_componentwise, vec_div_scalar,
-    vec_dot, vec_length, vec_mul_componentwise, vec_mul_scalar, vec_normalize, vec_sub,
+    js_parse_float, js_parse_int, json_parse, json_stringify_bounded, lerp_value,
+    look_at_xyz_euler, math_constant, to_i32, to_u32, vec_add, vec_cross, vec_div_componentwise,
+    vec_div_scalar, vec_dot, vec_length, vec_mul_componentwise, vec_mul_scalar, vec_normalize,
+    vec_sub,
 };
 use crate::{
     EvalConfig, ExprContext, ExprError, ExprMode, HandleId, HandleRef, KeyframeRecord, NameOrIndex,
@@ -22,6 +24,18 @@ use crate::{
 };
 
 const MAX_EXPORT_DEPTH: usize = 128;
+/// Maximum byte length of any single runtime string in an expression evaluation (4 MiB).
+const MAX_STRING_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum cumulative heap budget (strings + array/object entries) per expression evaluation (64 MiB).
+const MAX_HEAP_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum element count of any single runtime array or object key list.
+const MAX_ARRAY_LEN: usize = 65_536;
+/// Maximum aggregate nodes expanded when converting an expression result to [`Value`].
+const MAX_EXPORT_NODES: usize = 65_536;
+/// Maximum aggregate string/container bytes materialized when converting an expression result.
+const MAX_EXPORT_BYTES: usize = 16 * 1024 * 1024;
+/// Estimated heap overhead per array/object element for allocation budgeting.
+const ARRAY_ELEM_BUDGET_BYTES: usize = 32;
 
 /// Evaluates a parsed [`Program`] against `ctx` using `config`.
 pub fn evaluate_program(
@@ -30,7 +44,7 @@ pub fn evaluate_program(
     config: &EvalConfig,
 ) -> Result<Value, ExprError> {
     let mut evaluator = Evaluator::new(ctx, *config);
-    let root_env = evaluator.push_env(None);
+    let root_env = evaluator.push_env(None)?;
     evaluator.hoist_decls(&program.body, root_env)?;
 
     let mut completion = RuntimeValue::Undefined;
@@ -64,7 +78,46 @@ pub fn evaluate_program(
         }
     }
 
-    evaluator.export_value(&completion, 0)
+    evaluator.export_root_value(&completion)
+}
+
+/// Immutable shared string with cached O(1) ASCII flag so `.length`, `s[i]`,
+/// `charAt`, `charCodeAt`, and ASCII slicing run in true O(1) time even on 4 MiB strings.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct JsStr {
+    text: Rc<str>,
+    is_ascii: bool,
+}
+
+impl JsStr {
+    fn from_rc(text: Rc<str>) -> Self {
+        let is_ascii = text.is_ascii();
+        Self { text, is_ascii }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::ops::Deref for JsStr {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl From<String> for JsStr {
+    fn from(s: String) -> Self {
+        Self::from_rc(Rc::from(s))
+    }
+}
+
+impl From<&str> for JsStr {
+    fn from(s: &str) -> Self {
+        Self::from_rc(Rc::from(s))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,11 +128,11 @@ enum RuntimeValue {
     Null,
     Bool(bool),
     Number(f64),
-    String(String),
+    String(JsStr),
     Array(usize),
     Object(usize),
     Closure(usize),
-    BuiltinFn(String),
+    BuiltinFn(Rc<str>),
     Namespace(NamespaceKind),
     Handle(HandleRef),
 }
@@ -115,40 +168,149 @@ struct EnvFrame {
     bindings: BTreeMap<String, Binding>,
 }
 
-struct Closure {
-    params: Vec<Param>,
-    body: FunctionBody,
-    captured_env: usize,
-    name: Option<String>,
+#[derive(Clone, Copy)]
+enum ClosureBody<'ast> {
+    Expr(&'ast Expr),
+    Block(&'ast [Stmt]),
 }
 
-struct Evaluator<'a> {
+#[derive(Clone, Copy)]
+struct Closure<'ast> {
+    params: &'ast [Param],
+    body: ClosureBody<'ast>,
+    captured_env: usize,
+    name: Option<&'ast str>,
+}
+
+struct Evaluator<'a, 'ast> {
     ctx: &'a dyn ExprContext,
     config: EvalConfig,
     steps: u64,
     recursion_depth: usize,
+    allocated_bytes: usize,
     envs: Vec<EnvFrame>,
     arrays: Vec<Vec<RuntimeValue>>,
     objects: Vec<BTreeMap<String, RuntimeValue>>,
-    closures: Vec<Closure>,
+    closures: Vec<Closure<'ast>>,
+    literal_strings: HashMap<String, JsStr>,
     rng: Option<DetRng>,
     stringifying_arrays: Vec<usize>,
 }
 
-impl<'a> Evaluator<'a> {
+impl<'a, 'ast> Evaluator<'a, 'ast> {
     fn new(ctx: &'a dyn ExprContext, config: EvalConfig) -> Self {
         Self {
             ctx,
             config,
             steps: 0,
             recursion_depth: 0,
+            allocated_bytes: 0,
             envs: Vec::new(),
             arrays: Vec::new(),
             objects: Vec::new(),
             closures: Vec::new(),
+            literal_strings: HashMap::new(),
             rng: None,
             stringifying_arrays: Vec::new(),
         }
+    }
+
+    fn charge_work(&mut self, units: usize) -> Result<(), ExprError> {
+        let delta = (units as u64).max(1);
+        self.steps = self.steps.saturating_add(delta);
+        if self.steps > self.config.max_steps {
+            return Err(ExprError::StepLimitExceeded {
+                limit: self.config.max_steps,
+            });
+        }
+        Ok(())
+    }
+
+    /// Charge execution steps proportional to linear byte scans (`1 step per 8 bytes`, min 1).
+    /// With default `max_steps = 10_000_000`, this caps total linear byte work at ~80 MB while
+    /// keeping the 64 MiB heap budget (`MAX_HEAP_BYTES`) reachable for allocation bombs.
+    fn charge_byte_work(&mut self, bytes: usize) -> Result<(), ExprError> {
+        self.charge_work((bytes / 8).max(1))
+    }
+
+    fn intern_literal_string(&mut self, s: &str) -> Result<RuntimeValue, ExprError> {
+        if let Some(js) = self.literal_strings.get(s) {
+            return Ok(RuntimeValue::String(js.clone()));
+        }
+        self.check_string_alloc(s.len())?;
+        let js = JsStr::from(s);
+        self.literal_strings.insert(s.to_owned(), js.clone());
+        Ok(RuntimeValue::String(js))
+    }
+
+    fn string_char_len(&mut self, s: &JsStr) -> Result<usize, ExprError> {
+        if s.is_ascii {
+            Ok(s.len())
+        } else {
+            self.charge_byte_work(s.len())?;
+            Ok(s.chars().count())
+        }
+    }
+
+    fn string_char_at(&mut self, s: &JsStr, idx: usize) -> Result<Option<char>, ExprError> {
+        if s.is_ascii {
+            Ok(s.as_bytes().get(idx).map(|&b| char::from(b)))
+        } else {
+            self.charge_byte_work(idx.min(s.len()))?;
+            Ok(s.chars().nth(idx))
+        }
+    }
+
+    fn string_byte_offset_for_char_index(s: &JsStr, char_idx: usize) -> usize {
+        if s.is_ascii {
+            char_idx.min(s.len())
+        } else {
+            s.char_indices()
+                .nth(char_idx)
+                .map_or(s.len(), |(byte_idx, _)| byte_idx)
+        }
+    }
+
+    fn charge_alloc_bytes(&mut self, bytes: usize) -> Result<(), ExprError> {
+        let next = self.allocated_bytes.saturating_add(bytes);
+        if next > MAX_HEAP_BYTES {
+            return Err(ExprError::RangeError(format!(
+                "expression memory budget exceeded ({MAX_HEAP_BYTES} bytes)"
+            )));
+        }
+        self.allocated_bytes = next;
+        Ok(())
+    }
+
+    fn check_string_alloc(&mut self, byte_len: usize) -> Result<(), ExprError> {
+        if byte_len > MAX_STRING_BYTES {
+            return Err(ExprError::RangeError(format!(
+                "string length {byte_len} exceeds {MAX_STRING_BYTES} byte limit"
+            )));
+        }
+        self.charge_alloc_bytes(byte_len)
+    }
+
+    fn alloc_string(&mut self, s: String) -> Result<RuntimeValue, ExprError> {
+        self.check_string_alloc(s.len())?;
+        Ok(RuntimeValue::String(JsStr::from(s)))
+    }
+
+    fn alloc_builtin_fn(&mut self, name: String) -> Result<RuntimeValue, ExprError> {
+        self.check_string_alloc(name.len())?;
+        Ok(RuntimeValue::BuiltinFn(Rc::from(name)))
+    }
+
+    fn check_array_alloc(&mut self, elem_count: usize) -> Result<(), ExprError> {
+        if elem_count > MAX_ARRAY_LEN {
+            return Err(ExprError::RangeError(format!(
+                "array length {elem_count} exceeds {MAX_ARRAY_LEN} limit"
+            )));
+        }
+        let bytes = elem_count
+            .checked_mul(ARRAY_ELEM_BUDGET_BYTES)
+            .ok_or_else(|| ExprError::RangeError("array allocation overflow".to_string()))?;
+        self.charge_alloc_bytes(bytes)
     }
 
     fn tick(&mut self) -> Result<(), ExprError> {
@@ -161,24 +323,26 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
-    fn push_env(&mut self, parent: Option<usize>) -> usize {
+    fn push_env(&mut self, parent: Option<usize>) -> Result<usize, ExprError> {
+        self.charge_alloc_bytes(64)?;
         let id = self.envs.len();
         self.envs.push(EnvFrame {
             parent,
             is_function_scope: parent.is_none(),
             bindings: BTreeMap::new(),
         });
-        id
+        Ok(id)
     }
 
-    fn push_fn_env(&mut self, parent: usize) -> usize {
+    fn push_fn_env(&mut self, parent: usize) -> Result<usize, ExprError> {
+        self.charge_alloc_bytes(64)?;
         let id = self.envs.len();
         self.envs.push(EnvFrame {
             parent: Some(parent),
             is_function_scope: true,
             bindings: BTreeMap::new(),
         });
-        id
+        Ok(id)
     }
 
     fn function_scope_of(&self, mut env: usize) -> usize {
@@ -193,12 +357,21 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn define_binding(&mut self, env: usize, name: String, value: RuntimeValue, kind: VarKind) {
+    fn define_binding(
+        &mut self,
+        env: usize,
+        name: String,
+        value: RuntimeValue,
+        kind: VarKind,
+    ) -> Result<(), ExprError> {
         let target_env = if kind == VarKind::Var {
             self.function_scope_of(env)
         } else {
             env
         };
+        if !self.envs[target_env].bindings.contains_key(&name) {
+            self.charge_alloc_bytes(ARRAY_ELEM_BUDGET_BYTES.saturating_add(name.len()))?;
+        }
         self.envs[target_env].bindings.insert(
             name,
             Binding {
@@ -207,6 +380,14 @@ impl<'a> Evaluator<'a> {
                 is_var: kind == VarKind::Var,
             },
         );
+        Ok(())
+    }
+
+    fn alloc_closure(&mut self, closure: Closure<'ast>) -> Result<usize, ExprError> {
+        self.charge_alloc_bytes(64)?;
+        let cid = self.closures.len();
+        self.closures.push(closure);
+        Ok(cid)
     }
 
     fn lookup_local(&self, mut env: usize, name: &str) -> Option<RuntimeValue> {
@@ -241,59 +422,179 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn intern_value(&mut self, val: Value) -> RuntimeValue {
+    fn intern_value(&mut self, val: Value) -> Result<RuntimeValue, ExprError> {
         match val {
-            Value::Undefined => RuntimeValue::Undefined,
-            Value::Null => RuntimeValue::Null,
-            Value::Bool(b) => RuntimeValue::Bool(b),
-            Value::Number(n) => RuntimeValue::Number(n),
-            Value::String(s) => RuntimeValue::String(s),
+            Value::Undefined => Ok(RuntimeValue::Undefined),
+            Value::Null => Ok(RuntimeValue::Null),
+            Value::Bool(b) => Ok(RuntimeValue::Bool(b)),
+            Value::Number(n) => Ok(RuntimeValue::Number(n)),
+            Value::String(s) => self.alloc_string(s),
             Value::Array(items) => {
-                let converted: Vec<RuntimeValue> =
-                    items.into_iter().map(|v| self.intern_value(v)).collect();
+                self.check_array_alloc(items.len())?;
+                let mut converted = Vec::with_capacity(items.len());
+                for v in items {
+                    converted.push(self.intern_value(v)?);
+                }
                 let id = self.arrays.len();
                 self.arrays.push(converted);
-                RuntimeValue::Array(id)
+                Ok(RuntimeValue::Array(id))
             }
             Value::Object(map) => {
-                let converted: BTreeMap<String, RuntimeValue> = map
-                    .into_iter()
-                    .map(|(k, v)| (k, self.intern_value(v)))
-                    .collect();
+                self.check_array_alloc(map.len())?;
+                let key_bytes: usize = map.keys().map(String::len).sum();
+                self.charge_alloc_bytes(key_bytes)?;
+                let mut converted = BTreeMap::new();
+                for (k, v) in map {
+                    converted.insert(k, self.intern_value(v)?);
+                }
                 let id = self.objects.len();
                 self.objects.push(converted);
-                RuntimeValue::Object(id)
+                Ok(RuntimeValue::Object(id))
             }
         }
     }
 
-    fn export_value(&mut self, rv: &RuntimeValue, depth: usize) -> Result<Value, ExprError> {
+    fn export_root_value(&mut self, rv: &RuntimeValue) -> Result<Value, ExprError> {
+        let mut nodes = 0_usize;
+        let mut bytes = 0_usize;
+        let mut active_arrays = Vec::new();
+        let mut active_objects = Vec::new();
+        self.export_value(
+            rv,
+            0,
+            &mut nodes,
+            &mut bytes,
+            &mut active_arrays,
+            &mut active_objects,
+        )
+    }
+
+    fn export_value(
+        &mut self,
+        rv: &RuntimeValue,
+        depth: usize,
+        nodes: &mut usize,
+        bytes: &mut usize,
+        active_arrays: &mut Vec<usize>,
+        active_objects: &mut Vec<usize>,
+    ) -> Result<Value, ExprError> {
+        self.tick()?;
         if depth > MAX_EXPORT_DEPTH {
             return Err(ExprError::RangeError(
                 "circular or overly deep value cannot be returned".to_string(),
             ));
+        }
+        *nodes = nodes.saturating_add(1);
+        if *nodes > MAX_EXPORT_NODES {
+            return Err(ExprError::RangeError(format!(
+                "returned value exceeds {MAX_EXPORT_NODES} element budget"
+            )));
+        }
+        *bytes = bytes.saturating_add(ARRAY_ELEM_BUDGET_BYTES);
+        if *bytes > MAX_EXPORT_BYTES {
+            return Err(ExprError::RangeError(format!(
+                "returned value exceeds {MAX_EXPORT_BYTES} byte budget"
+            )));
         }
         match rv {
             RuntimeValue::Empty | RuntimeValue::Undefined => Ok(Value::Undefined),
             RuntimeValue::Null => Ok(Value::Null),
             RuntimeValue::Bool(b) => Ok(Value::Bool(*b)),
             RuntimeValue::Number(n) => Ok(Value::Number(*n)),
-            RuntimeValue::String(s) => Ok(Value::String(s.clone())),
-            RuntimeValue::Array(id) => {
-                let items = self.arrays[*id].clone();
-                let mut out = Vec::with_capacity(items.len());
-                for item in &items {
-                    out.push(self.export_value(item, depth + 1)?);
+            RuntimeValue::String(s) => {
+                self.charge_byte_work(s.len())?;
+                *bytes = bytes.saturating_add(s.len());
+                if *bytes > MAX_EXPORT_BYTES {
+                    return Err(ExprError::RangeError(format!(
+                        "returned value exceeds {MAX_EXPORT_BYTES} byte budget"
+                    )));
                 }
-                Ok(Value::Array(out))
+                Ok(Value::String(s.to_string()))
+            }
+            RuntimeValue::Array(id) => {
+                if active_arrays.contains(id) {
+                    return Err(ExprError::RangeError(
+                        "circular array cannot be exported".to_string(),
+                    ));
+                }
+                let len = self.arrays[*id].len();
+                if nodes.saturating_add(len) > MAX_EXPORT_NODES {
+                    return Err(ExprError::RangeError(format!(
+                        "returned value exceeds {MAX_EXPORT_NODES} element budget"
+                    )));
+                }
+                if bytes.saturating_add(len.saturating_mul(ARRAY_ELEM_BUDGET_BYTES))
+                    > MAX_EXPORT_BYTES
+                {
+                    return Err(ExprError::RangeError(format!(
+                        "returned value exceeds {MAX_EXPORT_BYTES} byte budget"
+                    )));
+                }
+                self.charge_work(len)?;
+                active_arrays.push(*id);
+                let res = (|| -> Result<Value, ExprError> {
+                    let mut out = Vec::with_capacity(len);
+                    for i in 0..len {
+                        let item = self.arrays[*id][i].clone();
+                        out.push(self.export_value(
+                            &item,
+                            depth + 1,
+                            nodes,
+                            bytes,
+                            active_arrays,
+                            active_objects,
+                        )?);
+                    }
+                    Ok(Value::Array(out))
+                })();
+                active_arrays.pop();
+                res
             }
             RuntimeValue::Object(id) => {
-                let entries = self.objects[*id].clone();
-                let mut out = BTreeMap::new();
-                for (k, v) in &entries {
-                    out.insert(k.clone(), self.export_value(v, depth + 1)?);
+                if active_objects.contains(id) {
+                    return Err(ExprError::RangeError(
+                        "circular object cannot be exported".to_string(),
+                    ));
                 }
-                Ok(Value::Object(out))
+                let len = self.objects[*id].len();
+                if nodes.saturating_add(len) > MAX_EXPORT_NODES {
+                    return Err(ExprError::RangeError(format!(
+                        "returned value exceeds {MAX_EXPORT_NODES} element budget"
+                    )));
+                }
+                let key_bytes: usize = self.objects[*id].keys().map(String::len).sum();
+                let container_bytes =
+                    key_bytes.saturating_add(len.saturating_mul(ARRAY_ELEM_BUDGET_BYTES));
+                if bytes.saturating_add(container_bytes) > MAX_EXPORT_BYTES {
+                    return Err(ExprError::RangeError(format!(
+                        "returned value exceeds {MAX_EXPORT_BYTES} byte budget"
+                    )));
+                }
+                self.charge_work(len)?;
+                self.charge_byte_work(key_bytes)?;
+                *bytes = bytes.saturating_add(key_bytes);
+                active_objects.push(*id);
+                let entries: Vec<(String, RuntimeValue)> = self.objects[*id]
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let res = (|| -> Result<Value, ExprError> {
+                    let mut out = BTreeMap::new();
+                    for (k, v) in entries {
+                        let exported = self.export_value(
+                            &v,
+                            depth + 1,
+                            nodes,
+                            bytes,
+                            active_arrays,
+                            active_objects,
+                        )?;
+                        out.insert(k, exported);
+                    }
+                    Ok(Value::Object(out))
+                })();
+                active_objects.pop();
+                res
             }
             RuntimeValue::Handle(HandleRef::Property(prop_id)) => self.ctx.property_value(prop_id),
             RuntimeValue::Handle(_)
@@ -307,7 +608,7 @@ impl<'a> Evaluator<'a> {
     fn deref_property_handle(&mut self, rv: RuntimeValue) -> Result<RuntimeValue, ExprError> {
         if let RuntimeValue::Handle(HandleRef::Property(prop_id)) = rv {
             let val = self.ctx.property_value(&prop_id)?;
-            Ok(self.intern_value(val))
+            self.intern_value(val)
         } else {
             Ok(rv)
         }
@@ -318,6 +619,8 @@ impl<'a> Evaluator<'a> {
         let RuntimeValue::Array(id) = rv else {
             return Ok(None);
         };
+        let len = self.arrays[id].len();
+        self.charge_work(len)?;
         let items = &self.arrays[id];
         let mut out = Vec::with_capacity(items.len());
         for item in items {
@@ -359,7 +662,23 @@ impl<'a> Evaluator<'a> {
             }
             RuntimeValue::Number(n) => n,
             RuntimeValue::String(s) => {
-                let t = s.trim();
+                self.charge_byte_work(s.len())?;
+                let t = if s.is_ascii {
+                    let bytes = s.as_bytes();
+                    let is_js_ascii_ws =
+                        |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C);
+                    let start = bytes
+                        .iter()
+                        .position(|&b| !is_js_ascii_ws(b))
+                        .unwrap_or(bytes.len());
+                    let end = bytes[start..]
+                        .iter()
+                        .rposition(|&b| !is_js_ascii_ws(b))
+                        .map_or(start, |i| start + i + 1);
+                    &s.as_str()[start..end]
+                } else {
+                    s.trim()
+                };
                 if t.is_empty() {
                     0.0
                 } else {
@@ -378,7 +697,10 @@ impl<'a> Evaluator<'a> {
             RuntimeValue::Null => "null".to_string(),
             RuntimeValue::Bool(b) => b.to_string(),
             RuntimeValue::Number(n) => format_js_number(n),
-            RuntimeValue::String(s) => s,
+            RuntimeValue::String(s) => {
+                self.charge_byte_work(s.len())?;
+                s.to_string()
+            }
             RuntimeValue::Array(id) => self.join_array_to_string(id, ",")?,
             RuntimeValue::Object(_) | RuntimeValue::Namespace(_) | RuntimeValue::Handle(_) => {
                 "[object Object]".to_string()
@@ -401,13 +723,28 @@ impl<'a> Evaluator<'a> {
         let items = self.arrays[id].clone();
         let mut parts = Vec::with_capacity(items.len());
         let res = (|| -> Result<String, ExprError> {
-            for item in &items {
+            let mut total_bytes = 0_usize;
+            for (idx, item) in items.iter().enumerate() {
                 self.tick()?;
-                match item {
-                    RuntimeValue::Null | RuntimeValue::Undefined => parts.push(String::new()),
-                    other => parts.push(self.runtime_to_js_string(other)?),
+                let piece = match item {
+                    RuntimeValue::Null | RuntimeValue::Undefined => String::new(),
+                    other => self.runtime_to_js_string(other)?,
+                };
+                let add = piece
+                    .len()
+                    .checked_add(if idx > 0 { sep.len() } else { 0 })
+                    .ok_or_else(|| ExprError::RangeError("joined string overflow".to_string()))?;
+                total_bytes = total_bytes
+                    .checked_add(add)
+                    .ok_or_else(|| ExprError::RangeError("joined string overflow".to_string()))?;
+                if total_bytes > MAX_STRING_BYTES {
+                    return Err(ExprError::RangeError(format!(
+                        "joined string length exceeds {MAX_STRING_BYTES} byte limit"
+                    )));
                 }
+                parts.push(piece);
             }
+            self.check_string_alloc(total_bytes)?;
             Ok(parts.join(sep))
         })();
         self.stringifying_arrays.pop();
@@ -431,9 +768,10 @@ impl<'a> Evaluator<'a> {
         RuntimeValue::Array(id)
     }
 
-    fn alloc_f64_vec(&mut self, vals: Vec<f64>) -> RuntimeValue {
+    fn alloc_f64_vec(&mut self, vals: Vec<f64>) -> Result<RuntimeValue, ExprError> {
+        self.check_array_alloc(vals.len())?;
         let elems = vals.into_iter().map(RuntimeValue::Number).collect();
-        self.alloc_array(elems)
+        Ok(self.alloc_array(elems))
     }
 
     fn alloc_object(&mut self, map: BTreeMap<String, RuntimeValue>) -> RuntimeValue {
@@ -442,20 +780,20 @@ impl<'a> Evaluator<'a> {
         RuntimeValue::Object(id)
     }
 
-    fn keyframe_to_object(&mut self, kf: KeyframeRecord) -> RuntimeValue {
+    fn keyframe_to_object(&mut self, kf: KeyframeRecord) -> Result<RuntimeValue, ExprError> {
         let mut map = BTreeMap::new();
         map.insert("index".to_string(), RuntimeValue::Number(kf.index as f64));
         map.insert("time".to_string(), RuntimeValue::Number(kf.time));
-        let val = self.intern_value(kf.value);
+        let val = self.intern_value(kf.value)?;
         map.insert("value".to_string(), val);
-        self.alloc_object(map)
+        Ok(self.alloc_object(map))
     }
 
     // -----------------------------------------------------------------------
     // Hoisting & Pattern Binding
     // -----------------------------------------------------------------------
 
-    fn hoist_decls(&mut self, stmts: &[Stmt], env: usize) -> Result<(), ExprError> {
+    fn hoist_decls(&mut self, stmts: &'ast [Stmt], env: usize) -> Result<(), ExprError> {
         let fn_scope = self.function_scope_of(env);
         for stmt in stmts {
             match stmt {
@@ -464,23 +802,22 @@ impl<'a> Evaluator<'a> {
                     decls,
                 } => {
                     for d in decls {
-                        self.hoist_pattern_var(&d.pattern, fn_scope);
+                        self.hoist_pattern_var(&d.pattern, fn_scope)?;
                     }
                 }
                 Stmt::FunctionDecl(f) => {
-                    let cid = self.closures.len();
-                    self.closures.push(Closure {
-                        params: f.params.clone(),
-                        body: FunctionBody::Block(f.body.clone()),
+                    let cid = self.alloc_closure(Closure {
+                        params: &f.params,
+                        body: ClosureBody::Block(&f.body),
                         captured_env: fn_scope,
-                        name: Some(f.name.clone()),
-                    });
+                        name: Some(f.name.as_str()),
+                    })?;
                     self.define_binding(
                         fn_scope,
                         f.name.clone(),
                         RuntimeValue::Closure(cid),
                         VarKind::Var,
-                    );
+                    )?;
                 }
                 Stmt::Block(inner) => self.hoist_decls(inner, fn_scope)?,
                 Stmt::If {
@@ -503,20 +840,20 @@ impl<'a> Evaluator<'a> {
                     }) = &f.init
                     {
                         for d in decls {
-                            self.hoist_pattern_var(&d.pattern, fn_scope);
+                            self.hoist_pattern_var(&d.pattern, fn_scope)?;
                         }
                     }
                     self.hoist_decls(std::slice::from_ref(&f.body), fn_scope)?;
                 }
                 Stmt::ForOf(f) => {
                     if f.kind == Some(VarKind::Var) {
-                        self.hoist_pattern_var(&f.target, fn_scope);
+                        self.hoist_pattern_var(&f.target, fn_scope)?;
                     }
                     self.hoist_decls(std::slice::from_ref(&f.body), fn_scope)?;
                 }
                 Stmt::ForIn(f) => {
                     if f.kind == Some(VarKind::Var) {
-                        self.hoist_pattern_var(&f.target, fn_scope);
+                        self.hoist_pattern_var(&f.target, fn_scope)?;
                     }
                     self.hoist_decls(std::slice::from_ref(&f.body), fn_scope)?;
                 }
@@ -540,27 +877,30 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
-    fn hoist_pattern_var(&mut self, pattern: &Pattern, fn_scope: usize) {
+    fn hoist_pattern_var(&mut self, pattern: &Pattern, fn_scope: usize) -> Result<(), ExprError> {
         match pattern {
             Pattern::Ident(name) => {
-                self.envs[fn_scope]
-                    .bindings
-                    .entry(name.clone())
-                    .or_insert(Binding {
-                        value: RuntimeValue::Undefined,
-                        mutable: true,
-                        is_var: true,
-                    });
+                if !self.envs[fn_scope].bindings.contains_key(name) {
+                    self.charge_alloc_bytes(ARRAY_ELEM_BUDGET_BYTES.saturating_add(name.len()))?;
+                    self.envs[fn_scope].bindings.insert(
+                        name.clone(),
+                        Binding {
+                            value: RuntimeValue::Undefined,
+                            mutable: true,
+                            is_var: true,
+                        },
+                    );
+                }
             }
             Pattern::Array(elems) => {
                 for e in elems {
                     match e {
                         ArrayPatternElem::Hole => {}
                         ArrayPatternElem::Binding { pattern, .. } => {
-                            self.hoist_pattern_var(pattern, fn_scope);
+                            self.hoist_pattern_var(pattern, fn_scope)?;
                         }
                         ArrayPatternElem::Rest(name) => {
-                            self.hoist_pattern_var(&Pattern::Ident(name.clone()), fn_scope);
+                            self.hoist_pattern_var(&Pattern::Ident(name.clone()), fn_scope)?;
                         }
                     }
                 }
@@ -569,20 +909,21 @@ impl<'a> Evaluator<'a> {
                 for p in props {
                     match p {
                         ObjectPatternProp::Prop { pattern, .. } => {
-                            self.hoist_pattern_var(pattern, fn_scope);
+                            self.hoist_pattern_var(pattern, fn_scope)?;
                         }
                         ObjectPatternProp::Rest(name) => {
-                            self.hoist_pattern_var(&Pattern::Ident(name.clone()), fn_scope);
+                            self.hoist_pattern_var(&Pattern::Ident(name.clone()), fn_scope)?;
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn bind_pattern(
         &mut self,
-        pattern: &Pattern,
+        pattern: &'ast Pattern,
         val: RuntimeValue,
         env: usize,
         kind: VarKind,
@@ -590,43 +931,94 @@ impl<'a> Evaluator<'a> {
         let val = self.deref_property_handle(val)?;
         match pattern {
             Pattern::Ident(name) => {
-                self.define_binding(env, name.clone(), val, kind);
+                self.define_binding(env, name.clone(), val, kind)?;
                 Ok(())
             }
             Pattern::Array(elems) => {
-                let items = match val {
-                    RuntimeValue::Array(id) => self.arrays[id].clone(),
-                    RuntimeValue::String(s) => s
-                        .chars()
-                        .map(|c| RuntimeValue::String(c.to_string()))
-                        .collect(),
+                match val {
+                    RuntimeValue::Array(id) => {
+                        for (i, elem) in elems.iter().enumerate() {
+                            match elem {
+                                ArrayPatternElem::Hole => {}
+                                ArrayPatternElem::Binding { pattern, default } => {
+                                    let mut item = self.arrays[id]
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or(RuntimeValue::Undefined);
+                                    if matches!(item, RuntimeValue::Undefined)
+                                        && let Some(def_expr) = default
+                                    {
+                                        item = self.eval_expr(def_expr, env)?;
+                                    }
+                                    self.bind_pattern(pattern, item, env, kind)?;
+                                }
+                                ArrayPatternElem::Rest(name) => {
+                                    let rest_len = self.arrays[id].len().saturating_sub(i);
+                                    self.check_array_alloc(rest_len)?;
+                                    self.charge_work(rest_len)?;
+                                    let rest_items = if i < self.arrays[id].len() {
+                                        self.arrays[id][i..].to_vec()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let arr = self.alloc_array(rest_items);
+                                    self.define_binding(env, name.clone(), arr, kind)?;
+                                }
+                            }
+                        }
+                    }
+                    RuntimeValue::String(s) => {
+                        // Iterate string characters lazily by UTF-8 byte cursor so destructuring
+                        // a prefix like `const [c] = s` on a 4 MiB string is O(1).
+                        let mut byte_pos = 0_usize;
+                        for elem in elems {
+                            match elem {
+                                ArrayPatternElem::Hole => {
+                                    if let Some(ch) = s.as_str()[byte_pos..].chars().next() {
+                                        byte_pos += ch.len_utf8();
+                                    }
+                                }
+                                ArrayPatternElem::Binding { pattern, default } => {
+                                    let mut item =
+                                        if let Some(ch) = s.as_str()[byte_pos..].chars().next() {
+                                            byte_pos += ch.len_utf8();
+                                            RuntimeValue::String(JsStr::from(ch.to_string()))
+                                        } else {
+                                            RuntimeValue::Undefined
+                                        };
+                                    if matches!(item, RuntimeValue::Undefined)
+                                        && let Some(def_expr) = default
+                                    {
+                                        item = self.eval_expr(def_expr, env)?;
+                                    }
+                                    self.bind_pattern(pattern, item, env, kind)?;
+                                }
+                                ArrayPatternElem::Rest(name) => {
+                                    let rem = &s.as_str()[byte_pos..];
+                                    let rest_len = if s.is_ascii {
+                                        rem.len()
+                                    } else {
+                                        self.charge_byte_work(rem.len())?;
+                                        rem.chars().count()
+                                    };
+                                    self.check_array_alloc(rest_len)?;
+                                    self.check_string_alloc(rem.len())?;
+                                    self.charge_byte_work(rem.len())?;
+                                    let rest_items: Vec<RuntimeValue> = rem
+                                        .chars()
+                                        .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
+                                        .collect();
+                                    byte_pos = s.len();
+                                    let arr = self.alloc_array(rest_items);
+                                    self.define_binding(env, name.clone(), arr, kind)?;
+                                }
+                            }
+                        }
+                    }
                     _ => {
                         return Err(ExprError::TypeError(
                             "cannot destructure non-iterable value as array".to_string(),
                         ));
-                    }
-                };
-                for (i, elem) in elems.iter().enumerate() {
-                    match elem {
-                        ArrayPatternElem::Hole => {}
-                        ArrayPatternElem::Binding { pattern, default } => {
-                            let mut item = items.get(i).cloned().unwrap_or(RuntimeValue::Undefined);
-                            if matches!(item, RuntimeValue::Undefined)
-                                && let Some(def_expr) = default
-                            {
-                                item = self.eval_expr(def_expr, env)?;
-                            }
-                            self.bind_pattern(pattern, item, env, kind)?;
-                        }
-                        ArrayPatternElem::Rest(name) => {
-                            let rest_items = if i < items.len() {
-                                items[i..].to_vec()
-                            } else {
-                                Vec::new()
-                            };
-                            let arr = self.alloc_array(rest_items);
-                            self.define_binding(env, name.clone(), arr, kind);
-                        }
                     }
                 }
                 Ok(())
@@ -657,6 +1049,15 @@ impl<'a> Evaluator<'a> {
                         ObjectPatternProp::Rest(name) => {
                             let mut rest = BTreeMap::new();
                             if let RuntimeValue::Object(id) = val {
+                                let n = self.objects[id].len();
+                                let key_bytes: usize = self.objects[id]
+                                    .keys()
+                                    .filter(|k| !used_keys.contains(k))
+                                    .map(String::len)
+                                    .sum();
+                                self.check_array_alloc(n)?;
+                                self.charge_alloc_bytes(key_bytes)?;
+                                self.charge_work(n)?;
                                 let entries = self.objects[id].clone();
                                 for (k, v) in entries {
                                     if !used_keys.contains(&k) {
@@ -665,7 +1066,7 @@ impl<'a> Evaluator<'a> {
                                 }
                             }
                             let obj = self.alloc_object(rest);
-                            self.define_binding(env, name.clone(), obj, kind);
+                            self.define_binding(env, name.clone(), obj, kind)?;
                         }
                     }
                 }
@@ -678,13 +1079,13 @@ impl<'a> Evaluator<'a> {
     // Statement Execution
     // -----------------------------------------------------------------------
 
-    fn exec_stmt(&mut self, stmt: &Stmt, env: usize) -> Result<Flow, ExprError> {
+    fn exec_stmt(&mut self, stmt: &'ast Stmt, env: usize) -> Result<Flow, ExprError> {
         self.tick()?;
         match stmt {
             Stmt::Empty => Ok(Flow::Normal(RuntimeValue::Empty)),
             Stmt::Expr(expr) => Ok(Flow::Normal(self.eval_expr(expr, env)?)),
             Stmt::Block(stmts) => {
-                let block_env = self.push_env(Some(env));
+                let block_env = self.push_env(Some(env))?;
                 self.exec_stmt_list(stmts, block_env)
             }
             Stmt::VarDecl { kind, decls } => {
@@ -762,7 +1163,7 @@ impl<'a> Evaluator<'a> {
                 cases,
             } => {
                 let disc = self.eval_expr(discriminant, env)?;
-                let switch_env = self.push_env(Some(env));
+                let switch_env = self.push_env(Some(env))?;
                 let mut matched_idx = None;
                 let mut default_idx = None;
                 for (i, case) in cases.iter().enumerate() {
@@ -812,7 +1213,7 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn exec_stmt_list(&mut self, stmts: &[Stmt], env: usize) -> Result<Flow, ExprError> {
+    fn exec_stmt_list(&mut self, stmts: &'ast [Stmt], env: usize) -> Result<Flow, ExprError> {
         let mut last = RuntimeValue::Empty;
         for stmt in stmts {
             match self.exec_stmt(stmt, env)? {
@@ -829,7 +1230,7 @@ impl<'a> Evaluator<'a> {
 
     fn exec_for_stmt(
         &mut self,
-        for_stmt: &crate::ast::ForStmt,
+        for_stmt: &'ast crate::ast::ForStmt,
         env: usize,
     ) -> Result<Flow, ExprError> {
         let mut is_lexical = false;
@@ -840,7 +1241,7 @@ impl<'a> Evaluator<'a> {
                 ForInit::VarDecl { kind, decls } => {
                     if *kind != VarKind::Var {
                         is_lexical = true;
-                        loop_env = self.push_env(Some(env));
+                        loop_env = self.push_env(Some(env))?;
                     }
                     for d in decls {
                         let val = match &d.init {
@@ -869,7 +1270,7 @@ impl<'a> Evaluator<'a> {
 
             // Per-iteration fresh frame for `let`/`const` so closures capture iteration values.
             let body_env = if is_lexical {
-                self.clone_lexical_env(current_env, env)
+                self.clone_lexical_env(current_env, env)?
             } else {
                 current_env
             };
@@ -886,7 +1287,7 @@ impl<'a> Evaluator<'a> {
             }
 
             if is_lexical {
-                current_env = self.clone_lexical_env(body_env, env);
+                current_env = self.clone_lexical_env(body_env, env)?;
             }
             if let Some(update) = &for_stmt.update {
                 self.eval_expr(update, current_env)?;
@@ -895,7 +1296,14 @@ impl<'a> Evaluator<'a> {
         Ok(Flow::Normal(last))
     }
 
-    fn clone_lexical_env(&mut self, src_env: usize, parent: usize) -> usize {
+    fn clone_lexical_env(&mut self, src_env: usize, parent: usize) -> Result<usize, ExprError> {
+        let count = self.envs[src_env].bindings.len();
+        let name_bytes: usize = self.envs[src_env].bindings.keys().map(String::len).sum();
+        self.charge_alloc_bytes(
+            64_usize
+                .saturating_add(count.saturating_mul(64))
+                .saturating_add(name_bytes),
+        )?;
         let cloned_bindings: BTreeMap<String, Binding> = self.envs[src_env]
             .bindings
             .iter()
@@ -916,34 +1324,46 @@ impl<'a> Evaluator<'a> {
             is_function_scope: false,
             bindings: cloned_bindings,
         });
-        id
+        Ok(id)
     }
 
     fn exec_for_of_stmt(
         &mut self,
-        for_of: &crate::ast::ForOfStmt,
+        for_of: &'ast crate::ast::ForOfStmt,
         env: usize,
     ) -> Result<Flow, ExprError> {
         let iter_val = self.eval_expr(&for_of.iterable, env)?;
         let iter_val = self.deref_property_handle(iter_val)?;
-        let items: Vec<RuntimeValue> = match iter_val {
-            RuntimeValue::Array(id) => self.arrays[id].clone(),
-            RuntimeValue::String(s) => s
-                .chars()
-                .map(|c| RuntimeValue::String(c.to_string()))
-                .collect(),
-            _ => {
-                return Err(ExprError::TypeError(
-                    "value is not iterable in for..of loop".to_string(),
-                ));
-            }
-        };
+        if !matches!(iter_val, RuntimeValue::Array(_) | RuntimeValue::String(_)) {
+            return Err(ExprError::TypeError(
+                "value is not iterable in for..of loop".to_string(),
+            ));
+        }
 
         let mut last = RuntimeValue::Empty;
-        for item in items {
+        let mut idx = 0_usize;
+        let mut byte_pos = 0_usize;
+        loop {
+            let item = match &iter_val {
+                RuntimeValue::Array(id) => {
+                    let Some(elem) = self.arrays[*id].get(idx).cloned() else {
+                        break;
+                    };
+                    idx += 1;
+                    elem
+                }
+                RuntimeValue::String(s) => {
+                    let Some(ch) = s.as_str()[byte_pos..].chars().next() else {
+                        break;
+                    };
+                    byte_pos += ch.len_utf8();
+                    RuntimeValue::String(JsStr::from(ch.to_string()))
+                }
+                _ => unreachable!(),
+            };
             self.tick()?;
             let iter_env = match for_of.kind {
-                Some(VarKind::Let | VarKind::Const) => self.push_env(Some(env)),
+                Some(VarKind::Let | VarKind::Const) => self.push_env(Some(env))?,
                 _ => env,
             };
             match for_of.kind {
@@ -974,26 +1394,54 @@ impl<'a> Evaluator<'a> {
 
     fn exec_for_in_stmt(
         &mut self,
-        for_in: &crate::ast::ForInStmt,
+        for_in: &'ast crate::ast::ForInStmt,
         env: usize,
     ) -> Result<Flow, ExprError> {
         let obj_val = self.eval_expr(&for_in.object, env)?;
         let obj_val = self.deref_property_handle(obj_val)?;
-        let keys: Vec<String> = match obj_val {
-            RuntimeValue::Object(id) => self.objects[id].keys().cloned().collect(),
-            RuntimeValue::Array(id) => (0..self.arrays[id].len()).map(|i| i.to_string()).collect(),
-            RuntimeValue::Null | RuntimeValue::Undefined => Vec::new(),
-            _ => Vec::new(),
+
+        enum ForInKeys {
+            Object(Vec<JsStr>),
+            ArrayLen(usize),
+            Empty,
+        }
+
+        let source = match obj_val {
+            RuntimeValue::Object(id) => {
+                let key_count = self.objects[id].len();
+                let key_bytes: usize = self.objects[id].keys().map(String::len).sum();
+                self.check_array_alloc(key_count)?;
+                self.charge_alloc_bytes(key_bytes)?;
+                self.charge_work(key_count)?;
+                self.charge_byte_work(key_bytes)?;
+                let snapshot: Vec<JsStr> = self.objects[id]
+                    .keys()
+                    .map(|k| JsStr::from(k.as_str()))
+                    .collect();
+                ForInKeys::Object(snapshot)
+            }
+            RuntimeValue::Array(id) => ForInKeys::ArrayLen(self.arrays[id].len()),
+            RuntimeValue::Null | RuntimeValue::Undefined => ForInKeys::Empty,
+            _ => ForInKeys::Empty,
         };
 
         let mut last = RuntimeValue::Empty;
-        for key in keys {
+        let len = match &source {
+            ForInKeys::Object(keys) => keys.len(),
+            ForInKeys::ArrayLen(n) => *n,
+            ForInKeys::Empty => 0,
+        };
+        for idx in 0..len {
             self.tick()?;
             let iter_env = match for_in.kind {
-                Some(VarKind::Let | VarKind::Const) => self.push_env(Some(env)),
+                Some(VarKind::Let | VarKind::Const) => self.push_env(Some(env))?,
                 _ => env,
             };
-            let kv = RuntimeValue::String(key);
+            let kv = match &source {
+                ForInKeys::Object(keys) => RuntimeValue::String(keys[idx].clone()),
+                ForInKeys::ArrayLen(_) => RuntimeValue::String(JsStr::from(idx.to_string())),
+                ForInKeys::Empty => unreachable!(),
+            };
             match for_in.kind {
                 Some(kind) => self.bind_pattern(&for_in.target, kv, iter_env, kind)?,
                 None => {
@@ -1018,16 +1466,16 @@ impl<'a> Evaluator<'a> {
 
     fn exec_try_stmt(
         &mut self,
-        try_stmt: &crate::ast::TryStmt,
+        try_stmt: &'ast crate::ast::TryStmt,
         env: usize,
     ) -> Result<Flow, ExprError> {
-        let try_env = self.push_env(Some(env));
+        let try_env = self.push_env(Some(env))?;
         let try_res = self.exec_stmt_list(&try_stmt.block, try_env);
 
         let mut outcome: Result<Flow, ExprError> = match try_res {
             Ok(Flow::Throw(thrown)) => {
                 if let Some(catch_body) = &try_stmt.catch_body {
-                    let catch_env = self.push_env(Some(env));
+                    let catch_env = self.push_env(Some(env))?;
                     if let Some(pat) = &try_stmt.catch_param {
                         self.bind_pattern(pat, thrown, catch_env, VarKind::Let)?;
                     }
@@ -1038,11 +1486,16 @@ impl<'a> Evaluator<'a> {
             }
             Err(err) if is_catchable_error(&err) => {
                 if let Some(catch_body) = &try_stmt.catch_body {
-                    let catch_env = self.push_env(Some(env));
+                    let catch_env = self.push_env(Some(env))?;
                     if let Some(pat) = &try_stmt.catch_param {
+                        let msg = err.to_string();
+                        self.check_string_alloc(msg.len())?;
+                        self.charge_alloc_bytes(ARRAY_ELEM_BUDGET_BYTES)?;
                         let mut err_obj = BTreeMap::new();
-                        err_obj
-                            .insert("message".to_string(), RuntimeValue::String(err.to_string()));
+                        err_obj.insert(
+                            "message".to_string(),
+                            RuntimeValue::String(JsStr::from(msg)),
+                        );
                         let err_val = self.alloc_object(err_obj);
                         self.bind_pattern(pat, err_val, catch_env, VarKind::Let)?;
                     }
@@ -1055,7 +1508,7 @@ impl<'a> Evaluator<'a> {
         };
 
         if let Some(finally_body) = &try_stmt.finally_body {
-            let finally_env = self.push_env(Some(env));
+            let finally_env = self.push_env(Some(env))?;
             match self.exec_stmt_list(finally_body, finally_env)? {
                 Flow::Normal(_) => {}
                 abrupt => outcome = Ok(abrupt),
@@ -1069,7 +1522,7 @@ impl<'a> Evaluator<'a> {
     // Expression Evaluation
     // -----------------------------------------------------------------------
 
-    fn eval_expr(&mut self, expr: &Expr, env: usize) -> Result<RuntimeValue, ExprError> {
+    fn eval_expr(&mut self, expr: &'ast Expr, env: usize) -> Result<RuntimeValue, ExprError> {
         self.tick()?;
         match expr {
             Expr::Literal(lit) => Ok(match lit {
@@ -1077,38 +1530,87 @@ impl<'a> Evaluator<'a> {
                 Literal::Null => RuntimeValue::Null,
                 Literal::Bool(b) => RuntimeValue::Bool(*b),
                 Literal::Number(n) => RuntimeValue::Number(*n),
-                Literal::String(s) => RuntimeValue::String(s.clone()),
+                Literal::String(s) => self.intern_literal_string(s)?,
             }),
             Expr::Ident(name) => self.resolve_ident(name, env),
             Expr::Template(parts) => {
                 let mut out = String::new();
                 for part in parts {
-                    match part {
-                        TemplatePart::Text(t) => out.push_str(t),
+                    let piece: std::borrow::Cow<'_, str> = match part {
+                        TemplatePart::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
                         TemplatePart::Expr(e) => {
                             let v = self.eval_expr(e, env)?;
-                            out.push_str(&self.runtime_to_js_string(&v)?);
+                            std::borrow::Cow::Owned(self.runtime_to_js_string(&v)?)
                         }
+                    };
+                    let new_len = out.len().checked_add(piece.len()).ok_or_else(|| {
+                        ExprError::RangeError("template string overflow".to_string())
+                    })?;
+                    if new_len > MAX_STRING_BYTES {
+                        return Err(ExprError::RangeError(format!(
+                            "template string length exceeds {MAX_STRING_BYTES} byte limit"
+                        )));
                     }
+                    self.charge_alloc_bytes(piece.len())?;
+                    out.push_str(&piece);
                 }
-                Ok(RuntimeValue::String(out))
+                Ok(RuntimeValue::String(JsStr::from(out)))
             }
             Expr::Array(elems) => {
                 let mut items = Vec::with_capacity(elems.len());
                 for elem in elems {
                     match elem {
-                        ArrayElem::Expr(e) => items.push(self.eval_expr(e, env)?),
+                        ArrayElem::Expr(e) => {
+                            let v = self.eval_expr(e, env)?;
+                            if items.len() >= MAX_ARRAY_LEN {
+                                return Err(ExprError::RangeError(format!(
+                                    "array length exceeds {MAX_ARRAY_LEN} limit"
+                                )));
+                            }
+                            self.charge_alloc_bytes(ARRAY_ELEM_BUDGET_BYTES)?;
+                            items.push(v);
+                        }
                         ArrayElem::Spread(e) => {
                             let val = self.eval_expr(e, env)?;
                             let val = self.deref_property_handle(val)?;
                             match val {
                                 RuntimeValue::Array(id) => {
-                                    let spread_items = self.arrays[id].clone();
-                                    items.extend(spread_items);
+                                    let add = self.arrays[id].len();
+                                    let next_len =
+                                        items.len().checked_add(add).ok_or_else(|| {
+                                            ExprError::RangeError(
+                                                "array length overflow".to_string(),
+                                            )
+                                        })?;
+                                    if next_len > MAX_ARRAY_LEN {
+                                        return Err(ExprError::RangeError(format!(
+                                            "array length {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                                        )));
+                                    }
+                                    self.check_array_alloc(add)?;
+                                    self.charge_work(add)?;
+                                    items.extend_from_slice(&self.arrays[id]);
                                 }
                                 RuntimeValue::String(s) => {
+                                    let add = self.string_char_len(&s)?;
+                                    let next_len =
+                                        items.len().checked_add(add).ok_or_else(|| {
+                                            ExprError::RangeError(
+                                                "array length overflow".to_string(),
+                                            )
+                                        })?;
+                                    if next_len > MAX_ARRAY_LEN {
+                                        return Err(ExprError::RangeError(format!(
+                                            "array length {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                                        )));
+                                    }
+                                    self.check_array_alloc(add)?;
+                                    self.check_string_alloc(s.len())?;
+                                    self.charge_byte_work(s.len())?;
                                     items.extend(
-                                        s.chars().map(|c| RuntimeValue::String(c.to_string())),
+                                        s.chars().map(|c| {
+                                            RuntimeValue::String(JsStr::from(c.to_string()))
+                                        }),
                                     );
                                 }
                                 _ => {
@@ -1123,24 +1625,67 @@ impl<'a> Evaluator<'a> {
                 Ok(self.alloc_array(items))
             }
             Expr::Object(props) => {
+                enum KeyRef<'k> {
+                    Static(&'k str),
+                    Owned(String),
+                }
+                impl KeyRef<'_> {
+                    fn as_str(&self) -> &str {
+                        match self {
+                            Self::Static(s) => s,
+                            Self::Owned(s) => s.as_str(),
+                        }
+                    }
+                }
                 let mut map = BTreeMap::new();
                 for prop in props {
                     match prop {
                         ObjectProp::KeyValue { key, value } => {
                             let k = match key {
-                                ObjectKey::Static(s) => s.clone(),
+                                ObjectKey::Static(s) => KeyRef::Static(s.as_str()),
                                 ObjectKey::Computed(e) => {
                                     let kv = self.eval_expr(e, env)?;
-                                    self.runtime_to_js_string(&kv)?
+                                    let owned = self.runtime_to_js_string(&kv)?;
+                                    self.check_string_alloc(owned.len())?;
+                                    KeyRef::Owned(owned)
                                 }
                             };
                             let v = self.eval_expr(value, env)?;
-                            map.insert(k, v);
+                            if !map.contains_key(k.as_str()) {
+                                if map.len() >= MAX_ARRAY_LEN {
+                                    return Err(ExprError::RangeError(format!(
+                                        "object property count exceeds {MAX_ARRAY_LEN} limit"
+                                    )));
+                                }
+                                let extra_bytes = match &k {
+                                    KeyRef::Static(s) => {
+                                        s.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES)
+                                    }
+                                    KeyRef::Owned(_) => ARRAY_ELEM_BUDGET_BYTES,
+                                };
+                                self.charge_alloc_bytes(extra_bytes)?;
+                            }
+                            let owned_key = match k {
+                                KeyRef::Static(s) => s.to_owned(),
+                                KeyRef::Owned(s) => s,
+                            };
+                            map.insert(owned_key, v);
                         }
                         ObjectProp::Spread(e) => {
                             let val = self.eval_expr(e, env)?;
                             let val = self.deref_property_handle(val)?;
                             if let RuntimeValue::Object(id) = val {
+                                let add_len = self.objects[id].len();
+                                let next_len = map.len().saturating_add(add_len);
+                                if next_len > MAX_ARRAY_LEN {
+                                    return Err(ExprError::RangeError(format!(
+                                        "object property count {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                                    )));
+                                }
+                                let key_bytes: usize =
+                                    self.objects[id].keys().map(String::len).sum();
+                                self.check_array_alloc(add_len)?;
+                                self.charge_alloc_bytes(key_bytes)?;
                                 let entries = self.objects[id].clone();
                                 map.extend(entries);
                             }
@@ -1208,13 +1753,16 @@ impl<'a> Evaluator<'a> {
             Expr::Call { callee, args } => self.eval_call_expr(callee, args, env),
             Expr::OptionalChain { base, ops } => self.eval_optional_chain(base, ops, env),
             Expr::Function(f) => {
-                let cid = self.closures.len();
-                self.closures.push(Closure {
-                    params: f.params.clone(),
-                    body: f.body.clone(),
+                let body = match &f.body {
+                    FunctionBody::Expr(expr) => ClosureBody::Expr(expr.as_ref()),
+                    FunctionBody::Block(stmts) => ClosureBody::Block(stmts.as_slice()),
+                };
+                let cid = self.alloc_closure(Closure {
+                    params: &f.params,
+                    body,
                     captured_env: env,
-                    name: f.name.clone(),
-                });
+                    name: f.name.as_deref(),
+                })?;
                 Ok(RuntimeValue::Closure(cid))
             }
             Expr::Sequence(items) => {
@@ -1245,21 +1793,21 @@ impl<'a> Evaluator<'a> {
             "fps" => return Ok(RuntimeValue::Number(self.ctx.fps())),
             "value" => {
                 let v = self.ctx.value();
-                return Ok(self.intern_value(v));
+                return self.intern_value(v);
             }
             "properties" => {
                 let props = self.ctx.properties();
-                return Ok(self.intern_value(Value::Object(props)));
+                return self.intern_value(Value::Object(props));
             }
             "Math" => return Ok(RuntimeValue::Namespace(NamespaceKind::Math)),
             "isNaN" | "isFinite" | "parseInt" | "parseFloat" => {
-                return Ok(RuntimeValue::BuiltinFn(name.to_string()));
+                return self.alloc_builtin_fn(name.to_string());
             }
             // Exact 17 Vanilla CM3 built-in functions
             "add" | "sub" | "mul" | "div" | "clamp" | "dot" | "cross" | "normalize" | "length"
             | "wave" | "lerp" | "linear" | "catmullRom" | "ease" | "random" | "gaussRandom"
             | "shake" => {
-                return Ok(RuntimeValue::BuiltinFn(name.to_string()));
+                return self.alloc_builtin_fn(name.to_string());
             }
             _ => {}
         }
@@ -1269,7 +1817,7 @@ impl<'a> Evaluator<'a> {
             return Ok(RuntimeValue::Number(c));
         }
         if is_top_level_math_fn(name) {
-            return Ok(RuntimeValue::BuiltinFn(format!("Math.{name}")));
+            return self.alloc_builtin_fn(format!("Math.{name}"));
         }
 
         // Expressions+ globals & handles
@@ -1314,7 +1862,7 @@ impl<'a> Evaluator<'a> {
                 | "seedRandom" | "wiggle" | "layer" | "effect" | "object" | "property" | "prop"
                 | "control" | "toWorld" | "fromWorld" | "worldPosition" | "worldRotation"
                 | "toScreen" | "fromScreen" => {
-                    return Ok(RuntimeValue::BuiltinFn(name.to_string()));
+                    return self.alloc_builtin_fn(name.to_string());
                 }
                 _ => {}
             }
@@ -1326,7 +1874,7 @@ impl<'a> Evaluator<'a> {
     fn eval_unary(
         &mut self,
         op: UnaryOp,
-        expr: &Expr,
+        expr: &'ast Expr,
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         match op {
@@ -1341,10 +1889,10 @@ impl<'a> Evaluator<'a> {
                         Err(ExprError::ReferenceError(_)) => RuntimeValue::Undefined,
                         Err(e) => return Err(e),
                     };
-                    return Ok(RuntimeValue::String(self.typeof_value(&val)?.to_string()));
+                    return Ok(RuntimeValue::String(JsStr::from(self.typeof_value(&val)?)));
                 }
                 let val = self.eval_expr(expr, env)?;
-                Ok(RuntimeValue::String(self.typeof_value(&val)?.to_string()))
+                Ok(RuntimeValue::String(JsStr::from(self.typeof_value(&val)?)))
             }
             UnaryOp::Delete => match expr {
                 Expr::Member { object, prop } => {
@@ -1388,14 +1936,14 @@ impl<'a> Evaluator<'a> {
             UnaryOp::Neg => {
                 let v = self.eval_expr(expr, env)?;
                 if let Some(vec) = self.runtime_as_f64_vec(&v)? {
-                    return Ok(self.alloc_f64_vec(vec.into_iter().map(|x| -x).collect()));
+                    return self.alloc_f64_vec(vec.into_iter().map(|x| -x).collect());
                 }
                 Ok(RuntimeValue::Number(-self.runtime_to_number(&v)?))
             }
             UnaryOp::Pos => {
                 let v = self.eval_expr(expr, env)?;
                 if let Some(vec) = self.runtime_as_f64_vec(&v)? {
-                    return Ok(self.alloc_f64_vec(vec));
+                    return self.alloc_f64_vec(vec);
                 }
                 Ok(RuntimeValue::Number(self.runtime_to_number(&v)?))
             }
@@ -1426,7 +1974,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         op: UpdateOp,
         prefix: bool,
-        target: &AssignTarget,
+        target: &'ast AssignTarget,
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         let delta = match op {
@@ -1443,8 +1991,8 @@ impl<'a> Evaluator<'a> {
     fn eval_assign(
         &mut self,
         op: AssignOp,
-        target: &AssignTarget,
-        value_expr: &Expr,
+        target: &'ast AssignTarget,
+        value_expr: &'ast Expr,
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         let rhs = self.eval_expr(value_expr, env)?;
@@ -1481,7 +2029,7 @@ impl<'a> Evaluator<'a> {
 
     fn read_target(
         &mut self,
-        target: &AssignTarget,
+        target: &'ast AssignTarget,
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         match target {
@@ -1500,7 +2048,7 @@ impl<'a> Evaluator<'a> {
 
     fn write_target(
         &mut self,
-        target: &AssignTarget,
+        target: &'ast AssignTarget,
         val: RuntimeValue,
         env: usize,
     ) -> Result<(), ExprError> {
@@ -1510,6 +2058,16 @@ impl<'a> Evaluator<'a> {
                 let obj = self.eval_expr(object, env)?;
                 match obj {
                     RuntimeValue::Object(id) => {
+                        if !self.objects[id].contains_key(prop) {
+                            if self.objects[id].len() >= MAX_ARRAY_LEN {
+                                return Err(ExprError::RangeError(format!(
+                                    "object property count exceeds {MAX_ARRAY_LEN} limit"
+                                )));
+                            }
+                            self.charge_alloc_bytes(
+                                prop.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES),
+                            )?;
+                        }
                         self.objects[id].insert(prop.clone(), val);
                         Ok(())
                     }
@@ -1531,20 +2089,32 @@ impl<'a> Evaluator<'a> {
                             return Err(ExprError::RangeError("invalid array index".to_string()));
                         }
                         let ui = i as usize;
-                        if ui > 100_000 {
-                            return Err(ExprError::RangeError(
-                                "array index exceeds sandbox limit".to_string(),
-                            ));
+                        if ui >= MAX_ARRAY_LEN {
+                            return Err(ExprError::RangeError(format!(
+                                "array index {ui} exceeds {MAX_ARRAY_LEN} limit"
+                            )));
                         }
-                        let arr = &mut self.arrays[id];
-                        if ui >= arr.len() {
-                            arr.resize(ui + 1, RuntimeValue::Undefined);
+                        let cur_len = self.arrays[id].len();
+                        if ui >= cur_len {
+                            let added = ui + 1 - cur_len;
+                            self.check_array_alloc(added)?;
+                            self.arrays[id].resize(ui + 1, RuntimeValue::Undefined);
                         }
-                        arr[ui] = val;
+                        self.arrays[id][ui] = val;
                         Ok(())
                     }
                     RuntimeValue::Object(id) => {
                         let key = self.runtime_to_js_string(&idx)?;
+                        if !self.objects[id].contains_key(&key) {
+                            if self.objects[id].len() >= MAX_ARRAY_LEN {
+                                return Err(ExprError::RangeError(format!(
+                                    "object property count exceeds {MAX_ARRAY_LEN} limit"
+                                )));
+                            }
+                            self.charge_alloc_bytes(
+                                key.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES),
+                            )?;
+                        }
                         self.objects[id].insert(key, val);
                         Ok(())
                     }
@@ -1573,7 +2143,14 @@ impl<'a> Evaluator<'a> {
                 {
                     let ls = self.runtime_to_js_string(&left)?;
                     let rs = self.runtime_to_js_string(&right)?;
-                    return Ok(RuntimeValue::String(format!("{ls}{rs}")));
+                    let total = ls.len().checked_add(rs.len()).ok_or_else(|| {
+                        ExprError::RangeError("string concatenation overflow".to_string())
+                    })?;
+                    self.check_string_alloc(total)?;
+                    let mut combined = String::with_capacity(total);
+                    combined.push_str(&ls);
+                    combined.push_str(&rs);
+                    return Ok(RuntimeValue::String(JsStr::from(combined)));
                 }
                 // Vector arithmetic (component-wise + scalar broadcast).
                 if let Some(res) = self.try_vector_arith(&left, &right, BinaryOp::Add)? {
@@ -1613,6 +2190,9 @@ impl<'a> Evaluator<'a> {
             BinaryOp::Ne => Ok(RuntimeValue::Bool(!self.loose_eq(&left, &right)?)),
             BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
                 if let (RuntimeValue::String(a), RuntimeValue::String(b)) = (&left, &right) {
+                    if !Rc::ptr_eq(&a.text, &b.text) {
+                        self.charge_byte_work(a.len().min(b.len()))?;
+                    }
                     let ord = match op {
                         BinaryOp::Lt => a < b,
                         BinaryOp::Le => a <= b,
@@ -1683,7 +2263,7 @@ impl<'a> Evaluator<'a> {
                     BinaryOp::Div => vec_div_componentwise(&a, &b),
                     _ => unreachable!(),
                 };
-                Ok(Some(self.alloc_f64_vec(out)))
+                Ok(Some(self.alloc_f64_vec(out)?))
             }
             (Some(a), None) if matches!(right, RuntimeValue::Number(_)) => {
                 let s = self.runtime_to_number(right)?;
@@ -1694,7 +2274,7 @@ impl<'a> Evaluator<'a> {
                     BinaryOp::Div => vec_div_scalar(&a, s),
                     _ => unreachable!(),
                 };
-                Ok(Some(self.alloc_f64_vec(out)))
+                Ok(Some(self.alloc_f64_vec(out)?))
             }
             (None, Some(b)) if matches!(left, RuntimeValue::Number(_)) => {
                 let s = self.runtime_to_number(left)?;
@@ -1705,7 +2285,7 @@ impl<'a> Evaluator<'a> {
                     BinaryOp::Div => b.into_iter().map(|x| s / x).collect(),
                     _ => unreachable!(),
                 };
-                Ok(Some(self.alloc_f64_vec(out)))
+                Ok(Some(self.alloc_f64_vec(out)?))
             }
             _ => Ok(None),
         }
@@ -1719,11 +2299,29 @@ impl<'a> Evaluator<'a> {
             | (RuntimeValue::Null, RuntimeValue::Null) => true,
             (RuntimeValue::Bool(x), RuntimeValue::Bool(y)) => x == y,
             (RuntimeValue::Number(x), RuntimeValue::Number(y)) => x == y,
-            (RuntimeValue::String(x), RuntimeValue::String(y)) => x == y,
+            (RuntimeValue::String(x), RuntimeValue::String(y)) => {
+                if Rc::ptr_eq(&x.text, &y.text) {
+                    true
+                } else {
+                    if x.len() == y.len() {
+                        self.charge_byte_work(x.len())?;
+                    }
+                    x == y
+                }
+            }
             (RuntimeValue::Array(x), RuntimeValue::Array(y)) => x == y,
             (RuntimeValue::Object(x), RuntimeValue::Object(y)) => x == y,
             (RuntimeValue::Closure(x), RuntimeValue::Closure(y)) => x == y,
-            (RuntimeValue::BuiltinFn(x), RuntimeValue::BuiltinFn(y)) => x == y,
+            (RuntimeValue::BuiltinFn(x), RuntimeValue::BuiltinFn(y)) => {
+                if Rc::ptr_eq(&x, &y) {
+                    true
+                } else if x.len() != y.len() {
+                    false
+                } else {
+                    self.charge_byte_work(x.len())?;
+                    x == y
+                }
+            }
             (RuntimeValue::Handle(x), RuntimeValue::Handle(y)) => x == y,
             _ => false,
         })
@@ -1764,7 +2362,8 @@ impl<'a> Evaluator<'a> {
 
         match obj {
             RuntimeValue::Null | RuntimeValue::Undefined => Err(ExprError::TypeError(format!(
-                "cannot read property '{prop}' of null or undefined"
+                "cannot read property '{}' of null or undefined",
+                truncate_diag(prop)
             ))),
             RuntimeValue::Namespace(NamespaceKind::Math) => {
                 if prop == "random" {
@@ -1773,7 +2372,7 @@ impl<'a> Evaluator<'a> {
                 if let Some(c) = math_constant(prop) {
                     return Ok(RuntimeValue::Number(c));
                 }
-                Ok(RuntimeValue::BuiltinFn(format!("Math.{prop}")))
+                self.alloc_builtin_fn(format!("Math.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::Number) => match prop {
                 "MAX_SAFE_INTEGER" => Ok(RuntimeValue::Number(9_007_199_254_740_991.0)),
@@ -1782,19 +2381,19 @@ impl<'a> Evaluator<'a> {
                 "POSITIVE_INFINITY" => Ok(RuntimeValue::Number(f64::INFINITY)),
                 "NEGATIVE_INFINITY" => Ok(RuntimeValue::Number(f64::NEG_INFINITY)),
                 "NaN" => Ok(RuntimeValue::Number(f64::NAN)),
-                _ => Ok(RuntimeValue::BuiltinFn(format!("Number.{prop}"))),
+                _ => self.alloc_builtin_fn(format!("Number.{prop}")),
             },
             RuntimeValue::Namespace(NamespaceKind::Array) => {
-                Ok(RuntimeValue::BuiltinFn(format!("Array.{prop}")))
+                self.alloc_builtin_fn(format!("Array.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::String) => {
-                Ok(RuntimeValue::BuiltinFn(format!("String.{prop}")))
+                self.alloc_builtin_fn(format!("String.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::Object) => {
-                Ok(RuntimeValue::BuiltinFn(format!("Object.{prop}")))
+                self.alloc_builtin_fn(format!("Object.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::Json) => {
-                Ok(RuntimeValue::BuiltinFn(format!("JSON.{prop}")))
+                self.alloc_builtin_fn(format!("JSON.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::Boolean) => Ok(RuntimeValue::Undefined),
             RuntimeValue::Handle(handle) => self.get_handle_property(handle, prop),
@@ -1812,13 +2411,13 @@ impl<'a> Evaluator<'a> {
             }
             RuntimeValue::String(s) => {
                 if prop == "length" {
-                    return Ok(RuntimeValue::Number(s.chars().count() as f64));
+                    let len = self.string_char_len(s)?;
+                    return Ok(RuntimeValue::Number(len as f64));
                 }
                 if let Ok(idx) = prop.parse::<usize>() {
-                    return Ok(s
-                        .chars()
-                        .nth(idx)
-                        .map(|c| RuntimeValue::String(c.to_string()))
+                    return Ok(self
+                        .string_char_at(s, idx)?
+                        .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
                         .unwrap_or(RuntimeValue::Undefined));
                 }
                 Ok(RuntimeValue::Undefined)
@@ -1844,7 +2443,7 @@ impl<'a> Evaluator<'a> {
         if matches!(obj, RuntimeValue::Handle(HandleRef::Controls)) {
             let name = self.runtime_to_js_string(&idx)?;
             let val = self.ctx.control(&name, None)?;
-            return Ok(self.intern_value(val));
+            return self.intern_value(val);
         }
 
         // Auto-deref PropertyHandle when indexed like `thisProperty[0]` or `prop("./Pos")[1]`.
@@ -1868,11 +2467,10 @@ impl<'a> Evaluator<'a> {
             }
             RuntimeValue::String(s) => {
                 if let RuntimeValue::Number(n) = idx {
-                    if n >= 0.0 && n.fract() == 0.0 {
-                        return Ok(s
-                            .chars()
-                            .nth(n as usize)
-                            .map(|c| RuntimeValue::String(c.to_string()))
+                    if n >= 0.0 && n.fract() == 0.0 && n.is_finite() {
+                        return Ok(self
+                            .string_char_at(&s, n as usize)?
+                            .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
                             .unwrap_or(RuntimeValue::Undefined));
                     }
                     return Ok(RuntimeValue::Undefined);
@@ -1900,11 +2498,11 @@ impl<'a> Evaluator<'a> {
             HandleRef::Property(id) => match prop {
                 "value" => {
                     let v = self.ctx.property_value(id)?;
-                    Ok(self.intern_value(v))
+                    self.intern_value(v)
                 }
                 "velocity" => {
                     let v = self.ctx.property_velocity(id, self.ctx.time())?;
-                    Ok(self.intern_value(v))
+                    self.intern_value(v)
                 }
                 "speed" => {
                     let s = self.ctx.property_speed(id, self.ctx.time())?;
@@ -1914,7 +2512,7 @@ impl<'a> Evaluator<'a> {
                 "name" => Ok(self
                     .ctx
                     .handle_name(id)
-                    .map(RuntimeValue::String)
+                    .map(|s| RuntimeValue::String(JsStr::from(s)))
                     .unwrap_or(RuntimeValue::Undefined)),
                 "parent" => match self.ctx.parent_of(id, 1)? {
                     Some(p) => Ok(RuntimeValue::Handle(p)),
@@ -1922,7 +2520,7 @@ impl<'a> Evaluator<'a> {
                 },
                 "length" => {
                     let v = self.ctx.property_value(id)?;
-                    let rv = self.intern_value(v);
+                    let rv = self.intern_value(v)?;
                     self.get_property(&rv, "length")
                 }
                 _ => Ok(RuntimeValue::Undefined),
@@ -1934,7 +2532,7 @@ impl<'a> Evaluator<'a> {
                 "name" => Ok(self
                     .ctx
                     .handle_name(id)
-                    .map(RuntimeValue::String)
+                    .map(|s| RuntimeValue::String(JsStr::from(s)))
                     .unwrap_or(RuntimeValue::Undefined)),
                 "parent" => match self.ctx.parent_of(id, 1)? {
                     Some(p) => Ok(RuntimeValue::Handle(p)),
@@ -1949,15 +2547,15 @@ impl<'a> Evaluator<'a> {
             },
             HandleRef::Controls => {
                 let val = self.ctx.control(prop, None)?;
-                Ok(self.intern_value(val))
+                self.intern_value(val)
             }
         }
     }
 
     fn eval_optional_chain(
         &mut self,
-        base: &Expr,
-        ops: &[ChainOp],
+        base: &'ast Expr,
+        ops: &'ast [ChainOp],
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         let mut current = self.eval_expr(base, env)?;
@@ -2014,20 +2612,55 @@ impl<'a> Evaluator<'a> {
 
     fn eval_call_args(
         &mut self,
-        args: &[CallArg],
+        args: &'ast [CallArg],
         env: usize,
     ) -> Result<Vec<RuntimeValue>, ExprError> {
         let mut out = Vec::with_capacity(args.len());
         for arg in args {
             match arg {
-                CallArg::Expr(e) => out.push(self.eval_expr(e, env)?),
+                CallArg::Expr(e) => {
+                    if out.len() >= MAX_ARRAY_LEN {
+                        return Err(ExprError::RangeError(format!(
+                            "call argument count exceeds {MAX_ARRAY_LEN} limit"
+                        )));
+                    }
+                    out.push(self.eval_expr(e, env)?);
+                }
                 CallArg::Spread(e) => {
                     let v = self.eval_expr(e, env)?;
                     let v = self.deref_property_handle(v)?;
                     match v {
-                        RuntimeValue::Array(id) => out.extend(self.arrays[id].clone()),
+                        RuntimeValue::Array(id) => {
+                            let add = self.arrays[id].len();
+                            let next_len = out.len().checked_add(add).ok_or_else(|| {
+                                ExprError::RangeError("call argument count overflow".to_string())
+                            })?;
+                            if next_len > MAX_ARRAY_LEN {
+                                return Err(ExprError::RangeError(format!(
+                                    "call argument count {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                                )));
+                            }
+                            self.check_array_alloc(add)?;
+                            self.charge_work(add)?;
+                            out.extend_from_slice(&self.arrays[id]);
+                        }
                         RuntimeValue::String(s) => {
-                            out.extend(s.chars().map(|c| RuntimeValue::String(c.to_string())));
+                            let add = self.string_char_len(&s)?;
+                            let next_len = out.len().checked_add(add).ok_or_else(|| {
+                                ExprError::RangeError("call argument count overflow".to_string())
+                            })?;
+                            if next_len > MAX_ARRAY_LEN {
+                                return Err(ExprError::RangeError(format!(
+                                    "call argument count {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                                )));
+                            }
+                            self.check_array_alloc(add)?;
+                            self.check_string_alloc(s.len())?;
+                            self.charge_byte_work(s.len())?;
+                            out.extend(
+                                s.chars()
+                                    .map(|c| RuntimeValue::String(JsStr::from(c.to_string()))),
+                            );
                         }
                         _ => {
                             return Err(ExprError::TypeError(
@@ -2043,8 +2676,8 @@ impl<'a> Evaluator<'a> {
 
     fn eval_call_expr(
         &mut self,
-        callee: &Expr,
-        args: &[CallArg],
+        callee: &'ast Expr,
+        args: &'ast [CallArg],
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
         if let Expr::Member { object, prop } = callee {
@@ -2143,7 +2776,7 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => String::new(),
                 };
-                Ok(RuntimeValue::String(s))
+                self.alloc_string(s)
             }
             RuntimeValue::Namespace(NamespaceKind::Boolean) => {
                 let b = match args.first() {
@@ -2155,12 +2788,15 @@ impl<'a> Evaluator<'a> {
             RuntimeValue::Namespace(NamespaceKind::Array) => {
                 if args.len() == 1
                     && let RuntimeValue::Number(n) = args[0]
-                    && n >= 0.0
-                    && n.fract() == 0.0
-                    && n <= 100_000.0
                 {
-                    return Ok(self.alloc_array(vec![RuntimeValue::Undefined; n as usize]));
+                    if n < 0.0 || !n.is_finite() || n.fract() != 0.0 || n > (MAX_ARRAY_LEN as f64) {
+                        return Err(ExprError::RangeError("invalid array length".to_string()));
+                    }
+                    let count = n as usize;
+                    self.check_array_alloc(count)?;
+                    return Ok(self.alloc_array(vec![RuntimeValue::Undefined; count]));
                 }
+                self.check_array_alloc(args.len())?;
                 Ok(self.alloc_array(args))
             }
             _ => Err(ExprError::TypeError("value is not callable".to_string())),
@@ -2190,18 +2826,23 @@ impl<'a> Evaluator<'a> {
         cid: usize,
         args: Vec<RuntimeValue>,
     ) -> Result<RuntimeValue, ExprError> {
-        let params = self.closures[cid].params.clone();
-        let body = self.closures[cid].body.clone();
-        let captured_env = self.closures[cid].captured_env;
-        let fn_name = self.closures[cid].name.clone();
+        let closure = self.closures[cid];
 
-        let call_env = self.push_fn_env(captured_env);
-        if let Some(name) = fn_name {
-            self.define_binding(call_env, name, RuntimeValue::Closure(cid), VarKind::Const);
+        let call_env = self.push_fn_env(closure.captured_env)?;
+        if let Some(name) = closure.name {
+            self.define_binding(
+                call_env,
+                name.to_string(),
+                RuntimeValue::Closure(cid),
+                VarKind::Const,
+            )?;
         }
 
-        for (i, param) in params.iter().enumerate() {
+        for (i, param) in closure.params.iter().enumerate() {
             if param.is_rest {
+                let rest_len = args.len().saturating_sub(i);
+                self.check_array_alloc(rest_len)?;
+                self.charge_work(rest_len)?;
                 let rest = if i < args.len() {
                     args[i..].to_vec()
                 } else {
@@ -2220,11 +2861,11 @@ impl<'a> Evaluator<'a> {
             }
         }
 
-        match body {
-            FunctionBody::Expr(expr) => self.eval_expr(&expr, call_env),
-            FunctionBody::Block(stmts) => {
-                self.hoist_decls(&stmts, call_env)?;
-                match self.exec_stmt_list(&stmts, call_env)? {
+        match closure.body {
+            ClosureBody::Expr(expr) => self.eval_expr(expr, call_env),
+            ClosureBody::Block(stmts) => {
+                self.hoist_decls(stmts, call_env)?;
+                match self.exec_stmt_list(stmts, call_env)? {
                     Flow::Normal(_) => Ok(RuntimeValue::Undefined),
                     Flow::Return(v) => Ok(v),
                     Flow::Throw(v) => {
@@ -2262,7 +2903,8 @@ impl<'a> Evaluator<'a> {
                 match eval_math_fn(method, &nums)? {
                     Some(v) => Ok(RuntimeValue::Number(v)),
                     None => Err(ExprError::TypeError(format!(
-                        "Math.{method} is not a function"
+                        "Math.{} is not a function",
+                        truncate_diag(method)
                     ))),
                 }
             }
@@ -2283,17 +2925,28 @@ impl<'a> Evaluator<'a> {
                     };
                     let src = self.deref_property_handle(src.clone())?;
                     let items = match src {
-                        RuntimeValue::Array(id) => self.arrays[id].clone(),
-                        RuntimeValue::String(s) => s
-                            .chars()
-                            .map(|c| RuntimeValue::String(c.to_string()))
-                            .collect(),
+                        RuntimeValue::Array(id) => {
+                            let len = self.arrays[id].len();
+                            self.check_array_alloc(len)?;
+                            self.charge_work(len)?;
+                            self.arrays[id].clone()
+                        }
+                        RuntimeValue::String(s) => {
+                            let count = self.string_char_len(&s)?;
+                            self.check_array_alloc(count)?;
+                            self.check_string_alloc(s.len())?;
+                            self.charge_byte_work(s.len())?;
+                            s.chars()
+                                .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
+                                .collect()
+                        }
                         _ => Vec::new(),
                     };
                     Ok(self.alloc_array(items))
                 }
                 _ => Err(ExprError::TypeError(format!(
-                    "Array.{method} is not a function"
+                    "Array.{} is not a function",
+                    truncate_diag(method)
                 ))),
             },
             NamespaceKind::Number => match method {
@@ -2337,11 +2990,13 @@ impl<'a> Evaluator<'a> {
                     Ok(RuntimeValue::Number(js_parse_int(&s, radix)))
                 }
                 _ => Err(ExprError::TypeError(format!(
-                    "Number.{method} is not a function"
+                    "Number.{} is not a function",
+                    truncate_diag(method)
                 ))),
             },
             NamespaceKind::String => match method {
                 "fromCharCode" => {
+                    self.check_string_alloc(args.len().saturating_mul(4))?;
                     let mut out = String::new();
                     for a in &args {
                         let code = to_u32(self.runtime_to_number(a)?) & 0xFFFF;
@@ -2349,10 +3004,11 @@ impl<'a> Evaluator<'a> {
                             out.push(ch);
                         }
                     }
-                    Ok(RuntimeValue::String(out))
+                    Ok(RuntimeValue::String(JsStr::from(out)))
                 }
                 _ => Err(ExprError::TypeError(format!(
-                    "String.{method} is not a function"
+                    "String.{} is not a function",
+                    truncate_diag(method)
                 ))),
             },
             NamespaceKind::Object => match method {
@@ -2362,14 +3018,23 @@ impl<'a> Evaluator<'a> {
                     };
                     let v = self.deref_property_handle(v.clone())?;
                     let keys: Vec<RuntimeValue> = match v {
-                        RuntimeValue::Object(id) => self.objects[id]
-                            .keys()
-                            .cloned()
-                            .map(RuntimeValue::String)
-                            .collect(),
-                        RuntimeValue::Array(id) => (0..self.arrays[id].len())
-                            .map(|i| RuntimeValue::String(i.to_string()))
-                            .collect(),
+                        RuntimeValue::Object(id) => {
+                            self.check_array_alloc(self.objects[id].len())?;
+                            let key_bytes: usize = self.objects[id].keys().map(String::len).sum();
+                            self.charge_alloc_bytes(key_bytes)?;
+                            self.objects[id]
+                                .keys()
+                                .map(|k| RuntimeValue::String(JsStr::from(k.as_str())))
+                                .collect()
+                        }
+                        RuntimeValue::Array(id) => {
+                            let n = self.arrays[id].len();
+                            self.check_array_alloc(n)?;
+                            self.charge_alloc_bytes(n.saturating_mul(8))?;
+                            (0..n)
+                                .map(|i| RuntimeValue::String(JsStr::from(i.to_string())))
+                                .collect()
+                        }
                         _ => Vec::new(),
                     };
                     Ok(self.alloc_array(keys))
@@ -2380,8 +3045,14 @@ impl<'a> Evaluator<'a> {
                     };
                     let v = self.deref_property_handle(v.clone())?;
                     let vals: Vec<RuntimeValue> = match v {
-                        RuntimeValue::Object(id) => self.objects[id].values().cloned().collect(),
-                        RuntimeValue::Array(id) => self.arrays[id].clone(),
+                        RuntimeValue::Object(id) => {
+                            self.check_array_alloc(self.objects[id].len())?;
+                            self.objects[id].values().cloned().collect()
+                        }
+                        RuntimeValue::Array(id) => {
+                            self.check_array_alloc(self.arrays[id].len())?;
+                            self.arrays[id].clone()
+                        }
                         _ => Vec::new(),
                     };
                     Ok(self.alloc_array(vals))
@@ -2392,20 +3063,36 @@ impl<'a> Evaluator<'a> {
                     };
                     let v = self.deref_property_handle(v.clone())?;
                     let pairs: Vec<(String, RuntimeValue)> = match v {
-                        RuntimeValue::Object(id) => self.objects[id]
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        RuntimeValue::Array(id) => self.arrays[id]
-                            .iter()
-                            .enumerate()
-                            .map(|(i, v)| (i.to_string(), v.clone()))
-                            .collect(),
+                        RuntimeValue::Object(id) => {
+                            let n = self.objects[id].len();
+                            self.check_array_alloc(n)?;
+                            let key_bytes: usize = self.objects[id].keys().map(String::len).sum();
+                            self.charge_alloc_bytes(
+                                n.saturating_mul(2 * ARRAY_ELEM_BUDGET_BYTES)
+                                    .saturating_add(key_bytes),
+                            )?;
+                            self.objects[id]
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect()
+                        }
+                        RuntimeValue::Array(id) => {
+                            let n = self.arrays[id].len();
+                            self.check_array_alloc(n)?;
+                            self.charge_alloc_bytes(
+                                n.saturating_mul(2 * ARRAY_ELEM_BUDGET_BYTES + 8),
+                            )?;
+                            self.arrays[id]
+                                .iter()
+                                .enumerate()
+                                .map(|(i, v)| (i.to_string(), v.clone()))
+                                .collect()
+                        }
                         _ => Vec::new(),
                     };
                     let mut out = Vec::with_capacity(pairs.len());
                     for (k, val) in pairs {
-                        out.push(self.alloc_array(vec![RuntimeValue::String(k), val]));
+                        out.push(self.alloc_array(vec![RuntimeValue::String(JsStr::from(k)), val]));
                     }
                     Ok(self.alloc_array(out))
                 }
@@ -2423,6 +3110,16 @@ impl<'a> Evaluator<'a> {
                     for src in args.iter().skip(1) {
                         let d = self.deref_property_handle(src.clone())?;
                         if let RuntimeValue::Object(sid) = d {
+                            let add_len = self.objects[sid].len();
+                            let next_len = self.objects[tid].len().saturating_add(add_len);
+                            if next_len > MAX_ARRAY_LEN {
+                                return Err(ExprError::RangeError(format!(
+                                    "object property count {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                                )));
+                            }
+                            let key_bytes: usize = self.objects[sid].keys().map(String::len).sum();
+                            self.check_array_alloc(add_len)?;
+                            self.charge_alloc_bytes(key_bytes)?;
                             let entries = self.objects[sid].clone();
                             self.objects[tid].extend(entries);
                         }
@@ -2430,19 +3127,24 @@ impl<'a> Evaluator<'a> {
                     Ok(RuntimeValue::Object(tid))
                 }
                 _ => Err(ExprError::TypeError(format!(
-                    "Object.{method} is not a function"
+                    "Object.{} is not a function",
+                    truncate_diag(method)
                 ))),
             },
             NamespaceKind::Json => match method {
                 "stringify" => {
                     let val = match args.first() {
-                        Some(v) => self.export_value(v, 0)?,
+                        Some(v) => self.export_root_value(v)?,
                         None => return Ok(RuntimeValue::Undefined),
                     };
                     if matches!(val, Value::Undefined) {
                         return Ok(RuntimeValue::Undefined);
                     }
-                    Ok(RuntimeValue::String(json_stringify(&val)?))
+                    let json = json_stringify_bounded(&val, MAX_STRING_BYTES, &mut |bytes| {
+                        self.charge_byte_work(bytes)
+                    })?;
+                    self.check_string_alloc(json.len())?;
+                    Ok(RuntimeValue::String(JsStr::from(json)))
                 }
                 "parse" => {
                     let s = match args.first() {
@@ -2455,14 +3157,16 @@ impl<'a> Evaluator<'a> {
                         }
                     };
                     let parsed = json_parse(&s)?;
-                    Ok(self.intern_value(parsed))
+                    self.intern_value(parsed)
                 }
                 _ => Err(ExprError::TypeError(format!(
-                    "JSON.{method} is not a function"
+                    "JSON.{} is not a function",
+                    truncate_diag(method)
                 ))),
             },
             NamespaceKind::Boolean => Err(ExprError::TypeError(format!(
-                "Boolean.{method} is not a function"
+                "Boolean.{} is not a function",
+                truncate_diag(method)
             ))),
         }
     }
@@ -2481,7 +3185,7 @@ impl<'a> Evaluator<'a> {
                         None => self.ctx.time(),
                     };
                     let val = self.ctx.property_value_at_time(id, t)?;
-                    Ok(self.intern_value(val))
+                    self.intern_value(val)
                 }
                 "velocityAtTime" => {
                     let t = match args.first() {
@@ -2489,7 +3193,7 @@ impl<'a> Evaluator<'a> {
                         None => self.ctx.time(),
                     };
                     let val = self.ctx.property_velocity(id, t)?;
-                    Ok(self.intern_value(val))
+                    self.intern_value(val)
                 }
                 "speedAtTime" => {
                     let t = match args.first() {
@@ -2513,7 +3217,7 @@ impl<'a> Evaluator<'a> {
                         )));
                     }
                     let kf = self.ctx.property_key(id, idx_f as usize)?;
-                    Ok(self.keyframe_to_object(kf))
+                    self.keyframe_to_object(kf)
                 }
                 "nearestKey" => {
                     let t = match args.first() {
@@ -2521,13 +3225,13 @@ impl<'a> Evaluator<'a> {
                         None => self.ctx.time(),
                     };
                     let kf = self.ctx.property_nearest_key(id, t)?;
-                    Ok(self.keyframe_to_object(kf))
+                    self.keyframe_to_object(kf)
                 }
                 "parent" => self.resolve_parent_call(id, &args),
                 _ => {
                     // Fall back to methods on the property's underlying value (e.g. array/string).
                     let val = self.ctx.property_value(id)?;
-                    let rv = self.intern_value(val);
+                    let rv = self.intern_value(val)?;
                     self.call_method_on(rv, method, args, false)
                 }
             },
@@ -2570,7 +3274,7 @@ impl<'a> Evaluator<'a> {
                         None => [0.0, 0.0, 0.0],
                     };
                     let out = self.ctx.to_world(Some(id), pt)?;
-                    Ok(self.alloc_f64_vec(out.to_vec()))
+                    self.alloc_f64_vec(out.to_vec())
                 }
                 "fromWorld" => {
                     let pt = match args.first() {
@@ -2578,15 +3282,15 @@ impl<'a> Evaluator<'a> {
                         None => [0.0, 0.0, 0.0],
                     };
                     let out = self.ctx.from_world(Some(id), pt)?;
-                    Ok(self.alloc_f64_vec(out.to_vec()))
+                    self.alloc_f64_vec(out.to_vec())
                 }
                 "worldPosition" => {
                     let out = self.ctx.world_position(Some(id))?;
-                    Ok(self.alloc_f64_vec(out.to_vec()))
+                    self.alloc_f64_vec(out.to_vec())
                 }
                 "worldRotation" => {
                     let out = self.ctx.world_rotation(Some(id))?;
-                    Ok(self.alloc_f64_vec(out.to_vec()))
+                    self.alloc_f64_vec(out.to_vec())
                 }
                 "toScreen" => {
                     let pt = match args.first() {
@@ -2594,7 +3298,7 @@ impl<'a> Evaluator<'a> {
                         None => [0.0, 0.0, 0.0],
                     };
                     let out = self.ctx.to_screen(Some(id), pt)?;
-                    Ok(self.alloc_f64_vec(out.to_vec()))
+                    self.alloc_f64_vec(out.to_vec())
                 }
                 "fromScreen" => {
                     let pt = match args.first() {
@@ -2602,7 +3306,7 @@ impl<'a> Evaluator<'a> {
                         None => [0.0, 0.0, 0.0],
                     };
                     let out = self.ctx.from_screen(Some(id), pt)?;
-                    Ok(self.alloc_f64_vec(out.to_vec()))
+                    self.alloc_f64_vec(out.to_vec())
                 }
                 _ => Err(ExprError::TypeError(format!(
                     "handle.{method} is not a function"
@@ -2684,6 +3388,16 @@ impl<'a> Evaluator<'a> {
     ) -> Result<RuntimeValue, ExprError> {
         match method {
             "push" => {
+                let next_len = self.arrays[id]
+                    .len()
+                    .checked_add(args.len())
+                    .ok_or_else(|| ExprError::RangeError("array length overflow".to_string()))?;
+                if next_len > MAX_ARRAY_LEN {
+                    return Err(ExprError::RangeError(format!(
+                        "array length {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                    )));
+                }
+                self.check_array_alloc(args.len())?;
                 self.arrays[id].extend(args);
                 Ok(RuntimeValue::Number(self.arrays[id].len() as f64))
             }
@@ -2692,16 +3406,29 @@ impl<'a> Evaluator<'a> {
                 if self.arrays[id].is_empty() {
                     Ok(RuntimeValue::Undefined)
                 } else {
+                    self.charge_work(self.arrays[id].len())?;
                     Ok(self.arrays[id].remove(0))
                 }
             }
             "unshift" => {
+                let next_len = self.arrays[id]
+                    .len()
+                    .checked_add(args.len())
+                    .ok_or_else(|| ExprError::RangeError("array length overflow".to_string()))?;
+                if next_len > MAX_ARRAY_LEN {
+                    return Err(ExprError::RangeError(format!(
+                        "array length {next_len} exceeds {MAX_ARRAY_LEN} limit"
+                    )));
+                }
+                self.check_array_alloc(args.len())?;
+                self.charge_work(next_len)?;
                 let mut new_vec = args;
                 new_vec.append(&mut self.arrays[id]);
                 self.arrays[id] = new_vec;
                 Ok(RuntimeValue::Number(self.arrays[id].len() as f64))
             }
             "reverse" => {
+                self.charge_work(self.arrays[id].len())?;
                 self.arrays[id].reverse();
                 Ok(RuntimeValue::Array(id))
             }
@@ -2717,6 +3444,9 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => len as usize,
                 };
+                let slice_len = end.saturating_sub(start);
+                self.check_array_alloc(slice_len)?;
+                self.charge_work(slice_len)?;
                 let slice = if start < end {
                     self.arrays[id][start..end].to_vec()
                 } else {
@@ -2725,12 +3455,32 @@ impl<'a> Evaluator<'a> {
                 Ok(self.alloc_array(slice))
             }
             "concat" => {
-                let mut out = self.arrays[id].clone();
+                let mut total_len = self.arrays[id].len();
+                let mut resolved = Vec::with_capacity(args.len());
                 for a in args {
                     let d = self.deref_property_handle(a)?;
+                    let add = match &d {
+                        RuntimeValue::Array(other_id) => self.arrays[*other_id].len(),
+                        _ => 1,
+                    };
+                    total_len = total_len.checked_add(add).ok_or_else(|| {
+                        ExprError::RangeError("array length overflow".to_string())
+                    })?;
+                    if total_len > MAX_ARRAY_LEN {
+                        return Err(ExprError::RangeError(format!(
+                            "array length {total_len} exceeds {MAX_ARRAY_LEN} limit"
+                        )));
+                    }
+                    resolved.push(d);
+                }
+                self.check_array_alloc(total_len)?;
+                self.charge_work(total_len)?;
+                let mut out = Vec::with_capacity(total_len);
+                out.extend(self.arrays[id].iter().cloned());
+                for d in resolved {
                     match d {
                         RuntimeValue::Array(other_id) => {
-                            out.extend(self.arrays[other_id].clone());
+                            out.extend(self.arrays[other_id].iter().cloned());
                         }
                         other => out.push(other),
                     }
@@ -2744,10 +3494,13 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => ",".to_string(),
                 };
-                Ok(RuntimeValue::String(self.join_array_to_string(id, &sep)?))
+                Ok(RuntimeValue::String(JsStr::from(
+                    self.join_array_to_string(id, &sep)?,
+                )))
             }
             "indexOf" => {
                 let needle = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
+                self.charge_work(self.arrays[id].len())?;
                 let items = self.arrays[id].clone();
                 for (i, item) in items.iter().enumerate() {
                     if self.strict_eq(item, &needle)? {
@@ -2758,6 +3511,7 @@ impl<'a> Evaluator<'a> {
             }
             "includes" => {
                 let needle = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
+                self.charge_work(self.arrays[id].len())?;
                 let items = self.arrays[id].clone();
                 for item in &items {
                     if self.strict_eq(item, &needle)? {
@@ -2768,6 +3522,9 @@ impl<'a> Evaluator<'a> {
             }
             "map" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
+                let len = self.arrays[id].len();
+                self.check_array_alloc(len)?;
+                self.charge_work(len)?;
                 let items = self.arrays[id].clone();
                 let mut out = Vec::with_capacity(items.len());
                 for (i, item) in items.into_iter().enumerate() {
@@ -2785,6 +3542,7 @@ impl<'a> Evaluator<'a> {
             }
             "filter" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
+                self.charge_work(self.arrays[id].len())?;
                 let items = self.arrays[id].clone();
                 let mut out = Vec::new();
                 for (i, item) in items.into_iter().enumerate() {
@@ -2800,10 +3558,12 @@ impl<'a> Evaluator<'a> {
                         out.push(item);
                     }
                 }
+                self.check_array_alloc(out.len())?;
                 Ok(self.alloc_array(out))
             }
             "reduce" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
+                self.charge_work(self.arrays[id].len())?;
                 let items = self.arrays[id].clone();
                 let (mut acc, start_idx) = if let Some(init) = args.get(1) {
                     (init.clone(), 0)
@@ -2829,6 +3589,7 @@ impl<'a> Evaluator<'a> {
             }
             "forEach" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
+                self.charge_work(self.arrays[id].len())?;
                 let items = self.arrays[id].clone();
                 for (i, item) in items.into_iter().enumerate() {
                     self.call_runtime_value(
@@ -2844,6 +3605,7 @@ impl<'a> Evaluator<'a> {
             }
             "find" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
+                self.charge_work(self.arrays[id].len())?;
                 let items = self.arrays[id].clone();
                 for (i, item) in items.into_iter().enumerate() {
                     let hit = self.call_runtime_value(
@@ -2862,6 +3624,7 @@ impl<'a> Evaluator<'a> {
             }
             "some" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
+                self.charge_work(self.arrays[id].len())?;
                 let items = self.arrays[id].clone();
                 for (i, item) in items.into_iter().enumerate() {
                     let hit = self.call_runtime_value(
@@ -2880,6 +3643,7 @@ impl<'a> Evaluator<'a> {
             }
             "every" => {
                 let cb = args.first().cloned().unwrap_or(RuntimeValue::Undefined);
+                self.charge_work(self.arrays[id].len())?;
                 let items = self.arrays[id].clone();
                 for (i, item) in items.into_iter().enumerate() {
                     let hit = self.call_runtime_value(
@@ -2908,6 +3672,7 @@ impl<'a> Evaluator<'a> {
                     None => len as usize,
                 };
                 if start < end {
+                    self.charge_work(end - start)?;
                     for slot in &mut self.arrays[id][start..end] {
                         *slot = val.clone();
                     }
@@ -2922,58 +3687,117 @@ impl<'a> Evaluator<'a> {
 
     fn call_string_method(
         &mut self,
-        s: &str,
+        s: &JsStr,
         method: &str,
         args: Vec<RuntimeValue>,
     ) -> Result<RuntimeValue, ExprError> {
-        let chars: Vec<char> = s.chars().collect();
-        let len = chars.len() as isize;
         match method {
-            "toLowerCase" => Ok(RuntimeValue::String(s.to_lowercase())),
-            "toUpperCase" => Ok(RuntimeValue::String(s.to_uppercase())),
-            "trim" => Ok(RuntimeValue::String(s.trim().to_string())),
-            "trimStart" => Ok(RuntimeValue::String(s.trim_start().to_string())),
-            "trimEnd" => Ok(RuntimeValue::String(s.trim_end().to_string())),
+            "toLowerCase" => {
+                self.check_string_alloc(s.len())?;
+                self.charge_byte_work(s.len())?;
+                let out = s.to_lowercase();
+                if out.len() > s.len() {
+                    if out.len() > MAX_STRING_BYTES {
+                        return Err(ExprError::RangeError(format!(
+                            "string length {} exceeds {MAX_STRING_BYTES} byte limit",
+                            out.len()
+                        )));
+                    }
+                    self.charge_alloc_bytes(out.len() - s.len())?;
+                }
+                Ok(RuntimeValue::String(JsStr::from(out)))
+            }
+            "toUpperCase" => {
+                self.check_string_alloc(s.len())?;
+                self.charge_byte_work(s.len())?;
+                let out = s.to_uppercase();
+                if out.len() > s.len() {
+                    if out.len() > MAX_STRING_BYTES {
+                        return Err(ExprError::RangeError(format!(
+                            "string length {} exceeds {MAX_STRING_BYTES} byte limit",
+                            out.len()
+                        )));
+                    }
+                    self.charge_alloc_bytes(out.len() - s.len())?;
+                }
+                Ok(RuntimeValue::String(JsStr::from(out)))
+            }
+            "trim" => {
+                self.charge_byte_work(s.len())?;
+                let t = s.trim();
+                self.check_string_alloc(t.len())?;
+                Ok(RuntimeValue::String(JsStr::from(t)))
+            }
+            "trimStart" => {
+                self.charge_byte_work(s.len())?;
+                let t = s.trim_start();
+                self.check_string_alloc(t.len())?;
+                Ok(RuntimeValue::String(JsStr::from(t)))
+            }
+            "trimEnd" => {
+                self.charge_byte_work(s.len())?;
+                let t = s.trim_end();
+                self.check_string_alloc(t.len())?;
+                Ok(RuntimeValue::String(JsStr::from(t)))
+            }
             "slice" => {
+                let char_len = self.string_char_len(s)? as isize;
                 let start = match args.first() {
-                    Some(v) => normalize_slice_index(self.runtime_to_number(v)?, len),
+                    Some(v) => normalize_slice_index(self.runtime_to_number(v)?, char_len),
                     None => 0,
                 };
                 let end = match args.get(1) {
                     Some(v) if !matches!(v, RuntimeValue::Undefined) => {
-                        normalize_slice_index(self.runtime_to_number(v)?, len)
+                        normalize_slice_index(self.runtime_to_number(v)?, char_len)
                     }
-                    _ => len as usize,
+                    _ => char_len as usize,
                 };
-                let out: String = if start < end {
-                    chars[start..end].iter().collect()
+                if start < end {
+                    let b_lo = Self::string_byte_offset_for_char_index(s, start);
+                    let b_hi = Self::string_byte_offset_for_char_index(s, end);
+                    let slice = &s.as_str()[b_lo..b_hi];
+                    self.check_string_alloc(slice.len())?;
+                    self.charge_byte_work(slice.len())?;
+                    Ok(RuntimeValue::String(JsStr::from(slice)))
                 } else {
-                    String::new()
-                };
-                Ok(RuntimeValue::String(out))
+                    Ok(RuntimeValue::String(JsStr::from("")))
+                }
             }
             "substring" => {
+                let char_len = self.string_char_len(s)?;
                 let a = match args.first() {
-                    Some(v) => clamp_f64(self.runtime_to_number(v)?, 0.0, len as f64) as usize,
+                    Some(v) => clamp_f64(self.runtime_to_number(v)?, 0.0, char_len as f64) as usize,
                     None => 0,
                 };
                 let b = match args.get(1) {
                     Some(v) if !matches!(v, RuntimeValue::Undefined) => {
-                        clamp_f64(self.runtime_to_number(v)?, 0.0, len as f64) as usize
+                        clamp_f64(self.runtime_to_number(v)?, 0.0, char_len as f64) as usize
                     }
-                    _ => len as usize,
+                    _ => char_len,
                 };
                 let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                Ok(RuntimeValue::String(chars[lo..hi].iter().collect()))
+                let b_lo = Self::string_byte_offset_for_char_index(s, lo);
+                let b_hi = Self::string_byte_offset_for_char_index(s, hi);
+                let slice = &s.as_str()[b_lo..b_hi];
+                self.check_string_alloc(slice.len())?;
+                self.charge_byte_work(slice.len())?;
+                Ok(RuntimeValue::String(JsStr::from(slice)))
             }
             "indexOf" => {
                 let pat = match args.first() {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                self.charge_byte_work(s.len().saturating_add(pat.len()))?;
                 let idx = s
                     .find(&pat)
-                    .map(|byte_idx| s[..byte_idx].chars().count() as f64)
+                    .map(|byte_idx| {
+                        if s.is_ascii {
+                            byte_idx as f64
+                        } else {
+                            s.as_str()[..byte_idx].chars().count() as f64
+                        }
+                    })
                     .unwrap_or(-1.0);
                 Ok(RuntimeValue::Number(idx))
             }
@@ -2982,6 +3806,7 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                self.charge_byte_work(s.len().saturating_add(pat.len()))?;
                 Ok(RuntimeValue::Bool(s.contains(&pat)))
             }
             "startsWith" => {
@@ -2989,6 +3814,7 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                self.charge_byte_work(pat.len())?;
                 Ok(RuntimeValue::Bool(s.starts_with(&pat)))
             }
             "endsWith" => {
@@ -2996,6 +3822,7 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
+                self.charge_byte_work(pat.len())?;
                 Ok(RuntimeValue::Bool(s.ends_with(&pat)))
             }
             "split" => {
@@ -3003,18 +3830,30 @@ impl<'a> Evaluator<'a> {
                     Some(v) if !matches!(v, RuntimeValue::Undefined) => {
                         self.runtime_to_js_string(v)?
                     }
-                    _ => return Ok(self.alloc_array(vec![RuntimeValue::String(s.to_string())])),
+                    _ => {
+                        self.check_string_alloc(s.len())?;
+                        return Ok(self.alloc_array(vec![RuntimeValue::String(s.clone())]));
+                    }
                 };
-                let parts: Vec<RuntimeValue> = if sep.is_empty() {
-                    chars
-                        .into_iter()
-                        .map(|c| RuntimeValue::String(c.to_string()))
-                        .collect()
-                } else {
-                    s.split(&sep)
-                        .map(|part| RuntimeValue::String(part.to_string()))
-                        .collect()
-                };
+                if sep.is_empty() {
+                    let part_count = self.string_char_len(s)?;
+                    self.check_array_alloc(part_count)?;
+                    self.check_string_alloc(s.len())?;
+                    self.charge_byte_work(s.len())?;
+                    let parts: Vec<RuntimeValue> = s
+                        .chars()
+                        .map(|c| RuntimeValue::String(JsStr::from(c.to_string())))
+                        .collect();
+                    return Ok(self.alloc_array(parts));
+                }
+                self.charge_byte_work(s.len())?;
+                let part_count = s.matches(&sep).count().saturating_add(1);
+                self.check_array_alloc(part_count)?;
+                self.check_string_alloc(s.len())?;
+                let parts: Vec<RuntimeValue> = s
+                    .split(&sep)
+                    .map(|part| RuntimeValue::String(JsStr::from(part)))
+                    .collect();
                 Ok(self.alloc_array(parts))
             }
             "replace" => {
@@ -3026,7 +3865,14 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
-                Ok(RuntimeValue::String(s.replacen(&from, &to, 1)))
+                let est = s
+                    .len()
+                    .saturating_sub(from.len())
+                    .checked_add(to.len())
+                    .ok_or_else(|| ExprError::RangeError("replace string overflow".to_string()))?;
+                self.check_string_alloc(est)?;
+                self.charge_byte_work(s.len())?;
+                Ok(RuntimeValue::String(JsStr::from(s.replacen(&from, &to, 1))))
             }
             "replaceAll" => {
                 let from = match args.first() {
@@ -3037,27 +3883,48 @@ impl<'a> Evaluator<'a> {
                     Some(v) => self.runtime_to_js_string(v)?,
                     None => "undefined".to_string(),
                 };
-                Ok(RuntimeValue::String(s.replace(&from, &to)))
+                self.charge_byte_work(s.len())?;
+                let matches = if from.is_empty() {
+                    self.string_char_len(s)?.saturating_add(1)
+                } else {
+                    s.matches(&from).count()
+                };
+                let added = matches.checked_mul(to.len()).ok_or_else(|| {
+                    ExprError::RangeError("replaceAll string overflow".to_string())
+                })?;
+                let removed = matches.saturating_mul(from.len());
+                let est = s
+                    .len()
+                    .saturating_sub(removed)
+                    .checked_add(added)
+                    .ok_or_else(|| {
+                        ExprError::RangeError("replaceAll string overflow".to_string())
+                    })?;
+                self.check_string_alloc(est)?;
+                Ok(RuntimeValue::String(JsStr::from(s.replace(&from, &to))))
             }
             "charAt" => {
                 let idx = match args.first() {
                     Some(v) => self.runtime_to_number(v)?,
                     None => 0.0,
                 };
-                let out = if idx >= 0.0 && (idx as usize) < chars.len() {
-                    chars[idx as usize].to_string()
+                let out = if idx >= 0.0 && idx.is_finite() {
+                    self.string_char_at(s, idx as usize)?
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 };
-                Ok(RuntimeValue::String(out))
+                Ok(RuntimeValue::String(JsStr::from(out)))
             }
             "charCodeAt" => {
                 let idx = match args.first() {
                     Some(v) => self.runtime_to_number(v)?,
                     None => 0.0,
                 };
-                let out = if idx >= 0.0 && (idx as usize) < chars.len() {
-                    (chars[idx as usize] as u32) as f64
+                let out = if idx >= 0.0 && idx.is_finite() {
+                    self.string_char_at(s, idx as usize)?
+                        .map_or(f64::NAN, |c| (c as u32) as f64)
                 } else {
                     f64::NAN
                 };
@@ -3071,7 +3938,13 @@ impl<'a> Evaluator<'a> {
                 if count < 0.0 || !count.is_finite() || count > 10_000.0 {
                     return Err(ExprError::RangeError("invalid repeat count".to_string()));
                 }
-                Ok(RuntimeValue::String(s.repeat(count as usize)))
+                let count_usize = count as usize;
+                let total_bytes = s.len().checked_mul(count_usize).ok_or_else(|| {
+                    ExprError::RangeError("string repeat length overflow".to_string())
+                })?;
+                self.check_string_alloc(total_bytes)?;
+                self.charge_byte_work(total_bytes)?;
+                Ok(RuntimeValue::String(JsStr::from(s.repeat(count_usize))))
             }
             _ => Err(ExprError::TypeError(format!(
                 "String.prototype.{method} is not a function"
@@ -3097,9 +3970,9 @@ impl<'a> Evaluator<'a> {
                     ));
                 }
                 let prec = digits as usize;
-                Ok(RuntimeValue::String(format!("{n:.prec$}")))
+                self.alloc_string(format!("{n:.prec$}"))
             }
-            "toString" => Ok(RuntimeValue::String(format_js_number(n))),
+            "toString" => Ok(RuntimeValue::String(JsStr::from(format_js_number(n)))),
             _ => Err(ExprError::TypeError(format!(
                 "Number.prototype.{method} is not a function"
             ))),
@@ -3182,11 +4055,11 @@ impl<'a> Evaluator<'a> {
             "cross" => {
                 let a = self.require_vec_arg(&args, 0, "cross")?;
                 let b = self.require_vec_arg(&args, 1, "cross")?;
-                Ok(self.alloc_f64_vec(vec_cross(&a, &b)))
+                self.alloc_f64_vec(vec_cross(&a, &b))
             }
             "normalize" => {
                 let v = self.require_vec_arg(&args, 0, "normalize")?;
-                Ok(self.alloc_f64_vec(vec_normalize(&v)))
+                self.alloc_f64_vec(vec_normalize(&v))
             }
             "length" => {
                 let Some(first) = args.first() else {
@@ -3223,7 +4096,7 @@ impl<'a> Evaluator<'a> {
                 let b = self.export_arg(&args, 1)?;
                 let t = self.number_arg(&args, 2, 0.0)?;
                 let res = lerp_value(&a, &b, t)?;
-                Ok(self.intern_value(res))
+                self.intern_value(res)
             }
             "linear" => self.builtin_linear(&args),
             "catmullRom" => {
@@ -3233,7 +4106,7 @@ impl<'a> Evaluator<'a> {
                 let p3 = self.export_arg(&args, 3)?;
                 let t = self.number_arg(&args, 4, 0.0)?;
                 let res = catmull_rom_value(&p0, &p1, &p2, &p3, t)?;
-                Ok(self.intern_value(res))
+                self.intern_value(res)
             }
             "ease" => self.builtin_ease(&args),
             "easeIn" => self.builtin_ae_ease_dir(&args, true),
@@ -3263,7 +4136,7 @@ impl<'a> Evaluator<'a> {
                     return Ok(RuntimeValue::Number(f64::NAN));
                 };
                 if let Some(v) = self.runtime_as_f64_vec(first)? {
-                    return Ok(self.alloc_f64_vec(v.into_iter().map(|x| x * PI / 180.0).collect()));
+                    return self.alloc_f64_vec(v.into_iter().map(|x| x * PI / 180.0).collect());
                 }
                 let x = self.runtime_to_number(first)?;
                 Ok(RuntimeValue::Number(x * PI / 180.0))
@@ -3273,7 +4146,7 @@ impl<'a> Evaluator<'a> {
                     return Ok(RuntimeValue::Number(f64::NAN));
                 };
                 if let Some(v) = self.runtime_as_f64_vec(first)? {
-                    return Ok(self.alloc_f64_vec(v.into_iter().map(|x| x * 180.0 / PI).collect()));
+                    return self.alloc_f64_vec(v.into_iter().map(|x| x * 180.0 / PI).collect());
                 }
                 let x = self.runtime_to_number(first)?;
                 Ok(RuntimeValue::Number(x * 180.0 / PI))
@@ -3288,7 +4161,7 @@ impl<'a> Evaluator<'a> {
                     None => [0.0, 0.0, 1.0],
                 };
                 let euler = look_at_xyz_euler(from, to);
-                Ok(self.alloc_f64_vec(euler.to_vec()))
+                self.alloc_f64_vec(euler.to_vec())
             }
             "seedRandom" => {
                 let seed = self.number_arg(&args, 0, 0.0)?;
@@ -3308,7 +4181,7 @@ impl<'a> Evaluator<'a> {
                 let seed_offset = self.rng.as_ref().map_or(0.0, DetRng::seed_offset);
                 let base_val = self.ctx.value();
                 let res = eval_wiggle(&base_val, freq, &amp, octaves, amp_mult, t, seed_offset);
-                Ok(self.intern_value(res))
+                self.intern_value(res)
             }
 
             // --- Expressions+ Scene & Property Access ---
@@ -3346,7 +4219,7 @@ impl<'a> Evaluator<'a> {
                     _ => None,
                 };
                 let val = self.ctx.control(&ctrl_name, stable_id.as_deref())?;
-                Ok(self.intern_value(val))
+                self.intern_value(val)
             }
             "toWorld" => {
                 let pt = match args.first() {
@@ -3354,7 +4227,7 @@ impl<'a> Evaluator<'a> {
                     None => [0.0, 0.0, 0.0],
                 };
                 let out = self.ctx.to_world(None, pt)?;
-                Ok(self.alloc_f64_vec(out.to_vec()))
+                self.alloc_f64_vec(out.to_vec())
             }
             "fromWorld" => {
                 let pt = match args.first() {
@@ -3362,15 +4235,15 @@ impl<'a> Evaluator<'a> {
                     None => [0.0, 0.0, 0.0],
                 };
                 let out = self.ctx.from_world(None, pt)?;
-                Ok(self.alloc_f64_vec(out.to_vec()))
+                self.alloc_f64_vec(out.to_vec())
             }
             "worldPosition" => {
                 let out = self.ctx.world_position(None)?;
-                Ok(self.alloc_f64_vec(out.to_vec()))
+                self.alloc_f64_vec(out.to_vec())
             }
             "worldRotation" => {
                 let out = self.ctx.world_rotation(None)?;
-                Ok(self.alloc_f64_vec(out.to_vec()))
+                self.alloc_f64_vec(out.to_vec())
             }
             "toScreen" => {
                 let pt = match args.first() {
@@ -3378,7 +4251,7 @@ impl<'a> Evaluator<'a> {
                     None => [0.0, 0.0, 0.0],
                 };
                 let out = self.ctx.to_screen(None, pt)?;
-                Ok(self.alloc_f64_vec(out.to_vec()))
+                self.alloc_f64_vec(out.to_vec())
             }
             "fromScreen" => {
                 let pt = match args.first() {
@@ -3386,9 +4259,9 @@ impl<'a> Evaluator<'a> {
                     None => [0.0, 0.0, 0.0],
                 };
                 let out = self.ctx.from_screen(None, pt)?;
-                Ok(self.alloc_f64_vec(out.to_vec()))
+                self.alloc_f64_vec(out.to_vec())
             }
-            _ => Err(ExprError::ReferenceError(name.to_string())),
+            _ => Err(ExprError::ReferenceError(truncate_diag(name).into_owned())),
         }
     }
 
@@ -3425,7 +4298,7 @@ impl<'a> Evaluator<'a> {
                     clamp_f64(x, lo, hi)
                 })
                 .collect();
-            Ok(self.alloc_f64_vec(out))
+            self.alloc_f64_vec(out)
         } else {
             let x = self.runtime_to_number(first)?;
             let lo = self.number_arg(args, 1, 0.0)?;
@@ -3448,14 +4321,14 @@ impl<'a> Evaluator<'a> {
             let a = self.export_arg(args, 3)?;
             let b = self.export_arg(args, 4)?;
             let res = ae_linear(t, t_min, t_max, &a, &b)?;
-            return Ok(self.intern_value(res));
+            return self.intern_value(res);
         }
         // Vanilla CM3 3-argument form: `linear(a, b, t) = (b - a) * t + a`
         let a = self.export_arg(args, 0)?;
         let b = self.export_arg(args, 1)?;
         let t = self.number_arg(args, 2, 0.0)?;
         let res = lerp_value(&a, &b, t)?;
-        Ok(self.intern_value(res))
+        self.intern_value(res)
     }
 
     fn builtin_ease(&mut self, args: &[RuntimeValue]) -> Result<RuntimeValue, ExprError> {
@@ -3472,7 +4345,7 @@ impl<'a> Evaluator<'a> {
             let a = self.export_arg(args, 3)?;
             let b = self.export_arg(args, 4)?;
             let res = ae_ease(t, t_min, t_max, &a, &b)?;
-            return Ok(self.intern_value(res));
+            return self.intern_value(res);
         }
         // Vanilla CM3 form: `ease(t, family = "Quadratic", dir = "InOut")`
         let t = self.number_arg(args, 0, 0.0)?;
@@ -3503,7 +4376,7 @@ impl<'a> Evaluator<'a> {
             } else {
                 ae_ease_out(t, t_min, t_max, &a, &b)?
             };
-            Ok(self.intern_value(res))
+            self.intern_value(res)
         } else {
             let t = clamp_f64(self.number_arg(args, 0, 0.0)?, 0.0, 1.0);
             let s = if is_in {
@@ -3534,7 +4407,7 @@ impl<'a> Evaluator<'a> {
                     .rng
                     .get_or_insert_with(|| DetRng::from_seed(0.0, frame, false));
                 let out = max_vec.into_iter().map(|m| rng.next_f64() * m).collect();
-                return Ok(self.alloc_f64_vec(out));
+                return self.alloc_f64_vec(out);
             }
             let seed = self.number_arg(args, 0, 0.0)?;
             return Ok(RuntimeValue::Number(cm3_random(seed)));
@@ -3563,7 +4436,7 @@ impl<'a> Evaluator<'a> {
                         ExprError::RuntimeError("PRNG stream not initialized".to_string())
                     })?;
                     let out = max_vec.into_iter().map(|m| rng.next_f64() * m).collect();
-                    return Ok(self.alloc_f64_vec(out));
+                    return self.alloc_f64_vec(out);
                 }
                 let max_val = self.runtime_to_number(&args[0])?;
                 let r = self.rng.as_mut().map_or(0.0, DetRng::next_f64);
@@ -3583,7 +4456,7 @@ impl<'a> Evaluator<'a> {
                         let b = hi.get(i).copied().unwrap_or(0.0);
                         out.push((b - a) * rng.next_f64() + a);
                     }
-                    return Ok(self.alloc_f64_vec(out));
+                    return self.alloc_f64_vec(out);
                 }
                 let lo = self.runtime_to_number(&args[0])?;
                 let hi = self.runtime_to_number(&args[1])?;
@@ -3625,10 +4498,22 @@ impl<'a> Evaluator<'a> {
 
     fn export_arg(&mut self, args: &[RuntimeValue], index: usize) -> Result<Value, ExprError> {
         match args.get(index) {
-            Some(v) => self.export_value(v, 0),
+            Some(v) => self.export_root_value(v),
             None => Ok(Value::Number(0.0)),
         }
     }
+}
+
+fn truncate_diag(s: &str) -> std::borrow::Cow<'_, str> {
+    const MAX_DIAG_NAME_BYTES: usize = 128;
+    if s.len() <= MAX_DIAG_NAME_BYTES {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut end = MAX_DIAG_NAME_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}...", &s[..end]))
 }
 
 fn is_catchable_error(err: &ExprError) -> bool {

@@ -7,9 +7,9 @@ pub mod glsl_shim;
 pub mod shader_plus;
 
 pub use glsl_shim::{
-    CompileOptions, CompiledCustomShader, ShaderError, TextureBinding, UniformBlockLayout,
-    UniformField, UniformType, UniformValue, align_up, pack_uniforms, translate_glsl_es100,
-    translate_glsl_es100_with_options,
+    CompileOptions, CompiledCustomShader, MAX_GLSL_SOURCE_BYTES, ShaderError, TextureBinding,
+    UniformBlockLayout, UniformField, UniformType, UniformValue, align_up, pack_uniforms,
+    translate_glsl_es100, translate_glsl_es100_with_options,
 };
 pub use shader_plus::{
     CURVE_LUT_WIDTH, ConditionClause, CurveChannel, CurveMode, CurvePoint, CurveSpec,

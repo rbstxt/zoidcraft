@@ -895,78 +895,142 @@ pub fn eval_wiggle(
 
 const MAX_JSON_DEPTH: usize = 128;
 
-pub fn json_stringify(val: &Value) -> Result<String, ExprError> {
-    let mut out = String::new();
-    write_json_value(val, &mut out, 0)?;
-    Ok(out)
+/// Deterministic `JSON.stringify` with a hard output byte limit and incremental work charging.
+///
+/// Charges `charge_work` as bytes are serialized (including before returning `RangeError` when
+/// `max_bytes` is exceeded) so catchable `try { JSON.stringify(x); } catch (e) {}` loops cannot
+/// bypass the evaluator step budget or allocate oversized escape buffers.
+pub fn json_stringify_bounded<F>(
+    val: &Value,
+    max_bytes: usize,
+    charge_work: &mut F,
+) -> Result<String, ExprError>
+where
+    F: FnMut(usize) -> Result<(), ExprError>,
+{
+    let mut writer = JsonWriter {
+        out: String::new(),
+        max_bytes,
+        pending_work_bytes: 0,
+        charge_work,
+    };
+    writer.write_value(val, 0)?;
+    writer.flush_work()?;
+    Ok(writer.out)
 }
 
-fn write_json_value(val: &Value, out: &mut String, depth: usize) -> Result<(), ExprError> {
-    if depth > MAX_JSON_DEPTH {
-        return Err(ExprError::RangeError(
-            "JSON nesting depth exceeded".to_string(),
-        ));
-    }
-    match val {
-        Value::Undefined | Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => {
-            if n.is_finite() {
-                out.push_str(&format_js_number(*n));
-            } else {
-                out.push_str("null");
-            }
-        }
-        Value::String(s) => write_json_string(s, out),
-        Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_json_value(item, out, depth + 1)?;
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            out.push('{');
-            let mut first = true;
-            for (k, v) in map {
-                if matches!(v, Value::Undefined) {
-                    continue;
-                }
-                if !first {
-                    out.push(',');
-                }
-                first = false;
-                write_json_string(k, out);
-                out.push(':');
-                write_json_value(v, out, depth + 1)?;
-            }
-            out.push('}');
-        }
-    }
-    Ok(())
+struct JsonWriter<'a, F> {
+    out: String,
+    max_bytes: usize,
+    pending_work_bytes: usize,
+    charge_work: &'a mut F,
 }
 
-fn write_json_string(s: &str, out: &mut String) {
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{0008}' => out.push_str("\\b"),
-            '\u{000C}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
+impl<F> JsonWriter<'_, F>
+where
+    F: FnMut(usize) -> Result<(), ExprError>,
+{
+    fn flush_work(&mut self) -> Result<(), ExprError> {
+        if self.pending_work_bytes > 0 {
+            let bytes = self.pending_work_bytes;
+            self.pending_work_bytes = 0;
+            (self.charge_work)(bytes)?;
         }
+        Ok(())
     }
-    out.push('"');
+
+    fn push_str(&mut self, piece: &str) -> Result<(), ExprError> {
+        self.pending_work_bytes = self.pending_work_bytes.saturating_add(piece.len());
+        if self.pending_work_bytes >= 256 {
+            self.flush_work()?;
+        }
+        if self.out.len().saturating_add(piece.len()) > self.max_bytes {
+            self.flush_work()?;
+            return Err(ExprError::RangeError(format!(
+                "JSON string length exceeds {} byte limit",
+                self.max_bytes
+            )));
+        }
+        self.out.push_str(piece);
+        Ok(())
+    }
+
+    fn push_char(&mut self, ch: char) -> Result<(), ExprError> {
+        let mut buf = [0_u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        self.push_str(s)
+    }
+
+    fn write_value(&mut self, val: &Value, depth: usize) -> Result<(), ExprError> {
+        if depth > MAX_JSON_DEPTH {
+            self.flush_work()?;
+            return Err(ExprError::RangeError(
+                "JSON nesting depth exceeded".to_string(),
+            ));
+        }
+        match val {
+            Value::Undefined | Value::Null => self.push_str("null")?,
+            Value::Bool(b) => self.push_str(if *b { "true" } else { "false" })?,
+            Value::Number(n) => {
+                if n.is_finite() {
+                    let formatted = format_js_number(*n);
+                    self.push_str(&formatted)?;
+                } else {
+                    self.push_str("null")?;
+                }
+            }
+            Value::String(s) => self.write_string(s)?,
+            Value::Array(items) => {
+                self.push_char('[')?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        self.push_char(',')?;
+                    }
+                    self.write_value(item, depth + 1)?;
+                }
+                self.push_char(']')?;
+            }
+            Value::Object(map) => {
+                self.push_char('{')?;
+                let mut first = true;
+                for (k, v) in map {
+                    if matches!(v, Value::Undefined) {
+                        continue;
+                    }
+                    if !first {
+                        self.push_char(',')?;
+                    }
+                    first = false;
+                    self.write_string(k)?;
+                    self.push_char(':')?;
+                    self.write_value(v, depth + 1)?;
+                }
+                self.push_char('}')?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_string(&mut self, s: &str) -> Result<(), ExprError> {
+        self.push_char('"')?;
+        for ch in s.chars() {
+            match ch {
+                '"' => self.push_str("\\\"")?,
+                '\\' => self.push_str("\\\\")?,
+                '\u{0008}' => self.push_str("\\b")?,
+                '\u{000C}' => self.push_str("\\f")?,
+                '\n' => self.push_str("\\n")?,
+                '\r' => self.push_str("\\r")?,
+                '\t' => self.push_str("\\t")?,
+                c if (c as u32) < 0x20 => {
+                    let esc = format!("\\u{:04x}", c as u32);
+                    self.push_str(&esc)?;
+                }
+                c => self.push_char(c)?,
+            }
+        }
+        self.push_char('"')
+    }
 }
 
 pub fn json_parse(input: &str) -> Result<Value, ExprError> {

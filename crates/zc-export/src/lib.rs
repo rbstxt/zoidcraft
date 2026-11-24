@@ -8,7 +8,7 @@
 //! - Cooperative `Arc<AtomicBool>` cancellation with guaranteed child reaping (zero zombies)
 //! - Direct PNG sequence export via the `image` crate (no FFmpeg required)
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod exporter;
 pub mod ffmpeg;

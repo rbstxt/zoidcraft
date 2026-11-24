@@ -9,7 +9,7 @@ pub mod meter;
 pub mod mixer;
 pub mod waveform;
 
-pub use clock::{AudioOutputHandle, MasterPlaybackClock, PlaybackSnapshot};
+pub use clock::{AudioMixWindow, AudioOutputHandle, MasterPlaybackClock, PlaybackSnapshot};
 pub use decode::{
     AudioBuffer, STANDARD_SAMPLE_RATE, decode_audio_bytes, encode_wav_f32_stereo,
     encode_wav_pcm16_stereo, resample_stereo, resample_stereo_48k,

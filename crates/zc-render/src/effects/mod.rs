@@ -1641,12 +1641,16 @@ impl EffectRegistry {
             if self.custom_pipelines.len() >= MAX_CUSTOM_PIPELINES {
                 self.evict_lru_custom_pipeline();
             }
+            let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let pipeline = self.compile_wgsl_pipeline(
                 device,
                 &format!("zc-custom-shader-{hash:016x}"),
                 wgsl_source,
                 None,
             );
+            if let Some(err) = pollster::block_on(error_scope.pop()) {
+                return Err(EffectError::CustomShaderInvalid(err.to_string()));
+            }
             self.custom_pipelines.insert(
                 hash,
                 CustomPipelineEntry {
