@@ -1,0 +1,669 @@
+//! Deadlock-free, zero-leak FFmpeg video exporter and direct PNG sequence exporter.
+
+use std::fs::{self, File};
+use std::io::{BufWriter, ErrorKind, Write};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use image::codecs::png::PngEncoder;
+use image::{ExtendedColorType, ImageEncoder};
+
+use crate::ExportError;
+use crate::ffmpeg::{
+    BoundedStderrBuffer, MAX_STDERR_BYTES, build_ffmpeg_args, resolve_ffmpeg_binary,
+};
+use crate::padding::pad_rgba_frame_into;
+use crate::settings::{
+    AudioCodec, ExportContainer, ExportProgress, ExportReport, ExportSettings, FrameProvider,
+};
+use crate::temp_audio::write_temp_stereo_wav_f32;
+
+/// RAII child process guard that kills and reaps (`wait()`) an unfinished child on drop,
+/// guaranteeing zero zombie processes and zero leaked file descriptors even on error/cancel/panic.
+struct ChildCleanupGuard {
+    child: Option<Child>,
+}
+
+impl ChildCleanupGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Terminates and reaps the child immediately if still running.
+    fn kill_and_reap(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Waits cleanly for normal child exit, disarming the kill-on-drop guard.
+    fn wait(mut self) -> Result<std::process::ExitStatus, std::io::Error> {
+        let mut child = self
+            .child
+            .take()
+            .expect("ChildCleanupGuard::wait called only once");
+        child.wait()
+    }
+}
+
+impl Drop for ChildCleanupGuard {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
+/// Exports video (via FFmpeg) or a PNG image sequence (directly via `image`),
+/// streaming rendered RGBA8 frames from `frame_provider` with a single reusable frame buffer.
+pub fn export_video<F>(
+    settings: &ExportSettings,
+    audio_stereo: Option<&[[f32; 2]]>,
+    cancel: &Arc<AtomicBool>,
+    frame_provider: F,
+) -> Result<ExportReport, ExportError>
+where
+    F: FrameProvider,
+{
+    export_video_with_progress(settings, audio_stereo, cancel, frame_provider, |_| {})
+}
+
+/// Same as [`export_video`], invoking `on_progress` after each completed frame.
+pub fn export_video_with_progress<F, P>(
+    settings: &ExportSettings,
+    audio_stereo: Option<&[[f32; 2]]>,
+    cancel: &Arc<AtomicBool>,
+    frame_provider: F,
+    on_progress: P,
+) -> Result<ExportReport, ExportError>
+where
+    F: FrameProvider,
+    P: FnMut(ExportProgress),
+{
+    settings.validate()?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
+
+    if matches!(settings.container, ExportContainer::PngSequence) {
+        export_png_sequence(settings, cancel, frame_provider, on_progress)
+    } else {
+        export_ffmpeg(settings, audio_stereo, cancel, frame_provider, on_progress)
+    }
+}
+
+fn export_png_sequence<F, P>(
+    settings: &ExportSettings,
+    cancel: &Arc<AtomicBool>,
+    mut frame_provider: F,
+    mut on_progress: P,
+) -> Result<ExportReport, ExportError>
+where
+    F: FrameProvider,
+    P: FnMut(ExportProgress),
+{
+    fs::create_dir_all(&settings.output_path)?;
+
+    let expected_bytes = checked_rgba_len(settings.width, settings.height)?;
+    let mut frame_buf = vec![0_u8; expected_bytes];
+    let total_frames = settings.total_frames();
+
+    for (offset, frame_index) in (settings.start_frame..settings.end_frame).enumerate() {
+        if cancel.load(Ordering::Acquire) {
+            return Err(ExportError::Cancelled);
+        }
+
+        frame_provider.render_frame(frame_index, &mut frame_buf)?;
+        if frame_buf.len() != expected_bytes {
+            return Err(ExportError::InvalidFrameSize {
+                frame_index,
+                expected: expected_bytes,
+                actual: frame_buf.len(),
+            });
+        }
+
+        if cancel.load(Ordering::Acquire) {
+            return Err(ExportError::Cancelled);
+        }
+
+        let file_name = format!("frame_{:06}.png", offset + 1);
+        let frame_path = settings.output_path.join(file_name);
+        let file = File::create(&frame_path)?;
+        let writer = BufWriter::new(file);
+        let encoder = PngEncoder::new(writer);
+        encoder
+            .write_image(
+                &frame_buf,
+                settings.width,
+                settings.height,
+                ExtendedColorType::Rgba8,
+            )
+            .map_err(|err| ExportError::ImageEncode(err.to_string()))?;
+
+        on_progress(ExportProgress {
+            completed_frames: (offset as u32) + 1,
+            total_frames,
+            frame_index,
+        });
+    }
+
+    Ok(ExportReport {
+        frames_exported: total_frames,
+        output_width: settings.width,
+        output_height: settings.height,
+        audio_samples_written: 0,
+        output_path: settings.output_path.clone(),
+    })
+}
+
+fn export_ffmpeg<F, P>(
+    settings: &ExportSettings,
+    audio_stereo: Option<&[[f32; 2]]>,
+    cancel: &Arc<AtomicBool>,
+    mut frame_provider: F,
+    mut on_progress: P,
+) -> Result<ExportReport, ExportError>
+where
+    F: FrameProvider,
+    P: FnMut(ExportProgress),
+{
+    let raw_bytes = checked_rgba_len(settings.width, settings.height)?;
+    let (enc_w, enc_h) = settings.padded_dimensions();
+    let needs_padding = enc_w != settings.width || enc_h != settings.height;
+    let padded_bytes = checked_rgba_len(enc_w, enc_h)?;
+
+    // Stage A: Write pre-mixed audio to an RAII-managed temp WAV file so video pipe
+    // and audio input can never deadlock on OS pipe buffers.
+    let (temp_audio_guard, audio_samples_written) = match audio_stereo {
+        Some(samples) if !samples.is_empty() && settings.audio_codec != AudioCodec::None => {
+            let guard = write_temp_stereo_wav_f32(samples, settings.sample_rate)?;
+            (Some(guard), samples.len())
+        }
+        _ => (None, 0),
+    };
+
+    if cancel.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
+
+    let args = build_ffmpeg_args(settings, temp_audio_guard.as_ref().map(|g| g.path()))?;
+    if let Some(parent) = settings.output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
+    let mut child = Command::new(bin)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                ExportError::FfmpegNotFound(bin.display().to_string())
+            } else {
+                ExportError::Io(err)
+            }
+        })?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdin")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr")))?;
+
+    let total_frames = settings.total_frames();
+
+    // Stage B: Stream frames over stdin while draining stderr concurrently on a scoped thread.
+    // Drop order on return OR panic: `stdin` drops first -> `child_guard` kills & reaps FFmpeg
+    // (closing FFmpeg's stderr pipe) -> `scope` joins `stderr_thread` cleanly with zero deadlock.
+    let result = std::thread::scope(|scope| -> Result<(), ExportError> {
+        let stderr_handle = scope.spawn(move || {
+            let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
+            ring.drain_reader(stderr);
+            ring.into_string_lossy()
+        });
+
+        let mut child_guard = ChildCleanupGuard::new(child);
+        let mut stdin_opt = Some(stdin);
+
+        let mut raw_frame = vec![0_u8; raw_bytes];
+        let mut padded_frame = if needs_padding {
+            vec![0_u8; padded_bytes]
+        } else {
+            Vec::new()
+        };
+
+        let mut broken_pipe = false;
+
+        for (offset, frame_index) in (settings.start_frame..settings.end_frame).enumerate() {
+            if cancel.load(Ordering::Acquire) {
+                drop(stdin_opt.take());
+                child_guard.kill_and_reap();
+                cleanup_partial_output(&settings.output_path);
+                return Err(ExportError::Cancelled);
+            }
+
+            if let Err(err) = frame_provider.render_frame(frame_index, &mut raw_frame) {
+                drop(stdin_opt.take());
+                child_guard.kill_and_reap();
+                cleanup_partial_output(&settings.output_path);
+                return Err(err);
+            }
+
+            if raw_frame.len() != raw_bytes {
+                drop(stdin_opt.take());
+                child_guard.kill_and_reap();
+                cleanup_partial_output(&settings.output_path);
+                return Err(ExportError::InvalidFrameSize {
+                    frame_index,
+                    expected: raw_bytes,
+                    actual: raw_frame.len(),
+                });
+            }
+
+            if cancel.load(Ordering::Acquire) {
+                drop(stdin_opt.take());
+                child_guard.kill_and_reap();
+                cleanup_partial_output(&settings.output_path);
+                return Err(ExportError::Cancelled);
+            }
+
+            let payload: &[u8] = if needs_padding {
+                pad_rgba_frame_into(
+                    &raw_frame,
+                    (settings.width, settings.height),
+                    (enc_w, enc_h),
+                    settings.transparent_alpha,
+                    &mut padded_frame,
+                )?;
+                &padded_frame
+            } else {
+                &raw_frame
+            };
+
+            if let Some(pipe) = stdin_opt.as_mut()
+                && let Err(err) = pipe.write_all(payload)
+            {
+                if err.kind() == ErrorKind::BrokenPipe {
+                    broken_pipe = true;
+                    break;
+                }
+                drop(stdin_opt.take());
+                child_guard.kill_and_reap();
+                cleanup_partial_output(&settings.output_path);
+                return Err(ExportError::Io(err));
+            }
+
+            on_progress(ExportProgress {
+                completed_frames: (offset as u32) + 1,
+                total_frames,
+                frame_index,
+            });
+        }
+
+        // Flush and close stdin so FFmpeg receives EOF and finishes muxing.
+        if let Some(mut pipe) = stdin_opt.take()
+            && !broken_pipe
+        {
+            let _ = pipe.flush();
+        }
+
+        if cancel.load(Ordering::Acquire) {
+            child_guard.kill_and_reap();
+            cleanup_partial_output(&settings.output_path);
+            return Err(ExportError::Cancelled);
+        }
+
+        let status = child_guard.wait()?;
+        let stderr_text = stderr_handle.join().unwrap_or_default();
+
+        if cancel.load(Ordering::Acquire) {
+            cleanup_partial_output(&settings.output_path);
+            return Err(ExportError::Cancelled);
+        }
+
+        if !status.success() {
+            cleanup_partial_output(&settings.output_path);
+            return Err(ExportError::FfmpegFailed {
+                exit_code: status.code(),
+                stderr: stderr_text,
+            });
+        }
+
+        Ok(())
+    });
+
+    // Explicitly keep `temp_audio_guard` alive until FFmpeg has completely exited, then drop it.
+    drop(temp_audio_guard);
+
+    result?;
+
+    Ok(ExportReport {
+        frames_exported: total_frames,
+        output_width: enc_w,
+        output_height: enc_h,
+        audio_samples_written,
+        output_path: settings.output_path.clone(),
+    })
+}
+
+fn checked_rgba_len(width: u32, height: u32) -> Result<usize, ExportError> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| ExportError::InvalidSettings("frame dimensions overflow RGBA size".into()))
+}
+
+fn cleanup_partial_output(path: &Path) {
+    if let Err(err) = fs::remove_file(path)
+        && err.kind() != ErrorKind::NotFound
+    {
+        tracing::warn!(
+            "failed to remove partial export output {}: {err}",
+            path.display()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::f64::consts::TAU;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+    use crate::ffmpeg::probe_ffmpeg;
+    use crate::settings::{QualityMode, VideoCodec};
+    use crate::temp_audio::TempFileGuard;
+
+    static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_test_path(name: &str) -> PathBuf {
+        let pid = std::process::id();
+        let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("zc_export_test_{pid}_{seq}_{nanos}_{name}"))
+    }
+
+    fn fill_synthetic_rgba(frame_idx: u32, width: u32, height: u32, buf: &mut [u8]) {
+        let shift = (frame_idx * 17) as u8;
+        for y in 0..height {
+            for x in 0..width {
+                let off = ((y * width + x) * 4) as usize;
+                buf[off] = ((x * 255 / width.max(1)) as u8).wrapping_add(shift);
+                buf[off + 1] = (y * 255 / height.max(1)) as u8;
+                buf[off + 2] = shift;
+                buf[off + 3] = 255;
+            }
+        }
+    }
+
+    #[test]
+    fn png_sequence_exports_directly_without_ffmpeg() {
+        let out_dir = unique_test_path("png_seq");
+        let settings = ExportSettings {
+            width: 32,
+            height: 24,
+            fps: 30.0,
+            start_frame: 0,
+            end_frame: 3,
+            container: ExportContainer::PngSequence,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::None,
+            quality: QualityMode::Crf(18),
+            audio_bitrate_kbps: 0,
+            sample_rate: 48_000,
+            transparent_alpha: true,
+            output_path: out_dir.clone(),
+            ffmpeg_binary: Some(PathBuf::from("/nonexistent/ffmpeg")),
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let report = export_video(&settings, None, &cancel, |frame_idx, buf: &mut Vec<u8>| {
+            fill_synthetic_rgba(frame_idx, 32, 24, buf);
+            Ok(())
+        })
+        .expect("PNG sequence export succeeds without FFmpeg");
+
+        assert_eq!(report.frames_exported, 3);
+        assert_eq!(report.output_width, 32);
+        assert_eq!(report.output_height, 24);
+
+        for i in 1..=3 {
+            let p = out_dir.join(format!("frame_{i:06}.png"));
+            let img = image::open(&p).expect("decode exported PNG").to_rgba8();
+            assert_eq!(img.dimensions(), (32, 24));
+        }
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn cancellation_stops_export_and_cleans_up_partial_files() {
+        let out_file = unique_test_path("cancelled.mp4");
+        let _cleanup = TempFileGuard::new(out_file.clone());
+
+        let settings = ExportSettings {
+            width: 64,
+            height: 64,
+            fps: 30.0,
+            start_frame: 0,
+            end_frame: 30,
+            container: ExportContainer::Mp4,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Aac,
+            quality: QualityMode::Crf(23),
+            audio_bitrate_kbps: 128,
+            sample_rate: 48_000,
+            transparent_alpha: false,
+            output_path: out_file.clone(),
+            ffmpeg_binary: None,
+        };
+
+        // Pre-set cancellation works even when FFmpeg is not installed.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = export_video(&settings, None, &cancel, |_idx: u32, _buf: &mut Vec<u8>| {
+            Ok(())
+        })
+        .expect_err("cancelled export must return Cancelled");
+        assert!(matches!(err, ExportError::Cancelled));
+        assert!(!out_file.exists());
+
+        // Mid-stream cancellation test when FFmpeg is present.
+        if probe_ffmpeg(None).is_ok() {
+            let cancel_mid = Arc::new(AtomicBool::new(false));
+            let cancel_trigger = Arc::clone(&cancel_mid);
+            let audio = vec![[0.1_f32, -0.1_f32]; 48_000];
+            let err = export_video(
+                &settings,
+                Some(&audio),
+                &cancel_mid,
+                move |frame_idx, buf: &mut Vec<u8>| {
+                    fill_synthetic_rgba(frame_idx, 64, 64, buf);
+                    if frame_idx == 2 {
+                        cancel_trigger.store(true, Ordering::Release);
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("mid-stream cancel must fail with Cancelled");
+
+            assert!(matches!(err, ExportError::Cancelled));
+            assert!(
+                !out_file.exists(),
+                "partial MP4 output must be deleted on cancel"
+            );
+        }
+    }
+
+    #[test]
+    fn end_to_end_ffmpeg_mp4_export_with_440hz_sine_audio() {
+        if probe_ffmpeg(None).is_err() {
+            // Skip cleanly on environments without FFmpeg installed.
+            return;
+        }
+
+        let out_mp4 = unique_test_path("e2e_160x90.mp4");
+        let _guard = TempFileGuard::new(out_mp4.clone());
+
+        let width = 160;
+        let height = 90;
+        let fps = 30.0;
+        let frames = 15_u32;
+        let sample_rate = 48_000_u32;
+
+        // 0.5 seconds of 440 Hz stereo sine wave
+        let total_samples = ((f64::from(frames) / fps) * f64::from(sample_rate)).floor() as usize;
+        let audio: Vec<[f32; 2]> = (0..total_samples)
+            .map(|i| {
+                let t = i as f64 / f64::from(sample_rate);
+                let s = (TAU * 440.0 * t).sin() as f32 * 0.4;
+                [s, s]
+            })
+            .collect();
+
+        let settings = ExportSettings {
+            width,
+            height,
+            fps,
+            start_frame: 0,
+            end_frame: frames,
+            container: ExportContainer::Mp4,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Aac,
+            quality: QualityMode::Crf(23),
+            audio_bitrate_kbps: 128,
+            sample_rate,
+            transparent_alpha: false,
+            output_path: out_mp4.clone(),
+            ffmpeg_binary: None,
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut seen_progress = 0_u32;
+        let report = export_video_with_progress(
+            &settings,
+            Some(&audio),
+            &cancel,
+            |frame_idx, buf: &mut Vec<u8>| {
+                fill_synthetic_rgba(frame_idx, width, height, buf);
+                Ok(())
+            },
+            |p| {
+                seen_progress = p.completed_frames;
+            },
+        )
+        .expect("end-to-end FFmpeg MP4 export succeeds");
+
+        assert_eq!(report.frames_exported, frames);
+        assert_eq!(seen_progress, frames);
+        assert_eq!(report.output_width, width);
+        assert_eq!(report.output_height, height);
+        assert_eq!(report.audio_samples_written, total_samples);
+
+        let meta = fs::metadata(&out_mp4).expect("output MP4 exists");
+        assert!(meta.len() > 1_000, "MP4 output should be non-empty");
+
+        // Verify stream metadata via ffprobe if available
+        if let Ok(probe_out) = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name,width,height",
+                "-of",
+                "default=noprint_wrappers=1",
+            ])
+            .arg(&out_mp4)
+            .output()
+            && probe_out.status.success()
+        {
+            let text = String::from_utf8_lossy(&probe_out.stdout);
+            assert!(
+                text.contains("codec_type=video"),
+                "missing video stream: {text}"
+            );
+            assert!(
+                text.contains("codec_type=audio"),
+                "missing audio stream: {text}"
+            );
+            assert!(text.contains("width=160"), "unexpected width: {text}");
+            assert!(text.contains("height=90"), "unexpected height: {text}");
+        }
+    }
+
+    #[test]
+    fn end_to_end_ffmpeg_odd_dimension_h264_pads_to_even() {
+        if probe_ffmpeg(None).is_err() {
+            return;
+        }
+
+        let out_mp4 = unique_test_path("e2e_odd_161x91.mp4");
+        let _guard = TempFileGuard::new(out_mp4.clone());
+
+        let settings = ExportSettings {
+            width: 161,
+            height: 91,
+            fps: 30.0,
+            start_frame: 0,
+            end_frame: 5,
+            container: ExportContainer::Mp4,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::None,
+            quality: QualityMode::Crf(23),
+            audio_bitrate_kbps: 0,
+            sample_rate: 48_000,
+            transparent_alpha: false,
+            output_path: out_mp4.clone(),
+            ffmpeg_binary: None,
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let report = export_video(&settings, None, &cancel, |frame_idx, buf: &mut Vec<u8>| {
+            fill_synthetic_rgba(frame_idx, 161, 91, buf);
+            Ok(())
+        })
+        .expect("odd-dimension H.264 export succeeds with 1px padding");
+
+        assert_eq!(report.output_width, 162);
+        assert_eq!(report.output_height, 92);
+        assert!(fs::metadata(&out_mp4).expect("output exists").len() > 256);
+
+        if let Ok(probe_out) = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "default=noprint_wrappers=1",
+            ])
+            .arg(&out_mp4)
+            .output()
+            && probe_out.status.success()
+        {
+            let text = String::from_utf8_lossy(&probe_out.stdout);
+            assert!(
+                text.contains("width=162"),
+                "expected padded width=162: {text}"
+            );
+            assert!(
+                text.contains("height=92"),
+                "expected padded height=92: {text}"
+            );
+        }
+    }
+}

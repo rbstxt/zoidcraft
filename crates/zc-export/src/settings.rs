@@ -1,0 +1,265 @@
+//! Export container, codec, quality settings, progress/report structs, and [`FrameProvider`] trait.
+
+use std::path::PathBuf;
+
+use crate::ExportError;
+use crate::padding::even_padded_dimensions;
+
+/// Output container format for an export job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportContainer {
+    /// MPEG-4 Part 14 (`.mp4`).
+    Mp4,
+    /// WebM (`.webm`).
+    Webm,
+    /// Matroska (`.mkv`).
+    Mkv,
+    /// Directory of RGBA8 PNG frames (`frame_000001.png`, ...), exported directly without FFmpeg.
+    PngSequence,
+}
+
+/// Video codec selection for FFmpeg-backed containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    /// H.264 / AVC (`libx264`).
+    H264,
+    /// H.265 / HEVC (`libx265`).
+    H265,
+    /// VP9 (`libvpx-vp9`, supports `yuva420p` alpha).
+    Vp9,
+    /// VP8 (`libvpx`).
+    Vp8,
+    /// AV1 (`libsvtav1`).
+    Av1,
+}
+
+/// Audio codec selection for FFmpeg-backed containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioCodec {
+    /// AAC-LC (`aac`).
+    Aac,
+    /// Opus (`libopus`).
+    Opus,
+    /// Uncompressed 16-bit PCM (`pcm_s16le`).
+    Pcm,
+    /// Omit audio track (`-an`).
+    None,
+}
+
+/// Video rate-control mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityMode {
+    /// Constant Rate Factor (`0..=51` for H.264/H.265, `0..=63` for VP8/VP9/AV1).
+    Crf(u8),
+    /// Target average video bitrate in kilobits per second.
+    BitrateKbps(u32),
+}
+
+/// Complete configuration for an export job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportSettings {
+    /// Logical rendered frame width in pixels.
+    pub width: u32,
+    /// Logical rendered frame height in pixels.
+    pub height: u32,
+    /// Output frame rate in frames per second.
+    pub fps: f64,
+    /// Inclusive starting frame index.
+    pub start_frame: u32,
+    /// Exclusive ending frame index (`total_frames = end_frame - start_frame`).
+    pub end_frame: u32,
+    /// Output container format.
+    pub container: ExportContainer,
+    /// Video codec (ignored for [`ExportContainer::PngSequence`]).
+    pub video_codec: VideoCodec,
+    /// Audio codec (ignored for [`ExportContainer::PngSequence`]).
+    pub audio_codec: AudioCodec,
+    /// Video quality or bitrate control.
+    pub quality: QualityMode,
+    /// Lossy audio bitrate in kbps (e.g. `192`). Ignored for PCM/None.
+    pub audio_bitrate_kbps: u32,
+    /// Audio sample rate in Hz (typically `48_000` or `44_100`).
+    pub sample_rate: u32,
+    /// Whether to preserve transparent alpha (`yuva420p` for VP9, RGBA8 for PNG sequence).
+    pub transparent_alpha: bool,
+    /// Output video file path (or destination directory for [`ExportContainer::PngSequence`]).
+    pub output_path: PathBuf,
+    /// Optional explicit path to the `ffmpeg` executable (defaults to `ffmpeg` on `PATH`).
+    pub ffmpeg_binary: Option<PathBuf>,
+}
+
+impl ExportSettings {
+    /// Returns the total number of frames to export (`end_frame - start_frame`).
+    #[must_use]
+    pub const fn total_frames(&self) -> u32 {
+        self.end_frame.saturating_sub(self.start_frame)
+    }
+
+    /// Returns `true` when the selected container/codec requires even width and height (4:2:0).
+    #[must_use]
+    pub const fn requires_even_dimensions(&self) -> bool {
+        !matches!(self.container, ExportContainer::PngSequence)
+            && matches!(
+                self.video_codec,
+                VideoCodec::H264
+                    | VideoCodec::H265
+                    | VideoCodec::Vp9
+                    | VideoCodec::Vp8
+                    | VideoCodec::Av1
+            )
+    }
+
+    /// Returns the encoded output dimensions after odd-dimension 1px right/bottom padding.
+    #[must_use]
+    pub const fn padded_dimensions(&self) -> (u32, u32) {
+        if self.requires_even_dimensions() {
+            even_padded_dimensions(self.width, self.height)
+        } else {
+            (self.width, self.height)
+        }
+    }
+
+    /// Validates settings for internal consistency and container/codec compatibility.
+    pub fn validate(&self) -> Result<(), ExportError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(ExportError::InvalidSettings(
+                "width and height must be non-zero".to_string(),
+            ));
+        }
+        if !self.fps.is_finite() || self.fps <= 0.0 {
+            return Err(ExportError::InvalidSettings(
+                "fps must be finite and greater than zero".to_string(),
+            ));
+        }
+        if self.end_frame <= self.start_frame {
+            return Err(ExportError::InvalidSettings(format!(
+                "end_frame ({}) must be greater than start_frame ({})",
+                self.end_frame, self.start_frame
+            )));
+        }
+        if self.output_path.as_os_str().is_empty() {
+            return Err(ExportError::InvalidSettings(
+                "output_path must not be empty".to_string(),
+            ));
+        }
+
+        if matches!(self.container, ExportContainer::PngSequence) {
+            return Ok(());
+        }
+
+        if let QualityMode::BitrateKbps(kbps) = self.quality
+            && kbps == 0
+        {
+            return Err(ExportError::InvalidSettings(
+                "video bitrate must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.audio_codec != AudioCodec::None && self.sample_rate == 0 {
+            return Err(ExportError::InvalidSettings(
+                "sample_rate must be greater than zero when audio is enabled".to_string(),
+            ));
+        }
+
+        if matches!(self.audio_codec, AudioCodec::Aac | AudioCodec::Opus)
+            && self.audio_bitrate_kbps == 0
+        {
+            return Err(ExportError::InvalidSettings(
+                "audio_bitrate_kbps must be greater than zero for lossy audio codecs".to_string(),
+            ));
+        }
+
+        if self.transparent_alpha && self.video_codec != VideoCodec::Vp9 {
+            return Err(ExportError::InvalidSettings(format!(
+                "transparent_alpha is only supported for PngSequence or VP9 (WebM/MKV), not {:?}",
+                self.video_codec
+            )));
+        }
+
+        match self.container {
+            ExportContainer::Webm => {
+                if !matches!(
+                    self.video_codec,
+                    VideoCodec::Vp8 | VideoCodec::Vp9 | VideoCodec::Av1
+                ) {
+                    return Err(ExportError::InvalidSettings(format!(
+                        "WebM container does not support video codec {:?}",
+                        self.video_codec
+                    )));
+                }
+                if !matches!(self.audio_codec, AudioCodec::Opus | AudioCodec::None) {
+                    return Err(ExportError::InvalidSettings(format!(
+                        "WebM container requires Opus or None audio, not {:?}",
+                        self.audio_codec
+                    )));
+                }
+            }
+            ExportContainer::Mp4 => {
+                if self.transparent_alpha {
+                    return Err(ExportError::InvalidSettings(
+                        "MP4 container does not support transparent_alpha".to_string(),
+                    ));
+                }
+                if self.video_codec == VideoCodec::Vp8 {
+                    return Err(ExportError::InvalidSettings(
+                        "MP4 container does not support VP8 video".to_string(),
+                    ));
+                }
+                if self.audio_codec == AudioCodec::Pcm {
+                    return Err(ExportError::InvalidSettings(
+                        "MP4 container does not support raw PCM audio".to_string(),
+                    ));
+                }
+            }
+            ExportContainer::Mkv | ExportContainer::PngSequence => {}
+        }
+
+        Ok(())
+    }
+}
+
+/// Progress snapshot reported after each exported frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportProgress {
+    /// 1-based count of frames exported so far.
+    pub completed_frames: u32,
+    /// Total frames scheduled for export.
+    pub total_frames: u32,
+    /// Timeline frame index that just completed.
+    pub frame_index: u32,
+}
+
+/// Summary returned after a successful export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportReport {
+    /// Number of frames written.
+    pub frames_exported: u32,
+    /// Final encoded width (including any 1px odd-dimension padding).
+    pub output_width: u32,
+    /// Final encoded height (including any 1px odd-dimension padding).
+    pub output_height: u32,
+    /// Number of stereo audio sample frames muxed (`0` if silent/video-only).
+    pub audio_samples_written: usize,
+    /// Path to the output file or PNG sequence directory.
+    pub output_path: PathBuf,
+}
+
+/// Supplies tightly packed top-down RGBA8 frames into a caller-reused buffer.
+pub trait FrameProvider {
+    /// Renders `frame_index` into `rgba_out` (already sized to `width * height * 4`).
+    fn render_frame(&mut self, frame_index: u32, rgba_out: &mut Vec<u8>)
+    -> Result<(), ExportError>;
+}
+
+impl<F> FrameProvider for F
+where
+    F: FnMut(u32, &mut Vec<u8>) -> Result<(), ExportError>,
+{
+    fn render_frame(
+        &mut self,
+        frame_index: u32,
+        rgba_out: &mut Vec<u8>,
+    ) -> Result<(), ExportError> {
+        self(frame_index, rgba_out)
+    }
+}
