@@ -553,39 +553,45 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_escape(&mut self, start: usize) -> Result<char, ExprError> {
-        let Some(esc) = self.bump() else {
+        if self.pos >= self.bytes.len() {
             return Err(ExprError::SyntaxError {
                 offset: start,
                 message: "unterminated escape sequence".to_string(),
             });
-        };
+        }
+        let esc = self.next_utf8_char(start)?;
         match esc {
-            b'n' => Ok('\n'),
-            b'r' => Ok('\r'),
-            b't' => Ok('\t'),
-            b'b' => Ok('\u{0008}'),
-            b'f' => Ok('\u{000C}'),
-            b'0' => Ok('\0'),
-            b'\\' => Ok('\\'),
-            b'\'' => Ok('\''),
-            b'"' => Ok('"'),
-            b'`' => Ok('`'),
-            b'$' => Ok('$'),
-            b'x' => {
+            'n' => Ok('\n'),
+            'r' => Ok('\r'),
+            't' => Ok('\t'),
+            'b' => Ok('\u{0008}'),
+            'f' => Ok('\u{000C}'),
+            '0' => Ok('\0'),
+            '\\' => Ok('\\'),
+            '\'' => Ok('\''),
+            '"' => Ok('"'),
+            '`' => Ok('`'),
+            '$' => Ok('$'),
+            'x' => {
                 let code = self.read_hex_digits(2, start)?;
                 char::from_u32(code).ok_or_else(|| ExprError::SyntaxError {
                     offset: start,
                     message: "invalid hex escape".to_string(),
                 })
             }
-            b'u' => {
+            'u' => {
                 if self.peek() == Some(b'{') {
                     self.pos += 1;
                     let hex_start = self.pos;
                     while self.peek().is_some_and(|c| c != b'}') {
                         self.pos += 1;
                     }
-                    let hex = &self.src[hex_start..self.pos];
+                    let Some(hex) = self.src.get(hex_start..self.pos) else {
+                        return Err(ExprError::SyntaxError {
+                            offset: start,
+                            message: "invalid unicode escape".to_string(),
+                        });
+                    };
                     if self.bump() != Some(b'}') || hex.is_empty() {
                         return Err(ExprError::SyntaxError {
                             offset: start,
@@ -609,19 +615,30 @@ impl<'a> Lexer<'a> {
                     })
                 }
             }
-            other => Ok(other as char),
+            other => Ok(other),
         }
     }
 
     fn read_hex_digits(&mut self, count: usize, start: usize) -> Result<u32, ExprError> {
-        if self.pos + count > self.bytes.len() {
+        let Some(end) = self.pos.checked_add(count) else {
+            return Err(ExprError::SyntaxError {
+                offset: start,
+                message: "incomplete hex escape".to_string(),
+            });
+        };
+        if end > self.bytes.len() {
             return Err(ExprError::SyntaxError {
                 offset: start,
                 message: "incomplete hex escape".to_string(),
             });
         }
-        let slice = &self.src[self.pos..self.pos + count];
-        self.pos += count;
+        let Some(slice) = self.src.get(self.pos..end) else {
+            return Err(ExprError::SyntaxError {
+                offset: start,
+                message: "invalid hex escape".to_string(),
+            });
+        };
+        self.pos = end;
         u32::from_str_radix(slice, 16).map_err(|_| ExprError::SyntaxError {
             offset: start,
             message: "invalid hex escape".to_string(),

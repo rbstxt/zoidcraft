@@ -489,4 +489,32 @@ fn rejects_string_repeat_concat_array_and_dag_export_memory_bombs() {
     let vt = eval("+\"\\u000B5\"", &ctx, &cfg)
         .expect("vertical-tab ASCII numeric coercion should succeed");
     assert_eq!(vt, zc_expr::Value::Number(5.0));
+
+    // 29. Catching errors from calling an unknown huge Math[...] method must truncate the
+    // diagnostic and charge caught error message allocations (no 4 GB OOM).
+    let catch_t0 = std::time::Instant::now();
+    let res = eval(
+        r#"var f = Math["x".repeat(10000).repeat(400)]; var c = 0; for (var i = 0; i < 1000; i++) { try { f(); } catch (e) { if (e.message.length < 256) c++; } } c"#,
+        &ctx,
+        &cfg,
+    )
+    .expect("caught truncated Math[...] errors should stay bounded and complete cleanly");
+    assert_eq!(res, zc_expr::Value::Number(1000.0));
+    assert!(
+        catch_t0.elapsed() < std::time::Duration::from_secs(5),
+        "caught Math[...] error loop took too long: {:?}",
+        catch_t0.elapsed()
+    );
+
+    // 30. Malformed hex/unicode escapes cutting across multi-byte UTF-8 characters must return
+    // SyntaxError cleanly without panicking, and escaped multibyte chars must parse cleanly.
+    for bad in ["+\"\\x0あ\"", "\"\\u00あ\""] {
+        let err = eval(bad, &ctx, &cfg).expect_err("malformed multibyte escape must fail");
+        assert!(
+            matches!(err, ExprError::SyntaxError { .. }),
+            "expected SyntaxError for {bad}, got {err:?}"
+        );
+    }
+    let mb_esc = eval("\"\\あ\"", &ctx, &cfg).expect("escaped multibyte char should not panic");
+    assert_eq!(mb_esc, zc_expr::Value::String("あ".to_string()));
 }

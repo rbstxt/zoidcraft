@@ -1488,10 +1488,13 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 if let Some(catch_body) = &try_stmt.catch_body {
                     let catch_env = self.push_env(Some(env))?;
                     if let Some(pat) = &try_stmt.catch_param {
+                        let msg = err.to_string();
+                        self.check_string_alloc(msg.len())?;
+                        self.charge_alloc_bytes(ARRAY_ELEM_BUDGET_BYTES)?;
                         let mut err_obj = BTreeMap::new();
                         err_obj.insert(
                             "message".to_string(),
-                            RuntimeValue::String(JsStr::from(err.to_string())),
+                            RuntimeValue::String(JsStr::from(msg)),
                         );
                         let err_val = self.alloc_object(err_obj);
                         self.bind_pattern(pat, err_val, catch_env, VarKind::Let)?;
@@ -2359,7 +2362,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
 
         match obj {
             RuntimeValue::Null | RuntimeValue::Undefined => Err(ExprError::TypeError(format!(
-                "cannot read property '{prop}' of null or undefined"
+                "cannot read property '{}' of null or undefined",
+                truncate_diag(prop)
             ))),
             RuntimeValue::Namespace(NamespaceKind::Math) => {
                 if prop == "random" {
@@ -2899,7 +2903,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 match eval_math_fn(method, &nums)? {
                     Some(v) => Ok(RuntimeValue::Number(v)),
                     None => Err(ExprError::TypeError(format!(
-                        "Math.{method} is not a function"
+                        "Math.{} is not a function",
+                        truncate_diag(method)
                     ))),
                 }
             }
@@ -2940,7 +2945,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     Ok(self.alloc_array(items))
                 }
                 _ => Err(ExprError::TypeError(format!(
-                    "Array.{method} is not a function"
+                    "Array.{} is not a function",
+                    truncate_diag(method)
                 ))),
             },
             NamespaceKind::Number => match method {
@@ -2984,7 +2990,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     Ok(RuntimeValue::Number(js_parse_int(&s, radix)))
                 }
                 _ => Err(ExprError::TypeError(format!(
-                    "Number.{method} is not a function"
+                    "Number.{} is not a function",
+                    truncate_diag(method)
                 ))),
             },
             NamespaceKind::String => match method {
@@ -3000,7 +3007,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     Ok(RuntimeValue::String(JsStr::from(out)))
                 }
                 _ => Err(ExprError::TypeError(format!(
-                    "String.{method} is not a function"
+                    "String.{} is not a function",
+                    truncate_diag(method)
                 ))),
             },
             NamespaceKind::Object => match method {
@@ -3119,7 +3127,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     Ok(RuntimeValue::Object(tid))
                 }
                 _ => Err(ExprError::TypeError(format!(
-                    "Object.{method} is not a function"
+                    "Object.{} is not a function",
+                    truncate_diag(method)
                 ))),
             },
             NamespaceKind::Json => match method {
@@ -3151,11 +3160,13 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     self.intern_value(parsed)
                 }
                 _ => Err(ExprError::TypeError(format!(
-                    "JSON.{method} is not a function"
+                    "JSON.{} is not a function",
+                    truncate_diag(method)
                 ))),
             },
             NamespaceKind::Boolean => Err(ExprError::TypeError(format!(
-                "Boolean.{method} is not a function"
+                "Boolean.{} is not a function",
+                truncate_diag(method)
             ))),
         }
     }
@@ -4250,7 +4261,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 let out = self.ctx.from_screen(None, pt)?;
                 self.alloc_f64_vec(out.to_vec())
             }
-            _ => Err(ExprError::ReferenceError(name.to_string())),
+            _ => Err(ExprError::ReferenceError(truncate_diag(name).into_owned())),
         }
     }
 
@@ -4491,6 +4502,18 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             None => Ok(Value::Number(0.0)),
         }
     }
+}
+
+fn truncate_diag(s: &str) -> std::borrow::Cow<'_, str> {
+    const MAX_DIAG_NAME_BYTES: usize = 128;
+    if s.len() <= MAX_DIAG_NAME_BYTES {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut end = MAX_DIAG_NAME_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}...", &s[..end]))
 }
 
 fn is_catchable_error(err: &ExprError) -> bool {
