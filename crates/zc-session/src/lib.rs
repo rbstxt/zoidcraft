@@ -1,6 +1,10 @@
+#![forbid(unsafe_code)]
+
 pub mod commands;
 pub mod control;
 pub mod history;
+mod plugin_defaults;
+mod pro_commands;
 pub mod selection;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-pub use commands::{Command, CommandMeta, CommandRegistry};
+pub use commands::{ClipSnapshot, Command, CommandMeta, CommandRegistry};
 pub use control::{
     ControlError, ControlRequest, ControlResponse, ControlTarget, dispatch_json_line,
     dispatch_json_line_str, dispatch_json_lines, dispatch_request,
@@ -21,6 +25,21 @@ pub use history::{
 pub use selection::{
     KeyframeRef, PlaybackState, SelectionDomain, SelectionError, SelectionState,
     TIME_FORMAT_FRAME_NUMBER, TIME_FORMAT_TIMECODE_FRAMES, TIME_FORMAT_TIMECODE_MS,
+};
+
+use plugin_defaults::{
+    PBR_PLUS_SURFACE_KEYS, canonicalize_object_3d_kind, default_particles_data,
+    default_shape2d_rectangle_path, insert_default_expresstext_properties,
+    insert_default_optical_flare_properties, insert_default_repeater_properties,
+    insert_default_text_plus_properties, insert_default_trapcode_properties,
+    is_3d_camera_plus_kind, is_3d_container_kind, is_3d_expresstext_plus_kind,
+    is_3d_light_plus_kind, is_3d_optical_flare_kind, is_3d_repeater_kind, is_3d_text_plus_kind,
+    is_3d_trapcode_kind, is_core_object_3d_property, plugin_light_kind,
+    preserved_value_to_session_property, session_property_to_preserved_value,
+    uses_preserved_plugin_properties,
+};
+use pro_commands::{
+    clone_layer_masks_shifted, scale_property_track_keyframes, shift_property_track_keyframes,
 };
 
 /// Errors returned by [`Session::execute`] and transaction helpers.
@@ -338,6 +357,10 @@ pub struct SessionDocument {
     pub video_tracks: Vec<SessionTrack>,
     pub audio_tracks: Vec<SessionTrack>,
     pub sequence_properties: BTreeMap<String, SessionProperty>,
+    /// Active Precomp+ composition UUID (`None` edits the root `project.sequence`;
+    /// `Some(id)` edits `project.compositions[&id]` in place).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_composition_id: Option<zc_project::Uuid>,
     /// Preserves the declaration order and original `SequenceControl::id` for each `ctl_*`
     /// entry in `sequence_properties` so duplicate-named controls never collide or reorder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -843,32 +866,31 @@ fn object_3d_kind_to_str(kind: &zc_project::Object3DKind) -> String {
             zc_project::Shape3DKind::CustomGeometry { .. } => "custom".to_string(),
             zc_project::Shape3DKind::Cone { .. } => "zoidium:geometry-plus/cone".to_string(),
             zc_project::Shape3DKind::RoundedBox { .. } => {
-                "zoidium:geometry-plus/rounded_box".to_string()
+                "zoidium:geometry-plus/rounded-box".to_string()
             }
-            zc_project::Shape3DKind::Tetrahedron { .. } => {
-                "zoidium:geometry-plus/tetrahedron".to_string()
-            }
-            zc_project::Shape3DKind::Octahedron { .. } => {
-                "zoidium:geometry-plus/octahedron".to_string()
-            }
-            zc_project::Shape3DKind::Dodecahedron { .. } => {
-                "zoidium:geometry-plus/dodecahedron".to_string()
-            }
-            zc_project::Shape3DKind::Icosahedron { .. } => {
-                "zoidium:geometry-plus/icosahedron".to_string()
+            zc_project::Shape3DKind::Tetrahedron { .. }
+            | zc_project::Shape3DKind::Octahedron { .. }
+            | zc_project::Shape3DKind::Dodecahedron { .. }
+            | zc_project::Shape3DKind::Icosahedron { .. } => {
+                "zoidium:geometry-plus/polyhedron".to_string()
             }
             zc_project::Shape3DKind::Capsule { .. } => "zoidium:geometry-plus/capsule".to_string(),
             zc_project::Shape3DKind::TorusKnot { .. } => {
-                "zoidium:geometry-plus/torus_knot".to_string()
+                "zoidium:geometry-plus/torus-knot".to_string()
             }
+            zc_project::Shape3DKind::Tube { .. } => "zoidium:geometry-plus/tube".to_string(),
+            zc_project::Shape3DKind::Gear { .. } => "zoidium:geometry-plus/gear".to_string(),
+            zc_project::Shape3DKind::Helix { .. } => "zoidium:geometry-plus/helix".to_string(),
+            zc_project::Shape3DKind::Spline { .. } => "zoidium:geometry-plus/spline".to_string(),
         },
         zc_project::Object3DKind::Light(_) => "light".to_string(),
         zc_project::Object3DKind::Camera(_) => "camera".to_string(),
         zc_project::Object3DKind::Particles(_) => "particles".to_string(),
         zc_project::Object3DKind::Model(_) => "model".to_string(),
-        zc_project::Object3DKind::Dummy { original_type, .. } => {
-            original_type.clone().unwrap_or_else(|| "dummy".to_string())
-        }
+        zc_project::Object3DKind::Dummy { original_type, .. } => original_type
+            .as_deref()
+            .map(|raw| canonicalize_object_3d_kind(raw).0)
+            .unwrap_or_else(|| "dummy".to_string()),
     }
 }
 
@@ -891,395 +913,252 @@ fn export_material_to_session(
     mat: &zc_project::MaterialSpec,
     properties: &mut BTreeMap<String, SessionProperty>,
 ) {
+    export_material_to_session_with_prefix(mat, "material.", properties);
+}
+
+fn export_material_to_session_with_prefix(
+    mat: &zc_project::MaterialSpec,
+    prefix: &str,
+    properties: &mut BTreeMap<String, SessionProperty>,
+) {
+    let k = |suffix: &str| format!("{prefix}{suffix}");
     if let Some(idx) = material_type_index(mat) {
-        properties.insert(
-            "material.type".to_string(),
-            SessionProperty::static_value(json!(idx)),
-        );
+        properties.insert(k("type"), SessionProperty::static_value(json!(idx)));
     }
     match mat {
         zc_project::MaterialSpec::SingleColor { color, side } => {
-            properties.insert(
-                "material.color".to_string(),
-                property_track_to_session(color),
-            );
-            properties.insert(
-                "material.side".to_string(),
-                SessionProperty::static_value(json!(*side)),
-            );
-            properties.insert(
-                "material.roughness".to_string(),
-                SessionProperty::static_value(json!(0.5)),
-            );
-            properties.insert(
-                "material.metalness".to_string(),
-                SessionProperty::static_value(json!(0.0)),
-            );
-            properties.insert(
-                "material.opacity".to_string(),
-                SessionProperty::static_value(json!(1.0)),
-            );
+            properties.insert(k("color"), property_track_to_session(color));
+            properties.insert(k("side"), SessionProperty::static_value(json!(*side)));
+            properties.insert(k("roughness"), SessionProperty::static_value(json!(0.5)));
+            properties.insert(k("metalness"), SessionProperty::static_value(json!(0.0)));
+            properties.insert(k("opacity"), SessionProperty::static_value(json!(1.0)));
         }
         zc_project::MaterialSpec::CustomPbr(pbr) => {
+            properties.insert(k("color"), property_track_to_session(&pbr.color));
+            properties.insert(k("emissive"), property_track_to_session(&pbr.emissive));
+            properties.insert(k("roughness"), property_track_to_session(&pbr.roughness));
+            properties.insert(k("metalness"), property_track_to_session(&pbr.metalness));
+            properties.insert(k("opacity"), property_track_to_session(&pbr.opacity));
             properties.insert(
-                "material.color".to_string(),
-                property_track_to_session(&pbr.color),
-            );
-            properties.insert(
-                "material.emissive".to_string(),
-                property_track_to_session(&pbr.emissive),
-            );
-            properties.insert(
-                "material.roughness".to_string(),
-                property_track_to_session(&pbr.roughness),
-            );
-            properties.insert(
-                "material.metalness".to_string(),
-                property_track_to_session(&pbr.metalness),
-            );
-            properties.insert(
-                "material.opacity".to_string(),
-                property_track_to_session(&pbr.opacity),
-            );
-            properties.insert(
-                "material.transparent".to_string(),
+                k("transparent"),
                 SessionProperty::static_value(json!(u32::from(pbr.transparent))),
             );
             properties.insert(
-                "material.blending".to_string(),
+                k("blending"),
                 SessionProperty::static_value(json!(pbr.blending)),
             );
-            properties.insert(
-                "material.side".to_string(),
-                SessionProperty::static_value(json!(pbr.side)),
-            );
+            properties.insert(k("side"), SessionProperty::static_value(json!(pbr.side)));
             if let Some(tex) = &pbr.texture {
-                properties.insert(
-                    "material.texture".to_string(),
-                    SessionProperty::static_value(json!(tex)),
-                );
+                properties.insert(k("texture"), SessionProperty::static_value(json!(tex)));
             }
             if let Some(nm) = &pbr.normal_map {
-                properties.insert(
-                    "material.normalMap".to_string(),
-                    SessionProperty::static_value(json!(nm)),
-                );
+                properties.insert(k("normalMap"), SessionProperty::static_value(json!(nm)));
             }
             properties.insert(
-                "material.normalScale".to_string(),
+                k("normalScale"),
                 SessionProperty::static_value(json!(pbr.normal_scale)),
             );
+            properties.insert(k("wrap"), SessionProperty::static_value(json!(pbr.wrap)));
+            properties.insert(k("repeat"), property_track_to_session(&pbr.repeat));
+            properties.insert(k("offset"), property_track_to_session(&pbr.offset));
+            properties.insert(k("center"), property_track_to_session(&pbr.center));
+            properties.insert(k("rotation"), property_track_to_session(&pbr.rotation));
             properties.insert(
-                "material.wrap".to_string(),
-                SessionProperty::static_value(json!(pbr.wrap)),
-            );
-            properties.insert(
-                "material.repeat".to_string(),
-                property_track_to_session(&pbr.repeat),
-            );
-            properties.insert(
-                "material.offset".to_string(),
-                property_track_to_session(&pbr.offset),
-            );
-            properties.insert(
-                "material.center".to_string(),
-                property_track_to_session(&pbr.center),
-            );
-            properties.insert(
-                "material.rotation".to_string(),
-                property_track_to_session(&pbr.rotation),
-            );
-            properties.insert(
-                "material.reflection".to_string(),
+                k("reflection"),
                 SessionProperty::static_value(json!(u32::from(pbr.reflection))),
+            );
+            properties.insert(
+                k("uvNormalized"),
+                SessionProperty::static_value_with_kind(
+                    json!(u32::from(pbr.uv_normalized)),
+                    SessionValueKind::Option,
+                ),
             );
         }
         zc_project::MaterialSpec::PbrPlus(pbr) => {
+            properties.insert(k("color"), property_track_to_session(&pbr.base_color));
+            properties.insert(k("emissive"), property_track_to_session(&pbr.emissive));
+            properties.insert(k("roughness"), property_track_to_session(&pbr.roughness));
+            properties.insert(k("metalness"), property_track_to_session(&pbr.metalness));
+            properties.insert(k("opacity"), property_track_to_session(&pbr.opacity));
             properties.insert(
-                "material.color".to_string(),
-                property_track_to_session(&pbr.base_color),
-            );
-            properties.insert(
-                "material.emissive".to_string(),
-                property_track_to_session(&pbr.emissive),
-            );
-            properties.insert(
-                "material.roughness".to_string(),
-                property_track_to_session(&pbr.roughness),
-            );
-            properties.insert(
-                "material.metalness".to_string(),
-                property_track_to_session(&pbr.metalness),
-            );
-            properties.insert(
-                "material.opacity".to_string(),
-                property_track_to_session(&pbr.opacity),
-            );
-            properties.insert(
-                "material.transparent".to_string(),
+                k("transparent"),
                 SessionProperty::static_value(json!(u32::from(pbr.transparent))),
             );
             properties.insert(
-                "material.blending".to_string(),
+                k("blending"),
                 SessionProperty::static_value(json!(pbr.blending)),
             );
-            properties.insert(
-                "material.side".to_string(),
-                SessionProperty::static_value(json!(pbr.side)),
-            );
+            properties.insert(k("side"), SessionProperty::static_value(json!(pbr.side)));
             if let Some(tex) = &pbr.base_color_map {
-                properties.insert(
-                    "material.texture".to_string(),
-                    SessionProperty::static_value(json!(tex)),
-                );
+                properties.insert(k("texture"), SessionProperty::static_value(json!(tex)));
             }
             if let Some(m) = &pbr.emissive_map {
-                properties.insert(
-                    "material.emissiveMap".to_string(),
-                    SessionProperty::static_value(json!(m)),
-                );
+                properties.insert(k("emissiveMap"), SessionProperty::static_value(json!(m)));
             }
             if let Some(m) = &pbr.roughness_map {
-                properties.insert(
-                    "material.roughnessMap".to_string(),
-                    SessionProperty::static_value(json!(m)),
-                );
+                properties.insert(k("roughnessMap"), SessionProperty::static_value(json!(m)));
             }
             if let Some(m) = &pbr.metalness_map {
-                properties.insert(
-                    "material.metalnessMap".to_string(),
-                    SessionProperty::static_value(json!(m)),
-                );
+                properties.insert(k("metalnessMap"), SessionProperty::static_value(json!(m)));
             }
             if let Some(m) = &pbr.normal_map {
-                properties.insert(
-                    "material.normalMap".to_string(),
-                    SessionProperty::static_value(json!(m)),
-                );
+                properties.insert(k("normalMap"), SessionProperty::static_value(json!(m)));
             }
             if let Some(tr) = &pbr.normal_scale_track {
-                properties.insert(
-                    "material.normalScale".to_string(),
-                    property_track_to_session(tr),
-                );
+                properties.insert(k("normalScale"), property_track_to_session(tr));
             } else {
                 properties.insert(
-                    "material.normalScale".to_string(),
+                    k("normalScale"),
                     SessionProperty::static_value(json!(pbr.normal_scale)),
                 );
             }
             if let Some(m) = &pbr.alpha_map {
-                properties.insert(
-                    "material.alphaMap".to_string(),
-                    SessionProperty::static_value(json!(m)),
-                );
+                properties.insert(k("alphaMap"), SessionProperty::static_value(json!(m)));
             }
             if let Some(m) = &pbr.ao_texture {
-                properties.insert(
-                    "material.aoMap".to_string(),
-                    SessionProperty::static_value(json!(m)),
-                );
+                properties.insert(k("aoTexture"), SessionProperty::static_value(json!(m)));
+                properties.insert(k("aoMap"), SessionProperty::static_value(json!(m)));
             }
             properties.insert(
-                "material.emissiveIntensity".to_string(),
+                k("emissiveIntensity"),
                 property_track_to_session(&pbr.emissive_intensity),
             );
             properties.insert(
-                "material.alphaTest".to_string(),
+                k("alphaTest"),
                 SessionProperty::static_value(json!(pbr.alpha_test)),
             );
             properties.insert(
-                "material.reflection".to_string(),
+                k("reflection"),
                 SessionProperty::static_value(json!(u32::from(pbr.reflection))),
             );
-            properties.insert(
-                "material.wrap".to_string(),
-                SessionProperty::static_value(json!(pbr.wrap)),
-            );
-            properties.insert(
-                "material.repeat".to_string(),
-                property_track_to_session(&pbr.repeat),
-            );
-            properties.insert(
-                "material.offset".to_string(),
-                property_track_to_session(&pbr.offset),
-            );
-            properties.insert(
-                "material.center".to_string(),
-                property_track_to_session(&pbr.center),
-            );
-            properties.insert(
-                "material.rotation".to_string(),
-                property_track_to_session(&pbr.rotation),
-            );
+            properties.insert(k("wrap"), SessionProperty::static_value(json!(pbr.wrap)));
+            properties.insert(k("repeat"), property_track_to_session(&pbr.repeat));
+            properties.insert(k("offset"), property_track_to_session(&pbr.offset));
+            properties.insert(k("center"), property_track_to_session(&pbr.center));
+            properties.insert(k("rotation"), property_track_to_session(&pbr.rotation));
             if let Some(tr) = &pbr.reflection_intensity_track {
-                properties.insert(
-                    "material.reflectionIntensity".to_string(),
-                    property_track_to_session(tr),
-                );
+                properties.insert(k("reflectionIntensity"), property_track_to_session(tr));
             } else {
                 properties.insert(
-                    "material.reflectionIntensity".to_string(),
+                    k("reflectionIntensity"),
                     SessionProperty::static_value(json!(pbr.reflection_intensity)),
                 );
+            }
+            for (pk, pv) in &pbr.preserved {
+                properties.insert(k(pk), preserved_value_to_session_property(pv));
             }
         }
         zc_project::MaterialSpec::Texture(tex) => {
             if let Some(t) = &tex.texture {
-                properties.insert(
-                    "material.texture".to_string(),
-                    SessionProperty::static_value(json!(t)),
-                );
+                properties.insert(k("texture"), SessionProperty::static_value(json!(t)));
             }
+            properties.insert(k("side"), SessionProperty::static_value(json!(tex.side)));
+            properties.insert(k("wrap"), SessionProperty::static_value(json!(tex.wrap)));
+            properties.insert(k("repeat"), property_track_to_session(&tex.repeat));
+            properties.insert(k("offset"), property_track_to_session(&tex.offset));
+            properties.insert(k("center"), property_track_to_session(&tex.center));
+            properties.insert(k("rotation"), property_track_to_session(&tex.rotation));
             properties.insert(
-                "material.side".to_string(),
-                SessionProperty::static_value(json!(tex.side)),
-            );
-            properties.insert(
-                "material.wrap".to_string(),
-                SessionProperty::static_value(json!(tex.wrap)),
-            );
-            properties.insert(
-                "material.repeat".to_string(),
-                property_track_to_session(&tex.repeat),
-            );
-            properties.insert(
-                "material.offset".to_string(),
-                property_track_to_session(&tex.offset),
-            );
-            properties.insert(
-                "material.center".to_string(),
-                property_track_to_session(&tex.center),
-            );
-            properties.insert(
-                "material.rotation".to_string(),
-                property_track_to_session(&tex.rotation),
-            );
-            properties.insert(
-                "material.color".to_string(),
+                k("color"),
                 SessionProperty::static_value(json!([1.0, 1.0, 1.0])),
             );
-            properties.insert(
-                "material.opacity".to_string(),
-                SessionProperty::static_value(json!(1.0)),
-            );
+            properties.insert(k("opacity"), SessionProperty::static_value(json!(1.0)));
         }
         zc_project::MaterialSpec::Video(vid) => {
+            properties.insert(k("color"), property_track_to_session(&vid.color));
+            properties.insert(k("opacity"), property_track_to_session(&vid.opacity));
             properties.insert(
-                "material.color".to_string(),
-                property_track_to_session(&vid.color),
-            );
-            properties.insert(
-                "material.opacity".to_string(),
-                property_track_to_session(&vid.opacity),
-            );
-            properties.insert(
-                "material.transparent".to_string(),
+                k("transparent"),
                 SessionProperty::static_value(json!(u32::from(vid.transparent))),
             );
             properties.insert(
-                "material.blending".to_string(),
+                k("blending"),
                 SessionProperty::static_value(json!(vid.blending)),
             );
             properties.insert(
-                "material.startOffset".to_string(),
+                k("startOffset"),
                 SessionProperty::static_value(json!(vid.start_offset)),
             );
             properties.insert(
-                "material.mediaOffset".to_string(),
+                k("mediaOffset"),
                 SessionProperty::static_value(json!(vid.media_offset)),
             );
             if let Some(v) = &vid.video {
-                properties.insert(
-                    "material.texture".to_string(),
-                    SessionProperty::static_value(json!(v)),
-                );
+                properties.insert(k("texture"), SessionProperty::static_value(json!(v)));
             }
         }
         zc_project::MaterialSpec::Matcap(mc) => {
+            properties.insert(k("color"), property_track_to_session(&mc.color));
+            properties.insert(k("brightness"), property_track_to_session(&mc.brightness));
+            properties.insert(k("opacity"), property_track_to_session(&mc.opacity));
             properties.insert(
-                "material.color".to_string(),
-                property_track_to_session(&mc.color),
-            );
-            properties.insert(
-                "material.brightness".to_string(),
-                property_track_to_session(&mc.brightness),
-            );
-            properties.insert(
-                "material.opacity".to_string(),
-                property_track_to_session(&mc.opacity),
-            );
-            properties.insert(
-                "material.transparent".to_string(),
+                k("transparent"),
                 SessionProperty::static_value(json!(u32::from(mc.transparent))),
             );
             properties.insert(
-                "material.blending".to_string(),
+                k("blending"),
                 SessionProperty::static_value(json!(mc.blending)),
             );
-            properties.insert(
-                "material.side".to_string(),
-                SessionProperty::static_value(json!(mc.side)),
-            );
+            properties.insert(k("side"), SessionProperty::static_value(json!(mc.side)));
             if let Some(t) = &mc.texture {
-                properties.insert(
-                    "material.texture".to_string(),
-                    SessionProperty::static_value(json!(t)),
-                );
+                properties.insert(k("texture"), SessionProperty::static_value(json!(t)));
             }
         }
         zc_project::MaterialSpec::ImagePlus(img) => {
+            properties.insert(k("opacity"), property_track_to_session(&img.opacity));
             properties.insert(
-                "material.opacity".to_string(),
-                property_track_to_session(&img.opacity),
-            );
-            properties.insert(
-                "material.transparent".to_string(),
+                k("transparent"),
                 SessionProperty::static_value(json!(u32::from(img.transparent))),
             );
             properties.insert(
-                "material.blending".to_string(),
+                k("blending"),
                 SessionProperty::static_value(json!(img.blending)),
             );
-            properties.insert(
-                "material.side".to_string(),
-                SessionProperty::static_value(json!(img.side)),
-            );
-            properties.insert(
-                "material.wrap".to_string(),
-                SessionProperty::static_value(json!(img.wrap)),
-            );
-            properties.insert(
-                "material.repeat".to_string(),
-                property_track_to_session(&img.repeat),
-            );
-            properties.insert(
-                "material.offset".to_string(),
-                property_track_to_session(&img.offset),
-            );
-            properties.insert(
-                "material.center".to_string(),
-                property_track_to_session(&img.center),
-            );
-            properties.insert(
-                "material.rotation".to_string(),
-                property_track_to_session(&img.rotation),
-            );
+            properties.insert(k("side"), SessionProperty::static_value(json!(img.side)));
+            properties.insert(k("wrap"), SessionProperty::static_value(json!(img.wrap)));
+            properties.insert(k("repeat"), property_track_to_session(&img.repeat));
+            properties.insert(k("offset"), property_track_to_session(&img.offset));
+            properties.insert(k("center"), property_track_to_session(&img.center));
+            properties.insert(k("rotation"), property_track_to_session(&img.rotation));
             if let Some(t) = &img.texture {
+                properties.insert(k("texture"), SessionProperty::static_value(json!(t)));
+            }
+        }
+        zc_project::MaterialSpec::CustomShader {
+            frag_shader,
+            custom_properties,
+        } => {
+            properties.insert(
+                k("fragShader"),
+                SessionProperty::static_value(json!(frag_shader)),
+            );
+            for cp in custom_properties {
                 properties.insert(
-                    "material.texture".to_string(),
-                    SessionProperty::static_value(json!(t)),
+                    format!("{prefix}custom.{}", cp.name),
+                    property_track_to_session(&cp.track),
                 );
             }
         }
-        zc_project::MaterialSpec::CustomShader { frag_shader, .. } => {
+        zc_project::MaterialSpec::NodeMaterial {
+            schema_version,
+            resolution,
+            graph,
+        } => {
             properties.insert(
-                "material.fragShader".to_string(),
-                SessionProperty::static_value(json!(frag_shader)),
+                k("schemaVersion"),
+                SessionProperty::static_value(json!(*schema_version)),
+            );
+            properties.insert(
+                k("bakeResolution"),
+                SessionProperty::static_value(json!(*resolution)),
+            );
+            properties.insert(
+                k("graph"),
+                SessionProperty::static_value_with_kind(graph.clone(), SessionValueKind::Json),
             );
         }
-        zc_project::MaterialSpec::NodeMaterial { .. }
-        | zc_project::MaterialSpec::Unknown { .. } => {}
+        zc_project::MaterialSpec::Unknown { .. } => {}
     }
 }
 
@@ -1389,6 +1268,37 @@ fn flatten_objects_3d(
                         SessionValueKind::Option,
                     ),
                 );
+                properties.insert(
+                    "characterIndexOffset".to_string(),
+                    property_track_to_session(&t.character_index_offset),
+                );
+                properties.insert(
+                    "characterCountOverride".to_string(),
+                    property_track_to_session(&t.character_count_override),
+                );
+                properties.insert(
+                    "textScaleMode".to_string(),
+                    SessionProperty::static_value_with_kind(
+                        json!(u32::from(
+                            t.text_scale_mode == zc_project::CompatMode::Legacy
+                        )),
+                        SessionValueKind::Option,
+                    ),
+                );
+                if let Some(kern) = obj
+                    .preserved
+                    .get("kerning")
+                    .or_else(|| obj.preserved.get("property.kerning"))
+                    .and_then(parse_preserved_bool_u64)
+                {
+                    properties.insert(
+                        "kerning".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(kern),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                }
             }
             zc_project::Object3DKind::Shape3D(s) => match s {
                 zc_project::Shape3DKind::Box { size } => {
@@ -1528,10 +1438,16 @@ fn flatten_objects_3d(
                     height,
                     detail,
                     open_ended,
+                    top_radius,
+                    shading,
                 } => {
                     properties.insert(
                         "cone.radius".to_string(),
                         SessionProperty::static_value(json!(*radius)),
+                    );
+                    properties.insert(
+                        "cone.topRadius".to_string(),
+                        SessionProperty::static_value(json!(*top_radius)),
                     );
                     properties.insert(
                         "cone.height".to_string(),
@@ -1548,11 +1464,23 @@ fn flatten_objects_3d(
                             SessionValueKind::Option,
                         ),
                     );
+                    properties.insert(
+                        "cone.shading".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(*shading),
+                            SessionValueKind::Option,
+                        ),
+                    );
                 }
                 zc_project::Shape3DKind::RoundedBox {
                     size,
                     radius,
                     segments,
+                    corner_radius,
+                    corner_segments,
+                    bevel_size,
+                    bevel_segments,
+                    shading,
                 } => {
                     properties.insert(
                         "box_size".to_string(),
@@ -1569,11 +1497,71 @@ fn flatten_objects_3d(
                         "roundedBox.segments".to_string(),
                         SessionProperty::static_value(json!(*segments)),
                     );
+                    if let Some(cr) = corner_radius {
+                        properties.insert(
+                            "roundedBox.cornerRadius".to_string(),
+                            SessionProperty::static_value(json!(*cr)),
+                        );
+                    }
+                    if let Some(cs) = corner_segments {
+                        properties.insert(
+                            "roundedBox.cornerSegments".to_string(),
+                            SessionProperty::static_value(json!(*cs)),
+                        );
+                    }
+                    if let Some(bs) = bevel_size {
+                        properties.insert(
+                            "roundedBox.bevelSize".to_string(),
+                            SessionProperty::static_value(json!(*bs)),
+                        );
+                    }
+                    if let Some(bseg) = bevel_segments {
+                        properties.insert(
+                            "roundedBox.bevelSegments".to_string(),
+                            SessionProperty::static_value(json!(*bseg)),
+                        );
+                    }
+                    properties.insert(
+                        "roundedBox.shading".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(*shading),
+                            SessionValueKind::Option,
+                        ),
+                    );
                 }
-                zc_project::Shape3DKind::Tetrahedron { radius, detail }
-                | zc_project::Shape3DKind::Octahedron { radius, detail }
-                | zc_project::Shape3DKind::Dodecahedron { radius, detail }
-                | zc_project::Shape3DKind::Icosahedron { radius, detail } => {
+                zc_project::Shape3DKind::Tetrahedron {
+                    radius,
+                    detail,
+                    shading,
+                }
+                | zc_project::Shape3DKind::Octahedron {
+                    radius,
+                    detail,
+                    shading,
+                }
+                | zc_project::Shape3DKind::Dodecahedron {
+                    radius,
+                    detail,
+                    shading,
+                }
+                | zc_project::Shape3DKind::Icosahedron {
+                    radius,
+                    detail,
+                    shading,
+                } => {
+                    let shape_idx = match s {
+                        zc_project::Shape3DKind::Octahedron { .. } => 1_u32,
+                        zc_project::Shape3DKind::Icosahedron { .. } => 2_u32,
+                        zc_project::Shape3DKind::Dodecahedron { .. } => 3_u32,
+                        _ => 0_u32,
+                    };
+                    properties.insert(
+                        "polyhedron.shape".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(shape_idx),
+                            SessionValueKind::Option,
+                        ),
+                    );
                     properties.insert(
                         "polyhedron.radius".to_string(),
                         SessionProperty::static_value(json!(*radius)),
@@ -1582,12 +1570,20 @@ fn flatten_objects_3d(
                         "polyhedron.detail".to_string(),
                         SessionProperty::static_value(json!(*detail)),
                     );
+                    properties.insert(
+                        "polyhedron.shading".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(*shading),
+                            SessionValueKind::Option,
+                        ),
+                    );
                 }
                 zc_project::Shape3DKind::Capsule {
                     radius,
                     length,
                     cap_segments,
                     radial_segments,
+                    shading,
                 } => {
                     properties.insert(
                         "capsule.radius".to_string(),
@@ -1604,6 +1600,13 @@ fn flatten_objects_3d(
                     properties.insert(
                         "capsule.radialSegments".to_string(),
                         SessionProperty::static_value(json!(*radial_segments)),
+                    );
+                    properties.insert(
+                        "capsule.shading".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(*shading),
+                            SessionValueKind::Option,
+                        ),
                     );
                 }
                 zc_project::Shape3DKind::TorusKnot {
@@ -1637,6 +1640,232 @@ fn flatten_objects_3d(
                     properties.insert(
                         "torusKnot.q".to_string(),
                         SessionProperty::static_value(json!(*q)),
+                    );
+                }
+                zc_project::Shape3DKind::Tube {
+                    outer_radius,
+                    inner_radius,
+                    height,
+                    radial_segments,
+                    open_ended,
+                    shading,
+                } => {
+                    properties.insert(
+                        "tube.outerRadius".to_string(),
+                        SessionProperty::static_value(json!(*outer_radius)),
+                    );
+                    properties.insert(
+                        "tube.innerRadius".to_string(),
+                        SessionProperty::static_value(json!(*inner_radius)),
+                    );
+                    properties.insert(
+                        "tube.height".to_string(),
+                        SessionProperty::static_value(json!(*height)),
+                    );
+                    properties.insert(
+                        "tube.radialSegments".to_string(),
+                        SessionProperty::static_value(json!(*radial_segments)),
+                    );
+                    properties.insert(
+                        "tube.openEnded".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(u32::from(*open_ended)),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                    properties.insert(
+                        "tube.shading".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(*shading),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                }
+                zc_project::Shape3DKind::Gear {
+                    teeth,
+                    inner_radius,
+                    outer_radius,
+                    thickness,
+                    tooth_width,
+                    bevel_size,
+                    bevel_segments,
+                    shading,
+                } => {
+                    properties.insert(
+                        "gear.teeth".to_string(),
+                        SessionProperty::static_value(json!(*teeth)),
+                    );
+                    properties.insert(
+                        "gear.innerRadius".to_string(),
+                        SessionProperty::static_value(json!(*inner_radius)),
+                    );
+                    properties.insert(
+                        "gear.outerRadius".to_string(),
+                        SessionProperty::static_value(json!(*outer_radius)),
+                    );
+                    properties.insert(
+                        "gear.thickness".to_string(),
+                        SessionProperty::static_value(json!(*thickness)),
+                    );
+                    properties.insert(
+                        "gear.toothWidth".to_string(),
+                        SessionProperty::static_value(json!(*tooth_width)),
+                    );
+                    properties.insert(
+                        "gear.bevelSize".to_string(),
+                        SessionProperty::static_value(json!(*bevel_size)),
+                    );
+                    properties.insert(
+                        "gear.bevelSegments".to_string(),
+                        SessionProperty::static_value(json!(*bevel_segments)),
+                    );
+                    properties.insert(
+                        "gear.shading".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(*shading),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                }
+                zc_project::Shape3DKind::Helix {
+                    radius,
+                    height,
+                    turns,
+                    tube_radius,
+                    path_segments,
+                    radial_segments,
+                    shading,
+                } => {
+                    properties.insert(
+                        "helix.radius".to_string(),
+                        SessionProperty::static_value(json!(*radius)),
+                    );
+                    properties.insert(
+                        "helix.height".to_string(),
+                        SessionProperty::static_value(json!(*height)),
+                    );
+                    properties.insert(
+                        "helix.turns".to_string(),
+                        SessionProperty::static_value(json!(*turns)),
+                    );
+                    properties.insert(
+                        "helix.tubeRadius".to_string(),
+                        SessionProperty::static_value(json!(*tube_radius)),
+                    );
+                    properties.insert(
+                        "helix.pathSegments".to_string(),
+                        SessionProperty::static_value(json!(*path_segments)),
+                    );
+                    properties.insert(
+                        "helix.radialSegments".to_string(),
+                        SessionProperty::static_value(json!(*radial_segments)),
+                    );
+                    properties.insert(
+                        "helix.shading".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(*shading),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                }
+                zc_project::Shape3DKind::Spline {
+                    points,
+                    interpolation,
+                    closed,
+                    start,
+                    end,
+                    thickness,
+                    thickness_map,
+                    gradient_space,
+                    tension,
+                    path_segments,
+                    radial_segments,
+                    caps,
+                    cap_style,
+                    shading,
+                } => {
+                    properties.insert(
+                        "spline.points".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(points),
+                            SessionValueKind::Json,
+                        ),
+                    );
+                    properties.insert(
+                        "spline.interpolation".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(interpolation),
+                            SessionValueKind::Text,
+                        ),
+                    );
+                    properties.insert(
+                        "spline.closed".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(u32::from(*closed)),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                    properties.insert(
+                        "spline.start".to_string(),
+                        SessionProperty::static_value(json!(*start)),
+                    );
+                    properties.insert(
+                        "spline.end".to_string(),
+                        SessionProperty::static_value(json!(*end)),
+                    );
+                    properties.insert(
+                        "spline.thickness".to_string(),
+                        SessionProperty::static_value(json!(*thickness)),
+                    );
+                    properties.insert(
+                        "spline.thicknessMap".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(
+                                serde_json::to_string(thickness_map)
+                                    .unwrap_or_else(|_| "[]".to_owned())
+                            ),
+                            SessionValueKind::Text,
+                        ),
+                    );
+                    properties.insert(
+                        "spline.gradientSpace".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(gradient_space),
+                            SessionValueKind::Text,
+                        ),
+                    );
+                    properties.insert(
+                        "spline.tension".to_string(),
+                        SessionProperty::static_value(json!(*tension)),
+                    );
+                    properties.insert(
+                        "spline.pathSegments".to_string(),
+                        SessionProperty::static_value(json!(*path_segments)),
+                    );
+                    properties.insert(
+                        "spline.radialSegments".to_string(),
+                        SessionProperty::static_value(json!(*radial_segments)),
+                    );
+                    properties.insert(
+                        "spline.caps".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(caps),
+                            SessionValueKind::Text,
+                        ),
+                    );
+                    properties.insert(
+                        "spline.capStyle".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(cap_style),
+                            SessionValueKind::Text,
+                        ),
+                    );
+                    properties.insert(
+                        "spline.shading".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(*shading),
+                            SessionValueKind::Option,
+                        ),
                     );
                 }
             },
@@ -1687,6 +1916,14 @@ fn flatten_objects_3d(
                     "castShadow".to_string(),
                     SessionProperty::static_value(json!(u32::from(l.cast_shadow))),
                 );
+                properties.insert(
+                    "shadowMapSize".to_string(),
+                    SessionProperty::static_value(json!(l.shadow_map_size)),
+                );
+                properties.insert(
+                    "shadowBias".to_string(),
+                    SessionProperty::static_value(json!(l.shadow_bias)),
+                );
             }
             zc_project::Object3DKind::Camera(c) => {
                 let ckind = match c.kind {
@@ -1707,6 +1944,46 @@ fn flatten_objects_3d(
                     SessionProperty::static_value(json!(c.far)),
                 );
                 properties.insert("zoom".to_string(), property_track_to_session(&c.zoom));
+                properties.insert(
+                    "active".to_string(),
+                    SessionProperty::static_value_with_kind(
+                        json!(u32::from(c.active)),
+                        SessionValueKind::Option,
+                    ),
+                );
+                properties.insert(
+                    "focalLength".to_string(),
+                    property_track_to_session(&c.focal_length),
+                );
+                properties.insert(
+                    "filmGate".to_string(),
+                    SessionProperty::static_value(json!(c.film_gate)),
+                );
+                properties.insert(
+                    "filmOffsetX".to_string(),
+                    property_track_to_session(&c.film_offset_x),
+                );
+                properties.insert(
+                    "filmOffsetY".to_string(),
+                    property_track_to_session(&c.film_offset_y),
+                );
+                if let Some(mb) = &c.motion_blur {
+                    properties.insert(
+                        "motionBlur.enabled".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(u32::from(mb.enabled)),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                    properties.insert(
+                        "motionBlur.samples".to_string(),
+                        SessionProperty::static_value(json!(mb.samples)),
+                    );
+                    properties.insert(
+                        "motionBlur.shutter".to_string(),
+                        property_track_to_session(&mb.shutter),
+                    );
+                }
                 properties.insert(
                     "shakeAmplitude".to_string(),
                     property_track_to_session(&c.shake_amplitude),
@@ -1808,12 +2085,62 @@ fn flatten_objects_3d(
                         "vibrate.frequency".to_string(),
                         property_track_to_session(&vib.frequency),
                     );
+                    properties.insert(
+                        "vibrate.regularPulse".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(u32::from(vib.regular_pulse)),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                    properties.insert(
+                        "vibrate.relative".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(u32::from(vib.relative)),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                    properties.insert(
+                        "vibrate.enablePosition".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(u32::from(vib.enable_position)),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                    properties.insert(
+                        "vibrate.enableRotation".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(u32::from(vib.enable_rotation)),
+                            SessionValueKind::Option,
+                        ),
+                    );
+                    properties.insert(
+                        "vibrate.positionFrequency".to_string(),
+                        property_track_to_session(&vib.position_frequency),
+                    );
+                    properties.insert(
+                        "vibrate.rotationFrequency".to_string(),
+                        property_track_to_session(&vib.rotation_frequency),
+                    );
                 }
             }
             zc_project::Object3DKind::Particles(p) => {
                 properties.insert(
                     "particles.time".to_string(),
                     property_track_to_session(&p.time),
+                );
+                properties.insert(
+                    "particles.color".to_string(),
+                    SessionProperty::static_value_with_kind(
+                        json!(serde_json::to_string(&p.color).unwrap_or_else(|_| "[]".to_owned())),
+                        SessionValueKind::Text,
+                    ),
+                );
+                properties.insert(
+                    "particles.size".to_string(),
+                    SessionProperty::static_value_with_kind(
+                        json!(serde_json::to_string(&p.size).unwrap_or_else(|_| "[]".to_owned())),
+                        SessionValueKind::Text,
+                    ),
                 );
                 properties.insert(
                     "particles.number".to_string(),
@@ -1912,12 +2239,49 @@ fn flatten_objects_3d(
                         SessionProperty::static_value(json!(tex)),
                     );
                 }
+                if let Some(preset) = &p.sprite_preset {
+                    properties.insert(
+                        "particles.spritePreset".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(preset),
+                            SessionValueKind::Text,
+                        ),
+                    );
+                }
             }
             zc_project::Object3DKind::Dummy { .. } => {}
         }
 
         if let Some(mat) = &obj.material {
             export_material_to_session(mat, &mut properties);
+        }
+        if let Some(front_mat) = obj.material_slots.get("front") {
+            export_material_to_session_with_prefix(front_mat, "frontMaterial.", &mut properties);
+        }
+        if let Some(side_mat) = obj.material_slots.get("side") {
+            export_material_to_session_with_prefix(side_mat, "sideMaterial.", &mut properties);
+        }
+
+        for (pk, pv) in &obj.preserved {
+            if let Some(prop_name) = pk.strip_prefix("property.")
+                && !prop_name.is_empty()
+                && prop_name != "kerning"
+                && !is_core_object_3d_property(prop_name)
+                && !properties.contains_key(prop_name)
+            {
+                properties.insert(
+                    prop_name.to_owned(),
+                    preserved_value_to_session_property(pv),
+                );
+            }
+        }
+        if !properties.contains_key("fieldNoiseEvolution")
+            && let Some(ev) = obj.preserved.get("property.fieldEvolution")
+        {
+            properties.insert(
+                "fieldNoiseEvolution".to_owned(),
+                preserved_value_to_session_property(ev),
+            );
         }
 
         if let Some(tt) = &obj.constraints.track_to {
@@ -1988,19 +2352,34 @@ fn flatten_objects_3d(
         }
 
         let obj_id = obj.id.to_string();
+        let plugin_type_str = obj
+            .preserved
+            .get("zoidiumPluginObjectType")
+            .and_then(Value::as_str)
+            .or_else(|| obj.preserved.get("type").and_then(Value::as_str));
         let kind = match &obj.kind {
-            zc_project::Object3DKind::Group { .. } => obj
-                .preserved
-                .get("zoidiumPluginObjectType")
-                .and_then(Value::as_str)
-                .filter(|k| is_3d_repeater_kind(k))
-                .or_else(|| {
-                    obj.preserved
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .filter(|k| is_3d_repeater_kind(k))
-                })
-                .map_or_else(|| object_3d_kind_to_str(&obj.kind), str::to_owned),
+            zc_project::Object3DKind::Group { .. } => plugin_type_str
+                .filter(|k| is_3d_container_kind(k) && *k != "group")
+                .map_or_else(
+                    || object_3d_kind_to_str(&obj.kind),
+                    |k| canonicalize_object_3d_kind(k).0,
+                ),
+            zc_project::Object3DKind::Camera(_) => plugin_type_str
+                .filter(|k| is_3d_camera_plus_kind(k))
+                .map_or_else(
+                    || object_3d_kind_to_str(&obj.kind),
+                    |_| "zoidium:camera-plus/camera".to_owned(),
+                ),
+            zc_project::Object3DKind::Light(_) => plugin_type_str
+                .filter(|k| is_3d_light_plus_kind(k) || is_3d_trapcode_kind(k))
+                .map_or_else(
+                    || object_3d_kind_to_str(&obj.kind),
+                    |k| canonicalize_object_3d_kind(k).0,
+                ),
+            zc_project::Object3DKind::Dummy { .. } => plugin_type_str.map_or_else(
+                || object_3d_kind_to_str(&obj.kind),
+                |k| canonicalize_object_3d_kind(k).0,
+            ),
             _ => object_3d_kind_to_str(&obj.kind),
         };
         out.push(SessionObject3D {
@@ -2225,9 +2604,17 @@ fn default_clip_properties(
 
 impl SessionDocument {
     fn from_project(project: &zc_project::Project) -> Self {
-        let fps = f64::from(project.sequence.fps.max(1));
-        let mut video_tracks = Vec::with_capacity(project.sequence.video_tracks.len());
-        for vt in &project.sequence.video_tracks {
+        Self::from_sequence(project, &project.sequence, None)
+    }
+
+    pub(crate) fn from_sequence(
+        project: &zc_project::Project,
+        seq: &zc_project::Sequence,
+        active_composition_id: Option<zc_project::Uuid>,
+    ) -> Self {
+        let fps = f64::from(seq.fps.max(1));
+        let mut video_tracks = Vec::with_capacity(seq.video_tracks.len());
+        for vt in &seq.video_tracks {
             let mut clips = Vec::with_capacity(vt.clips.len());
             for vc in &vt.clips {
                 let (time_start, time_end, time_animated) =
@@ -2261,7 +2648,7 @@ impl SessionDocument {
                     "time".to_string(),
                     property_track_to_session(&vc.time_curve),
                 );
-                if vc.layer.resolution != project.sequence.resolution {
+                if vc.layer.resolution != seq.resolution {
                     properties.insert(
                         "resolution".to_string(),
                         SessionProperty::static_value_with_kind(
@@ -2401,9 +2788,9 @@ impl SessionDocument {
                                 "backgroundColor".to_string(),
                                 SessionProperty::static_value_with_kind(
                                     json!([
-                                        f64::from(project.sequence.background_color[0]),
-                                        f64::from(project.sequence.background_color[1]),
-                                        f64::from(project.sequence.background_color[2]),
+                                        f64::from(seq.background_color[0]),
+                                        f64::from(seq.background_color[1]),
+                                        f64::from(seq.background_color[2]),
                                     ]),
                                     SessionValueKind::Color,
                                 ),
@@ -2417,6 +2804,21 @@ impl SessionDocument {
                             );
                         }
                         let _ = shadow_mode;
+                    }
+                    zc_project::LayerKind::PrecompRef { composition_id } => {
+                        properties.insert(
+                            "compositionId".to_string(),
+                            SessionProperty::static_value_with_kind(
+                                json!(composition_id.to_string()),
+                                SessionValueKind::Text,
+                            ),
+                        );
+                        if let Some(&offset) = seq.precomp_offsets.get(&vc.layer.id) {
+                            properties.insert(
+                                "precompOffset".to_string(),
+                                SessionProperty::static_value(json!(offset)),
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -2462,8 +2864,8 @@ impl SessionDocument {
             });
         }
 
-        let mut audio_tracks = Vec::with_capacity(project.sequence.audio_tracks.len());
-        for at in &project.sequence.audio_tracks {
+        let mut audio_tracks = Vec::with_capacity(seq.audio_tracks.len());
+        for at in &seq.audio_tracks {
             let mut clips = Vec::with_capacity(at.clips.len());
             for ac in &at.clips {
                 let (time_start, time_end, time_animated) =
@@ -2518,18 +2920,18 @@ impl SessionDocument {
         let mut sequence_properties = BTreeMap::new();
         sequence_properties.insert(
             "motionBlur.enabled".to_string(),
-            SessionProperty::static_value(json!(u32::from(project.sequence.motion_blur.enabled))),
+            SessionProperty::static_value(json!(u32::from(seq.motion_blur.enabled))),
         );
         sequence_properties.insert(
             "motionBlur.samples".to_string(),
-            property_track_to_session(&project.sequence.motion_blur.samples),
+            property_track_to_session(&seq.motion_blur.samples),
         );
         sequence_properties.insert(
             "motionBlur.shutter".to_string(),
-            property_track_to_session(&project.sequence.motion_blur.shutter),
+            property_track_to_session(&seq.motion_blur.shutter),
         );
-        let mut sequence_control_order = Vec::with_capacity(project.sequence.controls.len());
-        for ctl in &project.sequence.controls {
+        let mut sequence_control_order = Vec::with_capacity(seq.controls.len());
+        for ctl in &seq.controls {
             let base_key = if ctl.name.starts_with("ctl_") {
                 ctl.name.clone()
             } else {
@@ -2558,12 +2960,13 @@ impl SessionDocument {
 
         Self {
             project_name: project.name.clone(),
-            resolution: project.sequence.resolution,
+            resolution: seq.resolution,
             fps,
-            sequence_length: project.sequence.length_frames,
+            sequence_length: seq.length_frames,
             video_tracks,
             audio_tracks,
             sequence_properties,
+            active_composition_id,
             sequence_control_order,
         }
     }
@@ -2919,6 +3322,8 @@ pub struct Session {
     external_plugin_requirements: BTreeSet<String>,
     /// Monotonic counter bumped on non-history session state mutations (e.g. plugin toggles).
     plugin_revision: u64,
+    /// Keyframe shifts to apply when cloning `layer_masks` for newly split clips on sync.
+    pending_clip_side_table_shifts: BTreeMap<String, f64>,
     next_id: u64,
 }
 
@@ -2969,8 +3374,47 @@ impl Session {
             prev_doc_plugin_deps,
             external_plugin_requirements,
             plugin_revision: 0,
+            pending_clip_side_table_shifts: BTreeMap::new(),
             next_id,
         }
+    }
+
+    /// Returns the currently active [`zc_project::Sequence`] (root `project.sequence` when
+    /// `active_composition_id` is `None`, or `project.compositions[&id]` when editing a precomp).
+    #[must_use]
+    pub fn active_sequence(&self) -> &zc_project::Sequence {
+        if let Some(comp_id) = self.document.active_composition_id
+            && let Some(comp) = self.project.compositions.get(&comp_id)
+        {
+            return comp;
+        }
+        &self.project.sequence
+    }
+
+    /// Mutable view of the currently active [`zc_project::Sequence`].
+    pub fn active_sequence_mut(&mut self) -> &mut zc_project::Sequence {
+        if let Some(comp_id) = self.document.active_composition_id
+            && self.project.compositions.contains_key(&comp_id)
+        {
+            return self
+                .project
+                .compositions
+                .get_mut(&comp_id)
+                .expect("checked contains_key");
+        }
+        &mut self.project.sequence
+    }
+
+    /// Flushes `self.document` into the active target sequence in `self.project`.
+    pub fn sync_to_project(&mut self) {
+        self.sync_document_to_project();
+    }
+
+    /// Flushes `self.document` into the active target sequence and returns a cloned [`zc_project::Project`].
+    #[must_use]
+    pub fn to_project(&mut self) -> zc_project::Project {
+        self.sync_document_to_project();
+        self.project.clone()
     }
 
     /// Garbage-collects cached asset binary blobs in `self.asset_blobs` that are no longer
@@ -3499,133 +3943,10 @@ impl Session {
     /// without lossy JSON round-tripping and without disturbing embedded asset binary buffers.
     fn sync_document_to_project(&mut self) {
         self.project.name = self.document.project_name.clone();
-        self.project.sequence.resolution = self.document.resolution;
-        let next_fps = self.document.fps.round().clamp(1.0, 240.0) as u32;
-        if self.project.sequence.fps != next_fps {
-            self.project.sequence.fps = next_fps;
-            self.project.sequence.exact_fps = None;
-        }
-        self.project.sequence.length_frames = self.document.sequence_length;
-
-        // Sync sequence-level motion blur & Expressions+ sequence controls.
-        if let Some(v) = prop_f64_static(&self.document.sequence_properties, "motionBlur.enabled") {
-            self.project.sequence.motion_blur.enabled = v.round() as i64 != 0;
-        }
-        if let Some(p) = self.document.sequence_properties.get("motionBlur.samples") {
-            self.project.sequence.motion_blur.samples =
-                session_property_to_track(p, Some(&self.project.sequence.motion_blur.samples));
-        }
-        if let Some(p) = self.document.sequence_properties.get("motionBlur.shutter") {
-            self.project.sequence.motion_blur.shutter =
-                session_property_to_track(p, Some(&self.project.sequence.motion_blur.shutter));
-        }
-        let mut existing_ctls: Vec<Option<zc_project::SequenceControl>> =
-            self.project.sequence.controls.drain(..).map(Some).collect();
-        let mut synced_ctls = Vec::new();
-        let mut next_control_order = Vec::new();
-        let mut handled_ctl_keys = BTreeSet::new();
-        for (prop_key, ctl_id) in &self.document.sequence_control_order {
-            let Some(prop) = self.document.sequence_properties.get(prop_key) else {
-                continue;
-            };
-            let existing = existing_ctls
-                .iter_mut()
-                .find_map(|slot| {
-                    if slot.as_ref().is_some_and(|c| c.id == *ctl_id) {
-                        slot.take()
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| {
-                    existing_ctls.iter_mut().find_map(|slot| {
-                        let matches = slot.as_ref().is_some_and(|c| {
-                            let expected = if c.name.starts_with("ctl_") {
-                                c.name.clone()
-                            } else {
-                                format!("ctl_{}", c.name)
-                            };
-                            expected == *prop_key
-                        });
-                        if matches { slot.take() } else { None }
-                    })
-                });
-            let stripped = prop_key.strip_prefix("ctl_").unwrap_or(prop_key);
-            let mut ctl = existing.unwrap_or_else(|| zc_project::SequenceControl {
-                id: if ctl_id.is_empty() {
-                    prop_key.clone()
-                } else {
-                    ctl_id.clone()
-                },
-                name: if stripped.is_empty() {
-                    prop_key.clone()
-                } else {
-                    stripped.to_string()
-                },
-                kind: zc_project::SequenceControlKind::Slider,
-                track: zc_project::PropertyTrack::number(0.0),
-                preserved: BTreeMap::new(),
-            });
-            ctl.track = session_property_to_track(prop, Some(&ctl.track));
-            next_control_order.push((prop_key.clone(), ctl.id.clone()));
-            handled_ctl_keys.insert(prop_key.clone());
-            synced_ctls.push(ctl);
-        }
-        for (k, prop) in &self.document.sequence_properties {
-            if handled_ctl_keys.contains(k) {
-                continue;
-            }
-            if let Some(stripped) = k.strip_prefix("ctl_") {
-                let existing = existing_ctls.iter_mut().find_map(|slot| {
-                    let matches = slot.as_ref().is_some_and(|c| {
-                        let expected = if c.name.starts_with("ctl_") {
-                            c.name.clone()
-                        } else {
-                            format!("ctl_{}", c.name)
-                        };
-                        expected == *k || c.id == *k
-                    });
-                    if matches { slot.take() } else { None }
-                });
-                let mut ctl = existing.unwrap_or_else(|| zc_project::SequenceControl {
-                    id: k.clone(),
-                    name: if stripped.is_empty() {
-                        k.clone()
-                    } else {
-                        stripped.to_string()
-                    },
-                    kind: zc_project::SequenceControlKind::Slider,
-                    track: zc_project::PropertyTrack::number(0.0),
-                    preserved: BTreeMap::new(),
-                });
-                ctl.track = session_property_to_track(prop, Some(&ctl.track));
-                next_control_order.push((k.clone(), ctl.id.clone()));
-                synced_ctls.push(ctl);
-            }
-        }
-        self.document.sequence_control_order = next_control_order;
-        self.project.sequence.controls = synced_ctls;
-
-        let fps_u32 = self.project.sequence.fps.max(1);
-        let resolution = self.document.resolution;
-        let seq_bg = self.project.sequence.background_color;
-
-        // Index existing tracks and clips by UUID string so preserved metadata and
-        // source-clip templates (for Split / Duplicate / Overwrite straddle splits) survive sync.
-        let mut existing_vtracks: BTreeMap<String, zc_project::VideoTrack> = self
-            .project
-            .sequence
-            .video_tracks
-            .drain(..)
-            .map(|t| (t.id.to_string(), t))
-            .collect();
-        let mut existing_vclips: BTreeMap<String, zc_project::VideoClip> = BTreeMap::new();
-        for vt in existing_vtracks.values_mut() {
-            for vc in vt.clips.drain(..) {
-                existing_vclips.insert(vc.id.to_string(), vc);
-            }
-        }
-        let vclip_templates = existing_vclips.clone();
+        let active_comp_id = self
+            .document
+            .active_composition_id
+            .filter(|id| self.project.compositions.contains_key(id));
 
         let mut next_id_counter = self.next_id;
         let mut used_ids_local = std::mem::take(&mut self.used_ids);
@@ -3640,137 +3961,365 @@ impl Session {
             }
         };
 
-        let mut synced_vtracks = Vec::with_capacity(self.document.video_tracks.len());
-        let mut live_clip_ids: BTreeSet<zc_project::Uuid> = BTreeSet::new();
-        for strack in &mut self.document.video_tracks {
-            let mut vt =
-                existing_vtracks
-                    .remove(&strack.id)
-                    .unwrap_or_else(|| zc_project::VideoTrack {
-                        id: parse_uuid_or_new(&strack.id),
-                        name: strack.name.clone(),
-                        enabled: strack.enabled,
-                        solo: strack.solo,
-                        locked: strack.locked,
-                        is_3d: strack.is_3d,
-                        clips: Vec::new(),
+        let pending_shifts = std::mem::take(&mut self.pending_clip_side_table_shifts);
+        let mut new_compositions_to_insert: Vec<(zc_project::Uuid, zc_project::Sequence)> =
+            Vec::new();
+
+        {
+            let target_seq: &mut zc_project::Sequence = match active_comp_id {
+                Some(comp_id) => self
+                    .project
+                    .compositions
+                    .get_mut(&comp_id)
+                    .expect("filtered active_comp_id"),
+                None => &mut self.project.sequence,
+            };
+
+            target_seq.resolution = self.document.resolution;
+            let next_fps = self.document.fps.round().clamp(1.0, 240.0) as u32;
+            if target_seq.fps != next_fps {
+                target_seq.fps = next_fps;
+                target_seq.exact_fps = None;
+            }
+            target_seq.length_frames = self.document.sequence_length;
+
+            // Sync sequence-level motion blur & Expressions+ sequence controls.
+            if let Some(v) =
+                prop_f64_static(&self.document.sequence_properties, "motionBlur.enabled")
+            {
+                target_seq.motion_blur.enabled = v.round() as i64 != 0;
+            }
+            if let Some(p) = self.document.sequence_properties.get("motionBlur.samples") {
+                target_seq.motion_blur.samples =
+                    session_property_to_track(p, Some(&target_seq.motion_blur.samples));
+            }
+            if let Some(p) = self.document.sequence_properties.get("motionBlur.shutter") {
+                target_seq.motion_blur.shutter =
+                    session_property_to_track(p, Some(&target_seq.motion_blur.shutter));
+            }
+            let mut existing_ctls: Vec<Option<zc_project::SequenceControl>> =
+                target_seq.controls.drain(..).map(Some).collect();
+            let mut synced_ctls = Vec::new();
+            let mut next_control_order = Vec::new();
+            let mut handled_ctl_keys = BTreeSet::new();
+            for (prop_key, ctl_id) in &self.document.sequence_control_order {
+                let Some(prop) = self.document.sequence_properties.get(prop_key) else {
+                    continue;
+                };
+                let existing = existing_ctls
+                    .iter_mut()
+                    .find_map(|slot| {
+                        if slot.as_ref().is_some_and(|c| c.id == *ctl_id) {
+                            slot.take()
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        existing_ctls.iter_mut().find_map(|slot| {
+                            let matches = slot.as_ref().is_some_and(|c| {
+                                let expected = if c.name.starts_with("ctl_") {
+                                    c.name.clone()
+                                } else {
+                                    format!("ctl_{}", c.name)
+                                };
+                                expected == *prop_key
+                            });
+                            if matches { slot.take() } else { None }
+                        })
+                    });
+                let stripped = prop_key.strip_prefix("ctl_").unwrap_or(prop_key);
+                let mut ctl = existing.unwrap_or_else(|| zc_project::SequenceControl {
+                    id: if ctl_id.is_empty() {
+                        prop_key.clone()
+                    } else {
+                        ctl_id.clone()
+                    },
+                    name: if stripped.is_empty() {
+                        prop_key.clone()
+                    } else {
+                        stripped.to_string()
+                    },
+                    kind: zc_project::SequenceControlKind::Slider,
+                    track: zc_project::PropertyTrack::number(0.0),
+                    preserved: BTreeMap::new(),
+                });
+                ctl.track = session_property_to_track(prop, Some(&ctl.track));
+                next_control_order.push((prop_key.clone(), ctl.id.clone()));
+                handled_ctl_keys.insert(prop_key.clone());
+                synced_ctls.push(ctl);
+            }
+            for (k, prop) in &self.document.sequence_properties {
+                if handled_ctl_keys.contains(k) {
+                    continue;
+                }
+                if let Some(stripped) = k.strip_prefix("ctl_") {
+                    let existing = existing_ctls.iter_mut().find_map(|slot| {
+                        let matches = slot.as_ref().is_some_and(|c| {
+                            let expected = if c.name.starts_with("ctl_") {
+                                c.name.clone()
+                            } else {
+                                format!("ctl_{}", c.name)
+                            };
+                            expected == *k || c.id == *k
+                        });
+                        if matches { slot.take() } else { None }
+                    });
+                    let mut ctl = existing.unwrap_or_else(|| zc_project::SequenceControl {
+                        id: k.clone(),
+                        name: if stripped.is_empty() {
+                            k.clone()
+                        } else {
+                            stripped.to_string()
+                        },
+                        kind: zc_project::SequenceControlKind::Slider,
+                        track: zc_project::PropertyTrack::number(0.0),
                         preserved: BTreeMap::new(),
                     });
-            vt.name = strack.name.clone();
-            vt.enabled = strack.enabled;
-            vt.solo = strack.solo;
-            vt.locked = strack.locked;
-            vt.is_3d = strack.is_3d;
-            vt.clips = strack
-                .clips
-                .iter_mut()
-                .map(|sclip| {
-                    let base = existing_vclips.remove(&sclip.id).or_else(|| {
-                        sclip
-                            .source_clip_id
-                            .as_deref()
-                            .and_then(|src_id| vclip_templates.get(src_id))
-                            .map(|tpl| {
-                                let mut cloned = tpl.clone();
-                                cloned.id = parse_uuid_or_new(&sclip.id);
-                                cloned.link = None;
-                                regenerate_cloned_layer_ids(
-                                    &mut cloned.layer,
-                                    true,
-                                    &mut alloc_uuid,
-                                );
-                                cloned
-                            })
-                    });
-                    sclip.source_clip_id = None;
-                    let synced = sync_video_clip_from_session(
-                        sclip,
-                        base,
-                        resolution,
-                        fps_u32,
-                        seq_bg,
-                        &mut alloc_uuid,
-                    );
-                    live_clip_ids.insert(synced.id);
-                    synced
-                })
+                    ctl.track = session_property_to_track(prop, Some(&ctl.track));
+                    next_control_order.push((k.clone(), ctl.id.clone()));
+                    synced_ctls.push(ctl);
+                }
+            }
+            self.document.sequence_control_order = next_control_order;
+            target_seq.controls = synced_ctls;
+
+            let fps_u32 = target_seq.fps.max(1);
+            let resolution = self.document.resolution;
+            let seq_bg = target_seq.background_color;
+            let seq_len = target_seq.length_frames.max(1.0);
+
+            // Index existing tracks and clips by UUID string so preserved metadata and
+            // source-clip templates (for Split / Duplicate / Overwrite straddle splits) survive sync.
+            let mut existing_vtracks: BTreeMap<String, zc_project::VideoTrack> = target_seq
+                .video_tracks
+                .drain(..)
+                .map(|t| (t.id.to_string(), t))
                 .collect();
-            synced_vtracks.push(vt);
+            let mut existing_vclips: BTreeMap<String, zc_project::VideoClip> = BTreeMap::new();
+            for vt in existing_vtracks.values_mut() {
+                for vc in vt.clips.drain(..) {
+                    existing_vclips.insert(vc.id.to_string(), vc);
+                }
+            }
+            let vclip_templates = existing_vclips.clone();
+
+            let mut cloned_layer_pairs: Vec<(zc_project::Uuid, zc_project::Uuid, f64)> = Vec::new();
+            let mut precomp_offset_updates: Vec<(zc_project::Uuid, f64)> = Vec::new();
+            let mut synced_vtracks = Vec::with_capacity(self.document.video_tracks.len());
+            let mut live_clip_ids: BTreeSet<zc_project::Uuid> = BTreeSet::new();
+            for strack in &mut self.document.video_tracks {
+                let mut vt =
+                    existing_vtracks
+                        .remove(&strack.id)
+                        .unwrap_or_else(|| zc_project::VideoTrack {
+                            id: parse_uuid_or_new(&strack.id),
+                            name: strack.name.clone(),
+                            enabled: strack.enabled,
+                            solo: strack.solo,
+                            locked: strack.locked,
+                            is_3d: strack.is_3d,
+                            clips: Vec::new(),
+                            preserved: BTreeMap::new(),
+                        });
+                vt.name = strack.name.clone();
+                vt.enabled = strack.enabled;
+                vt.solo = strack.solo;
+                vt.locked = strack.locked;
+                vt.is_3d = strack.is_3d;
+                vt.clips = strack
+                    .clips
+                    .iter_mut()
+                    .map(|sclip| {
+                        let base = existing_vclips.remove(&sclip.id).or_else(|| {
+                            sclip
+                                .source_clip_id
+                                .as_deref()
+                                .and_then(|src_id| vclip_templates.get(src_id))
+                                .map(|tpl| {
+                                    let old_layer_id = tpl.layer.id;
+                                    let mut cloned = tpl.clone();
+                                    cloned.id = parse_uuid_or_new(&sclip.id);
+                                    cloned.link = None;
+                                    regenerate_cloned_layer_ids(
+                                        &mut cloned.layer,
+                                        true,
+                                        &mut alloc_uuid,
+                                    );
+                                    let shift =
+                                        pending_shifts.get(&sclip.id).copied().unwrap_or(0.0);
+                                    cloned_layer_pairs.push((old_layer_id, cloned.layer.id, shift));
+                                    cloned
+                                })
+                        });
+                        sclip.source_clip_id = None;
+                        let mut synced = sync_video_clip_from_session(
+                            sclip,
+                            base,
+                            resolution,
+                            fps_u32,
+                            seq_bg,
+                            &mut alloc_uuid,
+                        );
+                        if let zc_project::LayerKind::PrecompRef {
+                            ref mut composition_id,
+                        } = synced.layer.kind
+                        {
+                            if *composition_id == zc_project::Uuid::nil() {
+                                let new_comp_id = alloc_uuid();
+                                let v1_id = alloc_uuid();
+                                let a1_id = alloc_uuid();
+                                let comp = zc_project::Sequence {
+                                    id: new_comp_id,
+                                    name: synced.name.clone(),
+                                    resolution,
+                                    fps: fps_u32,
+                                    length_frames: seq_len,
+                                    background_color: seq_bg,
+                                    video_tracks: vec![zc_project::VideoTrack {
+                                        id: v1_id,
+                                        name: "V1".to_owned(),
+                                        enabled: true,
+                                        solo: false,
+                                        locked: false,
+                                        is_3d: false,
+                                        clips: Vec::new(),
+                                        preserved: BTreeMap::new(),
+                                    }],
+                                    audio_tracks: vec![zc_project::AudioTrack {
+                                        id: a1_id,
+                                        name: "A1".to_owned(),
+                                        enabled: true,
+                                        muted: false,
+                                        solo: false,
+                                        locked: false,
+                                        clips: Vec::new(),
+                                        preserved: BTreeMap::new(),
+                                    }],
+                                    ..zc_project::Sequence::default()
+                                };
+                                *composition_id = new_comp_id;
+                                sclip.properties.insert(
+                                    "compositionId".to_owned(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!(new_comp_id.to_string()),
+                                        SessionValueKind::Text,
+                                    ),
+                                );
+                                new_compositions_to_insert.push((new_comp_id, comp));
+                            }
+                            if let Some(off) = prop_f64_static(&sclip.properties, "precompOffset") {
+                                precomp_offset_updates.push((synced.layer.id, off));
+                            }
+                        }
+                        live_clip_ids.insert(synced.id);
+                        synced
+                    })
+                    .collect();
+                synced_vtracks.push(vt);
+            }
+            target_seq.video_tracks = synced_vtracks;
+
+            // Propagate sequence side-tables (`layer_masks`, `precomp_offsets`, etc.) from source
+            // clip layers onto split / duplicated clip layers (shifting mask keyframes on split!).
+            for (old_lid, new_lid, shift) in cloned_layer_pairs {
+                if let Some(masks) = target_seq.layer_masks.get(&old_lid).cloned() {
+                    target_seq
+                        .layer_masks
+                        .insert(new_lid, clone_layer_masks_shifted(&masks, shift));
+                }
+                if let Some(&offset) = target_seq.precomp_offsets.get(&old_lid) {
+                    target_seq.precomp_offsets.insert(new_lid, offset);
+                }
+                if let Some(bd) = target_seq.scene_backdrops.get(&old_lid).cloned() {
+                    target_seq.scene_backdrops.insert(new_lid, bd);
+                }
+                if let Some(p3d) = target_seq.layer_3d_props.get(&old_lid).cloned() {
+                    target_seq.layer_3d_props.insert(new_lid, p3d);
+                }
+                if let Some(cam_objs) = target_seq.camera_layer_objects.get(&old_lid).cloned() {
+                    target_seq.camera_layer_objects.insert(new_lid, cam_objs);
+                }
+            }
+            for (lid, off) in precomp_offset_updates {
+                target_seq.precomp_offsets.insert(lid, off);
+            }
+
+            let mut existing_atracks: BTreeMap<String, zc_project::AudioTrack> = target_seq
+                .audio_tracks
+                .drain(..)
+                .map(|t| (t.id.to_string(), t))
+                .collect();
+            let mut existing_aclips: BTreeMap<String, zc_project::AudioClip> = BTreeMap::new();
+            for at in existing_atracks.values_mut() {
+                for ac in at.clips.drain(..) {
+                    existing_aclips.insert(ac.id.to_string(), ac);
+                }
+            }
+            let aclip_templates = existing_aclips.clone();
+
+            let mut synced_atracks = Vec::with_capacity(self.document.audio_tracks.len());
+            for strack in &mut self.document.audio_tracks {
+                let mut at =
+                    existing_atracks
+                        .remove(&strack.id)
+                        .unwrap_or_else(|| zc_project::AudioTrack {
+                            id: parse_uuid_or_new(&strack.id),
+                            name: strack.name.clone(),
+                            enabled: strack.enabled,
+                            muted: !strack.enabled,
+                            solo: strack.solo,
+                            locked: strack.locked,
+                            clips: Vec::new(),
+                            preserved: BTreeMap::new(),
+                        });
+                at.name = strack.name.clone();
+                // Preserve distinct `(enabled, muted)` states on imported `.pz` audio tracks
+                // whenever the effective enabled flag was not toggled in the session.
+                if strack.enabled != (at.enabled && !at.muted) {
+                    at.enabled = strack.enabled;
+                    at.muted = !strack.enabled;
+                }
+                at.solo = strack.solo;
+                at.locked = strack.locked;
+                at.clips = strack
+                    .clips
+                    .iter_mut()
+                    .map(|sclip| {
+                        let base = existing_aclips.remove(&sclip.id).or_else(|| {
+                            sclip
+                                .source_clip_id
+                                .as_deref()
+                                .and_then(|src_id| aclip_templates.get(src_id))
+                                .map(|tpl| {
+                                    let mut cloned = tpl.clone();
+                                    cloned.id = parse_uuid_or_new(&sclip.id);
+                                    cloned.link = None;
+                                    cloned
+                                })
+                        });
+                        sclip.source_clip_id = None;
+                        let synced = sync_audio_clip_from_session(sclip, base, fps_u32);
+                        live_clip_ids.insert(synced.id);
+                        synced
+                    })
+                    .collect();
+                synced_atracks.push(at);
+            }
+            target_seq.audio_tracks = synced_atracks;
+
+            // Prune stale clip UUIDs (e.g. engulfed or deleted clips) from clip_links.
+            target_seq.clip_links.retain(|_, members| {
+                members.retain(|id| live_clip_ids.contains(id));
+                !members.is_empty()
+            });
+        }
+
+        for (cid, comp) in new_compositions_to_insert {
+            self.project.compositions.insert(cid, comp);
         }
         self.next_id = next_id_counter;
         self.used_ids = used_ids_local;
-        self.project.sequence.video_tracks = synced_vtracks;
-
-        let mut existing_atracks: BTreeMap<String, zc_project::AudioTrack> = self
-            .project
-            .sequence
-            .audio_tracks
-            .drain(..)
-            .map(|t| (t.id.to_string(), t))
-            .collect();
-        let mut existing_aclips: BTreeMap<String, zc_project::AudioClip> = BTreeMap::new();
-        for at in existing_atracks.values_mut() {
-            for ac in at.clips.drain(..) {
-                existing_aclips.insert(ac.id.to_string(), ac);
-            }
-        }
-        let aclip_templates = existing_aclips.clone();
-
-        let mut synced_atracks = Vec::with_capacity(self.document.audio_tracks.len());
-        for strack in &mut self.document.audio_tracks {
-            let mut at =
-                existing_atracks
-                    .remove(&strack.id)
-                    .unwrap_or_else(|| zc_project::AudioTrack {
-                        id: parse_uuid_or_new(&strack.id),
-                        name: strack.name.clone(),
-                        enabled: strack.enabled,
-                        muted: !strack.enabled,
-                        solo: strack.solo,
-                        locked: strack.locked,
-                        clips: Vec::new(),
-                        preserved: BTreeMap::new(),
-                    });
-            at.name = strack.name.clone();
-            // Preserve distinct `(enabled, muted)` states on imported `.pz` audio tracks
-            // whenever the effective enabled flag was not toggled in the session.
-            if strack.enabled != (at.enabled && !at.muted) {
-                at.enabled = strack.enabled;
-                at.muted = !strack.enabled;
-            }
-            at.solo = strack.solo;
-            at.locked = strack.locked;
-            at.clips = strack
-                .clips
-                .iter_mut()
-                .map(|sclip| {
-                    let base = existing_aclips.remove(&sclip.id).or_else(|| {
-                        sclip
-                            .source_clip_id
-                            .as_deref()
-                            .and_then(|src_id| aclip_templates.get(src_id))
-                            .map(|tpl| {
-                                let mut cloned = tpl.clone();
-                                cloned.id = parse_uuid_or_new(&sclip.id);
-                                cloned.link = None;
-                                cloned
-                            })
-                    });
-                    sclip.source_clip_id = None;
-                    let synced = sync_audio_clip_from_session(sclip, base, fps_u32);
-                    live_clip_ids.insert(synced.id);
-                    synced
-                })
-                .collect();
-            synced_atracks.push(at);
-        }
-        self.project.sequence.audio_tracks = synced_atracks;
-
-        // Prune stale clip UUIDs (e.g. engulfed or deleted clips) from clip_links.
-        self.project.sequence.clip_links.retain(|_, members| {
-            members.retain(|id| live_clip_ids.contains(id));
-            !members.is_empty()
-        });
 
         let new_doc_deps = self.document.collect_plugin_dependencies();
         for old_dep in &self.prev_doc_plugin_deps {
@@ -3876,7 +4425,9 @@ impl Session {
                                 .source_clip_id
                                 .clone()
                                 .or_else(|| Some(other.id.clone()));
-                            right_rem.id = right_id;
+                            right_rem.id = right_id.clone();
+                            self.pending_clip_side_table_shifts
+                                .insert(right_id, -cut_right);
                             right_rem.start = placed_end;
                             right_rem.length = new_right_len;
                             right_rem.shift_all_keyframes(-cut_right);
@@ -4030,6 +4581,7 @@ impl Session {
                 self.project = zc_project::Project::new_cm3_default();
                 self.document = SessionDocument::from_project(&self.project);
                 self.asset_blobs.clear();
+                self.pending_clip_side_table_shifts.clear();
                 self.selection.clear_all();
                 self.playback = PlaybackState::default();
                 self.history.clear();
@@ -4066,7 +4618,7 @@ impl Session {
                     )));
                 }
                 self.document.fps = fps.round().clamp(1.0, 240.0);
-                self.project.sequence.exact_fps = None;
+                self.active_sequence_mut().exact_fps = None;
                 self.playback.bump_epoch();
                 Ok(json!({ "fps": self.document.fps }))
             }
@@ -4343,14 +4895,60 @@ impl Session {
                     )));
                 }
 
+                let kind = match kind.as_str() {
+                    "shape2d" | "shape_2d" => "shape".to_owned(),
+                    "text2d" => "text_2d".to_owned(),
+                    "precomp" => "zoidium:precomp-plus/precomp".to_owned(),
+                    "shape_plus" => "zoidium:shape-plus/shape-layer".to_owned(),
+                    _ => kind,
+                };
                 let clip_id = self.alloc_uuid_id();
                 let clip_name = name.unwrap_or_else(|| kind.clone());
                 let fps = self.document.fps.max(1.0);
-                let properties = default_clip_properties(
-                    track_kind,
-                    &kind,
-                    self.project.sequence.background_color,
-                );
+                let seq_bg = self.active_sequence().background_color;
+                let mut properties = default_clip_properties(track_kind, &kind, seq_bg);
+                if kind == "zoidium:precomp-plus/precomp" {
+                    let comp_uuid = parse_uuid_or_new(&self.alloc_uuid_id());
+                    let v1_uuid = parse_uuid_or_new(&self.alloc_uuid_id());
+                    let a1_uuid = parse_uuid_or_new(&self.alloc_uuid_id());
+                    let comp = zc_project::Sequence {
+                        id: comp_uuid,
+                        name: clip_name.clone(),
+                        resolution: self.document.resolution,
+                        fps: fps.round().clamp(1.0, 240.0) as u32,
+                        length_frames: self.document.sequence_length.max(length),
+                        background_color: seq_bg,
+                        video_tracks: vec![zc_project::VideoTrack {
+                            id: v1_uuid,
+                            name: "V1".to_owned(),
+                            enabled: true,
+                            solo: false,
+                            locked: false,
+                            is_3d: false,
+                            clips: Vec::new(),
+                            preserved: BTreeMap::new(),
+                        }],
+                        audio_tracks: vec![zc_project::AudioTrack {
+                            id: a1_uuid,
+                            name: "A1".to_owned(),
+                            enabled: true,
+                            muted: false,
+                            solo: false,
+                            locked: false,
+                            clips: Vec::new(),
+                            preserved: BTreeMap::new(),
+                        }],
+                        ..zc_project::Sequence::default()
+                    };
+                    self.project.compositions.insert(comp_uuid, comp);
+                    properties.insert(
+                        "compositionId".to_owned(),
+                        SessionProperty::static_value_with_kind(
+                            json!(comp_uuid.to_string()),
+                            SessionValueKind::Text,
+                        ),
+                    );
+                }
                 let mut clip = SessionClip {
                     id: clip_id.clone(),
                     kind: kind.clone(),
@@ -4557,6 +5155,30 @@ impl Session {
                 let length = clip.length;
                 let time_start = clip.time_start;
                 let time_end = clip.time_end;
+                if kind == TrackKind::Video
+                    && let Ok(clip_uuid) = zc_project::Uuid::parse_str(&clip_id)
+                {
+                    let seq = self.active_sequence_mut();
+                    if let Some(layer_id) = seq
+                        .video_tracks
+                        .iter()
+                        .flat_map(|t| t.clips.iter())
+                        .find(|c| c.id == clip_uuid)
+                        .map(|c| c.layer.id)
+                        && let Some(masks) = seq.layer_masks.get_mut(&layer_id)
+                    {
+                        if rate_stretch && old_length > 0.0 {
+                            let scale = length / old_length;
+                            for m in masks {
+                                scale_property_track_keyframes(&mut m.path, scale);
+                            }
+                        } else {
+                            for m in masks {
+                                shift_property_track_keyframes(&mut m.path, -applied_delta);
+                            }
+                        }
+                    }
+                }
                 self.resolve_track_overlaps(kind, track_idx, &clip_id);
                 self.playback.bump_epoch();
                 Ok(json!({
@@ -4648,6 +5270,26 @@ impl Session {
                 let start = clip.start;
                 let time_start = clip.time_start;
                 let time_end = clip.time_end;
+                if kind == TrackKind::Video
+                    && rate_stretch
+                    && old_length > 0.0
+                    && let Ok(clip_uuid) = zc_project::Uuid::parse_str(&clip_id)
+                {
+                    let scale = new_length / old_length;
+                    let seq = self.active_sequence_mut();
+                    if let Some(layer_id) = seq
+                        .video_tracks
+                        .iter()
+                        .flat_map(|t| t.clips.iter())
+                        .find(|c| c.id == clip_uuid)
+                        .map(|c| c.layer.id)
+                        && let Some(masks) = seq.layer_masks.get_mut(&layer_id)
+                    {
+                        for m in masks {
+                            scale_property_track_keyframes(&mut m.path, scale);
+                        }
+                    }
+                }
                 self.resolve_track_overlaps(kind, track_idx, &clip_id);
                 self.document.recompute_sequence_length_if_extended();
                 self.playback.bump_epoch();
@@ -4700,6 +5342,8 @@ impl Session {
                     .clone()
                     .or_else(|| Some(right_clip.id.clone()));
                 right_clip.id = right_clip_id.clone();
+                self.pending_clip_side_table_shifts
+                    .insert(right_clip_id.clone(), -local_offset);
                 right_clip.start = orig_start + local_offset;
                 right_clip.length = orig_length - local_offset;
                 // Spec 02 §2.7: shift all dynamic keyframes on right half by -local_offset
@@ -4832,13 +5476,14 @@ impl Session {
                         }
                     }
                 }
+                let (canonical_kind, poly_shape_opt) = canonicalize_object_3d_kind(&kind);
                 let new_obj_id = self.alloc_uuid_id();
                 let (track, clip_idx) = self
                     .document
                     .find_clip_mut(&clip_id)
                     .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                 let clip = &mut track.clips[clip_idx];
-                let obj_name = name.unwrap_or_else(|| kind.clone());
+                let obj_name = name.unwrap_or_else(|| canonical_kind.clone());
                 let mut properties = BTreeMap::new();
                 properties.insert(
                     "position".to_string(),
@@ -4856,7 +5501,7 @@ impl Session {
                     "enabled".to_string(),
                     SessionProperty::static_value(json!(1)),
                 );
-                match kind.as_str() {
+                match canonical_kind.as_str() {
                     "text" | "text_3d" => {
                         properties.insert(
                             "text".to_string(),
@@ -4895,13 +5540,35 @@ impl Session {
                             SessionProperty::static_value(json!(1.0)),
                         );
                     }
-                    k if k.contains("light") => {
-                        let lkind = match k {
-                            "point_light" => 1,
-                            "directional_light" => 2,
-                            "hemisphere_light" => 3,
-                            "ambient_light" => 4,
-                            _ => 0,
+                    k if is_3d_repeater_kind(k) => {
+                        insert_default_repeater_properties(k, &mut properties);
+                    }
+                    k if is_3d_text_plus_kind(k) => {
+                        insert_default_text_plus_properties(k, &mut properties);
+                    }
+                    k if is_3d_expresstext_plus_kind(k) => {
+                        insert_default_expresstext_properties(k, &mut properties);
+                    }
+                    k if is_3d_optical_flare_kind(k) => {
+                        insert_default_optical_flare_properties(&mut properties);
+                    }
+                    k if plugin_light_kind(k).is_some() || k.contains("light") => {
+                        let lkind = if let Some(pk) = plugin_light_kind(k) {
+                            match pk {
+                                zc_project::LightKind::Spot => 0,
+                                zc_project::LightKind::Point => 1,
+                                zc_project::LightKind::Directional => 2,
+                                zc_project::LightKind::Hemisphere => 3,
+                                zc_project::LightKind::Ambient => 4,
+                            }
+                        } else {
+                            match k {
+                                "point_light" => 1,
+                                "directional_light" => 2,
+                                "hemisphere_light" => 3,
+                                "ambient_light" => 4,
+                                _ => 0,
+                            }
                         };
                         properties.insert(
                             "light.kind".to_string(),
@@ -4919,8 +5586,23 @@ impl Session {
                             "distance".to_string(),
                             SessionProperty::static_value(json!(0.0)),
                         );
+                        properties.insert(
+                            "castShadow".to_string(),
+                            SessionProperty::static_value(json!(u32::from(matches!(lkind, 0..=2)))),
+                        );
+                        properties.insert(
+                            "shadowMapSize".to_string(),
+                            SessionProperty::static_value(json!(1024)),
+                        );
+                        properties.insert(
+                            "shadowBias".to_string(),
+                            SessionProperty::static_value(json!(0.0)),
+                        );
                     }
-                    k if k.contains("camera") => {
+                    k if is_3d_trapcode_kind(k) => {
+                        insert_default_trapcode_properties(k, &mut properties);
+                    }
+                    k if is_3d_camera_plus_kind(k) || k.contains("camera") => {
                         properties.insert(
                             "position".to_string(),
                             SessionProperty::static_value(json!([0.0, 0.0, 80.0])),
@@ -4937,23 +5619,111 @@ impl Session {
                             "far".to_string(),
                             SessionProperty::static_value(json!(5000.0)),
                         );
+                        properties.insert(
+                            "zoom".to_string(),
+                            SessionProperty::static_value(json!(1.0)),
+                        );
+                        if is_3d_camera_plus_kind(k) {
+                            properties.insert(
+                                "active".to_string(),
+                                SessionProperty::static_value_with_kind(
+                                    json!(1),
+                                    SessionValueKind::Option,
+                                ),
+                            );
+                            properties.insert(
+                                "focalLength".to_string(),
+                                SessionProperty::static_value(json!(35.0)),
+                            );
+                            properties.insert(
+                                "filmGate".to_string(),
+                                SessionProperty::static_value(json!(36.0)),
+                            );
+                            properties.insert(
+                                "filmOffsetX".to_string(),
+                                SessionProperty::static_value(json!(0.0)),
+                            );
+                            properties.insert(
+                                "filmOffsetY".to_string(),
+                                SessionProperty::static_value(json!(0.0)),
+                            );
+                        }
                     }
                     "particles" => {
+                        let p = default_particles_data();
+                        properties.insert(
+                            "particles.time".to_string(),
+                            property_track_to_session(&p.time),
+                        );
+                        properties.insert(
+                            "particles.color".to_string(),
+                            SessionProperty::static_value_with_kind(
+                                json!(
+                                    serde_json::to_string(&p.color)
+                                        .unwrap_or_else(|_| "[]".to_owned())
+                                ),
+                                SessionValueKind::Text,
+                            ),
+                        );
+                        properties.insert(
+                            "particles.size".to_string(),
+                            SessionProperty::static_value_with_kind(
+                                json!(
+                                    serde_json::to_string(&p.size)
+                                        .unwrap_or_else(|_| "[]".to_owned())
+                                ),
+                                SessionValueKind::Text,
+                            ),
+                        );
                         properties.insert(
                             "particles.number".to_string(),
-                            SessionProperty::static_value(json!(100)),
+                            SessionProperty::static_value(json!(p.number)),
                         );
                         properties.insert(
                             "particles.rate".to_string(),
-                            SessionProperty::static_value(json!(25.0)),
+                            SessionProperty::static_value(json!(p.rate)),
                         );
                         properties.insert(
                             "particles.lifetime".to_string(),
-                            SessionProperty::static_value(json!(2.0)),
+                            SessionProperty::static_value(json!(p.lifetime)),
                         );
+                        properties.insert(
+                            "particles.pspread".to_string(),
+                            SessionProperty::static_value_with_kind(
+                                json!(p.pspread),
+                                SessionValueKind::Vec3,
+                            ),
+                        );
+                        properties.insert(
+                            "particles.vspread".to_string(),
+                            SessionProperty::static_value_with_kind(
+                                json!(p.vspread),
+                                SessionValueKind::Vec3,
+                            ),
+                        );
+                        if let Some(preset) = p.sprite_preset {
+                            properties.insert(
+                                "particles.spritePreset".to_string(),
+                                SessionProperty::static_value_with_kind(
+                                    json!(preset),
+                                    SessionValueKind::Text,
+                                ),
+                            );
+                        }
                     }
                     "group" => {}
+                    k if (k.starts_with("zoidium:") || k.starts_with("zoidcraft:"))
+                        && !k.starts_with("zoidium:geometry-plus/") => {}
                     _ => {
+                        if let Some(shape_idx) = poly_shape_opt {
+                            properties.insert(
+                                "polyhedron.shape".to_string(),
+                                SessionProperty::static_value_with_kind(
+                                    json!(shape_idx),
+                                    SessionValueKind::Option,
+                                ),
+                            );
+                        }
                         properties.insert(
                             "material.type".to_string(),
                             SessionProperty::static_value(json!(3)),
@@ -4980,7 +5750,7 @@ impl Session {
                 clip.objects_3d.push(SessionObject3D {
                     id: new_obj_id.clone(),
                     parent_id: parent_id.clone(),
-                    kind: kind.clone(),
+                    kind: canonical_kind.clone(),
                     name: obj_name.clone(),
                     source_id: None,
                     properties,
@@ -4989,7 +5759,7 @@ impl Session {
                     "clip_id": clip_id,
                     "object_id": new_obj_id,
                     "parent_id": parent_id,
-                    "kind": kind,
+                    "kind": canonical_kind,
                     "name": obj_name,
                 }))
             }
@@ -5787,6 +6557,104 @@ impl Session {
                     "plugins": plugins,
                 }))
             }
+
+            // --- Pro Commands (Shape+, LayerMask, Precomp+, Preserved/Preset/SplitLetters, Markers, Controls, Clipboard, Assets) ---
+            Command::UpdateShapePlusPayload { clip_id, payload } => {
+                self.exec_update_shape_plus_payload(clip_id, payload)
+            }
+            Command::AddLayerMask { clip_id, mask } => self.exec_add_layer_mask(clip_id, mask),
+            Command::UpdateLayerMask {
+                clip_id,
+                mask_id,
+                mask,
+            } => self.exec_update_layer_mask(clip_id, mask_id, mask),
+            Command::RemoveLayerMask { clip_id, mask_id } => {
+                self.exec_remove_layer_mask(clip_id, mask_id)
+            }
+            Command::ReorderLayerMask {
+                clip_id,
+                mask_id,
+                to_index,
+            } => self.exec_reorder_layer_mask(clip_id, mask_id, to_index),
+            Command::DuplicateLayerMask { clip_id, mask_id } => {
+                self.exec_duplicate_layer_mask(clip_id, mask_id)
+            }
+            Command::CreateComposition {
+                name,
+                resolution,
+                fps,
+                length_frames,
+            } => self.exec_create_composition(name, resolution, fps, length_frames),
+            Command::RenameComposition { comp_id, name } => {
+                self.exec_rename_composition(comp_id, name)
+            }
+            Command::DuplicateComposition { comp_id } => self.exec_duplicate_composition(comp_id),
+            Command::DeleteComposition { comp_id } => self.exec_delete_composition(comp_id),
+            Command::PrecomposeClips { clip_ids, name } => {
+                self.exec_precompose_clips(clip_ids, name)
+            }
+            Command::SetActiveComposition { comp_id } => self.exec_set_active_composition(comp_id),
+            Command::SetPrecompClipTarget {
+                clip_id,
+                composition_id,
+            } => self.exec_set_precomp_clip_target(clip_id, composition_id),
+            Command::UpdateLayerPreserved {
+                clip_id,
+                key,
+                value,
+            } => self.exec_update_layer_preserved(clip_id, key, value),
+            Command::SetPresetShapeKind {
+                clip_id,
+                shape_kind,
+            } => self.exec_set_preset_shape_kind(clip_id, shape_kind),
+            Command::SplitText3DIntoLetters { clip_id, object_id } => {
+                self.exec_split_text_3d_into_letters(clip_id, object_id)
+            }
+            Command::AddMarker { frame, name, color } => self.exec_add_marker(frame, name, color),
+            Command::UpdateMarker {
+                index,
+                frame,
+                name,
+                color,
+            } => self.exec_update_marker(index, frame, name, color),
+            Command::DeleteMarker { index } => self.exec_delete_marker(index),
+            Command::AddSequenceControl {
+                name,
+                kind,
+                value,
+                min,
+                max,
+                step,
+            } => self.exec_add_sequence_control(name, kind, value, min, max, step),
+            Command::UpdateSequenceControl {
+                control_id,
+                name,
+                value,
+                min,
+                max,
+                step,
+            } => self.exec_update_sequence_control(control_id, name, value, min, max, step),
+            Command::DeleteSequenceControl { control_id } => {
+                self.exec_delete_sequence_control(control_id)
+            }
+            Command::ReorderSequenceControl {
+                control_id,
+                to_index,
+            } => self.exec_reorder_sequence_control(control_id, to_index),
+            Command::PasteClips {
+                clips,
+                target_frame,
+            } => self.exec_paste_clips(clips, target_frame),
+            Command::FreezeClipFrame { clip_id, frame } => {
+                self.exec_freeze_clip_frame(clip_id, frame)
+            }
+            Command::ReverseClip { clip_id } => self.exec_reverse_clip(clip_id),
+            Command::RelinkAsset {
+                asset_id,
+                filename,
+                bytes,
+            } => self.exec_relink_asset(asset_id, filename, bytes),
+            Command::PurgeUnusedAssets => self.exec_purge_unused_assets(),
         }
     }
 
@@ -5805,14 +6673,6 @@ impl ControlTarget for Session {
     fn dispatch_command(&mut self, command: Command) -> Result<Value, ControlError> {
         self.execute(command).map_err(ControlError::from)
     }
-}
-
-fn is_3d_repeater_kind(kind: &str) -> bool {
-    kind.starts_with("zoidium:repeater/") || kind.starts_with("zoidcraft:repeater/")
-}
-
-fn is_3d_container_kind(kind: &str) -> bool {
-    kind == "group" || is_3d_repeater_kind(kind)
 }
 
 fn extract_namespaced_plugin_id(s: &str) -> Option<&str> {
@@ -6035,12 +6895,21 @@ fn sync_material_from_session(
     props: &BTreeMap<String, SessionProperty>,
     mat_slot: &mut Option<zc_project::MaterialSpec>,
 ) {
-    let has_any_mat_prop = props.keys().any(|k| k.starts_with("material."));
+    sync_material_from_session_with_prefix(props, "material.", mat_slot);
+}
+
+fn sync_material_from_session_with_prefix(
+    props: &BTreeMap<String, SessionProperty>,
+    prefix: &str,
+    mat_slot: &mut Option<zc_project::MaterialSpec>,
+) {
+    let has_any_mat_prop = props.keys().any(|k| k.starts_with(prefix));
     if !has_any_mat_prop {
         return;
     }
+    let key = |suffix: &str| format!("{prefix}{suffix}");
     let desired_type =
-        prop_f64_static(props, "material.type").map(|v| v.round().clamp(0.0, 8.0) as u32);
+        prop_f64_static(props, &key("type")).map(|v| v.round().clamp(0.0, 8.0) as u32);
     if let Some(t_idx) = desired_type {
         let current_idx = mat_slot.as_ref().and_then(material_type_index);
         if current_idx != Some(t_idx) {
@@ -6058,7 +6927,7 @@ fn sync_material_from_session(
                 7 => zc_project::MaterialSpec::ImagePlus(Box::default()),
                 8 => zc_project::MaterialSpec::NodeMaterial {
                     schema_version: 1,
-                    resolution: 512,
+                    resolution: 256,
                     graph: json!({}),
                 },
                 _ => zc_project::MaterialSpec::CustomPbr(Box::default()),
@@ -6071,129 +6940,135 @@ fn sync_material_from_session(
     let Some(mat) = mat_slot.as_mut() else {
         return;
     };
-    let has_tex_prop = props.contains_key("material.texture");
-    let tex_opt = prop_str_static(props, "material.texture").filter(|s| !s.is_empty());
-    let opt_asset = |key: &str| prop_str_static(props, key).filter(|s| !s.is_empty());
+    let tex_key = key("texture");
+    let has_tex_prop = props.contains_key(&tex_key);
+    let tex_opt = prop_str_static(props, &tex_key).filter(|s| !s.is_empty());
+    let opt_asset = |suffix: &str| prop_str_static(props, &key(suffix)).filter(|s| !s.is_empty());
     match mat {
         zc_project::MaterialSpec::SingleColor { color, side } => {
-            if let Some(p) = props.get("material.color") {
+            if let Some(p) = props.get(&key("color")) {
                 *color = session_property_to_track(p, Some(color));
             }
-            if let Some(s) = prop_f64_static(props, "material.side") {
+            if let Some(s) = prop_f64_static(props, &key("side")) {
                 *side = s.round().clamp(0.0, 2.0) as u32;
             }
         }
         zc_project::MaterialSpec::CustomPbr(pbr) => {
-            if let Some(p) = props.get("material.color") {
+            if let Some(p) = props.get(&key("color")) {
                 pbr.color = session_property_to_track(p, Some(&pbr.color));
             }
-            if let Some(p) = props.get("material.emissive") {
+            if let Some(p) = props.get(&key("emissive")) {
                 pbr.emissive = session_property_to_track(p, Some(&pbr.emissive));
             }
-            if let Some(p) = props.get("material.roughness") {
+            if let Some(p) = props.get(&key("roughness")) {
                 pbr.roughness = session_property_to_track(p, Some(&pbr.roughness));
             }
-            if let Some(p) = props.get("material.metalness") {
+            if let Some(p) = props.get(&key("metalness")) {
                 pbr.metalness = session_property_to_track(p, Some(&pbr.metalness));
             }
             let prev_transparent = pbr.transparent;
-            if let Some(tr) = prop_f64_static(props, "material.transparent") {
+            if let Some(tr) = prop_f64_static(props, &key("transparent")) {
                 pbr.transparent = tr.round() as i64 != 0;
             }
             let transparent_explicitly_changed = pbr.transparent != prev_transparent;
-            if let Some(p) = props.get("material.opacity") {
+            if let Some(p) = props.get(&key("opacity")) {
                 let opacity_changed = property_track_to_session(&pbr.opacity) != *p;
                 pbr.opacity = session_property_to_track(p, Some(&pbr.opacity));
-                let op = prop_f64_static(props, "material.opacity").unwrap_or(1.0);
+                let op = prop_f64_static(props, &key("opacity")).unwrap_or(1.0);
                 if opacity_changed && !transparent_explicitly_changed && (op < 0.999 || p.animated)
                 {
                     pbr.transparent = true;
                 }
             }
-            if let Some(b) = prop_f64_static(props, "material.blending") {
+            if let Some(b) = prop_f64_static(props, &key("blending")) {
                 pbr.blending = b.round().clamp(0.0, 4.0) as u32;
             }
-            if let Some(s) = prop_f64_static(props, "material.side") {
+            if let Some(s) = prop_f64_static(props, &key("side")) {
                 pbr.side = s.round().clamp(0.0, 2.0) as u32;
             }
             if has_tex_prop {
                 pbr.texture = tex_opt;
             }
-            if props.contains_key("material.normalMap") {
-                pbr.normal_map = opt_asset("material.normalMap");
+            if props.contains_key(&key("normalMap")) {
+                pbr.normal_map = opt_asset("normalMap");
             }
-            if let Some(ns) = prop_f64_static(props, "material.normalScale") {
+            if let Some(ns) = prop_f64_static(props, &key("normalScale")) {
                 pbr.normal_scale = ns;
             }
-            if let Some(w) = prop_f64_static(props, "material.wrap") {
+            if let Some(w) = prop_f64_static(props, &key("wrap")) {
                 pbr.wrap = w.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(p) = props.get("material.repeat") {
+            if let Some(p) = props.get(&key("repeat")) {
                 pbr.repeat = session_property_to_track(p, Some(&pbr.repeat));
             }
-            if let Some(p) = props.get("material.offset") {
+            if let Some(p) = props.get(&key("offset")) {
                 pbr.offset = session_property_to_track(p, Some(&pbr.offset));
             }
-            if let Some(p) = props.get("material.center") {
+            if let Some(p) = props.get(&key("center")) {
                 pbr.center = session_property_to_track(p, Some(&pbr.center));
             }
-            if let Some(p) = props.get("material.rotation") {
+            if let Some(p) = props.get(&key("rotation")) {
                 pbr.rotation = session_property_to_track(p, Some(&pbr.rotation));
             }
-            if let Some(r) = prop_f64_static(props, "material.reflection") {
+            if let Some(r) = prop_f64_static(props, &key("reflection")) {
                 pbr.reflection = r.round() as i64 != 0;
+            }
+            if let Some(uv) = prop_f64_static(props, &key("uvNormalized")) {
+                pbr.uv_normalized = uv.round() as i64 != 0;
             }
         }
         zc_project::MaterialSpec::PbrPlus(pbr) => {
-            if let Some(p) = props.get("material.color") {
+            if let Some(p) = props.get(&key("color")) {
                 pbr.base_color = session_property_to_track(p, Some(&pbr.base_color));
             }
-            if let Some(p) = props.get("material.emissive") {
+            if let Some(p) = props.get(&key("emissive")) {
                 pbr.emissive = session_property_to_track(p, Some(&pbr.emissive));
             }
-            if let Some(p) = props.get("material.roughness") {
+            if let Some(p) = props.get(&key("roughness")) {
                 pbr.roughness = session_property_to_track(p, Some(&pbr.roughness));
             }
-            if let Some(p) = props.get("material.metalness") {
+            if let Some(p) = props.get(&key("metalness")) {
                 pbr.metalness = session_property_to_track(p, Some(&pbr.metalness));
             }
             let prev_transparent = pbr.transparent;
-            if let Some(tr) = prop_f64_static(props, "material.transparent") {
+            if let Some(tr) = prop_f64_static(props, &key("transparent")) {
                 pbr.transparent = tr.round() as i64 != 0;
             }
             let transparent_explicitly_changed = pbr.transparent != prev_transparent;
-            if let Some(p) = props.get("material.opacity") {
+            if let Some(p) = props.get(&key("opacity")) {
                 let opacity_changed = property_track_to_session(&pbr.opacity) != *p;
                 pbr.opacity = session_property_to_track(p, Some(&pbr.opacity));
-                let op = prop_f64_static(props, "material.opacity").unwrap_or(1.0);
+                let op = prop_f64_static(props, &key("opacity")).unwrap_or(1.0);
                 if opacity_changed && !transparent_explicitly_changed && (op < 0.999 || p.animated)
                 {
                     pbr.transparent = true;
                 }
             }
-            if let Some(b) = prop_f64_static(props, "material.blending") {
+            if let Some(b) = prop_f64_static(props, &key("blending")) {
                 pbr.blending = b.round().clamp(0.0, 4.0) as u32;
             }
-            if let Some(s) = prop_f64_static(props, "material.side") {
+            if let Some(s) = prop_f64_static(props, &key("side")) {
                 pbr.side = s.round().clamp(0.0, 2.0) as u32;
             }
             if has_tex_prop {
                 pbr.base_color_map = tex_opt;
+            } else if props.contains_key(&key("baseColorMap")) {
+                pbr.base_color_map = opt_asset("baseColorMap");
             }
-            if props.contains_key("material.emissiveMap") {
-                pbr.emissive_map = opt_asset("material.emissiveMap");
+            if props.contains_key(&key("emissiveMap")) {
+                pbr.emissive_map = opt_asset("emissiveMap");
             }
-            if props.contains_key("material.roughnessMap") {
-                pbr.roughness_map = opt_asset("material.roughnessMap");
+            if props.contains_key(&key("roughnessMap")) {
+                pbr.roughness_map = opt_asset("roughnessMap");
             }
-            if props.contains_key("material.metalnessMap") {
-                pbr.metalness_map = opt_asset("material.metalnessMap");
+            if props.contains_key(&key("metalnessMap")) {
+                pbr.metalness_map = opt_asset("metalnessMap");
             }
-            if props.contains_key("material.normalMap") {
-                pbr.normal_map = opt_asset("material.normalMap");
+            if props.contains_key(&key("normalMap")) {
+                pbr.normal_map = opt_asset("normalMap");
             }
-            if let Some(p) = props.get("material.normalScale") {
-                if let Some(ns) = prop_f64_static(props, "material.normalScale") {
+            if let Some(p) = props.get(&key("normalScale")) {
+                if let Some(ns) = prop_f64_static(props, &key("normalScale")) {
                     pbr.normal_scale = ns;
                 }
                 if pbr.normal_scale_track.is_some() || p.animated || p.expression.is_some() {
@@ -6203,39 +7078,51 @@ fn sync_material_from_session(
                     ));
                 }
             }
-            if props.contains_key("material.alphaMap") {
-                pbr.alpha_map = opt_asset("material.alphaMap");
+            if props.contains_key(&key("alphaMap")) {
+                pbr.alpha_map = opt_asset("alphaMap");
             }
-            if props.contains_key("material.aoMap") {
-                pbr.ao_texture = opt_asset("material.aoMap");
+            let has_ao_tex = props.contains_key(&key("aoTexture"));
+            let has_ao_map = props.contains_key(&key("aoMap"));
+            if has_ao_tex && has_ao_map {
+                let tex_val = opt_asset("aoTexture");
+                let map_val = opt_asset("aoMap");
+                if tex_val != pbr.ao_texture {
+                    pbr.ao_texture = tex_val;
+                } else if map_val != pbr.ao_texture {
+                    pbr.ao_texture = map_val;
+                }
+            } else if has_ao_tex {
+                pbr.ao_texture = opt_asset("aoTexture");
+            } else if has_ao_map {
+                pbr.ao_texture = opt_asset("aoMap");
             }
-            if let Some(p) = props.get("material.emissiveIntensity") {
+            if let Some(p) = props.get(&key("emissiveIntensity")) {
                 pbr.emissive_intensity =
                     session_property_to_track(p, Some(&pbr.emissive_intensity));
             }
-            if let Some(at) = prop_f64_static(props, "material.alphaTest") {
+            if let Some(at) = prop_f64_static(props, &key("alphaTest")) {
                 pbr.alpha_test = at;
             }
-            if let Some(r) = prop_f64_static(props, "material.reflection") {
+            if let Some(r) = prop_f64_static(props, &key("reflection")) {
                 pbr.reflection = r.round() as i64 != 0;
             }
-            if let Some(w) = prop_f64_static(props, "material.wrap") {
+            if let Some(w) = prop_f64_static(props, &key("wrap")) {
                 pbr.wrap = w.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(p) = props.get("material.repeat") {
+            if let Some(p) = props.get(&key("repeat")) {
                 pbr.repeat = session_property_to_track(p, Some(&pbr.repeat));
             }
-            if let Some(p) = props.get("material.offset") {
+            if let Some(p) = props.get(&key("offset")) {
                 pbr.offset = session_property_to_track(p, Some(&pbr.offset));
             }
-            if let Some(p) = props.get("material.center") {
+            if let Some(p) = props.get(&key("center")) {
                 pbr.center = session_property_to_track(p, Some(&pbr.center));
             }
-            if let Some(p) = props.get("material.rotation") {
+            if let Some(p) = props.get(&key("rotation")) {
                 pbr.rotation = session_property_to_track(p, Some(&pbr.rotation));
             }
-            if let Some(p) = props.get("material.reflectionIntensity") {
-                if let Some(ri) = prop_f64_static(props, "material.reflectionIntensity") {
+            if let Some(p) = props.get(&key("reflectionIntensity")) {
+                if let Some(ri) = prop_f64_static(props, &key("reflectionIntensity")) {
                     pbr.reflection_intensity = ri;
                 }
                 if pbr.reflection_intensity_track.is_some() || p.animated || p.expression.is_some()
@@ -6246,55 +7133,70 @@ fn sync_material_from_session(
                     ));
                 }
             }
+            // Sync Material+ surface props (AO, Cel, Fresnel, Color Ramp, Bump Noise, UV Projection, Env).
+            for &sk in PBR_PLUS_SURFACE_KEYS {
+                let direct_k = key(sk);
+                let surface_k = format!("{prefix}surface.{sk}");
+                if let Some(prop) = props.get(&direct_k).or_else(|| props.get(&surface_k)) {
+                    let val = session_property_to_preserved_value(prop, |p| {
+                        session_property_to_track(p, None)
+                    });
+                    if val.is_null() {
+                        pbr.preserved.remove(sk);
+                    } else {
+                        pbr.preserved.insert(sk.to_owned(), val);
+                    }
+                }
+            }
         }
         zc_project::MaterialSpec::Texture(tex) => {
             if has_tex_prop {
                 tex.texture = tex_opt;
             }
-            if let Some(s) = prop_f64_static(props, "material.side") {
+            if let Some(s) = prop_f64_static(props, &key("side")) {
                 tex.side = s.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(w) = prop_f64_static(props, "material.wrap") {
+            if let Some(w) = prop_f64_static(props, &key("wrap")) {
                 tex.wrap = w.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(p) = props.get("material.repeat") {
+            if let Some(p) = props.get(&key("repeat")) {
                 tex.repeat = session_property_to_track(p, Some(&tex.repeat));
             }
-            if let Some(p) = props.get("material.offset") {
+            if let Some(p) = props.get(&key("offset")) {
                 tex.offset = session_property_to_track(p, Some(&tex.offset));
             }
-            if let Some(p) = props.get("material.center") {
+            if let Some(p) = props.get(&key("center")) {
                 tex.center = session_property_to_track(p, Some(&tex.center));
             }
-            if let Some(p) = props.get("material.rotation") {
+            if let Some(p) = props.get(&key("rotation")) {
                 tex.rotation = session_property_to_track(p, Some(&tex.rotation));
             }
         }
         zc_project::MaterialSpec::Video(vid) => {
-            if let Some(p) = props.get("material.color") {
+            if let Some(p) = props.get(&key("color")) {
                 vid.color = session_property_to_track(p, Some(&vid.color));
             }
             let prev_transparent = vid.transparent;
-            if let Some(tr) = prop_f64_static(props, "material.transparent") {
+            if let Some(tr) = prop_f64_static(props, &key("transparent")) {
                 vid.transparent = tr.round() as i64 != 0;
             }
             let transparent_explicitly_changed = vid.transparent != prev_transparent;
-            if let Some(p) = props.get("material.opacity") {
+            if let Some(p) = props.get(&key("opacity")) {
                 let opacity_changed = property_track_to_session(&vid.opacity) != *p;
                 vid.opacity = session_property_to_track(p, Some(&vid.opacity));
-                let op = prop_f64_static(props, "material.opacity").unwrap_or(1.0);
+                let op = prop_f64_static(props, &key("opacity")).unwrap_or(1.0);
                 if opacity_changed && !transparent_explicitly_changed && (op < 0.999 || p.animated)
                 {
                     vid.transparent = true;
                 }
             }
-            if let Some(b) = prop_f64_static(props, "material.blending") {
+            if let Some(b) = prop_f64_static(props, &key("blending")) {
                 vid.blending = b.round().clamp(0.0, 4.0) as u32;
             }
-            if let Some(so) = prop_f64_static(props, "material.startOffset") {
+            if let Some(so) = prop_f64_static(props, &key("startOffset")) {
                 vid.start_offset = so.round().max(0.0) as u32;
             }
-            if let Some(mo) = prop_f64_static(props, "material.mediaOffset") {
+            if let Some(mo) = prop_f64_static(props, &key("mediaOffset")) {
                 vid.media_offset = mo.round().max(0.0) as u32;
             }
             if has_tex_prop {
@@ -6302,30 +7204,30 @@ fn sync_material_from_session(
             }
         }
         zc_project::MaterialSpec::Matcap(mc) => {
-            if let Some(p) = props.get("material.color") {
+            if let Some(p) = props.get(&key("color")) {
                 mc.color = session_property_to_track(p, Some(&mc.color));
             }
-            if let Some(p) = props.get("material.brightness") {
+            if let Some(p) = props.get(&key("brightness")) {
                 mc.brightness = session_property_to_track(p, Some(&mc.brightness));
             }
             let prev_transparent = mc.transparent;
-            if let Some(tr) = prop_f64_static(props, "material.transparent") {
+            if let Some(tr) = prop_f64_static(props, &key("transparent")) {
                 mc.transparent = tr.round() as i64 != 0;
             }
             let transparent_explicitly_changed = mc.transparent != prev_transparent;
-            if let Some(p) = props.get("material.opacity") {
+            if let Some(p) = props.get(&key("opacity")) {
                 let opacity_changed = property_track_to_session(&mc.opacity) != *p;
                 mc.opacity = session_property_to_track(p, Some(&mc.opacity));
-                let op = prop_f64_static(props, "material.opacity").unwrap_or(1.0);
+                let op = prop_f64_static(props, &key("opacity")).unwrap_or(1.0);
                 if opacity_changed && !transparent_explicitly_changed && (op < 0.999 || p.animated)
                 {
                     mc.transparent = true;
                 }
             }
-            if let Some(b) = prop_f64_static(props, "material.blending") {
+            if let Some(b) = prop_f64_static(props, &key("blending")) {
                 mc.blending = b.round().clamp(0.0, 4.0) as u32;
             }
-            if let Some(s) = prop_f64_static(props, "material.side") {
+            if let Some(s) = prop_f64_static(props, &key("side")) {
                 mc.side = s.round().clamp(0.0, 2.0) as u32;
             }
             if has_tex_prop {
@@ -6333,44 +7235,120 @@ fn sync_material_from_session(
             }
         }
         zc_project::MaterialSpec::ImagePlus(img) => {
-            if let Some(p) = props.get("material.opacity") {
+            if let Some(p) = props.get(&key("opacity")) {
                 img.opacity = session_property_to_track(p, Some(&img.opacity));
             }
-            if let Some(tr) = prop_f64_static(props, "material.transparent") {
+            if let Some(tr) = prop_f64_static(props, &key("transparent")) {
                 img.transparent = tr.round() as i64 != 0;
             }
-            if let Some(b) = prop_f64_static(props, "material.blending") {
+            if let Some(b) = prop_f64_static(props, &key("blending")) {
                 img.blending = b.round().clamp(0.0, 4.0) as u32;
             }
-            if let Some(s) = prop_f64_static(props, "material.side") {
+            if let Some(s) = prop_f64_static(props, &key("side")) {
                 img.side = s.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(w) = prop_f64_static(props, "material.wrap") {
+            if let Some(w) = prop_f64_static(props, &key("wrap")) {
                 img.wrap = w.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(p) = props.get("material.repeat") {
+            if let Some(p) = props.get(&key("repeat")) {
                 img.repeat = session_property_to_track(p, Some(&img.repeat));
             }
-            if let Some(p) = props.get("material.offset") {
+            if let Some(p) = props.get(&key("offset")) {
                 img.offset = session_property_to_track(p, Some(&img.offset));
             }
-            if let Some(p) = props.get("material.center") {
+            if let Some(p) = props.get(&key("center")) {
                 img.center = session_property_to_track(p, Some(&img.center));
             }
-            if let Some(p) = props.get("material.rotation") {
+            if let Some(p) = props.get(&key("rotation")) {
                 img.rotation = session_property_to_track(p, Some(&img.rotation));
             }
             if has_tex_prop {
                 img.texture = tex_opt;
             }
         }
-        zc_project::MaterialSpec::CustomShader { frag_shader, .. } => {
-            if let Some(code) = prop_str_static(props, "material.fragShader") {
+        zc_project::MaterialSpec::CustomShader {
+            frag_shader,
+            custom_properties,
+        } => {
+            if let Some(code) = prop_str_static(props, &key("fragShader")) {
                 *frag_shader = code;
             }
+            let custom_prefix = format!("{prefix}custom.");
+            let mut handled = BTreeSet::new();
+            for cp in custom_properties.iter_mut() {
+                let ck = format!("{custom_prefix}{}", cp.name);
+                if let Some(prop) = props.get(&ck) {
+                    cp.track = session_property_to_track(prop, Some(&cp.track));
+                    handled.insert(cp.name.clone());
+                }
+            }
+            for (pk, prop) in props {
+                if let Some(name) = pk.strip_prefix(&custom_prefix)
+                    && !name.is_empty()
+                    && !handled.contains(name)
+                {
+                    custom_properties.push(zc_project::CustomProperty {
+                        name: name.to_owned(),
+                        prop_type: None,
+                        track: session_property_to_track(prop, None),
+                        metadata: BTreeMap::new(),
+                    });
+                }
+            }
         }
-        zc_project::MaterialSpec::NodeMaterial { .. }
-        | zc_project::MaterialSpec::Unknown { .. } => {}
+        zc_project::MaterialSpec::NodeMaterial {
+            schema_version,
+            resolution,
+            graph,
+        } => {
+            if let Some(sv) = prop_f64_static(props, &key("schemaVersion")) {
+                *schema_version = sv.round().max(1.0) as u32;
+            }
+            if let Some(br) = prop_f64_static(props, &key("bakeResolution")) {
+                let raw = br.round().max(0.0) as u32;
+                *resolution = match raw {
+                    0 => 128,
+                    1 => 256,
+                    2 => 512,
+                    3 => 1024,
+                    4 => 2048,
+                    other if other >= 64 => other.min(4096),
+                    _ => 256,
+                };
+            }
+            if let Some(gp) = props.get(&key("graph")).and_then(|p| p.keyframes.first()) {
+                if let Some(s) = gp.value.as_str() {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                        *graph = parsed;
+                    }
+                } else {
+                    *graph = gp.value.clone();
+                }
+            }
+        }
+        zc_project::MaterialSpec::Unknown { .. } => {}
+    }
+}
+
+fn parse_gradient_stops_from_session(
+    props: &BTreeMap<String, SessionProperty>,
+    key: &str,
+) -> Option<Vec<zc_project::GradientStop>> {
+    let val = &props.get(key)?.keyframes.first()?.value;
+    if let Some(s) = val.as_str() {
+        return serde_json::from_str::<Vec<zc_project::GradientStop>>(s).ok();
+    }
+    serde_json::from_value::<Vec<zc_project::GradientStop>>(val.clone()).ok()
+}
+
+fn clamp_track_f64_range(track: &mut zc_project::PropertyTrack, min: f64, max: f64) {
+    if let zc_project::PropertyValue::Number(ref mut n) = track.value {
+        *n = n.clamp(min, max);
+    }
+    for kf in &mut track.keyframes {
+        if let zc_project::PropertyValue::Number(ref mut n) = kf.value {
+            *n = n.clamp(min, max);
+        }
     }
 }
 
@@ -6379,19 +7357,32 @@ fn build_object_3d_from_session(
     existing: Option<zc_project::Object3D>,
     children: Vec<zc_project::Object3D>,
 ) -> zc_project::Object3D {
+    let (canonical_kind, poly_shape_alias) = canonicalize_object_3d_kind(&sobj.kind);
+    let was_existing = existing.is_some();
     let mut obj = existing.unwrap_or_else(|| {
         let mut default_material: Option<zc_project::MaterialSpec> = None;
-        let kind = match sobj.kind.as_str() {
-            k if is_3d_container_kind(k) => zc_project::Object3DKind::Group {
-                reflection_visibility: 0,
-                custom_properties: Vec::new(),
-                children: Vec::new(),
-            },
+        let mut plugin_tag: Option<String> = None;
+        let kind = match canonical_kind.as_str() {
+            k if is_3d_container_kind(k) => {
+                if k != "group" {
+                    plugin_tag = Some(k.to_owned());
+                }
+                zc_project::Object3DKind::Group {
+                    reflection_visibility: 0,
+                    custom_properties: Vec::new(),
+                    children: Vec::new(),
+                }
+            }
             "text" | "text_3d" => {
                 default_material = Some(zc_project::MaterialSpec::single_color_default());
                 zc_project::Object3DKind::Text3D(Box::default())
             }
-            "light" | "spot_light" | "zoidium:light-plus/light_rig" => {
+            k if plugin_light_kind(k).is_some() => {
+                plugin_tag = Some(k.to_owned());
+                let lk = plugin_light_kind(k).unwrap_or(zc_project::LightKind::Spot);
+                zc_project::Object3DKind::Light(Box::new(zc_project::LightData::for_kind(lk)))
+            }
+            "light" | "spot_light" => {
                 zc_project::Object3DKind::Light(Box::new(zc_project::LightData::spot()))
             }
             "point_light" => zc_project::Object3DKind::Light(Box::new(
@@ -6406,21 +7397,12 @@ fn build_object_3d_from_session(
             "ambient_light" => zc_project::Object3DKind::Light(Box::new(
                 zc_project::LightData::for_kind(zc_project::LightKind::Ambient),
             )),
-            "camera" | "zoidium:camera-plus/camera" | "zoidium:camera-plus/camera_plus" => {
+            k if is_3d_camera_plus_kind(k) => {
+                plugin_tag = Some("zoidium:camera-plus/camera".to_owned());
                 zc_project::Object3DKind::Camera(Box::default())
             }
-            "particles" => {
-                let p = zc_project::ParticlesData {
-                    number: 100,
-                    rate: 25.0,
-                    lifetime: 2.0,
-                    pspread: [5.0, 5.0, 5.0],
-                    ivel: [0.0, 4.0, 0.0],
-                    vspread: [2.0, 2.0, 2.0],
-                    ..Default::default()
-                };
-                zc_project::Object3DKind::Particles(Box::new(p))
-            }
+            "camera" => zc_project::Object3DKind::Camera(Box::default()),
+            "particles" => zc_project::Object3DKind::Particles(Box::new(default_particles_data())),
             "model" => {
                 default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
                 zc_project::Object3DKind::Model(Box::default())
@@ -6481,61 +7463,76 @@ fn build_object_3d_from_session(
                     asset_id: None,
                 })
             }
-            "zoidium:geometry-plus/rounded_box" | "zoidium:geometry-plus/rounded-box" => {
+            "zoidium:geometry-plus/rounded-box" => {
+                plugin_tag = Some("zoidium:geometry-plus/rounded-box".to_owned());
                 default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
                 zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::RoundedBox {
-                    size: [10.0, 10.0, 10.0],
-                    radius: 1.5,
-                    segments: 4,
+                    size: [40.0, 24.0, 6.0],
+                    radius: 3.0,
+                    segments: 6,
+                    corner_radius: Some(3.0),
+                    corner_segments: Some(6),
+                    bevel_size: Some(0.6),
+                    bevel_segments: Some(2),
+                    shading: 0,
                 })
+            }
+            "zoidium:geometry-plus/polyhedron" => {
+                plugin_tag = Some("zoidium:geometry-plus/polyhedron".to_owned());
+                default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
+                let shape_idx = poly_shape_alias.unwrap_or_else(|| {
+                    prop_f64_static(&sobj.properties, "polyhedron.shape")
+                        .map_or(0, |v| v.round().clamp(0.0, 3.0) as u32)
+                });
+                let shape = match shape_idx {
+                    1 => zc_project::Shape3DKind::Octahedron {
+                        radius: 12.0,
+                        detail: 0,
+                        shading: 0,
+                    },
+                    2 => zc_project::Shape3DKind::Icosahedron {
+                        radius: 12.0,
+                        detail: 0,
+                        shading: 0,
+                    },
+                    3 => zc_project::Shape3DKind::Dodecahedron {
+                        radius: 12.0,
+                        detail: 0,
+                        shading: 0,
+                    },
+                    _ => zc_project::Shape3DKind::Tetrahedron {
+                        radius: 12.0,
+                        detail: 0,
+                        shading: 0,
+                    },
+                };
+                zc_project::Object3DKind::Shape3D(shape)
             }
             "zoidium:geometry-plus/cone" => {
+                plugin_tag = Some("zoidium:geometry-plus/cone".to_owned());
                 default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
                 zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Cone {
-                    radius: 5.0,
-                    height: 10.0,
+                    radius: 16.0,
+                    height: 32.0,
                     detail: 24,
                     open_ended: false,
-                })
-            }
-            "zoidium:geometry-plus/tetrahedron" => {
-                default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
-                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Tetrahedron {
-                    radius: 6.0,
-                    detail: 0,
-                })
-            }
-            "zoidium:geometry-plus/octahedron" => {
-                default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
-                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Octahedron {
-                    radius: 6.0,
-                    detail: 0,
-                })
-            }
-            "zoidium:geometry-plus/dodecahedron" => {
-                default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
-                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Dodecahedron {
-                    radius: 6.0,
-                    detail: 0,
-                })
-            }
-            "zoidium:geometry-plus/icosahedron" => {
-                default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
-                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Icosahedron {
-                    radius: 6.0,
-                    detail: 0,
+                    top_radius: 0.0,
+                    shading: 0,
                 })
             }
             "zoidium:geometry-plus/capsule" => {
+                plugin_tag = Some("zoidium:geometry-plus/capsule".to_owned());
                 default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
                 zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Capsule {
-                    radius: 3.5,
-                    length: 8.0,
+                    radius: 8.0,
+                    length: 16.0,
                     cap_segments: 8,
-                    radial_segments: 20,
+                    radial_segments: 16,
+                    shading: 0,
                 })
             }
-            "zoidium:geometry-plus/torus_knot" => {
+            "zoidium:geometry-plus/torus-knot" => {
+                plugin_tag = Some("zoidium:geometry-plus/torus-knot".to_owned());
                 default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
                 zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::TorusKnot {
                     radius: 5.0,
@@ -6545,6 +7542,76 @@ fn build_object_3d_from_session(
                     p: 2,
                     q: 3,
                 })
+            }
+            "zoidium:geometry-plus/tube" => {
+                plugin_tag = Some("zoidium:geometry-plus/tube".to_owned());
+                default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
+                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Tube {
+                    outer_radius: 12.0,
+                    inner_radius: 8.0,
+                    height: 24.0,
+                    radial_segments: 24,
+                    open_ended: false,
+                    shading: 0,
+                })
+            }
+            "zoidium:geometry-plus/gear" => {
+                plugin_tag = Some("zoidium:geometry-plus/gear".to_owned());
+                default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
+                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Gear {
+                    teeth: 12,
+                    inner_radius: 10.0,
+                    outer_radius: 16.0,
+                    thickness: 6.0,
+                    tooth_width: 0.55,
+                    bevel_size: 0.3,
+                    bevel_segments: 2,
+                    shading: 0,
+                })
+            }
+            "zoidium:geometry-plus/helix" => {
+                plugin_tag = Some("zoidium:geometry-plus/helix".to_owned());
+                default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
+                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Helix {
+                    radius: 14.0,
+                    height: 32.0,
+                    turns: 3.0,
+                    tube_radius: 2.0,
+                    path_segments: 64,
+                    radial_segments: 8,
+                    shading: 0,
+                })
+            }
+            "zoidium:geometry-plus/spline" => {
+                plugin_tag = Some("zoidium:geometry-plus/spline".to_owned());
+                default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
+                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Spline {
+                    points: vec![[-20.0, 0.0, 0.0], [0.0, 20.0, 0.0], [20.0, 0.0, 0.0]],
+                    interpolation: "Cubic".to_owned(),
+                    closed: false,
+                    start: 0.0,
+                    end: 1.0,
+                    thickness: 2.0,
+                    thickness_map: zc_project::GradientStop::white_default(),
+                    gradient_space: "Curve".to_owned(),
+                    tension: 1.0,
+                    path_segments: 16,
+                    radial_segments: 8,
+                    caps: "Both".to_owned(),
+                    cap_style: "Flat".to_owned(),
+                    shading: 0,
+                })
+            }
+            k if is_3d_optical_flare_kind(k)
+                || is_3d_trapcode_kind(k)
+                || k.starts_with("zoidium:")
+                || k.starts_with("zoidcraft:") =>
+            {
+                plugin_tag = Some(k.to_owned());
+                zc_project::Object3DKind::Dummy {
+                    original_type: Some(k.to_owned()),
+                    payload: json!({}),
+                }
             }
             _ => {
                 default_material = Some(zc_project::MaterialSpec::CustomPbr(Box::default()));
@@ -6556,12 +7623,28 @@ fn build_object_3d_from_session(
         let mut created = zc_project::Object3D::new(&sobj.name, kind);
         created.id = parse_uuid_or_new(&sobj.id);
         created.material = default_material;
+        if let Some(tag) = plugin_tag {
+            created
+                .preserved
+                .insert("zoidiumPluginObjectType".to_string(), json!(tag));
+        }
         created
     });
-    if is_3d_repeater_kind(&sobj.kind) {
+    if is_3d_repeater_kind(&canonical_kind)
+        || is_3d_text_plus_kind(&canonical_kind)
+        || is_3d_expresstext_plus_kind(&canonical_kind)
+        || is_3d_optical_flare_kind(&canonical_kind)
+        || is_3d_trapcode_kind(&canonical_kind)
+        || is_3d_light_plus_kind(&canonical_kind)
+    {
         obj.preserved
-            .insert("zoidiumPluginObjectType".to_string(), json!(sobj.kind));
+            .insert("zoidiumPluginObjectType".to_string(), json!(canonical_kind));
         obj.preserved.remove("type");
+    } else if is_3d_camera_plus_kind(&canonical_kind) {
+        obj.preserved.insert(
+            "zoidiumPluginObjectType".to_string(),
+            json!("zoidium:camera-plus/camera"),
+        );
     }
     obj.name = sobj.name.clone();
     if let Some(p) = sobj.properties.get("enabled") {
@@ -6647,6 +7730,36 @@ fn build_object_3d_from_session(
             }
             if let Some(bp) = prop_f64_static(&sobj.properties, "bevelProfile") {
                 t.bevel_profile = bp.round().clamp(0.0, 1.0) as u32;
+            }
+            if let Some(p) = sobj.properties.get("characterIndexOffset") {
+                t.character_index_offset =
+                    session_property_to_track(p, Some(&t.character_index_offset));
+            }
+            if let Some(p) = sobj.properties.get("characterCountOverride") {
+                t.character_count_override =
+                    session_property_to_track(p, Some(&t.character_count_override));
+            }
+            if let Some(tsm_str) = prop_str_static(&sobj.properties, "textScaleMode") {
+                t.text_scale_mode = zc_project::CompatMode::from_token(&tsm_str);
+            } else if let Some(tsm) = prop_f64_static(&sobj.properties, "textScaleMode") {
+                t.text_scale_mode = if tsm.round() as i64 != 0 {
+                    zc_project::CompatMode::Legacy
+                } else {
+                    zc_project::CompatMode::Current
+                };
+            }
+            if let Some(kern) = prop_f64_static(&sobj.properties, "kerning") {
+                let new_kern = u64::from(kern.round() as i64 != 0);
+                let prev_kern = obj
+                    .preserved
+                    .get("kerning")
+                    .or_else(|| obj.preserved.get("property.kerning"))
+                    .and_then(parse_preserved_bool_u64);
+                let unchanged_default = was_existing && prev_kern.is_none() && new_kern == 1;
+                if prev_kern != Some(new_kern) && !unchanged_default {
+                    obj.preserved.remove("property.kerning");
+                    obj.preserved.insert("kerning".to_owned(), json!(new_kern));
+                }
             }
         }
         zc_project::Object3DKind::Shape3D(s) => match s {
@@ -6763,9 +7876,14 @@ fn build_object_3d_from_session(
                 height,
                 detail,
                 open_ended,
+                top_radius,
+                shading,
             } => {
                 if let Some(r) = prop_f64_static(&sobj.properties, "cone.radius") {
                     *radius = r;
+                }
+                if let Some(tr) = prop_f64_static(&sobj.properties, "cone.topRadius") {
+                    *top_radius = tr.max(0.0);
                 }
                 if let Some(h) = prop_f64_static(&sobj.properties, "cone.height") {
                     *height = h;
@@ -6776,11 +7894,19 @@ fn build_object_3d_from_session(
                 if let Some(oe) = prop_f64_static(&sobj.properties, "cone.openEnded") {
                     *open_ended = oe.round() as i64 != 0;
                 }
+                if let Some(sh) = prop_f64_static(&sobj.properties, "cone.shading") {
+                    *shading = sh.round().clamp(0.0, 1.0) as u32;
+                }
             }
             zc_project::Shape3DKind::RoundedBox {
                 size,
                 radius,
                 segments,
+                corner_radius,
+                corner_segments,
+                bevel_size,
+                bevel_segments,
+                shading,
             } => {
                 if let Some(v) = prop_vec3_static(&sobj.properties, "box_size") {
                     *size = v;
@@ -6791,16 +7917,87 @@ fn build_object_3d_from_session(
                 if let Some(seg) = prop_f64_static(&sobj.properties, "roundedBox.segments") {
                     *segments = seg.round().max(1.0) as u32;
                 }
+                if let Some(cr) = prop_f64_static(&sobj.properties, "roundedBox.cornerRadius")
+                    .or_else(|| prop_f64_static(&sobj.properties, "cornerRadius"))
+                {
+                    *corner_radius = Some(cr.max(0.0));
+                }
+                if let Some(cs) = prop_f64_static(&sobj.properties, "roundedBox.cornerSegments")
+                    .or_else(|| prop_f64_static(&sobj.properties, "cornerSegments"))
+                {
+                    *corner_segments = Some(cs.round().max(1.0) as u32);
+                }
+                if let Some(bs) = prop_f64_static(&sobj.properties, "roundedBox.bevelSize")
+                    .or_else(|| prop_f64_static(&sobj.properties, "bevelSize"))
+                {
+                    *bevel_size = Some(bs.max(0.0));
+                }
+                if let Some(bseg) = prop_f64_static(&sobj.properties, "roundedBox.bevelSegments")
+                    .or_else(|| prop_f64_static(&sobj.properties, "bevelSegments"))
+                {
+                    *bevel_segments = Some(bseg.round().max(0.0) as u32);
+                }
+                if let Some(sh) = prop_f64_static(&sobj.properties, "roundedBox.shading")
+                    .or_else(|| prop_f64_static(&sobj.properties, "shading"))
+                {
+                    *shading = sh.round().clamp(0.0, 1.0) as u32;
+                }
             }
-            zc_project::Shape3DKind::Tetrahedron { radius, detail }
-            | zc_project::Shape3DKind::Octahedron { radius, detail }
-            | zc_project::Shape3DKind::Dodecahedron { radius, detail }
-            | zc_project::Shape3DKind::Icosahedron { radius, detail } => {
+            zc_project::Shape3DKind::Tetrahedron {
+                radius,
+                detail,
+                shading,
+            }
+            | zc_project::Shape3DKind::Octahedron {
+                radius,
+                detail,
+                shading,
+            }
+            | zc_project::Shape3DKind::Dodecahedron {
+                radius,
+                detail,
+                shading,
+            }
+            | zc_project::Shape3DKind::Icosahedron {
+                radius,
+                detail,
+                shading,
+            } => {
                 if let Some(r) = prop_f64_static(&sobj.properties, "polyhedron.radius") {
                     *radius = r;
                 }
                 if let Some(d) = prop_f64_static(&sobj.properties, "polyhedron.detail") {
                     *detail = d.round().max(0.0) as u32;
+                }
+                if let Some(sh) = prop_f64_static(&sobj.properties, "polyhedron.shading") {
+                    *shading = sh.round().clamp(0.0, 1.0) as u32;
+                }
+                if let Some(shape_f) = prop_f64_static(&sobj.properties, "polyhedron.shape") {
+                    let cur_r = *radius;
+                    let cur_d = *detail;
+                    let cur_s = *shading;
+                    *s = match shape_f.round() as i64 {
+                        1 => zc_project::Shape3DKind::Octahedron {
+                            radius: cur_r,
+                            detail: cur_d,
+                            shading: cur_s,
+                        },
+                        2 => zc_project::Shape3DKind::Icosahedron {
+                            radius: cur_r,
+                            detail: cur_d,
+                            shading: cur_s,
+                        },
+                        3 => zc_project::Shape3DKind::Dodecahedron {
+                            radius: cur_r,
+                            detail: cur_d,
+                            shading: cur_s,
+                        },
+                        _ => zc_project::Shape3DKind::Tetrahedron {
+                            radius: cur_r,
+                            detail: cur_d,
+                            shading: cur_s,
+                        },
+                    };
                 }
             }
             zc_project::Shape3DKind::Capsule {
@@ -6808,6 +8005,7 @@ fn build_object_3d_from_session(
                 length,
                 cap_segments,
                 radial_segments,
+                shading,
             } => {
                 if let Some(r) = prop_f64_static(&sobj.properties, "capsule.radius") {
                     *radius = r;
@@ -6820,6 +8018,9 @@ fn build_object_3d_from_session(
                 }
                 if let Some(rs) = prop_f64_static(&sobj.properties, "capsule.radialSegments") {
                     *radial_segments = rs.round().max(1.0) as u32;
+                }
+                if let Some(sh) = prop_f64_static(&sobj.properties, "capsule.shading") {
+                    *shading = sh.round().clamp(0.0, 1.0) as u32;
                 }
             }
             zc_project::Shape3DKind::TorusKnot {
@@ -6847,6 +8048,174 @@ fn build_object_3d_from_session(
                 }
                 if let Some(qv) = prop_f64_static(&sobj.properties, "torusKnot.q") {
                     *q = qv.round().max(1.0) as u32;
+                }
+            }
+            zc_project::Shape3DKind::Tube {
+                outer_radius,
+                inner_radius,
+                height,
+                radial_segments,
+                open_ended,
+                shading,
+            } => {
+                if let Some(v) = prop_f64_static(&sobj.properties, "tube.outerRadius") {
+                    *outer_radius = v.max(0.01);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "tube.innerRadius") {
+                    *inner_radius = v.max(0.0);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "tube.height") {
+                    *height = v.max(0.01);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "tube.radialSegments") {
+                    *radial_segments = v.round().max(3.0) as u32;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "tube.openEnded") {
+                    *open_ended = v.round() as i64 != 0;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "tube.shading") {
+                    *shading = v.round().clamp(0.0, 1.0) as u32;
+                }
+            }
+            zc_project::Shape3DKind::Gear {
+                teeth,
+                inner_radius,
+                outer_radius,
+                thickness,
+                tooth_width,
+                bevel_size,
+                bevel_segments,
+                shading,
+            } => {
+                if let Some(v) = prop_f64_static(&sobj.properties, "gear.teeth") {
+                    *teeth = v.round().clamp(3.0, 64.0) as u32;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "gear.innerRadius") {
+                    *inner_radius = v.max(0.01);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "gear.outerRadius") {
+                    *outer_radius = v.max(0.01);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "gear.thickness") {
+                    *thickness = v.max(0.01);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "gear.toothWidth") {
+                    *tooth_width = v.clamp(0.05, 0.95);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "gear.bevelSize") {
+                    *bevel_size = v.max(0.0);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "gear.bevelSegments") {
+                    *bevel_segments = v.round().max(0.0) as u32;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "gear.shading") {
+                    *shading = v.round().clamp(0.0, 1.0) as u32;
+                }
+            }
+            zc_project::Shape3DKind::Helix {
+                radius,
+                height,
+                turns,
+                tube_radius,
+                path_segments,
+                radial_segments,
+                shading,
+            } => {
+                if let Some(v) = prop_f64_static(&sobj.properties, "helix.radius") {
+                    *radius = v.max(0.01);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "helix.height") {
+                    *height = v.max(0.01);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "helix.turns") {
+                    *turns = v.max(0.05);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "helix.tubeRadius") {
+                    *tube_radius = v.max(0.01);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "helix.pathSegments") {
+                    *path_segments = v.round().max(8.0) as u32;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "helix.radialSegments") {
+                    *radial_segments = v.round().max(3.0) as u32;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "helix.shading") {
+                    *shading = v.round().clamp(0.0, 1.0) as u32;
+                }
+            }
+            zc_project::Shape3DKind::Spline {
+                points,
+                interpolation,
+                closed,
+                start,
+                end,
+                thickness,
+                thickness_map,
+                gradient_space,
+                tension,
+                path_segments,
+                radial_segments,
+                caps,
+                cap_style,
+                shading,
+            } => {
+                if let Some(vp) = sobj
+                    .properties
+                    .get("spline.points")
+                    .and_then(|p| p.keyframes.first())
+                {
+                    let parsed: Option<Vec<[f64; 3]>> = if let Some(s) = vp.value.as_str() {
+                        serde_json::from_str(s).ok()
+                    } else {
+                        serde_json::from_value(vp.value.clone()).ok()
+                    };
+                    if let Some(pts) = parsed
+                        && pts.len() >= 2
+                    {
+                        *points = pts;
+                    }
+                }
+                if let Some(s) = prop_str_static(&sobj.properties, "spline.interpolation") {
+                    *interpolation = s;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "spline.closed") {
+                    *closed = v.round() as i64 != 0;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "spline.start") {
+                    *start = v.clamp(0.0, 1.0);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "spline.end") {
+                    *end = v.clamp(0.0, 1.0);
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "spline.thickness") {
+                    *thickness = v.max(0.01);
+                }
+                if let Some(stops) =
+                    parse_gradient_stops_from_session(&sobj.properties, "spline.thicknessMap")
+                    && !stops.is_empty()
+                {
+                    *thickness_map = stops;
+                }
+                if let Some(s) = prop_str_static(&sobj.properties, "spline.gradientSpace") {
+                    *gradient_space = s;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "spline.tension") {
+                    *tension = v;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "spline.pathSegments") {
+                    *path_segments = v.round().max(1.0) as u32;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "spline.radialSegments") {
+                    *radial_segments = v.round().max(3.0) as u32;
+                }
+                if let Some(s) = prop_str_static(&sobj.properties, "spline.caps") {
+                    *caps = s;
+                }
+                if let Some(s) = prop_str_static(&sobj.properties, "spline.capStyle") {
+                    *cap_style = s;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "spline.shading") {
+                    *shading = v.round().clamp(0.0, 1.0) as u32;
                 }
             }
         },
@@ -6893,6 +8262,17 @@ fn build_object_3d_from_session(
             if let Some(v) = prop_f64_static(&sobj.properties, "castShadow") {
                 l.cast_shadow = v.round() as i64 != 0;
             }
+            if let Some(v) = prop_f64_static(&sobj.properties, "shadowMapSize") {
+                let raw = v.round().max(0.0) as u32;
+                if raw != l.shadow_map_size {
+                    l.shadow_map_size = raw.clamp(64, 4096);
+                }
+            }
+            if let Some(v) = prop_f64_static(&sobj.properties, "shadowBias")
+                && (v - l.shadow_bias).abs() > 1e-12
+            {
+                l.shadow_bias = v.clamp(-1.0, 1.0);
+            }
         }
         zc_project::Object3DKind::Camera(c) => {
             if let Some(ck) = prop_f64_static(&sobj.properties, "camera.kind") {
@@ -6913,6 +8293,35 @@ fn build_object_3d_from_session(
             }
             if let Some(p) = sobj.properties.get("zoom") {
                 c.zoom = session_property_to_track(p, Some(&c.zoom));
+            }
+            if let Some(v) = prop_f64_static(&sobj.properties, "active") {
+                c.active = v.round() as i64 != 0;
+            }
+            if let Some(p) = sobj.properties.get("focalLength") {
+                c.focal_length = session_property_to_track(p, Some(&c.focal_length));
+            }
+            if let Some(v) = prop_f64_static(&sobj.properties, "filmGate")
+                && (v - c.film_gate).abs() > 1e-12
+            {
+                c.film_gate = v.clamp(1.0, 500.0);
+            }
+            if let Some(p) = sobj.properties.get("filmOffsetX") {
+                c.film_offset_x = session_property_to_track(p, Some(&c.film_offset_x));
+            }
+            if let Some(p) = sobj.properties.get("filmOffsetY") {
+                c.film_offset_y = session_property_to_track(p, Some(&c.film_offset_y));
+            }
+            if sobj.properties.keys().any(|k| k.starts_with("motionBlur.")) {
+                let mb = c.motion_blur.get_or_insert_with(Default::default);
+                if let Some(v) = prop_f64_static(&sobj.properties, "motionBlur.enabled") {
+                    mb.enabled = v.round() as i64 != 0;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "motionBlur.samples") {
+                    mb.samples = v.round().clamp(1.0, 64.0) as u32;
+                }
+                if let Some(p) = sobj.properties.get("motionBlur.shutter") {
+                    mb.shutter = session_property_to_track(p, Some(&mb.shutter));
+                }
             }
             if let Some(p) = sobj.properties.get("shakeAmplitude") {
                 c.shake_amplitude = session_property_to_track(p, Some(&c.shake_amplitude));
@@ -6964,7 +8373,11 @@ fn build_object_3d_from_session(
                     dof.focus_distance = session_property_to_track(p, Some(&dof.focus_distance));
                 }
                 if let Some(p) = sobj.properties.get("dofAperture") {
+                    let changed = property_track_to_session(&dof.aperture) != *p;
                     dof.aperture = session_property_to_track(p, Some(&dof.aperture));
+                    if changed {
+                        clamp_track_f64_range(&mut dof.aperture, 0.0, 40.0);
+                    }
                 }
                 if let Some(p) = sobj.properties.get("dofFocusAreaWidth") {
                     dof.focus_area_width =
@@ -6996,11 +8409,43 @@ fn build_object_3d_from_session(
                 if let Some(p) = sobj.properties.get("vibrate.frequency") {
                     vib.frequency = session_property_to_track(p, Some(&vib.frequency));
                 }
+                if let Some(v) = prop_f64_static(&sobj.properties, "vibrate.regularPulse") {
+                    vib.regular_pulse = v.round() as i64 != 0;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "vibrate.relative") {
+                    vib.relative = v.round() as i64 != 0;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "vibrate.enablePosition") {
+                    vib.enable_position = v.round() as i64 != 0;
+                }
+                if let Some(v) = prop_f64_static(&sobj.properties, "vibrate.enableRotation") {
+                    vib.enable_rotation = v.round() as i64 != 0;
+                }
+                if let Some(p) = sobj.properties.get("vibrate.positionFrequency") {
+                    vib.position_frequency =
+                        session_property_to_track(p, Some(&vib.position_frequency));
+                }
+                if let Some(p) = sobj.properties.get("vibrate.rotationFrequency") {
+                    vib.rotation_frequency =
+                        session_property_to_track(p, Some(&vib.rotation_frequency));
+                }
             }
         }
         zc_project::Object3DKind::Particles(pt) => {
             if let Some(p) = sobj.properties.get("particles.time") {
                 pt.time = session_property_to_track(p, Some(&pt.time));
+            }
+            if let Some(stops) =
+                parse_gradient_stops_from_session(&sobj.properties, "particles.color")
+                && !stops.is_empty()
+            {
+                pt.color = stops;
+            }
+            if let Some(stops) =
+                parse_gradient_stops_from_session(&sobj.properties, "particles.size")
+                && !stops.is_empty()
+            {
+                pt.size = stops;
             }
             if let Some(v) = prop_f64_static(&sobj.properties, "particles.number") {
                 let raw = v.round().max(0.0) as u32;
@@ -7066,6 +8511,10 @@ fn build_object_3d_from_session(
                 pt.texture = prop_str_static(&sobj.properties, "particles.texture")
                     .filter(|s| !s.is_empty());
             }
+            if sobj.properties.contains_key("particles.spritePreset") {
+                pt.sprite_preset = prop_str_static(&sobj.properties, "particles.spritePreset")
+                    .filter(|s| !s.is_empty());
+            }
         }
         zc_project::Object3DKind::Group {
             reflection_visibility,
@@ -7081,6 +8530,45 @@ fn build_object_3d_from_session(
     }
 
     sync_material_from_session(&sobj.properties, &mut obj.material);
+    if sobj
+        .properties
+        .keys()
+        .any(|k| k.starts_with("frontMaterial."))
+    {
+        let mut slot = obj.material_slots.remove("front");
+        sync_material_from_session_with_prefix(&sobj.properties, "frontMaterial.", &mut slot);
+        if let Some(mat) = slot {
+            obj.material_slots.insert("front".to_owned(), mat);
+        }
+    }
+    if sobj
+        .properties
+        .keys()
+        .any(|k| k.starts_with("sideMaterial."))
+    {
+        let mut slot = obj.material_slots.remove("side");
+        sync_material_from_session_with_prefix(&sobj.properties, "sideMaterial.", &mut slot);
+        if let Some(mat) = slot {
+            obj.material_slots.insert("side".to_owned(), mat);
+        }
+    }
+
+    if uses_preserved_plugin_properties(&canonical_kind)
+        || matches!(obj.kind, zc_project::Object3DKind::Dummy { .. })
+    {
+        for (pk, prop) in &sobj.properties {
+            if is_core_object_3d_property(pk) {
+                continue;
+            }
+            let val =
+                session_property_to_preserved_value(prop, |p| session_property_to_track(p, None));
+            obj.preserved.insert(format!("property.{pk}"), val.clone());
+            if pk == "fieldNoiseEvolution" && !sobj.properties.contains_key("fieldEvolution") {
+                obj.preserved
+                    .insert("property.fieldEvolution".to_owned(), val);
+            }
+        }
+    }
 
     let default_track_axis = if matches!(
         obj.kind,
@@ -7099,7 +8587,7 @@ fn build_object_3d_from_session(
                         target_id: String::new(),
                         track_axis: default_track_axis,
                         up_axis: 1,
-                        influence: zc_project::PropertyTrack::number(1.0),
+                        influence: zc_project::PropertyTrack::number(100.0),
                     });
             if let Some(tid) = prop_str_static(&sobj.properties, "constraint.trackTo.targetId") {
                 tt.target_id = tid;
@@ -7111,7 +8599,11 @@ fn build_object_3d_from_session(
                 tt.up_axis = ua.round().clamp(0.0, 2.0) as u32;
             }
             if let Some(p) = sobj.properties.get("constraint.trackTo.influence") {
+                let changed = property_track_to_session(&tt.influence) != *p;
                 tt.influence = session_property_to_track(p, Some(&tt.influence));
+                if changed {
+                    clamp_track_f64_range(&mut tt.influence, 0.0, 100.0);
+                }
             }
         } else {
             obj.constraints.track_to = None;
@@ -7136,8 +8628,21 @@ fn build_object_3d_from_session(
             if let Some(tid) = prop_str_static(&sobj.properties, "constraint.follow.targetId") {
                 fl.target_id = tid;
             }
-            if let Some(sp) = prop_f64_static(&sobj.properties, "constraint.follow.space") {
-                fl.space = sp.round().clamp(0.0, 1.0) as u32;
+            let sp_opt = prop_f64_static(&sobj.properties, "constraint.follow.space")
+                .map(|v| v.round().clamp(0.0, 1.0) as u32);
+            let fsp_opt = prop_f64_static(&sobj.properties, "constraint.follow.followSpace")
+                .map(|v| v.round().clamp(0.0, 1.0) as u32);
+            match (sp_opt, fsp_opt) {
+                (Some(s), Some(f)) => {
+                    if f != fl.space && s == fl.space {
+                        fl.space = f;
+                    } else {
+                        fl.space = s;
+                    }
+                }
+                (Some(s), None) => fl.space = s,
+                (None, Some(f)) => fl.space = f,
+                (None, None) => {}
             }
             if let Some(fp) = prop_f64_static(&sobj.properties, "constraint.follow.followPosition")
             {
@@ -7320,12 +8825,12 @@ fn sync_video_clip_from_session(
             "composite" => zc_project::LayerKind::Composite { layers: Vec::new() },
             "image" => zc_project::LayerKind::Image { image: None },
             "generator" => zc_project::LayerKind::Generator,
-            "shape" => zc_project::LayerKind::Shape2D {
+            "shape" | "shape2d" | "shape_2d" => zc_project::LayerKind::Shape2D {
                 shapes: vec![zc_project::Shape2DNode {
-                    id: zc_project::Uuid::new_v4(),
+                    id: alloc_uuid(),
                     name: "Shape".to_owned(),
                     kind: zc_project::Shape2DKind::Path {
-                        path: json!({ "preset": "rectangle" }),
+                        path: default_shape2d_rectangle_path(),
                     },
                     position: zc_project::PropertyTrack::vec2([0.0, 0.0]),
                     rotation: zc_project::PropertyTrack::number(0.0),
@@ -7336,12 +8841,12 @@ fn sync_video_clip_from_session(
                     preserved: BTreeMap::new(),
                 }],
             },
-            "text" | "text_2d" => zc_project::LayerKind::Text2D {
+            "text" | "text_2d" | "text2d" => zc_project::LayerKind::Text2D {
                 text: "text".to_owned(),
                 font: None,
                 size: 72,
                 shapes: vec![zc_project::Shape2DNode {
-                    id: zc_project::Uuid::new_v4(),
+                    id: alloc_uuid(),
                     name: "Text Fill".to_owned(),
                     kind: zc_project::Shape2DKind::Group {
                         children: Vec::new(),
@@ -7358,7 +8863,7 @@ fn sync_video_clip_from_session(
             "preset_shape" => zc_project::LayerKind::PresetShape2D {
                 preset: zc_project::PresetShapeKind::Rectangle,
                 shapes: vec![zc_project::Shape2DNode {
-                    id: zc_project::Uuid::new_v4(),
+                    id: alloc_uuid(),
                     name: "Preset Shape".to_owned(),
                     kind: zc_project::Shape2DKind::Group {
                         children: Vec::new(),
@@ -7381,8 +8886,17 @@ fn sync_video_clip_from_session(
                     camera: Box::default(),
                 }
             }
-            "zoidium:precomp-plus/precomp" => zc_project::LayerKind::PrecompRef {
-                composition_id: zc_project::Uuid::nil(),
+            "zoidium:precomp-plus/precomp" | "precomp" => {
+                let comp_id = prop_str_static(&sclip.properties, "compositionId")
+                    .and_then(|s| zc_project::Uuid::parse_str(&s).ok())
+                    .unwrap_or_else(zc_project::Uuid::nil);
+                zc_project::LayerKind::PrecompRef {
+                    composition_id: comp_id,
+                }
+            }
+            "zoidium:shape-plus/shape-layer" | "shape_plus" => zc_project::LayerKind::Plugin {
+                plugin_type: "zoidium:shape-plus/shape-layer".to_owned(),
+                payload: zc_render::shape_plus::default_shape_plus_payload(),
             },
             other => zc_project::LayerKind::Plugin {
                 plugin_type: other.to_owned(),
@@ -7936,6 +9450,14 @@ fn collect_plugin_deps_from_objects(objects: &[zc_project::Object3D], deps: &mut
         for mat in obj.material_slots.values() {
             collect_plugin_deps_from_material(mat, deps);
         }
+        if let Some(pt) = obj
+            .preserved
+            .get("zoidiumPluginObjectType")
+            .and_then(Value::as_str)
+            && let Some(pid) = extract_namespaced_plugin_id(pt)
+        {
+            deps.insert(pid.to_string());
+        }
         match &obj.kind {
             zc_project::Object3DKind::Group {
                 custom_properties,
@@ -7961,6 +9483,10 @@ fn collect_plugin_deps_from_objects(objects: &[zc_project::Object3D], deps: &mut
                         | zc_project::Shape3DKind::Icosahedron { .. }
                         | zc_project::Shape3DKind::Capsule { .. }
                         | zc_project::Shape3DKind::TorusKnot { .. }
+                        | zc_project::Shape3DKind::Tube { .. }
+                        | zc_project::Shape3DKind::Gear { .. }
+                        | zc_project::Shape3DKind::Helix { .. }
+                        | zc_project::Shape3DKind::Spline { .. }
                 ) {
                     deps.insert("geometry-plus".to_string());
                 }
@@ -7980,8 +9506,17 @@ fn collect_plugin_deps_from_objects(objects: &[zc_project::Object3D], deps: &mut
                     || track_has_expression(&c.zoom)
                     || track_has_expression(&c.shake_amplitude)
                     || track_has_expression(&c.shake_speed)
+                    || track_has_expression(&c.focal_length)
+                    || track_has_expression(&c.film_offset_x)
+                    || track_has_expression(&c.film_offset_y)
                 {
                     deps.insert("expressions-plus".to_string());
+                }
+                if let Some(mb) = &c.motion_blur {
+                    deps.insert("camera-plus".to_string());
+                    if track_has_expression(&mb.shutter) {
+                        deps.insert("expressions-plus".to_string());
+                    }
                 }
                 if let Some(dof) = &c.dof {
                     deps.insert("camera-plus".to_string());
@@ -7999,12 +9534,17 @@ fn collect_plugin_deps_from_objects(objects: &[zc_project::Object3D], deps: &mut
                     if track_has_expression(&vib.position_amplitude)
                         || track_has_expression(&vib.rotation_amplitude)
                         || track_has_expression(&vib.frequency)
+                        || track_has_expression(&vib.position_frequency)
+                        || track_has_expression(&vib.rotation_frequency)
                     {
                         deps.insert("expressions-plus".to_string());
                     }
                 }
             }
             zc_project::Object3DKind::Particles(p) => {
+                if p.sprite_preset.is_some() {
+                    deps.insert("particles-plus".to_string());
+                }
                 if track_has_expression(&p.time) {
                     deps.insert("expressions-plus".to_string());
                 }
@@ -8319,7 +9859,7 @@ mod tests {
         assert!((session.playback.current_frame - 42.0).abs() < 1e-9);
         assert_eq!(
             lines[3].result.as_ref().and_then(|v| v.get("count")),
-            Some(&json!(46))
+            Some(&json!(74))
         );
 
         // Malformed JSON and unknown commands return structured errors without panicking.
@@ -9604,9 +11144,11 @@ mod tests {
             "Cone",
             zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Cone {
                 radius: 5.0,
+                top_radius: 0.0,
                 height: 10.0,
                 detail: 16,
                 open_ended: false,
+                shading: 0,
             }),
         );
         cone.material = Some(zc_project::MaterialSpec::PbrPlus(Box::default()));
@@ -10115,9 +11657,17 @@ mod tests {
             .unwrap()
             .to_string();
 
-        for (repeater_kind, child_name) in [
-            ("zoidcraft:repeater/linear_repeater", "ZC Child"),
-            ("zoidium:repeater/echo_repeater", "Zoidium Child"),
+        for (repeater_kind, canonical_kind, child_name) in [
+            (
+                "zoidcraft:repeater/linear_repeater",
+                "zoidium:repeater/linear-repeater",
+                "ZC Child",
+            ),
+            (
+                "zoidium:repeater/echo_repeater",
+                "zoidium:repeater/echo-repeater",
+                "Zoidium Child",
+            ),
         ] {
             let rep_id = session
                 .execute(Command::AddObject3D {
@@ -10154,8 +11704,12 @@ mod tests {
                 .expect("repeater in project");
             assert_eq!(
                 proj_rep.preserved.get("zoidiumPluginObjectType"),
-                Some(&json!(repeater_kind)),
-                "repeater preserved[\"zoidiumPluginObjectType\"] must record {repeater_kind}"
+                Some(&json!(canonical_kind)),
+                "repeater preserved[\"zoidiumPluginObjectType\"] must canonicalize {repeater_kind} -> {canonical_kind}"
+            );
+            assert!(
+                proj_rep.material.is_none(),
+                "repeater must never attach bogus PBR material"
             );
             assert!(
                 !proj_rep.preserved.contains_key("type"),
@@ -10193,19 +11747,19 @@ mod tests {
         let reloaded =
             Session::from_project(session.project.clone(), zc_plugin::PluginRegistry::new());
         let reloaded_objs = &reloaded.document().video_tracks[0].clips[0].objects_3d;
-        for repeater_kind in [
-            "zoidcraft:repeater/linear_repeater",
-            "zoidium:repeater/echo_repeater",
+        for canonical_kind in [
+            "zoidium:repeater/linear-repeater",
+            "zoidium:repeater/echo-repeater",
         ] {
             let rep = reloaded_objs
                 .iter()
-                .find(|o| o.kind == repeater_kind)
-                .unwrap_or_else(|| panic!("expected {repeater_kind} after reload"));
+                .find(|o| o.kind == canonical_kind)
+                .unwrap_or_else(|| panic!("expected {canonical_kind} after reload"));
             assert!(
                 reloaded_objs
                     .iter()
                     .any(|o| o.parent_id.as_deref() == Some(rep.id.as_str())),
-                "child of {repeater_kind} must survive reload"
+                "child of {canonical_kind} must survive reload"
             );
         }
     }

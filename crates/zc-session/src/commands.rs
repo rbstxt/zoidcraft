@@ -2,6 +2,27 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use zc_project::Uuid;
+
+use crate::{SessionClip, TrackKind};
+
+/// Serializable clipboard snapshot of a timeline clip (plus lossless project layer,
+/// `LayerMask` list, and `Precomp+` frame offset) for [`Command::PasteClips`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClipSnapshot {
+    pub track_kind: TrackKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_id: Option<String>,
+    pub clip: SessionClip,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_clip: Option<zc_project::VideoClip>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_clip: Option<zc_project::AudioClip>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layer_masks: Vec<zc_project::LayerMask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precomp_offset: Option<f64>,
+}
 
 /// Unified serializable command enum covering every core ZoidCraft editor operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,6 +203,137 @@ pub enum Command {
     ListCommands,
     #[serde(rename = "control.list_plugins")]
     ListPlugins,
+
+    // --- Shape+ ---
+    #[serde(rename = "shape_plus.update_payload")]
+    UpdateShapePlusPayload { clip_id: Uuid, payload: Value },
+
+    // --- Layer Masks (zoidiumMasks) ---
+    #[serde(rename = "mask.add")]
+    AddLayerMask {
+        clip_id: Uuid,
+        mask: zc_project::LayerMask,
+    },
+    #[serde(rename = "mask.update")]
+    UpdateLayerMask {
+        clip_id: Uuid,
+        mask_id: String,
+        mask: zc_project::LayerMask,
+    },
+    #[serde(rename = "mask.remove")]
+    RemoveLayerMask { clip_id: Uuid, mask_id: String },
+    #[serde(rename = "mask.reorder")]
+    ReorderLayerMask {
+        clip_id: Uuid,
+        mask_id: String,
+        to_index: usize,
+    },
+    #[serde(rename = "mask.duplicate")]
+    DuplicateLayerMask { clip_id: Uuid, mask_id: String },
+
+    // --- Precomp+ Compositions ---
+    #[serde(rename = "comp.create")]
+    CreateComposition {
+        name: String,
+        resolution: [u32; 2],
+        fps: u32,
+        length_frames: u32,
+    },
+    #[serde(rename = "comp.rename")]
+    RenameComposition { comp_id: Uuid, name: String },
+    #[serde(rename = "comp.duplicate")]
+    DuplicateComposition { comp_id: Uuid },
+    #[serde(rename = "comp.delete")]
+    DeleteComposition { comp_id: Uuid },
+    #[serde(rename = "comp.precompose_clips")]
+    PrecomposeClips { clip_ids: Vec<Uuid>, name: String },
+    #[serde(rename = "comp.set_active")]
+    SetActiveComposition {
+        #[serde(default)]
+        comp_id: Option<Uuid>,
+    },
+    #[serde(rename = "comp.set_clip_target")]
+    SetPrecompClipTarget { clip_id: Uuid, composition_id: Uuid },
+
+    // --- Layer Preserved / PresetShape2D / Split Letters ---
+    #[serde(rename = "layer.update_preserved")]
+    UpdateLayerPreserved {
+        clip_id: Uuid,
+        key: String,
+        #[serde(default)]
+        value: Option<Value>,
+    },
+    #[serde(rename = "layer.set_preset_shape_kind")]
+    SetPresetShapeKind {
+        clip_id: Uuid,
+        shape_kind: zc_project::PresetShapeKind,
+    },
+    #[serde(rename = "scene.split_text_3d_into_letters")]
+    SplitText3DIntoLetters { clip_id: Uuid, object_id: Uuid },
+
+    // --- Pro Timeline / Markers / Sequence Controls / Assets ---
+    #[serde(rename = "timeline.add_marker")]
+    AddMarker {
+        frame: f64,
+        name: String,
+        #[serde(default)]
+        color: Option<String>,
+    },
+    #[serde(rename = "timeline.update_marker")]
+    UpdateMarker {
+        index: usize,
+        frame: f64,
+        name: String,
+        #[serde(default)]
+        color: Option<String>,
+    },
+    #[serde(rename = "timeline.delete_marker")]
+    DeleteMarker { index: usize },
+    #[serde(rename = "sequence.add_control")]
+    AddSequenceControl {
+        name: String,
+        kind: zc_project::SequenceControlKind,
+        value: zc_project::PropertyValue,
+        #[serde(default)]
+        min: Option<f64>,
+        #[serde(default)]
+        max: Option<f64>,
+        #[serde(default)]
+        step: Option<f64>,
+    },
+    #[serde(rename = "sequence.update_control")]
+    UpdateSequenceControl {
+        control_id: String,
+        name: String,
+        value: zc_project::PropertyValue,
+        #[serde(default)]
+        min: Option<f64>,
+        #[serde(default)]
+        max: Option<f64>,
+        #[serde(default)]
+        step: Option<f64>,
+    },
+    #[serde(rename = "sequence.delete_control")]
+    DeleteSequenceControl { control_id: String },
+    #[serde(rename = "sequence.reorder_control")]
+    ReorderSequenceControl { control_id: String, to_index: usize },
+    #[serde(rename = "timeline.paste_clips")]
+    PasteClips {
+        clips: Vec<ClipSnapshot>,
+        target_frame: f64,
+    },
+    #[serde(rename = "timeline.freeze_clip_frame")]
+    FreezeClipFrame { clip_id: Uuid, frame: f64 },
+    #[serde(rename = "timeline.reverse_clip")]
+    ReverseClip { clip_id: Uuid },
+    #[serde(rename = "assets.relink")]
+    RelinkAsset {
+        asset_id: String,
+        filename: String,
+        bytes: Vec<u8>,
+    },
+    #[serde(rename = "assets.purge_unused")]
+    PurgeUnusedAssets,
 }
 
 impl Command {
@@ -235,6 +387,34 @@ impl Command {
             Self::InspectState => "control.inspect_state",
             Self::ListCommands => "control.list_commands",
             Self::ListPlugins => "control.list_plugins",
+            Self::UpdateShapePlusPayload { .. } => "shape_plus.update_payload",
+            Self::AddLayerMask { .. } => "mask.add",
+            Self::UpdateLayerMask { .. } => "mask.update",
+            Self::RemoveLayerMask { .. } => "mask.remove",
+            Self::ReorderLayerMask { .. } => "mask.reorder",
+            Self::DuplicateLayerMask { .. } => "mask.duplicate",
+            Self::CreateComposition { .. } => "comp.create",
+            Self::RenameComposition { .. } => "comp.rename",
+            Self::DuplicateComposition { .. } => "comp.duplicate",
+            Self::DeleteComposition { .. } => "comp.delete",
+            Self::PrecomposeClips { .. } => "comp.precompose_clips",
+            Self::SetActiveComposition { .. } => "comp.set_active",
+            Self::SetPrecompClipTarget { .. } => "comp.set_clip_target",
+            Self::UpdateLayerPreserved { .. } => "layer.update_preserved",
+            Self::SetPresetShapeKind { .. } => "layer.set_preset_shape_kind",
+            Self::SplitText3DIntoLetters { .. } => "scene.split_text_3d_into_letters",
+            Self::AddMarker { .. } => "timeline.add_marker",
+            Self::UpdateMarker { .. } => "timeline.update_marker",
+            Self::DeleteMarker { .. } => "timeline.delete_marker",
+            Self::AddSequenceControl { .. } => "sequence.add_control",
+            Self::UpdateSequenceControl { .. } => "sequence.update_control",
+            Self::DeleteSequenceControl { .. } => "sequence.delete_control",
+            Self::ReorderSequenceControl { .. } => "sequence.reorder_control",
+            Self::PasteClips { .. } => "timeline.paste_clips",
+            Self::FreezeClipFrame { .. } => "timeline.freeze_clip_frame",
+            Self::ReverseClip { .. } => "timeline.reverse_clip",
+            Self::RelinkAsset { .. } => "assets.relink",
+            Self::PurgeUnusedAssets => "assets.purge_unused",
         }
     }
 
@@ -275,6 +455,34 @@ impl Command {
                 | Self::SetExpression { .. }
                 | Self::RemoveProperty { .. }
                 | Self::ResetPropertyList { .. }
+                | Self::UpdateShapePlusPayload { .. }
+                | Self::AddLayerMask { .. }
+                | Self::UpdateLayerMask { .. }
+                | Self::RemoveLayerMask { .. }
+                | Self::ReorderLayerMask { .. }
+                | Self::DuplicateLayerMask { .. }
+                | Self::CreateComposition { .. }
+                | Self::RenameComposition { .. }
+                | Self::DuplicateComposition { .. }
+                | Self::DeleteComposition { .. }
+                | Self::PrecomposeClips { .. }
+                | Self::SetActiveComposition { .. }
+                | Self::SetPrecompClipTarget { .. }
+                | Self::UpdateLayerPreserved { .. }
+                | Self::SetPresetShapeKind { .. }
+                | Self::SplitText3DIntoLetters { .. }
+                | Self::AddMarker { .. }
+                | Self::UpdateMarker { .. }
+                | Self::DeleteMarker { .. }
+                | Self::AddSequenceControl { .. }
+                | Self::UpdateSequenceControl { .. }
+                | Self::DeleteSequenceControl { .. }
+                | Self::ReorderSequenceControl { .. }
+                | Self::PasteClips { .. }
+                | Self::FreezeClipFrame { .. }
+                | Self::ReverseClip { .. }
+                | Self::RelinkAsset { .. }
+                | Self::PurgeUnusedAssets
         )
     }
 
@@ -321,6 +529,7 @@ fn is_unit_command(canonical: &str) -> bool {
             | "control.inspect_state"
             | "control.list_commands"
             | "control.list_plugins"
+            | "assets.purge_unused"
     )
 }
 
@@ -374,6 +583,36 @@ fn resolve_canonical_command_id(name: &str) -> Option<&'static str> {
         "control.inspect_state" | "InspectState" => Some("control.inspect_state"),
         "control.list_commands" | "ListCommands" => Some("control.list_commands"),
         "control.list_plugins" | "ListPlugins" => Some("control.list_plugins"),
+        "shape_plus.update_payload" | "UpdateShapePlusPayload" => Some("shape_plus.update_payload"),
+        "mask.add" | "AddLayerMask" => Some("mask.add"),
+        "mask.update" | "UpdateLayerMask" => Some("mask.update"),
+        "mask.remove" | "RemoveLayerMask" => Some("mask.remove"),
+        "mask.reorder" | "ReorderLayerMask" => Some("mask.reorder"),
+        "mask.duplicate" | "DuplicateLayerMask" => Some("mask.duplicate"),
+        "comp.create" | "CreateComposition" => Some("comp.create"),
+        "comp.rename" | "RenameComposition" => Some("comp.rename"),
+        "comp.duplicate" | "DuplicateComposition" => Some("comp.duplicate"),
+        "comp.delete" | "DeleteComposition" => Some("comp.delete"),
+        "comp.precompose_clips" | "PrecomposeClips" => Some("comp.precompose_clips"),
+        "comp.set_active" | "SetActiveComposition" => Some("comp.set_active"),
+        "comp.set_clip_target" | "SetPrecompClipTarget" => Some("comp.set_clip_target"),
+        "layer.update_preserved" | "UpdateLayerPreserved" => Some("layer.update_preserved"),
+        "layer.set_preset_shape_kind" | "SetPresetShapeKind" => Some("layer.set_preset_shape_kind"),
+        "scene.split_text_3d_into_letters" | "SplitText3DIntoLetters" => {
+            Some("scene.split_text_3d_into_letters")
+        }
+        "timeline.add_marker" | "AddMarker" => Some("timeline.add_marker"),
+        "timeline.update_marker" | "UpdateMarker" => Some("timeline.update_marker"),
+        "timeline.delete_marker" | "DeleteMarker" => Some("timeline.delete_marker"),
+        "sequence.add_control" | "AddSequenceControl" => Some("sequence.add_control"),
+        "sequence.update_control" | "UpdateSequenceControl" => Some("sequence.update_control"),
+        "sequence.delete_control" | "DeleteSequenceControl" => Some("sequence.delete_control"),
+        "sequence.reorder_control" | "ReorderSequenceControl" => Some("sequence.reorder_control"),
+        "timeline.paste_clips" | "PasteClips" => Some("timeline.paste_clips"),
+        "timeline.freeze_clip_frame" | "FreezeClipFrame" => Some("timeline.freeze_clip_frame"),
+        "timeline.reverse_clip" | "ReverseClip" => Some("timeline.reverse_clip"),
+        "assets.relink" | "RelinkAsset" => Some("assets.relink"),
+        "assets.purge_unused" | "PurgeUnusedAssets" => Some("assets.purge_unused"),
         _ => None,
     }
 }
@@ -1042,6 +1281,384 @@ fn builtin_command_metadata() -> Vec<CommandMeta> {
             false,
             empty_schema(),
         ),
+        // --- Shape+ ---
+        CommandMeta::new(
+            "shape_plus.update_payload",
+            "Shape+/Update Payload",
+            "Replace a Shape+ layer's JSON vector document payload",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "payload": { "type": "object" }
+                }),
+                &["clip_id", "payload"],
+            ),
+        ),
+        // --- Layer Masks ---
+        CommandMeta::new(
+            "mask.add",
+            "Masks/Add Layer Mask",
+            "Attach a new Shape+ LayerMask to a video clip's layer",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "mask": { "type": "object" }
+                }),
+                &["clip_id", "mask"],
+            ),
+        ),
+        CommandMeta::new(
+            "mask.update",
+            "Masks/Update Layer Mask",
+            "Update an existing LayerMask on a video clip's layer",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "mask_id": { "type": "string" },
+                    "mask": { "type": "object" }
+                }),
+                &["clip_id", "mask_id", "mask"],
+            ),
+        ),
+        CommandMeta::new(
+            "mask.remove",
+            "Masks/Remove Layer Mask",
+            "Remove a LayerMask from a video clip's layer",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "mask_id": { "type": "string" }
+                }),
+                &["clip_id", "mask_id"],
+            ),
+        ),
+        CommandMeta::new(
+            "mask.reorder",
+            "Masks/Reorder Layer Mask",
+            "Move a LayerMask to a new index in the layer's mask stack",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "mask_id": { "type": "string" },
+                    "to_index": { "type": "integer", "minimum": 0 }
+                }),
+                &["clip_id", "mask_id", "to_index"],
+            ),
+        ),
+        CommandMeta::new(
+            "mask.duplicate",
+            "Masks/Duplicate Layer Mask",
+            "Duplicate a LayerMask immediately after the original",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "mask_id": { "type": "string" }
+                }),
+                &["clip_id", "mask_id"],
+            ),
+        ),
+        // --- Precomp+ Compositions ---
+        CommandMeta::new(
+            "comp.create",
+            "Composition/New Composition",
+            "Create a new nested Precomp+ composition",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "name": { "type": "string" },
+                    "resolution": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+                    "fps": { "type": "integer", "minimum": 1, "maximum": 240 },
+                    "length_frames": { "type": "integer", "minimum": 1 }
+                }),
+                &["name", "resolution", "fps", "length_frames"],
+            ),
+        ),
+        CommandMeta::new(
+            "comp.rename",
+            "Composition/Rename Composition",
+            "Rename an existing nested Precomp+ composition",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "comp_id": { "type": "string" },
+                    "name": { "type": "string" }
+                }),
+                &["comp_id", "name"],
+            ),
+        ),
+        CommandMeta::new(
+            "comp.duplicate",
+            "Composition/Duplicate Composition",
+            "Duplicate an existing nested Precomp+ composition with fresh IDs",
+            None,
+            true,
+            object_schema(json!({ "comp_id": { "type": "string" } }), &["comp_id"]),
+        ),
+        CommandMeta::new(
+            "comp.delete",
+            "Composition/Delete Composition",
+            "Delete a nested Precomp+ composition if not referenced by any PrecompRef clip",
+            None,
+            true,
+            object_schema(json!({ "comp_id": { "type": "string" } }), &["comp_id"]),
+        ),
+        CommandMeta::new(
+            "comp.precompose_clips",
+            "Composition/Precompose Clips",
+            "Move selected clips into a new nested composition and replace with a PrecompRef clip",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_ids": { "type": "array", "items": { "type": "string" } },
+                    "name": { "type": "string" }
+                }),
+                &["clip_ids", "name"],
+            ),
+        ),
+        CommandMeta::new(
+            "comp.set_active",
+            "Composition/Switch Active Composition",
+            "Switch active timeline editing between root sequence (null) and a nested composition",
+            None,
+            true,
+            object_schema(json!({ "comp_id": { "type": ["string", "null"] } }), &[]),
+        ),
+        CommandMeta::new(
+            "comp.set_clip_target",
+            "Composition/Set Precomp Clip Target",
+            "Retarget a PrecompRef clip to reference a different nested composition",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "composition_id": { "type": "string" }
+                }),
+                &["clip_id", "composition_id"],
+            ),
+        ),
+        // --- Layer Preserved / PresetShape2D / Split Letters ---
+        CommandMeta::new(
+            "layer.update_preserved",
+            "Layer/Update Preserved Field",
+            "Insert, update, or remove a key in a clip layer's preserved metadata map",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "key": { "type": "string" },
+                    "value": {}
+                }),
+                &["clip_id", "key"],
+            ),
+        ),
+        CommandMeta::new(
+            "layer.set_preset_shape_kind",
+            "Layer/Set Preset Shape Kind",
+            "Switch a PresetShape2D clip between Ellipse and Rectangle",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "shape_kind": { "type": "string", "enum": ["ellipse", "rectangle"] }
+                }),
+                &["clip_id", "shape_kind"],
+            ),
+        ),
+        CommandMeta::new(
+            "scene.split_text_3d_into_letters",
+            "Objects/Split 3D Text Into Letters",
+            "Split a Text3D object into a Group containing one Text3D per non-whitespace character",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "object_id": { "type": "string" }
+                }),
+                &["clip_id", "object_id"],
+            ),
+        ),
+        // --- Pro Timeline / Markers / Sequence Controls / Assets ---
+        CommandMeta::new(
+            "timeline.add_marker",
+            "Timeline/Markers/Add Marker",
+            "Add a named timeline marker at a frame",
+            Some("M"),
+            true,
+            object_schema(
+                json!({
+                    "frame": { "type": "number", "minimum": 0.0 },
+                    "name": { "type": "string" },
+                    "color": { "type": ["string", "null"] }
+                }),
+                &["frame", "name"],
+            ),
+        ),
+        CommandMeta::new(
+            "timeline.update_marker",
+            "Timeline/Markers/Update Marker",
+            "Update an existing timeline marker's frame, name, or color",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "index": { "type": "integer", "minimum": 0 },
+                    "frame": { "type": "number", "minimum": 0.0 },
+                    "name": { "type": "string" },
+                    "color": { "type": ["string", "null"] }
+                }),
+                &["index", "frame", "name"],
+            ),
+        ),
+        CommandMeta::new(
+            "timeline.delete_marker",
+            "Timeline/Markers/Delete Marker",
+            "Delete a timeline marker by index",
+            None,
+            true,
+            object_schema(
+                json!({ "index": { "type": "integer", "minimum": 0 } }),
+                &["index"],
+            ),
+        ),
+        CommandMeta::new(
+            "sequence.add_control",
+            "Sequence/Controls/Add Sequence Control",
+            "Add an Expressions+ sequence control (Slider, Angle, Checkbox, Color, Point2D, Point3D)",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "name": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "value": { "type": "object" },
+                    "min": { "type": ["number", "null"] },
+                    "max": { "type": ["number", "null"] },
+                    "step": { "type": ["number", "null"] }
+                }),
+                &["name", "kind", "value"],
+            ),
+        ),
+        CommandMeta::new(
+            "sequence.update_control",
+            "Sequence/Controls/Update Sequence Control",
+            "Update an Expressions+ sequence control's name, value, or range bounds",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "control_id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "value": { "type": "object" },
+                    "min": { "type": ["number", "null"] },
+                    "max": { "type": ["number", "null"] },
+                    "step": { "type": ["number", "null"] }
+                }),
+                &["control_id", "name", "value"],
+            ),
+        ),
+        CommandMeta::new(
+            "sequence.delete_control",
+            "Sequence/Controls/Delete Sequence Control",
+            "Delete an Expressions+ sequence control by ID",
+            None,
+            true,
+            object_schema(
+                json!({ "control_id": { "type": "string" } }),
+                &["control_id"],
+            ),
+        ),
+        CommandMeta::new(
+            "sequence.reorder_control",
+            "Sequence/Controls/Reorder Sequence Control",
+            "Move an Expressions+ sequence control to a new index",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "control_id": { "type": "string" },
+                    "to_index": { "type": "integer", "minimum": 0 }
+                }),
+                &["control_id", "to_index"],
+            ),
+        ),
+        CommandMeta::new(
+            "timeline.paste_clips",
+            "Edit/Paste Clips",
+            "Paste one or more copied ClipSnapshots starting at target_frame",
+            Some("Ctrl+V"),
+            true,
+            object_schema(
+                json!({
+                    "clips": { "type": "array", "items": { "type": "object" } },
+                    "target_frame": { "type": "number", "minimum": 0.0 }
+                }),
+                &["clips", "target_frame"],
+            ),
+        ),
+        CommandMeta::new(
+            "timeline.freeze_clip_frame",
+            "Timeline/Clips/Freeze Frame",
+            "Freeze a clip's media time curve at the specified timeline frame",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string" },
+                    "frame": { "type": "number" }
+                }),
+                &["clip_id", "frame"],
+            ),
+        ),
+        CommandMeta::new(
+            "timeline.reverse_clip",
+            "Timeline/Clips/Reverse Clip",
+            "Reverse a clip's media playback time curve",
+            None,
+            true,
+            object_schema(json!({ "clip_id": { "type": "string" } }), &["clip_id"]),
+        ),
+        CommandMeta::new(
+            "assets.relink",
+            "Assets/Relink Asset",
+            "Replace an asset record's filename and binary payload, clearing missing status",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "asset_id": { "type": "string" },
+                    "filename": { "type": "string" },
+                    "bytes": { "type": "array", "items": { "type": "integer" } }
+                }),
+                &["asset_id", "filename", "bytes"],
+            ),
+        ),
+        CommandMeta::new(
+            "assets.purge_unused",
+            "Assets/Purge Unused Assets",
+            "Remove all assets not referenced anywhere in the project or its compositions",
+            None,
+            true,
+            empty_schema(),
+        ),
     ]
 }
 
@@ -1050,14 +1667,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_contains_all_46_commands() {
+    fn registry_contains_all_builtin_commands() {
         let reg = CommandRegistry::new_default();
-        assert_eq!(reg.len(), 46);
+        assert_eq!(reg.len(), 74);
         assert!(reg.get("project.new").is_some());
         assert!(reg.get("NewProject").is_some());
         assert!(reg.get("property.remove").is_some());
         assert!(reg.get("RemoveProperty").is_some());
         assert!(reg.get("control.inspect_state").is_some());
+        assert!(reg.get("shape_plus.update_payload").is_some());
+        assert!(reg.get("mask.add").is_some());
+        assert!(reg.get("comp.precompose_clips").is_some());
+        assert!(reg.get("assets.purge_unused").is_some());
     }
 
     #[test]
