@@ -1772,20 +1772,20 @@ fn precompose_non_adjacent_clips_preserves_unselected_middle_clip_and_undo() {
     let precomp_clip_str = res["clip_id"].as_str().unwrap().to_owned();
 
     let after_proj = session.to_project();
-    // Middle unselected clip 1 MUST remain completely intact at [30..60] on track 0!
+    // Replacement precomp track is inserted directly at target_vtrack_idx (0) at [0..90],
+    // while the middle unselected clip 1 remains completely intact at [30..60] on track 1!
     assert_eq!(after_proj.sequence.video_tracks.len(), 2);
     assert_eq!(after_proj.sequence.video_tracks[0].clips.len(), 1);
-    let kept_middle = &after_proj.sequence.video_tracks[0].clips[0];
-    assert_eq!(kept_middle.id.to_string(), clip1_str);
-    assert!((kept_middle.start - 30.0).abs() < 1e-6);
-    assert!((kept_middle.length - 30.0).abs() < 1e-6);
-
-    // Replacement precomp clip MUST live on the non-overlapping video track 1 at [0..90].
-    assert_eq!(after_proj.sequence.video_tracks[1].clips.len(), 1);
-    let precomp_clip = &after_proj.sequence.video_tracks[1].clips[0];
+    let precomp_clip = &after_proj.sequence.video_tracks[0].clips[0];
     assert_eq!(precomp_clip.id.to_string(), precomp_clip_str);
     assert!((precomp_clip.start - 0.0).abs() < 1e-6);
     assert!((precomp_clip.length - 90.0).abs() < 1e-6);
+
+    assert_eq!(after_proj.sequence.video_tracks[1].clips.len(), 1);
+    let kept_middle = &after_proj.sequence.video_tracks[1].clips[0];
+    assert_eq!(kept_middle.id.to_string(), clip1_str);
+    assert!((kept_middle.start - 30.0).abs() < 1e-6);
+    assert!((kept_middle.length - 30.0).abs() < 1e-6);
 
     // Child composition contains only clip 0 and clip 2.
     let child_comp = &after_proj.compositions[&comp_id];
@@ -1929,7 +1929,7 @@ fn reverse_clip_migrates_segment_tweens_mirrors_easings_and_mirrors_bezier_handl
 
     let proj = session.to_project();
     let kfs = &find_clip(&proj, &clip_str).time_curve.keyframes;
-    assert_eq!(kfs.len(), 3);
+    assert_eq!(kfs.len(), 4);
     assert!((kfs[0].frame - 0.0).abs() < 1e-6);
     assert_eq!(kfs[0].value, PropertyValue::Number(2.0));
     assert_eq!(
@@ -1945,11 +1945,16 @@ fn reverse_clip_migrates_segment_tweens_mirrors_easings_and_mirrors_bezier_handl
         "reversed segment 0->10 must carry mirrored QuadOut (3)"
     );
 
-    // Reversed segment 10->20 reverses original 0->10 (Hold = 0) -> Hold = 0!
-    assert!((kfs[2].frame - 20.0).abs() < 1e-6);
+    // Reversed Hold segment 10->20 inserts a transition step key right after 10.0 so the
+    // interior (10..20) holds 0.0 (matching forward [0..10)), while 10.0 still equals 1.0!
+    assert!((kfs[2].frame - 10.0001).abs() < 1e-6);
     assert_eq!(kfs[2].value, PropertyValue::Number(0.0));
+    assert_eq!(kfs[2].tween, 0);
+
+    assert!((kfs[3].frame - 20.0).abs() < 1e-6);
+    assert_eq!(kfs[3].value, PropertyValue::Number(0.0));
     assert_eq!(
-        kfs[2].tween, 0,
+        kfs[3].tween, 0,
         "reversed segment 10->20 must carry Hold (0)"
     );
 
@@ -2127,4 +2132,466 @@ fn freeze_clip_frame_evaluates_time_expression_and_sequence_controls() {
     assert!((freeze2["frozen_time"].as_f64().unwrap() - 4.0).abs() < 1e-9);
     let proj2 = session.to_project();
     assert_eq!(find_clip(&proj2, &clip2_str).time_curve.expression, None);
+}
+
+#[test]
+fn precompose_fallback_preserves_visibility_solo_stacking_order_and_undo() {
+    let mut project = Project::new_cm3_default();
+    let v0_id = Uuid::new_v4();
+    let v1_id = Uuid::new_v4();
+    let v2_id = Uuid::new_v4();
+    let v3_id = Uuid::new_v4();
+
+    let clip_a_id = Uuid::new_v4();
+    let clip_mid_id = Uuid::new_v4();
+    let clip_b_id = Uuid::new_v4();
+    let clip_fg_id = Uuid::new_v4();
+    let clip_other_solo_id = Uuid::new_v4();
+
+    let make_clip = |id: Uuid, name: &str, start: f64, length: f64| VideoClip {
+        id,
+        name: name.to_owned(),
+        start,
+        length,
+        link: None,
+        media: None,
+        time_curve: PropertyTrack::linear_time_curve(length, 30),
+        layer: zc_project::Layer::new(
+            name,
+            LayerKind::Shape2D { shapes: Vec::new() },
+            [1920, 1080],
+        ),
+        preserved: BTreeMap::new(),
+    };
+
+    project.sequence.video_tracks = vec![
+        // Track 0: empty & DISABLED (must NEVER be picked as fallback!).
+        zc_project::VideoTrack {
+            id: v0_id,
+            name: "V0 Disabled".to_owned(),
+            enabled: false,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: Vec::new(),
+            preserved: BTreeMap::new(),
+        },
+        // Track 1: enabled & SOLOED, holds non-adjacent selected clips A and B around unselected M.
+        zc_project::VideoTrack {
+            id: v1_id,
+            name: "V1 Solo Target".to_owned(),
+            enabled: true,
+            solo: true,
+            locked: false,
+            is_3d: false,
+            clips: vec![
+                make_clip(clip_a_id, "Selected A", 0.0, 10.0),
+                make_clip(clip_mid_id, "Unselected Mid", 10.0, 10.0),
+                make_clip(clip_b_id, "Selected B", 20.0, 10.0),
+            ],
+            preserved: BTreeMap::new(),
+        },
+        // Track 2: unselected foreground track ABOVE V1.
+        zc_project::VideoTrack {
+            id: v2_id,
+            name: "V2 Foreground".to_owned(),
+            enabled: true,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![make_clip(clip_fg_id, "Foreground", 0.0, 30.0)],
+            preserved: BTreeMap::new(),
+        },
+        // Track 3: another soloed track in parent sequence.
+        zc_project::VideoTrack {
+            id: v3_id,
+            name: "V3 Other Solo".to_owned(),
+            enabled: true,
+            solo: true,
+            locked: false,
+            is_3d: false,
+            clips: vec![make_clip(clip_other_solo_id, "Other Solo", 40.0, 10.0)],
+            preserved: BTreeMap::new(),
+        },
+    ];
+
+    let mut session = Session::from_project(project, PluginRegistry::new());
+    let res = session
+        .execute(Command::PrecomposeClips {
+            clip_ids: vec![clip_a_id, clip_b_id],
+            name: "NonAdjacent Precomp".to_owned(),
+        })
+        .expect("precompose succeeds");
+    let precomp_clip_id = Uuid::parse_str(res["clip_id"].as_str().unwrap()).unwrap();
+
+    let after = session.to_project();
+    assert_eq!(
+        after.sequence.video_tracks.len(),
+        5,
+        "must insert a fresh track at target_vtrack_idx instead of reusing disabled V0 or overwriting Mid"
+    );
+
+    // Track 0 stays disabled and empty.
+    assert_eq!(after.sequence.video_tracks[0].id, v0_id);
+    assert!(!after.sequence.video_tracks[0].enabled);
+    assert!(after.sequence.video_tracks[0].clips.is_empty());
+
+    // Track 1 is the newly inserted precomp track: enabled, unlocked, soloed, directly at target_vtrack_idx!
+    let precomp_track = &after.sequence.video_tracks[1];
+    assert!(precomp_track.enabled, "precomp track must be enabled");
+    assert!(!precomp_track.locked, "precomp track must be unlocked");
+    assert!(
+        precomp_track.solo,
+        "precomp track must inherit solo visibility when parent has soloed tracks and selected track was soloed"
+    );
+    assert_eq!(precomp_track.clips.len(), 1);
+    assert_eq!(precomp_track.clips[0].id, precomp_clip_id);
+
+    // Original V1 (now index 2) keeps Unselected Mid intact.
+    assert_eq!(after.sequence.video_tracks[2].id, v1_id);
+    assert_eq!(after.sequence.video_tracks[2].clips.len(), 1);
+    assert_eq!(after.sequence.video_tracks[2].clips[0].id, clip_mid_id);
+
+    // Foreground track (now index 3) remains ABOVE the precomp track (preserving z-order!).
+    assert_eq!(after.sequence.video_tracks[3].id, v2_id);
+    assert_eq!(after.sequence.video_tracks[3].clips[0].id, clip_fg_id);
+
+    // Undo restores the exact original 4 tracks, flags, and clips.
+    session.execute(Command::Undo).expect("undo precompose");
+    let undone = session.to_project();
+    assert_eq!(undone.sequence.video_tracks.len(), 4);
+    assert_eq!(undone.sequence.video_tracks[0].id, v0_id);
+    assert!(!undone.sequence.video_tracks[0].enabled);
+    assert_eq!(undone.sequence.video_tracks[1].id, v1_id);
+    assert!(undone.sequence.video_tracks[1].solo);
+    let v1_clip_ids: Vec<Uuid> = undone.sequence.video_tracks[1]
+        .clips
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(v1_clip_ids, vec![clip_a_id, clip_mid_id, clip_b_id]);
+    assert_eq!(undone.sequence.video_tracks[2].id, v2_id);
+    assert_eq!(undone.sequence.video_tracks[3].id, v3_id);
+}
+
+#[test]
+fn freeze_clip_frame_lazy_controls_strict_id_lookup_and_layer_handles() {
+    let mut project = Project::new_cm3_default();
+    project.sequence.resolution = [1920, 1080];
+    project.sequence.fps = 30;
+
+    // Control A (index 0) references Control B (index 1) — requires lazy resolution!
+    let track_a = PropertyTrack::number_with_expr(0.0, "control('Base') * 2.0 + 1.0");
+    let track_b = PropertyTrack::number_with_expr(0.0, "frame * 0.1 + 0.5");
+
+    project.sequence.controls = vec![
+        zc_project::SequenceControl {
+            id: "ctl-a".to_owned(),
+            name: "Derived".to_owned(),
+            kind: SequenceControlKind::Slider,
+            track: track_a,
+            preserved: BTreeMap::new(),
+        },
+        zc_project::SequenceControl {
+            id: "ctl-b".to_owned(),
+            name: "Base".to_owned(),
+            kind: SequenceControlKind::Slider,
+            track: track_b,
+            preserved: BTreeMap::new(),
+        },
+    ];
+
+    let mut plugins = PluginRegistry::new();
+    let _ = plugins.enable("expressions-plus");
+    let mut session = Session::from_project(project, plugins);
+    let vtrack = session.document().video_tracks[0].id.clone();
+
+    // Clip 1: references lazily-resolved Control A + thisLayer/thisClip/thisComp properties.
+    let clip1_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack.clone(),
+            kind: "video".to_owned(),
+            name: Some("Lazy Handle Clip".to_owned()),
+            start: 10.0,
+            length: 60.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let clip1_uuid = Uuid::parse_str(&clip1_str).unwrap();
+    session
+        .execute(Command::SetPropertyValue {
+            target_id: clip1_str.clone(),
+            property: "opacity".to_owned(),
+            value: json!(0.5),
+        })
+        .unwrap();
+    session
+        .execute(Command::SetExpression {
+            target_id: clip1_str.clone(),
+            property: "time".to_owned(),
+            expression: Some(
+                "control('Derived') + thisLayer.property('opacity').value + thisClip.property('start').value * 0.01 + thisComp.property('Resolution').value[0] * 0.001"
+                    .to_owned(),
+            ),
+        })
+        .unwrap();
+
+    // At abs frame 40:
+    // Control B ('Base') = 40 * 0.1 + 0.5 = 4.5
+    // Control A ('Derived') = 4.5 * 2.0 + 1.0 = 10.0
+    // opacity = 0.5, clip start * 0.01 = 0.1, seq width * 0.001 = 1.92
+    // Expected frozen time = 12.52
+    let res1 = session
+        .execute(Command::FreezeClipFrame {
+            clip_id: clip1_uuid,
+            frame: 40.0,
+        })
+        .unwrap();
+    let frozen1 = res1["frozen_time"].as_f64().unwrap();
+    assert!(
+        (frozen1 - 12.52).abs() < 1e-9,
+        "FreezeClipFrame must lazily resolve forward-referenced controls + layer/clip/comp handles (expected 12.52), got {frozen1}"
+    );
+
+    // Clip 2: strict ID lookup — nonexistent stable_id MUST NOT fall back to matching by name!
+    let clip2_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack.clone(),
+            kind: "video".to_owned(),
+            name: Some("Strict Missing ID Clip".to_owned()),
+            start: 100.0,
+            length: 60.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let clip2_uuid = Uuid::parse_str(&clip2_str).unwrap();
+    session
+        .execute(Command::SetExpression {
+            target_id: clip2_str.clone(),
+            property: "time".to_owned(),
+            expression: Some("control('Base', 'nonexistent-id') + 99.0".to_owned()),
+        })
+        .unwrap();
+    // At frame 130 -> local_frame = 30 -> base_time = 1.0; missing ID errors and falls back to 1.0.
+    let res2 = session
+        .execute(Command::FreezeClipFrame {
+            clip_id: clip2_uuid,
+            frame: 130.0,
+        })
+        .unwrap();
+    let frozen2 = res2["frozen_time"].as_f64().unwrap();
+    assert!(
+        (frozen2 - 1.0).abs() < 1e-9,
+        "strict ID lookup must NOT fall back to control name when stable_id is missing (expected fallback 1.0), got {frozen2}"
+    );
+
+    // Clip 3: valid stable_id resolves even when display name does not match.
+    let clip3_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack,
+            kind: "video".to_owned(),
+            name: Some("Strict Valid ID Clip".to_owned()),
+            start: 200.0,
+            length: 60.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let clip3_uuid = Uuid::parse_str(&clip3_str).unwrap();
+    session
+        .execute(Command::SetExpression {
+            target_id: clip3_str.clone(),
+            property: "time".to_owned(),
+            expression: Some("control('Renamed', 'ctl-b')".to_owned()),
+        })
+        .unwrap();
+    // At abs frame 230: Control B = 230 * 0.1 + 0.5 = 23.5.
+    let res3 = session
+        .execute(Command::FreezeClipFrame {
+            clip_id: clip3_uuid,
+            frame: 230.0,
+        })
+        .unwrap();
+    let frozen3 = res3["frozen_time"].as_f64().unwrap();
+    assert!(
+        (frozen3 - 23.5).abs() < 1e-9,
+        "valid stable_id must resolve control even when name differs (expected 23.5), got {frozen3}"
+    );
+}
+
+#[test]
+fn precompose_preserves_exact_fps_and_shifts_cloned_control_expression_time_origin() {
+    let mut project = Project::new_cm3_default();
+    project.sequence.fps = 30;
+    project.sequence.exact_fps = Some(29.97);
+
+    let orig_expr = "frame * 2.0 + time * 10.0";
+    let ctrl_track = PropertyTrack::number_with_expr(0.0, orig_expr);
+    project.sequence.controls.push(zc_project::SequenceControl {
+        id: "ctl-wave".to_owned(),
+        name: "Wave".to_owned(),
+        kind: SequenceControlKind::Slider,
+        track: ctrl_track,
+        preserved: BTreeMap::new(),
+    });
+
+    let clip_id = Uuid::new_v4();
+    project.sequence.video_tracks[0].clips.push(VideoClip {
+        id: clip_id,
+        name: "Offset Clip".to_owned(),
+        start: 60.0,
+        length: 30.0,
+        link: None,
+        media: None,
+        time_curve: PropertyTrack::linear_time_curve(30.0, 30),
+        layer: zc_project::Layer::new(
+            "Offset Clip",
+            LayerKind::Shape2D { shapes: Vec::new() },
+            [1920, 1080],
+        ),
+        preserved: BTreeMap::new(),
+    });
+
+    let mut session = Session::from_project(project, PluginRegistry::new());
+    let res = session
+        .execute(Command::PrecomposeClips {
+            clip_ids: vec![clip_id],
+            name: "NTSC Child".to_owned(),
+        })
+        .expect("precompose succeeds");
+    let comp_id = Uuid::parse_str(res["comp_id"].as_str().unwrap()).unwrap();
+
+    let after = session.to_project();
+    let child_comp = after
+        .compositions
+        .get(&comp_id)
+        .expect("child composition exists");
+    assert_eq!(
+        child_comp.exact_fps,
+        Some(29.97),
+        "child composition must preserve parent exact_fps"
+    );
+
+    let child_expr = child_comp.controls[0]
+        .track
+        .expression
+        .as_deref()
+        .expect("cloned control keeps expression");
+
+    let cfg = zc_expr::EvalConfig::expressions_plus();
+    for offset in [0.0_f64, 15.0_f64, 29.0_f64] {
+        let parent_frame = 60.0 + offset;
+        let parent_ctx = zc_expr::BasicContext {
+            frame: parent_frame,
+            time: Some(parent_frame / 29.97),
+            fps: 29.97,
+            ..zc_expr::BasicContext::default()
+        };
+        let child_ctx = zc_expr::BasicContext {
+            frame: offset,
+            time: Some(offset / 29.97),
+            fps: 29.97,
+            ..zc_expr::BasicContext::default()
+        };
+        let parent_out = zc_expr::eval_with_fallback(orig_expr, &parent_ctx, &cfg);
+        let child_out = zc_expr::eval_with_fallback(child_expr, &child_ctx, &cfg);
+        assert!(parent_out.error.is_none());
+        assert!(
+            child_out.error.is_none(),
+            "rewritten child control expr `{child_expr}` must evaluate without error: {:?}",
+            child_out.error
+        );
+        let pv = parent_out.value.as_f64().unwrap();
+        let cv = child_out.value.as_f64().unwrap();
+        assert!(
+            (pv - cv).abs() < 1e-9,
+            "cloned control at child frame {offset} ({cv}) must match parent frame {parent_frame} ({pv}); expr=`{child_expr}`"
+        );
+    }
+}
+
+#[test]
+fn reverse_clip_preserves_hold_segment_interior() {
+    let mut session = Session::new();
+    let vtrack = session.document().video_tracks[0].id.clone();
+
+    let clip_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack,
+            kind: "video".to_owned(),
+            name: Some("Hold Reverse Clip".to_owned()),
+            start: 0.0,
+            length: 20.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let clip_uuid = Uuid::parse_str(&clip_str).unwrap();
+
+    // Forward Hold curve: [frame 0: 0.0, frame 20: 10.0 (Hold = tween 0)].
+    session
+        .execute(Command::SetKeyframe {
+            target_id: clip_str.clone(),
+            property: "time".to_owned(),
+            frame: 0.0,
+            value: json!(0.0),
+            tween: Some(1),
+        })
+        .unwrap();
+    session
+        .execute(Command::SetKeyframe {
+            target_id: clip_str.clone(),
+            property: "time".to_owned(),
+            frame: 20.0,
+            value: json!(10.0),
+            tween: Some(0), // Hold
+        })
+        .unwrap();
+
+    // Helper: sample the clip's evaluated time at `frame` via FreezeClipFrame on a cloned session.
+    let sample_at = |sess: &mut Session, frame: f64| -> f64 {
+        let mut clone = Session::from_project(sess.to_project(), sess.plugins.clone());
+        clone
+            .execute(Command::FreezeClipFrame {
+                clip_id: clip_uuid,
+                frame,
+            })
+            .unwrap()["frozen_time"]
+            .as_f64()
+            .unwrap()
+    };
+
+    // Forward sanity check: [0, 20) evaluates to 0.0, and frame 20 evaluates to 10.0.
+    assert!((sample_at(&mut session, 0.0) - 0.0).abs() < 1e-9);
+    assert!((sample_at(&mut session, 5.0) - 0.0).abs() < 1e-9);
+    assert!((sample_at(&mut session, 10.0) - 0.0).abs() < 1e-9);
+    assert!((sample_at(&mut session, 20.0) - 10.0).abs() < 1e-9);
+
+    // Reverse the clip across [0, 20].
+    session
+        .execute(Command::ReverseClip { clip_id: clip_uuid })
+        .unwrap();
+
+    // Reversed Hold curve MUST evaluate to 10.0 at frame 0, 0.0 across the interior (5, 10, 15), and 0.0 at frame 20!
+    assert!(
+        (sample_at(&mut session, 0.0) - 10.0).abs() < 1e-9,
+        "reversed Hold start frame 0 must equal 10.0"
+    );
+    for interior_frame in [5.0, 10.0, 15.0] {
+        let v = sample_at(&mut session, interior_frame);
+        assert!(
+            (v - 0.0).abs() < 1e-9,
+            "reversed Hold interior frame {interior_frame} must evaluate to 0.0 (not 10.0!), got {v}"
+        );
+    }
+    assert!(
+        (sample_at(&mut session, 20.0) - 0.0).abs() < 1e-9,
+        "reversed Hold end frame 20 must equal 0.0"
+    );
 }

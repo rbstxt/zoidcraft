@@ -642,10 +642,17 @@ impl<'a> GltfDocument<'a> {
         &self,
         accessor_idx: usize,
         expected_type: &str,
+        max_count: usize,
     ) -> Result<AccessorSlice<'_>, GltfLoadError> {
         let acc = self.accessors.get(accessor_idx).ok_or_else(|| {
             GltfLoadError::InvalidBuffer(format!("accessor {accessor_idx} out of bounds"))
         })?;
+        if acc.count > max_count {
+            return Err(GltfLoadError::InvalidJson(format!(
+                "accessor {accessor_idx} count {} exceeds maximum budget of {max_count}",
+                acc.count
+            )));
+        }
         if acc.accessor_type != expected_type {
             return Err(GltfLoadError::InvalidBuffer(format!(
                 "accessor {accessor_idx}: expected {expected_type}, got {}",
@@ -704,7 +711,7 @@ impl<'a> GltfDocument<'a> {
     }
 
     fn read_vec3_f32(&self, accessor_idx: usize) -> Result<Vec<[f32; 3]>, GltfLoadError> {
-        let s = self.accessor_slice_params(accessor_idx, "VEC3")?;
+        let s = self.accessor_slice_params(accessor_idx, "VEC3", MAX_TOTAL_VERTICES)?;
         if s.component_type != COMP_FLOAT {
             return Err(GltfLoadError::UnsupportedFeature(format!(
                 "VEC3 accessor {accessor_idx} requires f32 (5126), got {}",
@@ -724,7 +731,7 @@ impl<'a> GltfDocument<'a> {
     }
 
     fn read_vec2_f32(&self, accessor_idx: usize) -> Result<Vec<[f32; 2]>, GltfLoadError> {
-        let s = self.accessor_slice_params(accessor_idx, "VEC2")?;
+        let s = self.accessor_slice_params(accessor_idx, "VEC2", MAX_TOTAL_VERTICES)?;
         let mut out = Vec::with_capacity(s.count);
         for i in 0..s.count {
             let off = s.base + i * s.stride;
@@ -751,7 +758,7 @@ impl<'a> GltfDocument<'a> {
     }
 
     fn read_indices(&self, accessor_idx: usize) -> Result<Vec<u32>, GltfLoadError> {
-        let s = self.accessor_slice_params(accessor_idx, "SCALAR")?;
+        let s = self.accessor_slice_params(accessor_idx, "SCALAR", MAX_TOTAL_INDICES)?;
         let mut out = Vec::with_capacity(s.count);
         for i in 0..s.count {
             let off = s.base + i * s.stride;
@@ -833,12 +840,19 @@ impl<'a> GltfDocument<'a> {
 
             let raw_index_count =
                 if let Some(i_acc) = prim.get("indices").and_then(JsonValue::as_usize) {
-                    self.accessors
+                    let count = self
+                        .accessors
                         .get(i_acc)
                         .ok_or_else(|| {
                             GltfLoadError::InvalidBuffer(format!("accessor {i_acc} out of bounds"))
                         })?
-                        .count
+                        .count;
+                    if count > MAX_TOTAL_INDICES {
+                        return Err(GltfLoadError::InvalidJson(format!(
+                            "glTF scene exceeds maximum index budget of {MAX_TOTAL_INDICES}"
+                        )));
+                    }
+                    count
                 } else {
                     pos_count
                 };
@@ -869,25 +883,47 @@ impl<'a> GltfDocument<'a> {
             }
 
             let normals = if let Some(n_acc) = attrs.get("NORMAL").and_then(JsonValue::as_usize) {
-                let ns = self.read_vec3_f32(n_acc)?;
-                if ns.len() != positions.len() {
+                let n_count = self
+                    .accessors
+                    .get(n_acc)
+                    .ok_or_else(|| {
+                        GltfLoadError::InvalidBuffer(format!("accessor {n_acc} out of bounds"))
+                    })?
+                    .count;
+                if n_count > MAX_TOTAL_VERTICES {
+                    return Err(GltfLoadError::InvalidJson(format!(
+                        "NORMAL accessor {n_acc} count {n_count} exceeds maximum vertex budget of {MAX_TOTAL_VERTICES}"
+                    )));
+                }
+                if n_count != positions.len() {
                     return Err(GltfLoadError::InvalidBuffer(String::from(
                         "NORMAL count does not match POSITION count",
                     )));
                 }
-                Some(ns)
+                Some(self.read_vec3_f32(n_acc)?)
             } else {
                 None
             };
 
             let uvs = if let Some(uv_acc) = attrs.get("TEXCOORD_0").and_then(JsonValue::as_usize) {
-                let ts = self.read_vec2_f32(uv_acc)?;
-                if ts.len() != positions.len() {
+                let uv_count = self
+                    .accessors
+                    .get(uv_acc)
+                    .ok_or_else(|| {
+                        GltfLoadError::InvalidBuffer(format!("accessor {uv_acc} out of bounds"))
+                    })?
+                    .count;
+                if uv_count > MAX_TOTAL_VERTICES {
+                    return Err(GltfLoadError::InvalidJson(format!(
+                        "TEXCOORD_0 accessor {uv_acc} count {uv_count} exceeds maximum vertex budget of {MAX_TOTAL_VERTICES}"
+                    )));
+                }
+                if uv_count != positions.len() {
                     return Err(GltfLoadError::InvalidBuffer(String::from(
                         "TEXCOORD_0 count does not match POSITION count",
                     )));
                 }
-                Some(ts)
+                Some(self.read_vec2_f32(uv_acc)?)
             } else {
                 None
             };
@@ -1082,11 +1118,16 @@ impl<'a> GltfDocument<'a> {
                     .and_then(JsonValue::as_usize)
                     .unwrap_or(0)
                     .min(scenes.len() - 1);
-                scenes[scene_idx]
-                    .get("nodes")
-                    .and_then(JsonValue::as_array)
-                    .map(|arr| arr.iter().filter_map(JsonValue::as_usize).collect())
-                    .unwrap_or_default()
+                if let Some(arr) = scenes[scene_idx].get("nodes").and_then(JsonValue::as_array) {
+                    if arr.len() > MAX_SCENE_NODE_VISITS {
+                        return Err(GltfLoadError::InvalidJson(format!(
+                            "glTF scene traversal exceeds maximum node visit budget of {MAX_SCENE_NODE_VISITS}"
+                        )));
+                    }
+                    arr.iter().filter_map(JsonValue::as_usize).collect()
+                } else {
+                    Vec::new()
+                }
             } else {
                 let mut child_set = HashSet::new();
                 for node in nodes {
@@ -1098,9 +1139,17 @@ impl<'a> GltfDocument<'a> {
                         }
                     }
                 }
-                let roots: Vec<usize> = (0..nodes.len())
-                    .filter(|i| !child_set.contains(i))
-                    .collect();
+                let mut roots = Vec::new();
+                for i in 0..nodes.len() {
+                    if !child_set.contains(&i) {
+                        if roots.len() >= MAX_SCENE_NODE_VISITS {
+                            return Err(GltfLoadError::InvalidJson(format!(
+                                "glTF scene traversal exceeds maximum node visit budget of {MAX_SCENE_NODE_VISITS}"
+                            )));
+                        }
+                        roots.push(i);
+                    }
+                }
                 if roots.is_empty() {
                     return Err(GltfLoadError::InvalidJson(String::from(
                         "cyclic glTF node graph has no root nodes",
@@ -1108,6 +1157,13 @@ impl<'a> GltfDocument<'a> {
                 }
                 roots
             };
+
+            let mut scheduled_visits = root_indices.len();
+            if scheduled_visits > MAX_SCENE_NODE_VISITS {
+                return Err(GltfLoadError::InvalidJson(format!(
+                    "glTF scene traversal exceeds maximum node visit budget of {MAX_SCENE_NODE_VISITS}"
+                )));
+            }
 
             let mut active_ancestors = HashSet::new();
             let mut visits = 0usize;
@@ -1186,6 +1242,14 @@ impl<'a> GltfDocument<'a> {
                         stack.push(TraversalStep::Exit { node_idx });
 
                         if let Some(children) = node.get("children").and_then(JsonValue::as_array) {
+                            scheduled_visits = scheduled_visits
+                                .checked_add(children.len())
+                                .filter(|&total| total <= MAX_SCENE_NODE_VISITS)
+                                .ok_or_else(|| {
+                                    GltfLoadError::InvalidJson(format!(
+                                        "glTF scene traversal exceeds maximum node visit budget of {MAX_SCENE_NODE_VISITS}"
+                                    ))
+                                })?;
                             for child in children.iter().rev() {
                                 if let Some(child_idx) = child.as_usize() {
                                     stack.push(TraversalStep::Enter {
@@ -1508,6 +1572,90 @@ mod tests {
         assert!(
             err.to_string().contains("cyclic"),
             "expected cyclic node error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn oversized_normal_and_texcoord_accessor_counts_rejected_before_decode() {
+        let bin = single_triangle_bin();
+        let huge_count = 50_000_000usize;
+
+        // NORMAL claims 50,000,000 elements over a tiny 42-byte buffer -> must be rejected
+        // by pre-decode count validation before touching bufferView bounds or allocating.
+        let gltf_normal = format!(
+            r#"{{
+              "asset": {{"version": "2.0"}},
+              "scene": 0,
+              "scenes": [{{"nodes": [0]}}],
+              "nodes": [{{"mesh": 0}}],
+              "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0, "NORMAL": 2}}, "indices": 1}}]}}],
+              "buffers": [{{"byteLength": {bin_len}}}],
+              "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 6}}
+              ],
+              "accessors": [
+                {{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3"}},
+                {{"bufferView": 1, "byteOffset": 0, "componentType": 5123, "count": 3, "type": "SCALAR"}},
+                {{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": {huge_count}, "type": "VEC3"}}
+              ]
+            }}"#,
+            bin_len = bin.len()
+        );
+        let err = parse_gltf(&gltf_normal, &[&bin])
+            .expect_err("oversized NORMAL count must fail before decoding");
+        assert!(
+            matches!(err, GltfLoadError::InvalidJson(_))
+                && err.to_string().contains("NORMAL")
+                && err.to_string().contains("vertex budget"),
+            "expected pre-decode NORMAL vertex budget error, got: {err}"
+        );
+
+        // TEXCOORD_0 claims 50,000,000 elements over a tiny buffer -> must also be rejected
+        // by pre-decode count validation.
+        let gltf_uv = format!(
+            r#"{{
+              "asset": {{"version": "2.0"}},
+              "scene": 0,
+              "scenes": [{{"nodes": [0]}}],
+              "nodes": [{{"mesh": 0}}],
+              "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0, "TEXCOORD_0": 2}}, "indices": 1}}]}}],
+              "buffers": [{{"byteLength": {bin_len}}}],
+              "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 6}}
+              ],
+              "accessors": [
+                {{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3"}},
+                {{"bufferView": 1, "byteOffset": 0, "componentType": 5123, "count": 3, "type": "SCALAR"}},
+                {{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": {huge_count}, "type": "VEC2"}}
+              ]
+            }}"#,
+            bin_len = bin.len()
+        );
+        let err_uv = parse_gltf(&gltf_uv, &[&bin])
+            .expect_err("oversized TEXCOORD_0 count must fail before decoding");
+        assert!(
+            matches!(err_uv, GltfLoadError::InvalidJson(_))
+                && err_uv.to_string().contains("TEXCOORD_0")
+                && err_uv.to_string().contains("vertex budget"),
+            "expected pre-decode TEXCOORD_0 vertex budget error, got: {err_uv}"
+        );
+    }
+
+    #[test]
+    fn node_listing_excessive_children_rejected_before_pushing_stack() {
+        let bin = single_triangle_bin();
+        // Node 0 lists MAX_SCENE_NODE_VISITS + 1 children pointing to leaf node 1.
+        let many_children = vec!["1"; MAX_SCENE_NODE_VISITS + 1].join(",");
+        let nodes = format!(r#"{{"children": [{many_children}]}}, {{"mesh": 0}}"#);
+        let gltf = wrap_gltf_with_nodes(&nodes, bin.len());
+        let err = parse_gltf(&gltf, &[&bin])
+            .expect_err("node listing > MAX_SCENE_NODE_VISITS children must fail cleanly");
+        assert!(
+            matches!(err, GltfLoadError::InvalidJson(_))
+                && err.to_string().contains("visit budget"),
+            "expected node visit budget error, got: {err}"
         );
     }
 }

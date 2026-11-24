@@ -2121,9 +2121,17 @@ impl MatBuf {
         }
     }
 
-    fn to_rgba8(&self, size: usize) -> BakedMap {
-        let total = size * size;
-        let mut rgba8 = vec![0u8; total * 4];
+    fn to_rgba8(
+        &self,
+        size: usize,
+        tracker: &Arc<BakeMemoryTracker>,
+    ) -> Result<(BakedMap, MemoryReservation), String> {
+        let bytes = size
+            .checked_mul(size)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| format!("NodeMaterial RGBA8 output size overflow for {size}x{size}"))?;
+        let reservation = tracker.try_reserve(bytes)?;
+        let mut rgba8 = vec![0u8; bytes];
         match self {
             Self::Scalar(v) => {
                 let b = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -2160,11 +2168,14 @@ impl MatBuf {
                 }
             }
         }
-        BakedMap {
-            width: size as u32,
-            height: size as u32,
-            rgba8,
-        }
+        Ok((
+            BakedMap {
+                width: size as u32,
+                height: size as u32,
+                rgba8,
+            },
+            reservation,
+        ))
     }
 }
 
@@ -2599,7 +2610,16 @@ fn eval_fractal_buffer(
     for _ in 0..octs {
         let cells_x = freq_x.clamp(1, 1024);
         let cells_y = freq_y.clamp(1, 1024);
-        let mut lattice = vec![0.0f64; cells_x * cells_y];
+        let lattice_len = cells_x.checked_mul(cells_y).ok_or_else(|| {
+            format!("NodeMaterial fractal lattice size overflow for {cells_x}x{cells_y}")
+        })?;
+        let lattice_bytes = lattice_len
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| {
+                format!("NodeMaterial fractal lattice byte overflow for {cells_x}x{cells_y}")
+            })?;
+        let _lattice_reservation = tracker.try_reserve(lattice_bytes)?;
+        let mut lattice = vec![0.0f64; lattice_len];
         for v in &mut lattice {
             *v = rng.next_f64();
         }
@@ -4097,32 +4117,46 @@ fn bake_node_material_maps_with_budget(
     let normal_strength = param_f64(&output_node.params, &["normalStrength"], 1.0).clamp(0.0, 8.0);
     baked.normal_strength = normal_strength as f32;
 
+    let mut output_reservations: Vec<MemoryReservation> = Vec::new();
+
     if let Some(buf) = eval.get_input(out_id, &["color", "baseColor", "albedo"]) {
         baked.base_color_factor = buf.mean_rgba();
-        baked.color = Some(buf.to_rgba8(size));
+        let (map, res) = buf.to_rgba8(size, &eval.tracker)?;
+        baked.color = Some(map);
+        output_reservations.push(res);
     }
     if let Some(buf) = eval.get_input(out_id, &["emissive", "emission", "luminance"]) {
         let m = buf.mean_rgba();
         baked.emissive_factor = [m[0], m[1], m[2]];
-        baked.emissive = Some(buf.to_rgba8(size));
+        let (map, res) = buf.to_rgba8(size, &eval.tracker)?;
+        baked.emissive = Some(map);
+        output_reservations.push(res);
     }
     if let Some(buf) = eval.get_input(out_id, &["roughness"]) {
         let m = buf.mean_rgba();
         baked.roughness_factor = m[0];
-        baked.roughness = Some(buf.to_rgba8(size));
+        let (map, res) = buf.to_rgba8(size, &eval.tracker)?;
+        baked.roughness = Some(map);
+        output_reservations.push(res);
     }
     if let Some(buf) = eval.get_input(out_id, &["metalness", "metallic"]) {
         let m = buf.mean_rgba();
         baked.metalness_factor = m[0];
-        baked.metalness = Some(buf.to_rgba8(size));
+        let (map, res) = buf.to_rgba8(size, &eval.tracker)?;
+        baked.metalness = Some(map);
+        output_reservations.push(res);
     }
     if let Some(buf) = eval.get_input(out_id, &["opacity", "alpha"]) {
         let m = buf.mean_rgba();
         baked.opacity_factor = m[0];
-        baked.opacity = Some(buf.to_rgba8(size));
+        let (map, res) = buf.to_rgba8(size, &eval.tracker)?;
+        baked.opacity = Some(map);
+        output_reservations.push(res);
     }
     if let Some(buf) = eval.get_input(out_id, &["bump"]) {
-        baked.bump = Some(buf.to_rgba8(size));
+        let (map, res) = buf.to_rgba8(size, &eval.tracker)?;
+        baked.bump = Some(map);
+        output_reservations.push(res);
     }
 
     if let Some(buf) = eval.get_input(out_id, &["normal"]) {
@@ -4131,15 +4165,20 @@ fn bake_node_material_maps_with_budget(
         } else {
             normalize_tangent_normal(buf, size, normal_strength, &eval.tracker)?
         };
-        baked.normal = Some(normal_buf.to_rgba8(size));
+        let (map, res) = normal_buf.to_rgba8(size, &eval.tracker)?;
+        baked.normal = Some(map);
+        output_reservations.push(res);
     } else if let Some(bump_buf) = eval.get_input(out_id, &["bump"]) {
         // Derive tangent-space normal map via Sobel height-to-normal whenever `bump` is wired.
         let normal_buf =
             height_to_normal_sobel(bump_buf, size, normal_strength, false, &eval.tracker)?;
-        baked.normal = Some(normal_buf.to_rgba8(size));
+        let (map, res) = normal_buf.to_rgba8(size, &eval.tracker)?;
+        baked.normal = Some(map);
+        output_reservations.push(res);
     }
 
     drop(eval);
+    drop(output_reservations);
     Ok((baked, tracker))
 }
 
@@ -4422,12 +4461,13 @@ mod tests {
             ]
         });
 
-        let (maps, tracker) = bake_node_material_maps_with_budget(&graph, 64, 1024)
+        let out_rgba8_bytes = 64 * 64 * 4;
+        let (maps, tracker) = bake_node_material_maps_with_budget(&graph, 64, out_rgba8_bytes)
             .expect("disconnected nodes skipped");
         assert_eq!(
             tracker.peak_bytes(),
-            0,
-            "disconnected nodes must not allocate any intermediate image bytes"
+            out_rgba8_bytes,
+            "disconnected nodes must not allocate any intermediate image bytes (only the single output RGBA8 map)"
         );
         assert_eq!(tracker.live_bytes(), 0);
         assert!(maps.color.is_some());
@@ -4532,5 +4572,86 @@ mod tests {
             public_err.contains("memory budget exceeded"),
             "expected public API memory budget error, got: {public_err}"
         );
+    }
+
+    #[test]
+    fn node_material_bake_tracks_fractal_lattice_and_output_rgba8_maps() {
+        // 1. Fractal lattice temporary buffer reservation:
+        // At 32x32 with scale=256 and octaves=1:
+        //   values buffer  = 32 * 32 * 8   =   8,192 bytes
+        //   lattice buffer = 256 * 256 * 8 = 524,288 bytes (512 KiB)
+        //   f32 RGBA out   = 32 * 32 * 16  =  16,384 bytes
+        //   RGBA8 output   = 32 * 32 * 4   =   4,096 bytes
+        // Peak live bytes during eval_fractal_buffer is values + lattice = 532,480 bytes.
+        let res = 32usize;
+        let values_bytes = res * res * std::mem::size_of::<f64>();
+        let lattice_bytes = 256 * 256 * std::mem::size_of::<f64>();
+        let fractal_peak = values_bytes + lattice_bytes;
+        let fractal_graph = json!({
+            "nodes": [
+                { "id": "rf", "type": "ridgedFractal", "params": { "scale": 256, "octaves": 1, "seed": 1 } },
+                { "id": "out", "type": "output" }
+            ],
+            "links": [
+                { "from": "rf", "fromPort": "out", "to": "out", "toPort": "color" }
+            ]
+        });
+
+        let err = bake_node_material_maps_with_budget(&fractal_graph, res as u32, fractal_peak - 1)
+            .expect_err("fractal lattice exceeding tight budget must fail cleanly");
+        assert!(
+            err.contains("memory budget exceeded"),
+            "expected fractal lattice budget error, got: {err}"
+        );
+
+        let (maps, tracker) =
+            bake_node_material_maps_with_budget(&fractal_graph, res as u32, fractal_peak)
+                .expect("fractal bake must succeed at exact values + lattice budget");
+        assert!(maps.color.is_some());
+        assert_eq!(tracker.peak_bytes(), fractal_peak);
+        assert_eq!(tracker.live_bytes(), 0);
+
+        // 2. Final output RGBA8 maps reservation (combined with live producer buffer):
+        // A spatial `checker` node wired to 4 output slots at 64x64:
+        //   producer f32 RGBA = 64 * 64 * 16 = 65,536 bytes
+        //   4x RGBA8 outputs  = 4 * (64 * 64 * 4) = 65,536 bytes
+        //   Combined peak     = 131,072 bytes.
+        let out_res = 64usize;
+        let producer_bytes = out_res * out_res * 4 * std::mem::size_of::<f32>();
+        let one_rgba8_bytes = out_res * out_res * 4;
+        let combined_peak = producer_bytes + one_rgba8_bytes * 4;
+        let multi_out_graph = json!({
+            "nodes": [
+                { "id": "chk", "type": "checker", "params": { "scale": 4 } },
+                { "id": "out", "type": "output" }
+            ],
+            "links": [
+                { "from": "chk", "fromPort": "out", "to": "out", "toPort": "color" },
+                { "from": "chk", "fromPort": "out", "to": "out", "toPort": "emissive" },
+                { "from": "chk", "fromPort": "out", "to": "out", "toPort": "roughness" },
+                { "from": "chk", "fromPort": "out", "to": "out", "toPort": "metalness" }
+            ]
+        });
+
+        let err_out = bake_node_material_maps_with_budget(
+            &multi_out_graph,
+            out_res as u32,
+            combined_peak - 1,
+        )
+        .expect_err("output RGBA8 maps exceeding tight budget must fail cleanly");
+        assert!(
+            err_out.contains("memory budget exceeded"),
+            "expected output RGBA8 budget error, got: {err_out}"
+        );
+
+        let (maps_out, tracker_out) =
+            bake_node_material_maps_with_budget(&multi_out_graph, out_res as u32, combined_peak)
+                .expect("multi-output bake must succeed at exact producer + 4x RGBA8 budget");
+        assert!(maps_out.color.is_some());
+        assert!(maps_out.emissive.is_some());
+        assert!(maps_out.roughness.is_some());
+        assert!(maps_out.metalness.is_some());
+        assert_eq!(tracker_out.peak_bytes(), combined_peak);
+        assert_eq!(tracker_out.live_bytes(), 0);
     }
 }

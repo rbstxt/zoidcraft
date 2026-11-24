@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Value, json};
 use zc_project::Uuid;
@@ -928,7 +929,7 @@ impl Session {
         // Flush current document edits into active sequence before extracting clips.
         self.sync_document_to_project();
 
-        let (resolution, fps, bg_color, mut child_controls) = {
+        let (resolution, fps, parent_exact_fps, bg_color, mut child_controls) = {
             let seq = self.active_sequence();
             // Validate every requested clip exists and its track is unlocked.
             let mut found = BTreeSet::new();
@@ -960,17 +961,23 @@ impl Session {
             (
                 seq.resolution,
                 seq.fps.max(1),
+                seq.exact_fps,
                 seq.background_color,
                 seq.controls.clone(),
             )
         };
+        let effective_fps = parent_exact_fps.unwrap_or_else(|| f64::from(fps)).max(1.0);
 
-        // Compute bounding span [min_start, max_end] and lowest affected video track index.
+        // Compute bounding span [min_start, max_end], lowest affected video track index,
+        // and solo state before extracting selected clips.
         let mut min_start = f64::INFINITY;
         let mut max_end = 0.0_f64;
         let mut target_vtrack_idx: Option<usize> = None;
+        let mut any_selected_solo = false;
+        let parent_has_solo;
         {
             let seq = self.active_sequence();
+            parent_has_solo = seq.video_tracks.iter().any(|vt| vt.solo);
             for (ti, vt) in seq.video_tracks.iter().enumerate() {
                 for vc in &vt.clips {
                     if unique_ids.contains(&vc.id) {
@@ -978,6 +985,9 @@ impl Session {
                         max_end = max_end.max(vc.start + vc.length);
                         if target_vtrack_idx.is_none() {
                             target_vtrack_idx = Some(ti);
+                        }
+                        if vt.solo {
+                            any_selected_solo = true;
                         }
                     }
                 }
@@ -1087,8 +1097,9 @@ impl Session {
                 }
             }
 
-            // Ensure target video track exists for placing the PrecompRef clip without
-            // overlapping or deleting any unselected clip remaining on the parent timeline.
+            // Place the replacement PrecompRef clip without overlapping unselected clips,
+            // falling onto a disabled track, shifting z-order across unrelated tracks, or
+            // losing solo visibility when parent tracks are soloed.
             let precomp_end = min_start + span;
             let track_has_unselected_overlap = |vt: &zc_project::VideoTrack| {
                 vt.clips.iter().any(|c| {
@@ -1096,23 +1107,47 @@ impl Session {
                     c_end > min_start + 1e-6 && c.start < precomp_end - 1e-6
                 })
             };
-            let vt_idx = if let Some(ti) = target_vtrack_idx
-                && !seq.video_tracks[ti].locked
-                && !track_has_unselected_overlap(&seq.video_tracks[ti])
-            {
-                ti
-            } else if let Some(ti) = seq
-                .video_tracks
-                .iter()
-                .position(|t| !t.locked && !track_has_unselected_overlap(t))
-            {
+            let needs_solo = parent_has_solo && any_selected_solo;
+            let vt_idx = if let Some(ti) = target_vtrack_idx {
+                let target_vt = &seq.video_tracks[ti];
+                let can_reuse = target_vt.enabled
+                    && !target_vt.locked
+                    && !track_has_unselected_overlap(target_vt)
+                    && (!needs_solo || target_vt.solo || target_vt.clips.is_empty());
+                if can_reuse {
+                    if needs_solo {
+                        seq.video_tracks[ti].solo = true;
+                    }
+                    ti
+                } else {
+                    seq.video_tracks.insert(
+                        ti,
+                        zc_project::VideoTrack {
+                            id: fresh_vtrack_ids[track_alloc_count_v],
+                            name: format!("V{}", seq.video_tracks.len() + 1),
+                            enabled: true,
+                            solo: needs_solo,
+                            locked: false,
+                            is_3d: false,
+                            clips: Vec::new(),
+                            preserved: BTreeMap::new(),
+                        },
+                    );
+                    ti
+                }
+            } else if let Some(ti) = seq.video_tracks.iter().position(|t| {
+                t.enabled
+                    && !t.locked
+                    && !track_has_unselected_overlap(t)
+                    && (!parent_has_solo || t.solo)
+            }) {
                 ti
             } else {
                 seq.video_tracks.push(zc_project::VideoTrack {
                     id: fresh_vtrack_ids[track_alloc_count_v],
                     name: format!("V{}", seq.video_tracks.len() + 1),
                     enabled: true,
-                    solo: false,
+                    solo: needs_solo,
                     locked: false,
                     is_3d: false,
                     clips: Vec::new(),
@@ -1150,6 +1185,13 @@ impl Session {
         // expressions referencing controls by name or ID evaluate identically.
         for ctl in &mut child_controls {
             shift_property_track_keyframes(&mut ctl.track, -min_start);
+            if min_start.abs() > 1e-9 {
+                offset_property_track_expressions_time_origin(
+                    &mut ctl.track,
+                    min_start,
+                    effective_fps,
+                );
+            }
         }
 
         if new_vtracks.is_empty() {
@@ -1182,6 +1224,7 @@ impl Session {
             name: trimmed.to_owned(),
             resolution,
             fps,
+            exact_fps: parent_exact_fps,
             length_frames: span,
             background_color: bg_color,
             controls: child_controls,
@@ -1936,25 +1979,44 @@ impl Session {
         };
 
         let frozen_time = if let Some(expr_src) = time_expr {
-            let fps = self.document.fps.max(1.0);
             let config = if self.plugins.is_enabled("expressions-plus") {
                 zc_expr::EvalConfig::expressions_plus()
             } else {
                 zc_expr::EvalConfig::vanilla()
             };
             self.sync_document_to_project();
-            let controls = evaluate_sequence_controls_at(
-                &self.active_sequence().controls,
-                frame,
+            let active_seq = self.active_sequence();
+            let fps = active_seq
+                .exact_fps
+                .unwrap_or_else(|| f64::from(active_seq.fps.max(1)))
+                .max(1.0);
+            let active_vclip = active_seq
+                .video_tracks
+                .iter()
+                .flat_map(|vt| vt.clips.iter())
+                .find(|c| c.id == clip_id);
+            let state = FreezeExprState {
+                project: &self.project,
+                sequence: active_seq,
+                abs_frame: frame,
                 fps,
-                &config,
-            );
+                config: &config,
+                control_cache: RefCell::new(HashMap::new()),
+                active_stack: RefCell::new(HashSet::new()),
+            };
+            let self_prop_id = zc_expr::HandleId::new(format!("prop:clip:{clip_id}:time"));
             let ctx = FreezeTimeExprContext {
-                local_frame,
-                base_time,
-                fps,
-                time_prop: time_prop_snapshot.as_ref(),
-                controls: &controls,
+                state: &state,
+                frame: local_frame,
+                time: base_time,
+                base_value: zc_expr::Value::Number(base_time),
+                self_prop_id,
+                self_track: active_vclip.map(|c| &c.time_curve),
+                time_prop_fallback: time_prop_snapshot.as_ref(),
+                active_clip_id: Some(clip_id),
+                active_layer_id: active_vclip.map(|c| c.layer.id),
+                active_object_id: None,
+                active_effect_id: None,
             };
             let outcome = zc_expr::eval_with_fallback(&expr_src, &ctx, &config);
             if outcome.error.is_none() {
@@ -2123,9 +2185,13 @@ fn mirror_cm3_tween_code(tween: u16) -> u16 {
     (tween & 0xFF00) | u16::from(mirrored_low)
 }
 
+fn is_hold_tween(tween: u16) -> bool {
+    (tween & 0xFF) == 0
+}
+
 /// Reverses a sorted keyframe curve across `[0, duration]`, migrating each segment's
 /// CM3 right-endpoint tween code to the new right endpoint with mirrored easing and
-/// mirrored Bezier handles.
+/// mirrored Bezier handles, and preserving Hold (`tween == 0`) segment interiors.
 fn reverse_session_keyframes(keyframes: &mut Vec<SessionKeyframe>, duration: f64) {
     if keyframes.is_empty() {
         return;
@@ -2136,22 +2202,232 @@ fn reverse_session_keyframes(keyframes: &mut Vec<SessionKeyframe>, duration: f64
     let mut reversed = Vec::with_capacity(n);
     for j in 0..n {
         let src = &old[n - 1 - j];
+        let new_frame = duration - src.frame;
         let tween = if j == 0 {
             1
         } else {
             // Segment `new[j - 1] -> new[j]` reverses `old[n - 1 - j] -> old[n - j]`,
             // whose CM3 tween metadata lives on its original right endpoint `old[n - j]`.
-            mirror_cm3_tween_code(old[n - j].tween)
+            let orig_right = &old[n - j];
+            let orig_left = src;
+            let seg_len = orig_right.frame - orig_left.frame;
+            if is_hold_tween(orig_right.tween)
+                && orig_left.value != orig_right.value
+                && seg_len > 2e-4
+            {
+                // Forward Hold `[t0: v0, t1: v1 (Hold)]` evaluates to `v0` throughout `[t0, t1)`
+                // and jumps to `v1` at `t1`. When reversed to `[d - t1, d - t0]`, keep `v1` at
+                // `new_start` and step to `v0` at `new_start + 1e-4` so the entire reversed
+                // segment interior evaluates to `v0`.
+                let new_start = duration - orig_right.frame;
+                let step_frame = (new_start + 1e-4).min(new_frame - 1e-6);
+                if reversed
+                    .last()
+                    .is_none_or(|prev: &SessionKeyframe| (step_frame - prev.frame).abs() > 1e-9)
+                    && (new_frame - step_frame).abs() > 1e-9
+                {
+                    let mut step_kf = orig_left.clone();
+                    step_kf.frame = step_frame;
+                    step_kf.tween = 0;
+                    step_kf.continuous_tangent = false;
+                    step_kf.control_points = [[0.0, 0.0], [0.0, 0.0]];
+                    reversed.push(step_kf);
+                }
+            }
+            mirror_cm3_tween_code(orig_right.tween)
         };
         let old_in = src.control_points[0];
         let old_out = src.control_points[1];
         let mut kf = src.clone();
-        kf.frame = duration - src.frame;
+        kf.frame = new_frame;
         kf.tween = tween;
         kf.control_points = [[-old_out[0], old_out[1]], [-old_in[0], old_in[1]]];
         reversed.push(kf);
     }
+    reversed.sort_by(|a, b| a.frame.total_cmp(&b.frame));
     *keyframes = reversed;
+}
+
+/// Rewrites standalone `frame` and `time` identifiers inside a cloned sequence control
+/// expression so evaluating it in a precomposed child timeline (shifted by `frame_offset`
+/// frames at `fps`) yields the exact same result as evaluating in the parent timeline.
+fn offset_expr_time_origin(expr: &str, frame_offset: f64, fps: f64) -> String {
+    if expr.trim().is_empty() || !frame_offset.is_finite() || frame_offset.abs() <= 1e-9 {
+        return expr.to_owned();
+    }
+    let Ok(tokens) = zc_expr::lexer::Lexer::new(expr).tokenize() else {
+        return expr.to_owned();
+    };
+    let time_offset = frame_offset / fps.max(1.0);
+    let frame_repl = if frame_offset >= 0.0 {
+        format!("(frame + {frame_offset:?})")
+    } else {
+        format!("(frame - {:?})", -frame_offset)
+    };
+    let time_repl = if time_offset >= 0.0 {
+        format!("(time + {time_offset:?})")
+    } else {
+        format!("(time - {:?})", -time_offset)
+    };
+
+    // Detect if the expression explicitly shadows `frame` or `time` via declaration or parameter.
+    let mut shadows_frame = false;
+    let mut shadows_time = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        use zc_expr::lexer::TokenKind;
+        match &tokens[i].kind {
+            TokenKind::Var | TokenKind::Let | TokenKind::Const => {
+                if let Some(tok) = tokens.get(i + 1)
+                    && let TokenKind::Ident(name) = &tok.kind
+                {
+                    if name == "frame" {
+                        shadows_frame = true;
+                    } else if name == "time" {
+                        shadows_time = true;
+                    }
+                }
+            }
+            TokenKind::Function => {
+                let mut k = i + 1;
+                if matches!(tokens.get(k).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
+                    k += 1;
+                }
+                if matches!(tokens.get(k).map(|t| &t.kind), Some(TokenKind::LParen)) {
+                    let mut depth = 0usize;
+                    while k < tokens.len() {
+                        match &tokens[k].kind {
+                            TokenKind::LParen => depth += 1,
+                            TokenKind::RParen => {
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            TokenKind::Ident(name) if depth == 1 => {
+                                if name == "frame" {
+                                    shadows_frame = true;
+                                } else if name == "time" {
+                                    shadows_time = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                }
+            }
+            TokenKind::Ident(name)
+                if matches!(
+                    tokens.get(i + 1).map(|t| &t.kind),
+                    Some(TokenKind::FatArrow)
+                ) =>
+            {
+                if name == "frame" {
+                    shadows_frame = true;
+                } else if name == "time" {
+                    shadows_time = true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let mut replacements: Vec<(usize, usize, &str)> = Vec::new();
+    for (idx, tok) in tokens.iter().enumerate() {
+        use zc_expr::lexer::TokenKind;
+        let TokenKind::Ident(name) = &tok.kind else {
+            continue;
+        };
+        let repl = if name == "frame" && !shadows_frame {
+            frame_repl.as_str()
+        } else if name == "time" && !shadows_time {
+            time_repl.as_str()
+        } else {
+            continue;
+        };
+        let prev = idx
+            .checked_sub(1)
+            .and_then(|p| tokens.get(p))
+            .map(|t| &t.kind);
+        let next = tokens.get(idx + 1).map(|t| &t.kind);
+
+        // Skip member accesses (`obj.frame`, `obj?.time`), declaration bindings,
+        // assignment/update targets, and object literal property keys (`{ frame: 1 }`).
+        if matches!(
+            prev,
+            Some(
+                TokenKind::Dot
+                    | TokenKind::OptionalChain
+                    | TokenKind::Var
+                    | TokenKind::Let
+                    | TokenKind::Const
+                    | TokenKind::Function
+                    | TokenKind::PlusPlus
+                    | TokenKind::MinusMinus
+            )
+        ) {
+            continue;
+        }
+        if matches!(
+            next,
+            Some(
+                TokenKind::Eq
+                    | TokenKind::PlusEq
+                    | TokenKind::MinusEq
+                    | TokenKind::StarEq
+                    | TokenKind::SlashEq
+                    | TokenKind::PercentEq
+                    | TokenKind::StarStarEq
+                    | TokenKind::PlusPlus
+                    | TokenKind::MinusMinus
+            )
+        ) {
+            continue;
+        }
+        if matches!(prev, Some(TokenKind::LBrace | TokenKind::Comma))
+            && matches!(next, Some(TokenKind::Colon))
+        {
+            continue;
+        }
+        replacements.push((tok.span.start, tok.span.end, repl));
+    }
+
+    if replacements.is_empty() {
+        return expr.to_owned();
+    }
+
+    let mut out = String::with_capacity(expr.len() + replacements.len() * 20);
+    let mut cursor = 0usize;
+    for (start, end, repl) in replacements {
+        if start >= cursor && end <= expr.len() {
+            out.push_str(&expr[cursor..start]);
+            out.push_str(repl);
+            cursor = end;
+        }
+    }
+    out.push_str(&expr[cursor..]);
+
+    if zc_expr::parser::parse_source(&out, zc_expr::ExprMode::ExpressionsPlus).is_ok() {
+        out
+    } else {
+        expr.to_owned()
+    }
+}
+
+fn offset_property_track_expressions_time_origin(
+    track: &mut zc_project::PropertyTrack,
+    frame_offset: f64,
+    fps: f64,
+) {
+    if let Some(expr) = track.expression.as_deref() {
+        let rewritten = offset_expr_time_origin(expr, frame_offset, fps);
+        track.expression = Some(rewritten);
+    }
+    for ch in &mut track.channels {
+        offset_property_track_expressions_time_origin(ch, frame_offset, fps);
+    }
 }
 
 fn json_to_expr_value(val: &Value) -> zc_expr::Value {
@@ -2171,80 +2447,318 @@ fn json_to_expr_value(val: &Value) -> zc_expr::Value {
     }
 }
 
-struct ControlExprContext<'a> {
-    abs_frame: f64,
-    fps: f64,
-    base_value: zc_expr::Value,
-    controls: &'a BTreeMap<String, zc_expr::Value>,
+fn eval_project_track_base(track: &zc_project::PropertyTrack, frame: f64) -> zc_expr::Value {
+    if !track.channels.is_empty() {
+        let vals = track
+            .channels
+            .iter()
+            .map(|ch| {
+                let sp = property_track_to_session(ch);
+                json_to_expr_value(&eval_session_property_at(&sp, frame))
+            })
+            .collect();
+        return zc_expr::Value::Array(vals);
+    }
+    let sp = property_track_to_session(track);
+    json_to_expr_value(&eval_session_property_at(&sp, frame))
 }
 
-impl zc_expr::ExprContext for ControlExprContext<'_> {
-    fn frame(&self) -> f64 {
-        self.abs_frame
+fn sorted_unique_track_key_frames(track: &zc_project::PropertyTrack) -> Vec<f64> {
+    let mut frames: Vec<f64> = if !track.channels.is_empty() {
+        track
+            .channels
+            .iter()
+            .flat_map(|ch| ch.keyframes.iter().map(|k| k.frame))
+            .collect()
+    } else {
+        track.keyframes.iter().map(|k| k.frame).collect()
+    };
+    frames.sort_by(f64::total_cmp);
+    let mut dedup: Vec<f64> = Vec::with_capacity(frames.len());
+    for f in frames {
+        if dedup.last().is_none_or(|&prev| (f - prev).abs() > 1e-9) {
+            dedup.push(f);
+        }
+    }
+    dedup
+}
+
+fn lookup_layer_track<'a>(
+    layer: &'a zc_project::Layer,
+    name: &str,
+) -> Option<&'a zc_project::PropertyTrack> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "position" | "pos" => Some(&layer.position),
+        "scale" => Some(&layer.scale),
+        "rotation" | "rot" => Some(&layer.rotation),
+        "anchor" | "anchorpoint" | "anchor point" => Some(&layer.anchor),
+        "opacity" => Some(&layer.opacity),
+        _ => None,
+    }
+}
+
+fn lookup_object_track<'a>(
+    obj: &'a zc_project::Object3D,
+    name: &str,
+) -> Option<&'a zc_project::PropertyTrack> {
+    let key = name.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "position" | "pos" => return Some(&obj.position),
+        "rotation" | "rot" => return Some(&obj.rotation),
+        "scale" => return Some(&obj.scale),
+        "enabled" | "visible" => return Some(&obj.enabled),
+        _ => {}
+    }
+    match &obj.kind {
+        zc_project::Object3DKind::Camera(cam) => match key.as_str() {
+            "fov" => Some(&cam.fov),
+            "zoom" => Some(&cam.zoom),
+            "shakeamplitude" | "shake amplitude" => Some(&cam.shake_amplitude),
+            "shakespeed" | "shake speed" => Some(&cam.shake_speed),
+            _ => None,
+        },
+        zc_project::Object3DKind::Light(light) => match key.as_str() {
+            "color" => Some(&light.color),
+            "groundcolor" | "ground color" => Some(&light.ground_color),
+            "target" => Some(&light.target),
+            "intensity" => Some(&light.intensity),
+            "angle" => Some(&light.angle),
+            _ => None,
+        },
+        zc_project::Object3DKind::Group {
+            custom_properties, ..
+        } => custom_properties
+            .iter()
+            .find(|cp| cp.name == name || cp.name.eq_ignore_ascii_case(name))
+            .map(|cp| &cp.track),
+        zc_project::Object3DKind::Particles(p) => (key == "time").then_some(&p.time),
+        zc_project::Object3DKind::Model(m) => m.model_properties.get(name).or_else(|| {
+            m.model_properties
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+        }),
+        _ => None,
+    }
+}
+
+fn lookup_effect_track<'a>(
+    fx: &'a zc_project::EffectInstance,
+    name: &str,
+) -> Option<&'a zc_project::PropertyTrack> {
+    if name.eq_ignore_ascii_case("enabled") {
+        return Some(&fx.enabled);
+    }
+    if let Some(t) = fx.params.get(name) {
+        return Some(t);
+    }
+    if let Some((_, t)) = fx.params.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+        return Some(t);
+    }
+    match &fx.kind {
+        zc_project::EffectKind::EffectGroup {
+            custom_properties, ..
+        }
+        | zc_project::EffectKind::CustomShader {
+            custom_properties, ..
+        } => custom_properties
+            .iter()
+            .find(|cp| cp.name == name || cp.name.eq_ignore_ascii_case(name))
+            .map(|cp| &cp.track),
+        _ => None,
+    }
+}
+
+/// Shared lazy evaluation state for `FreezeClipFrame` expressions matching `zc-render`'s
+/// `EngineExprContext` semantics (lazy control evaluation, strict ID lookup, cycle guard,
+/// and clip/layer/sequence handle resolution).
+struct FreezeExprState<'a> {
+    project: &'a zc_project::Project,
+    sequence: &'a zc_project::Sequence,
+    abs_frame: f64,
+    fps: f64,
+    config: &'a zc_expr::EvalConfig,
+    control_cache: RefCell<HashMap<String, zc_expr::Value>>,
+    active_stack: RefCell<HashSet<String>>,
+}
+
+impl<'a> FreezeExprState<'a> {
+    fn find_clip_by_id(&self, id: Uuid) -> Option<&'a zc_project::VideoClip> {
+        self.sequence
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == id)
     }
 
-    fn time(&self) -> f64 {
-        self.abs_frame / self.fps
-    }
-
-    fn fps(&self) -> f64 {
-        self.fps
-    }
-
-    fn value(&self) -> zc_expr::Value {
-        self.base_value.clone()
-    }
-
-    fn control(
+    fn find_layer_owner(
         &self,
-        name: &str,
-        stable_id: Option<&str>,
-    ) -> Result<zc_expr::Value, zc_expr::ExprError> {
-        if let Some(id) = stable_id
-            && let Some(val) = self.controls.get(id)
-        {
-            return Ok(val.clone());
+        layer_id: Uuid,
+    ) -> Option<(&'a zc_project::VideoClip, &'a zc_project::Layer)> {
+        fn search_layer(layer: &zc_project::Layer, target: Uuid) -> Option<&zc_project::Layer> {
+            if layer.id == target {
+                return Some(layer);
+            }
+            if let zc_project::LayerKind::Composite { layers } = &layer.kind {
+                for child in layers {
+                    if let Some(found) = search_layer(child, target) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
         }
-        if let Some(val) = self.controls.get(name) {
-            return Ok(val.clone());
+        for track in &self.sequence.video_tracks {
+            for clip in &track.clips {
+                if let Some(layer) = search_layer(&clip.layer, layer_id) {
+                    return Some((clip, layer));
+                }
+            }
         }
-        Err(zc_expr::ExprError::NotFound(format!("control '{name}'")))
+        None
     }
-}
 
-fn evaluate_sequence_controls_at(
-    controls: &[zc_project::SequenceControl],
-    abs_frame: f64,
-    fps: f64,
-    config: &zc_expr::EvalConfig,
-) -> BTreeMap<String, zc_expr::Value> {
-    let mut evaluated = BTreeMap::new();
-    for ctrl in controls {
-        let session_prop = property_track_to_session(&ctrl.track);
-        let base_json = eval_session_property_at(&session_prop, abs_frame);
-        let base_expr = json_to_expr_value(&base_json);
-        let mut expr_val = if let Some(expr_src) = ctrl
-            .track
+    fn find_object_owner(
+        &self,
+        obj_id: Uuid,
+    ) -> Option<(
+        &'a zc_project::VideoClip,
+        &'a zc_project::Layer,
+        Option<Uuid>,
+        &'a zc_project::Object3D,
+    )> {
+        fn search_objs(
+            objs: &[zc_project::Object3D],
+            parent: Option<Uuid>,
+            target: Uuid,
+        ) -> Option<(Option<Uuid>, &zc_project::Object3D)> {
+            for o in objs {
+                if o.id == target {
+                    return Some((parent, o));
+                }
+                if let zc_project::Object3DKind::Group { children, .. } = &o.kind
+                    && let Some(found) = search_objs(children, Some(o.id), target)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        for track in &self.sequence.video_tracks {
+            for clip in &track.clips {
+                if let zc_project::LayerKind::Scene3D { objects, .. } = &clip.layer.kind
+                    && let Some((parent, obj)) = search_objs(objects, None, obj_id)
+                {
+                    return Some((clip, &clip.layer, parent, obj));
+                }
+            }
+        }
+        None
+    }
+
+    fn find_effect_owner(
+        &self,
+        fx_id: Uuid,
+    ) -> Option<(
+        &'a zc_project::VideoClip,
+        &'a zc_project::Layer,
+        Option<Uuid>,
+        &'a zc_project::EffectInstance,
+    )> {
+        fn search_fxs(
+            fxs: &[zc_project::EffectInstance],
+            parent: Option<Uuid>,
+            target: Uuid,
+        ) -> Option<(Option<Uuid>, &zc_project::EffectInstance)> {
+            for fx in fxs {
+                if fx.id == target {
+                    return Some((parent, fx));
+                }
+                if let zc_project::EffectKind::EffectGroup { children, .. } = &fx.kind
+                    && let Some(found) = search_fxs(children, Some(fx.id), target)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        for track in &self.sequence.video_tracks {
+            for clip in &track.clips {
+                if let Some((parent, fx)) = search_fxs(&clip.layer.effects, None, fx_id) {
+                    return Some((clip, &clip.layer, parent, fx));
+                }
+            }
+        }
+        None
+    }
+
+    fn eval_track_checked(
+        &self,
+        track: &'a zc_project::PropertyTrack,
+        frame: f64,
+        time: f64,
+        self_prop_id: zc_expr::HandleId,
+        scope: FreezeExprScope,
+    ) -> Result<zc_expr::Value, zc_expr::ExprError> {
+        let has_expr = track
+            .expression
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let base_value = if !track.channels.is_empty() && !has_expr {
+            let mut vals = Vec::with_capacity(track.channels.len());
+            for (idx, ch) in track.channels.iter().enumerate() {
+                let ch_id = zc_expr::HandleId::new(format!("{}:ch{idx}", self_prop_id.as_str()));
+                vals.push(self.eval_track_checked(ch, frame, time, ch_id, scope)?);
+            }
+            zc_expr::Value::Array(vals)
+        } else {
+            eval_project_track_base(track, frame)
+        };
+
+        if let Some(expr_src) = track
             .expression
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            let ctx = ControlExprContext {
-                abs_frame,
-                fps,
-                base_value: base_expr.clone(),
-                controls: &evaluated,
+            let ctx = FreezeTimeExprContext {
+                state: self,
+                frame,
+                time,
+                base_value: base_value.clone(),
+                self_prop_id,
+                self_track: Some(track),
+                time_prop_fallback: None,
+                active_clip_id: scope.clip_id,
+                active_layer_id: scope.layer_id,
+                active_object_id: scope.object_id,
+                active_effect_id: scope.effect_id,
             };
-            let outcome = zc_expr::eval_with_fallback(expr_src, &ctx, config);
-            if outcome.error.is_none() {
-                outcome.value
-            } else {
-                base_expr
+            let outcome = zc_expr::eval_with_fallback(expr_src, &ctx, self.config);
+            if let Some(err) = outcome.error {
+                if matches!(err, zc_expr::ExprError::CycleDetected(_)) {
+                    return Err(err);
+                }
+                return Ok(base_value);
             }
-        } else {
-            base_expr
-        };
+            return Ok(outcome.value);
+        }
+
+        Ok(base_value)
+    }
+
+    fn eval_control(
+        &self,
+        ctrl: &'a zc_project::SequenceControl,
+        cycle_key: &str,
+    ) -> Result<zc_expr::Value, zc_expr::ExprError> {
+        let mut expr_val = self.eval_track_checked(
+            &ctrl.track,
+            self.abs_frame,
+            self.abs_frame / self.fps.max(1.0),
+            zc_expr::HandleId::new(cycle_key.to_owned()),
+            FreezeExprScope::default(),
+        )?;
         if ctrl.kind == zc_project::SequenceControlKind::Checkbox {
             expr_val = match expr_val {
                 zc_expr::Value::String(s) => {
@@ -2254,35 +2768,345 @@ fn evaluate_sequence_controls_at(
                 other => other,
             };
         }
-        evaluated.insert(ctrl.id.clone(), expr_val.clone());
-        evaluated.insert(ctrl.name.clone(), expr_val);
+        Ok(expr_val)
     }
-    evaluated
+}
+
+#[derive(Clone, Copy, Default)]
+struct FreezeExprScope {
+    clip_id: Option<Uuid>,
+    layer_id: Option<Uuid>,
+    object_id: Option<Uuid>,
+    effect_id: Option<Uuid>,
 }
 
 struct FreezeTimeExprContext<'a> {
-    local_frame: f64,
-    base_time: f64,
-    fps: f64,
-    time_prop: Option<&'a SessionProperty>,
-    controls: &'a BTreeMap<String, zc_expr::Value>,
+    state: &'a FreezeExprState<'a>,
+    frame: f64,
+    time: f64,
+    base_value: zc_expr::Value,
+    self_prop_id: zc_expr::HandleId,
+    self_track: Option<&'a zc_project::PropertyTrack>,
+    time_prop_fallback: Option<&'a SessionProperty>,
+    active_clip_id: Option<Uuid>,
+    active_layer_id: Option<Uuid>,
+    active_object_id: Option<Uuid>,
+    active_effect_id: Option<Uuid>,
+}
+
+type ResolvedPropTrack<'a> = (
+    &'a zc_project::PropertyTrack,
+    Option<&'a zc_project::VideoClip>,
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<Uuid>,
+);
+
+impl<'a> FreezeTimeExprContext<'a> {
+    fn resolve_property_track(&self, id: &zc_expr::HandleId) -> Option<ResolvedPropTrack<'a>> {
+        let rest = id.as_str().strip_prefix("prop:")?;
+        if let Some(after) = rest.strip_prefix("clip:") {
+            let (u_str, prop) = after.split_once(':')?;
+            let u = Uuid::parse_str(u_str).ok()?;
+            let clip = self.state.find_clip_by_id(u)?;
+            if prop.eq_ignore_ascii_case("time") {
+                return Some((
+                    &clip.time_curve,
+                    Some(clip),
+                    Some(clip.layer.id),
+                    None,
+                    None,
+                ));
+            }
+        } else if let Some(after) = rest.strip_prefix("layer:") {
+            let (u_str, prop) = after.split_once(':')?;
+            let u = Uuid::parse_str(u_str).ok()?;
+            let (clip, layer) = self.state.find_layer_owner(u)?;
+            let track = lookup_layer_track(layer, prop)?;
+            return Some((track, Some(clip), Some(layer.id), None, None));
+        } else if let Some(after) = rest.strip_prefix("obj:") {
+            let (u_str, prop) = after.split_once(':')?;
+            let u = Uuid::parse_str(u_str).ok()?;
+            let (clip, layer, _, obj) = self.state.find_object_owner(u)?;
+            let track = lookup_object_track(obj, prop)?;
+            return Some((track, Some(clip), Some(layer.id), Some(obj.id), None));
+        } else if let Some(after) = rest.strip_prefix("fx:") {
+            let (u_str, prop) = after.split_once(':')?;
+            let u = Uuid::parse_str(u_str).ok()?;
+            let (clip, layer, _, fx) = self.state.find_effect_owner(u)?;
+            let track = lookup_effect_track(fx, prop)?;
+            return Some((track, Some(clip), Some(layer.id), None, Some(fx.id)));
+        }
+        None
+    }
 }
 
 impl zc_expr::ExprContext for FreezeTimeExprContext<'_> {
     fn frame(&self) -> f64 {
-        self.local_frame
+        self.frame
     }
 
     fn time(&self) -> f64 {
-        self.base_time
+        self.time
     }
 
     fn fps(&self) -> f64 {
-        self.fps
+        self.state.fps
     }
 
     fn value(&self) -> zc_expr::Value {
-        zc_expr::Value::Number(self.base_time)
+        self.base_value.clone()
+    }
+
+    fn this_property_id(&self) -> Option<zc_expr::HandleId> {
+        Some(self.self_prop_id.clone())
+    }
+
+    fn this_object_id(&self) -> Option<zc_expr::HandleId> {
+        self.active_object_id
+            .map(|id| zc_expr::HandleId::new(format!("obj:{id}")))
+    }
+
+    fn this_layer_id(&self) -> Option<zc_expr::HandleId> {
+        self.active_layer_id
+            .map(|id| zc_expr::HandleId::new(format!("layer:{id}")))
+    }
+
+    fn this_clip_id(&self) -> Option<zc_expr::HandleId> {
+        self.active_clip_id
+            .map(|id| zc_expr::HandleId::new(format!("clip:{id}")))
+    }
+
+    fn this_sequence_id(&self) -> Option<zc_expr::HandleId> {
+        Some(zc_expr::HandleId::new("seq"))
+    }
+
+    fn property_local_frame(&self, id: &zc_expr::HandleId) -> Option<f64> {
+        if id == &self.self_prop_id {
+            return Some(self.frame);
+        }
+        self.resolve_property_track(id)
+            .map(|(_, clip_opt, _, _, _)| {
+                clip_opt.map_or(self.state.abs_frame, |c| self.state.abs_frame - c.start)
+            })
+    }
+
+    fn handle_name(&self, id: &zc_expr::HandleId) -> Option<String> {
+        let s = id.as_str();
+        if s == "seq" {
+            return Some(self.state.sequence.name.clone());
+        }
+        if let Some(u) = s
+            .strip_prefix("clip:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            return self.state.find_clip_by_id(u).map(|c| c.name.clone());
+        }
+        if let Some(u) = s
+            .strip_prefix("layer:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            return self.state.find_layer_owner(u).map(|(_, l)| l.name.clone());
+        }
+        if let Some(u) = s.strip_prefix("obj:").and_then(|v| Uuid::parse_str(v).ok()) {
+            return self
+                .state
+                .find_object_owner(u)
+                .map(|(_, _, _, o)| o.name.clone());
+        }
+        if let Some(u) = s.strip_prefix("fx:").and_then(|v| Uuid::parse_str(v).ok()) {
+            return self
+                .state
+                .find_effect_owner(u)
+                .map(|(_, _, _, f)| f.name.clone());
+        }
+        if let Some(rest) = s.strip_prefix("prop:")
+            && let Some((_, prop_name)) = rest.rsplit_once(':')
+        {
+            return Some(prop_name.to_owned());
+        }
+        None
+    }
+
+    fn parent_of(
+        &self,
+        id: &zc_expr::HandleId,
+        levels: usize,
+    ) -> Result<Option<zc_expr::HandleRef>, zc_expr::ExprError> {
+        use zc_expr::{HandleId, HandleRef};
+        if levels == 0 {
+            return Ok(None);
+        }
+        let mut current: Option<HandleRef> = if let Some(rest) = id.as_str().strip_prefix("prop:") {
+            if let Some(after) = rest.strip_prefix("obj:") {
+                after
+                    .split_once(':')
+                    .map(|(u, _)| HandleRef::Object(HandleId::new(format!("obj:{u}"))))
+            } else if let Some(after) = rest.strip_prefix("fx:") {
+                after
+                    .split_once(':')
+                    .map(|(u, _)| HandleRef::Effect(HandleId::new(format!("fx:{u}"))))
+            } else if let Some(after) = rest.strip_prefix("layer:") {
+                after
+                    .split_once(':')
+                    .map(|(u, _)| HandleRef::Layer(HandleId::new(format!("layer:{u}"))))
+            } else if let Some(after) = rest.strip_prefix("clip:") {
+                after
+                    .split_once(':')
+                    .map(|(u, _)| HandleRef::Clip(HandleId::new(format!("clip:{u}"))))
+            } else {
+                None
+            }
+        } else if let Some(u) = id
+            .as_str()
+            .strip_prefix("obj:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            self.state
+                .find_object_owner(u)
+                .map(|(_, layer, parent_obj, _)| {
+                    if let Some(po) = parent_obj {
+                        HandleRef::Object(HandleId::new(format!("obj:{po}")))
+                    } else {
+                        HandleRef::Layer(HandleId::new(format!("layer:{}", layer.id)))
+                    }
+                })
+        } else if let Some(u) = id
+            .as_str()
+            .strip_prefix("fx:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            self.state
+                .find_effect_owner(u)
+                .map(|(_, layer, parent_fx, _)| {
+                    if let Some(pf) = parent_fx {
+                        HandleRef::Effect(HandleId::new(format!("fx:{pf}")))
+                    } else {
+                        HandleRef::Layer(HandleId::new(format!("layer:{}", layer.id)))
+                    }
+                })
+        } else if let Some(u) = id
+            .as_str()
+            .strip_prefix("layer:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            self.state
+                .find_layer_owner(u)
+                .map(|(clip, _)| HandleRef::Clip(HandleId::new(format!("clip:{}", clip.id))))
+        } else if id.as_str().starts_with("clip:") {
+            Some(HandleRef::Sequence)
+        } else {
+            None
+        };
+
+        for _ in 1..levels {
+            let Some(ref cur) = current else {
+                return Ok(None);
+            };
+            current = match cur {
+                HandleRef::Object(hid)
+                | HandleRef::Effect(hid)
+                | HandleRef::Layer(hid)
+                | HandleRef::Clip(hid)
+                | HandleRef::Property(hid) => self.parent_of(hid, 1)?,
+                HandleRef::Sequence | HandleRef::Controls => None,
+            };
+        }
+        Ok(current)
+    }
+
+    fn property_value(&self, id: &zc_expr::HandleId) -> Result<zc_expr::Value, zc_expr::ExprError> {
+        if id == &self.self_prop_id {
+            return Ok(self.value());
+        }
+        if let Some(seq_prop) = id.as_str().strip_prefix("prop:seq:") {
+            return match seq_prop.to_ascii_lowercase().as_str() {
+                "resolution" => Ok(zc_expr::Value::vec2(
+                    f64::from(self.state.sequence.resolution[0]),
+                    f64::from(self.state.sequence.resolution[1]),
+                )),
+                "width" => Ok(zc_expr::Value::Number(f64::from(
+                    self.state.sequence.resolution[0],
+                ))),
+                "height" => Ok(zc_expr::Value::Number(f64::from(
+                    self.state.sequence.resolution[1],
+                ))),
+                "rate" | "fps" => Ok(zc_expr::Value::Number(self.state.fps)),
+                "length" | "duration" => {
+                    Ok(zc_expr::Value::Number(self.state.sequence.length_frames))
+                }
+                _ => Err(zc_expr::ExprError::NotFound(format!(
+                    "sequence property '{seq_prop}'"
+                ))),
+            };
+        }
+        if let Some(after) = id.as_str().strip_prefix("prop:clip:")
+            && let Some((u_str, prop)) = after.split_once(':')
+            && let Ok(u) = Uuid::parse_str(u_str)
+            && let Some(clip) = self.state.find_clip_by_id(u)
+        {
+            match prop.to_ascii_lowercase().as_str() {
+                "start" => return Ok(zc_expr::Value::Number(clip.start)),
+                "length" | "duration" => return Ok(zc_expr::Value::Number(clip.length)),
+                _ => {}
+            }
+        }
+        if let Some(after) = id.as_str().strip_prefix("prop:layer:")
+            && let Some((u_str, prop)) = after.split_once(':')
+            && let Ok(u) = Uuid::parse_str(u_str)
+            && let Some((_, layer)) = self.state.find_layer_owner(u)
+        {
+            match prop.to_ascii_lowercase().as_str() {
+                "width" => return Ok(zc_expr::Value::Number(f64::from(layer.resolution[0]))),
+                "height" => return Ok(zc_expr::Value::Number(f64::from(layer.resolution[1]))),
+                "resolution" => {
+                    return Ok(zc_expr::Value::vec2(
+                        f64::from(layer.resolution[0]),
+                        f64::from(layer.resolution[1]),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let key = id.as_str().to_owned();
+        if !self.state.active_stack.borrow_mut().insert(key.clone()) {
+            return Err(zc_expr::ExprError::CycleDetected(key));
+        }
+
+        let res = if let Some((track, clip_opt, layer_id, obj_id, fx_id)) =
+            self.resolve_property_track(id)
+        {
+            let target_local_frame =
+                clip_opt.map_or(self.state.abs_frame, |c| self.state.abs_frame - c.start);
+            let target_time = if let Some(c) = clip_opt {
+                eval_project_track_base(&c.time_curve, target_local_frame)
+                    .as_f64()
+                    .unwrap_or(target_local_frame / self.state.fps.max(1.0))
+            } else {
+                target_local_frame / self.state.fps.max(1.0)
+            };
+            self.state.eval_track_checked(
+                track,
+                target_local_frame,
+                target_time,
+                id.clone(),
+                FreezeExprScope {
+                    clip_id: clip_opt.map(|c| c.id),
+                    layer_id,
+                    object_id: obj_id,
+                    effect_id: fx_id,
+                },
+            )
+        } else {
+            Err(zc_expr::ExprError::NotFound(format!(
+                "property '{}'",
+                id.as_str()
+            )))
+        };
+
+        self.state.active_stack.borrow_mut().remove(&key);
+        res
     }
 
     fn property_value_at_time(
@@ -2290,25 +3114,34 @@ impl zc_expr::ExprContext for FreezeTimeExprContext<'_> {
         id: &zc_expr::HandleId,
         seconds: f64,
     ) -> Result<zc_expr::Value, zc_expr::ExprError> {
-        if self.this_property_id().as_ref() == Some(id) {
-            if let Some(prop) = self.time_prop {
-                let sampled = eval_session_property_at(prop, seconds * self.fps);
+        let sample_frame = seconds * self.state.fps;
+        if id == &self.self_prop_id {
+            if let Some(track) = self.self_track {
+                return Ok(eval_project_track_base(track, sample_frame));
+            }
+            if let Some(prop) = self.time_prop_fallback {
+                let sampled = eval_session_property_at(prop, sample_frame);
                 return Ok(json_to_expr_value(&sampled));
             }
             return Ok(self.value());
         }
-        Err(zc_expr::ExprError::NotFound(format!(
-            "property '{}'",
-            id.as_str()
-        )))
+        if let Some((track, _, _, _, _)) = self.resolve_property_track(id) {
+            return Ok(eval_project_track_base(track, sample_frame));
+        }
+        self.property_value(id)
     }
 
     fn property_num_keys(&self, id: &zc_expr::HandleId) -> usize {
-        if self.this_property_id().as_ref() == Some(id) {
-            self.time_prop.map_or(0, |p| p.keyframes.len())
-        } else {
-            0
+        if id == &self.self_prop_id {
+            if let Some(track) = self.self_track {
+                return sorted_unique_track_key_frames(track).len();
+            }
+            return self.time_prop_fallback.map_or(0, |p| p.keyframes.len());
         }
+        self.resolve_property_track(id)
+            .map_or(0, |(track, _, _, _, _)| {
+                sorted_unique_track_key_frames(track).len()
+            })
     }
 
     fn property_key(
@@ -2316,18 +3149,37 @@ impl zc_expr::ExprContext for FreezeTimeExprContext<'_> {
         id: &zc_expr::HandleId,
         index_1based: usize,
     ) -> Result<zc_expr::KeyframeRecord, zc_expr::ExprError> {
-        if self.this_property_id().as_ref() == Some(id)
-            && index_1based >= 1
-            && let Some(prop) = self.time_prop
-        {
-            let mut sorted: Vec<&SessionKeyframe> = prop.keyframes.iter().collect();
-            sorted.sort_by(|a, b| a.frame.total_cmp(&b.frame));
-            if let Some(kf) = sorted.get(index_1based - 1) {
-                return Ok(zc_expr::KeyframeRecord {
-                    index: index_1based,
-                    time: kf.frame / self.fps,
-                    value: json_to_expr_value(&kf.value),
-                });
+        if index_1based >= 1 {
+            if id == &self.self_prop_id {
+                if let Some(track) = self.self_track {
+                    let frames = sorted_unique_track_key_frames(track);
+                    if let Some(&kf_frame) = frames.get(index_1based - 1) {
+                        return Ok(zc_expr::KeyframeRecord {
+                            index: index_1based,
+                            time: kf_frame / self.state.fps.max(1.0),
+                            value: eval_project_track_base(track, kf_frame),
+                        });
+                    }
+                } else if let Some(prop) = self.time_prop_fallback {
+                    let mut sorted: Vec<&SessionKeyframe> = prop.keyframes.iter().collect();
+                    sorted.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+                    if let Some(kf) = sorted.get(index_1based - 1) {
+                        return Ok(zc_expr::KeyframeRecord {
+                            index: index_1based,
+                            time: kf.frame / self.state.fps.max(1.0),
+                            value: json_to_expr_value(&kf.value),
+                        });
+                    }
+                }
+            } else if let Some((track, _, _, _, _)) = self.resolve_property_track(id) {
+                let frames = sorted_unique_track_key_frames(track);
+                if let Some(&kf_frame) = frames.get(index_1based - 1) {
+                    return Ok(zc_expr::KeyframeRecord {
+                        index: index_1based,
+                        time: kf_frame / self.state.fps.max(1.0),
+                        value: eval_project_track_base(track, kf_frame),
+                    });
+                }
             }
         }
         Err(zc_expr::ExprError::RangeError(format!(
@@ -2336,19 +3188,398 @@ impl zc_expr::ExprContext for FreezeTimeExprContext<'_> {
         )))
     }
 
+    fn layer(&self, query: &zc_expr::NameOrIndex) -> Result<zc_expr::HandleId, zc_expr::ExprError> {
+        match query {
+            zc_expr::NameOrIndex::Index(idx) => {
+                if *idx >= 1
+                    && let Some(track) = self.state.sequence.video_tracks.get((*idx - 1) as usize)
+                    && let Some(clip) = track.clips.iter().find(|c| {
+                        c.length > 0.0
+                            && self.state.abs_frame >= c.start
+                            && self.state.abs_frame < c.start + c.length
+                    })
+                {
+                    return Ok(zc_expr::HandleId::new(format!("layer:{}", clip.layer.id)));
+                }
+                Err(zc_expr::ExprError::NotFound(format!("layer index {idx}")))
+            }
+            zc_expr::NameOrIndex::Name(name) => {
+                for track in &self.state.sequence.video_tracks {
+                    for clip in &track.clips {
+                        if clip.length > 0.0
+                            && self.state.abs_frame >= clip.start
+                            && self.state.abs_frame < clip.start + clip.length
+                            && (clip.layer.name == *name
+                                || clip.name == *name
+                                || track.name == *name)
+                        {
+                            return Ok(zc_expr::HandleId::new(format!("layer:{}", clip.layer.id)));
+                        }
+                    }
+                }
+                for track in &self.state.sequence.video_tracks {
+                    for clip in &track.clips {
+                        if clip.length > 0.0
+                            && self.state.abs_frame >= clip.start
+                            && self.state.abs_frame < clip.start + clip.length
+                            && (clip.layer.name.eq_ignore_ascii_case(name)
+                                || clip.name.eq_ignore_ascii_case(name))
+                        {
+                            return Ok(zc_expr::HandleId::new(format!("layer:{}", clip.layer.id)));
+                        }
+                    }
+                }
+                Err(zc_expr::ExprError::NotFound(format!("layer '{name}'")))
+            }
+        }
+    }
+
+    fn effect(
+        &self,
+        owner: Option<&zc_expr::HandleId>,
+        name: &str,
+    ) -> Result<zc_expr::HandleId, zc_expr::ExprError> {
+        fn find_fx<'b>(
+            effects: &'b [zc_project::EffectInstance],
+            name: &str,
+        ) -> Option<&'b zc_project::EffectInstance> {
+            for fx in effects {
+                if fx.name == name {
+                    return Some(fx);
+                }
+                match &fx.kind {
+                    zc_project::EffectKind::Standard(id) if id == name => return Some(fx),
+                    zc_project::EffectKind::Plugin { effect_id, .. } if effect_id == name => {
+                        return Some(fx);
+                    }
+                    zc_project::EffectKind::EffectGroup { children, .. } => {
+                        if let Some(found) = find_fx(children, name) {
+                            return Some(found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            effects.iter().find(|fx| fx.name.eq_ignore_ascii_case(name))
+        }
+
+        let target_layer_id = owner
+            .and_then(|h| {
+                h.as_str()
+                    .strip_prefix("layer:")
+                    .and_then(|u| Uuid::parse_str(u).ok())
+            })
+            .or(self.active_layer_id);
+
+        if let Some(owner_h) = owner
+            && let Some(u) = owner_h
+                .as_str()
+                .strip_prefix("fx:")
+                .and_then(|v| Uuid::parse_str(v).ok())
+            && let Some((_, _, _, parent_fx)) = self.state.find_effect_owner(u)
+            && let zc_project::EffectKind::EffectGroup { children, .. } = &parent_fx.kind
+            && let Some(found) = find_fx(children, name)
+        {
+            return Ok(zc_expr::HandleId::new(format!("fx:{}", found.id)));
+        }
+
+        if let Some(lid) = target_layer_id
+            && let Some((_, layer)) = self.state.find_layer_owner(lid)
+            && let Some(found) = find_fx(&layer.effects, name)
+        {
+            return Ok(zc_expr::HandleId::new(format!("fx:{}", found.id)));
+        }
+        Err(zc_expr::ExprError::NotFound(format!("effect '{name}'")))
+    }
+
+    fn effect_param(
+        &self,
+        effect_id: &zc_expr::HandleId,
+        param: &str,
+    ) -> Result<zc_expr::HandleId, zc_expr::ExprError> {
+        if let Some(u) = effect_id
+            .as_str()
+            .strip_prefix("fx:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+            && let Some((_, _, _, fx)) = self.state.find_effect_owner(u)
+            && lookup_effect_track(fx, param).is_some()
+        {
+            return Ok(zc_expr::HandleId::new(format!("prop:fx:{u}:{param}")));
+        }
+        Err(zc_expr::ExprError::NotFound(format!(
+            "effect '{}'.param('{param}')",
+            effect_id.as_str()
+        )))
+    }
+
+    fn object(
+        &self,
+        owner: Option<&zc_expr::HandleId>,
+        name: &str,
+    ) -> Result<zc_expr::HandleId, zc_expr::ExprError> {
+        fn find_obj<'b>(
+            objs: &'b [zc_project::Object3D],
+            name: &str,
+        ) -> Option<&'b zc_project::Object3D> {
+            for o in objs {
+                if o.name == name {
+                    return Some(o);
+                }
+                if let zc_project::Object3DKind::Group { children, .. } = &o.kind
+                    && let Some(found) = find_obj(children, name)
+                {
+                    return Some(found);
+                }
+            }
+            for o in objs {
+                if o.name.eq_ignore_ascii_case(name) {
+                    return Some(o);
+                }
+                if let zc_project::Object3DKind::Group { children, .. } = &o.kind
+                    && let Some(found) = find_obj(children, name)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        if let Some(owner_h) = owner {
+            if let Some(u) = owner_h
+                .as_str()
+                .strip_prefix("obj:")
+                .and_then(|v| Uuid::parse_str(v).ok())
+                && let Some((_, _, _, parent_obj)) = self.state.find_object_owner(u)
+                && let zc_project::Object3DKind::Group { children, .. } = &parent_obj.kind
+                && let Some(found) = find_obj(children, name)
+            {
+                return Ok(zc_expr::HandleId::new(format!("obj:{}", found.id)));
+            }
+            if let Some(u) = owner_h
+                .as_str()
+                .strip_prefix("layer:")
+                .and_then(|v| Uuid::parse_str(v).ok())
+                && let Some((_, layer)) = self.state.find_layer_owner(u)
+                && let zc_project::LayerKind::Scene3D { objects, .. } = &layer.kind
+                && let Some(found) = find_obj(objects, name)
+            {
+                return Ok(zc_expr::HandleId::new(format!("obj:{}", found.id)));
+            }
+        }
+
+        if let Some(lid) = self.active_layer_id
+            && let Some((_, layer)) = self.state.find_layer_owner(lid)
+            && let zc_project::LayerKind::Scene3D { objects, .. } = &layer.kind
+            && let Some(found) = find_obj(objects, name)
+        {
+            return Ok(zc_expr::HandleId::new(format!("obj:{}", found.id)));
+        }
+        Err(zc_expr::ExprError::NotFound(format!("object '{name}'")))
+    }
+
+    fn property(
+        &self,
+        owner: Option<&zc_expr::HandleId>,
+        name: &str,
+    ) -> Result<zc_expr::HandleId, zc_expr::ExprError> {
+        if let Some(owner_h) = owner {
+            let s = owner_h.as_str();
+            if s == "seq" {
+                return Ok(zc_expr::HandleId::new(format!("prop:seq:{name}")));
+            }
+            if let Some(u) = s.strip_prefix("obj:").and_then(|v| Uuid::parse_str(v).ok())
+                && let Some((_, _, _, obj)) = self.state.find_object_owner(u)
+                && lookup_object_track(obj, name).is_some()
+            {
+                return Ok(zc_expr::HandleId::new(format!("prop:obj:{u}:{name}")));
+            }
+            if let Some(u) = s.strip_prefix("fx:").and_then(|v| Uuid::parse_str(v).ok())
+                && let Some((_, _, _, fx)) = self.state.find_effect_owner(u)
+                && lookup_effect_track(fx, name).is_some()
+            {
+                return Ok(zc_expr::HandleId::new(format!("prop:fx:{u}:{name}")));
+            }
+            if let Some(u) = s
+                .strip_prefix("layer:")
+                .and_then(|v| Uuid::parse_str(v).ok())
+                && let Some((_, layer)) = self.state.find_layer_owner(u)
+                && (lookup_layer_track(layer, name).is_some()
+                    || matches!(
+                        name.trim().to_ascii_lowercase().as_str(),
+                        "width" | "height" | "resolution"
+                    ))
+            {
+                return Ok(zc_expr::HandleId::new(format!("prop:layer:{u}:{name}")));
+            }
+            if let Some(u) = s
+                .strip_prefix("clip:")
+                .and_then(|v| Uuid::parse_str(v).ok())
+                && self.state.find_clip_by_id(u).is_some()
+                && matches!(
+                    name.trim().to_ascii_lowercase().as_str(),
+                    "time" | "start" | "length" | "duration"
+                )
+            {
+                return Ok(zc_expr::HandleId::new(format!("prop:clip:{u}:{name}")));
+            }
+            return Err(zc_expr::ExprError::NotFound(format!(
+                "property '{name}' on '{}'",
+                owner_h.as_str()
+            )));
+        }
+
+        if let Some(oid) = self.active_object_id
+            && let Some((_, _, _, obj)) = self.state.find_object_owner(oid)
+            && lookup_object_track(obj, name).is_some()
+        {
+            return Ok(zc_expr::HandleId::new(format!("prop:obj:{oid}:{name}")));
+        }
+        if let Some(fid) = self.active_effect_id
+            && let Some((_, _, _, fx)) = self.state.find_effect_owner(fid)
+            && lookup_effect_track(fx, name).is_some()
+        {
+            return Ok(zc_expr::HandleId::new(format!("prop:fx:{fid}:{name}")));
+        }
+        if let Some(lid) = self.active_layer_id
+            && let Some((_, layer)) = self.state.find_layer_owner(lid)
+            && (lookup_layer_track(layer, name).is_some()
+                || matches!(
+                    name.trim().to_ascii_lowercase().as_str(),
+                    "width" | "height" | "resolution"
+                ))
+        {
+            return Ok(zc_expr::HandleId::new(format!("prop:layer:{lid}:{name}")));
+        }
+        if let Some(cid) = self.active_clip_id
+            && matches!(
+                name.trim().to_ascii_lowercase().as_str(),
+                "time" | "start" | "length" | "duration"
+            )
+        {
+            return Ok(zc_expr::HandleId::new(format!("prop:clip:{cid}:{name}")));
+        }
+        Err(zc_expr::ExprError::NotFound(format!("property '{name}'")))
+    }
+
+    fn prop(&self, path: &str) -> Result<zc_expr::HandleId, zc_expr::ExprError> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(zc_expr::ExprError::NotFound("empty prop path".to_owned()));
+        }
+        if let Some(rel) = trimmed.strip_prefix("./") {
+            return self.property(None, rel);
+        }
+        if let Some(rel) = trimmed.strip_prefix("../") {
+            let cur_owner = self
+                .this_object_id()
+                .or_else(|| self.this_layer_id())
+                .or_else(|| self.this_clip_id());
+            if let Some(cur_h) = cur_owner
+                && let Ok(Some(parent_ref)) = self.parent_of(&cur_h, 1)
+            {
+                let parent_id = match parent_ref {
+                    zc_expr::HandleRef::Object(h)
+                    | zc_expr::HandleRef::Layer(h)
+                    | zc_expr::HandleRef::Clip(h)
+                    | zc_expr::HandleRef::Effect(h)
+                    | zc_expr::HandleRef::Property(h) => Some(h),
+                    zc_expr::HandleRef::Sequence => Some(zc_expr::HandleId::new("seq")),
+                    zc_expr::HandleRef::Controls => None,
+                };
+                return self.property(parent_id.as_ref(), rel);
+            }
+            return Err(zc_expr::ExprError::NotFound(format!("prop('{path}')")));
+        }
+
+        let parts: Vec<&str> = trimmed
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return Err(zc_expr::ExprError::NotFound(format!("prop('{path}')")));
+        }
+        if parts.len() == 1 {
+            return self.property(None, parts[0]);
+        }
+        let mut current = self.layer(&zc_expr::NameOrIndex::Name(parts[0].to_owned()))?;
+        for seg in &parts[1..parts.len() - 1] {
+            if let Ok(obj_h) = self.object(Some(&current), seg) {
+                current = obj_h;
+            } else if let Ok(fx_h) = self.effect(Some(&current), seg) {
+                current = fx_h;
+            } else {
+                return Err(zc_expr::ExprError::NotFound(format!(
+                    "prop('{path}') segment '{seg}'"
+                )));
+            }
+        }
+        self.property(Some(&current), parts[parts.len() - 1])
+    }
+
     fn control(
         &self,
         name: &str,
         stable_id: Option<&str>,
     ) -> Result<zc_expr::Value, zc_expr::ExprError> {
-        if let Some(id) = stable_id
-            && let Some(val) = self.controls.get(id)
+        // Strict ID lookup matching `zc-render`: when `stable_id` is given, never fall back to `name`.
+        let ctrl_opt = if let Some(sid) = stable_id {
+            self.state
+                .sequence
+                .controls
+                .iter()
+                .find(|c| c.id == sid)
+                .or_else(|| {
+                    self.state
+                        .project
+                        .sequence
+                        .controls
+                        .iter()
+                        .find(|c| c.id == sid)
+                })
+        } else {
+            self.state
+                .sequence
+                .controls
+                .iter()
+                .find(|c| c.name == name)
+                .or_else(|| {
+                    self.state
+                        .project
+                        .sequence
+                        .controls
+                        .iter()
+                        .find(|c| c.name == name)
+                })
+        };
+
+        let Some(ctrl) = ctrl_opt else {
+            return Err(match stable_id {
+                Some(sid) => zc_expr::ExprError::NotFound(format!("control '{name}' (id '{sid}')")),
+                None => zc_expr::ExprError::NotFound(format!("control '{name}'")),
+            });
+        };
+
+        if let Some(cached) = self.state.control_cache.borrow().get(&ctrl.id).cloned() {
+            return Ok(cached);
+        }
+        let cycle_key = format!("ctrl:{}", ctrl.id);
+        if !self
+            .state
+            .active_stack
+            .borrow_mut()
+            .insert(cycle_key.clone())
         {
-            return Ok(val.clone());
+            return Err(zc_expr::ExprError::CycleDetected(cycle_key));
         }
-        if let Some(val) = self.controls.get(name) {
-            return Ok(val.clone());
+        let evaluated = self.state.eval_control(ctrl, &cycle_key);
+        self.state.active_stack.borrow_mut().remove(&cycle_key);
+        if let Ok(val) = &evaluated {
+            self.state
+                .control_cache
+                .borrow_mut()
+                .insert(ctrl.id.clone(), val.clone());
         }
-        Err(zc_expr::ExprError::NotFound(format!("control '{name}'")))
+        evaluated
     }
 }

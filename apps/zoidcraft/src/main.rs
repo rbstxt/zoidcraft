@@ -570,6 +570,24 @@ impl ExportQueueSnapshot {
     }
 }
 
+/// Promotes `active_composition_id` (when present in `project.compositions`) into
+/// `project.sequence`, moving the previous root sequence into `project.compositions`
+/// under its original `Uuid`. This ensures both `ProjectRenderEngine` and `zc_audio`
+/// render and mix the target child composition while preserving nested composition links.
+fn promote_active_composition_for_export(
+    project: &mut Project,
+    active_composition_id: Option<&str>,
+) {
+    let Some(comp_id) = active_composition_id.and_then(|s| Uuid::parse_str(s).ok()) else {
+        return;
+    };
+    let Some(comp_seq) = project.compositions.remove(&comp_id) else {
+        return;
+    };
+    let prev_root = std::mem::replace(&mut project.sequence, comp_seq);
+    project.compositions.insert(prev_root.id, prev_root);
+}
+
 struct ZoidCraftApp {
     session: Session,
     theme: Cm3Theme,
@@ -2265,7 +2283,7 @@ impl ZoidCraftApp {
         queue_job_id: Option<u64>,
         queued_snapshot: Option<ExportQueueSnapshot>,
     ) -> Result<(), String> {
-        let (seq_fps, export_project, export_plugins, active_composition_id, audio_source) =
+        let (seq_fps, mut export_project, export_plugins, active_composition_id, audio_source) =
             if let Some(snap) = queued_snapshot {
                 let fps = snap.effective_fps();
                 (
@@ -2276,7 +2294,6 @@ impl ZoidCraftApp {
                     Some(snap.decoded_audio),
                 )
             } else {
-                let fps = self.session.document().fps.max(1.0);
                 let project = self.session.to_project();
                 let plugins = self.session.plugins.clone();
                 let active_comp = self
@@ -2284,8 +2301,22 @@ impl ZoidCraftApp {
                     .document()
                     .active_composition_id
                     .map(|id| id.to_string());
+                let active_seq = active_comp
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .and_then(|uuid| project.compositions.get(&uuid))
+                    .unwrap_or(&project.sequence);
+                let fps = active_seq
+                    .exact_fps
+                    .unwrap_or_else(|| f64::from(active_seq.fps.max(1)))
+                    .max(1.0);
                 (fps, project, plugins, active_comp, None)
             };
+
+        promote_active_composition_for_export(
+            &mut export_project,
+            active_composition_id.as_deref(),
+        );
 
         let start_seq_frame = ui_cfg.start_frame.round().max(0.0) as u32;
         let end_seq_frame = (ui_cfg
@@ -2328,15 +2359,7 @@ impl ZoidCraftApp {
         let handle = thread::Builder::new()
             .name("zc-export-worker".to_owned())
             .spawn(move || {
-                let mut export_session = Session::from_project(export_project, export_plugins);
-                if let Some(comp_uuid) = active_composition_id
-                    .as_deref()
-                    .and_then(|s| Uuid::parse_str(s).ok())
-                {
-                    let _ = export_session.execute(Command::SetActiveComposition {
-                        comp_id: Some(comp_uuid),
-                    });
-                }
+                let export_session = Session::from_project(export_project, export_plugins);
                 let audio_mix = match build_offline_export_audio(
                     &export_session,
                     &export_audio_buffers,
@@ -6702,5 +6725,229 @@ mod tests {
         assert!(!app.export_queue_snapshots.contains_key(&job_c));
         assert!(app.export_queue_snapshots.contains_key(&job_a));
         assert_eq!(app.export_queue_snapshots.len(), 1);
+    }
+
+    #[test]
+    fn queued_export_from_child_composition_promotes_and_mixes_child_not_root() {
+        use zc_project::{
+            AudioClip, AudioClipData, AudioTrack, Layer, PropertyTrack, Sequence, VideoClip,
+            VideoTrack,
+        };
+
+        let sr = STANDARD_SAMPLE_RATE;
+        let mut project = Project::new_cm3_default();
+        project.name = "Child Comp Export Test".to_owned();
+        project.sequence.name = "Root Comp".to_owned();
+        project.sequence.fps = 30;
+        project.sequence.exact_fps = None;
+        project.sequence.length_frames = 60.0;
+        let root_id = project.sequence.id;
+
+        let root_wav = zc_audio::encode_wav_pcm16_stereo(&vec![[0.80, 0.80]; sr as usize * 2], sr);
+        let child_wav = zc_audio::encode_wav_pcm16_stereo(&vec![[0.25, 0.25]; sr as usize * 2], sr);
+        let root_audio_id =
+            project.insert_binary_asset(AssetKind::Av, "root.wav".to_owned(), root_wav.clone());
+        let child_audio_id =
+            project.insert_binary_asset(AssetKind::Av, "child.wav".to_owned(), child_wav.clone());
+        let root_decoded =
+            Arc::new(decode_audio_bytes(&root_wav, Some("wav")).expect("decode root wav"));
+        let child_decoded =
+            Arc::new(decode_audio_bytes(&child_wav, Some("wav")).expect("decode child wav"));
+
+        // Root sequence has distinct video clip ("Root Video") and loud audio (0.80).
+        project.sequence.video_tracks = vec![VideoTrack {
+            id: Uuid::new_v4(),
+            name: "V1".to_owned(),
+            enabled: true,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![VideoClip {
+                id: Uuid::new_v4(),
+                name: "Root Video".to_owned(),
+                start: 0.0,
+                length: 60.0,
+                link: None,
+                media: None,
+                time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                layer: Layer::new(
+                    "Root Video",
+                    LayerKind::Shape2D { shapes: Vec::new() },
+                    [1920, 1080],
+                ),
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        }];
+        project.sequence.audio_tracks = vec![AudioTrack {
+            id: Uuid::new_v4(),
+            name: "A1".to_owned(),
+            enabled: true,
+            muted: false,
+            solo: false,
+            locked: false,
+            clips: vec![AudioClip {
+                id: Uuid::new_v4(),
+                name: "Root Audio".to_owned(),
+                start: 0.0,
+                length: 60.0,
+                link: None,
+                media: Some(root_audio_id.clone()),
+                time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                audio: AudioClipData::default(),
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        }];
+
+        // Child composition has different FPS (48), distinct video ("Child Video"), and quieter audio (0.25).
+        let child_comp_id = Uuid::new_v4();
+        let child_seq = Sequence {
+            id: child_comp_id,
+            name: "Child Comp".to_owned(),
+            resolution: [1280, 720],
+            fps: 48,
+            exact_fps: Some(48.0),
+            length_frames: 48.0,
+            video_tracks: vec![VideoTrack {
+                id: Uuid::new_v4(),
+                name: "V1".to_owned(),
+                enabled: true,
+                solo: false,
+                locked: false,
+                is_3d: false,
+                clips: vec![VideoClip {
+                    id: Uuid::new_v4(),
+                    name: "Child Video".to_owned(),
+                    start: 0.0,
+                    length: 48.0,
+                    link: None,
+                    media: None,
+                    time_curve: PropertyTrack::linear_time_curve(48.0, 48),
+                    layer: Layer::new(
+                        "Child Video",
+                        LayerKind::Shape2D { shapes: Vec::new() },
+                        [1280, 720],
+                    ),
+                    preserved: BTreeMap::new(),
+                }],
+                preserved: BTreeMap::new(),
+            }],
+            audio_tracks: vec![AudioTrack {
+                id: Uuid::new_v4(),
+                name: "A1".to_owned(),
+                enabled: true,
+                muted: false,
+                solo: false,
+                locked: false,
+                clips: vec![AudioClip {
+                    id: Uuid::new_v4(),
+                    name: "Child Audio".to_owned(),
+                    start: 0.0,
+                    length: 48.0,
+                    link: None,
+                    media: Some(child_audio_id.clone()),
+                    time_curve: PropertyTrack::linear_time_curve(48.0, 48),
+                    audio: AudioClipData::default(),
+                    preserved: BTreeMap::new(),
+                }],
+                preserved: BTreeMap::new(),
+            }],
+            ..Sequence::default()
+        };
+        project.compositions.insert(child_comp_id, child_seq);
+
+        let mut app = make_headless_app_for_test();
+        app.session = Session::from_project(project, PluginRegistry::new());
+        app.decoded_audio
+            .insert(root_audio_id.clone(), root_decoded);
+        app.decoded_audio
+            .insert(child_audio_id.clone(), child_decoded);
+
+        // Activate child composition and enqueue export job.
+        app.session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(child_comp_id),
+            })
+            .expect("activate child composition");
+        let ui_cfg = UiExportSettings {
+            container: UiExportContainer::Wav,
+            sample_rate_hz: sr,
+            fps: 48.0,
+            start_frame: 0.0,
+            end_frame: 24.0,
+            ..UiExportSettings::default()
+        };
+        let job_id = app.enqueue_export_job(ui_cfg.clone(), PathBuf::from("/tmp/child_export.wav"));
+        let snap = app
+            .export_queue_snapshots
+            .remove(&job_id)
+            .expect("captured snapshot");
+
+        let seq_fps = snap.effective_fps();
+        assert!((seq_fps - 48.0).abs() < 1e-6);
+
+        let mut export_project = snap.project;
+        promote_active_composition_for_export(
+            &mut export_project,
+            snap.active_composition_id.as_deref(),
+        );
+
+        // Promoted export project must render child composition (not root), while retaining root in compositions.
+        assert_eq!(export_project.sequence.id, child_comp_id);
+        assert_eq!(export_project.sequence.name, "Child Comp");
+        assert_eq!(export_project.sequence.fps, 48);
+        assert_eq!(
+            export_project.sequence.video_tracks[0].clips[0].name,
+            "Child Video"
+        );
+        assert!(
+            export_project.compositions.contains_key(&root_id),
+            "previous root sequence must be preserved in compositions map"
+        );
+
+        let core_settings = convert_export_settings(
+            &ui_cfg,
+            seq_fps,
+            0,
+            24,
+            PathBuf::from("/tmp/child_export.wav"),
+        )
+        .expect("core export settings");
+
+        // Audio arc collection must pick only child_audio (not root_audio).
+        let export_audio_buffers = collect_in_range_audio_arcs_for_project(
+            &export_project,
+            snap.plugins.is_enabled("precomp-plus"),
+            &snap.decoded_audio,
+            &core_settings,
+            0,
+            24,
+        );
+        assert!(export_audio_buffers.contains_key(&child_audio_id));
+        assert!(!export_audio_buffers.contains_key(&root_audio_id));
+
+        // Offline audio mix must come from child composition (~0.25) at 48 fps (24/48 = 0.5s = 24_000 samples).
+        let export_session = Session::from_project(export_project, snap.plugins);
+        let mixed = build_offline_export_audio(
+            &export_session,
+            &export_audio_buffers,
+            &core_settings,
+            seq_fps,
+            0,
+            24,
+        )
+        .expect("offline audio mix succeeds")
+        .expect("offline audio produces stereo samples");
+        assert_eq!(
+            mixed.len(),
+            (sr / 2) as usize,
+            "24 frames at 48 fps must produce 0.5s of audio samples"
+        );
+        let mid = mixed[mixed.len() / 2];
+        assert!(
+            (mid[0] - 0.25).abs() < 0.02 && (mid[1] - 0.25).abs() < 0.02,
+            "exported audio must mix child composition (~0.25), not root (~0.80), got {mid:?}"
+        );
     }
 }
