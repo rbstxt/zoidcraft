@@ -2123,11 +2123,13 @@ pub fn cm3_gradient_bar(
         let stop_picker_id = id.with("stop_color");
         if stop_changed {
             let stop_popup_id = stop_picker_id.with("hsva_popup");
+            let mut was_open = false;
             let mut was_open_dirty = false;
             ui.data_mut(|d| {
                 if let Some(mut st) = d.get_temp::<ColorPopupState>(stop_popup_id)
                     && st.open
                 {
+                    was_open = true;
                     was_open_dirty = st.dirty;
                     st.open = false;
                     st.dirty = false;
@@ -2136,6 +2138,8 @@ pub fn cm3_gradient_bar(
             });
             if was_open_dirty {
                 ev.committed = true;
+            } else if was_open && !ev.changed && !ev.committed {
+                ev.cancelled = true;
             }
         }
         if let Some(sel) = stops.get_mut(state.selected_stop) {
@@ -4338,6 +4342,83 @@ mod tests {
             },
         );
         assert!(!ev_down.committed && !ev_up.committed);
+        let st = ctx
+            .data_mut(|d| d.get_temp::<ColorPopupState>(stop_popup_id))
+            .expect("stop popup state");
+        assert!(!st.open);
+    }
+
+    #[test]
+    fn gradient_bar_reverted_stop_switch_emits_cancel_to_close_tx() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let id = Id::unique("test_grad_reverted_switch");
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut stops = vec![
+            GradientStop {
+                position: 0.0,
+                color: "rgba(255,0,0,1.000)".to_owned(),
+            },
+            GradientStop {
+                position: 1.0,
+                color: "rgba(0,0,255,1.000)".to_owned(),
+            },
+        ];
+
+        // Frame 1: layout to discover stop 1 rect (right end of 245px lane)
+        let mut lane_origin = Pos2::ZERO;
+        run_frame(&ctx, vec![], |ui| {
+            ui.set_width(245.0);
+            lane_origin = ui.cursor().min;
+            let _ = cm3_gradient_bar(ui, id, &mut stops, vp, &theme);
+        });
+
+        // Stop 0's color picker is open and clean (e.g. after reverting via comparison bar)
+        let stop_popup_id = id.with("stop_color").with("hsva_popup");
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                stop_popup_id,
+                ColorPopupState {
+                    open: true,
+                    initial: Rgba::new(1.0, 0.0, 0.0, 1.0),
+                    hsv: Rgb::from_u8(255, 0, 0).to_hsv(),
+                    alpha: 1.0,
+                    hex_buf: "rgba(255, 0, 0, 1)".to_owned(),
+                    dirty: false,
+                },
+            );
+        });
+
+        // Switch to stop 1 in a single click frame so `stop_changed` fires while `st.open && !st.dirty`
+        let stop1_pos = Pos2::new(lane_origin.x + 244.0, lane_origin.y + 40.5);
+        let mut ev = GradientBarEvent::default();
+        run_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(stop1_pos),
+                egui::Event::PointerButton {
+                    pos: stop1_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: stop1_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            |ui| {
+                ui.set_width(245.0);
+                ev = cm3_gradient_bar(ui, id, &mut stops, vp, &theme);
+            },
+        );
+        assert!(ev.cancelled && !ev.committed && !ev.changed, "ev={ev:?}");
+        let bar_st = ctx
+            .data_mut(|d| d.get_temp::<GradientBarState>(id))
+            .expect("gradient bar state");
+        assert_eq!(bar_st.selected_stop, 1);
         let st = ctx
             .data_mut(|d| d.get_temp::<ColorPopupState>(stop_popup_id))
             .expect("stop popup state");

@@ -5,15 +5,18 @@
 
 pub mod clock;
 pub mod decode;
+pub mod expr;
 pub mod meter;
 pub mod mixer;
 pub mod waveform;
 
 pub use clock::{AudioMixWindow, AudioOutputHandle, MasterPlaybackClock, PlaybackSnapshot};
 pub use decode::{
-    AudioBuffer, STANDARD_SAMPLE_RATE, decode_audio_bytes, encode_wav_f32_stereo,
-    encode_wav_pcm16_stereo, resample_stereo, resample_stereo_48k,
+    AudioBuffer, STANDARD_SAMPLE_RATE, decode_audio_bytes, downmix_frame_to_stereo,
+    encode_wav_f32_stereo, encode_wav_pcm16_stereo, f32_to_pcm16, resample_stereo,
+    resample_stereo_48k, try_encode_wav_f32_stereo, try_encode_wav_pcm16_stereo,
 };
+pub use expr::{AudioExprContext, eval_audio_expression, eval_audio_expression_or_fallback};
 pub use meter::{AudioMeterState, METER_ANALYSIS_WINDOW, METER_MIN_PX};
 pub use mixer::{
     AudioClipScheduleItem, AudioClipTrackItem, ClipAudioSampleParams, MAX_OFFLINE_MIX_SAMPLES,

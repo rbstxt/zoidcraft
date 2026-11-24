@@ -48,20 +48,124 @@ impl TextAlignMode {
         }
     }
 
-    /// Computes the exact CM3 translation offset for raw mesh bounds `[b_min, b_max]`.
+    /// Computes the exact CM3 / Zoidium translation offset for raw mesh bounds `[b_min, b_max]`.
+    ///
+    /// Matches `PZ.object3d.text.center()` (`core-1.0.102.js`) and `getCenterOffset`
+    /// (`plugins/text-plus/text-plus-utils.js:406-437`):
+    /// - `Center (0)`: `-(min + max) / 2`
+    /// - `Left   (1)`: `x = 0` (preserves pen origin / left sidebearing)
+    /// - `Right  (2)`: `x = -(min.x + max.x)`
+    /// - `Top    (3)`: `y = -(min.y + max.y)`
+    /// - `Bottom (4)`: `y = 0` (preserves typography baseline for descenders)
+    /// - `Front  (5)`: `z = -(min.z + max.z)`
+    /// - `Back   (6)`: `z = 0`
     #[must_use]
     pub fn alignment_offset(self, b_min: Vec3, b_max: Vec3) -> Vec3 {
-        let t = -0.5 * (b_min + b_max);
+        let mut offset = -0.5 * (b_min + b_max);
         match self {
-            Self::Center => t,
-            Self::Left => Vec3::new(-b_min.x, t.y, t.z),
-            Self::Right => Vec3::new(-b_max.x, t.y, t.z),
-            Self::Top => Vec3::new(t.x, -b_max.y, t.z),
-            Self::Bottom => Vec3::new(t.x, -b_min.y, t.z),
-            Self::Front => Vec3::new(t.x, t.y, -b_max.z),
-            Self::Back => Vec3::new(t.x, t.y, -b_min.z),
+            Self::Center => {}
+            Self::Left => offset.x = 0.0,
+            Self::Right => offset.x *= 2.0,
+            Self::Top => offset.y *= 2.0,
+            Self::Bottom => offset.y = 0.0,
+            Self::Front => offset.z *= 2.0,
+            Self::Back => offset.z = 0.0,
+        }
+        offset
+    }
+}
+
+/// Zoidium Text+ bevel side (`bevelSide`: `0 = outside`, `1 = inside`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum BevelSide {
+    #[default]
+    Outside = 0,
+    Inside = 1,
+}
+
+impl BevelSide {
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Self {
+        match value {
+            1 => Self::Inside,
+            _ => Self::Outside,
         }
     }
+}
+
+/// Zoidium Text+ bevel cap profile (`bevelProfile`: `0 = flat`, `1 = round`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum BevelProfile {
+    Flat = 0,
+    #[default]
+    Round = 1,
+}
+
+impl BevelProfile {
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Self {
+        match value {
+            0 => Self::Flat,
+            _ => Self::Round,
+        }
+    }
+}
+
+/// Zoidium `zoidiumTextScaleMode` (`plugins/text-plus/legacy-text-scale.js`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum TextScaleMode {
+    /// Neutralizes parent Text scale on the container and reapplies it to glyph layout & mesh
+    /// so per-character rotations happen in unscaled space.
+    #[default]
+    Current,
+    /// Keeps Text scale on the parent container (`splitState.textScale = [1, 1, 1]`).
+    Legacy,
+}
+
+/// Extended Text+ bevel, kerning, line-height, and scale-compensation options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Text3DExtendedOptions {
+    pub bevel_side: BevelSide,
+    pub bevel_profile: BevelProfile,
+    /// Bevel curve tension in `[0.0, 1.0]` (default `0.5` -> `pow = 1.0` standard quarter-circle).
+    pub bevel_tension: f32,
+    /// Applies TTF `kern` table pairs when `true`. Disabled by default for Three.js r91 / CM3 parity.
+    pub kerning: bool,
+    /// Computes line height from `(bbox.yMax - bbox.yMin + underlineThickness) * scale`
+    /// matching Three.js r91 `Font.generateShapes` when `true` (default).
+    pub use_font_line_height: bool,
+    /// Controls Text+ per-character scale compensation (`zoidiumTextScaleMode`).
+    pub text_scale_mode: TextScaleMode,
+}
+
+impl Default for Text3DExtendedOptions {
+    fn default() -> Self {
+        Self {
+            bevel_side: BevelSide::Outside,
+            bevel_profile: BevelProfile::Round,
+            bevel_tension: 0.5,
+            kerning: false,
+            use_font_line_height: true,
+            text_scale_mode: TextScaleMode::Current,
+        }
+    }
+}
+
+/// Per-character 3D mesh and layout node for Zoidium Text+ split rendering.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Text3DCharacterMesh {
+    pub character: char,
+    pub index: usize,
+    pub source_index: usize,
+    pub layout_pos: Vec2,
+    pub advance: f32,
+    pub glyph_center: Vec3,
+    pub anchor_pos: Vec3,
+    pub mesh_offset: Vec3,
+    pub mesh_scale: Vec3,
+    pub mesh: MeshData,
 }
 
 /// UV unwrapping strategy for extruded 3D text (Spec 03 §3.4).
@@ -205,10 +309,46 @@ impl OutlineBuilder for GlyphContourCollector {
     }
 }
 
-/// Builds a 3D extruded & beveled text mesh from TTF/OTF font bytes.
+/// Computes Three.js r91 / Zoidium font line height:
+/// `(boundingBox.yMax - boundingBox.yMin + underlineThickness) * scale`.
+fn compute_font_line_step(
+    face: &Face<'_>,
+    params: &Text3DParams,
+    options: &Text3DExtendedOptions,
+) -> f32 {
+    let h = params.height.max(1e-3);
+    let fallback = h * params.line_height.max(0.1);
+    if !options.use_font_line_height {
+        return fallback;
+    }
+    let upem = f32::from(face.units_per_em().max(1));
+    let scale = h / upem;
+    let bbox = face.global_bounding_box();
+    let underline = face.underline_metrics().map_or(0, |m| m.thickness);
+    let raw_line = (f32::from(bbox.y_max) - f32::from(bbox.y_min) + f32::from(underline)) * scale;
+    if raw_line > 1e-4 {
+        // Default `params.line_height` is 1.2 -> multiplier 1.0 gives exact Three.js r91 lineHeight.
+        raw_line * (params.line_height.max(0.1) / 1.2)
+    } else {
+        fallback
+    }
+}
+
+/// Builds a 3D extruded & beveled text mesh from TTF/OTF font bytes using CM3-compatible defaults
+/// (no TTF kerning, font bbox + underline line height, exact CM3 `positionMode` alignment).
 pub fn build_text3d_mesh(
     font_bytes: &[u8],
     params: &Text3DParams,
+) -> Result<MeshData, Text3DError> {
+    build_text3d_mesh_with_options(font_bytes, params, &Text3DExtendedOptions::default())
+}
+
+/// Builds a 3D extruded & beveled text mesh from TTF/OTF font bytes with full Zoidium Text+ options
+/// (`bevelSide`, `bevelProfile`, `bevelTension`, `kerning`, `use_font_line_height`).
+pub fn build_text3d_mesh_with_options(
+    font_bytes: &[u8],
+    params: &Text3DParams,
+    options: &Text3DExtendedOptions,
 ) -> Result<MeshData, Text3DError> {
     let face = Face::parse(font_bytes, 0)?;
     if params.text.is_empty() {
@@ -217,7 +357,7 @@ pub fn build_text3d_mesh(
 
     let upem = f32::from(face.units_per_em().max(1));
     let scale = params.height.max(1e-3) / upem;
-    let line_step = params.height.max(1e-3) * params.line_height.max(0.1);
+    let line_step = compute_font_line_step(&face, params, options);
     let space_advance = face
         .glyph_index(' ')
         .and_then(|gid| face.glyph_hor_advance(gid))
@@ -244,13 +384,15 @@ pub fn build_text3d_mesh(
             continue;
         }
 
-        let Some(gid) = face.glyph_index(ch) else {
+        let gid_opt = face.glyph_index(ch).or_else(|| face.glyph_index('?'));
+        let Some(gid) = gid_opt else {
             pen_x += space_advance + params.letter_spacing;
             prev_glyph = None;
             continue;
         };
 
-        if let Some(prev) = prev_glyph
+        if options.kerning
+            && let Some(prev) = prev_glyph
             && let Some(kern) = face.tables().kern
         {
             for subtable in kern.subtables {
@@ -277,7 +419,165 @@ pub fn build_text3d_mesh(
         prev_glyph = Some(gid);
     }
 
-    extrude_oriented_contours(&all_contours, params)
+    extrude_oriented_contours_with_options(&all_contours, params, options, true)
+}
+
+/// Builds per-character 3D meshes and layout transforms matching Zoidium Text+
+/// (`plugins/text-plus/text-plus-geometry.js:336-535` & `legacy-text-scale.js`).
+///
+/// Honors `options.text_scale_mode`:
+/// - [`TextScaleMode::Current`]: neutralizes parent `text_scale` and applies it to `anchor_pos`,
+///   `mesh_offset`, and `mesh_scale` so per-character rotations happen in unscaled space.
+/// - [`TextScaleMode::Legacy`]: keeps `mesh_scale = Vec3::ONE` and leaves `text_scale` on the parent.
+pub fn build_text3d_character_meshes(
+    font_bytes: &[u8],
+    params: &Text3DParams,
+    options: &Text3DExtendedOptions,
+    text_scale: Vec3,
+) -> Result<Vec<Text3DCharacterMesh>, Text3DError> {
+    let face = Face::parse(font_bytes, 0)?;
+    if params.text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let upem = f32::from(face.units_per_em().max(1));
+    let scale = params.height.max(1e-3) / upem;
+    let line_step = compute_font_line_step(&face, params, options);
+    let space_advance = face
+        .glyph_index(' ')
+        .and_then(|gid| face.glyph_hor_advance(gid))
+        .map_or(params.height * 0.35, |a| f32::from(a) * scale);
+
+    struct PendingChar {
+        ch: char,
+        index: usize,
+        source_index: usize,
+        layout_pos: Vec2,
+        advance: f32,
+        mesh: MeshData,
+    }
+
+    let mut pending: Vec<PendingChar> = Vec::new();
+    let mut total_min = Vec3::splat(f32::INFINITY);
+    let mut total_max = Vec3::splat(f32::NEG_INFINITY);
+    let mut has_bounds = false;
+
+    let mut pen_x = 0.0_f32;
+    let mut pen_y = 0.0_f32;
+    let mut prev_glyph = None;
+
+    for (source_index, ch) in params.text.chars().enumerate() {
+        if ch == '\n' {
+            pen_x = 0.0;
+            pen_y -= line_step;
+            prev_glyph = None;
+            continue;
+        }
+        if ch == '\r' {
+            continue;
+        }
+
+        let (gid_opt, advance) = if ch == ' ' {
+            (face.glyph_index(' '), space_advance)
+        } else {
+            let gid_opt = face.glyph_index(ch).or_else(|| face.glyph_index('?'));
+            let adv = gid_opt
+                .and_then(|gid| face.glyph_hor_advance(gid))
+                .map_or(0.0, |a| f32::from(a) * scale);
+            (gid_opt, adv)
+        };
+
+        if options.kerning
+            && let (Some(prev), Some(gid)) = (prev_glyph, gid_opt)
+            && let Some(kern) = face.tables().kern
+        {
+            for subtable in kern.subtables {
+                if subtable.horizontal
+                    && !subtable.variable
+                    && let Some(k) = subtable.glyphs_kerning(prev, gid)
+                {
+                    pen_x += f32::from(k) * scale;
+                    break;
+                }
+            }
+        }
+
+        let mesh = if ch != ' '
+            && let Some(gid) = gid_opt
+        {
+            let mut collector =
+                GlyphContourCollector::new(scale, Vec2::ZERO, params.curve_segments);
+            face.outline_glyph(gid, &mut collector);
+            collector.finish_current();
+            let oriented = clean_and_orient_contours(&collector.contours);
+            if oriented.is_empty() {
+                MeshData::empty()
+            } else {
+                extrude_oriented_contours_with_options(&oriented, params, options, false)?
+            }
+        } else {
+            MeshData::empty()
+        };
+
+        if !mesh.vertices.is_empty() {
+            let shift = Vec3::new(pen_x, pen_y, 0.0);
+            total_min = total_min.min(mesh.bounds.min + shift);
+            total_max = total_max.max(mesh.bounds.max + shift);
+            has_bounds = true;
+        }
+
+        let idx = pending.len();
+        pending.push(PendingChar {
+            ch,
+            index: idx,
+            source_index,
+            layout_pos: Vec2::new(pen_x, pen_y),
+            advance,
+            mesh,
+        });
+
+        pen_x += advance + params.letter_spacing;
+        prev_glyph = gid_opt;
+    }
+
+    let center_offset = if has_bounds {
+        params.align.alignment_offset(total_min, total_max)
+    } else {
+        Vec3::ZERO
+    };
+
+    let eff_scale = match options.text_scale_mode {
+        TextScaleMode::Current => text_scale,
+        TextScaleMode::Legacy => Vec3::ONE,
+    };
+
+    let mut out = Vec::with_capacity(pending.len());
+    for item in pending {
+        let glyph_center = if !item.mesh.vertices.is_empty() {
+            0.5 * (item.mesh.bounds.min + item.mesh.bounds.max)
+        } else {
+            Vec3::new(item.advance * 0.5, 0.0, 0.0)
+        };
+        let anchor_unscaled = Vec3::new(
+            item.layout_pos.x + glyph_center.x + center_offset.x,
+            item.layout_pos.y + glyph_center.y + center_offset.y,
+            glyph_center.z + center_offset.z,
+        );
+        out.push(Text3DCharacterMesh {
+            character: item.ch,
+            index: item.index,
+            source_index: item.source_index,
+            layout_pos: item.layout_pos,
+            advance: item.advance,
+            glyph_center,
+            anchor_pos: anchor_unscaled * eff_scale,
+            mesh_offset: -glyph_center * eff_scale,
+            mesh_scale: eff_scale,
+            mesh: item.mesh,
+        });
+    }
+
+    Ok(out)
 }
 
 /// Builds a 3D extruded & beveled text mesh using the built-in geometric vector fallback font.
@@ -286,6 +586,15 @@ pub fn build_text3d_mesh(
 /// even when no external TTF/OTF font asset is loaded.
 #[must_use]
 pub fn build_fallback_text_mesh(params: &Text3DParams) -> MeshData {
+    build_fallback_text_mesh_with_options(params, &Text3DExtendedOptions::default())
+}
+
+/// Builds a 3D extruded & beveled text mesh using the built-in fallback font and extended bevel options.
+#[must_use]
+pub fn build_fallback_text_mesh_with_options(
+    params: &Text3DParams,
+    options: &Text3DExtendedOptions,
+) -> MeshData {
     if params.text.is_empty() {
         return MeshData::empty();
     }
@@ -322,7 +631,8 @@ pub fn build_fallback_text_mesh(params: &Text3DParams) -> MeshData {
         pen_x += advance_norm * h + params.letter_spacing;
     }
 
-    extrude_oriented_contours(&contours, params).unwrap_or_else(|_| MeshData::empty())
+    extrude_oriented_contours_with_options(&contours, params, options, true)
+        .unwrap_or_else(|_| MeshData::empty())
 }
 
 /// Extrudes and optionally bevels a set of closed 2D contours into a `MeshData`.
@@ -333,13 +643,75 @@ pub fn extrude_contours(
     raw_contours: &[Vec<Vec2>],
     params: &Text3DParams,
 ) -> Result<MeshData, Text3DError> {
-    let cleaned = clean_and_orient_contours(raw_contours);
-    extrude_oriented_contours(&cleaned, params)
+    extrude_contours_with_options(raw_contours, params, &Text3DExtendedOptions::default())
 }
 
-fn extrude_oriented_contours(
+/// Extrudes and optionally bevels closed 2D contours with extended Zoidium Text+ bevel options.
+pub fn extrude_contours_with_options(
+    raw_contours: &[Vec<Vec2>],
+    params: &Text3DParams,
+    options: &Text3DExtendedOptions,
+) -> Result<MeshData, Text3DError> {
+    let cleaned = clean_and_orient_contours(raw_contours);
+    extrude_oriented_contours_with_options(&cleaned, params, options, true)
+}
+
+fn compute_contour_miters(contour: &[Vec2]) -> Vec<Vec2> {
+    let n = contour.len();
+    let mut edge_normals = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = contour[i];
+        let b = contour[(i + 1) % n];
+        let d = b - a;
+        let len = d.length();
+        let en = if len > 1e-8 {
+            Vec2::new(d.y / len, -d.x / len)
+        } else {
+            Vec2::Y
+        };
+        edge_normals.push(en);
+    }
+
+    let mut miters = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev_n = edge_normals[(i + n - 1) % n];
+        let next_n = edge_normals[i];
+        let sum = prev_n + next_n;
+        if sum.length_squared() > 1e-6 {
+            let avg = sum.normalize();
+            let miter_scale = (1.0 / avg.dot(next_n).max(0.4)).min(2.5);
+            miters.push(avg * miter_scale);
+        } else {
+            miters.push(next_n);
+        }
+    }
+    miters
+}
+
+fn shift_contour_by_miter(contour: &[Vec2], shift: f32) -> Vec<Vec2> {
+    if shift.abs() <= 1e-7 || contour.len() < 3 {
+        return contour.to_vec();
+    }
+    let miters = compute_contour_miters(contour);
+    let shifted: Vec<Vec2> = contour
+        .iter()
+        .zip(miters)
+        .map(|(&p, m)| p + m * shift)
+        .collect();
+    let orig_area = signed_area_2d(contour);
+    let new_area = signed_area_2d(&shifted);
+    if orig_area * new_area > 0.0 && new_area.abs() > 1e-8 {
+        shifted
+    } else {
+        contour.to_vec()
+    }
+}
+
+fn extrude_oriented_contours_with_options(
     cleaned: &[Vec<Vec2>],
     params: &Text3DParams,
+    options: &Text3DExtendedOptions,
+    apply_alignment: bool,
 ) -> Result<MeshData, Text3DError> {
     if cleaned.is_empty() {
         return Ok(MeshData::empty());
@@ -367,6 +739,14 @@ fn extrude_oriented_contours(
         0.0
     };
     let bevel_s = if use_bevel { params.bevel_size } else { 0.0 };
+    let bevel_shift = if use_bevel && options.bevel_side == BevelSide::Inside {
+        bevel_s
+    } else {
+        0.0
+    };
+    let bevel_round = options.bevel_profile == BevelProfile::Round;
+    let bevel_tension = options.bevel_tension.clamp(0.0, 1.0);
+    let bevel_profile_pow = 2.0_f32.powf((bevel_tension - 0.5) * 4.0);
 
     let z_back = -bevel_t;
     let z_front = thickness + bevel_t;
@@ -375,9 +755,20 @@ fn extrude_oriented_contours(
         if span_y > 1e-6 { span_y } else { 1.0 }
     };
 
-    // Tessellate 2D contours via lyon_tessellation
+    // For BevelSide::Inside, caps sit inset by `-bevel_shift` so the outer walls keep the
+    // exact glyph silhouette while the bevel chamfers inward (matching runtime-resources-stage.js).
+    let cap_contours: Vec<Vec<Vec2>> = if bevel_shift > 1e-6 {
+        cleaned
+            .iter()
+            .map(|c| shift_contour_by_miter(c, -bevel_shift))
+            .collect()
+    } else {
+        cleaned.to_vec()
+    };
+
+    // Tessellate 2D cap contours via lyon_tessellation
     let mut path_builder = Path::builder();
-    for contour in cleaned {
+    for contour in &cap_contours {
         if let Some((&first, rest)) = contour.split_first() {
             path_builder.begin(point(first.x, first.y));
             for &p in rest {
@@ -390,13 +781,13 @@ fn extrude_oriented_contours(
 
     let mut cap_geo: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
     let mut tessellator = FillTessellator::new();
-    let options = FillOptions::default()
+    let fill_options = FillOptions::default()
         .with_fill_rule(FillRule::NonZero)
         .with_tolerance(0.01);
     tessellator
         .tessellate_path(
             &path,
-            &options,
+            &fill_options,
             &mut BuffersBuilder::new(&mut cap_geo, |v: FillVertex| {
                 let p = v.position();
                 [p.x, p.y]
@@ -474,24 +865,56 @@ fn extrude_oriented_contours(
         }
     }
 
-    // Build loft profile rings: (xy_outset, z)
+    // Build loft profile rings: (xy_outset, z) matching Zoidium's patched Three.js r91 ExtrudeGeometry
+    // (`tools/runtime-resources-stage.js:141-185`).
     let mut rings: Vec<(f32, f32)> = Vec::new();
+    let push_ring = |rings: &mut Vec<(f32, f32)>, ring: (f32, f32)| {
+        if let Some(&last) = rings.last()
+            && (last.0 - ring.0).abs() < 1e-6
+            && (last.1 - ring.1).abs() < 1e-6
+        {
+            return;
+        }
+        rings.push(ring);
+    };
+
     if use_bevel {
         let steps = params.bevel_segments.max(1);
-        for s in 0..=steps {
-            let theta = (s as f32 / steps as f32) * FRAC_PI_2;
-            rings.push((bevel_s * theta.sin(), -bevel_t * theta.cos()));
+        let eval_bevel_step = |r: u32| -> (f32, f32) {
+            let w_raw = r as f32 / steps as f32;
+            let w = if bevel_round {
+                w_raw.powf(bevel_profile_pow)
+            } else {
+                w_raw
+            };
+            let fa = if bevel_round {
+                bevel_t * (w * FRAC_PI_2).cos()
+            } else {
+                bevel_t * (1.0 - w)
+            };
+            let u_out = if bevel_round {
+                bevel_s * (w * FRAC_PI_2).sin() - bevel_shift
+            } else {
+                bevel_s * w - bevel_shift
+            };
+            (u_out, fa)
+        };
+
+        // Back bevel: R = 0..steps -> z from -bevel_t to 0
+        for r in 0..steps {
+            let (u_out, fa) = eval_bevel_step(r);
+            push_ring(&mut rings, (u_out, -fa));
         }
-        for s in 0..=steps {
-            let theta = (s as f32 / steps as f32) * FRAC_PI_2;
-            let ring = (bevel_s * theta.cos(), thickness + bevel_t * theta.sin());
-            if let Some(&last) = rings.last()
-                && (last.0 - ring.0).abs() < 1e-6
-                && (last.1 - ring.1).abs() < 1e-6
-            {
-                continue;
-            }
-            rings.push(ring);
+        // Extrusion body: z = 0 to z = thickness at outset = bevel_s - bevel_shift
+        let body_out = bevel_s - bevel_shift;
+        push_ring(&mut rings, (body_out, 0.0));
+        if thickness > 1e-6 {
+            push_ring(&mut rings, (body_out, thickness));
+        }
+        // Front bevel: R = steps-1 down to 0 -> z from thickness to thickness + bevel_t
+        for r in (0..steps).rev() {
+            let (u_out, fa) = eval_bevel_step(r);
+            push_ring(&mut rings, (u_out, thickness + fa));
         }
     } else if thickness > 1e-6 {
         rings.push((0.0, 0.0));
@@ -514,10 +937,12 @@ fn extrude_oriented_contours(
     }
 
     let mut mesh = MeshData::new(vertices, indices);
-    let offset = params
-        .align
-        .alignment_offset(mesh.bounds.min, mesh.bounds.max);
-    mesh.translate(offset);
+    if apply_alignment {
+        let offset = params
+            .align
+            .alignment_offset(mesh.bounds.min, mesh.bounds.max);
+        mesh.translate(offset);
+    }
     Ok(mesh)
 }
 

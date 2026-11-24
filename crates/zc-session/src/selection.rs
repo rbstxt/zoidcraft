@@ -175,6 +175,8 @@ impl SelectionState {
             self.object_3d_ids.clear();
             self.object_3d_ids.push(object_id);
             self.object_3d_base_type = Some(base_type);
+            self.clear_effects();
+            self.clear_keyframes();
             return Ok(true);
         }
 
@@ -198,6 +200,8 @@ impl SelectionState {
 
         self.object_3d_base_type = Some(base_type);
         self.object_3d_ids.push(object_id);
+        self.clear_effects();
+        self.clear_keyframes();
         Ok(true)
     }
 
@@ -215,6 +219,8 @@ impl SelectionState {
             self.effect_ids.clear();
             self.effect_ids.push(effect_id);
             self.effect_base_type = Some(base_type);
+            self.clear_objects_3d();
+            self.clear_keyframes();
             return Ok(true);
         }
 
@@ -238,6 +244,8 @@ impl SelectionState {
 
         self.effect_base_type = Some(base_type);
         self.effect_ids.push(effect_id);
+        self.clear_objects_3d();
+        self.clear_keyframes();
         Ok(true)
     }
 

@@ -205,12 +205,12 @@ impl EasingKind {
 /// Interpolation mode encoded in CM3's `tween: u16` bitfield.
 ///
 /// - Low byte (`tween & 0xFF`): easing index `0..=32` (`0` = Hold / `Discrete`).
-/// - High byte (`(tween >> 8) & 1`): `0` = standard easing (`Interpolated`), `1` = `Bezier`.
+/// - High byte (`tween >> 8`): `1` = `Bezier`, otherwise standard easing (`Interpolated`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum InterpolationMode {
     /// Hold / stepped segment (`ease_index == 0`).
     Discrete,
-    /// Standard easing curve segment (`(tween >> 8) == 0`, `ease_index >= 1`).
+    /// Standard easing curve segment (`(tween >> 8) != 1`, `ease_index >= 1`).
     #[default]
     Interpolated,
     /// Cubic Bezier handle segment (`(tween >> 8) == 1`, `ease_index >= 1`).
@@ -220,16 +220,17 @@ pub enum InterpolationMode {
 impl InterpolationMode {
     /// Decodes a CM3 `tween_code: u16` into `(InterpolationMode, EasingKind)`.
     ///
-    /// Per Spec 02 §3.1, `ease_index == 0` (Hold) always yields `Discrete` even if
-    /// bit 8 is set. Out-of-range easing indices (`> 32`) fall back to `Linear`.
+    /// Matches CM3 (`core-1.0.102.js`) and Easing+ (`easing-curves.js:306, 339`):
+    /// `ease_index == 0` (Hold) always yields `Discrete` even if high bits are set,
+    /// and Bezier requires strictly `(tween_code >> 8) == 1`. Out-of-range easing
+    /// indices (`> 32`) fall back to `Linear`.
     pub fn from_cm3_tween_code(tween_code: u16) -> (Self, EasingKind) {
         let ease_idx = (tween_code & 0xFF) as u8;
-        let bezier_flag = (tween_code >> 8) & 1;
         if ease_idx == 0 {
             return (Self::Discrete, EasingKind::Hold);
         }
         let easing = EasingKind::from_cm3_index(ease_idx).unwrap_or(EasingKind::Linear);
-        if bezier_flag == 1 {
+        if (tween_code >> 8) == 1 {
             (Self::Bezier, easing)
         } else {
             (Self::Interpolated, easing)
@@ -660,18 +661,37 @@ pub fn eval_cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, t: f64) -> f64 {
     ((ay * u + by) * u + cy) * u
 }
 
-/// Computes CM3 + Easing+ Bezier handle overlap correction factor `s` (Spec 02 §3.3).
+/// Returns `true` when `(out_tangent, in_tangent)` match untouched native CM3
+/// default Bezier handles (`[10, 0]` and `[-10, 0]`) within `1e-8` (Zoidium `easing-curves.js:172`).
+pub fn has_native_bezier_defaults(out_tangent: [f64; 2], in_tangent: [f64; 2]) -> bool {
+    (out_tangent[0] - 10.0).abs() <= 1e-8
+        && out_tangent[1].abs() <= 1e-8
+        && (in_tangent[0] + 10.0).abs() <= 1e-8
+        && in_tangent[1].abs() <= 1e-8
+}
+
+/// Computes CM3 Bezier handle overlap correction factor `s`.
 ///
-/// `out_x` is `k0.controlPoints[1][0]` (`>= 0`) and `in_x` is `k1.controlPoints[0][0]` (`<= 0`).
-pub fn correct_curve(duration: f64, out_x: f64, in_x: f64) -> f64 {
+/// When `preserve_crossing` is `true` (Easing+ active, `easing-plus.js:119-124`),
+/// crossing handles inside `[0, 1]` with `x1 > x2 + 1e-8` return `1.0`.
+/// When `preserve_crossing` is `false` (Vanilla CM3, `core-1.0.102.js` `PZ.tween.correctCurve`),
+/// overlapping handles always scale down by `duration / (|out_x| + |in_x|)`.
+pub fn correct_curve_with_mode(
+    duration: f64,
+    out_x: f64,
+    in_x: f64,
+    preserve_crossing: bool,
+) -> f64 {
     if !duration.is_finite() || duration <= 0.0 || !out_x.is_finite() || !in_x.is_finite() {
         return 1.0;
     }
-    let x1 = out_x / duration;
-    let x2 = 1.0 + in_x / duration;
-    // Easing+ crossing-handle preservation: both handles lie inside [0, 1] with x1 > x2.
-    if (0.0..=1.0).contains(&x1) && (0.0..=1.0).contains(&x2) && x1 > x2 + 1e-8 {
-        return 1.0;
+    if preserve_crossing {
+        let x1 = out_x / duration;
+        let x2 = 1.0 + in_x / duration;
+        // Easing+ crossing-handle preservation: both handles lie inside [0, 1] with x1 > x2.
+        if (0.0..=1.0).contains(&x1) && (0.0..=1.0).contains(&x2) && x1 > x2 + 1e-8 {
+            return 1.0;
+        }
     }
     let sum_x = out_x.abs() + in_x.abs();
     if !sum_x.is_finite() {
@@ -682,6 +702,13 @@ pub fn correct_curve(duration: f64, out_x: f64, in_x: f64) -> f64 {
     } else {
         1.0
     }
+}
+
+/// Computes CM3 + Easing+ Bezier handle overlap correction factor `s` (Spec 02 §3.3).
+///
+/// `out_x` is `k0.controlPoints[1][0]` (`>= 0`) and `in_x` is `k1.controlPoints[0][0]` (`<= 0`).
+pub fn correct_curve(duration: f64, out_x: f64, in_x: f64) -> f64 {
+    correct_curve_with_mode(duration, out_x, in_x, true)
 }
 
 /// Parameters describing a single keyframe-to-keyframe CM3 cubic Bezier segment.
@@ -697,8 +724,13 @@ pub struct BezierSegment {
     pub in_tangent: [f64; 2],
 }
 
-/// Evaluates a CM3 handle-driven cubic Bezier segment at `frame` (Spec 02 §3.3).
-pub fn eval_segment_bezier(segment: BezierSegment, frame: f64) -> f64 {
+/// Evaluates a CM3 handle-driven cubic Bezier segment at `frame` with explicit
+/// Easing+ crossing-handle mode (`preserve_crossing = true` for Easing+, `false` for Vanilla CM3).
+pub fn eval_segment_bezier_with_mode(
+    segment: BezierSegment,
+    frame: f64,
+    preserve_crossing: bool,
+) -> f64 {
     let duration = segment.end_frame - segment.start_frame;
     if !frame.is_finite()
         || !duration.is_finite()
@@ -731,7 +763,7 @@ pub fn eval_segment_bezier(segment: BezierSegment, frame: f64) -> f64 {
     } else {
         0.0
     };
-    let s = correct_curve(duration, out_x, in_x);
+    let s = correct_curve_with_mode(duration, out_x, in_x, preserve_crossing);
 
     let nx1 = (s * out_x / duration).clamp(0.0, 1.0);
     let nx2 = (1.0 + s * in_x / duration).clamp(0.0, 1.0);
@@ -747,19 +779,70 @@ pub fn eval_segment_bezier(segment: BezierSegment, frame: f64) -> f64 {
     mu * mu * mu * y0 + 3.0 * mu * mu * u * y1 + 3.0 * mu * u * u * y2 + u * u * u * y3
 }
 
+/// Evaluates a CM3 handle-driven cubic Bezier segment at `frame` (Spec 02 §3.3).
+pub fn eval_segment_bezier(segment: BezierSegment, frame: f64) -> f64 {
+    eval_segment_bezier_with_mode(segment, frame, true)
+}
+
+/// Computes Zoidium Easing+'s `valueScaleFor` normalization scale for equal-value
+/// segments (`easing-curves.js:125-143`).
+pub fn value_scale_for(
+    keyframe_values: &[f64],
+    min_max: Option<(f64, f64)>,
+    step: Option<f64>,
+    reference_value: f64,
+) -> f64 {
+    const EPSILON: f64 = 1e-8;
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+    let mut finite_count = 0usize;
+    for &v in keyframe_values {
+        if v.is_finite() {
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            finite_count += 1;
+        }
+    }
+    if finite_count > 1 {
+        let range = max_v - min_v;
+        if range > EPSILON {
+            return range;
+        }
+    }
+    if let Some((min_d, max_d)) = min_max
+        && min_d.is_finite()
+        && max_d.is_finite()
+    {
+        let range = (max_d - min_d).abs();
+        if range > EPSILON {
+            return range;
+        }
+    }
+    if let Some(s) = step
+        && s.is_finite()
+        && s.abs() > EPSILON
+    {
+        return s.abs() * 10.0;
+    }
+    let ref_abs = if reference_value.is_finite() {
+        reference_value.abs()
+    } else {
+        0.0
+    };
+    ref_abs.max(1.0)
+}
+
 /// Converts a CM3 Bezier segment's relative handles into normalized `[x1, y1, x2, y2]`
-/// Easing+ coordinates (Spec 02 §4.3).
-pub fn curve_from_segment(segment: BezierSegment) -> [f64; 4] {
+/// Easing+ coordinates, using `value_scale` to preserve non-zero Y handles on equal-value
+/// segments (`easing-curves.js:159-169, 185-211`).
+pub fn curve_from_segment_with_scale(segment: BezierSegment, value_scale: Option<f64>) -> [f64; 4] {
+    const EPSILON: f64 = 1e-8;
     let duration = segment.end_frame - segment.start_frame;
-    if duration <= 0.0 {
+    if !duration.is_finite() || duration <= 0.0 {
         return [0.333, 0.333, 0.667, 0.667];
     }
     // Untouched native CM3 default handles map to normalized linear.
-    if (segment.out_tangent[0] - 10.0).abs() <= 1e-8
-        && segment.out_tangent[1].abs() <= 1e-8
-        && (segment.in_tangent[0] + 10.0).abs() <= 1e-8
-        && segment.in_tangent[1].abs() <= 1e-8
-    {
+    if has_native_bezier_defaults(segment.out_tangent, segment.in_tangent) {
         return [0.333, 0.333, 0.667, 0.667];
     }
 
@@ -768,16 +851,36 @@ pub fn curve_from_segment(segment: BezierSegment) -> [f64; 4] {
         segment.out_tangent[0].max(0.0),
         segment.in_tangent[0].min(0.0),
     );
-    let x1 = ((segment.out_tangent[0] * c) / duration).clamp(0.0, 1.0);
-    let x2 = (1.0 + (segment.in_tangent[0] * c) / duration).clamp(0.0, 1.0);
+    let x1_raw = (segment.out_tangent[0] * c) / duration;
+    let x2_raw = 1.0 + (segment.in_tangent[0] * c) / duration;
+    let x1 = x1_raw.clamp(0.0, 1.0);
+    let x2 = x2_raw.clamp(0.0, 1.0);
     let delta = segment.end_value - segment.start_value;
-    if delta.abs() > 1e-8 {
+    if delta.abs() > EPSILON {
         let y1 = (segment.out_tangent[1] * c) / delta;
         let y2 = 1.0 + (segment.in_tangent[1] * c) / delta;
         [x1, y1, x2, y2]
     } else {
-        [x1, x1, x2, x2]
+        let scale = value_scale
+            .filter(|s| s.is_finite() && s.abs() > EPSILON)
+            .map(f64::abs)
+            .unwrap_or_else(|| {
+                if segment.start_value.is_finite() {
+                    segment.start_value.abs().max(1.0)
+                } else {
+                    1.0
+                }
+            });
+        let y1 = x1_raw + (segment.out_tangent[1] * c) / scale;
+        let y2 = x2_raw + (segment.in_tangent[1] * c) / scale;
+        [x1, y1, x2, y2]
     }
+}
+
+/// Converts a CM3 Bezier segment's relative handles into normalized `[x1, y1, x2, y2]`
+/// Easing+ coordinates (Spec 02 §4.3).
+pub fn curve_from_segment(segment: BezierSegment) -> [f64; 4] {
+    curve_from_segment_with_scale(segment, None)
 }
 
 /// Converts normalized `[x1, y1, x2, y2]` Easing+ coordinates into CM3 relative
@@ -1350,5 +1453,82 @@ mod tests {
             in_tangent: [-10.0, 0.0],
         };
         assert_eq!(eval_segment_bezier(seg_inf_frames, 10.0), 5.0);
+    }
+
+    #[test]
+    fn zoidium_p7_tween_bit8_crossing_and_equal_value_curve_parity() {
+        // P1-2: Bezier requires strictly `(tween >> 8) == 1`; e.g. 769 = (3 << 8) | 1 is NOT Bezier.
+        assert_eq!(
+            InterpolationMode::from_cm3_tween_code((3 << 8) | 1),
+            (InterpolationMode::Interpolated, EasingKind::Linear)
+        );
+        assert_eq!(
+            InterpolationMode::from_cm3_tween_code((2 << 8) | 5),
+            (InterpolationMode::Interpolated, EasingKind::CubicIn)
+        );
+        assert_eq!(
+            InterpolationMode::from_cm3_tween_code((1 << 8) | 32),
+            (InterpolationMode::Bezier, EasingKind::CubicOutIn)
+        );
+        // Hold (low byte 0) always wins even when high bits are set.
+        assert_eq!(
+            InterpolationMode::from_cm3_tween_code(1 << 8),
+            (InterpolationMode::Discrete, EasingKind::Hold)
+        );
+
+        // P2-1: Vanilla CM3 scales down crossing handles; Easing+ preserves crossing handles in [0, 1].
+        assert!(approx_eq(
+            correct_curve_with_mode(10.0, 8.0, -8.0, true),
+            1.0,
+            1e-12
+        ));
+        assert!(approx_eq(
+            correct_curve_with_mode(10.0, 8.0, -8.0, false),
+            10.0 / 16.0,
+            1e-12
+        ));
+
+        let crossing = BezierSegment {
+            start_frame: 0.0,
+            start_value: 0.0,
+            out_tangent: [8.0, 0.0],
+            end_frame: 10.0,
+            end_value: 100.0,
+            in_tangent: [-8.0, 0.0],
+        };
+        let v_plus = eval_segment_bezier_with_mode(crossing, 2.5, true);
+        let v_vanilla = eval_segment_bezier_with_mode(crossing, 2.5, false);
+        assert!(
+            (v_plus - v_vanilla).abs() > 1.0,
+            "Easing+ crossing curve ({v_plus}) must differ from Vanilla scaled curve ({v_vanilla})"
+        );
+
+        // P2-2: Equal-value segments preserve non-zero Y handles via value_scale.
+        let eq_seg = BezierSegment {
+            start_frame: 0.0,
+            start_value: 5.0,
+            out_tangent: [3.0, 2.0],
+            end_frame: 10.0,
+            end_value: 5.0,
+            in_tangent: [-2.0, -4.0],
+        };
+        let scale = value_scale_for(&[5.0, 5.0], Some((0.0, 10.0)), None, 5.0);
+        assert!(approx_eq(scale, 10.0, 1e-12));
+        let [x1, y1, x2, y2] = curve_from_segment_with_scale(eq_seg, Some(scale));
+        assert!(approx_eq(x1, 0.3, 1e-12));
+        assert!(approx_eq(y1, 0.3 + 2.0 / 10.0, 1e-12));
+        assert!(approx_eq(x2, 0.8, 1e-12));
+        assert!(approx_eq(y2, 0.8 - 4.0 / 10.0, 1e-12));
+
+        // Zero Y handles on equal-value segment still map to diagonal [x1, x1, x2, x2].
+        let flat_eq = BezierSegment {
+            out_tangent: [3.0, 0.0],
+            in_tangent: [-2.0, 0.0],
+            ..eq_seg
+        };
+        assert_eq!(
+            curve_from_segment_with_scale(flat_eq, Some(scale)),
+            [0.3, 0.3, 0.8, 0.8]
+        );
     }
 }

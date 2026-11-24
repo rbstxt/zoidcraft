@@ -229,6 +229,13 @@ impl MeshData {
         self.recompute_bounds();
     }
 
+    /// Uniform 4-way barycentric triangle subdivision (`1, 4, 16, 64, 256` triangles per source
+    /// triangle), matching Zoidium `effector-core.js:subdivideStage`.
+    #[must_use]
+    pub fn subdivide_quadrisect(&self, polygon_count: u32) -> Self {
+        subdivide_mesh(self, polygon_count)
+    }
+
     /// Appends another mesh into `self`, offsetting indices and updating bounds.
     pub fn merge(&mut self, other: &MeshData) {
         if other.vertices.is_empty() {
@@ -239,6 +246,117 @@ impl MeshData {
         self.indices.extend(other.indices.iter().map(|&i| i + base));
         self.recompute_bounds();
     }
+}
+
+/// Maximum triangle budget for smooth effector subdivision (`effector-core.js:8`).
+pub const MAX_SMOOTH_TRIANGLES: usize = 400_000;
+
+/// Snaps a requested per-triangle polygon count to the nearest power of 4 in `[1, 256]`
+/// (`4^0..=4^4`), matching Zoidium `subdivisionPolygons`.
+#[must_use]
+pub fn subdivision_polygons(value: u32) -> u32 {
+    let v = value.max(1) as f64;
+    let level = (v.ln() / 4.0_f64.ln()).round().clamp(0.0, 4.0) as u32;
+    4_u32.pow(level)
+}
+
+/// Caps subdivision so `source_triangles * polygons <= MAX_SMOOTH_TRIANGLES`
+/// (`effector-core.js:366-371` & `effector-mesh.js:315-318`).
+#[must_use]
+pub fn budget_subdivision(requested: u32, source_triangles: usize) -> u32 {
+    let budget = (MAX_SMOOTH_TRIANGLES / source_triangles.max(1)) as u32;
+    let mut count = subdivision_polygons(requested);
+    while count > budget && count > 1 {
+        count /= 4;
+    }
+    if count < 4 { 1 } else { count }
+}
+
+/// Refines every triangle in `mesh` into `subdivision_polygons(polygon_count)` smaller triangles
+/// via uniform 4-way midpoint quadrisection (up to `4^4 = 256x`), linearly interpolating vertex
+/// positions, normals, and UVs while preserving `material_slot`.
+#[must_use]
+pub fn subdivide_mesh(mesh: &MeshData, polygon_count: u32) -> MeshData {
+    let source_tris = mesh.indices.len() / 3;
+    let target = budget_subdivision(polygon_count, source_tris);
+    if target <= 1 || source_tris == 0 || mesh.vertices.is_empty() {
+        return mesh.clone();
+    }
+
+    // Build barycentric template by repeated 4-way midpoint splitting.
+    let mut template: Vec<[[f32; 3]; 3]> =
+        vec![[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]];
+    while template.len() * 4 <= target as usize {
+        let mut next = Vec::with_capacity(template.len() * 4);
+        for [a, b, c] in template {
+            let ab = [
+                0.5 * (a[0] + b[0]),
+                0.5 * (a[1] + b[1]),
+                0.5 * (a[2] + b[2]),
+            ];
+            let bc = [
+                0.5 * (b[0] + c[0]),
+                0.5 * (b[1] + c[1]),
+                0.5 * (b[2] + c[2]),
+            ];
+            let ca = [
+                0.5 * (c[0] + a[0]),
+                0.5 * (c[1] + a[1]),
+                0.5 * (c[2] + a[2]),
+            ];
+            next.push([a, ab, ca]);
+            next.push([ab, b, bc]);
+            next.push([ca, bc, c]);
+            next.push([ab, bc, ca]);
+        }
+        template = next;
+    }
+
+    let out_vert_count = source_tris * template.len() * 3;
+    let mut vertices = Vec::with_capacity(out_vert_count);
+    let mut indices = Vec::with_capacity(out_vert_count);
+
+    for tri in mesh.indices.as_chunks::<3>().0 {
+        let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        if i0 >= mesh.vertices.len() || i1 >= mesh.vertices.len() || i2 >= mesh.vertices.len() {
+            continue;
+        }
+        let v0 = mesh.vertices[i0];
+        let v1 = mesh.vertices[i1];
+        let v2 = mesh.vertices[i2];
+        let slot = v0.material_slot;
+
+        for sub in &template {
+            let base = vertices.len() as u32;
+            for w in sub {
+                let pos = [
+                    w[0] * v0.position[0] + w[1] * v1.position[0] + w[2] * v2.position[0],
+                    w[0] * v0.position[1] + w[1] * v1.position[1] + w[2] * v2.position[1],
+                    w[0] * v0.position[2] + w[1] * v1.position[2] + w[2] * v2.position[2],
+                ];
+                let raw_n = Vec3::new(
+                    w[0] * v0.normal[0] + w[1] * v1.normal[0] + w[2] * v2.normal[0],
+                    w[0] * v0.normal[1] + w[1] * v1.normal[1] + w[2] * v2.normal[1],
+                    w[0] * v0.normal[2] + w[1] * v1.normal[2] + w[2] * v2.normal[2],
+                );
+                let n = if raw_n.length_squared() > 1e-12 {
+                    raw_n.normalize().to_array()
+                } else {
+                    v0.normal
+                };
+                let uv = [
+                    w[0] * v0.uv[0] + w[1] * v1.uv[0] + w[2] * v2.uv[0],
+                    w[0] * v0.uv[1] + w[1] * v1.uv[1] + w[2] * v2.uv[1],
+                ];
+                vertices.push(Vertex3D::new(pos, n, uv, slot));
+            }
+            indices.push(base);
+            indices.push(base + 1);
+            indices.push(base + 2);
+        }
+    }
+
+    MeshData::new(vertices, indices)
 }
 
 /// CM3 `Box` (`objectType = 1`): axis-aligned box centered at the origin.
@@ -363,7 +481,9 @@ pub fn build_cylinder(
         }
     }
 
-    MeshData::new(vertices, indices)
+    let mut mesh = MeshData::new(vertices, indices);
+    mesh.center_at_origin();
+    mesh
 }
 
 fn add_cylinder_cap(
@@ -456,7 +576,9 @@ pub fn build_circle(radius: f32, segments: u32) -> MeshData {
         indices.extend_from_slice(&[0, 1 + i, 2 + i]);
     }
 
-    MeshData::new(vertices, indices)
+    let mut mesh = MeshData::new(vertices, indices);
+    mesh.center_at_origin();
+    mesh
 }
 
 /// CM3 `Sphere` (`objectType = 5`): UV sphere centered at the origin.
@@ -512,7 +634,9 @@ pub fn build_sphere(radius: f32, width_segments: u32, height_segments: u32) -> M
         }
     }
 
-    MeshData::new(vertices, indices)
+    let mut mesh = MeshData::new(vertices, indices);
+    mesh.center_at_origin();
+    mesh
 }
 
 /// CM3 `Donut` (`objectType = 6`): torus in the XY plane centered at the origin.
@@ -561,7 +685,9 @@ pub fn build_donut(
         }
     }
 
-    MeshData::new(vertices, indices)
+    let mut mesh = MeshData::new(vertices, indices);
+    mesh.center_at_origin();
+    mesh
 }
 
 /// Evaluates a uniform Catmull-Rom spline segment for `t in [0, 1]`.
@@ -613,7 +739,9 @@ pub fn build_wire(
     let outer = outer_segs.max(3);
     let radius = thickness.max(1e-4);
 
-    let point_count = (loops * outer) as usize + 1;
+    // Exact CM3 `PZ.object3d.shape.generatePresetGeometry` case 7:
+    // `for (let e = 0; e < loops * outer; e++)` (NOT `loops * outer + 1`).
+    let point_count = ((loops * outer) as usize).max(2);
     let mut control_points = Vec::with_capacity(point_count);
     for k in 0..point_count {
         let frac = k as f32 / outer as f32;

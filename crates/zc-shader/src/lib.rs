@@ -8,15 +8,19 @@ pub mod shader_plus;
 
 pub use glsl_shim::{
     CompileOptions, CompiledCustomShader, MAX_GLSL_SOURCE_BYTES, ShaderError, TextureBinding,
-    UniformBlockLayout, UniformField, UniformType, UniformValue, align_up, pack_uniforms,
-    translate_glsl_es100, translate_glsl_es100_with_options,
+    UniformBlockLayout, UniformField, UniformType, UniformValue, align_up, bind_curve_ranges,
+    bind_gradient_cycles, fix_property_name, pack_uniforms, translate_glsl_es100,
+    translate_glsl_es100_with_options,
 };
 pub use shader_plus::{
     CURVE_LUT_WIDTH, ConditionClause, CurveChannel, CurveMode, CurvePoint, CurveSpec,
     GRADIENT_LUT_WIDTH, GradientColorSpace, GradientInterpolation, GradientSpec, GradientStop,
-    MAX_PALETTE_COLORS, MAX_TIME_SAMPLES, PaletteSpec, RenameRule, ShaderPlusError,
+    MAX_PALETTE_COLORS, MAX_TIME_SAMPLES, OpacityStop, PaletteSpec, RenameRule, ShaderPlusError,
     ShaderPropertyDef, ShaderPropertyKind, TextTextureMode, TimeSampleUnit, ToggleDisplayStyle,
-    VisibilityCondition, bake_curve_rgba8, bake_gradient_rgba8, resolve_label,
+    VisibilityCondition, ZoidiumConditionOp, ZoidiumConditionValue, ZoidiumCurveHandles,
+    ZoidiumCurvePoint, ZoidiumRenameRule, ZoidiumVisibilityWhen, bake_curve_rgba8,
+    bake_curve_rgba16f, bake_curve_rgba32f, bake_gradient_rgba8, bake_gradient_rgba8_with_opacity,
+    evaluate_zoidium_curve_points, f32_to_f16_bits, resolve_label,
 };
 
 #[cfg(test)]
@@ -263,31 +267,23 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_webgl1_extensions_and_features() {
-        for ext in [
-            "GL_EXT_shader_texture_lod",
-            "GL_EXT_frag_depth",
-            "GL_EXT_draw_buffers",
-        ] {
+        for ext in ["GL_EXT_frag_depth", "GL_EXT_draw_buffers"] {
             let src =
                 format!("#extension {ext} : require\nvoid main() {{ gl_FragColor = vec4(1.0); }}");
             let err = translate_glsl_es100(&src).unwrap_err();
             assert_eq!(err, ShaderError::UnsupportedExtension(ext.to_string()));
         }
 
-        let lod_src = r#"
-            uniform sampler2D tDiffuse;
-            varying vec2 vUv;
-            void main() { gl_FragColor = texture2DLodEXT(tDiffuse, vUv, 0.0); }
-        "#;
-        assert_eq!(
-            translate_glsl_es100(lod_src).unwrap_err(),
-            ShaderError::UnsupportedFeature("texture2DLodEXT".to_string())
-        );
-
         let depth_src = "void main() { gl_FragDepthEXT = 0.5; gl_FragColor = vec4(1.0); }";
         assert_eq!(
             translate_glsl_es100(depth_src).unwrap_err(),
             ShaderError::UnsupportedFeature("gl_FragDepthEXT".to_string())
+        );
+
+        let frag_data_src = "void main() { gl_FragData[0] = vec4(1.0); }";
+        assert_eq!(
+            translate_glsl_es100(frag_data_src).unwrap_err(),
+            ShaderError::UnsupportedFeature("gl_FragData".to_string())
         );
 
         // Commented-out unsupported extensions must NOT be rejected.
@@ -572,8 +568,9 @@ mod tests {
             range: [0.0, 1.0],
         };
         let bezier_lut = bake_curve_rgba8(&bezier_spec);
-        assert_eq!(bezier_lut[3], 255);
-        assert_eq!(bezier_lut[512 * 4 + 3], 255);
+        // Zoidium CurveMode::Single writes [common, common, common, common]
+        assert_eq!(bezier_lut[3], bezier_lut[0]);
+        assert_eq!(bezier_lut[512 * 4 + 3], bezier_lut[512 * 4]);
         assert!((i32::from(bezier_lut[512 * 4]) - 128).abs() <= 2);
         // Ease-in-out S-curve is below linear at x = 0.25
         assert!(bezier_lut[256 * 4] < 64);
@@ -823,31 +820,464 @@ mod tests {
         );
     }
 
+    fn assert_valid_wgsl(compiled: &CompiledCustomShader) {
+        let module = naga::front::wgsl::parse_str(&compiled.wgsl).unwrap_or_else(|e| {
+            panic!(
+                "WGSL re-parse failed: {}\n---\n{}",
+                e.emit_to_string(&compiled.wgsl),
+                compiled.wgsl
+            )
+        });
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("WGSL re-validation failed: {e}\n---\n{}", compiled.wgsl));
+    }
+
     #[test]
-    fn bake_curve_rgba8_scales_master_and_identity_alpha_with_custom_range() {
+    fn bake_curve_preserves_normalized_lut_regardless_of_range_and_supports_rgba16f() {
         let spec = CurveSpec {
             mode: CurveMode::Rgba,
-            master: CurveChannel {
-                points: vec![CurvePoint::new(0.0, -1.0), CurvePoint::new(1.0, 1.0)],
-            },
+            master: CurveChannel::identity(),
             red: Some(CurveChannel {
-                points: vec![CurvePoint::new(0.0, 1.0), CurvePoint::new(1.0, -1.0)],
+                points: vec![CurvePoint::new(0.0, 1.0), CurvePoint::new(1.0, 0.0)],
             }),
             green: None,
             blue: None,
-            alpha: None,
-            range: [-1.0, 1.0],
+            alpha: Some(CurveChannel {
+                points: vec![CurvePoint::new(0.0, 0.2), CurvePoint::new(1.0, 0.2)],
+            }),
+            range: [-10.0, 100.0],
         };
-        let lut = bake_curve_rgba8(&spec);
-        // x = 0.0 -> master = -1.0 (norm 0.0) -> red(0.0) = +1.0 (u8 255), G/B = 0, identity A = 0
-        assert_eq!(&lut[0..4], &[255, 0, 0, 0]);
-        // x = 1.0 -> master = +1.0 (norm 1.0) -> red(1.0) = -1.0 (u8 0), G/B = 255, identity A = 255
-        let last = (CURVE_LUT_WIDTH - 1) * 4;
-        assert_eq!(&lut[last..last + 4], &[0, 255, 255, 255]);
-        // Midpoint x ~= 0.5 -> all channels ~= 128
-        let mid = 512 * 4;
-        for ch in 0..4 {
-            assert!((i32::from(lut[mid + ch]) - 128).abs() <= 1);
+        let lut8 = bake_curve_rgba8(&spec);
+        let lut32 = bake_curve_rgba32f(&spec);
+        let lut16 = bake_curve_rgba16f(&spec);
+        assert_eq!(lut8.len(), CURVE_LUT_WIDTH * 4);
+        assert_eq!(lut32.len(), CURVE_LUT_WIDTH * 4);
+        assert_eq!(lut16.len(), CURVE_LUT_WIDTH * 4);
+        // Range is applied in GLSL via mix(range.x, range.y, texel), NOT during baking!
+        assert_eq!(lut8[0], 255);
+        assert_eq!(lut8[3], 51);
+        assert_eq!(lut8[(CURVE_LUT_WIDTH - 1) * 4], 0);
+        assert!((lut32[3] - 0.2).abs() < 1e-6);
+        assert_eq!(f32_to_f16_bits(0.0), 0);
+        assert_eq!(f32_to_f16_bits(0.5), 0x3800);
+        assert_eq!(f32_to_f16_bits(1.0), 0x3c00);
+        assert_eq!(lut16[0], 0x3c00);
+    }
+
+    #[test]
+    fn compiles_all_nine_shader_plus_and_expressions_plus_templates_to_valid_wgsl() {
+        let templates: &[(&str, &str)] = &[
+            (
+                "passthrough",
+                "precision highp float;\nuniform sampler2D tDiffuse;\nvarying vec2 vUvScaled;\nvoid main() {\n  gl_FragColor = texture2D(tDiffuse, vUvScaled);\n}",
+            ),
+            (
+                "color",
+                "precision highp float;\nuniform sampler2D tDiffuse;\nuniform float Amount;\nvarying vec2 vUvScaled;\nvoid main() {\n  vec4 color = texture2D(tDiffuse, vUvScaled);\n  gl_FragColor = vec4(color.rgb * (0.5 + Amount), color.a);\n}",
+            ),
+            (
+                "gradient",
+                "precision highp float;\n// #include <zoidium/gradient>\nuniform sampler2D tDiffuse;\nuniform sampler2D Ramp;\nvarying vec2 vUvScaled;\nvoid main() {\n  vec4 color = texture2D(tDiffuse, vUvScaled);\n  float luma = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));\n  gl_FragColor = vec4(zGradient(Ramp, luma).rgb, color.a);\n}",
+            ),
+            (
+                "curve",
+                "precision highp float;\n// #include <zoidium/curve>\nuniform sampler2D tDiffuse;\nuniform sampler2D Remap;\nvarying vec2 vUvScaled;\nvoid main() {\n  vec4 color = texture2D(tDiffuse, vUvScaled);\n  gl_FragColor = vec4(zCurves(Remap, color.rgb), color.a);\n}",
+            ),
+            (
+                "noise",
+                "precision highp float;\n// #include <zoidium/noise>\nuniform float zTime;\nvarying vec2 vUv;\nvoid main() {\n  float n = zNoise(vec3(vUv * 6.0, zTime));\n  gl_FragColor = vec4(vec3(n), 1.0);\n}",
+            ),
+            (
+                "text",
+                "precision highp float;\n// #include <zoidium/text>\nuniform sampler2D tDiffuse;\nuniform sampler2D Title;\nvarying vec2 vUvScaled;\nvarying vec2 vUv;\nvoid main() {\n  vec4 color = texture2D(tDiffuse, vUvScaled);\n  float coverage = zText(Title, vUv);\n  gl_FragColor = vec4(mix(color.rgb, vec3(1.0), coverage), max(color.a, coverage));\n}",
+            ),
+            (
+                "velocity",
+                "precision highp float;\nuniform sampler2D tDiffuse;\nuniform vec2 Velocity;\nvarying vec2 vUvScaled;\nvoid main() {\n  gl_FragColor = texture2D(tDiffuse, vUvScaled + Velocity * 0.01);\n}",
+            ),
+            (
+                "time-motion",
+                "precision highp float;\n// #include <zoidium/temporal>\nuniform sampler2D Before;\nuniform sampler2D After;\nuniform vec2 resolution;\nuniform vec2 uvScale;\nvarying vec2 vUvScaled;\nvoid main() {\n  vec2 motion = zTimeMotion(Before, After, vUvScaled, uvScale / resolution);\n  gl_FragColor = vec4(vec2(0.5) + motion * 20.0, 0.5, 1.0);\n}",
+            ),
+            (
+                "time-jitter",
+                "precision highp float;\nuniform sampler2D Jitter;\nvarying vec2 vUvScaled;\nvoid main() {\n  gl_FragColor = texture2D(Jitter, vUvScaled);\n}",
+            ),
+        ];
+
+        for &(id, src) in templates {
+            let compiled = translate_glsl_es100(src)
+                .unwrap_or_else(|e| panic!("template `{id}` failed to compile: {e}"));
+            assert_valid_wgsl(&compiled);
         }
+    }
+
+    #[test]
+    fn compiles_all_expressions_plus_and_shader_plus_includes_together() {
+        let src = r#"
+            precision highp float;
+            // #include <zoidium/hash>
+            // #include <zoidium/noise>
+            // #include <zoidium/color>
+            // #include <zoidium/sdf>
+            // #include <zoidium/gradient>
+            // #include <zoidium/curve>
+            // #include <zoidium/text>
+            // #include <zoidium/temporal>
+            uniform sampler2D tDiffuse;
+            uniform sampler2D Ramp;
+            uniform sampler2D Remap;
+            uniform sampler2D Title;
+            uniform sampler2D Before;
+            uniform sampler2D After;
+            uniform float zTime;
+            uniform float zFrame;
+            uniform float zFps;
+            uniform vec3 ctl_Tint;
+            varying vec2 vUv;
+            varying vec2 vUvScaled;
+            void main() {
+                float h = zHash(zFrame) + zHash(vUv) + zHash(vec3(vUv, zTime));
+                float n = zNoise(vUv * 4.0) + zNoise(vec3(vUv, zTime / max(zFps, 1.0)));
+                vec3 lin = zSrgbToLinear(ctl_Tint);
+                vec3 srgb = zLinearToSrgb(lin);
+                vec3 hsv = zRgbToHsv(srgb);
+                vec3 rgb = zHsvToRgb(hsv);
+                float d = zSmoothUnion(
+                    zSdCircle(vUv - 0.5, 0.25),
+                    zSdBox(vUv - 0.5, vec2(0.2, 0.1)),
+                    0.05
+                );
+                float d3 = zSdSphere(vec3(vUv, 0.0), 0.5) + zSdBox(vec3(vUv, 0.0), vec3(0.2));
+                vec4 g = zGradientCycle(Ramp, vUv.x + h * 0.01);
+                float c1 = zCurve(Remap, clamp(n * 0.5, 0.0, 1.0));
+                vec4 c4 = zCurves(Remap, g);
+                float glyph = zGlyph(Title, vec2(4.0, 4.0), 2.0, vUv);
+                vec2 mot = zTimeMotion(Before, After, vUvScaled, vec2(1.0 / 1280.0, 1.0 / 720.0));
+                gl_FragColor = vec4(rgb * c1 + c4.rgb * glyph + vec3(mot, d + d3) * 0.001, 1.0);
+            }
+        "#;
+
+        let bound_curve = bind_curve_ranges(src, ["Remap"]);
+        assert!(bound_curve.contains("uniform vec2 Remap_range;"));
+        assert!(bound_curve.contains("zCurve(Remap, clamp(n * 0.5, 0.0, 1.0), Remap_range)"));
+        assert!(bound_curve.contains("zCurves(Remap, g, Remap_range)"));
+
+        let bound_both = bind_gradient_cycles(&bound_curve, ["Ramp"]);
+        assert!(bound_both.contains("uniform float Ramp_repetitions;"));
+        assert!(bound_both.contains("zGradientCycle(Ramp, vUv.x + h * 0.01, Ramp_repetitions)"));
+
+        let compiled = translate_glsl_es100(&bound_both)
+            .expect("combined Shader+ & Expressions+ includes must compile");
+        assert_valid_wgsl(&compiled);
+    }
+
+    #[test]
+    fn compiles_node_effect_vector_math_4_and_out_of_domain_literal_math() {
+        let src = r#"
+            precision highp float;
+            uniform sampler2D tDiffuse;
+            uniform vec2 uvScale;
+            uniform vec2 resolution;
+            varying vec2 vUv;
+            const vec3 UNIT_Z = normalize(vec3(0.0, 0.0, 2.0));
+            const float ROOT_TWO = sqrt(2.0);
+            void main() {
+                vec4 n0 = vec4(length((vec4(0.0, 0.0, 0.0, 1.0)).rgb) > 0.0
+                    ? normalize((vec4(0.0, 0.0, 0.0, 1.0)).rgb)
+                    : vec3(0.0), 1.0);
+                float p1 = false ? pow(-2.0, 2.0) : 1.0;
+                float p2 = false ? pow(0.0, 0.0) : 1.0;
+                vec4 src = texture2D(tDiffuse, vUv * uvScale);
+                gl_FragColor = vec4(n0.rgb + UNIT_Z * 0.0 + src.rgb * (p1 * p2 * ROOT_TWO * 0.5), 1.0);
+            }
+        "#;
+        let compiled = translate_glsl_es100(src)
+            .expect("dead-branch normalize(vec3(0.0)) and pow literals must compile");
+        assert_valid_wgsl(&compiled);
+    }
+
+    #[test]
+    fn compiles_mat2_widened_array_args_const_int_arrays_bvec_struct_and_sampler_cube() {
+        let src = r#"
+            precision highp float;
+            const int ARR_N = 3;
+            struct Light {
+                vec3 color;
+                float power;
+            };
+            uniform mat2 Rot;
+            uniform mat2 Mats[2];
+            uniform float Weights[ARR_N];
+            uniform vec2 Offsets[2];
+            uniform bool Flags[2];
+            uniform bvec2 B2;
+            uniform bvec3 B3;
+            uniform bvec4 B4;
+            uniform Light uLight;
+            uniform Light uLights[2];
+            uniform samplerCube Env;
+            varying vec2 vUv;
+
+            float sum3(float a[3]) {
+                return a[0] + a[1] + a[2];
+            }
+            vec2 sum2v(vec2 a[2]) {
+                return a[0] + a[1];
+            }
+            bool any2(bool a[2]) {
+                return a[0] || a[1];
+            }
+            vec3 evalLight(Light l) {
+                return l.color * l.power;
+            }
+            vec4 sampleEnv(samplerCube c, vec3 dir) {
+                return textureCube(c, dir);
+            }
+
+            void main() {
+                const int LOCAL_N = 4;
+                float scratch[LOCAL_N];
+                scratch[0] = sum3(Weights);
+                vec2 p = Rot * vUv + Mats[1] * sum2v(Offsets);
+                vec3 lit = evalLight(uLight) + uLights[0].color;
+                vec4 env = sampleEnv(Env, vec3(p, 1.0));
+                float mask = (any2(Flags) && B2.x && B3.y && B4.z) ? 1.0 : 0.5;
+                gl_FragColor = vec4((lit + env.rgb) * mask + vec3(scratch[0] * 0.0), 1.0);
+            }
+        "#;
+        let compiled = translate_glsl_es100(src).expect("advanced uniform types must compile");
+        assert_valid_wgsl(&compiled);
+
+        // Verify mat2 + struct + bvec layout packing
+        let mut vals = BTreeMap::new();
+        vals.insert("Rot".to_string(), UniformValue::Mat2([1.0, 2.0, 3.0, 4.0]));
+        vals.insert("B2".to_string(), UniformValue::Bvec2([true, false]));
+        vals.insert(
+            "uLight.color".to_string(),
+            UniformValue::Vec3([0.2, 0.4, 0.6]),
+        );
+        vals.insert("uLight.power".to_string(), UniformValue::Float(2.0));
+        let bytes = pack_uniforms(&compiled.uniform_layout, &vals);
+        let rot = compiled.uniform_layout.field("Rot").unwrap();
+        assert!((read_f32_le(&bytes, rot.offset as usize) - 1.0).abs() < 1e-6);
+        assert!((read_f32_le(&bytes, rot.offset as usize + 4) - 2.0).abs() < 1e-6);
+        assert!((read_f32_le(&bytes, rot.offset as usize + 16) - 3.0).abs() < 1e-6);
+        assert!((read_f32_le(&bytes, rot.offset as usize + 20) - 4.0).abs() < 1e-6);
+        let b2 = compiled.uniform_layout.field("B2").unwrap();
+        assert_eq!(read_u32_le(&bytes, b2.offset as usize), 1);
+        assert_eq!(read_u32_le(&bytes, b2.offset as usize + 4), 0);
+    }
+
+    #[test]
+    fn normalizes_space_containing_property_names_in_pack_uniforms_and_defines() {
+        let src = r#"
+            precision highp float;
+            uniform vec2 Corner_Point;
+            uniform float Style_Amount;
+            varying vec2 vUv;
+            void main() {
+                #if Render_Mode == 2
+                    gl_FragColor = vec4(Corner_Point * Style_Amount, 0.0, 1.0);
+                #else
+                    gl_FragColor = vec4(0.0);
+                #endif
+            }
+        "#;
+        let mut opts = CompileOptions::default();
+        opts.defines
+            .insert("Render Mode".to_string(), "2".to_string());
+        let compiled = translate_glsl_es100_with_options(src, &opts)
+            .expect("space-containing define name must normalize");
+        assert_valid_wgsl(&compiled);
+        assert_eq!(fix_property_name("Corner Point"), "Corner_Point");
+
+        let mut vals = BTreeMap::new();
+        vals.insert("Corner Point".to_string(), UniformValue::Vec2([0.25, 0.75]));
+        vals.insert("Style Amount".to_string(), UniformValue::Float(0.5));
+        let bytes = pack_uniforms(&compiled.uniform_layout, &vals);
+        let cp = compiled.uniform_layout.field("Corner_Point").unwrap();
+        let sa = compiled.uniform_layout.field("Style_Amount").unwrap();
+        assert!((read_f32_le(&bytes, cp.offset as usize) - 0.25).abs() < 1e-6);
+        assert!((read_f32_le(&bytes, cp.offset as usize + 4) - 0.75).abs() < 1e-6);
+        assert!((read_f32_le(&bytes, sa.offset as usize) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn supports_texture_lod_ext_point_coord_bg_coord_and_derivative_uniformity_diagnostic() {
+        let src = r#"
+            #extension GL_EXT_shader_texture_lod : require
+            precision highp float;
+            uniform sampler2D tDiffuse;
+            varying vec2 vUv;
+            varying vec2 bgCoord;
+            void main() {
+                vec4 a = texture2DLodEXT(tDiffuse, bgCoord, 1.0);
+                vec4 b = texture2DGradEXT(tDiffuse, vUv, vec2(0.01, 0.0), vec2(0.0, 0.01));
+                vec4 c = texture2DProjLodEXT(tDiffuse, vec3(vUv, 1.0), 0.5);
+                vec4 d = texture2DProjGradEXT(tDiffuse, vec4(vUv, 0.0, 1.0), vec2(0.01, 0.0), vec2(0.0, 0.01));
+                vec2 pc = gl_PointCoord;
+                gl_FragColor = (a + b + c + d) * 0.25 + vec4(pc, 0.0, 0.0);
+            }
+        "#;
+        let compiled = translate_glsl_es100(src)
+            .expect("GL_EXT_shader_texture_lod, gl_PointCoord, and bgCoord must compile");
+        assert!(compiled.glsl450_source.contains("_zc_flip_grad"));
+        assert!(!compiled.glsl450_source.contains("gl_PointCoord"));
+        assert!(!compiled.glsl450_source.contains("location = 2"));
+        assert_valid_wgsl(&compiled);
+
+        // Derivative uniformity diagnostic emitted when implicit derivatives/textureSample are used
+        let sample_src = r#"
+            uniform sampler2D tDiffuse;
+            varying vec2 vUv;
+            void main() {
+                gl_FragColor = texture2D(tDiffuse, vUv);
+            }
+        "#;
+        let sampled = translate_glsl_es100(sample_src).unwrap();
+        assert!(
+            sampled
+                .wgsl
+                .starts_with("diagnostic(off, derivative_uniformity);\n")
+        );
+        assert_valid_wgsl(&sampled);
+
+        // Dead fallback loop with helper call after unconditional `return;` (AlipFX mosaic.glsl pattern)
+        let mosaic_pattern = r#"
+            #ifdef GL_EXT_shader_texture_lod
+            #extension GL_EXT_shader_texture_lod : enable
+            #endif
+            precision highp float;
+            uniform sampler2D tDiffuse;
+            uniform vec2 resolution;
+            varying vec2 vUvScaled;
+            vec2 snap(vec2 uv) { return (floor(uv * resolution) + 0.5) / resolution; }
+            void main() {
+                #ifdef GL_EXT_shader_texture_lod
+                    gl_FragColor = texture2DGradEXT(tDiffuse, vUvScaled, vec2(0.01, 0.0), vec2(0.0, 0.01));
+                    return;
+                #endif
+                vec4 acc = vec4(0.0);
+                for (int i = 0; i < 4; i++) {
+                    acc += texture2D(tDiffuse, snap(vUvScaled));
+                }
+                gl_FragColor = acc * 0.25;
+            }
+        "#;
+        let mosaic_compiled = translate_glsl_es100(mosaic_pattern)
+            .expect("mosaic.glsl dead-code-after-return pattern must compile");
+        assert_valid_wgsl(&mosaic_compiled);
+
+        // Pure generator without textureSample / derivatives omits diagnostic
+        let pure_src = "varying vec2 vUv; void main() { gl_FragColor = vec4(vUv, 0.0, 1.0); }";
+        let pure = translate_glsl_es100(pure_src).unwrap();
+        assert!(!pure.wgsl.contains("derivative_uniformity"));
+        assert_valid_wgsl(&pure);
+    }
+
+    #[test]
+    fn visibility_gradient_and_curve_match_zoidium_parity_rules() {
+        // Visibility strict boundaries, newline split, string tokens, and rejecting `== 4`
+        assert!(VisibilityCondition::parse("Mode", "== 4").is_err());
+        assert!(VisibilityCondition::parse("Mode", "! 3").is_err());
+        assert!(VisibilityCondition::parse("Mode", "1....2").is_err());
+
+        let cond = VisibilityCondition::parse("Mode", "> 5.5\n1..3; = 4; off").unwrap();
+        assert!(cond.matches_value(5.5001));
+        assert!(!cond.matches_value(5.5));
+        assert!(cond.matches_value(1.0));
+        assert!(cond.matches_value(4.0));
+        assert!(cond.matches_str("off"));
+        assert!(!cond.matches_value(0.0));
+        assert!(!cond.matches_value(f64::NAN));
+        assert!(!cond.matches_value(f64::INFINITY));
+
+        let static_dd = VisibilityCondition::parse("Mode", ">= 1").unwrap();
+        assert!(static_dd.matches_static_dropdown("2"));
+        assert!(!static_dd.matches_static_dropdown("0"));
+
+        // Zoidium JSON struct round-trip (values array + conditions array)
+        let zwhen = cond.to_zoidium();
+        let back = VisibilityCondition::from_zoidium(&zwhen).unwrap();
+        assert_eq!(back.to_zoidium(), zwhen);
+        assert!(back.matches_value(5.5001));
+        assert!(!back.matches_value(5.5));
+        assert!(back.matches_value(2.0));
+        assert!(back.matches_value(4.0));
+        assert!(back.matches_str("off"));
+        assert!(!back.matches_value(3.5));
+
+        // Gradient empty stops -> opaque white, cyclic seam texel[0] == texel[255], midpoint piecewise-linear, opacityStops
+        let empty = bake_gradient_rgba8(&GradientSpec {
+            stops: vec![],
+            ..GradientSpec::default()
+        });
+        assert_eq!(&empty[0..4], &[255, 255, 255, 255]);
+
+        let cyclic = bake_gradient_rgba8(&GradientSpec {
+            stops: vec![
+                GradientStop::new(0.2, [1.0, 0.0, 0.0, 1.0]),
+                GradientStop::new(0.8, [0.0, 0.0, 1.0, 1.0]),
+            ],
+            cyclic: true,
+            ..GradientSpec::default()
+        });
+        assert_eq!(&cyclic[0..4], &cyclic[255 * 4..256 * 4]);
+
+        let mut mid_stop = GradientStop::new(0.0, [0.0, 0.0, 0.0, 1.0]);
+        mid_stop.midpoint = 0.25;
+        let mid_lut = bake_gradient_rgba8_with_opacity(
+            &GradientSpec {
+                stops: vec![mid_stop, GradientStop::new(1.0, [1.0, 1.0, 1.0, 1.0])],
+                ..GradientSpec::default()
+            },
+            &[OpacityStop::new(0.0, 0.0), OpacityStop::new(1.0, 1.0)],
+        );
+        // Piecewise-linear midpoint at t = 0.25 -> u = 0.5 -> R ~= 128; at t = 0.5 -> u = 0.5 + 0.5*(0.25/0.75) = 0.6667 -> R ~= 170
+        let at_quarter = mid_lut[64 * 4];
+        let at_half = mid_lut[128 * 4];
+        assert!((i32::from(at_quarter) - 128).abs() <= 2);
+        assert!((i32::from(at_half) - 170).abs() <= 2);
+        assert_eq!(mid_lut[3], 0);
+        assert_eq!(mid_lut[255 * 4 + 3], 255);
+
+        // Zoidium absolute Bezier handles: ordered vs independent crossed handles
+        let ordered = vec![
+            ZoidiumCurvePoint::new(0.0, 0.0),
+            ZoidiumCurvePoint {
+                x: 0.2,
+                y: 0.3,
+                handles: Some(ZoidiumCurveHandles {
+                    in_handle: None,
+                    out_handle: Some([0.7, 0.6]),
+                    in_independent: false,
+                    out_independent: false,
+                }),
+            },
+            ZoidiumCurvePoint {
+                x: 0.8,
+                y: 0.7,
+                handles: Some(ZoidiumCurveHandles {
+                    in_handle: Some([0.3, 0.1]),
+                    out_handle: None,
+                    in_independent: false,
+                    out_independent: false,
+                }),
+            },
+            ZoidiumCurvePoint::new(1.0, 1.0),
+        ];
+        let mut independent = ordered.clone();
+        independent[2].handles.as_mut().unwrap().in_independent = true;
+        let y_ord = evaluate_zoidium_curve_points(&ordered, 0.5);
+        let y_ind = evaluate_zoidium_curve_points(&independent, 0.5);
+        assert!((0.0..=1.0).contains(&y_ord));
+        assert!((0.0..=1.0).contains(&y_ind));
+        assert!((y_ord - y_ind).abs() > 1e-3);
     }
 }

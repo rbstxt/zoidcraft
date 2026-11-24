@@ -10,26 +10,44 @@ pub mod particles;
 pub mod text3d;
 
 pub use camera::{
-    CameraPlusDofParams, CameraPlusVibrateOffset, CameraPlusVibrateParams, CameraProjection,
-    CameraShakeMode, CameraShakeParams, evaluate_camera_shake, evaluate_camera_shake_channels,
-    evaluate_camera_vibrate, shake_noise, shake_wave,
+    CameraPlusDofParams, CameraPlusFilmParams, CameraPlusVibrateFullParams,
+    CameraPlusVibrateOffset, CameraPlusVibrateParams, CameraProjection, CameraShakeMode,
+    CameraShakeParams, apply_camera_vibrate, evaluate_camera_shake, evaluate_camera_shake_channels,
+    evaluate_camera_vibrate, evaluate_camera_vibrate_full, shake_noise, shake_wave,
+    vibrate_hash_noise, vibrate_sample_noise,
 };
-pub use effector::{DeformAxis, apply_repeater, apply_twist, apply_voronoi_fracture, apply_warp};
+pub use effector::{
+    DeformAxis, DeformerFrame, DelayMode, DelayParams, EffectorField, EffectorFieldType,
+    FieldFalloffCurve, FractureDistribution, MAX_REPEATS, PlainParams, PreparedEffectorField,
+    RepeaterMode, RepeaterParams, RepeaterTransform, SPRING_CYCLES, SPRING_DAMPING,
+    SPRING_MIN_TOTAL, TwistParams, VoronoiFractureParams, WarpAxis, WarpParams, apply_delay,
+    apply_plain, apply_repeater, apply_repeater_with_params, apply_twist, apply_twist_with_params,
+    apply_voronoi_fracture, apply_voronoi_fracture_with_params, apply_warp, apply_warp_with_params,
+    compute_deformer_frame, compute_shared_deformer_bounds, connected_pieces, delay_weight,
+    effector_hash_unit_vector, effector_hash01, evaluate_field, generate_voronoi_sites,
+    prepare_field_for_bounds, prepare_field_from_positions, repeater_echo_frames,
+    repeater_instance_transform, rotate_xyz_deg, voronoi_piece_color,
+};
 pub use mesh::{
-    MeshData, Vertex3D, build_box, build_capsule, build_circle, build_cylinder, build_dodecahedron,
-    build_donut, build_icosahedron, build_octahedron, build_rectangle, build_rounded_box,
-    build_sphere, build_tetrahedron, build_wire, compute_bounds,
+    MAX_SMOOTH_TRIANGLES, MeshData, Vertex3D, budget_subdivision, build_box, build_capsule,
+    build_circle, build_cylinder, build_dodecahedron, build_donut, build_icosahedron,
+    build_octahedron, build_rectangle, build_rounded_box, build_sphere, build_tetrahedron,
+    build_wire, compute_bounds, subdivide_mesh, subdivision_polygons,
 };
 pub use obj_loader::{ObjLoadError, parse_obj};
 pub use particles::{
-    GradientStop, ParticleBlending, ParticleInstance, ParticleSpriteKind, ParticleSystemParams,
-    PositionDistribution, VelocityDistribution, bake_gradient_lut, evaluate_particle,
-    evaluate_particles, generate_particle_sprite, particle_hash, perspective_point_size,
-    sample_gradient,
+    CM3_GRADIENT_LUT_SIZE, GradientStop, ParticleBlending, ParticleInstance, ParticleSpriteKind,
+    ParticleSystemParams, PositionDistribution, VelocityDistribution, bake_cm3_gradient_lut_rgba8,
+    bake_gradient_lut, cm3_quad_rotation_rad, cm3_rotate_point_sprite_uv,
+    compose_particle_fragment_premul, evaluate_particle, evaluate_particle_cm3_lut,
+    evaluate_particles, evaluate_particles_cm3_lut, generate_particle_sprite, particle_hash,
+    perspective_point_size, sample_cm3_gradient_lut, sample_gradient,
 };
 pub use text3d::{
-    Text3DError, Text3DParams, TextAlignMode, UvMode, build_fallback_text_mesh, build_text3d_mesh,
-    extrude_contours,
+    BevelProfile, BevelSide, Text3DCharacterMesh, Text3DError, Text3DExtendedOptions, Text3DParams,
+    TextAlignMode, TextScaleMode, UvMode, build_fallback_text_mesh,
+    build_fallback_text_mesh_with_options, build_text3d_character_meshes, build_text3d_mesh,
+    build_text3d_mesh_with_options, extrude_contours, extrude_contours_with_options,
 };
 
 #[cfg(test)]
@@ -593,15 +611,39 @@ mod tests {
         let dof = CameraPlusDofParams {
             enabled: true,
             focus_distance: 80.0,
-            aperture: 2.8,
+            aperture: 3.0,
             focus_area_width: 4.0,
             ..CameraPlusDofParams::default()
         };
-        assert!((dof.vertical_fov_deg() - 60.0).abs() < 1e-2);
-        assert!((dof.equivalent_35mm_focal_length() - dof.focal_length_mm).abs() < 1e-4);
+        // 35mm focal length on 36mm horizontal filmGate at 16:9 -> 20.25mm film height -> ~32.27° vFOV
+        let expected_vfov = 2.0
+            * ((36.0_f32 / (16.0 / 9.0)) / (2.0 * 35.0))
+                .atan()
+                .to_degrees();
+        assert!((dof.vertical_fov_deg() - expected_vfov).abs() < 1e-3);
+        assert!((dof.equivalent_35mm_focal_length() - 35.0).abs() < 1e-4);
         assert_eq!(dof.signed_coc(80.0), 0.0);
         assert!(dof.signed_coc(40.0) < 0.0);
         assert!(dof.signed_coc(160.0) > 0.0);
+        // Larger aperture = MORE blur up to Zoidium's 5% minSide cap (aperture >= 2.5 clamps to 0.05).
+        let dof_narrow = CameraPlusDofParams {
+            aperture: 1.0,
+            ..dof.clone()
+        };
+        let dof_mid = CameraPlusDofParams {
+            aperture: 2.0,
+            ..dof.clone()
+        };
+        assert!(dof_mid.signed_coc(160.0) > dof_narrow.signed_coc(160.0));
+        assert!(dof.signed_coc(160.0) > dof_mid.signed_coc(160.0));
+        assert!(
+            (dof.max_blur_radius(1920.0, 1080.0) - 1080.0 * 0.05).abs() < 1e-4,
+            "aperture=3.0 should hit Zoidium's 5% minSide cap"
+        );
+        assert!(
+            (dof_narrow.max_blur_radius(1920.0, 1080.0) - 1.0 * 0.02 * 1080.0).abs() < 1e-4,
+            "aperture=1.0 should scale linearly at 2% * minSide"
+        );
     }
 
     #[test]
@@ -878,5 +920,516 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Zoidium Parity Tests (P5 Audit: Text3D, Particles, Presets, Camera+, Effectors)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn text3d_position_mode_matches_cm3_with_sidebearing_descenders_and_bevel() {
+        // Bounds with non-zero left sidebearing (min.x = 1.0), descender (min.y = -3.0),
+        // and front/back bevel (min.z = -0.5, max.z = 4.5).
+        let b_min = Vec3::new(1.0, -3.0, -0.5);
+        let b_max = Vec3::new(11.0, 17.0, 4.5);
+        // Base center offset: -(min + max) / 2 = (-6.0, -7.0, -2.0)
+        assert_eq!(
+            TextAlignMode::Center.alignment_offset(b_min, b_max),
+            Vec3::new(-6.0, -7.0, -2.0)
+        );
+        // Left: x = 0 (preserves pen origin / left sidebearing!)
+        assert_eq!(
+            TextAlignMode::Left.alignment_offset(b_min, b_max),
+            Vec3::new(0.0, -7.0, -2.0)
+        );
+        // Right: x = -(min.x + max.x) = -12.0 (NOT -11.0!)
+        assert_eq!(
+            TextAlignMode::Right.alignment_offset(b_min, b_max),
+            Vec3::new(-12.0, -7.0, -2.0)
+        );
+        // Top: y = -(min.y + max.y) = -14.0 (NOT -17.0!)
+        assert_eq!(
+            TextAlignMode::Top.alignment_offset(b_min, b_max),
+            Vec3::new(-6.0, -14.0, -2.0)
+        );
+        // Bottom: y = 0 (preserves typography baseline for descenders!)
+        assert_eq!(
+            TextAlignMode::Bottom.alignment_offset(b_min, b_max),
+            Vec3::new(-6.0, 0.0, -2.0)
+        );
+        // Front: z = -(min.z + max.z) = -4.0 (NOT -4.5!)
+        assert_eq!(
+            TextAlignMode::Front.alignment_offset(b_min, b_max),
+            Vec3::new(-6.0, -7.0, -4.0)
+        );
+        // Back: z = 0 (NOT +0.5!)
+        assert_eq!(
+            TextAlignMode::Back.alignment_offset(b_min, b_max),
+            Vec3::new(-6.0, -7.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn text3d_bevel_side_profile_tension_line_height_and_scale_mode() {
+        let rect = vec![vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(10.0, 10.0),
+            Vec2::new(0.0, 10.0),
+        ]];
+        let base_params = Text3DParams {
+            thickness: 4.0,
+            bevel_enabled: true,
+            bevel_thickness: 1.0,
+            bevel_size: 1.0,
+            bevel_segments: 4,
+            align: TextAlignMode::Center,
+            ..Text3DParams::default()
+        };
+
+        // Outside bevel expands XY bounds to 10 + 2*1 = 12; Inside bevel keeps XY bounds at 10!
+        let m_out = extrude_contours_with_options(
+            &rect,
+            &base_params,
+            &Text3DExtendedOptions {
+                bevel_side: BevelSide::Outside,
+                bevel_profile: BevelProfile::Round,
+                bevel_tension: 0.5,
+                ..Text3DExtendedOptions::default()
+            },
+        )
+        .expect("outside bevel");
+        let m_in = extrude_contours_with_options(
+            &rect,
+            &base_params,
+            &Text3DExtendedOptions {
+                bevel_side: BevelSide::Inside,
+                bevel_profile: BevelProfile::Round,
+                bevel_tension: 0.5,
+                ..Text3DExtendedOptions::default()
+            },
+        )
+        .expect("inside bevel");
+        assert_valid_mesh(&m_out, "bevel_outside");
+        assert_valid_mesh(&m_in, "bevel_inside");
+        assert!(((m_out.bounds.max.x - m_out.bounds.min.x) - 12.0).abs() < 1e-3);
+        assert!(((m_in.bounds.max.x - m_in.bounds.min.x) - 10.0).abs() < 1e-3);
+
+        // Flat vs Round profile and different bevelTension produce distinct intermediate bevel vertices.
+        let m_flat = extrude_contours_with_options(
+            &rect,
+            &base_params,
+            &Text3DExtendedOptions {
+                bevel_profile: BevelProfile::Flat,
+                ..Text3DExtendedOptions::default()
+            },
+        )
+        .expect("flat bevel");
+        let m_tense = extrude_contours_with_options(
+            &rect,
+            &base_params,
+            &Text3DExtendedOptions {
+                bevel_profile: BevelProfile::Round,
+                bevel_tension: 0.9,
+                ..Text3DExtendedOptions::default()
+            },
+        )
+        .expect("tense bevel");
+        assert_valid_mesh(&m_flat, "bevel_flat");
+        assert_valid_mesh(&m_tense, "bevel_tense");
+        assert_ne!(m_out.vertices, m_flat.vertices);
+        assert_ne!(m_out.vertices, m_tense.vertices);
+
+        // Font line height from bbox (yMax=700, yMin=0, underline=0, upem=1000, height=20 -> lineHeight=14.0)
+        // and TextScaleMode Current vs Legacy per-character split.
+        let ttf = make_minimal_test_ttf();
+        let multi_params = Text3DParams {
+            text: String::from("A\nA"),
+            height: 20.0,
+            thickness: 2.0,
+            letter_spacing: 3.0,
+            ..Text3DParams::default()
+        };
+        let chars_cur = build_text3d_character_meshes(
+            &ttf,
+            &multi_params,
+            &Text3DExtendedOptions {
+                text_scale_mode: TextScaleMode::Current,
+                ..Text3DExtendedOptions::default()
+            },
+            Vec3::new(2.0, 3.0, 0.0),
+        )
+        .expect("split current");
+        let chars_leg = build_text3d_character_meshes(
+            &ttf,
+            &multi_params,
+            &Text3DExtendedOptions {
+                text_scale_mode: TextScaleMode::Legacy,
+                ..Text3DExtendedOptions::default()
+            },
+            Vec3::new(2.0, 3.0, 0.0),
+        )
+        .expect("split legacy");
+        assert_eq!(chars_cur.len(), 2);
+        // Second line sits at y = -14.0 = -(700 - 0 + 0) * (20 / 1000)
+        assert!((chars_cur[1].layout_pos.y + 14.0).abs() < 1e-4);
+        assert_eq!(chars_cur[0].mesh_scale, Vec3::new(2.0, 3.0, 0.0));
+        assert_eq!(chars_leg[0].mesh_scale, Vec3::ONE);
+    }
+
+    #[test]
+    fn particles_pid_zero_rotation_sign_alpha_and_cm3_lut_parity() {
+        // pid = 0 MUST evaluate rand(vec2(0, 0)) = 0.0 (NOT pid + 1 = 1!)
+        let params = ParticleSystemParams {
+            count: 2,
+            rate: 10.0,
+            lifetime: 2.0,
+            position_dist: PositionDistribution::Box,
+            origin: Vec3::ZERO,
+            position_spread: Vec3::new(10.0, 20.0, 30.0),
+            velocity_dist: VelocityDistribution::Box,
+            velocity: Vec3::ZERO,
+            velocity_spread: Vec3::ZERO,
+            initial_angle_deg: 30.0,
+            angle_spread_deg: 60.0,
+            ..ParticleSystemParams::default()
+        };
+        let p0 = evaluate_particle(0, 1.0, &params);
+        assert!(p0.alive);
+        // For pid = 0: r1 = r2 = r3 = particle_hash(0, 0) = 0.0 -> offset = -0.5 * spread
+        assert!((p0.position[0] + 5.0).abs() < 1e-5);
+        assert!((p0.position[1] + 10.0).abs() < 1e-5);
+        assert!((p0.position[2] + 15.0).abs() < 1e-5);
+        // a0 = (30 + (0 - 0.5) * 60) deg = 0 deg
+        assert!(p0.angle.abs() < 1e-5);
+
+        // For pid = 1 at time = 1.0: delay = 0.1, elapsed = 0.9, cycle = 1.0, k = 1.0
+        let p1 = evaluate_particle(1, 1.0, &params);
+        let expected_r1 = particle_hash(1.0, 1.0);
+        let expected_r2 = particle_hash(1.0, 2.0);
+        let expected_r3 = particle_hash(1.0, 3.0);
+        assert!((p1.position[0] - (expected_r1 - 0.5) * 10.0).abs() < 1e-5);
+        assert!((p1.position[1] - (expected_r2 - 0.5) * 20.0).abs() < 1e-5);
+        assert!((p1.position[2] - (expected_r3 - 0.5) * 30.0).abs() < 1e-5);
+
+        // Perspective point size parity: default Zoidium size (38/255) at dist=80, width=1920 -> 178.8235px
+        let px = perspective_point_size(38.0 / 255.0, 1920.0, 80.0);
+        assert!((px - 178.82353).abs() < 1e-3);
+
+        // Rotation sign: +vAngle rotates sprite UV CCW -> visual CW -> quad rotation is -vAngle
+        let v_angle = std::f32::consts::FRAC_PI_2;
+        assert_eq!(cm3_quad_rotation_rad(v_angle), -v_angle);
+        let uv_rot = cm3_rotate_point_sprite_uv([1.0, 0.5], v_angle);
+        // x = +0.5, y = 0.0; c = 0, s = -1 -> rotatedUV = (0.5, 0.5 + 0.5) = (0.5, 1.0)
+        assert!((uv_rot[0] - 0.5).abs() < 1e-5);
+        assert!((uv_rot[1] - 1.0).abs() < 1e-5);
+
+        // Single premultiplication check (no double alpha^2 darkening)
+        let straight_sprite = [1.0, 0.5, 0.25, 0.5];
+        let premul_sprite = [0.5, 0.25, 0.125, 0.5];
+        let v_color_premul = [0.5, 0.5, 0.5, 0.5];
+        let c_from_straight =
+            compose_particle_fragment_premul(straight_sprite, v_color_premul, false);
+        let c_from_premul = compose_particle_fragment_premul(premul_sprite, v_color_premul, true);
+        for k in 0..4 {
+            assert!((c_from_straight[k] - c_from_premul[k]).abs() < 1e-6);
+        }
+        assert!((c_from_premul[0] - 0.25).abs() < 1e-6);
+
+        // 32-texel CM3 LUT baking and texel-center linear sampling
+        let stops = vec![
+            GradientStop {
+                position: 0.0,
+                color: [1.0, 1.0, 1.0, 1.0],
+            },
+            GradientStop {
+                position: 1.0,
+                color: [1.0, 1.0, 1.0, 0.0],
+            },
+        ];
+        let lut = bake_cm3_gradient_lut_rgba8(&stops, true);
+        assert_eq!(lut[0], [255, 255, 255, 255]);
+        // i = 16 -> t = 0.5 -> a = 0.5 -> floor(255 * 0.5) = 127
+        assert_eq!(lut[16], [127, 127, 127, 127]);
+        let s0 = sample_cm3_gradient_lut(&lut, 0.0);
+        assert!((s0[3] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn wire_point_count_preset_centering_and_subdivision_parity() {
+        // CM3 Wire uses `loops * outer` points (NOT +1): for loops=1, outer=4, size=(0,0,10),
+        // points are z = 0, 2.5, 5.0, 7.5 -> total Z span = 7.5 + 2*radius (not 10.0 + 2*radius!).
+        let wire = build_wire(Vec3::new(0.0, 0.0, 10.0), 0.1, 1, 6, 4);
+        assert_valid_mesh(&wire, "wire_exact_points");
+        let z_span = wire.bounds.max.z - wire.bounds.min.z;
+        assert!(
+            (z_span - 7.5).abs() < 0.25,
+            "expected wire z_span ~7.5 for loops*outer=4 points, got {z_span}"
+        );
+        let wire_center = 0.5 * (wire.bounds.min + wire.bounds.max);
+        assert!(wire_center.length() < 1e-4);
+
+        // Odd-segment preset shapes must be bounding-box centered (matching CM3 `e.center()`).
+        for (name, m) in [
+            ("cyl_3", build_cylinder(5.0, 5.0, 10.0, 3, false)),
+            ("circle_3", build_circle(6.0, 3)),
+            ("sphere_5x3", build_sphere(8.0, 5, 3)),
+            ("donut_3x5", build_donut(10.0, 2.0, 3, 5)),
+        ] {
+            assert_valid_mesh(&m, name);
+            let c = 0.5 * (m.bounds.min + m.bounds.max);
+            assert!(
+                c.length() < 1e-4,
+                "{name}: expected centered bounds, got {c:?}"
+            );
+        }
+
+        // 4-way triangle subdivision parity (`subdivision_polygons` & `subdivide_mesh`)
+        assert_eq!(subdivision_polygons(1), 1);
+        assert_eq!(subdivision_polygons(4), 4);
+        assert_eq!(subdivision_polygons(16), 16);
+        assert_eq!(subdivision_polygons(64), 64);
+        assert_eq!(subdivision_polygons(256), 256);
+        assert_eq!(subdivision_polygons(999), 256);
+        let b = build_box(4.0, 4.0, 4.0);
+        let sub16 = subdivide_mesh(&b, 16);
+        assert_valid_mesh(&sub16, "subdivided_box_16");
+        assert_eq!(sub16.triangle_count(), b.triangle_count() * 16);
+    }
+
+    #[test]
+    fn camera_plus_vibrate_film_gate_and_ortho_resolution_parity() {
+        // Exact Zoidium `vibrateHashNoise(0, 0)` = fract(sin(12.9898) * 43758.5453) * 2 - 1
+        let raw = (12.9898_f64).sin() * 43758.5453_f64;
+        let expected_h0 = (raw - raw.floor()) * 2.0 - 1.0;
+        assert!((vibrate_hash_noise(0, 0.0) - expected_h0).abs() < 1e-12);
+
+        // Stepped (`regular_pulse`) vs smooth value noise at fractional x = 0.25
+        let smooth_v = vibrate_sample_noise(0.25, 0.0, false);
+        let stepped_v = vibrate_sample_noise(0.25, 0.0, true);
+        assert!((stepped_v - expected_h0).abs() < 1e-12);
+        assert!((smooth_v - stepped_v).abs() > 1e-3);
+
+        // Full vibrate: rotation amplitude in degrees, relative mode, additive pose
+        let full = CameraPlusVibrateFullParams {
+            enabled: true,
+            regular_pulse: false,
+            relative: true,
+            seed: 7.0,
+            enable_position: true,
+            position_amplitude: Vec3::new(10.0, 0.0, 0.0),
+            position_frequency: 1.5,
+            enable_rotation: true,
+            rotation_amplitude_deg: Vec3::new(0.0, 90.0, 0.0),
+            rotation_frequency: 0.5,
+        };
+        let base_pos = Vec3::new(200.0, 0.0, 80.0);
+        let base_rot = Vec3::new(0.0, 1.0, 0.0);
+        let (p_out, r_out) = apply_camera_vibrate(10.0, &full, base_pos, base_rot);
+        let exp_px =
+            base_pos.x + (vibrate_sample_noise(15.0, 7.0, false) * (10.0 * 0.01 * 200.0)) as f32;
+        let exp_ry = base_rot.y
+            + (vibrate_sample_noise(5.0, 7.0 + 101.0 + 17.0, false)
+                * (90.0 * 0.01 * 1.0)
+                * (std::f64::consts::PI / 180.0)) as f32;
+        assert!((p_out.x - exp_px).abs() < 1e-5);
+        assert!((r_out.y - exp_ry).abs() < 1e-5);
+
+        // Film gate 36mm at 1920x1080 with 35mm focal length and zoom=1
+        let film = CameraPlusFilmParams::default();
+        let [hfov, vfov] = film.field_of_view_deg(1920.0, 1080.0);
+        assert!((vfov - 32.269_38).abs() < 1e-3);
+        assert!((hfov - 54.432_22).abs() < 1e-3);
+        let roundtrip_fl =
+            CameraPlusFilmParams::focal_length_for_fov(1, vfov, 36.0, 1.0, 16.0 / 9.0)
+                .expect("valid focal length");
+        assert!((roundtrip_fl - 35.0).abs() < 1e-3);
+
+        // Orthographic projection coupled to sequence resolution
+        let ortho_1x =
+            CameraProjection::orthographic_from_resolution(1920.0, 1080.0, 1.0, 0.1, 5000.0);
+        let ortho_2x =
+            CameraProjection::orthographic_from_resolution(1920.0, 1080.0, 2.0, 0.1, 5000.0);
+        assert!((ortho_2x.x_axis.x - 2.0 * ortho_1x.x_axis.x).abs() < 1e-5);
+    }
+
+    #[test]
+    fn effector_plus_and_repeater_exact_zoidium_math() {
+        // 1. effectorHash01 exact match against JS integer xorshift-mul
+        let h_0_0_0 = effector_hash01(0, 0, 0);
+        assert!((0.0..1.0).contains(&h_0_0_0));
+        assert_eq!(h_0_0_0, effector_hash01(0, 0, 0));
+        assert_ne!(effector_hash01(1, 0, 0), effector_hash01(2, 0, 0));
+
+        // 2. Exact Warp sinc / (1 - cos) / theta formula (`effector-core.js:253-274`)
+        let bar = MeshData::new(
+            vec![
+                Vertex3D::new([-5.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0], 0),
+                Vertex3D::new([5.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0], 0),
+                Vertex3D::new([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.5, 1.0], 0),
+            ],
+            vec![0, 1, 2],
+        );
+        let strength = std::f32::consts::PI; // half-circle across size = 10 -> k = pi / 10
+        let warped_y = apply_warp_with_params(
+            &bar,
+            &WarpParams {
+                strength,
+                axis: WarpAxis::IntoY,
+                ..WarpParams::default()
+            },
+            None,
+            None,
+        );
+        // For x = 5.0, pivot = 0, s = 5, theta = pi/2:
+        // x' = 5 * sin(pi/2) / (pi/2) = 10 / pi; y' = 0 + 5 * (1 - cos(pi/2)) / (pi/2) = 10 / pi
+        let expected = 10.0 / std::f32::consts::PI;
+        assert!((warped_y.vertices[1].position[0] - expected).abs() < 1e-4);
+        assert!((warped_y.vertices[1].position[1] - expected).abs() < 1e-4);
+        assert!(warped_y.vertices[1].position[2].abs() < 1e-5);
+
+        // Warp IntoZ bends along X into +Z instead of +Y
+        let warped_z = apply_warp_with_params(
+            &bar,
+            &WarpParams {
+                strength,
+                axis: WarpAxis::IntoZ,
+                ..WarpParams::default()
+            },
+            None,
+            None,
+        );
+        assert!((warped_z.vertices[1].position[0] - expected).abs() < 1e-4);
+        assert!(warped_z.vertices[1].position[1].abs() < 1e-5);
+        assert!((warped_z.vertices[1].position[2] - expected).abs() < 1e-4);
+
+        // 3. All 6 EffectorField types evaluate cleanly in [0, 1]
+        let box_mesh = build_box(10.0, 10.0, 10.0);
+        for ft in [
+            EffectorFieldType::Infinite,
+            EffectorFieldType::Linear,
+            EffectorFieldType::Box,
+            EffectorFieldType::Sphere,
+            EffectorFieldType::Cylinder,
+            EffectorFieldType::Noise,
+        ] {
+            let f = EffectorField {
+                field_type: ft,
+                sweep: 50.0,
+                falloff: 50.0,
+                curve: FieldFalloffCurve::Smooth,
+                ..EffectorField::default()
+            };
+            let pf = prepare_field_for_bounds(&f, box_mesh.bounds);
+            let w_center = evaluate_field(Vec3::ZERO, &pf);
+            let w_far = evaluate_field(Vec3::new(100.0, 0.0, 0.0), &pf);
+            assert!((0.0..=1.0).contains(&w_center));
+            assert!((0.0..=1.0).contains(&w_far));
+            if matches!(
+                ft,
+                EffectorFieldType::Box | EffectorFieldType::Sphere | EffectorFieldType::Cylinder
+            ) {
+                assert!(w_center > 0.99);
+                assert!(w_far < 1e-6);
+            }
+        }
+
+        // 4. DeformerFrame (parent-group deformer space) & Plain per-piece TRS
+        let mut two_pieces = build_box(2.0, 2.0, 2.0);
+        let mut second_box = build_box(2.0, 2.0, 2.0);
+        second_box.translate(Vec3::new(20.0, 0.0, 0.0));
+        two_pieces.merge(&second_box);
+        let (_, piece_count) = connected_pieces(&two_pieces);
+        assert_eq!(piece_count, 2);
+
+        let plain = apply_plain(
+            &two_pieces,
+            &PlainParams {
+                position_offset: Vec3::new(0.0, 5.0, 0.0),
+                uniform_scale: 0.0,
+                ..PlainParams::default()
+            },
+            None,
+            None,
+        );
+        assert!((plain.bounds.min.y - 4.0).abs() < 1e-4);
+        assert!((plain.bounds.max.y - 6.0).abs() < 1e-4);
+
+        // 5. Delay: Blend / Average / Spring kernels + rigid piece transform filtering
+        let mut hist1 = box_mesh.clone();
+        hist1.translate(Vec3::new(10.0, 0.0, 0.0));
+        let delayed = apply_delay(
+            &box_mesh,
+            &box_mesh,
+            &[&hist1],
+            &DelayParams {
+                mode: DelayMode::Average,
+                strength: 0.5,
+                window: 1,
+                ..DelayParams::default()
+            },
+            false,
+        );
+        let delayed_center = 0.5 * (delayed.bounds.min + delayed.bounds.max);
+        assert!((delayed_center.x - 5.0).abs() < 1e-3);
+        assert!((delay_weight(DelayMode::Blend, 0.5, 3.0, 1.0) - (-2.0_f64).exp()).abs() < 1e-12);
+        assert!(
+            (delay_weight(DelayMode::Spring, 0.25, 3.0, 1.0) - (-0.75_f64).exp()).abs() < 1e-12
+        );
+
+        // 6. Repeater Step (count > 64 up to 128, scale clamped >= 0.001), Linear, Random, Echo
+        let step_100 = apply_repeater(
+            &box_mesh,
+            100,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        assert_eq!(step_100.triangle_count(), box_mesh.triangle_count() * 100);
+        let lin_params = RepeaterParams {
+            mode: RepeaterMode::Linear,
+            count: 5,
+            position_end: Vec3::new(40.0, 0.0, 0.0),
+            scale_end: Vec3::splat(3.0),
+            ..RepeaterParams::default()
+        };
+        let lin_mid = repeater_instance_transform(&lin_params, 2);
+        assert!((lin_mid.position.x - 20.0).abs() < 1e-5);
+        assert!((lin_mid.scale.x - 2.0).abs() < 1e-5);
+        let rand_params = RepeaterParams {
+            mode: RepeaterMode::Random,
+            count: 4,
+            seed: 42,
+            ..RepeaterParams::default()
+        };
+        assert_eq!(
+            repeater_instance_transform(&rand_params, 0).position,
+            Vec3::ZERO
+        );
+        assert_eq!(
+            repeater_echo_frames(12.0, 4, 5.0),
+            vec![12.0, 7.0, 2.0, 0.0]
+        );
+
+        // 7. Voronoi Fracture open vs closed, distributions, piece color, gravity/spin
+        let frac_open = apply_voronoi_fracture_with_params(
+            &box_mesh,
+            &VoronoiFractureParams {
+                cells: 6,
+                seed: 7,
+                closed: false,
+                distribution: FractureDistribution::Center,
+                distance: 2.0,
+                gravity: 4.0,
+                spin_rad: 0.5,
+                ..VoronoiFractureParams::default()
+            },
+            None,
+            None,
+        );
+        assert_valid_mesh(&frac_open, "voronoi_open_motion");
+        assert!(frac_open.vertices.iter().all(|v| v.material_slot == 0));
+        let col = voronoi_piece_color(7, 0);
+        assert!(col.iter().all(|&c| (0.0..=1.0).contains(&c)));
     }
 }

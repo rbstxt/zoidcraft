@@ -1,6 +1,8 @@
 //! Audio decoding via `symphonia` (WAV, MP3, OGG/Vorbis, FLAC, AAC, MP4),
 //! stereo linear resampling to 48 kHz, and lightweight WAV encoders.
 
+use std::f32::consts::FRAC_1_SQRT_2;
+use std::f64::consts::PI;
 use std::io::{self, Cursor};
 
 use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -61,6 +63,14 @@ impl AudioBuffer {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.frame_count() == 0
+    }
+
+    /// Reads frame `frame_idx` and downmixes it to stereo `[L, R]` using standard
+    /// ITU-R BS.775 / Web Audio channel layout rules.
+    #[must_use]
+    #[inline]
+    pub fn read_stereo_frame(&self, frame_idx: usize) -> [f32; 2] {
+        downmix_frame_to_stereo(self, frame_idx)
     }
 }
 
@@ -236,7 +246,7 @@ pub fn resample_stereo(buffer: &AudioBuffer, target_sample_rate: u32) -> Vec<[f3
         let capped = in_frames.min(MAX_RESAMPLED_STEREO_FRAMES);
         let mut out = Vec::with_capacity(capped);
         for frame_idx in 0..capped {
-            out.push(read_stereo_frame(buffer, frame_idx));
+            out.push(downmix_frame_to_stereo(buffer, frame_idx));
         }
         return out;
     }
@@ -252,42 +262,132 @@ pub fn resample_stereo(buffer: &AudioBuffer, target_sample_rate: u32) -> Vec<[f3
     let out_frames = (out_frames_f64.round().max(1.0) as usize).min(MAX_RESAMPLED_STEREO_FRAMES);
     let ratio = f64::from(buffer.sample_rate) / f64::from(target_sample_rate);
     let last_frame = in_frames - 1;
+    let use_antialias = ratio > 1.0 + 1e-6;
 
     let mut out = Vec::with_capacity(out_frames);
-    for out_idx in 0..out_frames {
-        let src_pos = (out_idx as f64) * ratio;
-        let idx0 = (src_pos.floor() as usize).min(last_frame);
-        let idx1 = (idx0 + 1).min(last_frame);
-        let frac = (src_pos - idx0 as f64).clamp(0.0, 1.0) as f32;
+    if use_antialias {
+        for out_idx in 0..out_frames {
+            let src_pos = (out_idx as f64) * ratio;
+            out.push(sample_stereo_sinc(buffer, src_pos, ratio));
+        }
+    } else {
+        for out_idx in 0..out_frames {
+            let src_pos = (out_idx as f64) * ratio;
+            let idx0 = (src_pos.floor() as usize).min(last_frame);
+            let idx1 = (idx0 + 1).min(last_frame);
+            let frac = (src_pos - idx0 as f64).clamp(0.0, 1.0) as f32;
 
-        let a = read_stereo_frame(buffer, idx0);
-        let b = read_stereo_frame(buffer, idx1);
-        out.push([a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac]);
+            let a = downmix_frame_to_stereo(buffer, idx0);
+            let b = downmix_frame_to_stereo(buffer, idx1);
+            out.push([a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac]);
+        }
     }
 
     out
 }
 
+/// Samples a stereo frame from `buffer` at fractional source frame index `src_pos` using a
+/// Hann-windowed sinc low-pass anti-aliasing filter tuned for downsampling ratio `ratio > 1.0`.
+#[must_use]
+pub(crate) fn sample_stereo_sinc(buffer: &AudioBuffer, src_pos: f64, ratio: f64) -> [f32; 2] {
+    let frames = buffer.frame_count();
+    if !src_pos.is_finite() || !ratio.is_finite() || src_pos < 0.0 || frames == 0 {
+        return [0.0, 0.0];
+    }
+    let center = src_pos.floor() as isize;
+    if center as usize >= frames {
+        return [0.0, 0.0];
+    }
+    let effective_ratio = ratio.max(1.0);
+    // Cutoff slightly below target Nyquist (0.9 / ratio) to prevent fold-back aliasing.
+    let cutoff = 0.9 / effective_ratio;
+    let radius = ((8.0 * effective_ratio).ceil() as isize).clamp(8, 64);
+    let radius_f = radius as f64;
+    let max_idx = (frames - 1) as isize;
+
+    let mut acc_l = 0.0_f64;
+    let mut acc_r = 0.0_f64;
+    let mut weight_sum = 0.0_f64;
+
+    let start = (center - radius).max(0);
+    let end = (center + radius).min(max_idx);
+    for idx in start..=end {
+        let d = src_pos - idx as f64;
+        if d.abs() > radius_f {
+            continue;
+        }
+        let window = 0.5 * (1.0 + (PI * d / radius_f).cos());
+        let x = PI * cutoff * d;
+        let sinc = if x.abs() < 1e-9 { 1.0 } else { x.sin() / x };
+        let w = sinc * window;
+        let s = downmix_frame_to_stereo(buffer, idx as usize);
+        acc_l += f64::from(s[0]) * w;
+        acc_r += f64::from(s[1]) * w;
+        weight_sum += w;
+    }
+
+    if weight_sum.abs() <= 1e-12 {
+        return downmix_frame_to_stereo(buffer, (center as usize).min(frames - 1));
+    }
+    let inv = 1.0 / weight_sum;
+    [(acc_l * inv) as f32, (acc_r * inv) as f32]
+}
+
 #[inline]
-fn read_stereo_frame(buffer: &AudioBuffer, frame_idx: usize) -> [f32; 2] {
+fn clean_sample(s: f32) -> f32 {
+    if s.is_finite() { s } else { 0.0 }
+}
+
+/// Reads frame `frame_idx` from `buffer` and downmixes multi-channel layouts to stereo `[L, R]`
+/// following ITU-R BS.775 / W3C Web Audio channel downmix rules:
+///
+/// - 1 ch (mono): `[M, M]`
+/// - 2 ch (stereo): `[L, R]`
+/// - 3 ch (3.0 FL/FR/FC): `[FL + 0.7071*FC, FR + 0.7071*FC]`
+/// - 4 ch (quad FL/FR/BL/BR): `[0.5*(FL + BL), 0.5*(FR + BR)]`
+/// - 6 ch (5.1 FL/FR/FC/LFE/BL/BR): `[FL + 0.7071*FC + 0.7071*BL, FR + 0.7071*FC + 0.7071*BR]` (LFE omitted)
+/// - 8 ch (7.1 FL/FR/FC/LFE/BL/BR/SL/SR): `[FL + 0.7071*(FC + BL + SL), FR + 0.7071*(FC + BR + SR)]`
+#[must_use]
+#[inline]
+pub fn downmix_frame_to_stereo(buffer: &AudioBuffer, frame_idx: usize) -> [f32; 2] {
     let ch = usize::from(buffer.channels);
+    if ch == 0 || frame_idx >= buffer.frame_count() {
+        return [0.0, 0.0];
+    }
     let base = frame_idx * ch;
+    let s = |offset: usize| clean_sample(buffer.samples_interleaved_f32[base + offset]);
     match ch {
         1 => {
-            let s = buffer.samples_interleaved_f32[base];
-            [s, s]
+            let m = s(0);
+            [m, m]
         }
-        2 => [
-            buffer.samples_interleaved_f32[base],
-            buffer.samples_interleaved_f32[base + 1],
-        ],
+        2 => [s(0), s(1)],
+        3 => {
+            let fc = s(2) * FRAC_1_SQRT_2;
+            [s(0) + fc, s(1) + fc]
+        }
+        4 => [0.5 * (s(0) + s(2)), 0.5 * (s(1) + s(3))],
+        6 => {
+            // Standard 5.1 channel order: FL=0, FR=1, FC=2, LFE=3, BL=4, BR=5.
+            let fc = s(2) * FRAC_1_SQRT_2;
+            let l = s(0) + fc + s(4) * FRAC_1_SQRT_2;
+            let r = s(1) + fc + s(5) * FRAC_1_SQRT_2;
+            [l, r]
+        }
+        8 => {
+            // Standard 7.1 channel order: FL=0, FR=1, FC=2, LFE=3, BL=4, BR=5, SL=6, SR=7.
+            let fc = s(2) * FRAC_1_SQRT_2;
+            let l = s(0) + fc + (s(4) + s(6)) * FRAC_1_SQRT_2;
+            let r = s(1) + fc + (s(5) + s(7)) * FRAC_1_SQRT_2;
+            [l, r]
+        }
         _ => {
             let mut left = 0.0_f32;
             let mut right = 0.0_f32;
             let mut left_count = 0_u32;
             let mut right_count = 0_u32;
             for c in 0..ch {
-                let sample = buffer.samples_interleaved_f32[base + c];
+                let sample = s(c);
                 if c % 2 == 0 {
                     left += sample;
                     left_count += 1;
@@ -311,15 +411,62 @@ fn read_stereo_frame(buffer: &AudioBuffer, frame_idx: usize) -> [f32; 2] {
     }
 }
 
-/// Encodes stereo `f32` samples as a standard 16-bit signed PCM RIFF/WAVE byte vector.
+/// Converts a normalized `f32` audio sample in `[-1.0, 1.0]` to signed 16-bit PCM using
+/// asymmetric full-range scaling (`-1.0 -> -32768`, `+1.0 -> +32767`, matching Zoidium).
 #[must_use]
-pub fn encode_wav_pcm16_stereo(samples: &[[f32; 2]], sample_rate: u32) -> Vec<u8> {
+#[inline]
+pub fn f32_to_pcm16(sample: f32) -> i16 {
+    if !sample.is_finite() {
+        return 0;
+    }
+    let clamped = sample.clamp(-1.0, 1.0);
+    let scaled = if clamped < 0.0 {
+        f64::from(clamped) * 32_768.0
+    } else {
+        f64::from(clamped) * 32_767.0
+    };
+    scaled
+        .round()
+        .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+}
+
+pub(crate) fn checked_wav_chunk_sizes(
+    frame_count: usize,
+    block_align: u16,
+    header_overhead: u32,
+) -> Result<(u32, u32), AudioError> {
+    let data_bytes_usize = frame_count
+        .checked_mul(usize::from(block_align))
+        .ok_or_else(|| {
+            AudioError::InvalidFormat("WAV payload byte size overflow (> 4 GiB RIFF limit)".into())
+        })?;
+    let data_bytes = u32::try_from(data_bytes_usize).map_err(|_| {
+        AudioError::InvalidFormat("WAV payload exceeds 4 GiB RIFF/WAVE limit".into())
+    })?;
+    let riff_size = header_overhead.checked_add(data_bytes).ok_or_else(|| {
+        AudioError::InvalidFormat("WAV RIFF chunk size exceeds 4 GiB limit".into())
+    })?;
+    Ok((data_bytes, riff_size))
+}
+
+/// Fallible version of [`encode_wav_pcm16_stereo`] that rejects invalid sample rates and
+/// payloads exceeding the 4 GiB RIFF/WAVE header limit.
+pub fn try_encode_wav_pcm16_stereo(
+    samples: &[[f32; 2]],
+    sample_rate: u32,
+) -> Result<Vec<u8>, AudioError> {
+    if sample_rate == 0 {
+        return Err(AudioError::InvalidFormat(
+            "WAV sample_rate must be non-zero".into(),
+        ));
+    }
     let num_channels: u16 = 2;
     let bits_per_sample: u16 = 16;
     let block_align = num_channels * (bits_per_sample / 8);
-    let byte_rate = sample_rate.saturating_mul(u32::from(block_align));
-    let data_bytes = (samples.len() * usize::from(block_align)) as u32;
-    let riff_size = 36_u32.saturating_add(data_bytes);
+    let byte_rate = sample_rate
+        .checked_mul(u32::from(block_align))
+        .ok_or_else(|| AudioError::InvalidFormat("WAV byte_rate overflow".into()))?;
+    let (data_bytes, riff_size) = checked_wav_chunk_sizes(samples.len(), block_align, 36)?;
 
     let mut out = Vec::with_capacity(44 + data_bytes as usize);
     out.extend_from_slice(b"RIFF");
@@ -338,23 +485,45 @@ pub fn encode_wav_pcm16_stereo(samples: &[[f32; 2]], sample_rate: u32) -> Vec<u8
     out.extend_from_slice(b"data");
     out.extend_from_slice(&data_bytes.to_le_bytes());
     for &[l, r] in samples {
-        let l16 = (l.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
-        let r16 = (r.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+        let l16 = f32_to_pcm16(l);
+        let r16 = f32_to_pcm16(r);
         out.extend_from_slice(&l16.to_le_bytes());
         out.extend_from_slice(&r16.to_le_bytes());
     }
-    out
+    Ok(out)
 }
 
-/// Encodes stereo `f32` samples as a standard 32-bit IEEE float RIFF/WAVE byte vector.
+/// Encodes stereo `f32` samples as a standard 16-bit signed PCM RIFF/WAVE byte vector.
+///
+/// Panics if `samples` exceeds the 4 GiB RIFF/WAVE header limit; use
+/// [`try_encode_wav_pcm16_stereo`] for fallible encoding of untrusted buffer sizes.
 #[must_use]
-pub fn encode_wav_f32_stereo(samples: &[[f32; 2]], sample_rate: u32) -> Vec<u8> {
+pub fn encode_wav_pcm16_stereo(samples: &[[f32; 2]], sample_rate: u32) -> Vec<u8> {
+    try_encode_wav_pcm16_stereo(samples, sample_rate.max(1))
+        .expect("WAV PCM16 payload exceeds 4 GiB RIFF/WAVE limit")
+}
+
+/// Fallible version of [`encode_wav_f32_stereo`] that rejects invalid sample rates and
+/// payloads exceeding the 4 GiB RIFF/WAVE header limit.
+pub fn try_encode_wav_f32_stereo(
+    samples: &[[f32; 2]],
+    sample_rate: u32,
+) -> Result<Vec<u8>, AudioError> {
+    if sample_rate == 0 {
+        return Err(AudioError::InvalidFormat(
+            "WAV sample_rate must be non-zero".into(),
+        ));
+    }
     let num_channels: u16 = 2;
     let bits_per_sample: u16 = 32;
     let block_align = num_channels * (bits_per_sample / 8);
-    let byte_rate = sample_rate.saturating_mul(u32::from(block_align));
-    let data_bytes = (samples.len() * usize::from(block_align)) as u32;
-    let riff_size = 48_u32.saturating_add(data_bytes);
+    let byte_rate = sample_rate
+        .checked_mul(u32::from(block_align))
+        .ok_or_else(|| AudioError::InvalidFormat("WAV byte_rate overflow".into()))?;
+    let (data_bytes, riff_size) = checked_wav_chunk_sizes(samples.len(), block_align, 48)?;
+    let frame_count_u32 = u32::try_from(samples.len()).map_err(|_| {
+        AudioError::InvalidFormat("WAV frame count exceeds 4 GiB RIFF/WAVE limit".into())
+    })?;
 
     let mut out = Vec::with_capacity(56 + data_bytes as usize);
     out.extend_from_slice(b"RIFF");
@@ -372,7 +541,7 @@ pub fn encode_wav_f32_stereo(samples: &[[f32; 2]], sample_rate: u32) -> Vec<u8> 
 
     out.extend_from_slice(b"fact");
     out.extend_from_slice(&4_u32.to_le_bytes());
-    out.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+    out.extend_from_slice(&frame_count_u32.to_le_bytes());
 
     out.extend_from_slice(b"data");
     out.extend_from_slice(&data_bytes.to_le_bytes());
@@ -380,7 +549,17 @@ pub fn encode_wav_f32_stereo(samples: &[[f32; 2]], sample_rate: u32) -> Vec<u8> 
         out.extend_from_slice(&l.to_le_bytes());
         out.extend_from_slice(&r.to_le_bytes());
     }
-    out
+    Ok(out)
+}
+
+/// Encodes stereo `f32` samples as a standard 32-bit IEEE float RIFF/WAVE byte vector.
+///
+/// Panics if `samples` exceeds the 4 GiB RIFF/WAVE header limit; use
+/// [`try_encode_wav_f32_stereo`] for fallible encoding of untrusted buffer sizes.
+#[must_use]
+pub fn encode_wav_f32_stereo(samples: &[[f32; 2]], sample_rate: u32) -> Vec<u8> {
+    try_encode_wav_f32_stereo(samples, sample_rate.max(1))
+        .expect("WAV float32 payload exceeds 4 GiB RIFF/WAVE limit")
 }
 
 #[cfg(test)]
@@ -471,5 +650,115 @@ mod tests {
     fn decode_empty_returns_error() {
         let err = decode_audio_bytes(&[], Some("wav")).unwrap_err();
         assert!(matches!(err, AudioError::EmptyInput));
+    }
+
+    #[test]
+    fn pcm16_scaling_is_asymmetric_full_range() {
+        assert_eq!(f32_to_pcm16(-1.0), -32_768);
+        assert_eq!(f32_to_pcm16(1.0), 32_767);
+        assert_eq!(f32_to_pcm16(0.0), 0);
+        assert_eq!(f32_to_pcm16(-2.0), -32_768);
+        assert_eq!(f32_to_pcm16(2.0), 32_767);
+        assert_eq!(f32_to_pcm16(f32::NAN), 0);
+
+        let wav = try_encode_wav_pcm16_stereo(&[[-1.0, 1.0]], 48_000).expect("encode wav");
+        let l = i16::from_le_bytes([wav[44], wav[45]]);
+        let r = i16::from_le_bytes([wav[46], wav[47]]);
+        assert_eq!(l, -32_768);
+        assert_eq!(r, 32_767);
+    }
+
+    #[test]
+    fn wav_4gib_overflow_guard_rejects_oversized_payloads() {
+        // Max valid PCM16 stereo frames: (u32::MAX - 36) / 4
+        let max_pcm16_frames = ((u32::MAX - 36) / 4) as usize;
+        assert!(checked_wav_chunk_sizes(max_pcm16_frames, 4, 36).is_ok());
+        assert!(matches!(
+            checked_wav_chunk_sizes(max_pcm16_frames + 1, 4, 36),
+            Err(AudioError::InvalidFormat(_))
+        ));
+
+        // Max valid float32 stereo frames: (u32::MAX - 48) / 8
+        let max_f32_frames = ((u32::MAX - 48) / 8) as usize;
+        assert!(checked_wav_chunk_sizes(max_f32_frames, 8, 48).is_ok());
+        assert!(matches!(
+            checked_wav_chunk_sizes(max_f32_frames + 1, 8, 48),
+            Err(AudioError::InvalidFormat(_))
+        ));
+
+        // Zero sample rate rejected by fallible encoders
+        assert!(matches!(
+            try_encode_wav_pcm16_stereo(&[[0.0, 0.0]], 0),
+            Err(AudioError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            try_encode_wav_f32_stereo(&[[0.0, 0.0]], 0),
+            Err(AudioError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn surround_5_1_downmix_centers_dialogue_and_omits_lfe() {
+        // 5.1 layout: FL=0, FR=1, FC=2, LFE=3, BL=4, BR=5
+        // Dialogue only in FC=1.0, LFE=0.9 (should be ignored, never panned right)
+        let buf = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 6,
+            samples_interleaved_f32: vec![0.0, 0.0, 1.0, 0.9, 0.0, 0.0],
+        };
+        let stereo = downmix_frame_to_stereo(&buf, 0);
+        assert!((stereo[0] - FRAC_1_SQRT_2).abs() < 1e-6);
+        assert!((stereo[1] - FRAC_1_SQRT_2).abs() < 1e-6);
+
+        // Quad layout: FL=0.8, FR=0.2, BL=0.4, BR=0.6
+        let quad = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 4,
+            samples_interleaved_f32: vec![0.8, 0.2, 0.4, 0.6],
+        };
+        let q = downmix_frame_to_stereo(&quad, 0);
+        assert!((q[0] - 0.6).abs() < 1e-6);
+        assert!((q[1] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn downsampling_96k_to_48k_attenuates_above_nyquist_aliasing() {
+        let sr = 96_000_u32;
+        let frames = 2_048_usize;
+        // 36 kHz tone at 96 kHz is well above 48 kHz Nyquist (24 kHz) -> would alias to 12 kHz without LPF.
+        let high_freq: Vec<f32> = (0..frames)
+            .map(|i| (TAU * 36_000.0 * (i as f64) / f64::from(sr)).sin() as f32)
+            .collect();
+        let hi_buf = AudioBuffer {
+            sample_rate: sr,
+            channels: 1,
+            samples_interleaved_f32: high_freq,
+        };
+        let resampled_hi = resample_stereo(&hi_buf, 48_000);
+        let steady_hi_peak = resampled_hi[64..resampled_hi.len() - 64]
+            .iter()
+            .fold(0.0_f32, |acc, &[l, _]| acc.max(l.abs()));
+        assert!(
+            steady_hi_peak < 0.05,
+            "expected >26 dB attenuation of 36 kHz aliasing tone, got peak {steady_hi_peak}"
+        );
+
+        // 1 kHz in-band tone passes cleanly near unity gain.
+        let low_freq: Vec<f32> = (0..frames)
+            .map(|i| (TAU * 1_000.0 * (i as f64) / f64::from(sr)).sin() as f32)
+            .collect();
+        let lo_buf = AudioBuffer {
+            sample_rate: sr,
+            channels: 1,
+            samples_interleaved_f32: low_freq,
+        };
+        let resampled_lo = resample_stereo(&lo_buf, 48_000);
+        let steady_lo_peak = resampled_lo[64..resampled_lo.len() - 64]
+            .iter()
+            .fold(0.0_f32, |acc, &[l, _]| acc.max(l.abs()));
+        assert!(
+            (steady_lo_peak - 1.0).abs() < 0.05,
+            "expected 1 kHz passband tone near 1.0, got {steady_lo_peak}"
+        );
     }
 }

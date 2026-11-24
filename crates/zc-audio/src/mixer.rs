@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
 
 use crate::AudioError;
-use crate::decode::{AudioBuffer, MAX_AUDIO_SAMPLE_RATE, MIN_AUDIO_SAMPLE_RATE};
+use crate::decode::{
+    AudioBuffer, MAX_AUDIO_SAMPLE_RATE, MIN_AUDIO_SAMPLE_RATE, downmix_frame_to_stereo,
+    sample_stereo_sinc,
+};
 
 /// Maximum stereo sample frames produced in one offline mix buffer (32M frames = 256 MiB).
 pub const MAX_OFFLINE_MIX_SAMPLES: usize = 32 * 1024 * 1024;
@@ -59,12 +62,13 @@ pub fn effective_playback_rate(
     ((time_at_length_sec - time_at_zero_sec) / clip_length_frames) * fps
 }
 
-/// Applies the exact CM3 offline stereo gain and equal-power pan law (Spec 03 §1.4):
+/// Applies the exact CM3 / W3C Web Audio `StereoPannerNode` offline stereo gain and
+/// equal-power pan law (Spec 03 §1.4):
 ///
 /// 1. Apply gain: `L1 = volume * L`, `R1 = volume * R`
 /// 2. Clamp `pan` to `[-1.0, 1.0]`:
 ///    - If `pan <= 0`: `theta = (pan + 1) * PI / 2`, `L_out = L1 + R1 * cos(theta)`, `R_out = R1 * sin(theta)`
-///    - If `pan > 0`: `theta = |pan| * PI / 2`, `L_out = L1 * cos(theta)`, `R_out = R1 + L_out * sin(theta)`
+///    - If `pan > 0`: `theta = |pan| * PI / 2`, `L_out = L1 * cos(theta)`, `R_out = R1 + L1 * sin(theta)`
 #[must_use]
 #[inline]
 pub fn apply_gain_and_pan(sample: [f32; 2], volume: f32, pan: f32) -> [f32; 2] {
@@ -90,7 +94,7 @@ pub fn apply_gain_and_pan(sample: [f32; 2], volume: f32, pan: f32) -> [f32; 2] {
     } else {
         let theta = p.abs() * FRAC_PI_2;
         let l_out = l1 * theta.cos();
-        let r_out = r1 + l_out * theta.sin();
+        let r_out = r1 + l1 * theta.sin();
         [l_out, r_out]
     }
 }
@@ -256,6 +260,9 @@ where
         // resampled buffer copies so long clips at any sample rate (e.g. 44.1 kHz)
         // never hit a secondary resampling cap or get silently muted.
         let src_sr_f64 = f64::from(raw_buf.sample_rate);
+        let base_rate_ratio = clip.playback_rate.abs() * (src_sr_f64 / sr_f64);
+        let mut prev_media_time: Option<f64> = None;
+
         for (sample_idx, out_frame) in output
             .iter_mut()
             .enumerate()
@@ -267,16 +274,28 @@ where
             let local_frame = timeline_frame - clip.clip_start_frame;
 
             if local_frame < 0.0 || local_frame >= clip.clip_length_frames {
+                prev_media_time = None;
                 continue;
             }
 
             let params = eval_clip(clip_idx, clip, local_frame);
             if !params.media_time_sec.is_finite() || params.media_time_sec < 0.0 {
+                prev_media_time = None;
                 continue;
             }
 
-            let src_sample =
-                sample_audio_buffer_stereo_linear(raw_buf, params.media_time_sec * src_sr_f64);
+            let src_pos = params.media_time_sec * src_sr_f64;
+            let local_ratio = match prev_media_time {
+                Some(prev) => (params.media_time_sec - prev).abs() * src_sr_f64,
+                None => base_rate_ratio,
+            };
+            prev_media_time = Some(params.media_time_sec);
+
+            let src_sample = if local_ratio > 1.02 {
+                sample_stereo_sinc(raw_buf, src_pos, local_ratio)
+            } else {
+                sample_audio_buffer_stereo_linear(raw_buf, src_pos)
+            };
             let mixed = apply_gain_and_pan(src_sample, params.volume, params.pan);
             out_frame[0] += mixed[0];
             out_frame[1] += mixed[1];
@@ -292,49 +311,6 @@ where
 }
 
 #[inline]
-fn read_buffer_stereo_frame(buf: &AudioBuffer, frame_idx: usize) -> [f32; 2] {
-    let ch = usize::from(buf.channels);
-    let base = frame_idx * ch;
-    match ch {
-        1 => {
-            let s = buf.samples_interleaved_f32[base];
-            [s, s]
-        }
-        2 => [
-            buf.samples_interleaved_f32[base],
-            buf.samples_interleaved_f32[base + 1],
-        ],
-        _ => {
-            let mut left = 0.0_f32;
-            let mut right = 0.0_f32;
-            let mut left_count = 0_u32;
-            let mut right_count = 0_u32;
-            for c in 0..ch {
-                let sample = buf.samples_interleaved_f32[base + c];
-                if c % 2 == 0 {
-                    left += sample;
-                    left_count += 1;
-                } else {
-                    right += sample;
-                    right_count += 1;
-                }
-            }
-            let l = if left_count > 0 {
-                left / left_count as f32
-            } else {
-                0.0
-            };
-            let r = if right_count > 0 {
-                right / right_count as f32
-            } else {
-                l
-            };
-            [l, r]
-        }
-    }
-}
-
-#[inline]
 fn sample_audio_buffer_stereo_linear(buf: &AudioBuffer, sample_pos: f64) -> [f32; 2] {
     let frames = buf.frame_count();
     if !sample_pos.is_finite() || sample_pos < 0.0 || frames == 0 {
@@ -346,8 +322,8 @@ fn sample_audio_buffer_stereo_linear(buf: &AudioBuffer, sample_pos: f64) -> [f32
     }
     let idx1 = (idx0 + 1).min(frames - 1);
     let frac = (sample_pos - idx0 as f64).clamp(0.0, 1.0) as f32;
-    let a = read_buffer_stereo_frame(buf, idx0);
-    let b = read_buffer_stereo_frame(buf, idx1);
+    let a = downmix_frame_to_stereo(buf, idx0);
+    let b = downmix_frame_to_stereo(buf, idx1);
     [a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac]
 }
 
@@ -387,17 +363,17 @@ mod tests {
         assert!((center[0] - 0.6).abs() < 1e-6);
         assert!((center[1] - 0.4).abs() < 1e-6);
 
-        // pan = +0.5: theta = PI/4 -> L_out = L1 * cos(PI/4), R_out = R1 + L_out * sin(PI/4)
+        // pan = +0.5: theta = PI/4 -> L_out = L1 * cos(PI/4), R_out = R1 + L1 * sin(PI/4)
         let half_right = apply_gain_and_pan(input, 1.0, 0.5);
         let expected_l = 0.6 * FRAC_1_SQRT_2;
-        let expected_r = 0.4 + expected_l * FRAC_1_SQRT_2;
+        let expected_r = 0.4 + 0.6 * FRAC_1_SQRT_2;
         assert!((half_right[0] - expected_l).abs() < 1e-6);
         assert!((half_right[1] - expected_r).abs() < 1e-6);
 
-        // pan = +1.0: theta = PI/2 -> cos=0, sin=1 -> L_out = 0, R_out = R1 + 0 = R1
+        // pan = +1.0: theta = PI/2 -> cos=0, sin=1 -> L_out = 0, R_out = R1 + L1 = 1.0
         let hard_right = apply_gain_and_pan(input, 1.0, 1.0);
         assert!(hard_right[0].abs() < 1e-6);
-        assert!((hard_right[1] - 0.4).abs() < 1e-6);
+        assert!((hard_right[1] - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -501,6 +477,70 @@ mod tests {
         assert_eq!(
             try_offline_total_samples(69.0, 30.0, 48_000).unwrap(),
             110_400
+        );
+    }
+
+    #[test]
+    fn offline_mix_5_1_surround_centers_dialogue_and_attenuates_sped_up_aliasing() {
+        let sr = STANDARD_SAMPLE_RATE;
+        // 5.1 surround buffer with dialogue solely in FC (channel 2) and LFE in channel 3.
+        let mut s51 = Vec::with_capacity(sr as usize * 6 / 10);
+        for _ in 0..(sr as usize / 10) {
+            s51.extend_from_slice(&[0.0, 0.0, 0.8, 0.9, 0.0, 0.0]);
+        }
+        let mut buffers = HashMap::new();
+        buffers.insert(
+            "surround".to_owned(),
+            AudioBuffer {
+                sample_rate: sr,
+                channels: 6,
+                samples_interleaved_f32: s51,
+            },
+        );
+        let clips = vec![AudioClipScheduleItem {
+            clip_start_frame: 0.0,
+            clip_length_frames: 3.0,
+            media_start_sec: 0.0,
+            playback_rate: 1.0,
+            volume: 1.0,
+            pan: 0.0,
+            buffer_id: "surround".to_owned(),
+        }];
+        let mixed = mix_offline_stereo(3.0, 30.0, sr, &clips, &buffers);
+        let expected = 0.8 * FRAC_1_SQRT_2;
+        assert!((mixed[100][0] - expected).abs() < 1e-5);
+        assert!((mixed[100][1] - expected).abs() < 1e-5);
+
+        // 18 kHz sine played at 2x speed -> 36 kHz (> 24 kHz Nyquist) must be attenuated.
+        let frames = 4_800_usize;
+        let hi_samples: Vec<f32> = (0..frames)
+            .map(|i| (std::f64::consts::TAU * 18_000.0 * (i as f64) / f64::from(sr)).sin() as f32)
+            .collect();
+        let mut fast_bufs = HashMap::new();
+        fast_bufs.insert(
+            "hi".to_owned(),
+            AudioBuffer {
+                sample_rate: sr,
+                channels: 1,
+                samples_interleaved_f32: hi_samples,
+            },
+        );
+        let fast_clips = vec![AudioClipScheduleItem {
+            clip_start_frame: 0.0,
+            clip_length_frames: 1.5, // 0.05s output = 2400 samples reading 4800 src samples at 2x
+            media_start_sec: 0.0,
+            playback_rate: 2.0,
+            volume: 1.0,
+            pan: 0.0,
+            buffer_id: "hi".to_owned(),
+        }];
+        let fast_mix = mix_offline_stereo(1.5, 30.0, sr, &fast_clips, &fast_bufs);
+        let peak = fast_mix[64..fast_mix.len() - 64]
+            .iter()
+            .fold(0.0_f32, |acc, &[l, _]| acc.max(l.abs()));
+        assert!(
+            peak < 0.05,
+            "expected anti-aliased 2x mix to attenuate 18kHz->36kHz tone, got peak {peak}"
         );
     }
 }

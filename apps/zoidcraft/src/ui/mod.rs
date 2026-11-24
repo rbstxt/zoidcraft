@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod controls;
+pub mod gestures;
 pub mod graph_editor;
 pub mod layout;
 pub mod panels;

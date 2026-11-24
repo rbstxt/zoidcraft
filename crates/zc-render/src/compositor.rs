@@ -105,9 +105,9 @@ impl BlendMode {
         Self::Blue,
     ];
 
-    /// Parses a CM3 blend mode token (also accepting underscore aliases).
+    /// Parses a CM3 blend mode token (case-insensitive, also accepting underscore aliases).
     pub fn from_token(token: &str) -> Option<Self> {
-        match token {
+        match token.trim().to_ascii_uppercase().as_str() {
             "BLEND_ZERO" => Some(Self::Zero),
             "BLEND_SRC" => Some(Self::Src),
             "BLEND_DST" => Some(Self::Dst),
@@ -336,7 +336,8 @@ impl Compositor2D {
         blend_mode: BlendMode,
     ) {
         let zero_scale = transform.scale[0].abs() < 1e-6 || transform.scale[1].abs() < 1e-6;
-        if zero_scale && blend_mode == BlendMode::SrcOver {
+        if zero_scale {
+            // A zero-scale quad covers zero pixels in CM3, leaving the backdrop untouched for all blend modes.
             self.blit(ctx, &backdrop.view, dst);
             return;
         }
@@ -873,49 +874,59 @@ fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
     let q = d_rot / u.pos_and_scale.zw + u.anchor_and_rot.xy;
     let layer_uv = vec2<f32>(q.x / layer_w + 0.5, 0.5 - q.y / layer_h);
 
-    // Unconditional sample with clamped UVs for uniform control flow.
+    // Unconditional sample + derivative computation for uniform control flow.
     let sampled = textureSample(t_layer, samp, clamp(layer_uv, vec2<f32>(0.0), vec2<f32>(1.0))) * u.opacity_pad.x;
-    let in_bounds = layer_uv.x >= 0.0 && layer_uv.x <= 1.0 && layer_uv.y >= 0.0 && layer_uv.y <= 1.0;
-    let src = select(vec4<f32>(0.0), sampled, in_bounds);
+    let d_edge = min(layer_uv, vec2<f32>(1.0) - layer_uv);
+    let fw = max(fwidth(layer_uv), vec2<f32>(1e-5));
+    let cov_v = clamp(d_edge / fw + vec2<f32>(0.5), vec2<f32>(0.0), vec2<f32>(1.0));
+    let edge_cov = cov_v.x * cov_v.y;
+
+    // Pixels outside the transformed layer quad always preserve backdrop unmodified (CM3 quad semantics).
+    if (edge_cov <= 0.0) {
+        return dst;
+    }
+
+    let src = sampled;
     let cs_col = unpremult(src);
     let cd_col = unpremult(dst);
     let mode = u.mode_pad.x;
 
+    var blended: vec4<f32>;
     switch mode {
         // 0..11: Porter-Duff
-        case 0u: { return vec4<f32>(0.0); }
-        case 1u: { return src; }
-        case 2u: { return dst; }
-        case 3u: { return src + dst * (1.0 - src.a); }
-        case 4u: { return dst + src * (1.0 - dst.a); }
-        case 5u: { return src * dst.a; }
-        case 6u: { return dst * src.a; }
-        case 7u: { return src * (1.0 - dst.a); }
-        case 8u: { return dst * (1.0 - src.a); }
-        case 9u: { return vec4<f32>(src.rgb * dst.a + dst.rgb * (1.0 - src.a), dst.a); }
-        case 10u: { return vec4<f32>(dst.rgb * src.a + src.rgb * (1.0 - dst.a), src.a); }
-        case 11u: { return src * (1.0 - dst.a) + dst * (1.0 - src.a); }
+        case 0u: { blended = vec4<f32>(0.0); }
+        case 1u: { blended = src; }
+        case 2u: { blended = dst; }
+        case 3u: { blended = src + dst * (1.0 - src.a); }
+        case 4u: { blended = dst + src * (1.0 - dst.a); }
+        case 5u: { blended = src * dst.a; }
+        case 6u: { blended = dst * src.a; }
+        case 7u: { blended = src * (1.0 - dst.a); }
+        case 8u: { blended = dst * (1.0 - src.a); }
+        case 9u: { blended = vec4<f32>(src.rgb * dst.a + dst.rgb * (1.0 - src.a), dst.a); }
+        case 10u: { blended = vec4<f32>(dst.rgb * src.a + src.rgb * (1.0 - dst.a), src.a); }
+        case 11u: { blended = src * (1.0 - dst.a) + dst * (1.0 - src.a); }
 
         // 12..28: Separable Photoshop modes
-        case 12u: { return compose_sep(src, dst, cd_col * cs_col); }
-        case 13u: { return compose_sep(src, dst, cd_col + cs_col - cd_col * cs_col); }
+        case 12u: { blended = compose_sep(src, dst, cd_col * cs_col); }
+        case 13u: { blended = compose_sep(src, dst, cd_col + cs_col - cd_col * cs_col); }
         case 14u: {
             let b = vec3<f32>(
                 hard_light_ch(cs_col.r, cd_col.r),
                 hard_light_ch(cs_col.g, cd_col.g),
                 hard_light_ch(cs_col.b, cd_col.b),
             );
-            return compose_sep(src, dst, b);
+            blended = compose_sep(src, dst, b);
         }
-        case 15u: { return compose_sep(src, dst, min(cd_col, cs_col)); }
-        case 16u: { return compose_sep(src, dst, max(cd_col, cs_col)); }
+        case 15u: { blended = compose_sep(src, dst, min(cd_col, cs_col)); }
+        case 16u: { blended = compose_sep(src, dst, max(cd_col, cs_col)); }
         case 17u: {
             let b = vec3<f32>(
                 dodge_ch(cd_col.r, cs_col.r),
                 dodge_ch(cd_col.g, cs_col.g),
                 dodge_ch(cd_col.b, cs_col.b),
             );
-            return compose_sep(src, dst, b);
+            blended = compose_sep(src, dst, b);
         }
         case 18u: {
             let b = vec3<f32>(
@@ -923,7 +934,7 @@ fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
                 burn_ch(cd_col.g, cs_col.g),
                 burn_ch(cd_col.b, cs_col.b),
             );
-            return compose_sep(src, dst, b);
+            blended = compose_sep(src, dst, b);
         }
         case 19u: {
             let b = vec3<f32>(
@@ -931,7 +942,7 @@ fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
                 hard_light_ch(cd_col.g, cs_col.g),
                 hard_light_ch(cd_col.b, cs_col.b),
             );
-            return compose_sep(src, dst, b);
+            blended = compose_sep(src, dst, b);
         }
         case 20u: {
             let b = vec3<f32>(
@@ -939,83 +950,282 @@ fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
                 soft_light_ch(cd_col.g, cs_col.g),
                 soft_light_ch(cd_col.b, cs_col.b),
             );
-            return compose_sep(src, dst, b);
+            blended = compose_sep(src, dst, b);
         }
-        case 21u: { return compose_sep(src, dst, abs(cd_col - cs_col)); }
-        case 22u: { return compose_sep(src, dst, cd_col + cs_col - 2.0 * cd_col * cs_col); }
-        case 23u: { return compose_sep(src, dst, min(vec3<f32>(1.0), cd_col + cs_col)); }
-        case 24u: { return compose_sep(src, dst, max(vec3<f32>(0.0), cd_col + cs_col - vec3<f32>(1.0))); }
+        case 21u: { blended = compose_sep(src, dst, abs(cd_col - cs_col)); }
+        case 22u: { blended = compose_sep(src, dst, cd_col + cs_col - 2.0 * cd_col * cs_col); }
+        case 23u: { blended = compose_sep(src, dst, min(vec3<f32>(1.0), cd_col + cs_col)); }
+        case 24u: { blended = compose_sep(src, dst, max(vec3<f32>(0.0), cd_col + cs_col - vec3<f32>(1.0))); }
         case 25u: {
             let b = vec3<f32>(
                 vivid_light_ch(cd_col.r, cs_col.r),
                 vivid_light_ch(cd_col.g, cs_col.g),
                 vivid_light_ch(cd_col.b, cs_col.b),
             );
-            return compose_sep(src, dst, b);
+            blended = compose_sep(src, dst, b);
         }
-        case 26u: { return compose_sep(src, dst, clamp(cd_col + 2.0 * cs_col - vec3<f32>(1.0), vec3<f32>(0.0), vec3<f32>(1.0))); }
+        case 26u: { blended = compose_sep(src, dst, clamp(cd_col + 2.0 * cs_col - vec3<f32>(1.0), vec3<f32>(0.0), vec3<f32>(1.0))); }
         case 27u: {
             let b = vec3<f32>(
                 pin_light_ch(cd_col.r, cs_col.r),
                 pin_light_ch(cd_col.g, cs_col.g),
                 pin_light_ch(cd_col.b, cs_col.b),
             );
-            return compose_sep(src, dst, b);
+            blended = compose_sep(src, dst, b);
         }
-        case 28u: { return compose_sep(src, dst, step(vec3<f32>(1.0), cd_col + cs_col)); }
+        case 28u: { blended = compose_sep(src, dst, step(vec3<f32>(1.0), cd_col + cs_col)); }
 
         // 29..32: Non-separable HSL modes
-        case 29u: { return compose_sep(src, dst, set_lum(set_sat(cs_col, sat(cd_col)), lum(cd_col))); }
-        case 30u: { return compose_sep(src, dst, set_lum(set_sat(cd_col, sat(cs_col)), lum(cd_col))); }
-        case 31u: { return compose_sep(src, dst, set_lum(cs_col, lum(cd_col))); }
-        case 32u: { return compose_sep(src, dst, set_lum(cd_col, lum(cs_col))); }
+        case 29u: { blended = compose_sep(src, dst, set_lum(set_sat(cs_col, sat(cd_col)), lum(cd_col))); }
+        case 30u: { blended = compose_sep(src, dst, set_lum(set_sat(cd_col, sat(cs_col)), lum(cd_col))); }
+        case 31u: { blended = compose_sep(src, dst, set_lum(cs_col, lum(cd_col))); }
+        case 32u: { blended = compose_sep(src, dst, set_lum(cd_col, lum(cs_col))); }
 
         // 33..42: Extended, Arithmetic, OpenVG, Channel modes
         case 33u: {
             let rgb = (vec3<f32>(1.0) - cd_col) * src.a * dst.a + dst.rgb * (1.0 - src.a);
             let a = src.a + dst.a * (1.0 - src.a);
-            return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(a, 0.0, 1.0));
+            blended = vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(a, 0.0, 1.0));
         }
         case 34u: {
             let b = cs_col * (vec3<f32>(1.0) - cd_col) + (vec3<f32>(1.0) - cs_col) * cd_col;
-            return compose_sep(src, dst, b);
+            blended = compose_sep(src, dst, b);
         }
-        case 35u: { return min(vec4<f32>(1.0), src + dst); }
+        case 35u: { blended = min(vec4<f32>(1.0), src + dst); }
         case 36u: {
-            let a = clamp(src.a + dst.a - 1.0, 0.0, 1.0);
-            let rgb = clamp(src.rgb + dst.rgb - vec3<f32>(1.0), vec3<f32>(0.0), vec3<f32>(a));
-            return vec4<f32>(rgb, a);
+            // CM3 / NV_blend_equation_advanced BLEND_PLUS_DARKER
+            let a = min(1.0, src.a + dst.a);
+            let rgb = clamp(
+                vec3<f32>(a) - ((vec3<f32>(src.a) - src.rgb) + (vec3<f32>(dst.a) - dst.rgb)),
+                vec3<f32>(0.0),
+                vec3<f32>(a),
+            );
+            blended = vec4<f32>(rgb, a);
         }
         case 37u: {
-            let rgb = max(vec3<f32>(0.0), dst.rgb - src.rgb);
-            let a = clamp(dst.a + src.a * (1.0 - dst.a), 0.0, 1.0);
-            return vec4<f32>(rgb, a);
+            // Premultiplied BLEND_MINUS: preserve destination alpha so transparent areas stay transparent.
+            let rgb = clamp(dst.rgb - src.rgb, vec3<f32>(0.0), vec3<f32>(dst.a));
+            blended = vec4<f32>(rgb, dst.a);
         }
         case 38u: {
-            let b = clamp((cd_col - vec3<f32>(0.5)) * (2.0 * cs_col) + vec3<f32>(0.5), vec3<f32>(0.0), vec3<f32>(1.0));
-            return compose_sep(src, dst, b);
+            // CM3 BLEND_CONTRAST (blend.glsl:259-264)
+            let half_d = vec3<f32>(dst.a * 0.5);
+            let half_s = vec3<f32>(src.a * 0.5);
+            let rgb = clamp(half_d + 2.0 * (dst.rgb - half_d) * (src.rgb - half_s), vec3<f32>(0.0), vec3<f32>(dst.a));
+            blended = vec4<f32>(rgb, dst.a);
         }
         case 39u: {
             let rgb = src.a * (vec3<f32>(dst.a) - dst.rgb) + dst.rgb * (1.0 - src.a);
-            let a = src.a + dst.a * (1.0 - src.a);
-            return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(a, 0.0, 1.0));
+            let a = clamp(src.a + dst.a * (1.0 - src.a), 0.0, 1.0);
+            blended = vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(a)), a);
         }
         case 40u: {
-            let a = clamp(src.a + dst.a * (1.0 - src.a), 0.0, 1.0);
-            let r = clamp(src.r + dst.r * (1.0 - src.a), 0.0, 1.0);
-            return vec4<f32>(r, dst.g, dst.b, a);
+            // CM3 BLEND_RED (blend.glsl:279): replace R channel, preserve destination alpha & premult invariant.
+            let r = clamp(src.r, 0.0, dst.a);
+            blended = vec4<f32>(r, dst.g, dst.b, dst.a);
         }
         case 41u: {
-            let a = clamp(src.a + dst.a * (1.0 - src.a), 0.0, 1.0);
-            let g = clamp(src.g + dst.g * (1.0 - src.a), 0.0, 1.0);
-            return vec4<f32>(dst.r, g, dst.b, a);
+            // CM3 BLEND_GREEN (blend.glsl:282)
+            let g = clamp(src.g, 0.0, dst.a);
+            blended = vec4<f32>(dst.r, g, dst.b, dst.a);
         }
         case 42u: {
-            let a = clamp(src.a + dst.a * (1.0 - src.a), 0.0, 1.0);
-            let b_val = clamp(src.b + dst.b * (1.0 - src.a), 0.0, 1.0);
-            return vec4<f32>(dst.r, dst.g, b_val, a);
+            // CM3 BLEND_BLUE (blend.glsl:285)
+            let b_val = clamp(src.b, 0.0, dst.a);
+            blended = vec4<f32>(dst.r, dst.g, b_val, dst.a);
         }
-        default: { return src + dst * (1.0 - src.a); }
+        default: { blended = src + dst * (1.0 - src.a); }
     }
+    return mix(dst, blended, edge_cov);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_token_is_case_insensitive_and_covers_all_43_modes() {
+        for &mode in &BlendMode::ALL {
+            let tok = mode.as_token();
+            assert_eq!(BlendMode::from_token(tok), Some(mode));
+            assert_eq!(BlendMode::from_token(&tok.to_ascii_lowercase()), Some(mode));
+            assert_eq!(BlendMode::from_token(&format!("  {tok}  ")), Some(mode));
+        }
+    }
+
+    #[test]
+    fn compositor_oob_porter_duff_zero_scale_and_blend_parity() {
+        let ctx = match GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to init GpuContext: {err}"),
+        };
+        let mut comp = Compositor2D::new(&ctx);
+
+        let bg =
+            RenderTarget::new(&ctx, 8, 8, wgpu::TextureFormat::Rgba8Unorm, Some("bg")).expect("bg");
+        let layer = RenderTarget::new(&ctx, 4, 4, wgpu::TextureFormat::Rgba8Unorm, Some("layer"))
+            .expect("layer");
+        let dst = RenderTarget::new(&ctx, 8, 8, wgpu::TextureFormat::Rgba8Unorm, Some("dst"))
+            .expect("dst");
+
+        // Solid opaque blue backdrop
+        comp.clear_target(
+            &ctx,
+            &bg,
+            wgpu::Color {
+                r: 0.2,
+                g: 0.4,
+                b: 0.8,
+                a: 1.0,
+            },
+        );
+        // Solid opaque red 4x4 layer centered on 8x8 canvas (covers pixels [2..6, 2..6])
+        comp.clear_target(
+            &ctx,
+            &layer,
+            wgpu::Color {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+        );
+
+        let mut px = Vec::new();
+        // 1. Out-of-bounds pixels outside 4x4 quad must preserve backdrop for Porter-Duff modes.
+        for mode in [
+            BlendMode::Zero,
+            BlendMode::Src,
+            BlendMode::SrcIn,
+            BlendMode::DstIn,
+            BlendMode::SrcOut,
+            BlendMode::DstAtop,
+        ] {
+            comp.composite_layer(
+                &ctx,
+                &bg,
+                &layer,
+                &dst,
+                LayerTransform2D::default(),
+                1.0,
+                mode,
+            );
+            crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback oob");
+            // Corner pixel (0, 0) is outside the 4x4 quad and must remain backdrop blue!
+            assert!(
+                (i32::from(px[0]) - 51).abs() <= 2
+                    && (i32::from(px[1]) - 102).abs() <= 2
+                    && (i32::from(px[2]) - 204).abs() <= 2
+                    && px[3] == 255,
+                "OOB corner must preserve backdrop for {mode:?}, got {:?}",
+                &px[..4]
+            );
+        }
+
+        // 2. Zero-scale layer must preserve backdrop for every blend mode (including Zero/Src).
+        let zero_tf = LayerTransform2D {
+            scale: [0.0, 1.0],
+            ..Default::default()
+        };
+        for mode in [BlendMode::Zero, BlendMode::Src, BlendMode::DstIn] {
+            comp.composite_layer(&ctx, &bg, &layer, &dst, zero_tf, 1.0, mode);
+            crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback zero scale");
+            let mid = ((4 * 8 + 4) * 4) as usize;
+            assert!(
+                (i32::from(px[mid + 2]) - 204).abs() <= 2 && px[mid + 3] == 255,
+                "zero-scale layer must preserve backdrop for {mode:?}, got {:?}",
+                &px[mid..mid + 4]
+            );
+        }
+
+        // 3. BLEND_PLUS_DARKER with transparent src over opaque backdrop must preserve backdrop.
+        let full_layer =
+            RenderTarget::new(&ctx, 8, 8, wgpu::TextureFormat::Rgba8Unorm, Some("full"))
+                .expect("full");
+        comp.clear_target(&ctx, &full_layer, wgpu::Color::TRANSPARENT);
+        comp.composite_layer(
+            &ctx,
+            &bg,
+            &full_layer,
+            &dst,
+            LayerTransform2D::default(),
+            1.0,
+            BlendMode::PlusDarker,
+        );
+        crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback plus_darker");
+        assert!(
+            (i32::from(px[0]) - 51).abs() <= 2
+                && (i32::from(px[1]) - 102).abs() <= 2
+                && (i32::from(px[2]) - 204).abs() <= 2
+                && px[3] == 255,
+            "BLEND_PLUS_DARKER with transparent src must preserve opaque backdrop, got {:?}",
+            &px[..4]
+        );
+
+        // 4. BLEND_RED over semi-transparent backdrop preserves dst.a and untouched G/B channels.
+        let semi_bg =
+            RenderTarget::new(&ctx, 8, 8, wgpu::TextureFormat::Rgba8Unorm, Some("semi_bg"))
+                .expect("semi_bg");
+        comp.clear_target(
+            &ctx,
+            &semi_bg,
+            wgpu::Color {
+                r: 0.1,
+                g: 0.3,
+                b: 0.4,
+                a: 0.5,
+            },
+        );
+        comp.clear_target(
+            &ctx,
+            &full_layer,
+            wgpu::Color {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+        );
+        comp.composite_layer(
+            &ctx,
+            &semi_bg,
+            &full_layer,
+            &dst,
+            LayerTransform2D::default(),
+            1.0,
+            BlendMode::Red,
+        );
+        crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback red");
+        assert!(
+            (i32::from(px[3]) - 128).abs() <= 2
+                && px[0] <= px[3]
+                && (i32::from(px[1]) - 77).abs() <= 2
+                && (i32::from(px[2]) - 102).abs() <= 2,
+            "BLEND_RED must preserve dst.a & G/B premult invariant, got {:?}",
+            &px[..4]
+        );
+
+        // 5. BLEND_MINUS over transparent backdrop must stay transparent (not opaque black).
+        let clear_bg =
+            RenderTarget::new(&ctx, 8, 8, wgpu::TextureFormat::Rgba8Unorm, Some("clear"))
+                .expect("clear");
+        comp.clear_target(&ctx, &clear_bg, wgpu::Color::TRANSPARENT);
+        comp.composite_layer(
+            &ctx,
+            &clear_bg,
+            &full_layer,
+            &dst,
+            LayerTransform2D::default(),
+            1.0,
+            BlendMode::Minus,
+        );
+        crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback minus");
+        assert_eq!(
+            &px[..4],
+            &[0, 0, 0, 0],
+            "BLEND_MINUS over transparent backdrop must remain transparent"
+        );
+    }
+}

@@ -8,15 +8,15 @@ use std::rc::Rc;
 use crate::ast::{
     ArrayElem, ArrayPatternElem, AssignOp, AssignTarget, BinaryOp, CallArg, ChainOp, Expr, ForInit,
     FunctionBody, Literal, LogicalOp, ObjectKey, ObjectPatternProp, ObjectProp, Param, Pattern,
-    Program, Stmt, TemplatePart, UnaryOp, UpdateOp, VarKind, is_forbidden_ident,
+    Program, Stmt, TemplatePart, UnaryOp, UpdateOp, VarKind, is_extended, is_forbidden_ident,
 };
 use crate::builtins::{
-    DetRng, ae_ease, ae_ease_in, ae_ease_out, ae_linear, catmull_rom_value, clamp_f64, cm3_ease,
+    ae_ease, ae_ease_in, ae_ease_out, ae_linear, catmull_rom_value, clamp_f64, cm3_ease,
     cm3_gauss_random, cm3_random, cm3_shake, cm3_wave, eval_math_fn, eval_wiggle, format_js_number,
-    format_js_number_radix, js_parse_float, js_parse_int, json_parse_bounded,
-    json_stringify_bounded, lerp_value, look_at_xyz_euler, math_constant, to_i32, to_u32, vec_add,
-    vec_cross, vec_div_componentwise, vec_div_scalar, vec_dot, vec_length, vec_mul_componentwise,
-    vec_mul_scalar, vec_normalize, vec_sub,
+    format_js_number_radix, js_parse_float, js_parse_int, js_round, json_parse_bounded,
+    json_stringify_bounded, lerp_value, look_at_xyz_euler, math_constant, property_seed, to_i32,
+    to_u32, vec_add, vec_cross, vec_div_componentwise, vec_div_scalar, vec_dot, vec_length,
+    vec_mul_componentwise, vec_mul_scalar, vec_normalize, vec_sub,
 };
 use crate::{
     EvalConfig, ExprContext, ExprError, ExprMode, HandleId, HandleRef, KeyframeRecord, NameOrIndex,
@@ -43,7 +43,8 @@ pub fn evaluate_program(
     ctx: &dyn ExprContext,
     config: &EvalConfig,
 ) -> Result<Value, ExprError> {
-    let mut evaluator = Evaluator::new(ctx, *config);
+    let program_extended = is_extended(program);
+    let mut evaluator = Evaluator::new(ctx, *config, program_extended);
     let root_env = evaluator.push_env(None)?;
     evaluator.hoist_decls(&program.body, root_env)?;
 
@@ -145,18 +146,33 @@ enum RuntimeValue {
     Closure(usize),
     BuiltinFn(Rc<str>),
     Namespace(NamespaceKind),
+    Intrinsic(IntrinsicSentinel),
     Handle(HandleRef),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NamespaceKind {
     Math,
+    Methods,
     Array,
     Number,
     String,
     Boolean,
     Object,
     Json,
+}
+
+/// Read-only intrinsic identity sentinels preserving JS `constructor` / `__proto__` / `prototype`
+/// reference equality without allowing sandbox escape or prototype mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntrinsicSentinel {
+    FunctionCtor,
+    ArrayProto,
+    ObjectProto,
+    NumberProto,
+    StringProto,
+    BooleanProto,
+    FunctionProto,
 }
 
 enum Flow {
@@ -208,6 +224,7 @@ enum ResolvedTarget<'ast> {
 struct Evaluator<'a, 'ast> {
     ctx: &'a dyn ExprContext,
     config: EvalConfig,
+    is_extended: bool,
     steps: u64,
     recursion_depth: usize,
     allocated_bytes: usize,
@@ -216,9 +233,10 @@ struct Evaluator<'a, 'ast> {
     objects: Vec<BTreeMap<String, RuntimeValue>>,
     closures: Vec<Closure<'ast>>,
     literal_strings: HashMap<(usize, usize), JsStr>,
-    rng: Option<DetRng>,
-    rng_explicitly_seeded: bool,
-    wiggle_seed_offset: f64,
+    rng_seed: f64,
+    rng_timeless: bool,
+    rng_index: u64,
+    rng_seeded: bool,
     cached_value: Option<RuntimeValue>,
     cached_properties: Option<RuntimeValue>,
     pending_throw: Option<RuntimeValue>,
@@ -226,10 +244,11 @@ struct Evaluator<'a, 'ast> {
 }
 
 impl<'a, 'ast> Evaluator<'a, 'ast> {
-    fn new(ctx: &'a dyn ExprContext, config: EvalConfig) -> Self {
+    fn new(ctx: &'a dyn ExprContext, config: EvalConfig, is_extended: bool) -> Self {
         Self {
             ctx,
             config,
+            is_extended,
             steps: 0,
             recursion_depth: 0,
             allocated_bytes: 0,
@@ -238,9 +257,10 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             objects: Vec::new(),
             closures: Vec::new(),
             literal_strings: HashMap::new(),
-            rng: None,
-            rng_explicitly_seeded: false,
-            wiggle_seed_offset: 0.0,
+            rng_seed: 0.0,
+            rng_timeless: false,
+            rng_index: 0,
+            rng_seeded: false,
             cached_value: None,
             cached_properties: None,
             pending_throw: None,
@@ -634,7 +654,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             RuntimeValue::Handle(_)
             | RuntimeValue::Closure(_)
             | RuntimeValue::BuiltinFn(_)
-            | RuntimeValue::Namespace(_) => Ok(Value::Undefined),
+            | RuntimeValue::Namespace(_)
+            | RuntimeValue::Intrinsic(_) => Ok(Value::Undefined),
         }
     }
 
@@ -678,6 +699,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             | RuntimeValue::Closure(_)
             | RuntimeValue::BuiltinFn(_)
             | RuntimeValue::Namespace(_)
+            | RuntimeValue::Intrinsic(_)
             | RuntimeValue::Handle(_) => true,
         })
     }
@@ -739,6 +761,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             RuntimeValue::Object(_) | RuntimeValue::Namespace(_) | RuntimeValue::Handle(_) => {
                 "[object Object]".to_string()
             }
+            RuntimeValue::Intrinsic(IntrinsicSentinel::FunctionCtor) => "[Function]".to_string(),
+            RuntimeValue::Intrinsic(_) => "[object Object]".to_string(),
             RuntimeValue::Closure(_) | RuntimeValue::BuiltinFn(_) => "[Function]".to_string(),
         })
     }
@@ -1842,16 +1866,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             "undefined" => return Ok(RuntimeValue::Undefined),
             "frame" => return Ok(RuntimeValue::Number(self.ctx.frame())),
             "time" => return Ok(RuntimeValue::Number(self.ctx.time())),
-            "fps" => return Ok(RuntimeValue::Number(self.ctx.fps())),
-            "value" => {
-                if let Some(v) = &self.cached_value {
-                    return Ok(v.clone());
-                }
-                let v = self.ctx.value();
-                let interned = self.intern_value(v)?;
-                self.cached_value = Some(interned.clone());
-                return Ok(interned);
-            }
+            "methods" => return Ok(RuntimeValue::Namespace(NamespaceKind::Methods)),
             "properties" => {
                 if let Some(p) = &self.cached_properties {
                     return Ok(p.clone());
@@ -1885,6 +1900,16 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         // Expressions+ globals & handles
         if self.config.mode == ExprMode::ExpressionsPlus {
             match name {
+                "fps" => return Ok(RuntimeValue::Number(self.ctx.fps())),
+                "value" => {
+                    if let Some(v) = &self.cached_value {
+                        return Ok(v.clone());
+                    }
+                    let v = self.ctx.value();
+                    let interned = self.intern_value(v)?;
+                    self.cached_value = Some(interned.clone());
+                    return Ok(interned);
+                }
                 "frameDuration" => return Ok(RuntimeValue::Number(self.ctx.frame_duration())),
                 "thisProperty" => {
                     return Ok(match self.ctx.this_property_id() {
@@ -2026,8 +2051,12 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             RuntimeValue::Number(_) => "number",
             RuntimeValue::String(_) => "string",
             RuntimeValue::Closure(_) | RuntimeValue::BuiltinFn(_) => "function",
-            RuntimeValue::Namespace(NamespaceKind::Math | NamespaceKind::Json) => "object",
+            RuntimeValue::Namespace(
+                NamespaceKind::Math | NamespaceKind::Json | NamespaceKind::Methods,
+            ) => "object",
             RuntimeValue::Namespace(_) => "function",
+            RuntimeValue::Intrinsic(IntrinsicSentinel::FunctionCtor) => "function",
+            RuntimeValue::Intrinsic(_) => "object",
             RuntimeValue::Handle(_) => "object",
         })
     }
@@ -2138,9 +2167,11 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     self.objects[id].insert((*prop).to_string(), val);
                     Ok(())
                 }
-                RuntimeValue::Handle(_) | RuntimeValue::Namespace(_) => Err(ExprError::TypeError(
-                    format!("cannot mutate read-only property '{prop}'"),
-                )),
+                RuntimeValue::Handle(_)
+                | RuntimeValue::Namespace(_)
+                | RuntimeValue::Intrinsic(_) => Err(ExprError::TypeError(format!(
+                    "cannot mutate read-only property '{prop}'"
+                ))),
                 _ => Err(ExprError::TypeError(format!(
                     "cannot set property '{prop}' on non-object"
                 ))),
@@ -2386,6 +2417,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             (RuntimeValue::Handle(x), RuntimeValue::Handle(y)) => x == y,
             (RuntimeValue::Namespace(x), RuntimeValue::Namespace(y)) => x == y,
+            (RuntimeValue::Intrinsic(x), RuntimeValue::Intrinsic(y)) => x == y,
             _ => false,
         })
     }
@@ -2430,16 +2462,115 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
     // Property Access & Optional Chaining
     // -----------------------------------------------------------------------
 
+    fn resolve_meta_property(obj: &RuntimeValue, prop: &str) -> RuntimeValue {
+        match prop {
+            "constructor" => match obj {
+                RuntimeValue::Array(_) | RuntimeValue::Intrinsic(IntrinsicSentinel::ArrayProto) => {
+                    RuntimeValue::Namespace(NamespaceKind::Array)
+                }
+                RuntimeValue::Object(_)
+                | RuntimeValue::Namespace(
+                    NamespaceKind::Math | NamespaceKind::Json | NamespaceKind::Methods,
+                )
+                | RuntimeValue::Intrinsic(IntrinsicSentinel::ObjectProto) => {
+                    RuntimeValue::Namespace(NamespaceKind::Object)
+                }
+                RuntimeValue::Number(_)
+                | RuntimeValue::Intrinsic(IntrinsicSentinel::NumberProto) => {
+                    RuntimeValue::Namespace(NamespaceKind::Number)
+                }
+                RuntimeValue::String(_)
+                | RuntimeValue::Intrinsic(IntrinsicSentinel::StringProto) => {
+                    RuntimeValue::Namespace(NamespaceKind::String)
+                }
+                RuntimeValue::Bool(_)
+                | RuntimeValue::Intrinsic(IntrinsicSentinel::BooleanProto) => {
+                    RuntimeValue::Namespace(NamespaceKind::Boolean)
+                }
+                RuntimeValue::Closure(_)
+                | RuntimeValue::BuiltinFn(_)
+                | RuntimeValue::Namespace(
+                    NamespaceKind::Array
+                    | NamespaceKind::Number
+                    | NamespaceKind::String
+                    | NamespaceKind::Boolean
+                    | NamespaceKind::Object,
+                )
+                | RuntimeValue::Intrinsic(
+                    IntrinsicSentinel::FunctionCtor | IntrinsicSentinel::FunctionProto,
+                ) => RuntimeValue::Intrinsic(IntrinsicSentinel::FunctionCtor),
+                // Null-prototype handles (`Object.create(null)`) and nullish have no constructor.
+                _ => RuntimeValue::Undefined,
+            },
+            "__proto__" => match obj {
+                RuntimeValue::Array(_) => RuntimeValue::Intrinsic(IntrinsicSentinel::ArrayProto),
+                RuntimeValue::Object(_)
+                | RuntimeValue::Namespace(
+                    NamespaceKind::Math | NamespaceKind::Json | NamespaceKind::Methods,
+                ) => RuntimeValue::Intrinsic(IntrinsicSentinel::ObjectProto),
+                RuntimeValue::Number(_) => RuntimeValue::Intrinsic(IntrinsicSentinel::NumberProto),
+                RuntimeValue::String(_) => RuntimeValue::Intrinsic(IntrinsicSentinel::StringProto),
+                RuntimeValue::Bool(_) => RuntimeValue::Intrinsic(IntrinsicSentinel::BooleanProto),
+                RuntimeValue::Closure(_)
+                | RuntimeValue::BuiltinFn(_)
+                | RuntimeValue::Namespace(
+                    NamespaceKind::Array
+                    | NamespaceKind::Number
+                    | NamespaceKind::String
+                    | NamespaceKind::Boolean
+                    | NamespaceKind::Object,
+                )
+                | RuntimeValue::Intrinsic(IntrinsicSentinel::FunctionCtor) => {
+                    RuntimeValue::Intrinsic(IntrinsicSentinel::FunctionProto)
+                }
+                RuntimeValue::Intrinsic(
+                    IntrinsicSentinel::ArrayProto
+                    | IntrinsicSentinel::NumberProto
+                    | IntrinsicSentinel::StringProto
+                    | IntrinsicSentinel::BooleanProto
+                    | IntrinsicSentinel::FunctionProto,
+                ) => RuntimeValue::Intrinsic(IntrinsicSentinel::ObjectProto),
+                RuntimeValue::Intrinsic(IntrinsicSentinel::ObjectProto) => RuntimeValue::Null,
+                _ => RuntimeValue::Undefined,
+            },
+            "prototype" => match obj {
+                RuntimeValue::Namespace(NamespaceKind::Array) => {
+                    RuntimeValue::Intrinsic(IntrinsicSentinel::ArrayProto)
+                }
+                RuntimeValue::Namespace(NamespaceKind::Object) => {
+                    RuntimeValue::Intrinsic(IntrinsicSentinel::ObjectProto)
+                }
+                RuntimeValue::Namespace(NamespaceKind::Number) => {
+                    RuntimeValue::Intrinsic(IntrinsicSentinel::NumberProto)
+                }
+                RuntimeValue::Namespace(NamespaceKind::String) => {
+                    RuntimeValue::Intrinsic(IntrinsicSentinel::StringProto)
+                }
+                RuntimeValue::Namespace(NamespaceKind::Boolean) => {
+                    RuntimeValue::Intrinsic(IntrinsicSentinel::BooleanProto)
+                }
+                RuntimeValue::Intrinsic(IntrinsicSentinel::FunctionCtor) => {
+                    RuntimeValue::Intrinsic(IntrinsicSentinel::FunctionProto)
+                }
+                _ => RuntimeValue::Undefined,
+            },
+            _ => RuntimeValue::Undefined,
+        }
+    }
+
     fn get_property(&mut self, obj: &RuntimeValue, prop: &str) -> Result<RuntimeValue, ExprError> {
+        if matches!(obj, RuntimeValue::Null | RuntimeValue::Undefined) {
+            return Err(ExprError::TypeError(format!(
+                "cannot read property '{}' of null or undefined",
+                truncate_diag(prop)
+            )));
+        }
         if matches!(prop, "__proto__" | "constructor" | "prototype") {
-            return Ok(RuntimeValue::Undefined);
+            return Ok(Self::resolve_meta_property(obj, prop));
         }
 
         match obj {
-            RuntimeValue::Null | RuntimeValue::Undefined => Err(ExprError::TypeError(format!(
-                "cannot read property '{}' of null or undefined",
-                truncate_diag(prop)
-            ))),
+            RuntimeValue::Null | RuntimeValue::Undefined => unreachable!(),
             RuntimeValue::Namespace(NamespaceKind::Math) => {
                 if prop == "random" {
                     return Err(ExprError::Forbidden("Math.random".to_string()));
@@ -2448,6 +2579,13 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     return Ok(RuntimeValue::Number(c));
                 }
                 self.alloc_builtin_fn(format!("Math.{prop}"))
+            }
+            RuntimeValue::Namespace(NamespaceKind::Methods) => {
+                if is_methods_member(prop, self.config.mode) {
+                    self.alloc_builtin_fn(prop.to_string())
+                } else {
+                    Ok(RuntimeValue::Undefined)
+                }
             }
             RuntimeValue::Namespace(NamespaceKind::Number) => match prop {
                 "MAX_SAFE_INTEGER" => Ok(RuntimeValue::Number(9_007_199_254_740_991.0)),
@@ -2511,7 +2649,10 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         idx: &RuntimeValue,
     ) -> Result<RuntimeValue, ExprError> {
         let idx = self.deref_property_handle(idx.clone())?;
-        if matches!(obj, RuntimeValue::Namespace(NamespaceKind::Math)) {
+        if matches!(
+            obj,
+            RuntimeValue::Namespace(NamespaceKind::Math | NamespaceKind::Methods)
+        ) {
             let key = self.runtime_to_js_string(&idx)?;
             return self.get_property(obj, &key);
         }
@@ -2564,6 +2705,19 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         }
     }
 
+    fn property_derivative_time(&self, id: &HandleId) -> f64 {
+        let fps = self.ctx.fps();
+        if fps > 0.0 {
+            let local_frame = self
+                .ctx
+                .property_local_frame(id)
+                .unwrap_or_else(|| self.ctx.frame());
+            local_frame / fps
+        } else {
+            self.ctx.time()
+        }
+    }
+
     fn get_handle_property(
         &mut self,
         handle: &HandleRef,
@@ -2576,11 +2730,13 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     self.intern_value(v)
                 }
                 "velocity" => {
-                    let v = self.ctx.property_velocity(id, self.ctx.time())?;
+                    let at_time = self.property_derivative_time(id);
+                    let v = self.ctx.property_velocity(id, at_time)?;
                     self.intern_value(v)
                 }
                 "speed" => {
-                    let s = self.ctx.property_speed(id, self.ctx.time())?;
+                    let at_time = self.property_derivative_time(id);
+                    let s = self.ctx.property_speed(id, at_time)?;
                     Ok(RuntimeValue::Number(s))
                 }
                 "numKeys" => Ok(RuntimeValue::Number(self.ctx.property_num_keys(id) as f64)),
@@ -2613,11 +2769,28 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     Some(p) => Ok(RuntimeValue::Handle(p)),
                     None => Ok(RuntimeValue::Null),
                 },
+                "frameDuration" => Ok(RuntimeValue::Number(self.ctx.frame_duration())),
                 _ => Ok(RuntimeValue::Undefined),
             },
             HandleRef::Sequence => match prop {
                 "frameDuration" => Ok(RuntimeValue::Number(self.ctx.frame_duration())),
                 "fps" => Ok(RuntimeValue::Number(self.ctx.fps())),
+                "name" => Ok(self
+                    .ctx
+                    .this_sequence_id()
+                    .and_then(|id| self.ctx.handle_name(&id))
+                    .map(|s| RuntimeValue::String(JsStr::from(s)))
+                    .unwrap_or(RuntimeValue::Undefined)),
+                "parent" => {
+                    if let Some(id) = self.ctx.this_sequence_id() {
+                        match self.ctx.parent_of(&id, 1)? {
+                            Some(p) => Ok(RuntimeValue::Handle(p)),
+                            None => Ok(RuntimeValue::Null),
+                        }
+                    } else {
+                        Ok(RuntimeValue::Null)
+                    }
+                }
                 _ => Ok(RuntimeValue::Undefined),
             },
             HandleRef::Controls => {
@@ -2700,7 +2873,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         prop: &str,
     ) -> Result<bool, ExprError> {
         if matches!(prop, "__proto__" | "constructor" | "prototype") {
-            return Ok(true);
+            let meta = Self::resolve_meta_property(receiver, prop);
+            return Ok(matches!(meta, RuntimeValue::Null | RuntimeValue::Undefined));
         }
         match receiver {
             RuntimeValue::Object(id) => {
@@ -2720,6 +2894,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     }
                     Ok(!is_top_level_math_fn(prop) && math_constant(prop).is_none())
                 }
+                NamespaceKind::Methods => Ok(!is_methods_member(prop, self.config.mode)),
                 NamespaceKind::Array => Ok(!matches!(prop, "isArray" | "from")),
                 NamespaceKind::Number => Ok(!matches!(
                     prop,
@@ -2823,19 +2998,27 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                         }
                     }
                 },
-                HandleRef::Effect(id) => match prop {
-                    "param" | "property" | "parent" => Ok(false),
+                HandleRef::Effect(id)
+                | HandleRef::Object(id)
+                | HandleRef::Layer(id)
+                | HandleRef::Clip(id) => match prop {
+                    "param" | "property" | "parent" | "effect" | "object" | "content" | "layer"
+                    | "frameDuration" | "toWorld" | "fromWorld" | "worldPosition"
+                    | "worldRotation" | "toScreen" | "fromScreen" => Ok(false),
                     "name" => Ok(self.ctx.handle_name(id).is_none()),
                     _ => Ok(true),
                 },
-                HandleRef::Object(id) | HandleRef::Layer(id) | HandleRef::Clip(id) => match prop {
-                    "parent" | "effect" | "object" | "property" | "layer" | "toWorld"
-                    | "fromWorld" | "worldPosition" | "worldRotation" | "toScreen"
-                    | "fromScreen" => Ok(false),
-                    "name" => Ok(self.ctx.handle_name(id).is_none()),
+                HandleRef::Sequence => match prop {
+                    "param" | "property" | "parent" | "effect" | "object" | "content" | "layer"
+                    | "frameDuration" | "fps" | "toWorld" | "fromWorld" | "worldPosition"
+                    | "worldRotation" | "toScreen" | "fromScreen" => Ok(false),
+                    "name" => Ok(self
+                        .ctx
+                        .this_sequence_id()
+                        .and_then(|id| self.ctx.handle_name(&id))
+                        .is_none()),
                     _ => Ok(true),
                 },
-                HandleRef::Sequence => Ok(!matches!(prop, "layer" | "frameDuration" | "fps")),
                 HandleRef::Controls => Ok(true),
             },
             _ => Ok(true),
@@ -2939,7 +3122,22 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             )));
         }
 
-        // Namespaces (`Math.*`, `Array.*`, `Number.*`, `Object.*`, `JSON.*`, `String.*`)
+        // Guard Function constructor invocations (`sin.constructor(...)`, `F.call(...)`, etc.).
+        if method == "constructor" {
+            let ctor = Self::resolve_meta_property(&receiver, "constructor");
+            return self.call_runtime_value(ctor, args);
+        }
+        if matches!(
+            receiver,
+            RuntimeValue::Intrinsic(IntrinsicSentinel::FunctionCtor)
+        ) && matches!(method, "call" | "apply" | "bind")
+        {
+            return Err(ExprError::Forbidden(
+                "Expression cannot call Function constructors or eval".to_string(),
+            ));
+        }
+
+        // Namespaces (`Math.*`, `methods.*`, `Array.*`, `Number.*`, `Object.*`, `JSON.*`, `String.*`)
         if let RuntimeValue::Namespace(ns) = receiver {
             return self.call_namespace_method(ns, method, args);
         }
@@ -2987,19 +3185,16 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         match callee {
             RuntimeValue::Closure(cid) => self.call_closure(cid, args),
             RuntimeValue::BuiltinFn(name) => self.call_builtin(&name, args),
-            RuntimeValue::Handle(HandleRef::Effect(effect_id)) => {
-                // Callable effect handle: `effect("Glow")("Radius")`.
-                let param_name = match args.first() {
-                    Some(v) => self.runtime_to_js_string(v)?,
-                    None => {
-                        return Err(ExprError::TypeError(
-                            "effect parameter lookup requires a name".to_string(),
-                        ));
-                    }
-                };
-                let prop_id = self.ctx.effect_param(&effect_id, &param_name)?;
-                Ok(RuntimeValue::Handle(HandleRef::Property(prop_id)))
-            }
+            RuntimeValue::Intrinsic(IntrinsicSentinel::FunctionCtor) => Err(ExprError::Forbidden(
+                "Expression cannot call Function constructors or eval".to_string(),
+            )),
+            RuntimeValue::Handle(
+                handle @ (HandleRef::Effect(_)
+                | HandleRef::Object(_)
+                | HandleRef::Layer(_)
+                | HandleRef::Clip(_)
+                | HandleRef::Sequence),
+            ) => self.call_object_handle(&handle, &args),
             RuntimeValue::Namespace(NamespaceKind::Number) => {
                 let n = match args.first() {
                     Some(v) => self.runtime_to_number(v)?,
@@ -3142,6 +3337,16 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                         "Math.{} is not a function",
                         truncate_diag(method)
                     ))),
+                }
+            }
+            NamespaceKind::Methods => {
+                if is_methods_member(method, self.config.mode) {
+                    self.call_builtin(method, args)
+                } else {
+                    Err(ExprError::TypeError(format!(
+                        "methods.{} is not a function",
+                        truncate_diag(method)
+                    )))
                 }
             }
             NamespaceKind::Array => match method {
@@ -3479,95 +3684,173 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     self.call_method_on(rv, method, args, false)
                 }
             },
-            HandleRef::Effect(id) => match method {
-                "param" | "property" => {
-                    let name = self.expect_string_arg(&args, 0, method)?;
-                    let pid = self.ctx.effect_param(id, &name)?;
-                    Ok(RuntimeValue::Handle(HandleRef::Property(pid)))
-                }
-                "parent" => self.resolve_parent_call(id, &args),
-                _ => Err(ExprError::TypeError(format!(
-                    "Effect.{method} is not a function"
-                ))),
-            },
-            HandleRef::Object(id) | HandleRef::Layer(id) | HandleRef::Clip(id) => match method {
-                "parent" => self.resolve_parent_call(id, &args),
-                "effect" => {
-                    let name = self.expect_string_arg(&args, 0, "effect")?;
-                    let eid = self.ctx.effect(Some(id), &name)?;
-                    Ok(RuntimeValue::Handle(HandleRef::Effect(eid)))
-                }
-                "object" => {
-                    let name = self.expect_string_arg(&args, 0, "object")?;
-                    let oid = self.ctx.object(Some(id), &name)?;
-                    Ok(RuntimeValue::Handle(HandleRef::Object(oid)))
-                }
-                "property" => {
-                    let name = self.expect_string_arg(&args, 0, "property")?;
-                    let pid = self.ctx.property(Some(id), &name)?;
-                    Ok(RuntimeValue::Handle(HandleRef::Property(pid)))
-                }
-                "layer" => {
-                    let query = self.parse_name_or_index_arg(&args)?;
-                    let lid = self.ctx.layer(&query)?;
-                    Ok(RuntimeValue::Handle(HandleRef::Layer(lid)))
-                }
-                "toWorld" => {
-                    let pt = match args.first() {
-                        Some(v) => self.runtime_to_vec3(v)?,
-                        None => [0.0, 0.0, 0.0],
-                    };
-                    let out = self.ctx.to_world(Some(id), pt)?;
-                    self.alloc_f64_vec(out.to_vec())
-                }
-                "fromWorld" => {
-                    let pt = match args.first() {
-                        Some(v) => self.runtime_to_vec3(v)?,
-                        None => [0.0, 0.0, 0.0],
-                    };
-                    let out = self.ctx.from_world(Some(id), pt)?;
-                    self.alloc_f64_vec(out.to_vec())
-                }
-                "worldPosition" => {
-                    let out = self.ctx.world_position(Some(id))?;
-                    self.alloc_f64_vec(out.to_vec())
-                }
-                "worldRotation" => {
-                    let out = self.ctx.world_rotation(Some(id))?;
-                    self.alloc_f64_vec(out.to_vec())
-                }
-                "toScreen" => {
-                    let pt = match args.first() {
-                        Some(v) => self.runtime_to_vec3(v)?,
-                        None => [0.0, 0.0, 0.0],
-                    };
-                    let out = self.ctx.to_screen(Some(id), pt)?;
-                    self.alloc_f64_vec(out.to_vec())
-                }
-                "fromScreen" => {
-                    let pt = match args.first() {
-                        Some(v) => self.runtime_to_vec3(v)?,
-                        None => [0.0, 0.0, 0.0],
-                    };
-                    let out = self.ctx.from_screen(Some(id), pt)?;
-                    self.alloc_f64_vec(out.to_vec())
-                }
-                _ => Err(ExprError::TypeError(format!(
-                    "handle.{method} is not a function"
-                ))),
-            },
-            HandleRef::Sequence => match method {
-                "layer" => {
-                    let query = self.parse_name_or_index_arg(&args)?;
-                    let lid = self.ctx.layer(&query)?;
-                    Ok(RuntimeValue::Handle(HandleRef::Layer(lid)))
-                }
-                _ => Err(ExprError::TypeError(format!(
-                    "Sequence.{method} is not a function"
-                ))),
-            },
+            HandleRef::Effect(_)
+            | HandleRef::Object(_)
+            | HandleRef::Layer(_)
+            | HandleRef::Clip(_)
+            | HandleRef::Sequence => self.call_object_handle_method(handle, method, args),
             HandleRef::Controls => Err(ExprError::TypeError(format!(
                 "controls.{method} is not a function"
+            ))),
+        }
+    }
+
+    fn resolve_object_handle_property(
+        &self,
+        handle: &HandleRef,
+        name: &str,
+    ) -> Result<HandleId, ExprError> {
+        match handle {
+            HandleRef::Effect(id) => self
+                .ctx
+                .effect_param(id, name)
+                .or_else(|_| self.ctx.property(Some(id), name)),
+            HandleRef::Object(id) | HandleRef::Layer(id) | HandleRef::Clip(id) => {
+                self.ctx.property(Some(id), name)
+            }
+            HandleRef::Sequence => self.ctx.sequence_property(name),
+            HandleRef::Property(id) => Ok(id.clone()),
+            HandleRef::Controls => Err(ExprError::NotFound(format!("property '{name}'"))),
+        }
+    }
+
+    /// Unified callable object handle matching Zoidium `plugins/expressions-plus/api.js:147-150`:
+    /// - `handle(n)` where `n` is a number climbs `n - 1` parents (`handle(1) === handle`,
+    ///   `thisObject.parent(2)` climbs 1 parent from `thisObject.parent`).
+    /// - `handle("Prop")` reads and returns a copied value of property `"Prop"`.
+    fn call_object_handle(
+        &mut self,
+        handle: &HandleRef,
+        args: &[RuntimeValue],
+    ) -> Result<RuntimeValue, ExprError> {
+        let Some(first) = args.first() else {
+            return Err(ExprError::TypeError(
+                "object handle call requires a property name or ancestor index".to_string(),
+            ));
+        };
+        let d = self.deref_property_handle(first.clone())?;
+        if let RuntimeValue::Number(n) = d {
+            if !n.is_finite() {
+                return Ok(RuntimeValue::Null);
+            }
+            let steps = if n <= 1.0 { 0 } else { (n.ceil() as usize) - 1 };
+            if steps == 0 {
+                return Ok(RuntimeValue::Handle(handle.clone()));
+            }
+            let owner_id = match handle {
+                HandleRef::Effect(id)
+                | HandleRef::Object(id)
+                | HandleRef::Layer(id)
+                | HandleRef::Clip(id) => Some(id.clone()),
+                HandleRef::Sequence => self.ctx.this_sequence_id(),
+                _ => None,
+            };
+            let Some(id) = owner_id else {
+                return Ok(RuntimeValue::Null);
+            };
+            return match self.ctx.parent_of(&id, steps)? {
+                Some(p) => Ok(RuntimeValue::Handle(p)),
+                None => Ok(RuntimeValue::Null),
+            };
+        }
+        let name = self.runtime_to_js_string(&d)?;
+        let pid = self.resolve_object_handle_property(handle, &name)?;
+        let val = self.ctx.property_value(&pid)?;
+        self.intern_value(val)
+    }
+
+    fn call_object_handle_method(
+        &mut self,
+        handle: &HandleRef,
+        method: &str,
+        args: Vec<RuntimeValue>,
+    ) -> Result<RuntimeValue, ExprError> {
+        let owner_id: Option<HandleId> = match handle {
+            HandleRef::Effect(id)
+            | HandleRef::Object(id)
+            | HandleRef::Layer(id)
+            | HandleRef::Clip(id) => Some(id.clone()),
+            HandleRef::Sequence => self.ctx.this_sequence_id(),
+            _ => None,
+        };
+        match method {
+            "param" => {
+                let name = self.expect_string_arg(&args, 0, "param")?;
+                let pid = self.resolve_object_handle_property(handle, &name)?;
+                let val = self.ctx.property_value(&pid)?;
+                self.intern_value(val)
+            }
+            "property" => {
+                let name = self.expect_string_arg(&args, 0, "property")?;
+                let pid = self.resolve_object_handle_property(handle, &name)?;
+                Ok(RuntimeValue::Handle(HandleRef::Property(pid)))
+            }
+            "parent" => match owner_id {
+                Some(ref id) => self.resolve_parent_call(id, &args),
+                None => Ok(RuntimeValue::Null),
+            },
+            "effect" => {
+                let name = self.expect_string_arg(&args, 0, "effect")?;
+                let eid = self.ctx.effect(owner_id.as_ref(), &name)?;
+                Ok(RuntimeValue::Handle(HandleRef::Effect(eid)))
+            }
+            "object" => {
+                let name = self.expect_string_arg(&args, 0, "object")?;
+                let oid = self.ctx.object(owner_id.as_ref(), &name)?;
+                Ok(RuntimeValue::Handle(HandleRef::Object(oid)))
+            }
+            "content" => {
+                let name = self.expect_string_arg(&args, 0, "content")?;
+                let cid = self.ctx.content(owner_id.as_ref(), &name)?;
+                Ok(RuntimeValue::Handle(HandleRef::Object(cid)))
+            }
+            "layer" => {
+                let query = self.parse_name_or_index_arg(&args)?;
+                let lid = self.ctx.layer(&query)?;
+                Ok(RuntimeValue::Handle(HandleRef::Layer(lid)))
+            }
+            "toWorld" => {
+                let pt = match args.first() {
+                    Some(v) => self.runtime_to_vec3(v)?,
+                    None => [0.0, 0.0, 0.0],
+                };
+                let out = self.ctx.to_world(owner_id.as_ref(), pt)?;
+                self.alloc_f64_vec(out.to_vec())
+            }
+            "fromWorld" => {
+                let pt = match args.first() {
+                    Some(v) => self.runtime_to_vec3(v)?,
+                    None => [0.0, 0.0, 0.0],
+                };
+                let out = self.ctx.from_world(owner_id.as_ref(), pt)?;
+                self.alloc_f64_vec(out.to_vec())
+            }
+            "worldPosition" => {
+                let out = self.ctx.world_position(owner_id.as_ref())?;
+                self.alloc_f64_vec(out.to_vec())
+            }
+            "worldRotation" => {
+                let out = self.ctx.world_rotation(owner_id.as_ref())?;
+                self.alloc_f64_vec(out.to_vec())
+            }
+            "toScreen" => {
+                let pt = match args.first() {
+                    Some(v) => self.runtime_to_vec3(v)?,
+                    None => [0.0, 0.0, 0.0],
+                };
+                let out = self.ctx.to_screen(owner_id.as_ref(), pt)?;
+                self.alloc_f64_vec(out.to_vec())
+            }
+            "fromScreen" => {
+                let pt = match args.first() {
+                    Some(v) => self.runtime_to_vec3(v)?,
+                    None => [0.0, 0.0, 0.0],
+                };
+                let out = self.ctx.from_screen(owner_id.as_ref(), pt)?;
+                self.alloc_f64_vec(out.to_vec())
+            }
+            _ => Err(ExprError::TypeError(format!(
+                "handle.{method} is not a function"
             ))),
         }
     }
@@ -4489,21 +4772,32 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     Some(v) => self.runtime_to_bool(v)?,
                     None => false,
                 };
-                let rng = DetRng::from_seed(seed, self.ctx.frame(), timeless);
-                self.wiggle_seed_offset = rng.seed_offset();
-                self.rng = Some(rng);
-                self.rng_explicitly_seeded = true;
+                self.rng_seed = seed;
+                self.rng_timeless = timeless;
+                self.rng_index = 0;
+                self.rng_seeded = true;
                 Ok(RuntimeValue::Undefined)
             }
             "wiggle" => {
                 let freq = self.number_arg(&args, 0, 1.0)?;
-                let amp = self.export_arg(&args, 1)?;
-                let octaves = self.number_arg(&args, 2, 1.0)?.max(1.0) as usize;
-                let amp_mult = self.number_arg(&args, 3, 0.5)?;
+                let amp = match args.get(1) {
+                    Some(v) if !matches!(v, RuntimeValue::Undefined) => {
+                        self.export_root_value(v)?
+                    }
+                    _ => Value::Number(1.0),
+                };
+                let octaves_f = self.number_arg(&args, 2, 2.0)?;
+                let octaves = if octaves_f.is_finite() {
+                    js_round(octaves_f).clamp(1.0, 1024.0) as usize
+                } else {
+                    1
+                };
+                let amp_mult = self.number_arg(&args, 3, 0.45)?;
                 let t = self.number_arg(&args, 4, self.ctx.frame())?;
-                let seed_offset = self.wiggle_seed_offset;
+                let addr = self.ctx.property_address();
+                let seed = property_seed(addr.as_deref());
                 let base_val = self.ctx.value();
-                let res = eval_wiggle(&base_val, freq, &amp, octaves, amp_mult, t, seed_offset);
+                let res = eval_wiggle(&base_val, freq, &amp, octaves, amp_mult, t, seed);
                 self.intern_value(res)
             }
 
@@ -4531,7 +4825,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             "prop" => {
                 let path = self.expect_string_arg(&args, 0, "prop")?;
                 let pid = self.ctx.prop(&path)?;
-                Ok(RuntimeValue::Handle(HandleRef::Property(pid)))
+                let val = self.ctx.property_value(&pid)?;
+                self.intern_value(val)
             }
             "control" => {
                 let ctrl_name = self.expect_string_arg(&args, 0, "control")?;
@@ -4622,22 +4917,20 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 })
                 .collect();
             self.alloc_f64_vec(out)
-        } else {
+        } else if self.config.mode == ExprMode::ExpressionsPlus && self.is_extended {
             let x = self.runtime_to_number(first)?;
             let lo = self.number_arg(args, 1, 0.0)?;
             let hi = self.number_arg(args, 2, 1.0)?;
             Ok(RuntimeValue::Number(clamp_f64(x, lo, hi)))
+        } else {
+            // Pure CM3 `clamp` only operates on arrays (`new Array(v.length)` -> `[undefined]`).
+            self.check_array_alloc(1)?;
+            Ok(self.alloc_array(vec![RuntimeValue::Undefined]))
         }
     }
 
     fn builtin_linear(&mut self, args: &[RuntimeValue]) -> Result<RuntimeValue, ExprError> {
-        if args.len() == 5 {
-            if self.config.mode == ExprMode::VanillaCm3 {
-                return Err(ExprError::ModeError {
-                    mode: self.config.mode,
-                    feature: "5-argument linear(t, tMin, tMax, a, b)".to_string(),
-                });
-            }
+        if args.len() == 5 && self.config.mode == ExprMode::ExpressionsPlus && self.is_extended {
             let t = self.number_arg(args, 0, 0.0)?;
             let t_min = self.number_arg(args, 1, 0.0)?;
             let t_max = self.number_arg(args, 2, 1.0)?;
@@ -4646,7 +4939,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             let res = ae_linear(t, t_min, t_max, &a, &b)?;
             return self.intern_value(res);
         }
-        // Vanilla CM3 3-argument form: `linear(a, b, t) = (b - a) * t + a`
+        // Vanilla CM3 3-argument form: `linear(a, b, t) = (b - a) * t + a` (ignoring extra args).
         let a = self.export_arg(args, 0)?;
         let b = self.export_arg(args, 1)?;
         let t = self.number_arg(args, 2, 0.0)?;
@@ -4655,13 +4948,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
     }
 
     fn builtin_ease(&mut self, args: &[RuntimeValue]) -> Result<RuntimeValue, ExprError> {
-        if args.len() == 5 {
-            if self.config.mode == ExprMode::VanillaCm3 {
-                return Err(ExprError::ModeError {
-                    mode: self.config.mode,
-                    feature: "5-argument ease(t, tMin, tMax, a, b)".to_string(),
-                });
-            }
+        if args.len() == 5 && self.config.mode == ExprMode::ExpressionsPlus && self.is_extended {
             let t = self.number_arg(args, 0, 0.0)?;
             let t_min = self.number_arg(args, 1, 0.0)?;
             let t_max = self.number_arg(args, 2, 1.0)?;
@@ -4670,7 +4957,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             let res = ae_ease(t, t_min, t_max, &a, &b)?;
             return self.intern_value(res);
         }
-        // Vanilla CM3 form: `ease(t, family = "Quadratic", dir = "InOut")`
+        // Vanilla CM3 form: `ease(t, family = "Quadratic", dir = "InOut")` (ignoring extra args).
         let t = self.number_arg(args, 0, 0.0)?;
         let family = match args.get(1) {
             Some(v) if !matches!(v, RuntimeValue::Undefined) => self.runtime_to_js_string(v)?,
@@ -4688,7 +4975,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         args: &[RuntimeValue],
         is_in: bool,
     ) -> Result<RuntimeValue, ExprError> {
-        if args.len() >= 5 {
+        if args.len() == 5 {
             let t = self.number_arg(args, 0, 0.0)?;
             let t_min = self.number_arg(args, 1, 0.0)?;
             let t_max = self.number_arg(args, 2, 1.0)?;
@@ -4700,93 +4987,43 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 ae_ease_out(t, t_min, t_max, &a, &b)?
             };
             self.intern_value(res)
+        } else if args.len() >= 3 {
+            // 3-arg Zoidium `interpolate([t, a, b], curve)` (`api.js:7`).
+            let t = clamp_f64(self.number_arg(args, 0, 0.0)?, 0.0, 1.0);
+            let s = if is_in { t * t } else { t * (2.0 - t) };
+            let a = self.export_arg(args, 1)?;
+            let b = self.export_arg(args, 2)?;
+            let res = lerp_value(&a, &b, s)?;
+            self.intern_value(res)
         } else {
             let t = clamp_f64(self.number_arg(args, 0, 0.0)?, 0.0, 1.0);
-            let s = if is_in {
-                t * t * t
-            } else {
-                let inv = 1.0 - t;
-                1.0 - inv * inv * inv
-            };
+            let s = if is_in { t * t } else { t * (2.0 - t) };
             Ok(RuntimeValue::Number(s))
         }
     }
 
     fn builtin_random(&mut self, args: &[RuntimeValue]) -> Result<RuntimeValue, ExprError> {
-        // If `seedRandom()` has been invoked in Expressions+, advance the deterministic stream.
-        if self.config.mode == ExprMode::ExpressionsPlus && self.rng_explicitly_seeded {
-            return self.sample_rng_stream(args);
+        // Matches Zoidium `plugins/expressions-plus/api.js:249-253`:
+        // - 0-arg after `seedRandom(seed, timeless)`:
+        //   `cm3_random(seed + (timeless ? 0 : frame) * 17.173 + randomIndex++ * 71.137)`.
+        // - 0-arg without `seedRandom`: `cm3_random(NaN)` -> `NaN`.
+        // - 1+ args: ALWAYS keeps CM3's 1-arg `cm3_random(args[0])` hash.
+        if self.config.mode == ExprMode::ExpressionsPlus && args.is_empty() && self.rng_seeded {
+            let frame = if self.rng_timeless {
+                0.0
+            } else {
+                self.ctx.frame()
+            };
+            let n = self.rng_seed + frame * 17.173 + (self.rng_index as f64) * 71.137;
+            self.rng_index = self.rng_index.saturating_add(1);
+            return Ok(RuntimeValue::Number(cm3_random(n)));
         }
 
-        // In Vanilla CM3 (or before `seedRandom` in Expressions+):
-        // - 1-arg numeric `random(seed)` uses exact CM3 deterministic hash.
-        // - 0-arg or 2-arg in Expressions+ initializes a default frame-seeded stream.
-        if args.len() == 1 {
-            if let Some(max_vec) = self.runtime_as_f64_vec(&args[0])?
-                && self.config.mode == ExprMode::ExpressionsPlus
-            {
-                let frame = self.ctx.frame();
-                let rng = self
-                    .rng
-                    .get_or_insert_with(|| DetRng::from_seed(0.0, frame, false));
-                let out = max_vec.into_iter().map(|m| rng.next_f64() * m).collect();
-                return self.alloc_f64_vec(out);
-            }
-            let seed = self.number_arg(args, 0, 0.0)?;
-            return Ok(RuntimeValue::Number(cm3_random(seed)));
-        }
-
-        if self.config.mode == ExprMode::VanillaCm3 {
-            let seed = self.number_arg(args, 0, 0.0)?;
-            return Ok(RuntimeValue::Number(cm3_random(seed)));
-        }
-
-        let frame = self.ctx.frame();
-        self.rng
-            .get_or_insert_with(|| DetRng::from_seed(0.0, frame, false));
-        self.sample_rng_stream(args)
-    }
-
-    fn sample_rng_stream(&mut self, args: &[RuntimeValue]) -> Result<RuntimeValue, ExprError> {
-        match args.len() {
-            0 => {
-                let val = self.rng.as_mut().map_or(0.0, DetRng::next_f64);
-                Ok(RuntimeValue::Number(val))
-            }
-            1 => {
-                if let Some(max_vec) = self.runtime_as_f64_vec(&args[0])? {
-                    let rng = self.rng.as_mut().ok_or_else(|| {
-                        ExprError::RuntimeError("PRNG stream not initialized".to_string())
-                    })?;
-                    let out = max_vec.into_iter().map(|m| rng.next_f64() * m).collect();
-                    return self.alloc_f64_vec(out);
-                }
-                let max_val = self.runtime_to_number(&args[0])?;
-                let r = self.rng.as_mut().map_or(0.0, DetRng::next_f64);
-                Ok(RuntimeValue::Number(r * max_val))
-            }
-            _ => {
-                let lo_vec = self.runtime_as_f64_vec(&args[0])?;
-                let hi_vec = self.runtime_as_f64_vec(&args[1])?;
-                if let (Some(lo), Some(hi)) = (lo_vec, hi_vec) {
-                    let len = lo.len().max(hi.len());
-                    let rng = self.rng.as_mut().ok_or_else(|| {
-                        ExprError::RuntimeError("PRNG stream not initialized".to_string())
-                    })?;
-                    let mut out = Vec::with_capacity(len);
-                    for i in 0..len {
-                        let a = lo.get(i).copied().unwrap_or(0.0);
-                        let b = hi.get(i).copied().unwrap_or(0.0);
-                        out.push((b - a) * rng.next_f64() + a);
-                    }
-                    return self.alloc_f64_vec(out);
-                }
-                let lo = self.runtime_to_number(&args[0])?;
-                let hi = self.runtime_to_number(&args[1])?;
-                let r = self.rng.as_mut().map_or(0.0, DetRng::next_f64);
-                Ok(RuntimeValue::Number((hi - lo) * r + lo))
-            }
-        }
+        let seed = match args.first() {
+            Some(v) => self.runtime_to_number(v)?,
+            None => f64::NAN,
+        };
+        Ok(RuntimeValue::Number(cm3_random(seed)))
     }
 
     fn require_vec_arg(
@@ -4906,4 +5143,34 @@ fn is_top_level_math_fn(name: &str) -> bool {
             | "tanh"
             | "trunc"
     )
+}
+
+fn is_methods_member(name: &str, mode: ExprMode) -> bool {
+    if matches!(
+        name,
+        "add"
+            | "sub"
+            | "mul"
+            | "div"
+            | "clamp"
+            | "dot"
+            | "cross"
+            | "normalize"
+            | "length"
+            | "wave"
+            | "lerp"
+            | "linear"
+            | "catmullRom"
+            | "ease"
+            | "random"
+            | "gaussRandom"
+            | "shake"
+    ) {
+        return true;
+    }
+    mode == ExprMode::ExpressionsPlus
+        && matches!(
+            name,
+            "wiggle" | "easeIn" | "easeOut" | "degreesToRadians" | "radiansToDegrees"
+        )
 }

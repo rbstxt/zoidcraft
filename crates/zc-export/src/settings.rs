@@ -31,6 +31,20 @@ pub enum ExportContainer {
     Mkv,
     /// Directory of RGBA8 PNG frames (`frame_000001.png`, ...), exported directly without FFmpeg.
     PngSequence,
+    /// Animated GIF (`.gif`), encoded with palettegen/paletteuse via FFmpeg.
+    Gif,
+    /// Audio-only 16-bit PCM RIFF/WAVE (`.wav`), written directly without FFmpeg.
+    Wav,
+    /// Audio-only AAC-LC MPEG-4 audio (`.m4a`), encoded via FFmpeg.
+    M4a,
+}
+
+impl ExportContainer {
+    /// Returns `true` for audio-only export containers (`Wav`, `M4a`) that skip video rendering.
+    #[must_use]
+    pub const fn is_audio_only(self) -> bool {
+        matches!(self, Self::Wav | Self::M4a)
+    }
 }
 
 /// Video codec selection for FFmpeg-backed containers.
@@ -113,15 +127,20 @@ impl ExportSettings {
     /// Returns `true` when the selected container/codec requires even width and height (4:2:0).
     #[must_use]
     pub const fn requires_even_dimensions(&self) -> bool {
-        !matches!(self.container, ExportContainer::PngSequence)
-            && matches!(
-                self.video_codec,
-                VideoCodec::H264
-                    | VideoCodec::H265
-                    | VideoCodec::Vp9
-                    | VideoCodec::Vp8
-                    | VideoCodec::Av1
-            )
+        !matches!(
+            self.container,
+            ExportContainer::PngSequence
+                | ExportContainer::Gif
+                | ExportContainer::Wav
+                | ExportContainer::M4a
+        ) && matches!(
+            self.video_codec,
+            VideoCodec::H264
+                | VideoCodec::H265
+                | VideoCodec::Vp9
+                | VideoCodec::Vp8
+                | VideoCodec::Av1
+        )
     }
 
     /// Returns the encoded output dimensions after odd-dimension 1px right/bottom padding.
@@ -136,28 +155,6 @@ impl ExportSettings {
 
     /// Validates settings for internal consistency, resource bounds, and container/codec compatibility.
     pub fn validate(&self) -> Result<(), ExportError> {
-        if self.width == 0
-            || self.height == 0
-            || self.width > MAX_EXPORT_DIMENSION
-            || self.height > MAX_EXPORT_DIMENSION
-        {
-            return Err(ExportError::InvalidSettings(format!(
-                "width ({}) and height ({}) must be in 1..={MAX_EXPORT_DIMENSION}",
-                self.width, self.height
-            )));
-        }
-        let (enc_w, enc_h) = self.padded_dimensions();
-        let padded_bytes = (enc_w as usize)
-            .checked_mul(enc_h as usize)
-            .and_then(|px| px.checked_mul(4))
-            .ok_or_else(|| {
-                ExportError::InvalidSettings("export frame byte size overflow".to_string())
-            })?;
-        if padded_bytes > MAX_EXPORT_FRAME_BYTES {
-            return Err(ExportError::InvalidSettings(format!(
-                "export frame size ({padded_bytes} bytes) exceeds limit ({MAX_EXPORT_FRAME_BYTES} bytes)"
-            )));
-        }
         if !self.fps.is_finite() || self.fps < MIN_EXPORT_FPS || self.fps > MAX_EXPORT_FPS {
             return Err(ExportError::InvalidSettings(format!(
                 "fps ({}) must be finite and in {MIN_EXPORT_FPS}..={MAX_EXPORT_FPS}",
@@ -182,7 +179,48 @@ impl ExportSettings {
             ));
         }
 
-        if matches!(self.container, ExportContainer::PngSequence) {
+        if self.container.is_audio_only() {
+            if !(MIN_EXPORT_SAMPLE_RATE..=MAX_EXPORT_SAMPLE_RATE).contains(&self.sample_rate) {
+                return Err(ExportError::InvalidSettings(format!(
+                    "sample_rate ({}) must be in {MIN_EXPORT_SAMPLE_RATE}..={MAX_EXPORT_SAMPLE_RATE} Hz for audio-only export",
+                    self.sample_rate
+                )));
+            }
+            if matches!(self.container, ExportContainer::M4a) && self.audio_bitrate_kbps == 0 {
+                return Err(ExportError::InvalidSettings(
+                    "audio_bitrate_kbps must be greater than zero for M4A export".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+
+        if self.width == 0
+            || self.height == 0
+            || self.width > MAX_EXPORT_DIMENSION
+            || self.height > MAX_EXPORT_DIMENSION
+        {
+            return Err(ExportError::InvalidSettings(format!(
+                "width ({}) and height ({}) must be in 1..={MAX_EXPORT_DIMENSION}",
+                self.width, self.height
+            )));
+        }
+        let (enc_w, enc_h) = self.padded_dimensions();
+        let padded_bytes = (enc_w as usize)
+            .checked_mul(enc_h as usize)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| {
+                ExportError::InvalidSettings("export frame byte size overflow".to_string())
+            })?;
+        if padded_bytes > MAX_EXPORT_FRAME_BYTES {
+            return Err(ExportError::InvalidSettings(format!(
+                "export frame size ({padded_bytes} bytes) exceeds limit ({MAX_EXPORT_FRAME_BYTES} bytes)"
+            )));
+        }
+
+        if matches!(
+            self.container,
+            ExportContainer::PngSequence | ExportContainer::Gif
+        ) {
             return Ok(());
         }
 
@@ -213,7 +251,7 @@ impl ExportSettings {
 
         if self.transparent_alpha && self.video_codec != VideoCodec::Vp9 {
             return Err(ExportError::InvalidSettings(format!(
-                "transparent_alpha is only supported for PngSequence or VP9 (WebM/MKV), not {:?}",
+                "transparent_alpha is only supported for PngSequence, Gif, or VP9 (WebM/MKV), not {:?}",
                 self.video_codec
             )));
         }
@@ -253,7 +291,11 @@ impl ExportSettings {
                     ));
                 }
             }
-            ExportContainer::Mkv | ExportContainer::PngSequence => {}
+            ExportContainer::Mkv
+            | ExportContainer::PngSequence
+            | ExportContainer::Gif
+            | ExportContainer::Wav
+            | ExportContainer::M4a => {}
         }
 
         Ok(())

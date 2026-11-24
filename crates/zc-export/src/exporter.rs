@@ -141,11 +141,181 @@ where
         return Err(ExportError::Cancelled);
     }
 
-    if matches!(settings.container, ExportContainer::PngSequence) {
-        export_png_sequence(settings, cancel, frame_provider, on_progress)
-    } else {
-        export_ffmpeg(settings, audio_stereo, cancel, frame_provider, on_progress)
+    match settings.container {
+        ExportContainer::PngSequence => {
+            export_png_sequence(settings, cancel, frame_provider, on_progress)
+        }
+        ExportContainer::Wav => export_wav_audio_only(settings, audio_stereo, cancel),
+        ExportContainer::M4a => export_m4a_audio_only(settings, audio_stereo, cancel),
+        ExportContainer::Mp4
+        | ExportContainer::Webm
+        | ExportContainer::Mkv
+        | ExportContainer::Gif => {
+            export_ffmpeg(settings, audio_stereo, cancel, frame_provider, on_progress)
+        }
     }
+}
+
+fn export_wav_audio_only(
+    settings: &ExportSettings,
+    audio_stereo: Option<&[[f32; 2]]>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<ExportReport, ExportError> {
+    if let Ok(meta) = fs::symlink_metadata(&settings.output_path)
+        && meta.is_dir()
+    {
+        return Err(ExportError::Io(std::io::Error::new(
+            ErrorKind::IsADirectory,
+            format!(
+                "audio output path {} is an existing directory",
+                settings.output_path.display()
+            ),
+        )));
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
+
+    let expected_samples = zc_audio::mixer::offline_total_samples(
+        f64::from(settings.total_frames()),
+        settings.fps,
+        settings.sample_rate,
+    );
+    let silence: Vec<[f32; 2]>;
+    let samples: &[[f32; 2]] = match audio_stereo {
+        Some(s) => s,
+        None => {
+            silence = vec![[0.0_f32; 2]; expected_samples];
+            &silence
+        }
+    };
+
+    let wav_bytes = zc_audio::try_encode_wav_pcm16_stereo(samples, settings.sample_rate)
+        .map_err(|e| ExportError::InvalidSettings(e.to_string()))?;
+
+    if let Some(parent) = settings.output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let temp_output_path = unique_sibling_temp_path(&settings.output_path);
+    let mut temp_output_guard = TempFileGuard::new(temp_output_path);
+    fs::write(temp_output_guard.path(), &wav_bytes)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
+    publish_temp_output(temp_output_guard.path(), &settings.output_path)?;
+    temp_output_guard.disarm();
+
+    Ok(ExportReport {
+        frames_exported: 0,
+        output_width: 0,
+        output_height: 0,
+        audio_samples_written: samples.len(),
+        output_path: settings.output_path.clone(),
+    })
+}
+
+fn export_m4a_audio_only(
+    settings: &ExportSettings,
+    audio_stereo: Option<&[[f32; 2]]>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<ExportReport, ExportError> {
+    if let Ok(meta) = fs::symlink_metadata(&settings.output_path)
+        && meta.is_dir()
+    {
+        return Err(ExportError::Io(std::io::Error::new(
+            ErrorKind::IsADirectory,
+            format!(
+                "audio output path {} is an existing directory",
+                settings.output_path.display()
+            ),
+        )));
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
+
+    let expected_samples = zc_audio::mixer::offline_total_samples(
+        f64::from(settings.total_frames()),
+        settings.fps,
+        settings.sample_rate,
+    );
+    let silence: Vec<[f32; 2]>;
+    let samples: &[[f32; 2]] = match audio_stereo {
+        Some(s) => s,
+        None => {
+            silence = vec![[0.0_f32; 2]; expected_samples];
+            &silence
+        }
+    };
+
+    let temp_audio_guard = write_temp_stereo_wav_f32(samples, settings.sample_rate)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
+    if let Some(parent) = settings.output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temp_output_path = unique_sibling_temp_path(&settings.output_path);
+    let mut temp_output_guard = TempFileGuard::new(temp_output_path);
+    let args = build_ffmpeg_os_args_with_output(
+        settings,
+        Some(temp_audio_guard.path()),
+        temp_output_guard.path(),
+    )?;
+
+    let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
+    let mut cmd = Command::new(bin);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    configure_process_group(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            ExportError::FfmpegNotFound(bin.display().to_string())
+        } else {
+            ExportError::Io(err)
+        }
+    })?;
+    let stderr_pipe = child.stderr.take();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
+        if let Some(reader) = stderr_pipe {
+            ring.drain_reader(reader);
+        }
+        let _ = stderr_tx.send(ring.into_string_lossy());
+    });
+
+    let child_guard = SharedChildGuard::new(child);
+    let status = child_guard.wait_cancellable(cancel)?;
+    let _ = stderr_handle.join();
+    let stderr_text = stderr_rx.try_recv().unwrap_or_default();
+    drop(temp_audio_guard);
+
+    if !status.success() {
+        return Err(ExportError::FfmpegFailed {
+            exit_code: status.code(),
+            stderr: stderr_text,
+        });
+    }
+
+    publish_temp_output(temp_output_guard.path(), &settings.output_path)?;
+    temp_output_guard.disarm();
+
+    Ok(ExportReport {
+        frames_exported: 0,
+        output_width: 0,
+        output_height: 0,
+        audio_samples_written: samples.len(),
+        output_path: settings.output_path.clone(),
+    })
 }
 
 struct TempDirGuard {
@@ -1494,5 +1664,185 @@ mod tests {
             "frame provider must not be called when destination is a directory"
         );
         let _ = fs::remove_dir_all(&existing_dir);
+    }
+
+    #[test]
+    fn end_to_end_bt709_color_parity_and_ntsc_rational_fps() {
+        if probe_ffmpeg(None).is_err() {
+            return;
+        }
+        let out_mp4 = unique_test_path("e2e_bt709_ntsc.mp4");
+        let _guard = TempFileGuard::new(out_mp4.clone());
+
+        let settings = ExportSettings {
+            width: 32,
+            height: 32,
+            fps: 29.97,
+            start_frame: 0,
+            end_frame: 4,
+            container: ExportContainer::Mp4,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::None,
+            quality: QualityMode::Crf(10),
+            audio_bitrate_kbps: 0,
+            sample_rate: 48_000,
+            transparent_alpha: false,
+            output_path: out_mp4.clone(),
+            ffmpeg_binary: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        export_video(&settings, None, &cancel, |_idx, buf: &mut Vec<u8>| {
+            for px in buf.as_chunks_mut::<4>().0 {
+                *px = [255, 0, 0, 255];
+            }
+            Ok(())
+        })
+        .expect("BT.709 NTSC MP4 export succeeds");
+
+        if let Ok(probe_out) = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=color_space,color_primaries,color_transfer,color_range,r_frame_rate",
+                "-of",
+                "default=noprint_wrappers=1",
+            ])
+            .arg(&out_mp4)
+            .output()
+            && probe_out.status.success()
+        {
+            let text = String::from_utf8_lossy(&probe_out.stdout);
+            assert!(text.contains("color_space=bt709"), "probe: {text}");
+            assert!(text.contains("color_primaries=bt709"), "probe: {text}");
+            assert!(
+                text.contains("color_transfer=iec61966-2-1"),
+                "probe: {text}"
+            );
+            assert!(text.contains("color_range=tv"), "probe: {text}");
+            assert!(text.contains("r_frame_rate=30000/1001"), "probe: {text}");
+        }
+
+        // Decode frame 0 back to raw YUV420p and verify exact BT.709 limited-range luma for pure red
+        // (BT.709 red Y = 63, whereas buggy BT.601 conversion yields Y = 81).
+        if let Ok(dec) = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&out_mp4)
+            .args([
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "pipe:1",
+            ])
+            .output()
+            && dec.status.success()
+            && !dec.stdout.is_empty()
+        {
+            let y = dec.stdout[0];
+            assert!(
+                (58..=68).contains(&y),
+                "expected BT.709 limited-range red luma ~63 (not BT.601 ~81), got Y={y}"
+            );
+        }
+    }
+
+    #[test]
+    fn end_to_end_vp9_transparent_alpha_and_wav_audio_only_export() {
+        let wav_path = unique_test_path("audio_only.wav");
+        let _wav_guard = TempFileGuard::new(wav_path.clone());
+        let audio = vec![[-1.0_f32, 1.0_f32]; 4_800];
+        let wav_settings = ExportSettings {
+            width: 0,
+            height: 0,
+            fps: 30.0,
+            start_frame: 0,
+            end_frame: 3,
+            container: ExportContainer::Wav,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Pcm,
+            quality: QualityMode::Crf(18),
+            audio_bitrate_kbps: 0,
+            sample_rate: 48_000,
+            transparent_alpha: false,
+            output_path: wav_path.clone(),
+            ffmpeg_binary: Some(PathBuf::from("/nonexistent/ffmpeg")),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let wav_report = export_video(
+            &wav_settings,
+            Some(&audio),
+            &cancel,
+            |_idx, _buf: &mut Vec<u8>| unreachable!("audio-only export must not render frames"),
+        )
+        .expect("WAV audio-only export succeeds without FFmpeg");
+        assert_eq!(wav_report.audio_samples_written, 4_800);
+        let raw_wav = fs::read(&wav_path).expect("read exported WAV");
+        assert_eq!(&raw_wav[0..4], b"RIFF");
+        assert_eq!(i16::from_le_bytes([raw_wav[44], raw_wav[45]]), -32_768);
+        assert_eq!(i16::from_le_bytes([raw_wav[46], raw_wav[47]]), 32_767);
+
+        if probe_ffmpeg(None).is_err() {
+            return;
+        }
+        let webm_path = unique_test_path("e2e_vp9_alpha.webm");
+        let _webm_guard = TempFileGuard::new(webm_path.clone());
+        let vp9_settings = ExportSettings {
+            width: 32,
+            height: 32,
+            fps: 23.976,
+            start_frame: 0,
+            end_frame: 3,
+            container: ExportContainer::Webm,
+            video_codec: VideoCodec::Vp9,
+            audio_codec: AudioCodec::None,
+            quality: QualityMode::Crf(12),
+            audio_bitrate_kbps: 0,
+            sample_rate: 48_000,
+            transparent_alpha: true,
+            output_path: webm_path.clone(),
+            ffmpeg_binary: None,
+        };
+        export_video(&vp9_settings, None, &cancel, |_idx, buf: &mut Vec<u8>| {
+            for px in buf.as_chunks_mut::<4>().0 {
+                *px = [0, 220, 40, 128];
+            }
+            Ok(())
+        })
+        .expect("VP9 transparent alpha export succeeds");
+
+        if let Ok(dec) = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-c:v",
+                "libvpx-vp9",
+                "-i",
+            ])
+            .arg(&webm_path)
+            .args([
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "pipe:1",
+            ])
+            .output()
+            && dec.status.success()
+            && dec.stdout.len() >= 4
+        {
+            let a = dec.stdout[3];
+            assert!(
+                (118..=138).contains(&a),
+                "expected preserved VP9 semi-transparent alpha ~128, got A={a}"
+            );
+        }
     }
 }

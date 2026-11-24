@@ -21,15 +21,17 @@ pub use effects::{
     create_zoidium_effect, find_effect_descriptor, standard_effect_catalog, zoidium_effect_catalog,
 };
 pub use model::{
-    AssetKind, AssetRecord, AssetSource, AudioClip, AudioClipData, AudioTrack, CameraData,
-    CameraDofParams, CameraKind, CameraShakeParams, CameraVibrateParams, CompatMode,
-    CustomPbrMaterial, CustomProperty, DrawOp, EffectInstance, EffectKind, EulerOrder,
-    FollowConstraint, GradientStop, ImagePlusMaterial, Layer, LayerKind, LightData, LightKind,
-    Marker, MatcapMaterial, MaterialSpec, MediaItem, ModelData, MotionBlurSettings, Object3D,
-    Object3DKind, ObjectConstraints, ParticlesData, PbrPlusMaterial, PresetShapeKind, Project,
-    PropertyKeyframe, PropertyTrack, PropertyValue, Sequence, SequenceControl, SequenceControlKind,
+    AssetKind, AssetRecord, AssetSource, AudioClip, AudioClipData, AudioTrack,
+    CM3_BLEND_MODE_TOKENS, CameraData, CameraDofParams, CameraKind, CameraMotionBlurParams,
+    CameraShakeParams, CameraVibrateParams, CompatMode, CustomPbrMaterial, CustomProperty, DrawOp,
+    EffectInstance, EffectKind, EulerOrder, FollowConstraint, GradientStop, ImagePlusMaterial,
+    Layer, Layer3DProps, LayerKind, LayerMask, LightData, LightKind, Marker, MaskMode,
+    MatcapMaterial, MaterialSpec, MediaItem, ModelData, MotionBlurSettings, Object3D, Object3DKind,
+    ObjectConstraints, ParticlesData, PbrPlusMaterial, PresetShapeKind, Project, PropertyKeyframe,
+    PropertyTrack, PropertyValue, SceneBackdrop, Sequence, SequenceControl, SequenceControlKind,
     Shape2DKind, Shape2DNode, Shape3DKind, StaticBehavior, Text3DAlign, Text3DData,
     TextureMaterial, TrackToConstraint, VideoClip, VideoMaterial, VideoTrack,
+    cm3_blend_mode_from_index, normalize_blend_mode_token,
 };
 pub use pz_import::{PzImportResult, import_pz, import_pz_from_bytes};
 pub use sha256::{cm3_asset_key, sha256_bytes, sha256_hex};

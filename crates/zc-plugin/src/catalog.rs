@@ -201,7 +201,7 @@ pub fn builtin_plugins() -> Vec<PluginDescriptor> {
             tagline: s("Editable 2D/3D viewport position trajectories and Bezier tangent handles."),
             description: s(
                 "Draws animated position trajectories directly in the viewport with direct keyframe \
-                 and tangent dragging, writing strictly native CM3 keyframe fields.",
+                 and tangent dragging, writing strictly standard keyframe fields.",
             ),
             default_enabled: true,
             always_enabled: false,
@@ -326,7 +326,7 @@ pub fn builtin_plugins() -> Vec<PluginDescriptor> {
             kind: PluginKind::MaterialPack,
             tagline: s("Node Material, PBR+, Matcap, Image+, and arc-length UV Custom materials."),
             description: s(
-                "Adds 5 native 3D materials without modifying stock CM3 materials, including a \
+                "Adds 5 native 3D materials without modifying standard materials, including a \
                  deterministic procedural Node Material baker and corrected arc-length text UVs.",
             ),
             default_enabled: false,
@@ -432,7 +432,7 @@ pub fn builtin_plugins() -> Vec<PluginDescriptor> {
         },
         PluginDescriptor {
             id: s("optical-flares"),
-            name: s("Optical Lens Flares"),
+            name: s("3D Lens Flares"),
             author: s("ZoidCraft"),
             version: s("1.0.0"),
             category: PluginCategory::Scene,
@@ -441,7 +441,7 @@ pub fn builtin_plugins() -> Vec<PluginDescriptor> {
                 "3D projected lens flares with per-pixel depth occlusion and 12 element types.",
             ),
             description: s(
-                "Clean-room 3D optical flare system projecting multi-element flares through the \
+                "3D lens flare system projecting multi-element flares through the \
                  active camera with depth occlusion, distance falloff, and deterministic shimmer.",
             ),
             default_enabled: false,
@@ -617,7 +617,7 @@ pub fn builtin_plugins() -> Vec<PluginDescriptor> {
             tagline: s("Visual GPU shader node graph compiling directly to native Custom Shaders."),
             description: s(
                 "Node-based fragment shader authoring tool supporting noise, Voronoi, color ramps, \
-                 blurs, and edge detection that compiles into standard CM3 Custom Shaders with \
+                 blurs, and edge detection that compiles into standard Custom Shaders with \
                  zero runtime plugin dependency.",
             ),
             default_enabled: true,
@@ -629,7 +629,7 @@ pub fn builtin_plugins() -> Vec<PluginDescriptor> {
         },
         PluginDescriptor {
             id: s("smart-motion-blur-lite"),
-            name: s("ZSMB Lite (beta 1.0)"),
+            name: s("Smart Motion Blur Lite (beta 1.0)"),
             author: s("ZoidCraft"),
             version: s("1.0.0-beta.1"),
             category: PluginCategory::Adjustment,

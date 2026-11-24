@@ -15,18 +15,18 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::glsl_shim::UniformValue;
+use crate::glsl_shim::{UniformValue, fix_property_name};
 
 /// Width in texels of baked Shader+ 1D gradient textures (`256 x 1` RGBA8 straight alpha).
 pub const GRADIENT_LUT_WIDTH: usize = 256;
-/// Width in texels of baked Shader+ 1D curve LUT textures (`1024 x 1` RGBA8).
+/// Width in texels of baked Shader+ 1D curve LUT textures (`1024 x 1` RGBA8 / RGBA16F).
 pub const CURVE_LUT_WIDTH: usize = 1024;
 /// Maximum number of RGBA swatches in a Shader+ `Palette` uniform (`vec4[16]`).
 pub const MAX_PALETTE_COLORS: usize = 16;
 /// Maximum number of temporal `TimeSample` textures per custom shader effect.
 pub const MAX_TIME_SAMPLES: usize = 4;
-
-const EQ_EPSILON: f64 = 1e-6;
+/// Maximum number of control points retained per curve channel (matches Zoidium `graph-curves.js`).
+const MAX_CURVE_POINTS: usize = 16;
 
 /// Errors emitted while parsing Shader+ rules or constructing constrained specs.
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -146,7 +146,7 @@ impl ShaderPropertyDef {
     /// If this property is a `StaticDropdown`, returns the `(macro_name, value)` compile define.
     pub fn static_define(&self, selected_index: u32) -> Option<(String, String)> {
         if matches!(self.kind, ShaderPropertyKind::StaticDropdown { .. }) {
-            Some((self.name.clone(), selected_index.to_string()))
+            Some((fix_property_name(&self.name), selected_index.to_string()))
         } else {
             None
         }
@@ -157,10 +157,11 @@ impl ShaderPropertyDef {
 // Visibility Conditions & Rename Rules
 // ---------------------------------------------------------------------------
 
-/// One atomic comparison clause inside a `;`-separated OR [`VisibilityCondition`].
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// One atomic comparison clause inside a `;` / `\n`-separated OR [`VisibilityCondition`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConditionClause {
     Exact(f64),
+    ExactString(String),
     NotEqual(f64),
     Greater(f64),
     GreaterOrEqual(f64),
@@ -170,19 +171,43 @@ pub enum ConditionClause {
 }
 
 impl ConditionClause {
-    /// Evaluates this clause against a numeric property value.
-    pub fn matches(self, value: f64) -> bool {
+    /// Evaluates this clause against a numeric property value using strict numeric boundaries
+    /// (matching Zoidium `visibility.js`).
+    pub fn matches(&self, value: f64) -> bool {
         if !value.is_finite() {
             return false;
         }
         match self {
-            Self::Exact(target) => (value - target).abs() <= EQ_EPSILON,
-            Self::NotEqual(target) => (value - target).abs() > EQ_EPSILON,
-            Self::Greater(target) => value > target + EQ_EPSILON,
-            Self::GreaterOrEqual(target) => value >= target - EQ_EPSILON,
-            Self::Less(target) => value < target - EQ_EPSILON,
-            Self::LessOrEqual(target) => value <= target + EQ_EPSILON,
-            Self::Range { min, max } => value >= min - EQ_EPSILON && value <= max + EQ_EPSILON,
+            Self::Exact(target) => value == *target,
+            Self::ExactString(_) => false,
+            Self::NotEqual(target) => value != *target,
+            Self::Greater(target) => value > *target,
+            Self::GreaterOrEqual(target) => value >= *target,
+            Self::Less(target) => value < *target,
+            Self::LessOrEqual(target) => value <= *target,
+            Self::Range { min, max } => value >= *min && value <= *max,
+        }
+    }
+
+    /// Evaluates this clause against a string property value (exact string equality).
+    pub fn matches_str(&self, value: &str) -> bool {
+        match self {
+            Self::ExactString(target) => value == target,
+            _ => false,
+        }
+    }
+
+    /// Formats this clause back into canonical Zoidium condition syntax.
+    pub fn format(&self) -> String {
+        match self {
+            Self::Exact(v) => format!("{v}"),
+            Self::ExactString(s) => s.clone(),
+            Self::NotEqual(v) => format!("!= {v}"),
+            Self::Greater(v) => format!("> {v}"),
+            Self::GreaterOrEqual(v) => format!(">= {v}"),
+            Self::Less(v) => format!("< {v}"),
+            Self::LessOrEqual(v) => format!("<= {v}"),
+            Self::Range { min, max } => format!("{min}..{max}"),
         }
     }
 
@@ -192,50 +217,54 @@ impl ConditionClause {
             return Err(ShaderPlusError::InvalidCondition(raw.to_string()));
         }
 
+        // Comparison operators: >=, <=, !=, >, <, = (explicitly rejects `==` and `!`).
+        for (prefix, ctor) in [
+            (">=", Self::GreaterOrEqual as fn(f64) -> Self),
+            ("<=", Self::LessOrEqual as fn(f64) -> Self),
+            ("!=", Self::NotEqual as fn(f64) -> Self),
+            (">", Self::Greater as fn(f64) -> Self),
+            ("<", Self::Less as fn(f64) -> Self),
+            ("=", Self::Exact as fn(f64) -> Self),
+        ] {
+            if let Some(rest) = s.strip_prefix(prefix) {
+                let n = parse_strict_number(rest.trim(), raw)?;
+                return Ok(ctor(n));
+            }
+        }
+
+        // Range: `min..max` with strictly one `..` and `min <= max`.
         if let Some((lhs, rhs)) = s.split_once("..") {
-            let min = parse_finite_number(lhs, raw)?;
-            let max = parse_finite_number(rhs, raw)?;
+            if rhs.contains("..") {
+                return Err(ShaderPlusError::InvalidCondition(raw.to_string()));
+            }
+            let min = parse_strict_number(lhs.trim(), raw)?;
+            let max = parse_strict_number(rhs.trim(), raw)?;
             if min > max {
                 return Err(ShaderPlusError::InvalidRange { min, max });
             }
             return Ok(Self::Range { min, max });
         }
 
-        if let Some(rest) = s.strip_prefix(">=") {
-            return Ok(Self::GreaterOrEqual(parse_finite_number(rest, raw)?));
-        }
-        if let Some(rest) = s.strip_prefix("<=") {
-            return Ok(Self::LessOrEqual(parse_finite_number(rest, raw)?));
-        }
-        if let Some(rest) = s.strip_prefix("!=") {
-            return Ok(Self::NotEqual(parse_finite_number(rest, raw)?));
-        }
-        if let Some(rest) = s.strip_prefix("==") {
-            return Ok(Self::Exact(parse_finite_number(rest, raw)?));
-        }
-        if let Some(rest) = s.strip_prefix('>') {
-            return Ok(Self::Greater(parse_finite_number(rest, raw)?));
-        }
-        if let Some(rest) = s.strip_prefix('<') {
-            return Ok(Self::Less(parse_finite_number(rest, raw)?));
-        }
-        if let Some(rest) = s.strip_prefix('=') {
-            return Ok(Self::Exact(parse_finite_number(rest, raw)?));
+        // Reject malformed operator-prefixed tokens (e.g. `! 3`, `== 4`).
+        if s.starts_with(['<', '>', '=', '!']) {
+            return Err(ShaderPlusError::InvalidCondition(raw.to_string()));
         }
 
-        Ok(Self::Exact(parse_finite_number(s, raw)?))
+        // Exact numeric value if valid finite number literal, else exact string value.
+        if let Ok(n) = parse_strict_number(s, raw) {
+            return Ok(Self::Exact(n));
+        }
+        Ok(Self::ExactString(s.to_string()))
     }
 }
 
-fn parse_finite_number(s: &str, full_raw: &str) -> Result<f64, ShaderPlusError> {
-    let trimmed = s.trim();
-    if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("on") {
-        return Ok(1.0);
+/// Parses a finite numeric literal matching Zoidium's `NUMBER` regex:
+/// `[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?`.
+fn parse_strict_number(s: &str, full_raw: &str) -> Result<f64, ShaderPlusError> {
+    if !is_strict_number_syntax(s) {
+        return Err(ShaderPlusError::InvalidCondition(full_raw.to_string()));
     }
-    if trimmed.eq_ignore_ascii_case("false") || trimmed.eq_ignore_ascii_case("off") {
-        return Ok(0.0);
-    }
-    let parsed = trimmed
+    let parsed = s
         .parse::<f64>()
         .map_err(|_| ShaderPlusError::InvalidCondition(full_raw.to_string()))?;
     if !parsed.is_finite() {
@@ -244,7 +273,103 @@ fn parse_finite_number(s: &str, full_raw: &str) -> Result<f64, ShaderPlusError> 
     Ok(parsed)
 }
 
-/// Conditional rule matching a controlling property against one or more `;`-separated OR clauses.
+fn is_strict_number_syntax(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return false;
+    }
+    let mut i = 0;
+    if matches!(bytes[i], b'+' | b'-') {
+        i += 1;
+        if i >= len {
+            return false;
+        }
+    }
+    let mut has_digits = false;
+    while i < len && bytes[i].is_ascii_digit() {
+        has_digits = true;
+        i += 1;
+    }
+    if i < len && bytes[i] == b'.' {
+        i += 1;
+        let mut frac_digits = false;
+        while i < len && bytes[i].is_ascii_digit() {
+            frac_digits = true;
+            i += 1;
+        }
+        if !has_digits && !frac_digits {
+            return false;
+        }
+    } else if !has_digits {
+        return false;
+    }
+    if i < len && matches!(bytes[i], b'e' | b'E') {
+        i += 1;
+        if i < len && matches!(bytes[i], b'+' | b'-') {
+            i += 1;
+        }
+        let exp_start = i;
+        while i < len && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exp_start {
+            return false;
+        }
+    }
+    i == len
+}
+
+/// Zoidium saved JSON condition value (`values` array entry: number or string).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ZoidiumConditionValue {
+    Number(f64),
+    String(String),
+}
+
+/// Zoidium saved JSON comparison/range entry inside `conditions`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op")]
+pub enum ZoidiumConditionOp {
+    #[serde(rename = ">")]
+    Greater { value: f64 },
+    #[serde(rename = ">=")]
+    GreaterOrEqual { value: f64 },
+    #[serde(rename = "<")]
+    Less { value: f64 },
+    #[serde(rename = "<=")]
+    LessOrEqual { value: f64 },
+    #[serde(rename = "!=")]
+    NotEqual { value: f64 },
+    #[serde(rename = "=")]
+    Equal { value: f64 },
+    #[serde(rename = "range")]
+    Range { min: f64, max: f64 },
+}
+
+/// Zoidium saved JSON `visibleWhen` schema (`{ property, values, conditions }`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZoidiumVisibilityWhen {
+    pub property: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<ZoidiumConditionValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<ZoidiumConditionOp>,
+}
+
+/// Zoidium saved JSON `renameWhen` entry schema (`{ property, name, values, conditions }`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZoidiumRenameRule {
+    pub property: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<ZoidiumConditionValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<ZoidiumConditionOp>,
+}
+
+/// Conditional rule matching a controlling property against one or more `;` / `\n`-separated OR clauses.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VisibilityCondition {
     pub target_property: String,
@@ -252,7 +377,7 @@ pub struct VisibilityCondition {
 }
 
 impl VisibilityCondition {
-    /// Parses a condition expression like `"1; 3..5; >=10"` targeting `target_property`.
+    /// Parses a condition expression like `"1; 3..5; >=10; off"` targeting `target_property`.
     pub fn parse(target_property: impl Into<String>, expr: &str) -> Result<Self, ShaderPlusError> {
         let target = target_property.into();
         if target.trim().is_empty() {
@@ -262,7 +387,7 @@ impl VisibilityCondition {
         }
 
         let mut clauses = Vec::new();
-        for part in expr.split(';') {
+        for part in expr.split([';', '\n']) {
             let trimmed = part.trim();
             if trimmed.is_empty() {
                 continue;
@@ -280,9 +405,128 @@ impl VisibilityCondition {
         })
     }
 
+    /// Formats all clauses back into canonical `; `-separated Zoidium condition text.
+    pub fn format(&self) -> String {
+        self.clauses
+            .iter()
+            .map(ConditionClause::format)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Converts from Zoidium's saved `{ property, values, conditions }` JSON schema.
+    pub fn from_zoidium(when: &ZoidiumVisibilityWhen) -> Result<Self, ShaderPlusError> {
+        if when.property.trim().is_empty() {
+            return Err(ShaderPlusError::InvalidCondition(
+                "target property name cannot be empty".to_string(),
+            ));
+        }
+        let mut clauses = Vec::with_capacity(when.values.len() + when.conditions.len());
+        for v in &when.values {
+            match v {
+                ZoidiumConditionValue::Number(n) if n.is_finite() => {
+                    clauses.push(ConditionClause::Exact(*n));
+                }
+                ZoidiumConditionValue::Number(_) => {}
+                ZoidiumConditionValue::String(s) => {
+                    clauses.push(ConditionClause::ExactString(s.clone()));
+                }
+            }
+        }
+        for c in &when.conditions {
+            match *c {
+                ZoidiumConditionOp::Greater { value } => {
+                    clauses.push(ConditionClause::Greater(value))
+                }
+                ZoidiumConditionOp::GreaterOrEqual { value } => {
+                    clauses.push(ConditionClause::GreaterOrEqual(value))
+                }
+                ZoidiumConditionOp::Less { value } => clauses.push(ConditionClause::Less(value)),
+                ZoidiumConditionOp::LessOrEqual { value } => {
+                    clauses.push(ConditionClause::LessOrEqual(value))
+                }
+                ZoidiumConditionOp::NotEqual { value } => {
+                    clauses.push(ConditionClause::NotEqual(value))
+                }
+                ZoidiumConditionOp::Equal { value } => clauses.push(ConditionClause::Exact(value)),
+                ZoidiumConditionOp::Range { min, max } => {
+                    clauses.push(ConditionClause::Range { min, max })
+                }
+            }
+        }
+        if clauses.is_empty() {
+            return Err(ShaderPlusError::InvalidCondition(
+                "empty visibility condition".to_string(),
+            ));
+        }
+        Ok(Self {
+            target_property: when.property.clone(),
+            clauses,
+        })
+    }
+
+    /// Converts to Zoidium's saved `{ property, values, conditions }` JSON schema.
+    pub fn to_zoidium(&self) -> ZoidiumVisibilityWhen {
+        let mut values = Vec::new();
+        let mut conditions = Vec::new();
+        for clause in &self.clauses {
+            match clause {
+                ConditionClause::Exact(v) => values.push(ZoidiumConditionValue::Number(*v)),
+                ConditionClause::ExactString(s) => {
+                    values.push(ZoidiumConditionValue::String(s.clone()))
+                }
+                ConditionClause::Greater(value) => {
+                    conditions.push(ZoidiumConditionOp::Greater { value: *value })
+                }
+                ConditionClause::GreaterOrEqual(value) => {
+                    conditions.push(ZoidiumConditionOp::GreaterOrEqual { value: *value })
+                }
+                ConditionClause::Less(value) => {
+                    conditions.push(ZoidiumConditionOp::Less { value: *value })
+                }
+                ConditionClause::LessOrEqual(value) => {
+                    conditions.push(ZoidiumConditionOp::LessOrEqual { value: *value })
+                }
+                ConditionClause::NotEqual(value) => {
+                    conditions.push(ZoidiumConditionOp::NotEqual { value: *value })
+                }
+                ConditionClause::Range { min, max } => conditions.push(ZoidiumConditionOp::Range {
+                    min: *min,
+                    max: *max,
+                }),
+            }
+        }
+        ZoidiumVisibilityWhen {
+            property: self.target_property.clone(),
+            values,
+            conditions,
+        }
+    }
+
     /// Evaluates all `;`-OR clauses directly against a single numeric value.
     pub fn matches_value(&self, value: f64) -> bool {
         self.clauses.iter().any(|clause| clause.matches(value))
+    }
+
+    /// Evaluates all `;`-OR clauses directly against a string value (exact string equality).
+    pub fn matches_str(&self, value: &str) -> bool {
+        self.clauses.iter().any(|clause| clause.matches_str(value))
+    }
+
+    /// Evaluates a `StaticDropdown` controller value (stored as a numeric string like `"1"`),
+    /// matching either exact string equality or its parsed integer index (mirroring Zoidium's
+    /// `matchesController`).
+    pub fn matches_static_dropdown(&self, value: &str) -> bool {
+        if self.matches_str(value) {
+            return true;
+        }
+        if !value.is_empty()
+            && value.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = value.parse::<f64>()
+        {
+            return self.matches_value(n);
+        }
+        false
     }
 
     /// Evaluates this condition against a map of current property values.
@@ -311,6 +555,35 @@ impl RenameRule {
             condition: VisibilityCondition::parse(target_property, condition_expr)?,
             label: label.into(),
         })
+    }
+
+    /// Converts from Zoidium's saved `{ property, name, values, conditions }` JSON schema.
+    pub fn from_zoidium(rule: &ZoidiumRenameRule) -> Result<Self, ShaderPlusError> {
+        if rule.name.trim().is_empty() {
+            return Err(ShaderPlusError::InvalidCondition(
+                "rename rule label cannot be empty".to_string(),
+            ));
+        }
+        let when = ZoidiumVisibilityWhen {
+            property: rule.property.clone(),
+            values: rule.values.clone(),
+            conditions: rule.conditions.clone(),
+        };
+        Ok(Self {
+            condition: VisibilityCondition::from_zoidium(&when)?,
+            label: rule.name.clone(),
+        })
+    }
+
+    /// Converts to Zoidium's saved `{ property, name, values, conditions }` JSON schema.
+    pub fn to_zoidium(&self) -> ZoidiumRenameRule {
+        let when = self.condition.to_zoidium();
+        ZoidiumRenameRule {
+            property: when.property,
+            name: self.label.clone(),
+            values: when.values,
+            conditions: when.conditions,
+        }
     }
 }
 
@@ -398,37 +671,95 @@ impl Default for GradientSpec {
     }
 }
 
+/// One independent alpha/opacity stop matching Zoidium's `opacityStops` array.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OpacityStop {
+    /// Normalized stop position in `[0.0, 1.0]`.
+    pub position: f32,
+    /// Straight alpha value in `[0.0, 1.0]`.
+    pub alpha: f32,
+    /// Midpoint bias in `[0.0, 1.0]` toward the next stop (`0.5` = unbiased).
+    #[serde(default = "default_midpoint")]
+    pub midpoint: f32,
+}
+
+const fn default_midpoint() -> f32 {
+    0.5
+}
+
+impl OpacityStop {
+    /// Creates an unbiased (`midpoint = 0.5`) opacity stop.
+    pub const fn new(position: f32, alpha: f32) -> Self {
+        Self {
+            position,
+            alpha,
+            midpoint: 0.5,
+        }
+    }
+}
+
 /// Bakes `spec` into a `256 x 1` RGBA8 straight-alpha LUT (`1024` bytes).
 pub fn bake_gradient_rgba8(spec: &GradientSpec) -> Vec<u8> {
-    let mut out = vec![0u8; GRADIENT_LUT_WIDTH * 4];
-    if spec.stops.is_empty() {
-        return out;
-    }
+    bake_gradient_rgba8_with_opacity(spec, &[])
+}
 
-    let mut stops: Vec<GradientStop> = spec
-        .stops
+/// Bakes `spec` with optional independent `opacity_stops` into a `256 x 1` RGBA8 straight-alpha
+/// LUT (`1024` bytes), matching Zoidium `plugins/shader-plus/bake.js`.
+pub fn bake_gradient_rgba8_with_opacity(
+    spec: &GradientSpec,
+    opacity_stops: &[OpacityStop],
+) -> Vec<u8> {
+    let mut out = vec![0u8; GRADIENT_LUT_WIDTH * 4];
+
+    let mut stops: Vec<(usize, GradientStop)> = if spec.stops.is_empty() {
+        vec![(0, GradientStop::new(0.0, [1.0, 1.0, 1.0, 1.0]))]
+    } else {
+        spec.stops
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                (
+                    idx,
+                    GradientStop {
+                        position: clamp01_f32(s.position),
+                        color: [
+                            clamp01_f32(s.color[0]),
+                            clamp01_f32(s.color[1]),
+                            clamp01_f32(s.color[2]),
+                            clamp01_f32(s.color[3]),
+                        ],
+                        midpoint: if s.midpoint.is_finite() {
+                            s.midpoint.clamp(0.0, 1.0)
+                        } else {
+                            0.5
+                        },
+                    },
+                )
+            })
+            .collect()
+    };
+    stops.sort_by(|a, b| {
+        a.1.position
+            .total_cmp(&b.1.position)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let stops: Vec<GradientStop> = stops.into_iter().map(|(_, s)| s).collect();
+
+    let mut op_stops: Vec<OpacityStop> = opacity_stops
         .iter()
-        .map(|s| GradientStop {
-            position: s.position.clamp(0.0, 1.0),
-            color: [
-                s.color[0].clamp(0.0, 1.0),
-                s.color[1].clamp(0.0, 1.0),
-                s.color[2].clamp(0.0, 1.0),
-                s.color[3].clamp(0.0, 1.0),
-            ],
-            midpoint: s.midpoint.clamp(0.01, 0.99),
+        .map(|s| OpacityStop {
+            position: clamp01_f32(s.position),
+            alpha: clamp01_f32(s.alpha),
+            midpoint: if s.midpoint.is_finite() {
+                s.midpoint.clamp(0.0, 1.0)
+            } else {
+                0.5
+            },
         })
         .collect();
-    stops.sort_by(|a, b| a.position.total_cmp(&b.position));
+    op_stops.sort_by(|a, b| a.position.total_cmp(&b.position));
 
-    if stops.len() == 1 {
-        let rgba = rgba_f32_to_u8(stops[0].color);
-        for pixel in out.as_chunks_mut::<4>().0 {
-            pixel.copy_from_slice(&rgba);
-        }
-        return out;
-    }
-
+    let cyclic = spec.cyclic && stops.len() > 1;
     let working: Vec<[f32; 4]> = stops
         .iter()
         .map(|s| srgb_rgba_to_space(s.color, spec.color_space))
@@ -436,19 +767,31 @@ pub fn bake_gradient_rgba8(spec: &GradientSpec) -> Vec<u8> {
 
     let n = stops.len();
     for (idx, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let t = if spec.cyclic {
-            idx as f32 / GRADIENT_LUT_WIDTH as f32
-        } else {
-            idx as f32 / (GRADIENT_LUT_WIDTH - 1) as f32
-        };
+        // Zoidium always bakes texel i at t = i / 255.0 so texel[0] == texel[255] when cyclic.
+        let t = idx as f32 / (GRADIENT_LUT_WIDTH - 1) as f32;
 
-        let sample_space =
-            evaluate_gradient_sample(&stops, &working, t, spec.interpolation, spec.cyclic, n);
-        let srgb = space_rgba_to_srgb(sample_space, spec.color_space);
+        let mut srgb = if n == 1 {
+            stops[0].color
+        } else {
+            let sample_space =
+                evaluate_gradient_sample(&stops, &working, t, spec.interpolation, cyclic, n);
+            space_rgba_to_srgb(sample_space, spec.color_space)
+        };
+        if !op_stops.is_empty() {
+            srgb[3] = evaluate_opacity_at(&op_stops, t, spec.cyclic, spec.interpolation);
+        }
         pixel.copy_from_slice(&rgba_f32_to_u8(srgb));
     }
 
     out
+}
+
+fn clamp01_f32(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn evaluate_gradient_sample(
@@ -459,61 +802,57 @@ fn evaluate_gradient_sample(
     cyclic: bool,
     n: usize,
 ) -> [f32; 4] {
-    let (i0, i1, raw_u) = if !cyclic {
-        if t <= stops[0].position {
-            return working[0];
+    let first = &stops[0];
+    let last = &stops[n - 1];
+
+    let (i0, i1, raw_u, i_prev, i_next) = if t < first.position || t > last.position {
+        if !cyclic {
+            return if t < first.position {
+                working[0]
+            } else {
+                working[n - 1]
+            };
         }
-        if t >= stops[n - 1].position {
-            return working[n - 1];
-        }
-        let mut seg = 0;
-        for k in 0..n - 1 {
-            if t <= stops[k + 1].position {
-                seg = k;
-                break;
-            }
-        }
-        let span = stops[seg + 1].position - stops[seg].position;
-        let u = if span > 1e-7 {
-            ((t - stops[seg].position) / span).clamp(0.0, 1.0)
+        let span = first.position + 1.0 - last.position;
+        let f = if span > 0.0 {
+            ((if t < first.position { t + 1.0 } else { t }) - last.position) / span
         } else {
             0.0
         };
-        (seg, seg + 1, u)
-    } else if t < stops[0].position {
-        let span = (1.0 - stops[n - 1].position) + stops[0].position;
-        let u = if span > 1e-7 {
-            ((t + 1.0 - stops[n - 1].position) / span).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        (n - 1, 0, u)
-    } else if t >= stops[n - 1].position {
-        let span = (1.0 - stops[n - 1].position) + stops[0].position;
-        if span > 1e-7 {
-            let u = ((t - stops[n - 1].position) / span).clamp(0.0, 1.0);
-            (n - 1, 0, u)
-        } else {
-            return working[n - 1];
-        }
+        (n - 1, 0, f, n.saturating_sub(2), 1.min(n - 1))
     } else {
-        let mut seg = 0;
-        for k in 0..n - 1 {
-            if t < stops[k + 1].position {
-                seg = k;
-                break;
-            }
+        let mut index = 0;
+        while index < n - 2 && t > stops[index + 1].position {
+            index += 1;
         }
-        let span = stops[seg + 1].position - stops[seg].position;
-        let u = if span > 1e-7 {
-            ((t - stops[seg].position) / span).clamp(0.0, 1.0)
+        let next_idx = (index + 1).min(n - 1);
+        let span = stops[next_idx].position - stops[index].position;
+        if span <= 0.0 {
+            return if t < stops[next_idx].position {
+                working[index]
+            } else {
+                working[next_idx]
+            };
+        }
+        let f = (t - stops[index].position) / span;
+        let prev_idx = if index > 0 {
+            index - 1
+        } else if cyclic {
+            n - 1
         } else {
-            0.0
+            0
         };
-        (seg, seg + 1, u)
+        let after_idx = if index + 2 < n {
+            index + 2
+        } else if cyclic {
+            0
+        } else {
+            n - 1
+        };
+        (index, next_idx, f, prev_idx, after_idx)
     };
 
-    let u = apply_midpoint(raw_u, stops[i0].midpoint);
+    let mut u = apply_midpoint(raw_u, stops[i0].midpoint);
     let c0 = working[i0];
     let c1 = working[i1];
 
@@ -527,32 +866,105 @@ fn evaluate_gradient_sample(
         }
         GradientInterpolation::Linear => lerp_rgba(c0, c1, u),
         GradientInterpolation::Ease => {
-            let s = u * u * (3.0 - 2.0 * u);
-            lerp_rgba(c0, c1, s)
+            u = u * u * (3.0 - 2.0 * u);
+            lerp_rgba(c0, c1, u)
         }
         GradientInterpolation::Cardinal => {
-            let i_prev = if cyclic {
-                (i0 + n - 1) % n
-            } else {
-                i0.saturating_sub(1)
-            };
-            let i_next = if cyclic {
-                (i1 + 1) % n
-            } else {
-                (i1 + 1).min(n - 1)
-            };
             catmull_rom_rgba(working[i_prev], c0, c1, working[i_next], u)
         }
     }
 }
 
-fn apply_midpoint(u: f32, midpoint: f32) -> f32 {
-    let clamped = u.clamp(0.0, 1.0);
-    if clamped == 0.0 || clamped == 1.0 || (midpoint - 0.5).abs() < 1e-5 {
-        return clamped;
+fn evaluate_opacity_at(
+    stops: &[OpacityStop],
+    mut t: f32,
+    cyclic: bool,
+    interpolation: GradientInterpolation,
+) -> f32 {
+    let n = stops.len();
+    let (a, b, prev_a, next_a) = if t < stops[0].position || t > stops[n - 1].position {
+        if !cyclic || n < 2 {
+            return if t < stops[0].position {
+                stops[0].alpha
+            } else {
+                stops[n - 1].alpha
+            };
+        }
+        let previous = stops[n.saturating_sub(2)].alpha;
+        let next = stops[1.min(n - 1)].alpha;
+        let mut wrapped_last = stops[n - 1];
+        wrapped_last.position -= 1.0;
+        let first = stops[0];
+        if t > first.position {
+            t -= 1.0;
+        }
+        (wrapped_last, first, previous, next)
+    } else {
+        let mut i = 0;
+        while i < n - 2 && t > stops[i + 1].position {
+            i += 1;
+        }
+        let a = stops[i];
+        let b = stops[(i + 1).min(n - 1)];
+        let previous = stops[if i > 0 {
+            i - 1
+        } else if cyclic {
+            n - 1
+        } else {
+            0
+        }]
+        .alpha;
+        let next = stops[if i + 2 < n {
+            i + 2
+        } else if cyclic {
+            0
+        } else {
+            n - 1
+        }]
+        .alpha;
+        (a, b, previous, next)
+    };
+
+    let raw_f = if b.position > a.position {
+        (t - a.position) / (b.position - a.position)
+    } else {
+        0.0
+    };
+    let mut f = apply_midpoint(raw_f, a.midpoint);
+    match interpolation {
+        GradientInterpolation::Constant => {
+            f = if f < 1.0 { 0.0 } else { 1.0 };
+            a.alpha + (b.alpha - a.alpha) * f
+        }
+        GradientInterpolation::Ease => {
+            f = f * f * (3.0 - 2.0 * f);
+            a.alpha + (b.alpha - a.alpha) * f
+        }
+        GradientInterpolation::Cardinal => {
+            let f2 = f * f;
+            let f3 = f2 * f;
+            let v = 0.5
+                * (2.0 * a.alpha
+                    + (-prev_a + b.alpha) * f
+                    + (2.0 * prev_a - 5.0 * a.alpha + 4.0 * b.alpha - next_a) * f2
+                    + (-prev_a + 3.0 * a.alpha - 3.0 * b.alpha + next_a) * f3);
+            clamp01_f32(v)
+        }
+        GradientInterpolation::Linear => a.alpha + (b.alpha - a.alpha) * f,
     }
-    let exp = 0.5_f32.ln() / midpoint.clamp(0.01, 0.99).ln();
-    clamped.powf(exp).clamp(0.0, 1.0)
+}
+
+/// Piecewise-linear midpoint remapping matching Zoidium `plugins/shader-plus/bake.js:89-93`.
+fn apply_midpoint(t: f32, midpoint: f32) -> f32 {
+    let m = clamp01_f32(if midpoint.is_finite() { midpoint } else { 0.5 });
+    if m == 0.5 || t <= 0.0 || t >= 1.0 {
+        return t;
+    }
+    if t <= m {
+        0.5 * t / m.max(1e-12)
+    } else {
+        0.5 + 0.5 * (t - m) / (1.0 - m).max(1e-12)
+    }
 }
 
 fn lerp_rgba(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
@@ -768,64 +1180,200 @@ impl CurveChannel {
     }
 }
 
+/// Zoidium absolute Bezier handle specification on a curve point (`[0, 1]^2` coordinates).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ZoidiumCurveHandles {
+    #[serde(rename = "in", default)]
+    pub in_handle: Option<[f32; 2]>,
+    #[serde(rename = "out", default)]
+    pub out_handle: Option<[f32; 2]>,
+    #[serde(rename = "inIndependent", default)]
+    pub in_independent: bool,
+    #[serde(rename = "outIndependent", default)]
+    pub out_independent: bool,
+}
+
+/// Control point using Zoidium's exact absolute `[0, 1]^2` Bezier handle representation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ZoidiumCurvePoint {
+    pub x: f32,
+    pub y: f32,
+    #[serde(default)]
+    pub handles: Option<ZoidiumCurveHandles>,
+}
+
+impl ZoidiumCurvePoint {
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self {
+            x,
+            y,
+            handles: None,
+        }
+    }
+}
+
+fn round_curve_coord(v: f32) -> f32 {
+    (clamp01_f32(v) * 10_000.0).round() / 10_000.0
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SanitizedCurvePoint {
+    x: f32,
+    y: f32,
+    in_abs: Option<[f32; 2]>,
+    out_abs: Option<[f32; 2]>,
+    in_independent: bool,
+    out_independent: bool,
+}
+
+fn sanitize_curve_points(raw: &[SanitizedCurvePoint]) -> Vec<SanitizedCurvePoint> {
+    let mut sorted: Vec<SanitizedCurvePoint> = raw
+        .iter()
+        .map(|p| SanitizedCurvePoint {
+            x: round_curve_coord(p.x),
+            y: round_curve_coord(p.y),
+            in_abs: p.in_abs.map(|h| [clamp01_f32(h[0]), clamp01_f32(h[1])]),
+            out_abs: p.out_abs.map(|h| [clamp01_f32(h[0]), clamp01_f32(h[1])]),
+            in_independent: p.in_independent,
+            out_independent: p.out_independent,
+        })
+        .collect();
+    sorted.sort_by(|a, b| a.x.total_cmp(&b.x));
+
+    let mut unique: Vec<SanitizedCurvePoint> = Vec::with_capacity(sorted.len() + 2);
+    for pt in sorted {
+        if let Some(last) = unique.last_mut()
+            && (last.x - pt.x).abs() < 0.0001
+        {
+            *last = pt;
+        } else {
+            unique.push(pt);
+        }
+    }
+
+    if unique.is_empty() || unique[0].x > 0.0001 {
+        unique.insert(
+            0,
+            SanitizedCurvePoint {
+                x: 0.0,
+                y: 0.0,
+                in_abs: None,
+                out_abs: None,
+                in_independent: false,
+                out_independent: false,
+            },
+        );
+    } else {
+        unique[0].x = 0.0;
+    }
+
+    if unique[unique.len() - 1].x < 0.9999 {
+        unique.push(SanitizedCurvePoint {
+            x: 1.0,
+            y: 1.0,
+            in_abs: None,
+            out_abs: None,
+            in_independent: false,
+            out_independent: false,
+        });
+    } else {
+        let last_idx = unique.len() - 1;
+        unique[last_idx].x = 1.0;
+    }
+
+    if unique.len() > MAX_CURVE_POINTS {
+        let first = unique[0];
+        let last = unique[unique.len() - 1];
+        let mut capped = Vec::with_capacity(MAX_CURVE_POINTS);
+        capped.push(first);
+        capped.extend_from_slice(&unique[1..MAX_CURVE_POINTS - 1]);
+        capped.push(last);
+        return capped;
+    }
+
+    unique
+}
+
 struct PreparedCurve {
-    points: Vec<CurvePoint>,
+    points: Vec<SanitizedCurvePoint>,
+    widths: Vec<f32>,
     slopes: Vec<f32>,
 }
 
 impl PreparedCurve {
-    fn new(raw_points: &[CurvePoint]) -> Self {
-        let mut points = raw_points.to_vec();
-        points.sort_by(|a, b| a.x.total_cmp(&b.x));
-
+    fn from_sanitized(points: Vec<SanitizedCurvePoint>) -> Self {
         let n = points.len();
         if n <= 1 {
             return Self {
                 points,
+                widths: Vec::new(),
                 slopes: Vec::new(),
             };
         }
 
-        // Fritsch-Carlson monotone cubic Hermite tangents.
+        // Fritsch-Butland weighted harmonic mean tangents matching Zoidium `graph-curves.js:108-129`.
+        let mut widths = vec![0.0f32; n - 1];
         let mut secants = vec![0.0f32; n - 1];
         for k in 0..n - 1 {
-            let dx = points[k + 1].x - points[k].x;
-            if dx > 1e-7 {
-                secants[k] = (points[k + 1].y - points[k].y) / dx;
-            }
+            let width = (points[k + 1].x - points[k].x).max(0.0001);
+            widths[k] = width;
+            secants[k] = (points[k + 1].y - points[k].y) / width;
         }
 
         let mut slopes = vec![0.0f32; n];
         slopes[0] = secants[0];
         slopes[n - 1] = secants[n - 2];
         for k in 1..n - 1 {
-            if secants[k - 1] * secants[k] <= 0.0 {
+            let prev = secants[k - 1];
+            let next = secants[k];
+            if prev == 0.0 || next == 0.0 || prev * next <= 0.0 {
                 slopes[k] = 0.0;
             } else {
-                slopes[k] = 0.5 * (secants[k - 1] + secants[k]);
+                let w1 = 2.0 * widths[k] + widths[k - 1];
+                let w2 = widths[k] + 2.0 * widths[k - 1];
+                slopes[k] = (w1 + w2) / (w1 / prev + w2 / next);
             }
         }
 
-        for (k, &dk) in secants.iter().enumerate() {
-            if dk.abs() < 1e-12 {
-                slopes[k] = 0.0;
-                slopes[k + 1] = 0.0;
-            } else {
-                let alpha = slopes[k] / dk;
-                let beta = slopes[k + 1] / dk;
-                let h = alpha.hypot(beta);
-                if h > 3.0 {
-                    let tau = 3.0 / h;
-                    slopes[k] = tau * alpha * dk;
-                    slopes[k + 1] = tau * beta * dk;
-                }
-            }
+        Self {
+            points,
+            widths,
+            slopes,
         }
-
-        Self { points, slopes }
     }
 
-    fn evaluate(&self, x: f32) -> f32 {
+    fn new(raw_points: &[CurvePoint]) -> Self {
+        let converted: Vec<SanitizedCurvePoint> = raw_points
+            .iter()
+            .map(|p| SanitizedCurvePoint {
+                x: p.x,
+                y: p.y,
+                in_abs: p.in_tangent.map(|t| [p.x + t[0], p.y + t[1]]),
+                out_abs: p.out_tangent.map(|t| [p.x + t[0], p.y + t[1]]),
+                in_independent: false,
+                out_independent: false,
+            })
+            .collect();
+        Self::from_sanitized(sanitize_curve_points(&converted))
+    }
+
+    fn from_zoidium(raw_points: &[ZoidiumCurvePoint]) -> Self {
+        let converted: Vec<SanitizedCurvePoint> = raw_points
+            .iter()
+            .map(|p| SanitizedCurvePoint {
+                x: p.x,
+                y: p.y,
+                in_abs: p.handles.and_then(|h| h.in_handle),
+                out_abs: p.handles.and_then(|h| h.out_handle),
+                in_independent: p.handles.is_some_and(|h| h.in_independent),
+                out_independent: p.handles.is_some_and(|h| h.out_independent),
+            })
+            .collect();
+        Self::from_sanitized(sanitize_curve_points(&converted))
+    }
+
+    fn evaluate(&self, raw_x: f32) -> f32 {
+        let x = clamp01_f32(raw_x);
         let n = self.points.len();
         if n == 0 {
             return x;
@@ -838,41 +1386,48 @@ impl PreparedCurve {
         }
 
         let mut seg = 0;
-        for k in 0..n - 1 {
-            if x <= self.points[k + 1].x {
-                seg = k;
-                break;
+        while seg < n - 2 && x > self.points[seg + 1].x {
+            seg += 1;
+        }
+
+        let a = self.points[seg];
+        let b = self.points[seg + 1];
+        if a.out_abs.is_some() || b.in_abs.is_some() {
+            if x <= a.x {
+                return a.y;
             }
+            if x >= b.x {
+                return b.y;
+            }
+            let third_dx = (b.x - a.x) / 3.0;
+            let out_h = a
+                .out_abs
+                .unwrap_or([a.x + third_dx, a.y + third_dx * self.slopes[seg]]);
+            let in_h = b
+                .in_abs
+                .unwrap_or([b.x - third_dx, b.y - third_dx * self.slopes[seg + 1]]);
+            let independent = a.out_independent || b.in_independent;
+            let x1 = out_h[0].clamp(a.x, b.x);
+            let x2 = in_h[0].clamp(if independent { a.x } else { x1 }, b.x);
+            return eval_cubic_bezier_at_x(a.x, a.y, x1, out_h[1], x2, in_h[1], b.x, b.y, x);
         }
 
-        let p0 = self.points[seg];
-        let p1 = self.points[seg + 1];
-        let dx = p1.x - p0.x;
-        if dx <= 1e-7 {
-            return p0.y;
-        }
-
-        if p0.out_tangent.is_some() || p1.in_tangent.is_some() {
-            let dy = p1.y - p0.y;
-            let out_t = p0.out_tangent.unwrap_or([dx / 3.0, dy / 3.0]);
-            let in_t = p1.in_tangent.unwrap_or([-dx / 3.0, -dy / 3.0]);
-            let c1x = p0.x + out_t[0].clamp(0.0, dx);
-            let c1y = p0.y + out_t[1];
-            let c2x = p1.x + in_t[0].clamp(-dx, 0.0);
-            let c2y = p1.y + in_t[1];
-            return eval_cubic_bezier_at_x(p0.x, p0.y, c1x, c1y, c2x, c2y, p1.x, p1.y, x);
-        }
-
-        let t = ((x - p0.x) / dx).clamp(0.0, 1.0);
+        let width = self.widths[seg];
+        let t = ((x - a.x) / width).clamp(0.0, 1.0);
         let t2 = t * t;
         let t3 = t2 * t;
-        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
-        let h10 = t3 - 2.0 * t2 + t;
-        let h01 = -2.0 * t3 + 3.0 * t2;
-        let h11 = t3 - t2;
-
-        h00 * p0.y + h10 * dx * self.slopes[seg] + h01 * p1.y + h11 * dx * self.slopes[seg + 1]
+        let value = (2.0 * t3 - 3.0 * t2 + 1.0) * a.y
+            + (t3 - 2.0 * t2 + t) * width * self.slopes[seg]
+            + (-2.0 * t3 + 3.0 * t2) * b.y
+            + (t3 - t2) * width * self.slopes[seg + 1];
+        clamp01_f32(value)
     }
+}
+
+#[inline]
+fn cubic_bezier_1d(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+    let mt = 1.0 - t;
+    mt * mt * mt * a + 3.0 * mt * mt * t * b + 3.0 * mt * t * t * c + t * t * t * d
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -889,40 +1444,18 @@ fn eval_cubic_bezier_at_x(
 ) -> f32 {
     let mut lo = 0.0f32;
     let mut hi = 1.0f32;
-    let mut t = ((target_x - x0) / (x3 - x0)).clamp(0.0, 1.0);
-
-    for _ in 0..24 {
-        let mt = 1.0 - t;
-        let bx =
-            mt * mt * mt * x0 + 3.0 * mt * mt * t * x1 + 3.0 * mt * t * t * x2 + t * t * t * x3;
-        let err = bx - target_x;
-        if err.abs() < 1e-6 {
-            break;
-        }
-        if err < 0.0 {
+    for _ in 0..32 {
+        let t = 0.5 * (lo + hi);
+        if cubic_bezier_1d(x0, x1, x2, x3, t) < target_x {
             lo = t;
         } else {
             hi = t;
         }
-
-        let dbx = 3.0 * mt * mt * (x1 - x0) + 6.0 * mt * t * (x2 - x1) + 3.0 * t * t * (x3 - x2);
-        let next = if dbx.abs() > 1e-6 {
-            t - err / dbx
-        } else {
-            0.5 * (lo + hi)
-        };
-        t = if next > lo && next < hi {
-            next
-        } else {
-            0.5 * (lo + hi)
-        };
     }
-
-    let mt = 1.0 - t;
-    mt * mt * mt * y0 + 3.0 * mt * mt * t * y1 + 3.0 * mt * t * t * y2 + t * t * t * y3
+    clamp01_f32(cubic_bezier_1d(y0, y1, y2, y3, 0.5 * (lo + hi)))
 }
 
-/// Complete Shader+ curve specification baked to a `1024 x 1` RGBA8 LUT.
+/// Complete Shader+ curve specification baked to a `1024 x 1` RGBA8 or RGBA16F LUT.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CurveSpec {
     pub mode: CurveMode,
@@ -936,7 +1469,8 @@ pub struct CurveSpec {
     pub blue: Option<CurveChannel>,
     /// Optional independent Alpha curve in `CurveMode::Rgba`.
     pub alpha: Option<CurveChannel>,
-    /// Output normalization range `[min, max]` mapped into `[0.0, 1.0]` in the RGBA8 LUT.
+    /// Output remapping range `[min, max]` applied in GLSL via `mix(range.x, range.y, texel)`
+    /// (curve points and baked LUT texels remain strictly in `[0.0, 1.0]`).
     pub range: [f32; 2],
 }
 
@@ -954,59 +1488,97 @@ impl Default for CurveSpec {
     }
 }
 
-/// Bakes `spec` into a `1024 x 1` RGBA8 LUT (`4096` bytes).
+/// Evaluates a Zoidium absolute-handle curve point list at `x` in `[0.0, 1.0]`.
+pub fn evaluate_zoidium_curve_points(points: &[ZoidiumCurvePoint], x: f32) -> f32 {
+    PreparedCurve::from_zoidium(points).evaluate(x)
+}
+
+/// Converts a finite `f32` value to IEEE-754 binary16 (`f16`) bits, matching Zoidium's `halfBits`
+/// for `[0.0, 1.0]` curve LUT samples.
+pub fn f32_to_f16_bits(value: f32) -> u16 {
+    if !value.is_finite() {
+        return if value.is_nan() {
+            0x7e00
+        } else if value.is_sign_negative() {
+            0xfc00
+        } else {
+            0x7c00
+        };
+    }
+    let sign = u16::from(value.is_sign_negative()) << 15;
+    let abs = value.abs();
+    if abs == 0.0 {
+        return sign;
+    }
+    if abs >= 65_504.0 {
+        return sign | 0x7bff;
+    }
+    if abs < 2.0_f32.powi(-14) {
+        let mantissa = (abs / 2.0_f32.powi(-24)).round() as u16;
+        return sign | mantissa;
+    }
+    let exponent = abs.log2().floor() as i32;
+    let significand = ((abs / 2.0_f32.powi(exponent) - 1.0) * 1024.0).round() as u16;
+    if significand >= 1024 {
+        sign | (((exponent + 16) as u16) << 10)
+    } else {
+        sign | (((exponent + 15) as u16) << 10) | significand
+    }
+}
+
+/// Bakes `spec` into a `1024 x 1` normalized `f32` RGBA LUT (`4096` floats in `[0.0, 1.0]`).
 ///
-/// - In `CurveMode::Single`: `R = G = B = normalize(master(x))` and `A = 255`.
+/// Matches Zoidium `plugins/shader-plus/bake.js`:
+/// - Curve points are strictly in `[0.0, 1.0]`; `spec.range` is NOT applied during baking.
+/// - In `CurveMode::Single`: `R = G = B = A = master(x)`.
 /// - In `CurveMode::Rgba`: `R = red(master(x))`, `G = green(master(x))`,
 ///   `B = blue(master(x))`, and `A = alpha(x)` (omitted channels default to identity).
-pub fn bake_curve_rgba8(spec: &CurveSpec) -> Vec<u8> {
+pub fn bake_curve_rgba32f(spec: &CurveSpec) -> Vec<f32> {
     let master = PreparedCurve::new(&spec.master.points);
     let red = spec.red.as_ref().map(|c| PreparedCurve::new(&c.points));
     let green = spec.green.as_ref().map(|c| PreparedCurve::new(&c.points));
     let blue = spec.blue.as_ref().map(|c| PreparedCurve::new(&c.points));
     let alpha = spec.alpha.as_ref().map(|c| PreparedCurve::new(&c.points));
 
-    let min_val = spec.range[0];
-    let span = spec.range[1] - spec.range[0];
-    let normalize_f32 = |v: f32| -> f32 {
-        if span.abs() > 1e-7 {
-            ((v - min_val) / span).clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
-    };
-    let normalize = |v: f32| -> u8 { f32_to_u8(normalize_f32(v)) };
-
-    let mut out = vec![0u8; CURVE_LUT_WIDTH * 4];
+    let mut out = vec![0.0f32; CURVE_LUT_WIDTH * 4];
     for (idx, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = idx as f32 / (CURVE_LUT_WIDTH - 1) as f32;
-        let m = master.evaluate(x);
+        let common = master.evaluate(x);
 
         match spec.mode {
             CurveMode::Single => {
-                let v = normalize(m);
-                pixel[0] = v;
-                pixel[1] = v;
-                pixel[2] = v;
-                pixel[3] = 255;
+                pixel[0] = common;
+                pixel[1] = common;
+                pixel[2] = common;
+                pixel[3] = common;
             }
             CurveMode::Rgba => {
-                let m_norm = normalize_f32(m);
-                let r_val = red.as_ref().map_or(m, |ch| ch.evaluate(m_norm));
-                let g_val = green.as_ref().map_or(m, |ch| ch.evaluate(m_norm));
-                let b_val = blue.as_ref().map_or(m, |ch| ch.evaluate(m_norm));
-                pixel[0] = normalize(r_val);
-                pixel[1] = normalize(g_val);
-                pixel[2] = normalize(b_val);
-                pixel[3] = match alpha.as_ref() {
-                    Some(ch) => normalize(ch.evaluate(x)),
-                    None => f32_to_u8(x),
-                };
+                pixel[0] = red.as_ref().map_or(common, |ch| ch.evaluate(common));
+                pixel[1] = green.as_ref().map_or(common, |ch| ch.evaluate(common));
+                pixel[2] = blue.as_ref().map_or(common, |ch| ch.evaluate(common));
+                pixel[3] = alpha.as_ref().map_or(x, |ch| ch.evaluate(x));
             }
         }
     }
 
     out
+}
+
+/// Bakes `spec` into a `1024 x 1` RGBA8 LUT (`4096` bytes), matching Zoidium `bakeCurve(..., false)`.
+pub fn bake_curve_rgba8(spec: &CurveSpec) -> Vec<u8> {
+    bake_curve_rgba32f(spec)
+        .into_iter()
+        .map(f32_to_u8)
+        .collect()
+}
+
+/// Bakes `spec` into a `1024 x 1` IEEE-754 `RGBA16F` half-float LUT (`4096` `u16` values /
+/// `8192` bytes for `wgpu::TextureFormat::Rgba16Float`), avoiding 8-bit stepping on wide `range`.
+pub fn bake_curve_rgba16f(spec: &CurveSpec) -> Vec<u16> {
+    bake_curve_rgba32f(spec)
+        .into_iter()
+        .map(f32_to_f16_bits)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,13 +1640,14 @@ impl PaletteSpec {
 
     /// Converts this palette into the two Shader+ uniform bindings (`<name>` and `<name>_count`).
     pub fn to_uniform_values(&self, name: &str) -> [(String, UniformValue); 2] {
+        let norm = fix_property_name(name);
         let (arr, count) = self.as_uniform_array();
         [
             (
-                name.to_string(),
+                norm.clone(),
                 UniformValue::Array(arr.into_iter().map(UniformValue::Vec4).collect()),
             ),
-            (format!("{name}_count"), UniformValue::Int(count)),
+            (format!("{norm}_count"), UniformValue::Int(count)),
         ]
     }
 }

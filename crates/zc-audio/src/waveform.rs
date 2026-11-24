@@ -57,8 +57,8 @@ impl WaveformPeaks {
                 .floor()
                 .max((start + 1) as f64) as usize)
                 .min(total_frames);
-            let mut min_avg = 1.0_f32;
-            let mut max_avg = -1.0_f32;
+            let mut min_avg = 0.0_f32;
+            let mut max_avg = 0.0_f32;
 
             for frame_idx in start..end {
                 let base = frame_idx * ch;
@@ -131,10 +131,10 @@ impl WaveformPeaks {
 
             if !b_lo.is_nan()
                 && !b_hi.is_nan()
-                && b_lo < len_f
+                && (b_lo < len_f || ((b_lo - b_hi).abs() < 1e-9 && (b_lo - len_f).abs() < 1e-6))
                 && (b_hi > 0.0 || (b_hi == 0.0 && b_lo == 0.0))
             {
-                let start = (b_lo.floor().max(0.0) as usize).min(len);
+                let start = (b_lo.floor().max(0.0) as usize).min(len.saturating_sub(1));
                 let mut end = (b_hi.ceil().clamp(0.0, len_f) as usize).min(len);
                 if end <= start && start < len {
                     end = (start + 1).min(len);
@@ -286,5 +286,44 @@ mod tests {
         assert_eq!(rev.len(), 100);
         assert!(rev[10].max_i8 >= 90);
         assert_eq!(rev[90].amplitude_u8, 0);
+    }
+
+    #[test]
+    fn waveform_peaks_dc_buckets_keep_zero_bounds_and_freeze_frame_samples_frozen_bucket() {
+        let sr = STANDARD_SAMPLE_RATE;
+        // First 0.5s: +0.5 DC; second 0.5s: -0.6 DC.
+        let mut samples = vec![0.5_f32; sr as usize];
+        for s in &mut samples[(sr as usize / 2)..] {
+            *s = -0.6;
+        }
+        let buf = AudioBuffer {
+            sample_rate: sr,
+            channels: 1,
+            samples_interleaved_f32: samples,
+        };
+        let peaks = WaveformPeaks::from_audio_buffer(&buf);
+
+        // Every bucket must obey min_i8 <= 0 and max_i8 >= 0 (matching Zoidium waveform-samples.js).
+        assert!(
+            peaks.min_peaks().iter().all(|&m| m <= 0),
+            "min_peaks must never exceed 0 on DC-positive audio"
+        );
+        assert!(
+            peaks.max_peaks().iter().all(|&m| m >= 0),
+            "max_peaks must never drop below 0 on DC-negative audio"
+        );
+        assert!(peaks.max_peaks()[10] >= 60);
+        assert_eq!(peaks.min_peaks()[10], 0);
+        assert!(peaks.min_peaks()[150] <= -70);
+        assert_eq!(peaks.max_peaks()[150], 0);
+
+        // Freeze-frame sampling (media_start_sec == media_end_sec) samples the frozen bucket consistently.
+        let frozen_pos = peaks.sample_columns(0.25, 0.25, 16);
+        assert_eq!(frozen_pos.len(), 16);
+        assert!(frozen_pos.iter().all(|c| c.max_i8 >= 60 && c.min_i8 == 0));
+
+        let frozen_end = peaks.sample_columns(1.0, 1.0, 8);
+        assert_eq!(frozen_end.len(), 8);
+        assert!(frozen_end.iter().all(|c| c.min_i8 <= -70 && c.max_i8 == 0));
     }
 }

@@ -175,11 +175,20 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 /// Derives a CM3-compatible 32-character lowercase hex asset key from the first
 /// 256 MiB of `data`.
+///
+/// CM3 (`PZ.asset.hash`) interprets the SHA-256 digest buffer as a little-endian
+/// `Uint32Array` and formats the first 4 `u32` words as 8 lowercase hex characters
+/// each (32 hex chars total).
 #[must_use]
 pub fn cm3_asset_key(data: &[u8]) -> String {
     let prefix_len = data.len().min(CM3_ASSET_HASH_PREFIX_BYTES);
-    let hex = sha256_hex(&data[..prefix_len]);
-    hex[..32].to_owned()
+    let digest = sha256_bytes(&data[..prefix_len]);
+    let mut out = String::with_capacity(32);
+    for chunk in digest[..16].as_chunks::<4>().0 {
+        let word = u32::from_le_bytes(*chunk);
+        let _ = write!(&mut out, "{word:08x}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -203,9 +212,15 @@ mod tests {
     }
 
     #[test]
-    fn cm3_asset_key_truncates_to_32_hex_chars() {
+    fn cm3_asset_key_uses_little_endian_u32_words() {
+        // SHA-256("abc") first 16 bytes: ba7816bf 8f01cfea 414140de 5dae2223
+        // Little-endian Uint32Array words: bf1678ba eacf018f de404141 2322ae5d
         let key = cm3_asset_key(b"abc");
         assert_eq!(key.len(), 32);
-        assert_eq!(key, "ba7816bf8f01cfea414140de5dae2223");
+        assert_eq!(key, "bf1678baeacf018fde4041412322ae5d");
+
+        // SHA-256("") first 16 bytes: e3b0c442 98fc1c14 9afbf4c8 996fb924
+        // Little-endian Uint32Array words: 42c4b0e3 141cfc98 c8f4fb9a 24b96f99
+        assert_eq!(cm3_asset_key(b""), "42c4b0e3141cfc98c8f4fb9a24b96f99");
     }
 }

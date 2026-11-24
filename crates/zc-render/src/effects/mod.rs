@@ -21,7 +21,7 @@ pub mod shaders_plugins;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::f32::consts::{FRAC_PI_2, PI};
+use std::f32::consts::FRAC_PI_2;
 use std::num::NonZeroU64;
 
 use bytemuck::{Pod, Zeroable};
@@ -229,6 +229,11 @@ fn inv_affine_aspect(
     return (r / safe_scale) * aspect_scale + vec2<f32>(0.5);
 }
 
+fn apply_uv_transform(uv: vec2<f32>) -> vec2<f32> {
+    let v = vec3<f32>(uv, 1.0);
+    return vec2<f32>(dot(u.m0.xyz, v), dot(u.m1.xyz, v));
+}
+
 fn wrap_uv(uv: vec2<f32>, wrap_mode: u32) -> vec2<f32> {
     if (wrap_mode == 1u) {
         return fract(uv);
@@ -350,6 +355,40 @@ fn soft_light_ch(b: f32, s: f32) -> f32 {
     return b + (2.0 * s - 1.0) * (d - b);
 }
 
+fn dodge_ch_fx(d: f32, s: f32) -> f32 {
+    if (d <= 0.0) {
+        return 0.0;
+    }
+    if (s >= 1.0) {
+        return 1.0;
+    }
+    return min(1.0, d / max(1.0 - s, EPS));
+}
+
+fn burn_ch_fx(d: f32, s: f32) -> f32 {
+    if (d >= 1.0) {
+        return 1.0;
+    }
+    if (s <= 0.0) {
+        return 0.0;
+    }
+    return 1.0 - min(1.0, (1.0 - d) / max(s, EPS));
+}
+
+fn vivid_light_ch_fx(d: f32, s: f32) -> f32 {
+    if (s <= 0.5) {
+        return burn_ch_fx(d, 2.0 * s);
+    }
+    return dodge_ch_fx(d, 2.0 * s - 1.0);
+}
+
+fn pin_light_ch_fx(d: f32, s: f32) -> f32 {
+    if (s <= 0.5) {
+        return min(d, 2.0 * s);
+    }
+    return max(d, 2.0 * s - 1.0);
+}
+
 fn apply_blend(dst: vec3<f32>, src: vec3<f32>, blend_mode: u32) -> vec3<f32> {
     switch (blend_mode) {
         case 1u: {
@@ -370,14 +409,18 @@ fn apply_blend(dst: vec3<f32>, src: vec3<f32>, blend_mode: u32) -> vec3<f32> {
             return max(dst, src);
         }
         case 6u: {
-            let dodge = min(vec3<f32>(1.0), dst / max(vec3<f32>(1.0) - src, vec3<f32>(EPS)));
-            let non_zero = select(dodge, vec3<f32>(1.0), src >= vec3<f32>(1.0 - EPS));
-            return select(non_zero, vec3<f32>(0.0), dst <= vec3<f32>(EPS));
+            return vec3<f32>(
+                dodge_ch_fx(dst.r, src.r),
+                dodge_ch_fx(dst.g, src.g),
+                dodge_ch_fx(dst.b, src.b),
+            );
         }
         case 7u: {
-            let burn = vec3<f32>(1.0) - min(vec3<f32>(1.0), (vec3<f32>(1.0) - dst) / max(src, vec3<f32>(EPS)));
-            let non_one = select(burn, vec3<f32>(0.0), src <= vec3<f32>(EPS));
-            return select(non_one, vec3<f32>(1.0), dst >= vec3<f32>(1.0 - EPS));
+            return vec3<f32>(
+                burn_ch_fx(dst.r, src.r),
+                burn_ch_fx(dst.g, src.g),
+                burn_ch_fx(dst.b, src.b),
+            );
         }
         case 8u: {
             let lo = 2.0 * dst * src;
@@ -409,16 +452,200 @@ fn apply_blend(dst: vec3<f32>, src: vec3<f32>, blend_mode: u32) -> vec3<f32> {
         case 15u: {
             return set_lum(dst, lum_blend(src));
         }
-        case 16u: {
+        case 16u, 18u: {
             return min(dst + src, vec3<f32>(1.0));
         }
         case 17u: {
             return max(dst - src, vec3<f32>(0.0));
         }
+        case 19u: {
+            return max(dst + src - vec3<f32>(1.0), vec3<f32>(0.0));
+        }
+        case 20u: {
+            return vec3<f32>(
+                vivid_light_ch_fx(dst.r, src.r),
+                vivid_light_ch_fx(dst.g, src.g),
+                vivid_light_ch_fx(dst.b, src.b),
+            );
+        }
+        case 21u: {
+            return clamp(dst + 2.0 * src - vec3<f32>(1.0), vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+        case 22u: {
+            return vec3<f32>(
+                pin_light_ch_fx(dst.r, src.r),
+                pin_light_ch_fx(dst.g, src.g),
+                pin_light_ch_fx(dst.b, src.b),
+            );
+        }
+        case 23u: {
+            return step(vec3<f32>(1.0), dst + src);
+        }
         default: {
             return src;
         }
     }
+}
+
+/// Full CM3 `blend.glsl` compositor supporting all 43 blend modes,
+/// `OVERLAP_MODE = 3` (`force_atop`), and direct premultiplied `BLEND_RGB` modes.
+fn composite_cm3_blend(
+    bg: vec4<f32>,
+    src_in: vec4<f32>,
+    opacity: f32,
+    blend_mode: u32,
+    force_atop: bool,
+) -> vec4<f32> {
+    let op = clamp(opacity, 0.0, 1.0);
+    // Direct premultiplied BLEND_RGB modes (blend.glsl:237-286, 330-334)
+    if (blend_mode == 16u) {
+        // BLEND_PLUS
+        let s = src_in * op;
+        let out_c = clamp(bg + s, vec4<f32>(0.0), vec4<f32>(1.0));
+        return vec4<f32>(min(out_c.rgb, vec3<f32>(out_c.a)), out_c.a);
+    }
+    if (blend_mode == 17u) {
+        // BLEND_MINUS
+        let s = src_in * op;
+        let out_a = clamp(bg.a - s.a, 0.0, 1.0);
+        let out_rgb = clamp(bg.rgb - s.rgb, vec3<f32>(0.0), vec3<f32>(out_a));
+        return vec4<f32>(out_rgb, out_a);
+    }
+    if (blend_mode == 26u) {
+        // BLEND_PLUS_DARKER
+        let s = src_in * op;
+        let a = min(1.0, s.a + bg.a);
+        let rgb = clamp(
+            vec3<f32>(a) - ((vec3<f32>(s.a) - s.rgb) + (vec3<f32>(bg.a) - bg.rgb)),
+            vec3<f32>(0.0),
+            vec3<f32>(a),
+        );
+        return vec4<f32>(rgb, a);
+    }
+    if (blend_mode == 27u) {
+        // BLEND_CONTRAST
+        let s = src_in * op;
+        let hd = vec3<f32>(bg.a * 0.5);
+        let hs = vec3<f32>(s.a * 0.5);
+        let rgb = clamp(hd + 2.0 * (bg.rgb - hd) * (s.rgb - hs), vec3<f32>(0.0), vec3<f32>(bg.a));
+        return vec4<f32>(rgb, bg.a);
+    }
+    if (blend_mode == 28u) {
+        // BLEND_INVERT_OVG
+        let s = src_in * op;
+        let a = clamp(s.a + bg.a - s.a * bg.a, 0.0, 1.0);
+        let rgb = clamp(s.a * (vec3<f32>(bg.a) - bg.rgb) + (1.0 - s.a) * bg.rgb, vec3<f32>(0.0), vec3<f32>(a));
+        return vec4<f32>(rgb, a);
+    }
+    if (blend_mode == 29u) {
+        // BLEND_RED
+        let s = src_in * op;
+        return vec4<f32>(clamp(s.r, 0.0, bg.a), bg.g, bg.b, bg.a);
+    }
+    if (blend_mode == 30u) {
+        // BLEND_GREEN
+        let s = src_in * op;
+        return vec4<f32>(bg.r, clamp(s.g, 0.0, bg.a), bg.b, bg.a);
+    }
+    if (blend_mode == 31u) {
+        // BLEND_BLUE
+        let s = src_in * op;
+        return vec4<f32>(bg.r, bg.g, clamp(s.b, 0.0, bg.a), bg.a);
+    }
+
+    let src_str = clamp(unpremultiply(src_in), vec3<f32>(0.0), vec3<f32>(1.0));
+    let bg_str = clamp(unpremultiply(bg), vec3<f32>(0.0), vec3<f32>(1.0));
+    let a_s = clamp(src_in.a * op, 0.0, 1.0);
+    let a_d = clamp(bg.a, 0.0, 1.0);
+
+    let p0 = a_s * a_d;
+    let p1 = select(a_s * (1.0 - a_d), 0.0, force_atop);
+    let p2 = a_d * (1.0 - a_s);
+
+    var coeff = vec3<f32>(1.0, 1.0, 1.0);
+    var f_rgb = src_str;
+
+    switch (blend_mode) {
+        case 0u: {
+            coeff = vec3<f32>(1.0, 1.0, 1.0);
+            f_rgb = src_str;
+        }
+        case 24u: {
+            // BLEND_INVERT
+            coeff = vec3<f32>(1.0, 0.0, 1.0);
+            f_rgb = vec3<f32>(1.0) - bg_str;
+        }
+        case 25u: {
+            // BLEND_INVERT_RGB
+            coeff = vec3<f32>(1.0, 0.0, 1.0);
+            f_rgb = src_str * (vec3<f32>(1.0) - bg_str);
+        }
+        case 32u: {
+            // BLEND_ZERO
+            coeff = vec3<f32>(0.0, 0.0, 0.0);
+            f_rgb = vec3<f32>(0.0);
+        }
+        case 33u: {
+            // BLEND_SRC
+            coeff = vec3<f32>(1.0, 1.0, 0.0);
+            f_rgb = src_str;
+        }
+        case 34u: {
+            // BLEND_DST
+            coeff = vec3<f32>(1.0, 0.0, 1.0);
+            f_rgb = bg_str;
+        }
+        case 35u: {
+            // BLEND_DST_OVER
+            coeff = vec3<f32>(1.0, 1.0, 1.0);
+            f_rgb = bg_str;
+        }
+        case 36u: {
+            // BLEND_SRC_IN
+            coeff = vec3<f32>(1.0, 0.0, 0.0);
+            f_rgb = src_str;
+        }
+        case 37u: {
+            // BLEND_DST_IN
+            coeff = vec3<f32>(1.0, 0.0, 0.0);
+            f_rgb = bg_str;
+        }
+        case 38u: {
+            // BLEND_SRC_OUT
+            coeff = vec3<f32>(0.0, 1.0, 0.0);
+            f_rgb = vec3<f32>(0.0);
+        }
+        case 39u: {
+            // BLEND_DST_OUT
+            coeff = vec3<f32>(0.0, 0.0, 1.0);
+            f_rgb = vec3<f32>(0.0);
+        }
+        case 40u: {
+            // BLEND_SRC_ATOP
+            coeff = vec3<f32>(1.0, 0.0, 1.0);
+            f_rgb = src_str;
+        }
+        case 41u: {
+            // BLEND_DST_ATOP
+            coeff = vec3<f32>(1.0, 1.0, 0.0);
+            f_rgb = bg_str;
+        }
+        case 42u: {
+            // BLEND_XOR
+            coeff = vec3<f32>(0.0, 1.0, 1.0);
+            f_rgb = vec3<f32>(0.0);
+        }
+        default: {
+            coeff = vec3<f32>(1.0, 1.0, 1.0);
+            f_rgb = apply_blend(bg_str, src_str, blend_mode);
+        }
+    }
+
+    let res = vec4<f32>(f_rgb, coeff.x) * p0
+        + coeff.y * vec4<f32>(src_str, 1.0) * p1
+        + coeff.z * vec4<f32>(bg_str, 1.0) * p2;
+    let out_a = clamp(res.a, 0.0, 1.0);
+    return vec4<f32>(clamp(res.rgb, vec3<f32>(0.0), vec3<f32>(out_a)), out_a);
 }
 "#;
 
@@ -433,16 +660,29 @@ pub fn build_effect_wgsl(body: &str) -> String {
     full
 }
 
+/// Maps canonical Zoidium plugin effect IDs to their internal shader registry keys.
+#[must_use]
+pub fn canonical_effect_id(effect_id: &str) -> &str {
+    match effect_id {
+        "looks" => "magiclooks",
+        "sglow-hq-v2-preview" => "sglow",
+        "smart-motion-blur-lite" => "smartmotionblur",
+        "echo-legacy" => "echo",
+        other => other,
+    }
+}
+
 /// Looks up the static WGSL fragment body for a standard CM3 or Zoidium plugin effect ID.
 #[must_use]
 pub fn lookup_effect_shader(effect_id: &str) -> Option<(&'static str, &'static str)> {
+    let resolved = canonical_effect_id(effect_id);
     for &(id, body) in &STANDARD_EFFECT_SHADERS {
-        if id == effect_id {
+        if id == resolved {
             return Some((id, body));
         }
     }
     for &(id, body) in &PLUGIN_EFFECT_SHADERS {
-        if id == effect_id {
+        if id == resolved {
             return Some((id, body));
         }
     }
@@ -642,13 +882,14 @@ pub enum EffectError {
     CustomShaderInvalid(String),
 }
 
-/// Maps a CM3 `PZ.layer.blendModes` name or index to its WGSL blend mode code (`0..=17`).
+/// Maps any of the 43 CM3 `PZ.layer.blendModes` names or indices to its WGSL blend mode code (`0..=42`).
 #[must_use]
 pub fn parse_blend_mode(value: Option<&EffectParamValue>) -> u32 {
     match value {
-        Some(EffectParamValue::Int(i)) => (*i).clamp(0, 17) as u32,
-        Some(EffectParamValue::Float(f)) => (f.round() as i32).clamp(0, 17) as u32,
+        Some(EffectParamValue::Int(i)) => (*i).clamp(0, 42) as u32,
+        Some(EffectParamValue::Float(f)) => (f.round() as i32).clamp(0, 42) as u32,
         Some(EffectParamValue::String(s)) => match s.trim().to_ascii_uppercase().as_str() {
+            "BLEND_SRC_OVER" | "SRC_OVER" | "NORMAL" => 0,
             "BLEND_MULTIPLY" | "MULTIPLY" => 1,
             "BLEND_SCREEN" | "SCREEN" => 2,
             "BLEND_OVERLAY" | "OVERLAY" => 3,
@@ -666,6 +907,31 @@ pub fn parse_blend_mode(value: Option<&EffectParamValue>) -> u32 {
             "BLEND_LUMINOSITY" | "LUMINOSITY" => 15,
             "BLEND_PLUS" | "BLEND_ADD" | "ADD" | "PLUS" => 16,
             "BLEND_MINUS" | "BLEND_SUBTRACT" | "SUBTRACT" | "MINUS" => 17,
+            "BLEND_LINEARDODGE" | "BLEND_LINEAR_DODGE" | "LINEARDODGE" | "LINEAR_DODGE" => 18,
+            "BLEND_LINEARBURN" | "BLEND_LINEAR_BURN" | "LINEARBURN" | "LINEAR_BURN" => 19,
+            "BLEND_VIVIDLIGHT" | "BLEND_VIVID_LIGHT" | "VIVIDLIGHT" | "VIVID_LIGHT" => 20,
+            "BLEND_LINEARLIGHT" | "BLEND_LINEAR_LIGHT" | "LINEARLIGHT" | "LINEAR_LIGHT" => 21,
+            "BLEND_PINLIGHT" | "BLEND_PIN_LIGHT" | "PINLIGHT" | "PIN_LIGHT" => 22,
+            "BLEND_HARDMIX" | "BLEND_HARD_MIX" | "HARDMIX" | "HARD_MIX" => 23,
+            "BLEND_INVERT" | "INVERT" => 24,
+            "BLEND_INVERT_RGB" | "INVERT_RGB" => 25,
+            "BLEND_PLUS_DARKER" | "PLUS_DARKER" => 26,
+            "BLEND_CONTRAST" | "CONTRAST" => 27,
+            "BLEND_INVERT_OVG" | "INVERT_OVG" => 28,
+            "BLEND_RED" | "RED" => 29,
+            "BLEND_GREEN" | "GREEN" => 30,
+            "BLEND_BLUE" | "BLUE" => 31,
+            "BLEND_ZERO" | "ZERO" => 32,
+            "BLEND_SRC" | "SRC" => 33,
+            "BLEND_DST" | "DST" => 34,
+            "BLEND_DST_OVER" | "DST_OVER" => 35,
+            "BLEND_SRC_IN" | "SRC_IN" => 36,
+            "BLEND_DST_IN" | "DST_IN" => 37,
+            "BLEND_SRC_OUT" | "SRC_OUT" => 38,
+            "BLEND_DST_OUT" | "DST_OUT" => 39,
+            "BLEND_SRC_ATOP" | "SRC_ATOP" => 40,
+            "BLEND_DST_ATOP" | "DST_ATOP" => 41,
+            "BLEND_XOR" | "XOR" => 42,
             _ => 0,
         },
         _ => 0,
@@ -682,7 +948,7 @@ pub fn should_bypass(effect_id: &str, params: &EffectParams) -> bool {
     if !params.enabled() {
         return true;
     }
-    match effect_id {
+    match canonical_effect_id(effect_id) {
         "boxblur" | "directionalblur" | "gaussianblur" => {
             params.float_or("delta", 1.0).abs() <= BYPASS_EPS
         }
@@ -714,11 +980,19 @@ pub fn should_bypass(effect_id: &str, params: &EffectParams) -> bool {
         "static" => params.float_or("amount", 0.5).abs() <= BYPASS_EPS,
         "swirl" => params.float_or("angle", 0.2).abs() <= BYPASS_EPS,
         "wavy" => params.float_or("amount", 3.0).abs() <= BYPASS_EPS,
-        // Plugin neutral bypasses
-        "radialblurspin" => params.float_or("amount", 10.0).abs() <= BYPASS_EPS,
+        // Plugin neutral bypasses (radialblurspin does NOT bypass on density == 0 in Zoidium)
         "smartmotionblur" => {
-            params.float_or("blurAmount", 0.5).abs() <= BYPASS_EPS
-                || params.float_or("motionSensitivity", 70.0).abs() <= BYPASS_EPS
+            let amt = if params.values.contains_key("amount") {
+                params.float_or("amount", 0.5)
+            } else {
+                params.float_or("blurAmount", 0.5)
+            };
+            let sens = if params.values.contains_key("sensitivity") {
+                params.float_or("sensitivity", 70.0)
+            } else {
+                params.float_or("motionSensitivity", 70.0)
+            };
+            amt.abs() <= BYPASS_EPS || sens.abs() <= BYPASS_EPS
         }
         _ => false,
     }
@@ -733,7 +1007,7 @@ pub fn pack_effect_uniforms(
     has_aux2: bool,
 ) -> EffectUniforms {
     let mut u = EffectUniforms::from_params(params);
-    match effect_id {
+    match canonical_effect_id(effect_id) {
         "brightnesscontrast" => {
             u.p0 = [
                 params.float_or("brightness", 0.0),
@@ -809,15 +1083,14 @@ pub fn pack_effect_uniforms(
         "gradientoverlay" => {
             let off = params.vec2_or("offset", [0.0, 0.0]);
             let sc = params.vec2_or("scale", [1.0, 1.0]);
+            let rot = params.float_or("rotation", 0.0);
+            let (m0, m1) = compute_gradient_uv_transform(off, sc, rot, u.resolution);
             u.mode = parse_blend_mode(params.values.get("blending"));
             u.extra = params.int_or("gradientType", 0).clamp(0, 4) as u32;
             u.p0 = [off[0], off[1], sc[0], sc[1]];
-            u.p1 = [
-                params.float_or("rotation", 0.0),
-                params.float_or("opacity", 1.0),
-                0.0,
-                0.0,
-            ];
+            u.p1 = [rot, params.float_or("opacity", 1.0), 0.0, 0.0];
+            u.m0 = m0;
+            u.m1 = m1;
         }
         "grayscale" => {
             u.p0 = [params.float_or("saturation", 1.0), 0.0, 0.0, 0.0];
@@ -837,11 +1110,17 @@ pub fn pack_effect_uniforms(
             u.flags = inv | (msk << 1);
         }
         "mask" => {
+            let pscale = params.vec2_or("_previewScale", [1.0, 1.0]);
             let pos = params.vec2_or("position", [0.0, 0.0]);
             let sz = params.vec2_or("size", [250.0, 250.0]);
             u.mode = params.int_or("mode", 0).clamp(0, 1) as u32;
             u.flags = u32::from(params.bool_or("invert", false));
-            u.p0 = [pos[0], pos[1], sz[0], sz[1]];
+            u.p0 = [
+                pos[0] * pscale[0],
+                pos[1] * pscale[1],
+                sz[0] * pscale[0],
+                sz[1] * pscale[1],
+            ];
             u.p1 = [
                 params.float_or("rotation", 0.0),
                 params.float_or("feather", 0.1),
@@ -853,16 +1132,15 @@ pub fn pack_effect_uniforms(
         "overlay" => {
             let off = params.vec2_or("offset", [0.0, 0.0]);
             let sc = params.vec2_or("scale", [1.0, 1.0]);
+            let rot = params.float_or("rotation", 0.0);
+            let (m0, m1) = compute_overlay_uv_transform(off, sc, rot, u.resolution);
             u.mode = parse_blend_mode(params.values.get("blending"));
             let rep = u32::from(params.bool_or("repeat", true));
             u.flags = rep | (u32::from(has_aux) << 1);
             u.p0 = [off[0], off[1], sc[0], sc[1]];
-            u.p1 = [
-                params.float_or("rotation", 0.0),
-                params.float_or("opacity", 1.0),
-                0.0,
-                0.0,
-            ];
+            u.p1 = [rot, params.float_or("opacity", 1.0), 0.0, 0.0];
+            u.m0 = m0;
+            u.m1 = m1;
         }
         "posterize" => {
             u.p0 = [
@@ -956,26 +1234,29 @@ pub fn pack_effect_uniforms(
             let doff = params.vec2_or("displacementOffset", [0.0, 0.0]);
             let off = params.vec2_or("offset", [0.0, 0.0]);
             let sc = params.vec2_or("scale", [1.0, 1.0]);
+            let rot = params.float_or("rotation", 0.0);
             let ud = params.vec3_or("uDisplacement", [1.0, 0.0, 0.0]);
             let vd = params.vec3_or("vDisplacement", [1.0, 0.0, 0.0]);
+            let (m0, m1) = compute_overlay_uv_transform(off, sc, rot, u.resolution);
             u.mode = params.int_or("wrap", 2).clamp(0, 2) as u32;
             u.flags = u32::from(has_aux);
-            u.p0 = [
-                doff[0],
-                doff[1],
-                params.float_or("amount", 0.1),
-                params.float_or("rotation", 0.0),
-            ];
+            u.p0 = [doff[0], doff[1], params.float_or("amount", 0.1), rot];
             u.p1 = [off[0], off[1], sc[0], sc[1]];
             u.p2 = [ud[0], ud[1], ud[2], 0.0];
             u.p3 = [vd[0], vd[1], vd[2], 0.0];
+            u.m0 = m0;
+            u.m1 = m1;
         }
         "duplicate" => {
             let off = params.vec2_or("offset", [0.0, 0.0]);
             let mult = params.vec2_or("multiplier", [3.0, 3.0]);
+            let rot = params.float_or("rotation", 0.0);
+            let (m0, m1) = compute_duplicate_uv_transform(off, mult, rot, u.resolution);
             u.mode = (params.int_or("repeat", 0).clamp(0, 1) as u32) + 1;
             u.p0 = [off[0], off[1], mult[0], mult[1]];
-            u.p1 = [params.float_or("rotation", 0.0), 0.0, 0.0, 0.0];
+            u.p1 = [rot, 0.0, 0.0, 0.0];
+            u.m0 = m0;
+            u.m1 = m1;
         }
         "fisheye" => {
             u.p0 = [params.float_or("amount", 25.0), 0.0, 0.0, 0.0];
@@ -1008,56 +1289,16 @@ pub fn pack_effect_uniforms(
             ];
         }
         "shake" => {
-            let amp = params.float_or("amplitude", 0.01);
-            let speed = params.float_or("speed", 15.0);
-            let zoom = params.float_or("zoom", 100.0);
-            let shake_mode = params.int_or("shake.mode", 1);
-            let chan_amp = if params.values.contains_key("shake.amplitude") {
-                params.vec4_or("shake.amplitude", [1000.0, 1000.0, 1000.0, 10.0])
-            } else {
-                params.vec4_or("shake.amp", [1000.0, 1000.0, 1000.0, 10.0])
-            };
-            let chan_freq = params.vec4_or("shake.frequency", [0.6, 0.8, 0.7, 0.9]);
-            let chan_phase = params.vec4_or("shake.phase", [0.0, 11.0, 20.0, 31.0]);
-            let chan_noise = params.vec4_or("shake.noise", [0.9, 0.9, 0.9, 0.55]);
-            let chan_smooth = params.vec4_or("shake.smooth", [1.0, 1.0, 1.0, 1.0]);
-            let shake_params = zc_scene::CameraShakeParams {
-                mode: if shake_mode == 0 {
-                    zc_scene::CameraShakeMode::Rotate
-                } else {
-                    zc_scene::CameraShakeMode::Move
-                },
-                amplitude: chan_amp,
-                frequency: chan_freq,
-                phase: chan_phase,
-                noise: chan_noise,
-                smooth: [
-                    chan_smooth[0] >= 0.5,
-                    chan_smooth[1] >= 0.5,
-                    chan_smooth[2] >= 0.5,
-                    chan_smooth[3] >= 0.5,
-                ],
-            };
-            let q = zc_scene::evaluate_camera_shake_channels(
-                f64::from(params.frame),
-                f64::from(speed),
-                &shake_params,
-            );
-            let w = u.resolution[0];
-            let h = u.resolution[1];
-            let d = w.max(h);
-            let (dx, dy) = if shake_mode == 0 {
-                let rx = (q[0] as f32) * amp * (PI / 180.0);
-                let ry = (q[1] as f32) * amp * (PI / 180.0);
-                (ry.sin() * d, rx.sin() * d)
-            } else {
-                ((q[0] as f32) * amp, (q[1] as f32) * amp)
-            };
-            let dz = (q[2] as f32) * amp;
-            let roll = (q[3] as f32) * amp * (PI / 180.0);
-            let scale_t = ((d - zoom + dz) / d).max(0.05);
             u.mode = params.int_or("wrap", 2).clamp(0, 2) as u32;
-            u.p0 = [dx / w, dy / h, scale_t, -roll];
+            if let Some((h_inv, depth_plane)) = compute_shake_inverse_homography(params) {
+                u.flags = 1;
+                u.p0 = [h_inv[0][0], h_inv[0][1], h_inv[0][2], 0.0];
+                u.p1 = [h_inv[1][0], h_inv[1][1], h_inv[1][2], 0.0];
+                u.p2 = [h_inv[2][0], h_inv[2][1], h_inv[2][2], 0.0];
+                u.p4 = depth_plane;
+            } else {
+                u.flags = 0;
+            }
         }
         "swirl" => {
             u.p0 = [params.float_or("angle", 0.2), 0.0, 0.0, 0.0];
@@ -1066,11 +1307,12 @@ pub fn pack_effect_uniforms(
             let uv_scale = params.vec2_or("uvScale", [1.0, 1.0]);
             u.mode = (params.int_or("wrap", 0).clamp(0, 1) as u32) + 1;
             u.p3 = [uv_scale[0], uv_scale[1], 0.0, 0.0];
-            if let Some(h_inv) = compute_transform_inverse_homography(params) {
+            if let Some((h_inv, depth_plane)) = compute_transform_inverse_homography(params) {
                 u.flags = 1;
                 u.p0 = [h_inv[0][0], h_inv[0][1], h_inv[0][2], 0.0];
                 u.p1 = [h_inv[1][0], h_inv[1][1], h_inv[1][2], 0.0];
                 u.p2 = [h_inv[2][0], h_inv[2][1], h_inv[2][2], 0.0];
+                u.p4 = depth_plane;
             } else {
                 u.flags = 0;
             }
@@ -1097,18 +1339,19 @@ pub fn pack_effect_uniforms(
         }
         "radialblurspin" => {
             let center = params.vec2_or("center", [0.0, 0.0]);
-            u.p0 = [
-                center[0],
-                center[1],
-                params.float_or("amount", 10.0).to_radians(),
-                params.float_or("dither", 0.5),
-            ];
-            u.p1 = [
-                params.float_or("samples", 24.0).clamp(4.0, 64.0),
-                0.0,
-                0.0,
-                0.0,
-            ];
+            let density = if params.values.contains_key("density") {
+                params.float_or("density", 0.5)
+            } else if params.values.contains_key("amount") {
+                params.float_or("amount", 10.0) * 0.05
+            } else {
+                0.5
+            };
+            let dither = params.float_or("dither", 0.5);
+            let decay = params.float_or("decay", 0.9);
+            let weight = params.float_or("weight", 0.2);
+            u.flags = u32::from(params.bool_or("overbright", false));
+            u.p0 = [center[0], center[1], density, dither];
+            u.p1 = [decay, weight, 0.0, 0.0];
         }
         "vhs" => {
             let jitter = if params.values.contains_key("trackingJitter") {
@@ -1130,18 +1373,35 @@ pub fn pack_effect_uniforms(
             ];
         }
         "jpegdamage" => {
-            let q = params.float_or("quality", 25.0);
-            let q_norm = if q > 1.0 { q / 100.0 } else { q }.clamp(0.0, 1.0);
+            let has_sapphire = params.values.contains_key("resFactor")
+                || params.values.contains_key("scaleLights")
+                || params.values.contains_key("errRate");
+            let q_default = if has_sapphire { 0.1 } else { 25.0 };
+            let q = params.float_or("quality", q_default);
+            let q_norm = if q > 1.0 { q / 100.0 } else { q }.clamp(0.01, 1.0);
             u.p0 = [
                 q_norm,
                 params.float_or("amount", 1.0),
                 params.float_or("blockSize", 8.0),
                 params.float_or("chromaSubsample", 2.0),
             ];
-            u.p1 = [params.float_or("blockJitter", 0.0), 0.0, 0.0, 0.0];
+            u.p1 = [
+                params.float_or("blockJitter", 0.0),
+                params.float_or("resFactor", 1.0),
+                params.float_or("resRelX", 1.0),
+                params.float_or("scaleLights", 1.0),
+            ];
+            u.p2 = [
+                params.float_or("offsetDarks", 0.0),
+                params.float_or("saturation", 1.0),
+                params.float_or("randSeed", 0.0),
+                0.0,
+            ];
         }
         "datamosh" => {
-            let mode = if params.values.contains_key("motionFamily") {
+            let mode = if params.values.contains_key("motion") {
+                params.int_or("motion", 0)
+            } else if params.values.contains_key("motionFamily") {
                 params.int_or("motionFamily", 0)
             } else {
                 params.int_or("mode", 0)
@@ -1150,8 +1410,8 @@ pub fn pack_effect_uniforms(
             u.flags = u32::from(has_aux);
             u.p0 = [
                 params.float_or("amount", 0.5),
-                params.float_or("intensity", 1.0),
-                params.float_or("blockSize", 16.0),
+                params.float_or("intensity", 0.6),
+                params.float_or("blockSize", 12.0),
                 params.float_or("seed", 1.0),
             ];
         }
@@ -1163,10 +1423,16 @@ pub fn pack_effect_uniforms(
             } else {
                 params.float_or("soften", 0.08)
             };
+            let raw_thresh = params.float_or("threshold", 0.5);
+            let norm_thresh = if raw_thresh > 1.0 {
+                (raw_thresh / 100.0).clamp(0.0, 1.0)
+            } else {
+                raw_thresh.clamp(0.0, 1.0)
+            };
             u.c0 = [key[0], key[1], key[2], 1.0];
             u.c1 = [acc[0], acc[1], acc[2], 1.0];
             u.p0 = [
-                params.float_or("threshold", 0.25),
+                norm_thresh,
                 soften,
                 params.float_or("gridSize", 32.0),
                 params.float_or("opacity", 1.0),
@@ -1176,10 +1442,25 @@ pub fn pack_effect_uniforms(
             u.flags = show_mask | (show_grid << 1);
         }
         "ascii" => {
-            let cell = params.vec2_or("cellSize", [8.0, 12.0]);
+            let cell = if params.values.contains_key("blockSize") {
+                let b = params.float_or("blockSize", 23.0).max(4.0);
+                let c = params.float_or("charSize", 18.0).max(4.0);
+                [c, b]
+            } else {
+                params.vec2_or("cellSize", [8.0, 12.0])
+            };
             let fg = params.vec3_or("fgColor", [1.0, 1.0, 1.0]);
-            let bg = params.vec3_or("bgColor", [0.0, 0.0, 0.0]);
-            u.mode = params.int_or("colorMode", 1).clamp(0, 4) as u32;
+            let bg = if params.values.contains_key("backgroundColor") {
+                params.vec3_or("backgroundColor", [0.03, 0.03, 0.04])
+            } else {
+                params.vec3_or("bgColor", [0.0, 0.0, 0.0])
+            };
+            let default_mode = if params.values.contains_key("blockSize") {
+                0
+            } else {
+                1
+            };
+            u.mode = params.int_or("colorMode", default_mode).clamp(0, 4) as u32;
             u.p0 = [
                 cell[0],
                 cell[1],
@@ -1214,22 +1495,51 @@ pub fn pack_effect_uniforms(
             u.c1 = [hi[0], hi[1], hi[2], 1.0];
         }
         "smartmotionblur" => {
+            let amt = if params.values.contains_key("amount") {
+                params.float_or("amount", 0.5)
+            } else {
+                params.float_or("blurAmount", 0.5)
+            };
+            let sens = if params.values.contains_key("sensitivity") {
+                params.float_or("sensitivity", 70.0)
+            } else {
+                params.float_or("motionSensitivity", 70.0)
+            };
+            let smooth = if params.values.contains_key("smoothness") {
+                params.float_or("smoothness", 50.0)
+            } else {
+                params.float_or("vectorSmoothness", 50.0)
+            };
             u.mode = params.int_or("view", 0).clamp(0, 2) as u32;
             u.flags = u32::from(has_aux) | (u32::from(has_aux2) << 1);
             u.p0 = [
-                params.float_or("blurAmount", 0.5),
-                (params.float_or("motionSensitivity", 70.0) / 100.0).clamp(0.0, 1.0),
+                amt,
+                (sens / 100.0).clamp(0.0, 1.0),
                 params.float_or("maxDisplacement", 256.0).clamp(1.0, 256.0),
-                (params.float_or("vectorSmoothness", 50.0) / 100.0).clamp(0.0, 1.0),
+                (smooth / 100.0).clamp(0.0, 1.0),
             ];
         }
         "echo" => {
             let weight = if params.values.contains_key("startingIntensity") {
                 params.float_or("startingIntensity", 1.0)
+            } else if params.values.contains_key("opacity") {
+                params.float_or("opacity", 0.75)
             } else {
                 params.float_or("weight", 1.0)
             };
-            u.mode = params.int_or("operator", 0).clamp(0, 6) as u32;
+            let mode = if params.values.contains_key("composite") {
+                // Zoidium native-fx echo.js: 0=over, 1=behind, 2=add, 3=screen, 4=maximum
+                match params.int_or("composite", 0) {
+                    0 => 4,
+                    1 => 5,
+                    2 => 0,
+                    3 => 3,
+                    _ => 1,
+                }
+            } else {
+                params.int_or("operator", 0).clamp(0, 6) as u32
+            };
+            u.mode = mode;
             u.flags = u32::from(has_aux);
             u.p0 = [weight, params.float_or("decay", 0.5), 0.0, 0.0];
         }
@@ -1238,9 +1548,195 @@ pub fn pack_effect_uniforms(
     u
 }
 
-/// Computes the 3x3 inverse homography (row-major) mapping screen NDC `(nx, ny, 1)`
+/// Computes the exact CM3 `gradientoverlay.js` `uvTransform` matrix rows `(m0, m1)`.
+fn compute_gradient_uv_transform(
+    offset: [f32; 2],
+    scale: [f32; 2],
+    rotation: f32,
+    resolution: [f32; 2],
+) -> ([f32; 4], [f32; 4]) {
+    let w = resolution[0].max(1.0);
+    let h = resolution[1].max(1.0);
+    let max_dim = w.max(h);
+    let aspect_w = max_dim / w;
+    let aspect_h = max_dim / h;
+    let i = if scale[0].abs() < 1e-6 {
+        1e-6
+    } else {
+        scale[0]
+    };
+    let r = if scale[1].abs() < 1e-6 {
+        1e-6
+    } else {
+        scale[1]
+    };
+    let a0 = 1.0 / (i * aspect_w);
+    let a1 = 1.0 / (r * aspect_h);
+    let (n, p) = rotation.sin_cos();
+    let m0 = [
+        a0 * p,
+        a1 * n * r / i,
+        -a0 * p * 0.5 - a1 * n * r / i * 0.5 - offset[0] * p / i - offset[1] * n / i + 0.5,
+        0.0,
+    ];
+    let m1 = [
+        -a0 * n * i / r,
+        a1 * p,
+        a0 * n * i / r * 0.5 - a1 * p * 0.5 + offset[0] * n / r - offset[1] * p / r + 0.5,
+        0.0,
+    ];
+    (m0, m1)
+}
+
+/// Computes the exact CM3 `overlay.js` / `displacementmap.js` `uvTransform` matrix rows `(m0, m1)`.
+fn compute_overlay_uv_transform(
+    offset: [f32; 2],
+    scale: [f32; 2],
+    rotation: f32,
+    resolution: [f32; 2],
+) -> ([f32; 4], [f32; 4]) {
+    let w = resolution[0].max(1.0);
+    let h = resolution[1].max(1.0);
+    let aspect = w / h;
+    let sx = if scale[0].abs() < 1e-6 {
+        1e-6
+    } else {
+        scale[0]
+    };
+    let sy = if scale[1].abs() < 1e-6 {
+        1e-6
+    } else {
+        scale[1]
+    };
+    let r = aspect * sx;
+    let i = sy;
+    let s0 = 1.0 / sx;
+    let s1 = 1.0 / sy;
+    let (n, p) = rotation.sin_cos();
+    let m0 = [
+        s0 * p,
+        s1 * n * i / r,
+        -s0 * p * 0.5 - s1 * n * i / r * 0.5 - offset[0] * p / r - offset[1] * n / r + 0.5,
+        0.0,
+    ];
+    let m1 = [
+        -s0 * n * r / i,
+        s1 * p,
+        s0 * n * r / i * 0.5 - s1 * p * 0.5 + offset[0] * n / i - offset[1] * p / i + 0.5,
+        0.0,
+    ];
+    (m0, m1)
+}
+
+/// Computes the exact CM3 `duplicate.js` `uvTransform` matrix rows `(m0, m1)`.
+fn compute_duplicate_uv_transform(
+    offset: [f32; 2],
+    multiplier: [f32; 2],
+    rotation: f32,
+    resolution: [f32; 2],
+) -> ([f32; 4], [f32; 4]) {
+    let w = resolution[0].max(1.0);
+    let h = resolution[1].max(1.0);
+    let aspect = w / h;
+    let s0 = if multiplier[0].abs() < 1e-6 {
+        1e-6
+    } else {
+        multiplier[0]
+    };
+    let s1 = if multiplier[1].abs() < 1e-6 {
+        1e-6
+    } else {
+        multiplier[1]
+    };
+    let r = aspect * s1;
+    let i = s0;
+    let (sin_a, cos_a) = rotation.sin_cos();
+    let m0 = [
+        s0 * cos_a,
+        s1 * sin_a * i / r,
+        -s0 * cos_a * 0.5 - s1 * sin_a * i / r * 0.5 + offset[0] + 0.5,
+        0.0,
+    ];
+    let m1 = [
+        -s0 * sin_a * r / i,
+        s1 * cos_a,
+        s0 * sin_a * r / i * 0.5 - s1 * cos_a * 0.5 + offset[1] + 0.5,
+        0.0,
+    ];
+    (m0, m1)
+}
+
+/// Computes the 3x3 inverse homography (row-major) and camera-space depth plane
+/// `[u_cam.z, v_cam.z, o_cam.z, far]` for `shake.js` using exact `PZ.shake` 3D camera transform.
+fn compute_shake_inverse_homography(params: &EffectParams) -> Option<([[f32; 3]; 3], [f32; 4])> {
+    let w = params.resolution[0].max(1.0);
+    let h = params.resolution[1].max(1.0);
+    let d = w.max(h);
+    let amp = params.float_or("amplitude", 0.01);
+    let speed = params.float_or("speed", 15.0);
+    let zoom = params.float_or("zoom", 100.0);
+    let shake_mode = params.int_or("shake.mode", 1);
+    let chan_amp = if params.values.contains_key("shake.amplitude") {
+        params.vec4_or("shake.amplitude", [1000.0, 1000.0, 1000.0, 10.0])
+    } else {
+        params.vec4_or("shake.amp", [1000.0, 1000.0, 1000.0, 10.0])
+    };
+    let chan_freq = params.vec4_or("shake.frequency", [0.6, 0.8, 0.7, 0.9]);
+    let chan_phase = params.vec4_or("shake.phase", [0.0, 11.0, 20.0, 31.0]);
+    let chan_noise = params.vec4_or("shake.noise", [0.9, 0.9, 0.9, 0.55]);
+    let chan_smooth = params.vec4_or("shake.smooth", [1.0, 1.0, 1.0, 1.0]);
+    let shake_params = zc_scene::CameraShakeParams {
+        mode: if shake_mode == 0 {
+            zc_scene::CameraShakeMode::Rotate
+        } else {
+            zc_scene::CameraShakeMode::Move
+        },
+        amplitude: chan_amp,
+        frequency: chan_freq,
+        phase: chan_phase,
+        noise: chan_noise,
+        smooth: [
+            chan_smooth[0] >= 0.5,
+            chan_smooth[1] >= 0.5,
+            chan_smooth[2] >= 0.5,
+            chan_smooth[3] >= 0.5,
+        ],
+    };
+
+    // shake.js: camera starts at (0, 0, -zoom), then PZ.shake.shake(r, amp, camera)
+    // right-multiplies M_shake (with * 0.1 rad scale on Rotate/Roll).
+    // Clamp zoom to `< d` so small preview/test targets (e.g. 64x64) don't place the camera behind the quad at z = -d.
+    let eff_zoom = zoom.min(d * 0.85);
+    let m_shake = zc_scene::evaluate_camera_shake(
+        f64::from(params.frame),
+        f64::from(amp),
+        f64::from(speed),
+        &shake_params,
+    );
+    let m_cam = zc_geom::Mat4::from_translation(zc_geom::Vec3::new(0.0, 0.0, -eff_zoom)) * m_shake;
+    let m_cam_inv = m_cam.inverse();
+
+    let u_cam = m_cam_inv.transform_vector3(zc_geom::Vec3::new(0.5 * w, 0.0, 0.0));
+    let v_cam = m_cam_inv.transform_vector3(zc_geom::Vec3::new(0.0, 0.5 * h, 0.0));
+    let o_cam = m_cam_inv.transform_point3(zc_geom::Vec3::new(0.0, 0.0, -d));
+
+    let fx = 2.0 * d / w;
+    let fy = 2.0 * d / h;
+    let m = [
+        [fx * u_cam.x, fx * v_cam.x, fx * o_cam.x],
+        [fy * u_cam.y, fy * v_cam.y, fy * o_cam.y],
+        [-u_cam.z, -v_cam.z, -o_cam.z],
+    ];
+    let h_inv = invert_mat3(m)?;
+    Some((h_inv, [u_cam.z, v_cam.z, o_cam.z, 2.0 * d]))
+}
+
+/// Computes the 3x3 inverse homography (row-major) and camera-space depth plane
+/// `[u_cam.z, v_cam.z, o_cam.z, far]` mapping screen NDC `(nx, ny, 1)`
 /// to quad local coordinates `(qx, qy, qw)` for the `transform` effect.
-fn compute_transform_inverse_homography(params: &EffectParams) -> Option<[[f32; 3]; 3]> {
+fn compute_transform_inverse_homography(
+    params: &EffectParams,
+) -> Option<([[f32; 3]; 3], [f32; 4])> {
     let w = params.resolution[0].max(1.0);
     let h = params.resolution[1].max(1.0);
     let d = w.max(h);
@@ -1290,7 +1786,8 @@ fn compute_transform_inverse_homography(params: &EffectParams) -> Option<[[f32; 
         [cols[0][1], cols[1][1], cols[2][1]],
         [cols[0][2], cols[1][2], cols[2][2]],
     ];
-    invert_mat3(m)
+    let h_inv = invert_mat3(m)?;
+    Some((h_inv, [u_cam[2], v_cam[2], o_cam[2], 2.0 * d]))
 }
 
 fn euler_xyz_matrix(rot: [f32; 3]) -> [[f32; 3]; 3] {
@@ -1381,7 +1878,7 @@ pub struct EffectRegistry {
     linear_repeat_sampler: wgpu::Sampler,
     _fallback_texture: wgpu::Texture,
     fallback_view: wgpu::TextureView,
-    pipelines: HashMap<(&'static str, bool), wgpu::RenderPipeline>,
+    pipelines: HashMap<(&'static str, bool, wgpu::TextureFormat), wgpu::RenderPipeline>,
     custom_pipelines: HashMap<u64, CustomPipelineEntry>,
     custom_tick: u64,
 }
@@ -1563,16 +2060,27 @@ impl EffectRegistry {
         effect_id: &str,
         additive: bool,
     ) -> Result<&'static str, EffectError> {
+        self.ensure_pipeline_for_format(device, effect_id, additive, self.format)
+    }
+
+    fn ensure_pipeline_for_format(
+        &mut self,
+        device: &wgpu::Device,
+        effect_id: &str,
+        additive: bool,
+        format: wgpu::TextureFormat,
+    ) -> Result<&'static str, EffectError> {
         let (canonical_id, body) = lookup_effect_shader(effect_id)
             .ok_or_else(|| EffectError::UnknownEffect(effect_id.to_owned()))?;
-        let key = (canonical_id, additive);
+        let key = (canonical_id, additive, format);
         if !self.pipelines.contains_key(&key) {
             let full_wgsl = build_effect_wgsl(body);
-            let pipeline = self.compile_wgsl_pipeline(
+            let pipeline = self.compile_wgsl_pipeline_for_format(
                 device,
                 &format!("zc-effect-{canonical_id}"),
                 &full_wgsl,
                 if additive { Some(ADDITIVE_BLEND) } else { None },
+                format,
             );
             self.pipelines.insert(key, pipeline);
         }
@@ -1612,7 +2120,8 @@ impl EffectRegistry {
             return Err(EffectError::InvalidDimensions { width, height });
         }
 
-        match effect_id {
+        let resolved = canonical_effect_id(effect_id);
+        match resolved {
             "boxblur" => self.run_box_blur(device, encoder, params, targets, width, height)?,
             "gaussianblur" => {
                 self.run_gaussian_blur(device, encoder, params, targets, width, height)?
@@ -1637,7 +2146,7 @@ impl EffectRegistry {
             "sglow" => self.run_sglow(device, encoder, params, targets, width, height)?,
             _ => {
                 let uploaded_lut = if targets.aux.is_none() {
-                    self.upload_param_lut(device, queue, effect_id, params)
+                    self.upload_param_lut(device, queue, resolved, params)
                 } else {
                     None
                 };
@@ -1646,16 +2155,16 @@ impl EffectRegistry {
                     .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
                 let effective_aux = targets.aux.or(lut_view.as_ref());
                 let uniforms = pack_effect_uniforms(
-                    effect_id,
+                    resolved,
                     params,
                     effective_aux.is_some(),
                     targets.aux2.is_some(),
                 );
-                let canonical = self.ensure_pipeline(device, effect_id, false)?;
+                let canonical = self.ensure_pipeline(device, resolved, false)?;
                 self.encode_pass(
                     device,
                     encoder,
-                    (canonical, false),
+                    (canonical, false, self.format),
                     &uniforms,
                     targets.input,
                     targets.output,
@@ -1763,7 +2272,7 @@ impl EffectRegistry {
         self.encode_pass(
             device,
             encoder,
-            (canonical, false),
+            (canonical, false, self.format),
             &u_v,
             targets.input,
             &temp_view,
@@ -1779,7 +2288,7 @@ impl EffectRegistry {
         self.encode_pass(
             device,
             encoder,
-            (canonical, false),
+            (canonical, false, self.format),
             &u_h,
             &temp_view,
             targets.output,
@@ -1817,7 +2326,7 @@ impl EffectRegistry {
             self.encode_pass(
                 device,
                 encoder,
-                (canonical, false),
+                (canonical, false, self.format),
                 &u_h,
                 src_h,
                 &view_a,
@@ -1833,7 +2342,7 @@ impl EffectRegistry {
             self.encode_pass(
                 device,
                 encoder,
-                (canonical, false),
+                (canonical, false, self.format),
                 &u_v,
                 &view_a,
                 dst_v,
@@ -1857,8 +2366,10 @@ impl EffectRegistry {
         height: u32,
         anamorphic: bool,
     ) -> Result<(), EffectError> {
+        let hdr_fmt = wgpu::TextureFormat::Rgba16Float;
         let canonical = self.ensure_pipeline(device, effect_id, false)?;
-        let _ = self.ensure_pipeline(device, effect_id, true)?;
+        let _ = self.ensure_pipeline_for_format(device, effect_id, false, hdr_fmt)?;
+        let _ = self.ensure_pipeline_for_format(device, effect_id, true, hdr_fmt)?;
 
         let amount = params.float_or("amount", 1.0);
         let inner = params.vec3_or(
@@ -1891,8 +2402,9 @@ impl EffectRegistry {
             ((height as f32) * 0.5).round().max(1.0) as u32
         };
 
-        // Pass 0: High-pass extraction into mip-0 seed texture.
-        let bright_tex = self.create_temp_target(device, mw0, mh0, "zc-glow-bright");
+        // Pass 0: High-pass extraction into mip-0 HDR seed texture.
+        let bright_tex =
+            self.create_temp_target_with_format(device, mw0, mh0, hdr_fmt, "zc-glow-bright");
         let bright_view = bright_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let mut u_hp = EffectUniforms::from_params(params);
         u_hp.pass = 0;
@@ -1900,7 +2412,7 @@ impl EffectRegistry {
         self.encode_pass(
             device,
             encoder,
-            (canonical, false),
+            (canonical, false, hdr_fmt),
             &u_hp,
             targets.input,
             &bright_view,
@@ -1909,7 +2421,9 @@ impl EffectRegistry {
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
 
-        let accum_tex = self.create_temp_target(device, mw0, mh0, "zc-glow-accum");
+        // HDR Rgba16Float accumulator prevents 8-bit highlight clipping before `amount` & highlight protection.
+        let accum_tex =
+            self.create_temp_target_with_format(device, mw0, mh0, hdr_fmt, "zc-glow-accum");
         let accum_view = accum_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let kernels = [3.0_f32, 5.0, 7.0, 9.0, 11.0];
@@ -1926,7 +2440,8 @@ impl EffectRegistry {
                 ((height as f32) / div).round().max(1.0) as u32
             };
 
-            let mip_h = self.create_temp_target(device, mw, mh, "zc-glow-mip-h");
+            let mip_h =
+                self.create_temp_target_with_format(device, mw, mh, hdr_fmt, "zc-glow-mip-h");
             let mip_h_view = mip_h.create_view(&wgpu::TextureViewDescriptor::default());
 
             let src_view = prev_view.as_ref().unwrap_or(&bright_view);
@@ -1939,7 +2454,7 @@ impl EffectRegistry {
             self.encode_pass(
                 device,
                 encoder,
-                (canonical, false),
+                (canonical, false, hdr_fmt),
                 &u_bh,
                 src_view,
                 &mip_h_view,
@@ -1948,31 +2463,27 @@ impl EffectRegistry {
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
 
-            // Vertical Gaussian pass on mip m (skipped for anamorphic horizontal streaks)
-            let (mip_out, mip_out_view) = if anamorphic {
-                (mip_h, mip_h_view)
-            } else {
-                let mip_v = self.create_temp_target(device, mw, mh, "zc-glow-mip-v");
-                let mip_v_view = mip_v.create_view(&wgpu::TextureViewDescriptor::default());
-                let mut u_bv = EffectUniforms::from_params(params);
-                u_bv.resolution = [mw as f32, mh as f32];
-                u_bv.pass = 1;
-                u_bv.p0 = [0.0, 1.0 / (mh as f32), k_m, 0.0];
-                self.encode_pass(
-                    device,
-                    encoder,
-                    (canonical, false),
-                    &u_bv,
-                    &mip_h_view,
-                    &mip_v_view,
-                    None,
-                    None,
-                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                );
-                (mip_v, mip_v_view)
-            };
+            // Vertical Gaussian pass on mip m (matches CM3 ALFPass & UnrealBloomPass: both run H + V)
+            let mip_v =
+                self.create_temp_target_with_format(device, mw, mh, hdr_fmt, "zc-glow-mip-v");
+            let mip_v_view = mip_v.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut u_bv = EffectUniforms::from_params(params);
+            u_bv.resolution = [mw as f32, mh as f32];
+            u_bv.pass = 1;
+            u_bv.p0 = [0.0, 1.0 / (mh as f32), k_m, 0.0];
+            self.encode_pass(
+                device,
+                encoder,
+                (canonical, false, hdr_fmt),
+                &u_bv,
+                &mip_h_view,
+                &mip_v_view,
+                None,
+                None,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
 
-            // Weighted tinted additive accumulation into `accum_view`
+            // Weighted tinted additive HDR accumulation into `accum_view`
             let w_m = f_m + ((1.2 - f_m) - f_m) * radius;
             let tint = if m < 3 { inner } else { outer };
             let mut u_acc = EffectUniforms::from_params(params);
@@ -1987,17 +2498,17 @@ impl EffectRegistry {
             self.encode_pass(
                 device,
                 encoder,
-                (canonical, true),
+                (canonical, true, hdr_fmt),
                 &u_acc,
-                &mip_out_view,
+                &mip_v_view,
                 &accum_view,
                 None,
                 None,
                 load_op,
             );
 
-            prev_tex = Some(mip_out);
-            prev_view = Some(mip_out_view);
+            prev_tex = Some(mip_v);
+            prev_view = Some(mip_v_view);
         }
         let _ = prev_tex;
 
@@ -2008,7 +2519,7 @@ impl EffectRegistry {
         self.encode_pass(
             device,
             encoder,
-            (canonical, false),
+            (canonical, false, self.format),
             &u_fin,
             targets.input,
             targets.output,
@@ -2037,7 +2548,7 @@ impl EffectRegistry {
         self.encode_pass(
             device,
             encoder,
-            (canonical, false),
+            (canonical, false, self.format),
             &u_sort,
             targets.input,
             &map_view,
@@ -2051,7 +2562,7 @@ impl EffectRegistry {
         self.encode_pass(
             device,
             encoder,
-            (canonical, false),
+            (canonical, false, self.format),
             &u_draw,
             targets.input,
             targets.output,
@@ -2078,9 +2589,22 @@ impl EffectRegistry {
         let view_b = temp_b.create_view(&wgpu::TextureViewDescriptor::default());
 
         let col = params.vec3_or("color", [0.0, 0.0, 0.0]);
-        let offset = params.vec2_or("offset", [8.0, -8.0]);
-        let opacity = params.float_or("opacity", 0.75);
-        let softness = params.float_or("softness", 3.0);
+        let use_polar = params.values.contains_key("angle")
+            || params.values.contains_key("distance")
+            || !params.values.contains_key("offset");
+        let offset = if use_polar {
+            let angle_rad = params.float_or("angle", 135.0).to_radians();
+            let dist = params.float_or("distance", 10.0);
+            [angle_rad.cos() * dist, -angle_rad.sin() * dist]
+        } else {
+            params.vec2_or("offset", [8.0, -8.0])
+        };
+        let opacity = params.float_or("opacity", 0.5);
+        let blur = if params.values.contains_key("blur") {
+            params.float_or("blur", 10.0)
+        } else {
+            params.float_or("softness", 10.0)
+        };
         let shadow_only = u32::from(params.bool_or("shadowOnly", false));
 
         // Pass 0: Extract & colorize offset alpha
@@ -2091,7 +2615,7 @@ impl EffectRegistry {
         self.encode_pass(
             device,
             encoder,
-            (canonical, false),
+            (canonical, false, self.format),
             &u0,
             targets.input,
             &view_a,
@@ -2100,37 +2624,43 @@ impl EffectRegistry {
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
 
-        // Pass 1a: Vertical blur
-        let mut u1v = EffectUniforms::from_params(params);
-        u1v.pass = 1;
-        u1v.p0 = [0.0, 1.0 / (height as f32), softness, 0.0];
-        self.encode_pass(
-            device,
-            encoder,
-            (canonical, false),
-            &u1v,
-            &view_a,
-            &view_b,
-            None,
-            None,
-            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-        );
+        // 3x H+V CM3 21-tap box blur (`delta = blur / 10.0`), matching dropshadow.js:208-224
+        if blur > 1e-4 {
+            let blur_delta = blur / 10.0;
+            let inv_w = 1.0 / (width as f32);
+            let inv_h = 1.0 / (height as f32);
+            for _ in 0..3 {
+                let mut u1h = EffectUniforms::from_params(params);
+                u1h.pass = 1;
+                u1h.p0 = [inv_w, 0.0, blur_delta, 0.0];
+                self.encode_pass(
+                    device,
+                    encoder,
+                    (canonical, false, self.format),
+                    &u1h,
+                    &view_a,
+                    &view_b,
+                    None,
+                    None,
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                );
 
-        // Pass 1b: Horizontal blur
-        let mut u1h = EffectUniforms::from_params(params);
-        u1h.pass = 1;
-        u1h.p0 = [1.0 / (width as f32), 0.0, softness, 0.0];
-        self.encode_pass(
-            device,
-            encoder,
-            (canonical, false),
-            &u1h,
-            &view_b,
-            &view_a,
-            None,
-            None,
-            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-        );
+                let mut u1v = EffectUniforms::from_params(params);
+                u1v.pass = 1;
+                u1v.p0 = [0.0, inv_h, blur_delta, 0.0];
+                self.encode_pass(
+                    device,
+                    encoder,
+                    (canonical, false, self.format),
+                    &u1v,
+                    &view_b,
+                    &view_a,
+                    None,
+                    None,
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                );
+            }
+        }
 
         // Pass 2: Composite shadow behind source
         let mut u2 = EffectUniforms::from_params(params);
@@ -2139,7 +2669,7 @@ impl EffectRegistry {
         self.encode_pass(
             device,
             encoder,
-            (canonical, false),
+            (canonical, false, self.format),
             &u2,
             targets.input,
             targets.output,
@@ -2159,115 +2689,484 @@ impl EffectRegistry {
         width: u32,
         height: u32,
     ) -> Result<(), EffectError> {
+        let hdr_fmt = wgpu::TextureFormat::Rgba16Float;
         let canonical = self.ensure_pipeline(device, "sglow", false)?;
-        let temp_a = self.create_temp_target(device, width, height, "zc-sglow-a");
-        let temp_b = self.create_temp_target(device, width, height, "zc-sglow-b");
-        let view_a = temp_a.create_view(&wgpu::TextureViewDescriptor::default());
-        let view_b = temp_b.create_view(&wgpu::TextureViewDescriptor::default());
+        let _ = self.ensure_pipeline_for_format(device, "sglow", false, hdr_fmt)?;
+        let _ = self.ensure_pipeline_for_format(device, "sglow", true, hdr_fmt)?;
 
         let color = params.vec3_or("color", [1.0, 1.0, 1.0]);
         let thresh_add = params.vec3_or("thresholdAddColor", [0.0, 0.0, 0.0]);
         let threshold = params.float_or("threshold", 0.5);
-        let brightness = params.float_or("brightness", 2.0);
-        let glow_width = params.float_or("glowWidth", 96.0);
-        let width_x = params.float_or("widthX", 1.0);
-        let width_y = params.float_or("widthY", 1.0);
+        let brightness = params.float_or("brightness", 2.0).max(0.0);
+        let glow_width = params.float_or("glowWidth", 96.0).max(0.0);
+        let width_x = params.float_or("widthX", 1.0).max(0.0);
+        let width_y = params.float_or("widthY", 1.0).max(0.0);
         let width_rgb = [
-            params.float_or("widthRed", 1.0),
-            params.float_or("widthGreen", 1.2),
-            params.float_or("widthBlue", 1.4),
+            params.float_or("widthRed", 1.0).max(0.0),
+            params.float_or("widthGreen", 1.2).max(0.0),
+            params.float_or("widthBlue", 1.4).max(0.0),
         ];
+        let show = params.int_or("show", 0) != 0;
+        let combine = params.int_or("combine", 2).clamp(0, 4) as u32;
+        let edge_mode = params.int_or("edgeMode", 1).clamp(0, 1) as f32;
+        let opacity_mode = params.int_or("opacity", 1).clamp(0, 2) as f32;
+        let subpixel_off = params.int_or("subpixel", 1) == 0;
+        let quality = params.int_or("quality", 2).clamp(0, 3);
+        let engine = if params.values.contains_key("engine") {
+            params.int_or("engine", 1)
+        } else if params.values.contains_key("blurEngine") {
+            params.int_or("blurEngine", 1)
+        } else {
+            1
+        };
+        let from_alpha = params.float_or("glowFromAlpha", 0.0);
+        let glow_under = params.float_or("glowUnderSource", 0.0);
+        let light_bg = params.float_or("lightBackground", 0.0);
+        let source_opacity = params.float_or("sourceOpacity", 1.0);
+        let affect_alpha = params.float_or("affectAlpha", 1.0);
+        let deband = params.int_or("deband", 1) != 0 && brightness > 0.0;
 
-        // Pass 0: Threshold emission
-        let mut u0 = EffectUniforms::from_params(params);
-        u0.pass = 0;
-        u0.c0 = [color[0], color[1], color[2], 1.0];
-        u0.c1 = [thresh_add[0], thresh_add[1], thresh_add[2], 1.0];
-        u0.p0 = [
-            threshold,
-            brightness,
-            params.float_or("glowFromAlpha", 0.0),
-            0.0,
-        ];
-        self.encode_pass(
-            device,
-            encoder,
-            (canonical, false),
-            &u0,
-            targets.input,
-            &view_a,
-            None,
-            None,
-            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-        );
-
-        // Pass 1a: Vertical anisotropic per-channel blur
-        let mut u1v = EffectUniforms::from_params(params);
-        u1v.pass = 1;
-        u1v.p0 = [0.0, width_y / (height as f32), glow_width, 0.0];
-        u1v.p1 = [width_rgb[0], width_rgb[1], width_rgb[2], 0.0];
-        self.encode_pass(
-            device,
-            encoder,
-            (canonical, false),
-            &u1v,
-            &view_a,
-            &view_b,
-            None,
-            None,
-            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-        );
-
-        // Pass 1b: Horizontal anisotropic per-channel blur
-        let mut u1h = EffectUniforms::from_params(params);
-        u1h.pass = 1;
-        u1h.p0 = [width_x / (width as f32), 0.0, glow_width, 0.0];
-        u1h.p1 = [width_rgb[0], width_rgb[1], width_rgb[2], 0.0];
-        self.encode_pass(
-            device,
-            encoder,
-            (canonical, false),
-            &u1h,
-            &view_b,
-            &view_a,
-            None,
-            None,
-            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-        );
-
-        // Pass 2: Atmosphere & combine
-        let mut u2 = EffectUniforms::from_params(params);
-        u2.pass = 2;
-        u2.mode = params.int_or("combine", 2).clamp(0, 4) as u32;
-        u2.flags = u32::from(params.int_or("show", 0) != 0);
-        u2.p0 = [
-            brightness,
-            params.float_or("sourceOpacity", 1.0),
-            params.float_or("glowUnderSource", 0.0),
-            params.float_or("affectAlpha", 1.0),
-        ];
         let atmo_t = if params.int_or("timeMode", 0) == 0 {
             params.time
         } else {
             params.float_or("time", params.time)
         };
-        u2.p1 = [
-            params.float_or("atmosphereAmp", 0.0),
-            params.float_or("atmosphereFreq", 1.0),
-            params.float_or("atmosphereSeed", 0.123),
-            atmo_t * params.float_or("atmosphereSpeed", 1.0),
-        ];
+        let atmo_amp = params.float_or("atmosphereAmp", 0.0) * 0.5;
+        let atmo_freq = params.float_or("atmosphereFreq", 1.0);
+        let atmo_detail = params.float_or("atmosphereDetail", 0.6);
+        let atmo_seed = params.float_or("atmosphereSeed", 0.123);
+        let atmo_speed = params.float_or("atmosphereSpeed", 1.0);
+
+        let wf = width as f32;
+        let hf = height as f32;
+
+        // Track HDR textures alive until encoder submission.
+        let mut owned_textures: Vec<wgpu::Texture> = Vec::new();
+        let mut fine_view: Option<wgpu::TextureView> = None;
+        let mut coarse_view: Option<wgpu::TextureView> = None;
+        let mut ae_mix: f32 = 0.0;
+        let mut no_blur = false;
+        let mut use_ae_blend = false;
+
+        if !show && brightness > 0.0 && engine == 1 {
+            // AE Match 3-box engine (sglow-hq-v2-preview.js:660-794)
+            let cap_x = 3.0 * ((wf * 0.5).floor() - 1.0).max(0.0);
+            let cap_y = 3.0 * ((hf * 0.5).floor() - 1.0).max(0.0);
+            let widths_x = width_rgb.map(|c| {
+                let nat = (glow_width * width_x * c).min(cap_x);
+                if subpixel_off {
+                    (nat + 0.5).floor()
+                } else {
+                    nat
+                }
+            });
+            let widths_y = width_rgb.map(|c| {
+                let nat = (glow_width * width_y * c).min(cap_y);
+                if subpixel_off {
+                    (nat + 0.5).floor()
+                } else {
+                    nat
+                }
+            });
+            let max_width = widths_x.into_iter().chain(widths_y).fold(0.0_f32, f32::max);
+
+            if max_width <= 1e-6 {
+                no_blur = true;
+            } else {
+                let max_per_box = match quality {
+                    0 => 5.0_f32,
+                    1 => 8.0_f32,
+                    2 => 12.0_f32,
+                    _ => 16.0_f32,
+                };
+                let lod = (((max_width / 3.0) + 1.0) / max_per_box)
+                    .log2()
+                    .clamp(0.0, 10.0);
+                let fine_level = (lod.floor() as i32) - 1;
+                let mix_frac = lod - lod.floor();
+
+                let split_box = |r: f32| -> [f32; 3] {
+                    let n = (r / 3.0).floor();
+                    let rem = r - 3.0 * n;
+                    [
+                        n,
+                        n + if rem >= 2.0 { 1.0 } else { 0.0 },
+                        n + if rem >= 1.0 { 1.0 } else { 0.0 },
+                    ]
+                };
+
+                let mut run_ae_level = |selected: i32,
+                                        owned: &mut Vec<wgpu::Texture>|
+                 -> (wgpu::Texture, wgpu::TextureView) {
+                    let (work_tex, mut work_view, work_w, work_h) = if selected < 0 {
+                        let t = self.create_temp_target_with_format(
+                            device,
+                            width,
+                            height,
+                            hdr_fmt,
+                            "zc-sglow-extract-full",
+                        );
+                        let v = t.create_view(&wgpu::TextureViewDescriptor::default());
+                        let mut u_ex = EffectUniforms::from_params(params);
+                        u_ex.pass = 0;
+                        u_ex.p0 = [threshold, from_alpha, opacity_mode, edge_mode];
+                        u_ex.p1 = [0.0, 0.0, 1.0, 0.0];
+                        u_ex.c1 = [thresh_add[0], thresh_add[1], thresh_add[2], 1.0];
+                        self.encode_pass(
+                            device,
+                            encoder,
+                            (canonical, false, hdr_fmt),
+                            &u_ex,
+                            targets.input,
+                            &v,
+                            None,
+                            None,
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        );
+                        (t, v, width, height)
+                    } else {
+                        let mut old_w = width;
+                        let mut old_h = height;
+                        let mut prev_t: Option<wgpu::Texture> = None;
+                        let mut prev_v: Option<wgpu::TextureView> = None;
+                        for lvl in 0..=selected {
+                            let nw = ((old_w as f32) * 0.5).round().max(1.0) as u32;
+                            let nh = ((old_h as f32) * 0.5).round().max(1.0) as u32;
+                            let t = self.create_temp_target_with_format(
+                                device,
+                                nw,
+                                nh,
+                                hdr_fmt,
+                                "zc-sglow-down",
+                            );
+                            let v = t.create_view(&wgpu::TextureViewDescriptor::default());
+                            if lvl == 0 {
+                                let mut u_ex = EffectUniforms::from_params(params);
+                                u_ex.resolution = [nw as f32, nh as f32];
+                                u_ex.pass = 0;
+                                u_ex.p0 = [threshold, from_alpha, opacity_mode, edge_mode];
+                                u_ex.p1 = [1.0 / wf, 1.0 / hf, 0.0, 0.0];
+                                u_ex.c1 = [thresh_add[0], thresh_add[1], thresh_add[2], 1.0];
+                                self.encode_pass(
+                                    device,
+                                    encoder,
+                                    (canonical, false, hdr_fmt),
+                                    &u_ex,
+                                    targets.input,
+                                    &v,
+                                    None,
+                                    None,
+                                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                );
+                            } else {
+                                let mut u_dn = EffectUniforms::from_params(params);
+                                u_dn.resolution = [nw as f32, nh as f32];
+                                u_dn.pass = 1;
+                                u_dn.p0 =
+                                    [1.0 / (old_w as f32), 1.0 / (old_h as f32), edge_mode, 0.0];
+                                self.encode_pass(
+                                    device,
+                                    encoder,
+                                    (canonical, false, hdr_fmt),
+                                    &u_dn,
+                                    prev_v.as_ref().expect("previous mip view"),
+                                    &v,
+                                    None,
+                                    None,
+                                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                );
+                            }
+                            if let Some(old_t) = prev_t.replace(t) {
+                                owned.push(old_t);
+                            }
+                            prev_v = Some(v);
+                            old_w = nw;
+                            old_h = nh;
+                        }
+                        (
+                            prev_t.expect("mip texture"),
+                            prev_v.expect("mip view"),
+                            old_w,
+                            old_h,
+                        )
+                    };
+                    owned.push(work_tex);
+
+                    let ping = self.create_temp_target_with_format(
+                        device,
+                        work_w,
+                        work_h,
+                        hdr_fmt,
+                        "zc-sglow-ae-ping",
+                    );
+                    let pong = self.create_temp_target_with_format(
+                        device,
+                        work_w,
+                        work_h,
+                        hdr_fmt,
+                        "zc-sglow-ae-pong",
+                    );
+                    let ping_v = ping.create_view(&wgpu::TextureViewDescriptor::default());
+                    let pong_v = pong.create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let scale_x = wf / (work_w as f32);
+                    let scale_y = hf / (work_h as f32);
+
+                    for pass_index in 0..6usize {
+                        let is_x = pass_index < 3;
+                        let stage = pass_index % 3;
+                        let px_widths = if is_x { widths_x } else { widths_y };
+                        let sc = if is_x { scale_x } else { scale_y };
+                        let mut r0 = [0.0_f32; 3];
+                        let mut r1 = [0.0_f32; 3];
+                        let mut fracs = [0.0_f32; 3];
+                        let mut max_r = 0.0_f32;
+                        for ch in 0..3 {
+                            let low = px_widths[ch].floor();
+                            let fr = if subpixel_off {
+                                0.0
+                            } else {
+                                px_widths[ch] - low
+                            };
+                            r0[ch] = split_box(low)[stage] / sc;
+                            r1[ch] = split_box(low + 1.0)[stage] / sc;
+                            fracs[ch] = fr;
+                            max_r = max_r.max(r0[ch]).max(r1[ch]);
+                        }
+                        let mut u_box = EffectUniforms::from_params(params);
+                        u_box.resolution = [work_w as f32, work_h as f32];
+                        u_box.pass = 2;
+                        u_box.p0 = [
+                            if is_x { 1.0 / (work_w as f32) } else { 0.0 },
+                            if is_x { 0.0 } else { 1.0 / (work_h as f32) },
+                            edge_mode,
+                            max_r.ceil().min(32.0),
+                        ];
+                        u_box.p1 = [r0[0], r0[1], r0[2], 0.0];
+                        u_box.p2 = [r1[0], r1[1], r1[2], 0.0];
+                        u_box.p3 = [fracs[0], fracs[1], fracs[2], 0.0];
+                        let dst_v = if pass_index % 2 == 0 {
+                            &ping_v
+                        } else {
+                            &pong_v
+                        };
+                        self.encode_pass(
+                            device,
+                            encoder,
+                            (canonical, false, hdr_fmt),
+                            &u_box,
+                            &work_view,
+                            dst_v,
+                            None,
+                            None,
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        );
+                        work_view = if pass_index % 2 == 0 {
+                            ping.create_view(&wgpu::TextureViewDescriptor::default())
+                        } else {
+                            pong.create_view(&wgpu::TextureViewDescriptor::default())
+                        };
+                    }
+                    owned.push(ping);
+                    (pong, pong_v)
+                };
+
+                let (fine_t, fine_v) = run_ae_level(fine_level, &mut owned_textures);
+                owned_textures.push(fine_t);
+                if mix_frac > 1e-6 {
+                    let (coarse_t, coarse_v) = run_ae_level(fine_level + 1, &mut owned_textures);
+                    owned_textures.push(coarse_t);
+                    fine_view = Some(fine_v);
+                    coarse_view = Some(coarse_v);
+                    ae_mix = mix_frac;
+                    use_ae_blend = true;
+                } else {
+                    fine_view = Some(fine_v);
+                }
+            }
+        } else if !show && brightness > 0.0 && glow_width > 0.0 {
+            // Legacy 5-mip Gaussian pyramid (sglow-hq-v2-preview.js:801-871)
+            let mip_count = match quality {
+                0 => 3usize,
+                1 => 4usize,
+                _ => 5usize,
+            };
+            let x_scale = if width_x < 1e-4 {
+                0.0
+            } else {
+                (width_x / width_y.max(1e-4)).sqrt().min(3.0)
+            };
+            let y_scale = if width_y < 1e-4 {
+                0.0
+            } else {
+                (width_y / width_x.max(1e-4)).sqrt().min(3.0)
+            };
+            let target_sigma =
+                width_rgb.map(|c| (glow_width * c * (width_x * width_y).sqrt() / 3.0).max(0.01));
+            let sigma_mip = [6.0_f32, 12.0, 24.0, 48.0, 96.0];
+            let mut weights = [[0.0_f32; 3]; 5];
+            for ch in 0..3 {
+                let mut sum = 0.0_f32;
+                for m in 0..mip_count {
+                    let ratio = (target_sigma[ch] / sigma_mip[m]).ln();
+                    let w = (-0.5 * ratio * ratio / (0.78 * 0.78)).exp();
+                    weights[m][ch] = w;
+                    sum += w;
+                }
+                for w in weights.iter_mut().take(mip_count) {
+                    w[ch] /= sum.max(1e-12);
+                }
+            }
+
+            let mw0 = (wf * 0.5).round().max(1.0) as u32;
+            let mh0 = (hf * 0.5).round().max(1.0) as u32;
+            let accum_t =
+                self.create_temp_target_with_format(device, mw0, mh0, hdr_fmt, "zc-sglow-accum");
+            let accum_v = accum_t.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let mut old_w = width;
+            let mut old_h = height;
+            let mut prev_blur_v: Option<wgpu::TextureView> = None;
+
+            for (m, mip_weights) in weights.iter().enumerate().take(mip_count) {
+                let nw = ((old_w as f32) * 0.5).round().max(1.0) as u32;
+                let nh = ((old_h as f32) * 0.5).round().max(1.0) as u32;
+                let down_t =
+                    self.create_temp_target_with_format(device, nw, nh, hdr_fmt, "zc-sglow-l-dn");
+                let temp_t =
+                    self.create_temp_target_with_format(device, nw, nh, hdr_fmt, "zc-sglow-l-tmp");
+                let blur_t =
+                    self.create_temp_target_with_format(device, nw, nh, hdr_fmt, "zc-sglow-l-blr");
+                let down_v = down_t.create_view(&wgpu::TextureViewDescriptor::default());
+                let temp_v = temp_t.create_view(&wgpu::TextureViewDescriptor::default());
+                let blur_v = blur_t.create_view(&wgpu::TextureViewDescriptor::default());
+
+                if m == 0 {
+                    let mut u_ex = EffectUniforms::from_params(params);
+                    u_ex.resolution = [nw as f32, nh as f32];
+                    u_ex.pass = 0;
+                    u_ex.p0 = [threshold, from_alpha, opacity_mode, edge_mode];
+                    u_ex.p1 = [1.0 / wf, 1.0 / hf, 0.0, 0.0];
+                    u_ex.c1 = [thresh_add[0], thresh_add[1], thresh_add[2], 1.0];
+                    self.encode_pass(
+                        device,
+                        encoder,
+                        (canonical, false, hdr_fmt),
+                        &u_ex,
+                        targets.input,
+                        &down_v,
+                        None,
+                        None,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
+                } else {
+                    let mut u_dn = EffectUniforms::from_params(params);
+                    u_dn.resolution = [nw as f32, nh as f32];
+                    u_dn.pass = 1;
+                    u_dn.p0 = [1.0 / (old_w as f32), 1.0 / (old_h as f32), edge_mode, 0.0];
+                    self.encode_pass(
+                        device,
+                        encoder,
+                        (canonical, false, hdr_fmt),
+                        &u_dn,
+                        prev_blur_v.as_ref().expect("prev blur mip"),
+                        &down_v,
+                        None,
+                        None,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
+                }
+
+                let mut u_h = EffectUniforms::from_params(params);
+                u_h.resolution = [nw as f32, nh as f32];
+                u_h.pass = 3;
+                u_h.p0 = [1.0 / (nw as f32), 0.0, x_scale, edge_mode];
+                self.encode_pass(
+                    device,
+                    encoder,
+                    (canonical, false, hdr_fmt),
+                    &u_h,
+                    &down_v,
+                    &temp_v,
+                    None,
+                    None,
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                );
+
+                let mut u_v = EffectUniforms::from_params(params);
+                u_v.resolution = [nw as f32, nh as f32];
+                u_v.pass = 3;
+                u_v.p0 = [0.0, 1.0 / (nh as f32), y_scale, edge_mode];
+                self.encode_pass(
+                    device,
+                    encoder,
+                    (canonical, false, hdr_fmt),
+                    &u_v,
+                    &temp_v,
+                    &blur_v,
+                    None,
+                    None,
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                );
+
+                let mut u_acc = EffectUniforms::from_params(params);
+                u_acc.resolution = [mw0 as f32, mh0 as f32];
+                u_acc.pass = 4;
+                u_acc.p0 = [mip_weights[0], mip_weights[1], mip_weights[2], 0.0];
+                let load_op = if m == 0 {
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                } else {
+                    wgpu::LoadOp::Load
+                };
+                self.encode_pass(
+                    device,
+                    encoder,
+                    (canonical, true, hdr_fmt),
+                    &u_acc,
+                    &blur_v,
+                    &accum_v,
+                    None,
+                    None,
+                    load_op,
+                );
+
+                owned_textures.push(down_t);
+                owned_textures.push(temp_t);
+                owned_textures.push(blur_t);
+                prev_blur_v = Some(blur_v);
+                old_w = nw;
+                old_h = nh;
+            }
+            owned_textures.push(accum_t);
+            fine_view = Some(accum_v);
+        }
+
+        // Pass 5: Final composite onto unmodified input -> output
+        let mut u_fin = EffectUniforms::from_params(params);
+        u_fin.pass = 5;
+        u_fin.mode = combine;
+        u_fin.flags = u32::from(show)
+            | (u32::from(no_blur) << 1)
+            | (u32::from(use_ae_blend) << 2)
+            | (u32::from(deband) << 3);
+        u_fin.c0 = [color[0], color[1], color[2], 1.0];
+        u_fin.c1 = [thresh_add[0], thresh_add[1], thresh_add[2], 1.0];
+        u_fin.p0 = [brightness, source_opacity, glow_under, affect_alpha];
+        u_fin.p1 = [atmo_amp, atmo_freq, atmo_seed, atmo_t];
+        u_fin.p2 = [threshold, from_alpha, opacity_mode, light_bg];
+        u_fin.p3 = [atmo_detail, atmo_speed, ae_mix, 0.0];
         self.encode_pass(
             device,
             encoder,
-            (canonical, false),
-            &u2,
+            (canonical, false, self.format),
+            &u_fin,
             targets.input,
             targets.output,
-            Some(&view_a),
-            None,
+            fine_view.as_ref(),
+            coarse_view.as_ref(),
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
+        let _ = owned_textures;
         Ok(())
     }
 
@@ -2337,6 +3236,17 @@ impl EffectRegistry {
         height: u32,
         label: &str,
     ) -> wgpu::Texture {
+        self.create_temp_target_with_format(device, width, height, self.format, label)
+    }
+
+    fn create_temp_target_with_format(
+        &self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        label: &str,
+    ) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -2347,7 +3257,7 @@ impl EffectRegistry {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: self.format,
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
@@ -2359,6 +3269,17 @@ impl EffectRegistry {
         label: &str,
         wgsl_source: &str,
         blend: Option<wgpu::BlendState>,
+    ) -> wgpu::RenderPipeline {
+        self.compile_wgsl_pipeline_for_format(device, label, wgsl_source, blend, self.format)
+    }
+
+    fn compile_wgsl_pipeline_for_format(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        wgsl_source: &str,
+        blend: Option<wgpu::BlendState>,
+        format: wgpu::TextureFormat,
     ) -> wgpu::RenderPipeline {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
@@ -2378,7 +3299,7 @@ impl EffectRegistry {
                 entry_point: Some("fs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: self.format,
+                    format,
                     blend,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -2444,7 +3365,7 @@ impl EffectRegistry {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        pipeline_key: (&'static str, bool),
+        pipeline_key: (&'static str, bool, wgpu::TextureFormat),
         uniforms: &EffectUniforms,
         input_view: &wgpu::TextureView,
         output_view: &wgpu::TextureView,
@@ -2802,7 +3723,7 @@ mod tests {
     }
 
     #[test]
-    fn blend_mode_parser_handles_all_18_modes() {
+    fn blend_mode_parser_handles_all_43_cm3_modes() {
         let names = [
             ("BLEND_SRC_OVER", 0),
             ("BLEND_MULTIPLY", 1),
@@ -2822,11 +3743,61 @@ mod tests {
             ("BLEND_LUMINOSITY", 15),
             ("BLEND_ADD", 16),
             ("BLEND_SUBTRACT", 17),
+            ("BLEND_LINEARDODGE", 18),
+            ("BLEND_LINEARBURN", 19),
+            ("BLEND_VIVIDLIGHT", 20),
+            ("BLEND_LINEARLIGHT", 21),
+            ("BLEND_PINLIGHT", 22),
+            ("BLEND_HARDMIX", 23),
+            ("BLEND_INVERT", 24),
+            ("BLEND_INVERT_RGB", 25),
+            ("BLEND_PLUS_DARKER", 26),
+            ("BLEND_CONTRAST", 27),
+            ("BLEND_INVERT_OVG", 28),
+            ("BLEND_RED", 29),
+            ("BLEND_GREEN", 30),
+            ("BLEND_BLUE", 31),
+            ("BLEND_ZERO", 32),
+            ("BLEND_SRC", 33),
+            ("BLEND_DST", 34),
+            ("BLEND_DST_OVER", 35),
+            ("BLEND_SRC_IN", 36),
+            ("BLEND_DST_IN", 37),
+            ("BLEND_SRC_OUT", 38),
+            ("BLEND_DST_OUT", 39),
+            ("BLEND_SRC_ATOP", 40),
+            ("BLEND_DST_ATOP", 41),
+            ("BLEND_XOR", 42),
         ];
+        assert_eq!(names.len(), 43);
         for (name, expected) in names {
             let val = EffectParamValue::String(name.to_owned());
             assert_eq!(parse_blend_mode(Some(&val)), expected, "failed for {name}");
         }
+    }
+
+    #[test]
+    fn canonical_plugin_aliases_resolve_to_shaders() {
+        assert_eq!(
+            lookup_effect_shader("looks").map(|(id, _)| id),
+            Some("magiclooks")
+        );
+        assert_eq!(
+            lookup_effect_shader("sglow-hq-v2-preview").map(|(id, _)| id),
+            Some("sglow")
+        );
+        assert_eq!(
+            lookup_effect_shader("smart-motion-blur-lite").map(|(id, _)| id),
+            Some("smartmotionblur")
+        );
+        assert_eq!(
+            lookup_effect_shader("echo-legacy").map(|(id, _)| id),
+            Some("echo")
+        );
+        // radialblurspin must NOT bypass at density == 0
+        let rbs_zero = EffectParams::new([64.0, 64.0], 0.0, 0.0)
+            .with_param("density", EffectParamValue::Float(0.0));
+        assert!(!should_bypass("radialblurspin", &rbs_zero));
     }
 
     #[test]
@@ -3074,6 +4045,212 @@ mod tests {
                 && (i32::from(sglow_px[2]) - 40).abs() <= 2,
             "S_Glow Overlay with zero glow must preserve dark source pixels, got {:?}",
             &sglow_px[..4]
+        );
+    }
+
+    #[test]
+    fn parity_regression_checks_for_fixed_cm3_and_plugin_shaders() {
+        let ctx = match crate::GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(crate::RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to init GpuContext: {err}"),
+        };
+        let mut registry =
+            EffectRegistry::new(&ctx.device, &ctx.queue, wgpu::TextureFormat::Rgba8Unorm);
+
+        let dst = crate::RenderTarget::new(
+            &ctx,
+            8,
+            8,
+            wgpu::TextureFormat::Rgba8Unorm,
+            Some("parity dst"),
+        )
+        .expect("dst");
+        let run_and_read = |reg: &mut EffectRegistry,
+                            id: &str,
+                            src: &crate::RenderTarget,
+                            aux: Option<&wgpu::TextureView>,
+                            params: &EffectParams|
+         -> Vec<u8> {
+            let mut enc = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            reg.run_effect(
+                &ctx.device,
+                &ctx.queue,
+                &mut enc,
+                id,
+                params,
+                &EffectTargets {
+                    input: &src.view,
+                    output: &dst.view,
+                    aux,
+                    aux2: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("effect {id} failed: {e}"));
+            ctx.queue.submit(std::iter::once(enc.finish()));
+            let mut out = Vec::new();
+            crate::readback_rgba8(&ctx, &dst, &mut out).expect("readback");
+            out
+        };
+
+        // 1. colorcorrection: addRGB applied BEFORE pow: (0.2 + 0.3)^2 * 1.0 = 0.25 (~64)
+        // Old bug gave 0.2^2 + 0.3 = 0.34 (~87).
+        let src_cc = ctx
+            .create_rgba8_texture("cc", 8, 8, &[51, 51, 51, 255].repeat(64))
+            .expect("cc");
+        let p_cc = EffectParams::new([8.0, 8.0], 0.0, 0.0)
+            .with_param("powRGB", EffectParamValue::Vec3([2.0, 2.0, 2.0]))
+            .with_param("mulRGB", EffectParamValue::Vec3([1.0, 1.0, 1.0]))
+            .with_param("addRGB", EffectParamValue::Vec3([0.3, 0.3, 0.3]));
+        let px = run_and_read(&mut registry, "colorcorrection", &src_cc, None, &p_cc);
+        assert!(
+            (i32::from(px[0]) - 64).abs() <= 3,
+            "colorcorrection addRGB must happen before pow (expected ~64, got {})",
+            px[0]
+        );
+
+        // 2. colorgrading: John Hable mean-subtracted neutral grey [0.5, 0.5, 0.5] must be identity.
+        let src_cg = ctx
+            .create_rgba8_texture("cg", 8, 8, &[180, 90, 45, 255].repeat(64))
+            .expect("cg");
+        let p_cg = EffectParams::new([8.0, 8.0], 0.0, 0.0)
+            .with_param("shadows", EffectParamValue::Vec3([0.5, 0.5, 0.5]))
+            .with_param("midtones", EffectParamValue::Vec3([0.5, 0.5, 0.5]))
+            .with_param("highlights", EffectParamValue::Vec3([0.5, 0.5, 0.5]));
+        let px = run_and_read(&mut registry, "colorgrading", &src_cg, None, &p_cg);
+        assert!(
+            (i32::from(px[0]) - 180).abs() <= 2
+                && (i32::from(px[1]) - 90).abs() <= 2
+                && (i32::from(px[2]) - 45).abs() <= 2,
+            "colorgrading with neutral grey [0.5,0.5,0.5] must be identity, got {:?}",
+            &px[..4]
+        );
+
+        // 3. colorize: must replace ONLY hue and preserve source saturation (grey stays grey!).
+        let src_gray = ctx
+            .create_rgba8_texture("gray", 8, 8, &[128, 128, 128, 255].repeat(64))
+            .expect("gray");
+        let p_col = EffectParams::new([8.0, 8.0], 0.0, 0.0)
+            .with_param("color", EffectParamValue::Vec3([1.0, 0.0, 0.0]))
+            .with_param("amount", EffectParamValue::Float(1.0));
+        let px = run_and_read(&mut registry, "colorize", &src_gray, None, &p_col);
+        assert!(
+            (i32::from(px[0]) - 128).abs() <= 2
+                && (i32::from(px[1]) - 128).abs() <= 2
+                && (i32::from(px[2]) - 128).abs() <= 2,
+            "colorize on desaturated grey must preserve 0 saturation, got {:?}",
+            &px[..4]
+        );
+
+        // 4. gradientoverlay & overlay: OVERLAP_MODE = 3 must NEVER paint over transparent pixels.
+        let src_clear = ctx
+            .create_rgba8_texture("clear", 8, 8, &[0, 0, 0, 0].repeat(64))
+            .expect("clear");
+        let p_grad = EffectParams::new([8.0, 8.0], 0.0, 0.0)
+            .with_param(
+                "gradient",
+                EffectParamValue::Lut1D(vec![[255, 0, 0, 255], [0, 255, 0, 255]]),
+            )
+            .with_param("opacity", EffectParamValue::Float(1.0));
+        let px = run_and_read(&mut registry, "gradientoverlay", &src_clear, None, &p_grad);
+        assert_eq!(
+            &px[..4],
+            &[0, 0, 0, 0],
+            "gradientoverlay OVERLAP_MODE=3 must preserve transparent bg"
+        );
+
+        let ov_tex = ctx
+            .create_rgba8_texture("ov", 8, 8, &[255, 255, 255, 255].repeat(64))
+            .expect("ov");
+        let p_ov = EffectParams::new([8.0, 8.0], 0.0, 0.0)
+            .with_param("opacity", EffectParamValue::Float(1.0));
+        let px = run_and_read(
+            &mut registry,
+            "overlay",
+            &src_clear,
+            Some(&ov_tex.view),
+            &p_ov,
+        );
+        assert_eq!(
+            &px[..4],
+            &[0, 0, 0, 0],
+            "overlay OVERLAP_MODE=3 must preserve transparent bg"
+        );
+
+        // 5. mask: invert=true, opacity=0.0 must preserve 100% of image (1 - cov*0 = 1).
+        let p_mask = EffectParams::new([8.0, 8.0], 0.0, 0.0)
+            .with_param("invert", EffectParamValue::Bool(true))
+            .with_param("opacity", EffectParamValue::Float(0.0));
+        let px = run_and_read(&mut registry, "mask", &src_cg, None, &p_mask);
+        assert!(
+            (i32::from(px[0]) - 180).abs() <= 2 && px[3] == 255,
+            "mask invert=1 opacity=0 must preserve 100% image, got {:?}",
+            &px[..4]
+        );
+
+        // 6. transform: quad moved behind near plane (z > d - 1) must be clipped to transparent.
+        let p_tf = EffectParams::new([8.0, 8.0], 0.0, 0.0)
+            .with_param("imagePosition", EffectParamValue::Vec3([0.0, 0.0, 100.0]));
+        let px = run_and_read(&mut registry, "transform", &src_cg, None, &p_tf);
+        assert_eq!(
+            &px[..4],
+            &[0, 0, 0, 0],
+            "transform quad behind camera near plane must clip"
+        );
+
+        // 7. sglow-hq-v2-preview alias + Mult combine (0) + Show Threshold (1) + legacy engine (0)
+        let p_sglow_alias = EffectParams::new([8.0, 8.0], 0.5, 15.0)
+            .with_param("engine", EffectParamValue::Int(0))
+            .with_param("show", EffectParamValue::Int(1))
+            .with_param("threshold", EffectParamValue::Float(0.2));
+        let px = run_and_read(
+            &mut registry,
+            "sglow-hq-v2-preview",
+            &src_cg,
+            None,
+            &p_sglow_alias,
+        );
+        assert!(
+            px[0] > 0 && px[3] == 255,
+            "sglow-hq-v2-preview show=1 must output threshold emitter, got {:?}",
+            &px[..4]
+        );
+
+        // 8. anamorphicflare + bloom + dropshadow + radialblurspin + echo Screen unpremult
+        for (id, params) in [
+            ("anamorphicflare", EffectParams::new([8.0, 8.0], 0.0, 0.0)),
+            ("bloom", EffectParams::new([8.0, 8.0], 0.0, 0.0)),
+            ("dropshadow", EffectParams::new([8.0, 8.0], 0.0, 0.0)),
+            ("radialblurspin", EffectParams::new([8.0, 8.0], 0.0, 0.0)),
+            ("pixelsort", EffectParams::new([8.0, 8.0], 0.0, 0.0)),
+            ("shake", EffectParams::new([8.0, 8.0], 0.0, 10.0)),
+            ("exposure", EffectParams::new([8.0, 8.0], 0.0, 0.0)),
+        ] {
+            let out = run_and_read(&mut registry, id, &src_cg, None, &params);
+            assert_eq!(out.len(), 8 * 8 * 4, "{id} readback size mismatch");
+        }
+
+        // echo Screen on semi-transparent red + semi-transparent green
+        let semi_r = ctx
+            .create_rgba8_texture("sr", 8, 8, &[128, 0, 0, 128].repeat(64))
+            .expect("sr");
+        let semi_g = ctx
+            .create_rgba8_texture("sg", 8, 8, &[0, 128, 0, 128].repeat(64))
+            .expect("sg");
+        let p_echo = EffectParams::new([8.0, 8.0], 0.0, 0.0)
+            .with_param("composite", EffectParamValue::Int(3))
+            .with_param("opacity", EffectParamValue::Float(1.0));
+        let px = run_and_read(&mut registry, "echo", &semi_r, Some(&semi_g.view), &p_echo);
+        // base=(0.5,0,0,0.5), tap=(0,0.5,0,0.5): straight bs=(1,0,0), ts=(0,1,0), screen=(1,1,0)
+        // rgb = (0.5,0,0)*0.5 + (0,0.5,0)*0.5 + (1,1,0)*0.25 = (0.5, 0.5, 0), a = 0.75 (~191)
+        assert!(
+            (i32::from(px[0]) - 128).abs() <= 3
+                && (i32::from(px[1]) - 128).abs() <= 3
+                && (i32::from(px[3]) - 191).abs() <= 3,
+            "echo Screen unpremultiplied math mismatch: expected ~(128,128,0,191), got {:?}",
+            &px[..4]
         );
     }
 }

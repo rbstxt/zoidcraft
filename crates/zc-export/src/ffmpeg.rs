@@ -474,9 +474,24 @@ pub(crate) fn probe_ffmpeg_with_timeout(
     Ok(first_line)
 }
 
-/// Formats an FPS value cleanly for FFmpeg's `-r` flag.
+/// Standard NTSC rational frame rates (`N * 1000 / 1001`).
+const NTSC_RATIONAL_FPS: &[(f64, &str)] = &[
+    (24_000.0 / 1001.0, "24000/1001"),
+    (30_000.0 / 1001.0, "30000/1001"),
+    (60_000.0 / 1001.0, "60000/1001"),
+    (120_000.0 / 1001.0, "120000/1001"),
+];
+
+/// Formats an FPS value cleanly for FFmpeg's `-r` flag, preserving exact NTSC rational
+/// rates (`23.976` -> `24000/1001`, `29.97` -> `30000/1001`, `59.94` -> `60000/1001`,
+/// `119.88` -> `120000/1001`) so CFR exports never accumulate A/V drift.
 #[must_use]
 pub fn format_fps(fps: f64) -> String {
+    for &(target, rational) in NTSC_RATIONAL_FPS {
+        if (fps - target).abs() < 5e-4 {
+            return rational.to_owned();
+        }
+    }
     let rounded = fps.round();
     if (fps - rounded).abs() < 1e-6 {
         format!("{}", rounded as u64)
@@ -484,6 +499,42 @@ pub fn format_fps(fps: f64) -> String {
         let s = format!("{fps:.6}");
         s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
+}
+
+/// Builds FFmpeg arguments for audio-only AAC `.m4a` export from a pre-staged stereo WAV file.
+pub(crate) fn build_ffmpeg_m4a_args(
+    settings: &ExportSettings,
+    temp_audio_wav: &Path,
+    output_path: &Path,
+) -> Result<Vec<OsString>, ExportError> {
+    settings.validate()?;
+    let aac_rate = match settings.sample_rate {
+        7_350 | 8_000 | 11_025 | 12_000 | 16_000 | 22_050 | 24_000 | 32_000 | 44_100 | 48_000
+        | 64_000 | 88_200 | 96_000 => settings.sample_rate,
+        _ => 48_000,
+    };
+    Ok(vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        temp_audio_wav.as_os_str().to_os_string(),
+        "-vn".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        format!("{}k", settings.audio_bitrate_kbps).into(),
+        "-ar".into(),
+        aac_rate.to_string().into(),
+        "-ac".into(),
+        "2".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        "-f".into(),
+        "mp4".into(),
+        output_path.as_os_str().to_os_string(),
+    ])
 }
 
 /// Builds deterministic FFmpeg CLI arguments for `settings` and an optional pre-staged WAV input.
@@ -508,16 +559,28 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
     output_path: &Path,
 ) -> Result<Vec<OsString>, ExportError> {
     settings.validate()?;
-    if matches!(settings.container, ExportContainer::PngSequence) {
-        return Err(ExportError::InvalidSettings(
-            "PngSequence export does not use FFmpeg".to_string(),
-        ));
+    if matches!(
+        settings.container,
+        ExportContainer::PngSequence | ExportContainer::Wav
+    ) {
+        return Err(ExportError::InvalidSettings(format!(
+            "{:?} export does not use FFmpeg",
+            settings.container
+        )));
+    }
+    if matches!(settings.container, ExportContainer::M4a) {
+        let audio_path = temp_audio_wav.ok_or_else(|| {
+            ExportError::InvalidSettings("M4A export requires a staged WAV audio input".to_string())
+        })?;
+        return build_ffmpeg_m4a_args(settings, audio_path, output_path);
     }
 
     let (enc_w, enc_h) = settings.padded_dimensions();
     let fps_str = format_fps(settings.fps);
     let gop = (settings.fps * 2.0).round().max(1.0) as u32;
-    let has_audio = temp_audio_wav.is_some() && settings.audio_codec != AudioCodec::None;
+    let has_audio = !matches!(settings.container, ExportContainer::Gif)
+        && temp_audio_wav.is_some()
+        && settings.audio_codec != AudioCodec::None;
 
     let mut args: Vec<OsString> = vec![
         "-y".into(),
@@ -543,6 +606,48 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
         args.push(audio_path.as_os_str().to_os_string());
     }
 
+    if matches!(settings.container, ExportContainer::Gif) {
+        let reserve = if settings.transparent_alpha {
+            "on"
+        } else {
+            "off"
+        };
+        let vf = format!(
+            "split[s0][s1];[s0]palettegen=reserve_transparent={reserve}[p];[s1][p]paletteuse"
+        );
+        args.extend([
+            "-vf".into(),
+            vf.into(),
+            "-fps_mode".into(),
+            "cfr".into(),
+            "-an".into(),
+            "-loop".into(),
+            "0".into(),
+            "-f".into(),
+            "gif".into(),
+            output_path.as_os_str().to_os_string(),
+        ]);
+        return Ok(args);
+    }
+
+    // Explicit BT.709 matrix + limited TV range conversion from full-range sRGB RGBA input,
+    // plus matching container/bitstream color metadata (`iec61966-2-1` sRGB transfer, BT.709
+    // primaries & matrix, limited range) and strict constant frame rate (`-fps_mode cfr`).
+    let target_pix_fmt = if settings.transparent_alpha && settings.video_codec == VideoCodec::Vp9 {
+        "yuva420p"
+    } else {
+        "yuv420p"
+    };
+    let color_vf = format!(
+        "scale=in_range=full:out_color_matrix=bt709:out_range=tv,format={target_pix_fmt},setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv"
+    );
+    args.extend([
+        "-vf".into(),
+        color_vf.into(),
+        "-fps_mode".into(),
+        "cfr".into(),
+    ]);
+
     match settings.video_codec {
         VideoCodec::H264 => {
             args.extend([
@@ -552,18 +657,7 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
                 "medium".into(),
             ]);
             push_quality_args(&mut args, settings.quality, 51, false);
-            args.extend([
-                "-g".into(),
-                gop.to_string().into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-                "-colorspace".into(),
-                "bt709".into(),
-                "-color_primaries".into(),
-                "bt709".into(),
-                "-color_trc".into(),
-                "bt709".into(),
-            ]);
+            args.extend(["-g".into(), gop.to_string().into()]);
         }
         VideoCodec::H265 => {
             args.extend([
@@ -573,34 +667,16 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
                 "hvc1".into(),
             ]);
             push_quality_args(&mut args, settings.quality, 51, false);
-            args.extend([
-                "-g".into(),
-                gop.to_string().into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-                "-colorspace".into(),
-                "bt709".into(),
-                "-color_primaries".into(),
-                "bt709".into(),
-                "-color_trc".into(),
-                "bt709".into(),
-            ]);
+            args.extend(["-g".into(), gop.to_string().into()]);
         }
         VideoCodec::Vp9 => {
             args.extend(["-c:v".into(), "libvpx-vp9".into()]);
             push_quality_args(&mut args, settings.quality, 63, true);
-            let pix_fmt = if settings.transparent_alpha {
-                "yuva420p"
-            } else {
-                "yuv420p"
-            };
             args.extend([
                 "-row-mt".into(),
                 "1".into(),
                 "-g".into(),
                 gop.to_string().into(),
-                "-pix_fmt".into(),
-                pix_fmt.into(),
             ]);
         }
         VideoCodec::Vp8 => {
@@ -618,12 +694,7 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
                     args.extend(["-b:v".into(), format!("{kbps}k").into()]);
                 }
             }
-            args.extend([
-                "-g".into(),
-                gop.to_string().into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-            ]);
+            args.extend(["-g".into(), gop.to_string().into()]);
         }
         VideoCodec::Av1 => {
             args.extend([
@@ -633,20 +704,22 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
                 "6".into(),
             ]);
             push_quality_args(&mut args, settings.quality, 63, false);
-            args.extend([
-                "-g".into(),
-                gop.to_string().into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-                "-colorspace".into(),
-                "bt709".into(),
-                "-color_primaries".into(),
-                "bt709".into(),
-                "-color_trc".into(),
-                "bt709".into(),
-            ]);
+            args.extend(["-g".into(), gop.to_string().into()]);
         }
     }
+
+    args.extend([
+        "-pix_fmt".into(),
+        target_pix_fmt.into(),
+        "-color_range".into(),
+        "tv".into(),
+        "-colorspace".into(),
+        "bt709".into(),
+        "-color_primaries".into(),
+        "bt709".into(),
+        "-color_trc".into(),
+        "iec61966-2-1".into(),
+    ]);
 
     if has_audio {
         match settings.audio_codec {
@@ -717,7 +790,10 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
         ExportContainer::Mkv => {
             args.extend(["-f".into(), "matroska".into()]);
         }
-        ExportContainer::PngSequence => {}
+        ExportContainer::PngSequence
+        | ExportContainer::Gif
+        | ExportContainer::Wav
+        | ExportContainer::M4a => {}
     }
 
     args.push(output_path.as_os_str().to_os_string());
@@ -883,7 +959,100 @@ mod tests {
         assert!(has_pair(&args, "-c:a", "aac"));
         assert!(has_pair(&args, "-b:a", "192k"));
         assert!(has_pair(&args, "-movflags", "+faststart"));
+        assert!(has_pair(&args, "-fps_mode", "cfr"));
+        assert!(has_pair(&args, "-color_range", "tv"));
+        assert!(has_pair(&args, "-color_primaries", "bt709"));
+        assert!(has_pair(&args, "-color_trc", "iec61966-2-1"));
+        assert!(args.windows(2).any(|w| {
+            w[0] == "-vf"
+                && w[1].contains("scale=in_range=full:out_color_matrix=bt709:out_range=tv")
+                && w[1].contains("format=yuv420p")
+                && w[1].contains("color_trc=iec61966-2-1")
+        }));
         assert_eq!(args.last().map(String::as_str), Some("/tmp/out.mp4"));
+    }
+
+    #[test]
+    fn format_fps_preserves_ntsc_rationals_and_exact_integers() {
+        assert_eq!(format_fps(23.976), "24000/1001");
+        assert_eq!(format_fps(24_000.0 / 1001.0), "24000/1001");
+        assert_eq!(format_fps(29.97), "30000/1001");
+        assert_eq!(format_fps(30_000.0 / 1001.0), "30000/1001");
+        assert_eq!(format_fps(59.94), "60000/1001");
+        assert_eq!(format_fps(60_000.0 / 1001.0), "60000/1001");
+        assert_eq!(format_fps(119.88), "120000/1001");
+        assert_eq!(format_fps(30.0), "30");
+        assert_eq!(format_fps(60.0), "60");
+        assert_eq!(format_fps(12.5), "12.5");
+    }
+
+    #[test]
+    fn all_video_codecs_emit_bt709_conversion_srgb_transfer_and_cfr() {
+        let codecs = [
+            (ExportContainer::Mp4, VideoCodec::H264, false, "yuv420p"),
+            (ExportContainer::Mp4, VideoCodec::H265, false, "yuv420p"),
+            (ExportContainer::Webm, VideoCodec::Vp9, false, "yuv420p"),
+            (ExportContainer::Webm, VideoCodec::Vp9, true, "yuva420p"),
+            (ExportContainer::Webm, VideoCodec::Vp8, false, "yuv420p"),
+            (ExportContainer::Mkv, VideoCodec::Av1, false, "yuv420p"),
+        ];
+        for (container, codec, transparent, expected_pix_fmt) in codecs {
+            let mut s = base_settings();
+            s.fps = 29.97;
+            s.container = container;
+            s.video_codec = codec;
+            s.audio_codec = AudioCodec::None;
+            s.transparent_alpha = transparent;
+            let args = build_ffmpeg_args(&s, None).expect("valid args");
+            assert!(has_pair(&args, "-r", "30000/1001"), "codec={codec:?}");
+            assert!(has_pair(&args, "-fps_mode", "cfr"), "codec={codec:?}");
+            assert!(
+                has_pair(&args, "-pix_fmt", expected_pix_fmt),
+                "codec={codec:?}"
+            );
+            assert!(has_pair(&args, "-color_range", "tv"), "codec={codec:?}");
+            assert!(has_pair(&args, "-colorspace", "bt709"), "codec={codec:?}");
+            assert!(
+                has_pair(&args, "-color_primaries", "bt709"),
+                "codec={codec:?}"
+            );
+            assert!(
+                has_pair(&args, "-color_trc", "iec61966-2-1"),
+                "codec={codec:?}"
+            );
+            assert!(
+                args.windows(2).any(|w| {
+                    w[0] == "-vf"
+                        && w[1].contains("scale=in_range=full:out_color_matrix=bt709:out_range=tv")
+                        && w[1].contains(&format!("format={expected_pix_fmt}"))
+                }),
+                "missing BT.709 scale filter for {codec:?}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gif_and_m4a_args_are_valid() {
+        let mut gif = base_settings();
+        gif.container = ExportContainer::Gif;
+        gif.transparent_alpha = true;
+        gif.output_path = PathBuf::from("/tmp/out.gif");
+        let gif_args = build_ffmpeg_args(&gif, None).expect("valid GIF args");
+        assert!(has_pair(&gif_args, "-f", "gif"));
+        assert!(has_pair(&gif_args, "-fps_mode", "cfr"));
+        assert!(
+            gif_args
+                .iter()
+                .any(|a| a.contains("palettegen=reserve_transparent=on"))
+        );
+
+        let mut m4a = base_settings();
+        m4a.container = ExportContainer::M4a;
+        m4a.output_path = PathBuf::from("/tmp/out.m4a");
+        let audio = PathBuf::from("/tmp/audio.wav");
+        let m4a_args = build_ffmpeg_args(&m4a, Some(&audio)).expect("valid M4A args");
+        assert!(has_pair(&m4a_args, "-c:a", "aac"));
+        assert!(m4a_args.iter().any(|a| a == "-vn"));
     }
 
     #[test]

@@ -7,9 +7,9 @@ use std::collections::BTreeSet;
 use egui::{Context, Key, Modifiers};
 use zc_session::{Command, Session};
 
-use super::graph_editor::GraphEditorState;
+use super::graph_editor::{GraphDragState, GraphEditorState};
 use super::timeline::TimelineViewState;
-use super::viewport::ViewportState;
+use super::viewport::{ViewportDragState, ViewportState};
 
 /// Actions returned by [`dispatch_shortcuts`] that require host-shell coordination
 /// (native file dialogs, floating window visibility, status toast reporting).
@@ -57,14 +57,18 @@ pub fn dispatch_shortcuts(
             if let egui::Event::Key {
                 key,
                 pressed: true,
+                repeat,
                 modifiers,
                 ..
             } = ev
             {
                 let m = *modifiers;
                 match key {
-                    Key::Space => {
+                    Key::Space if !*repeat => {
                         p.space.get_or_insert(m);
+                    }
+                    Key::Num0 => {
+                        p.num0.get_or_insert(m);
                     }
                     Key::Home => {
                         p.home.get_or_insert(m);
@@ -249,10 +253,29 @@ pub fn dispatch_shortcuts(
         duplicate_selected(session, &mut outcome);
         return outcome;
     }
+    if let Some(m) = pressed.num0
+        && cmd_only(m)
+    {
+        viewport.reset_2d_view();
+        // Consume Cmd/Ctrl+0 so egui's global gui_zoom does not rescale the UI chrome.
+        ctx.input_mut(|i| {
+            let _ = i.consume_shortcut(&egui::KeyboardShortcut::new(Modifiers::COMMAND, Key::Num0));
+            let _ = i.consume_shortcut(&egui::KeyboardShortcut::new(Modifiers::CTRL, Key::Num0));
+        });
+        outcome.mark_handled(Key::Num0);
+        return outcome;
+    }
 
     // --- Playback Transport ---
+    let space_pan_active = matches!(graph_editor.drag_state, GraphDragState::Panning { .. })
+        || matches!(
+            viewport.drag_state,
+            ViewportDragState::Canvas2DPan | ViewportDragState::CameraPan
+        )
+        || ctx.input(|i| i.pointer.primary_down());
     if let Some(m) = pressed.space
         && no_mods(m)
+        && !space_pan_active
     {
         let was_playing = session.playback.is_playing();
         exec(session, Command::TogglePlay, Key::Space, &mut outcome);
@@ -750,6 +773,7 @@ fn exec(session: &mut Session, cmd: Command, key: Key, outcome: &mut ShortcutOut
 #[derive(Debug, Default)]
 struct PressedSnapshot {
     space: Option<Modifiers>,
+    num0: Option<Modifiers>,
     home: Option<Modifiers>,
     end: Option<Modifiers>,
     arrow_left: Option<Modifiers>,
@@ -1152,5 +1176,55 @@ mod tests {
         );
         assert!(!session.playback.is_playing());
         assert!((session.playback.current_frame - 47.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cmd_zero_resets_2d_viewport_without_scaling_egui_zoom() {
+        let ctx = Context::default();
+        let mut session = Session::new();
+        let mut timeline = TimelineViewState::new();
+        let mut graph = GraphEditorState::new();
+        let mut viewport = ViewportState::new();
+
+        viewport.zoom_2d = 2.5;
+        viewport.pan_2d = egui::vec2(120.0, -45.0);
+        let initial_gui_zoom = ctx.zoom_factor();
+
+        let out = run_key_event(
+            &ctx,
+            Key::Num0,
+            Modifiers::COMMAND,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert!(out.handled_any);
+        assert_eq!(out.handled_keys, vec![Key::Num0]);
+        assert!((viewport.zoom_2d - 1.0).abs() < 1e-6);
+        assert_eq!(viewport.pan_2d, egui::Vec2::ZERO);
+        assert!((ctx.zoom_factor() - initial_gui_zoom).abs() < 1e-6);
+    }
+
+    #[test]
+    fn space_does_not_toggle_play_while_canvas_pan_drag_is_active() {
+        let ctx = Context::default();
+        let mut session = Session::new();
+        let mut timeline = TimelineViewState::new();
+        let mut graph = GraphEditorState::new();
+        let mut viewport = ViewportState::new();
+
+        viewport.drag_state = ViewportDragState::Canvas2DPan;
+        let out = run_key_event(
+            &ctx,
+            Key::Space,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert!(!out.handled_any);
+        assert!(!session.playback.is_playing());
     }
 }

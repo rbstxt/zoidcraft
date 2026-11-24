@@ -5,6 +5,7 @@
 pub mod ast;
 pub mod builtins;
 pub mod eval;
+pub mod expresstext;
 pub mod lexer;
 pub mod parser;
 
@@ -12,7 +13,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub use ast::{Program, Span, is_cacheable};
+pub use ast::{Program, Span, is_cacheable, is_extended};
 
 /// Expression language compatibility tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -348,6 +349,33 @@ pub trait ExprContext {
         None
     }
 
+    /// Handle ID for `thisSequence` / `thisComp` (optional; allows `.name`, `.parent`,
+    /// and `.property()` dispatch against the owning sequence).
+    fn this_sequence_id(&self) -> Option<HandleId> {
+        None
+    }
+
+    /// Dot-joined property address string used to seed `wiggle()` (matches Zoidium
+    /// `property.getAddress().join(".")`, defaulting to `"0"` when `None`).
+    fn property_address(&self) -> Option<String> {
+        None
+    }
+
+    /// Local frame coordinate for a referenced property handle (used to evaluate
+    /// `velocity`/`speed` at the property's own clip-local frame).
+    fn property_local_frame(&self, _id: &HandleId) -> Option<f64> {
+        None
+    }
+
+    /// Cycle-detection entry hook invoked before evaluating a referenced property.
+    /// Hosts can track an active property stack and return `Err(ExprError::CycleDetected(...))`.
+    fn enter_property(&self, _id: &HandleId) -> Result<(), ExprError> {
+        Ok(())
+    }
+
+    /// Cycle-detection exit hook paired with [`Self::enter_property`].
+    fn exit_property(&self, _id: &HandleId) {}
+
     /// Display name of a scene/layer/object/effect/property handle.
     fn handle_name(&self, _id: &HandleId) -> Option<String> {
         None
@@ -373,10 +401,10 @@ pub trait ExprContext {
         self.property_value(id)
     }
 
-    /// Symmetric finite-difference velocity `(valueAtTime(t + 0.005) - valueAtTime(t - 0.005)) / 0.01`
-    /// per Spec 03 §6.5.
+    /// Symmetric finite-difference velocity `(valueAtTime(t + 0.01) - valueAtTime(t - 0.01)) / 0.02`
+    /// matching Zoidium `plugins/expressions-plus/api.js:118-121`.
     fn property_velocity(&self, id: &HandleId, at_time: f64) -> Result<Value, ExprError> {
-        let dt = 0.005;
+        let dt = 0.01;
         let v_plus = self.property_value_at_time(id, at_time + dt)?;
         let v_minus = self.property_value_at_time(id, at_time - dt)?;
         let inv_2dt = 1.0 / (2.0 * dt);
@@ -479,6 +507,17 @@ pub trait ExprContext {
     /// Looks up a child 3D object by name under `owner` (or current scene/group).
     fn object(&self, _owner: Option<&HandleId>, name: &str) -> Result<HandleId, ExprError> {
         Err(ExprError::NotFound(format!("object '{name}'")))
+    }
+
+    /// Looks up a child content item by name under `owner` (`handle.content(name)`).
+    fn content(&self, _owner: Option<&HandleId>, name: &str) -> Result<HandleId, ExprError> {
+        Err(ExprError::NotFound(format!("content '{name}'")))
+    }
+
+    /// Looks up a property on the owning sequence (`thisComp.property("Resolution")`).
+    fn sequence_property(&self, name: &str) -> Result<HandleId, ExprError> {
+        let seq_id = self.this_sequence_id();
+        self.property(seq_id.as_ref(), name)
     }
 
     /// Looks up a property by storage key, display name, or custom property name.
@@ -608,6 +647,8 @@ pub struct CompiledExpr {
     program: Program,
     mode: ExprMode,
     cacheable: bool,
+    extended: bool,
+    unseeded_zero_arg_random: bool,
 }
 
 impl CompiledExpr {
@@ -615,10 +656,14 @@ impl CompiledExpr {
     pub fn compile(source: &str, mode: ExprMode) -> Result<Self, ExprError> {
         let program = parser::parse_source(source, mode)?;
         let cacheable = ast::is_cacheable(&program);
+        let extended = ast::is_extended(&program);
+        let unseeded_zero_arg_random = ast::has_unseeded_zero_arg_random(&program);
         Ok(Self {
             program,
             mode,
             cacheable,
+            extended,
+            unseeded_zero_arg_random,
         })
     }
 
@@ -635,6 +680,11 @@ impl CompiledExpr {
         self.cacheable
     }
 
+    /// Returns `true` when the expression uses Expressions+ syntax or API features.
+    pub fn is_extended(&self) -> bool {
+        self.extended
+    }
+
     /// Evaluates this compiled expression against `ctx` and `config`.
     pub fn evaluate(&self, ctx: &dyn ExprContext, config: &EvalConfig) -> Result<Value, ExprError> {
         let effective = EvalConfig {
@@ -645,14 +695,31 @@ impl CompiledExpr {
     }
 
     /// Evaluates this compiled expression, falling back to `ctx.value()` on error
-    /// while preserving the diagnostic [`ExprError`] (Spec 03 §6.2).
+    /// or unusable non-finite numeric result while preserving the diagnostic [`ExprError`]
+    /// (matching Zoidium `plugins/expressions-plus/engine.js:51-56`).
     pub fn evaluate_with_fallback(
         &self,
         ctx: &dyn ExprContext,
         config: &EvalConfig,
     ) -> EvalOutcome {
         match self.evaluate(ctx, config) {
-            Ok(value) => EvalOutcome { value, error: None },
+            Ok(value) => {
+                let base = ctx.value();
+                if matches!(base, Value::Number(_)) && !value.to_number().is_finite() {
+                    let msg = if self.unseeded_zero_arg_random {
+                        "random() needs a seed. Use random(frame), or call seedRandom(1) first."
+                            .to_string()
+                    } else {
+                        "The result is not a finite number.".to_string()
+                    };
+                    EvalOutcome {
+                        value: base,
+                        error: Some(ExprError::RuntimeError(msg)),
+                    }
+                } else {
+                    EvalOutcome { value, error: None }
+                }
+            }
             Err(err) => EvalOutcome {
                 value: ctx.value(),
                 error: Some(err),
@@ -781,7 +848,20 @@ mod tests {
             eval_vanilla("clamp([-2, 0.5, 5], 0, 1)"),
             Value::vec3(0.0, 0.5, 1.0)
         );
-        assert_eq!(eval_plus("clamp(15, 0, 10)"), Value::Number(10.0));
+        assert_eq!(
+            eval_plus("const x = 15; clamp(x, 0, 10)"),
+            Value::Number(10.0)
+        );
+        // P1-6: clamp does NOT swap inverted bounds (`Math.min(Math.max(5, 10), 0) === 0`).
+        assert_eq!(
+            eval_plus("const x = 5; clamp(x, 10, 0)"),
+            Value::Number(0.0)
+        );
+        // Pure-CM3 scalar clamp retains CM3 array-only behavior (`[undefined]`).
+        assert_eq!(
+            eval_vanilla("clamp(15, 0, 10)"),
+            Value::Array(vec![Value::Undefined])
+        );
     }
 
     #[test]
@@ -923,7 +1003,7 @@ mod tests {
             .unwrap();
         assert_near(s1, s2, 0.0);
 
-        // seedRandom(seed, timeless = true): invariant across frames
+        // seedRandom(seed, timeless = true): invariant across frames and exact Zoidium formula
         let cfg = EvalConfig::expressions_plus();
         let ctx_f1 = BasicContext {
             frame: 1.0,
@@ -933,39 +1013,74 @@ mod tests {
             frame: 25.0,
             ..Default::default()
         };
-        let timeless_src = "seedRandom(123, true); [random(), random(10), random(5, 15)]";
-        assert_eq!(
-            eval(timeless_src, &ctx_f1, &cfg).unwrap(),
-            eval(timeless_src, &ctx_f2, &cfg).unwrap()
-        );
+        let timeless_src = "seedRandom(123, true); [random(), random(), random(10)]";
+        let t_f1 = eval(timeless_src, &ctx_f1, &cfg).unwrap();
+        let t_f2 = eval(timeless_src, &ctx_f2, &cfg).unwrap();
+        assert_eq!(t_f1, t_f2);
+        let t_vec = t_f1.as_f64_vec().unwrap();
+        assert_near(t_vec[0], builtins::cm3_random(123.0), 1e-12);
+        assert_near(t_vec[1], builtins::cm3_random(123.0 + 71.137), 1e-12);
+        // 1-arg random(10) ALWAYS keeps CM3's 1-arg hash even after seedRandom()!
+        assert_near(t_vec[2], builtins::cm3_random(10.0), 1e-12);
 
-        // seedRandom(seed, timeless = false): varies across frames, deterministic per frame
+        // seedRandom(seed, timeless = false): varies across frames via `seed + frame * 17.173`
         let timed_src = "seedRandom(123, false); random()";
         let v_f1_a = eval(timed_src, &ctx_f1, &cfg).unwrap();
         let v_f1_b = eval(timed_src, &ctx_f1, &cfg).unwrap();
         let v_f2 = eval(timed_src, &ctx_f2, &cfg).unwrap();
         assert_eq!(v_f1_a, v_f1_b);
         assert_ne!(v_f1_a, v_f2);
+        assert_near(
+            v_f2.as_f64().unwrap(),
+            builtins::cm3_random(123.0 + 25.0 * 17.173),
+            1e-12,
+        );
 
-        // wiggle: deterministic, zero amplitude returns exact base value, supports vectors
+        // Unseeded 0-arg `random()` returns NaN in raw eval and triggers fallback error
+        // with Zoidium's diagnostic message in `eval_with_fallback`.
+        assert!(
+            eval("random()", &ctx_f1, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap()
+                .is_nan()
+        );
+        let ctx_num = BasicContext {
+            value: Value::Number(7.0),
+            ..Default::default()
+        };
+        let fb = eval_with_fallback("random() * 10", &ctx_num, &cfg);
+        assert_eq!(fb.value, Value::Number(7.0));
+        assert!(
+            fb.error
+                .as_ref()
+                .is_some_and(|e| e.to_string().contains("needs a seed"))
+        );
+
+        // wiggle: exact Zoidium normalized sinusoid algorithm, defaults (1, 1, 2, 0.45, frame),
+        // scalar amp returns scalar even on array base, array amp returns array of amp.len().
         let ctx_vec = BasicContext {
             frame: 15.0,
             value: Value::vec3(10.0, 20.0, 30.0),
             ..Default::default()
         };
         assert_eq!(
-            eval("wiggle(2, 0)", &ctx_vec, &cfg).unwrap(),
+            eval("wiggle(2, [0, 0, 0])", &ctx_vec, &cfg).unwrap(),
             Value::vec3(10.0, 20.0, 30.0)
         );
-        let w1 = eval("wiggle(0.5, 5, 3, 0.5, frame)", &ctx_vec, &cfg).unwrap();
-        let w2 = eval("wiggle(0.5, 5, 3, 0.5, frame)", &ctx_vec, &cfg).unwrap();
+        assert_eq!(
+            eval("wiggle(2, 0)", &ctx_vec, &cfg).unwrap(),
+            Value::Number(10.0)
+        );
+        let w1 = eval("wiggle(0.5, [5, 5, 5], 3, 0.5, frame)", &ctx_vec, &cfg).unwrap();
+        let w2 = eval("wiggle(0.5, [5, 5, 5], 3, 0.5, frame)", &ctx_vec, &cfg).unwrap();
         assert_eq!(w1, w2);
         let w_vec = w1.as_f64_vec().unwrap();
         assert_eq!(w_vec.len(), 3);
-        // Bound check: sum_{o=0..3} 5 * 0.5^o = 5 * (1 + 0.5 + 0.25) = 8.75
-        assert!((w_vec[0] - 10.0).abs() <= 8.75 + 1e-9);
-        assert!((w_vec[1] - 20.0).abs() <= 8.75 + 1e-9);
-        assert!((w_vec[2] - 30.0).abs() <= 8.75 + 1e-9);
+        // Normalized sinusoid sum is bounded by `amp[i]` (`<= 5.0`).
+        assert!((w_vec[0] - 10.0).abs() <= 5.0 + 1e-9);
+        assert!((w_vec[1] - 20.0).abs() <= 5.0 + 1e-9);
+        assert!((w_vec[2] - 30.0).abs() <= 5.0 + 1e-9);
     }
 
     #[test]
@@ -986,37 +1101,45 @@ mod tests {
             Value::vec2(5.0, 15.0)
         );
 
-        // 5-arg AE linear (clamped) in Expressions+
+        // Pure-CM3 5-arg `linear(.5, 0, 1, 10, 20)` keeps CM3 3-arg semantics (`0`),
+        // while extended programs (`const t = .5; ...`) opt into 5-arg AE remap (`15`).
         assert_near(
-            eval_plus("linear(0.5, 0, 1, 100, 200)").as_f64().unwrap(),
+            eval_plus("linear(0.5, 0, 1, 10, 20)").as_f64().unwrap(),
+            0.0,
+            1e-12,
+        );
+        assert_near(
+            eval_vanilla("linear(0.5, 0, 1, 10, 20)").as_f64().unwrap(),
+            0.0,
+            1e-12,
+        );
+        assert_near(
+            eval_plus("const t = 0.5; linear(t, 0, 1, 100, 200)")
+                .as_f64()
+                .unwrap(),
             150.0,
             1e-12,
         );
         assert_near(
-            eval_plus("linear(-5, 0, 1, 100, 200)").as_f64().unwrap(),
+            eval_plus("const t = -5; linear(t, 0, 1, 100, 200)")
+                .as_f64()
+                .unwrap(),
             100.0,
             1e-12,
         );
         assert_near(
-            eval_plus("linear(5, 0, 1, 100, 200)").as_f64().unwrap(),
+            eval_plus("const t = 5; linear(t, 0, 1, 100, 200)")
+                .as_f64()
+                .unwrap(),
             200.0,
             1e-12,
         );
         assert_eq!(
-            eval_plus("linear(0.5, 0, 1, [0, 0], [10, 20])"),
+            eval_plus("const t = 0.5; linear(t, 0, 1, [0, 0], [10, 20])"),
             Value::vec2(5.0, 10.0)
         );
 
-        // 5-arg linear rejected in Vanilla CM3
-        let err = eval(
-            "linear(0.5, 0, 1, 10, 20)",
-            &BasicContext::default(),
-            &EvalConfig::vanilla(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, ExprError::ModeError { .. }));
-
-        // CM3 ease vs 5-arg AE ease / easeIn / easeOut
+        // CM3 ease (including Cubic.OutIn) vs 5-arg AE ease / Quadratic easeIn / easeOut (1, 3, 5 args)
         assert_near(
             eval_vanilla("ease(0.5, 'Quadratic', 'In')")
                 .as_f64()
@@ -1032,20 +1155,42 @@ mod tests {
             1e-12,
         );
         assert_near(
-            eval_plus("ease(0.25, 0, 1, 0, 100)").as_f64().unwrap(),
-            15.625,
+            eval_vanilla("ease(0.25, 'Cubic', 'OutIn')")
+                .as_f64()
+                .unwrap(),
+            0.4375,
             1e-12,
         );
         assert_near(
+            eval_plus("const t = 0.25; ease(t, 0, 1, 0, 100)")
+                .as_f64()
+                .unwrap(),
+            15.625,
+            1e-12,
+        );
+        // Zoidium Quadratic easeIn (u^2) & easeOut (u*(2-u)): at 0.5 => 25 and 75.
+        assert_near(
             eval_plus("easeIn(0.5, 0, 1, 0, 100)").as_f64().unwrap(),
-            12.5,
+            25.0,
             1e-12,
         );
         assert_near(
             eval_plus("easeOut(0.5, 0, 1, 0, 100)").as_f64().unwrap(),
-            87.5,
+            75.0,
             1e-12,
         );
+        assert_near(
+            eval_plus("easeIn(0.5, 10, 50)").as_f64().unwrap(),
+            20.0,
+            1e-12,
+        );
+        assert_near(
+            eval_plus("easeOut(0.5, 10, 50)").as_f64().unwrap(),
+            40.0,
+            1e-12,
+        );
+        assert_near(eval_plus("easeIn(0.5)").as_f64().unwrap(), 0.25, 1e-12);
+        assert_near(eval_plus("easeOut(0.5)").as_f64().unwrap(), 0.75, 1e-12);
 
         // Catmull-Rom passes through p1 at t=0 and p2 at t=1
         assert_near(
@@ -1095,6 +1240,21 @@ mod tests {
         assert_near(la_yz[0], -FRAC_PI_4, 1e-12);
         assert_near(la_yz[1], 0.0, 1e-12);
         assert_near(la_yz[2], 0.0, 1e-12);
+
+        // P0-6: Zoidium api.js:230 exact lookAt parity (always zero Z roll).
+        let la_diag = eval_plus("lookAt([0, 0, 0], [1, 1, 1])")
+            .as_f64_vec()
+            .unwrap();
+        assert_near(la_diag[0], (-1.0_f64).atan2(2.0_f64.sqrt()), 1e-12);
+        assert_near(la_diag[1], FRAC_PI_4, 1e-12);
+        assert_near(la_diag[2], 0.0, 1e-12);
+
+        let la_back = eval_plus("lookAt([0, 0, 0], [1, 0, -1])")
+            .as_f64_vec()
+            .unwrap();
+        assert_near(la_back[0], 0.0, 1e-12);
+        assert_near(la_back[1], 3.0 * FRAC_PI_4, 1e-12);
+        assert_near(la_back[2], 0.0, 1e-12);
     }
 
     struct MockSceneContext {
@@ -1310,8 +1470,20 @@ mod tests {
             Value::Number(30.0)
         );
         assert_eq!(
-            eval("effect('Glow').param('Radius').value", &ctx, &cfg).unwrap(),
+            eval("effect('Glow').param('Radius')", &ctx, &cfg).unwrap(),
             Value::Number(24.0)
+        );
+        assert_eq!(
+            eval("effect('Glow').property('Radius').value", &ctx, &cfg).unwrap(),
+            Value::Number(24.0)
+        );
+        assert_eq!(
+            eval("layer('Hero')('Opacity')", &ctx, &cfg).unwrap(),
+            Value::Number(0.75)
+        );
+        assert_eq!(
+            eval("layer('Hero').param('Opacity')", &ctx, &cfg).unwrap(),
+            Value::Number(0.75)
         );
         assert_eq!(
             eval("layer('Hero').property('Opacity').value", &ctx, &cfg).unwrap(),
@@ -1473,5 +1645,242 @@ mod tests {
 
         let cyclic_join = eval_plus("let a = [2]; a[1] = a; a.join('-')");
         assert_eq!(cyclic_join, Value::String("2-".to_string()));
+    }
+
+    #[test]
+    fn zoidium_p7_methods_handles_velocity_and_meta_identity_parity() {
+        // P1-4: `methods` global in both Vanilla CM3 and Expressions+.
+        let ctx_f = BasicContext {
+            frame: 12.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            eval(
+                "var helper = methods.random; helper(frame)",
+                &ctx_f,
+                &EvalConfig::vanilla()
+            )
+            .unwrap(),
+            Value::Number(builtins::cm3_random(12.0))
+        );
+        assert_eq!(
+            eval(
+                "var helper = methods.random; helper(frame)",
+                &ctx_f,
+                &EvalConfig::expressions_plus()
+            )
+            .unwrap(),
+            Value::Number(builtins::cm3_random(12.0))
+        );
+
+        // P2-4: `fps` and `value` are gated to Expressions+ (rejected in Vanilla CM3).
+        assert!(matches!(
+            compile("fps", ExprMode::VanillaCm3),
+            Err(ExprError::ReferenceError(_))
+        ));
+        assert!(matches!(
+            compile("value", ExprMode::VanillaCm3),
+            Err(ExprError::ReferenceError(_))
+        ));
+
+        // P2-4: read-only constructor/__proto__ identity preserved while calling Function ctor is blocked.
+        assert_eq!(
+            eval_plus(r#"var key = "con" + "structor"; [1,2,3][key] === [4][key] ? 23 : 0"#),
+            Value::Number(23.0)
+        );
+        assert_eq!(
+            eval_plus("sin.constructor === [].constructor.constructor ? 9 : 0"),
+            Value::Number(9.0)
+        );
+        assert_eq!(
+            eval_plus(r#"var p = "__proto__"; [1][p] === [2][p]"#),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_plus("var f = sin.constructor; [f].indexOf(f)"),
+            Value::Number(0.0)
+        );
+        for bad in [
+            r#"sin.constructor("return 29")()"#,
+            r#"var F = sin.constructor; F("return 29")()"#,
+            r#"sin.constructor.call(null, "return 29")()"#,
+            r#"sin.constructor?.("return 29")"#,
+        ] {
+            let err = eval(
+                bad,
+                &BasicContext::default(),
+                &EvalConfig::expressions_plus(),
+            )
+            .expect_err(&format!("expected Forbidden for `{bad}`"));
+            assert!(
+                matches!(err, ExprError::Forbidden(_)),
+                "expected Forbidden for `{bad}`, got {err:?}"
+            );
+        }
+
+        // P1-5 & P0-7: `thisComp.property("Resolution").value`, `thisObject.parent(2)`,
+        // callable handles, `.content()`, and `velocity`/`speed` at local frame (ignoring remapped `time`).
+        struct RemappedSceneCtx;
+        impl ExprContext for RemappedSceneCtx {
+            fn frame(&self) -> f64 {
+                30.0 // local frame 30 @ 30fps => t = 1.0s
+            }
+            fn time(&self) -> f64 {
+                99.0 // time-remapped clip; velocity MUST still sample around frame/fps = 1.0s!
+            }
+            fn fps(&self) -> f64 {
+                30.0
+            }
+            fn value(&self) -> Value {
+                Value::Number(10.0)
+            }
+            fn property_address(&self) -> Option<String> {
+                Some("seq.clip.layer.pos".to_string())
+            }
+            fn this_object_id(&self) -> Option<HandleId> {
+                Some(HandleId::new("layer:scene"))
+            }
+            fn this_clip_id(&self) -> Option<HandleId> {
+                Some(HandleId::new("clip:0"))
+            }
+            fn this_sequence_id(&self) -> Option<HandleId> {
+                Some(HandleId::new("seq:0"))
+            }
+            fn handle_name(&self, id: &HandleId) -> Option<String> {
+                match id.as_str() {
+                    "layer:scene" => Some("Scene".into()),
+                    "seq:0" => Some("MainSeq".into()),
+                    "content:shape" => Some("Star".into()),
+                    _ => Some(String::new()),
+                }
+            }
+            fn parent_of(
+                &self,
+                id: &HandleId,
+                levels: usize,
+            ) -> Result<Option<HandleRef>, ExprError> {
+                match (id.as_str(), levels) {
+                    ("layer:scene", 1) => Ok(Some(HandleRef::Clip(HandleId::new("clip:0")))),
+                    ("layer:scene", 2) | ("clip:0", 1) => Ok(Some(HandleRef::Sequence)),
+                    _ => Ok(None),
+                }
+            }
+            fn property(
+                &self,
+                owner: Option<&HandleId>,
+                name: &str,
+            ) -> Result<HandleId, ExprError> {
+                match (owner.map(HandleId::as_str), name) {
+                    (Some("seq:0"), "Resolution") => Ok(HandleId::new("seq:res")),
+                    (Some("layer:scene"), "Position") => Ok(HandleId::new("layer:pos")),
+                    _ => Err(ExprError::NotFound(name.into())),
+                }
+            }
+            fn content(
+                &self,
+                _owner: Option<&HandleId>,
+                name: &str,
+            ) -> Result<HandleId, ExprError> {
+                if name == "Star" {
+                    Ok(HandleId::new("content:shape"))
+                } else {
+                    Err(ExprError::NotFound(name.into()))
+                }
+            }
+            fn property_value(&self, id: &HandleId) -> Result<Value, ExprError> {
+                match id.as_str() {
+                    "thisProperty" => Ok(self.value()),
+                    "seq:res" => Ok(Value::vec2(1920.0, 1080.0)),
+                    "layer:pos" => Ok(Value::vec3(1.0, 2.0, 3.0)),
+                    _ => Err(ExprError::NotFound(id.0.clone())),
+                }
+            }
+            fn property_value_at_time(
+                &self,
+                id: &HandleId,
+                seconds: f64,
+            ) -> Result<Value, ExprError> {
+                if id.as_str() == "thisProperty" {
+                    // Quadratic motion v(t) = 10 * t^2 -> exact derivative at t=1.0 is 20.0.
+                    Ok(Value::Number(10.0 * seconds * seconds))
+                } else {
+                    self.property_value(id)
+                }
+            }
+        }
+
+        let cfg = EvalConfig::expressions_plus();
+        assert_eq!(
+            eval(
+                "thisComp.property('Resolution').value",
+                &RemappedSceneCtx,
+                &cfg
+            )
+            .unwrap(),
+            Value::vec2(1920.0, 1080.0)
+        );
+        assert_eq!(
+            eval("thisComp('Resolution')", &RemappedSceneCtx, &cfg).unwrap(),
+            Value::vec2(1920.0, 1080.0)
+        );
+        assert_eq!(
+            eval("thisComp.param('Resolution')", &RemappedSceneCtx, &cfg).unwrap(),
+            Value::vec2(1920.0, 1080.0)
+        );
+        assert_eq!(
+            eval(
+                "thisObject.parent(2) === thisSequence",
+                &RemappedSceneCtx,
+                &cfg
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval(
+                "const p = thisObject.parent; p(2) === thisComp",
+                &RemappedSceneCtx,
+                &cfg
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval("thisObject.content('Star').name", &RemappedSceneCtx, &cfg).unwrap(),
+            Value::String("Star".into())
+        );
+        assert_near(
+            eval("thisObject.frameDuration", &RemappedSceneCtx, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            1.0 / 30.0,
+            1e-12,
+        );
+        // Velocity differentiates at local frame/fps = 1.0s (not remapped time = 99s!) with dt = 0.01s:
+        // (10*(1.01)^2 - 10*(0.99)^2) / 0.02 = 20.0.
+        assert_near(
+            eval("thisProperty.velocity", &RemappedSceneCtx, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            20.0,
+            1e-10,
+        );
+        // Wiggle uses `property_address()` seed rather than `seedRandom`.
+        let expected_seed = builtins::property_seed(Some("seq.clip.layer.pos"));
+        let expected_wig = builtins::eval_wiggle(
+            &Value::Number(10.0),
+            1.0,
+            &Value::Number(1.0),
+            2,
+            0.45,
+            30.0,
+            expected_seed,
+        );
+        assert_eq!(
+            eval("wiggle()", &RemappedSceneCtx, &cfg).unwrap(),
+            expected_wig
+        );
     }
 }

@@ -127,19 +127,13 @@ pub fn to_u32(n: f64) -> u32 {
     to_i32(n) as u32
 }
 
-/// Safe clamp that never panics on `NaN` or inverted bounds.
+/// Clamps `x` matching JS `Math.min(Math.max(x, lo), hi)` without swapping inverted bounds.
 pub fn clamp_f64(x: f64, lo: f64, hi: f64) -> f64 {
     if x.is_nan() || lo.is_nan() || hi.is_nan() {
         return f64::NAN;
     }
-    let (min_v, max_v) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-    if x < min_v {
-        min_v
-    } else if x > max_v {
-        max_v
-    } else {
-        x
-    }
+    let m = if x > lo { x } else { lo };
+    if m < hi { m } else { hi }
 }
 
 /// Formats an `f64` using clean ECMAScript number formatting.
@@ -613,7 +607,8 @@ pub fn ae_ease(t: f64, t_min: f64, t_max: f64, a: &Value, b: &Value) -> Result<V
     lerp_value(a, b, s)
 }
 
-/// 5-argument AE `easeIn(t, tMin, tMax, a, b)`.
+/// 5-argument AE `easeIn(t, tMin, tMax, a, b)` using Zoidium's Quadratic ease-in `u * u`
+/// (`plugins/expressions-plus/api.js:226, 256`).
 pub fn ae_ease_in(
     t: f64,
     t_min: f64,
@@ -622,11 +617,12 @@ pub fn ae_ease_in(
     b: &Value,
 ) -> Result<Value, ExprError> {
     let u = normalized_remap(t, t_min, t_max);
-    let s = u * u * u;
+    let s = u * u;
     lerp_value(a, b, s)
 }
 
-/// 5-argument AE `easeOut(t, tMin, tMax, a, b)`.
+/// 5-argument AE `easeOut(t, tMin, tMax, a, b)` using Zoidium's Quadratic ease-out `u * (2 - u)`
+/// (`plugins/expressions-plus/api.js:227, 256`).
 pub fn ae_ease_out(
     t: f64,
     t_min: f64,
@@ -635,8 +631,7 @@ pub fn ae_ease_out(
     b: &Value,
 ) -> Result<Value, ExprError> {
     let u = normalized_remap(t, t_min, t_max);
-    let inv = 1.0 - u;
-    let s = 1.0 - inv * inv * inv;
+    let s = u * (2.0 - u);
     lerp_value(a, b, s)
 }
 
@@ -674,6 +669,10 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 let m = k - 2.0;
                 0.5 * (m * m * m + 2.0)
             }
+        }
+        ("cubic", "outin") => {
+            let k = t - 0.5;
+            4.0 * k * k * k + 0.5
         }
         ("quartic" | "quart", "in") => t.powi(4),
         ("quartic" | "quart", "out") => 1.0 - (t - 1.0).powi(4),
@@ -824,67 +823,33 @@ fn bounce_out(k: f64) -> f64 {
     }
 }
 
-/// Computes `XYZ` intrinsic Euler angles in radians orienting local `+Z` from
-/// `from` toward `to` (Spec 03 §6.5).
+/// Computes `XYZ` Euler angles in radians orienting local `+Z` from `from` toward `to`
+/// matching Zoidium `plugins/expressions-plus/api.js:230`:
+/// `[atan2(-dy, hypot(dx, dz)), atan2(dx, dz), 0]`.
 pub fn look_at_xyz_euler(from: [f64; 3], to: [f64; 3]) -> [f64; 3] {
     let dx = to[0] - from[0];
     let dy = to[1] - from[1];
     let dz = to[2] - from[2];
-    let len = (dx * dx + dy * dy + dz * dz).sqrt();
-    if len < 1e-12 || !len.is_finite() {
-        return [0.0, 0.0, 0.0];
-    }
-    let zx = dx / len;
-    let zy = dy / len;
-    let zz = dz / len;
-
-    // Choose reference up vector avoiding collinearity with forward axis.
-    let (ux, uy, uz) = if zy.abs() > 0.999_999 {
-        (0.0, 0.0, 1.0)
-    } else {
-        (0.0, 1.0, 0.0)
-    };
-
-    // x_axis = normalize(up x z_axis)
-    let rx = uy * zz - uz * zy;
-    let ry = uz * zx - ux * zz;
-    let rz = ux * zy - uy * zx;
-    let rlen = (rx * rx + ry * ry + rz * rz).sqrt();
-    if rlen < 1e-12 {
-        return [0.0, 0.0, 0.0];
-    }
-    let xx = rx / rlen;
-    let xy = ry / rlen;
-    let xz = rz / rlen;
-
-    // y_axis = z_axis x x_axis
-    let yx = zy * xz - zz * xy;
-    let yy = zz * xx - zx * xz;
-    let yz = zx * xy - zy * xx;
-
-    // Rotation matrix R = [x_axis | y_axis | z_axis] decomposed as R_x(ax) * R_y(ay) * R_z(az).
-    let m00 = xx;
-    let m01 = yx;
-    let m02 = zx;
-    let m11 = yy;
-    let m12 = zy;
-    let m21 = yz;
-    let m22 = zz;
-
-    let ay = clamp_f64(m02, -1.0, 1.0).asin();
-    let (ax, az) = if m02.abs() < 0.999_999_9 {
-        ((-m12).atan2(m22), (-m01).atan2(m00))
-    } else {
-        (m21.atan2(m11), 0.0)
-    };
-
-    [ax, ay, az]
+    [(-dy).atan2(dx.hypot(dz)), dx.atan2(dz), 0.0]
 }
 
-/// Deterministic multi-octave procedural `wiggle` perturbation (Spec 03 §6.5).
+/// Computes Zoidium's Java-style property address hash seed (`trapcode-expressions.js:81-88`):
+/// `a = (a * 31 + charCode) | 0; Math.abs(a)` (defaults to `"0"` when address is `None`).
+pub fn property_seed(address: Option<&str>) -> f64 {
+    let addr = address.unwrap_or("0");
+    let mut a: i32 = 0;
+    for unit in addr.encode_utf16() {
+        a = a.wrapping_mul(31).wrapping_add(i32::from(unit));
+    }
+    (i64::from(a)).abs() as f64
+}
+
+/// Deterministic multi-octave normalized sinusoid `wiggle` matching Zoidium's
+/// `trapcode-expressions.js:34-80` verbatim.
 ///
-/// Perturbs `base_value` smoothly using frame-based frequency `freq` and
-/// amplitude `amp` (scalar or vector). Zero state leaks across frames.
+/// - `seed` is the property address hash from [`property_seed`].
+/// - If `amp` is an array, returns an array of `amp.len()` components using `[nx, ny, nz][i] ?? 0`.
+/// - If `amp` is scalar, returns a scalar `base[0] + nx * amp` (even when `base_value` is an array).
 pub fn eval_wiggle(
     base_value: &Value,
     freq: f64,
@@ -892,68 +857,78 @@ pub fn eval_wiggle(
     octaves: usize,
     amp_mult: f64,
     t: f64,
-    seed_offset: f64,
+    seed: f64,
 ) -> Value {
-    let octaves = octaves.clamp(1, 16);
+    let oct = octaves.clamp(1, 1024);
+    let s0 = seed * 0.001;
+    let s1 = seed * 0.003;
+    let s2 = seed * 0.007;
 
-    let sample_channel = |channel: usize| -> f64 {
-        let mut total = 0.0;
-        let mut cur_freq = freq;
-        let mut cur_amp = 1.0;
-        for oct in 0..octaves {
-            let phase = seed_offset + (channel as f64) * 37.13 + (oct as f64) * 101.7;
-            let u = t * cur_freq + phase;
-            let k0 = u.floor();
-            let k1 = k0 + 1.0;
-            let h = u - k0;
-            let s = h * h * (3.0 - 2.0 * h);
-            let n0 = 2.0 * cm3_random(k0 + phase * 0.17) - 1.0;
-            let n1 = 2.0 * cm3_random(k1 + phase * 0.17) - 1.0;
-            total += ((n1 - n0) * s + n0) * cur_amp;
-            cur_freq *= 2.0;
-            cur_amp *= amp_mult;
-        }
-        total
-    };
+    let mut ax = 0.0;
+    let mut ay = 0.0;
+    let mut az = 0.0;
+    let mut norm = 0.0;
+    // Exact literal from Zoidium `trapcode-expressions.js:55-57` (not `f64::consts::TAU`).
+    #[allow(clippy::approx_constant)]
+    const WIGGLE_TWO_PI: f64 = 6.2831853;
+    for k in 0..oct {
+        let kf = k as f64;
+        let a_k = amp_mult.powf(kf);
+        let fm = 1.0 + kf * 0.61 + 0.23 * cm3_random(seed * 0.01 + kf);
+        let f = freq * fm;
+        let ph0 = cm3_random(s0 + kf * 1.7) * WIGGLE_TWO_PI;
+        let ph1 = cm3_random(s1 + kf * 2.9) * WIGGLE_TWO_PI;
+        let ph2 = cm3_random(s2 + kf * 4.3) * WIGGLE_TWO_PI;
+        ax += a_k * (t * f + ph0).sin();
+        ay += a_k * (t * f * 1.17 + ph1).sin();
+        az += a_k * (t * f * 1.41 + ph2).sin();
+        norm += a_k;
+    }
 
-    match (base_value.as_f64_vec(), amp.as_f64_vec()) {
-        (Some(base), Some(amp_vec)) => {
-            let len = base.len().max(amp_vec.len());
-            let mut out = Vec::with_capacity(len);
-            for i in 0..len {
-                let b = base.get(i).copied().unwrap_or(0.0);
-                let a = if amp_vec.is_empty() {
-                    0.0
-                } else {
-                    amp_vec[i % amp_vec.len()]
-                };
-                out.push(Value::Number(b + sample_channel(i) * a));
-            }
-            Value::Array(out)
+    let nx = ax / norm;
+    let ny = ay / norm;
+    let nz = az / norm;
+
+    if let Value::Array(amp_items) = amp {
+        let mut out = Vec::with_capacity(amp_items.len());
+        for (x, amp_item) in amp_items.iter().enumerate() {
+            let v = match x {
+                0 => nx,
+                1 => ny,
+                2 => nz,
+                _ => 0.0,
+            };
+            let w = v * amp_item.to_number();
+            let kk = match base_value {
+                Value::Array(g) => g.get(x).map_or(0.0, |item| {
+                    if matches!(item, Value::Undefined) {
+                        0.0
+                    } else {
+                        item.to_number()
+                    }
+                }),
+                Value::Undefined => 0.0,
+                other => other.to_number(),
+            };
+            out.push(Value::Number(kk + w));
         }
-        (Some(base), None) => {
-            let a = amp.to_number();
-            let out = base
-                .iter()
-                .enumerate()
-                .map(|(i, &b)| Value::Number(b + sample_channel(i) * a))
-                .collect();
-            Value::Array(out)
-        }
-        (None, Some(amp_vec)) => {
-            let b = base_value.to_number();
-            let out = amp_vec
-                .iter()
-                .enumerate()
-                .map(|(i, &a)| Value::Number(b + sample_channel(i) * a))
-                .collect();
-            Value::Array(out)
-        }
-        (None, None) => {
-            let b = base_value.to_number();
-            let a = amp.to_number();
-            Value::Number(b + sample_channel(0) * a)
-        }
+        Value::Array(out)
+    } else {
+        let o = if matches!(amp, Value::Undefined) {
+            1.0
+        } else {
+            amp.to_number()
+        };
+        let w2 = nx * o;
+        let x2 = match base_value {
+            Value::Array(g) => g.first().map_or(0.0, |item| {
+                let n = item.to_number();
+                if n == 0.0 || n.is_nan() { 0.0 } else { n }
+            }),
+            Value::Undefined => 0.0,
+            other => other.to_number(),
+        };
+        Value::Number(x2 + w2)
     }
 }
 

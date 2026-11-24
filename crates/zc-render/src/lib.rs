@@ -14,7 +14,7 @@ pub use cache::{CachedFrame, FrameCache, FrameCacheKey};
 pub use compositor::{BlendMode, Compositor2D, LayerTransform2D, encode_png};
 pub use context::{
     DEFAULT_TARGET_POOL_MAX_BYTES, GpuContext, RenderError, RenderTarget, TargetPool,
-    readback_rgba8,
+    f32_to_f16_bits, readback_rgba8,
 };
 pub use engine::*;
 pub use scene3d::{

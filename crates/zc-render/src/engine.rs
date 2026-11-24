@@ -3,39 +3,48 @@
 //! and the low-level `wgpu` 3D, compositor, and post-processing effect engines.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
-use std::f32::consts::TAU;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::f32::consts::{PI, TAU};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use tracing::{debug, warn};
 use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
-use zc_expr::{EvalConfig, ExprContext, ExprError, HandleId, KeyframeRecord, Value as ExprValue};
-use zc_geom::{Aabb3, EulerOrder as GeomEulerOrder, Mat4, Transform3D, Vec3};
+use zc_expr::{
+    EvalConfig, ExprContext, ExprError, HandleId, HandleRef, KeyframeRecord, NameOrIndex,
+    Value as ExprValue,
+};
+use zc_geom::{
+    Aabb3, EulerOrder as GeomEulerOrder, Mat3, Mat4, Quat, Transform3D, Vec2, Vec3, Vec4,
+    euler_to_quat, mat4_to_euler,
+};
 use zc_plugin::PluginRegistry;
 use zc_project::{
     CameraKind, CompatMode as ProjectCompatMode, CustomProperty, DrawOp, EffectInstance,
     EffectKind, EulerOrder as ProjectEulerOrder, GradientStop as ProjectGradientStop, Layer,
     LayerKind, LightKind as ProjectLightKind, MaterialSpec, Object3D, Object3DKind,
     PresetShapeKind, Project, PropertyKeyframe, PropertyTrack, PropertyValue, Sequence,
-    Shape2DKind, Shape2DNode, Shape3DKind, StaticBehavior as ProjectStaticBehavior, Text3DAlign,
-    Uuid,
+    SequenceControlKind, Shape2DKind, Shape2DNode, Shape3DKind,
+    StaticBehavior as ProjectStaticBehavior, Text3DAlign, Uuid, VideoClip,
 };
 use zc_scene::{
-    CameraPlusVibrateParams, CameraShakeMode, CameraShakeParams as SceneCameraShakeParams,
-    DeformAxis, GradientStop as ParticleGradientStop, MeshData, ParticleBlending,
-    ParticleSystemParams, PositionDistribution, Text3DParams, TextAlignMode, UvMode,
-    VelocityDistribution, Vertex3D, apply_repeater, apply_twist, apply_voronoi_fracture,
-    apply_warp, build_box, build_capsule, build_circle, build_cylinder, build_dodecahedron,
-    build_donut, build_fallback_text_mesh, build_icosahedron, build_octahedron, build_rectangle,
-    build_rounded_box, build_sphere, build_tetrahedron, build_text3d_mesh, build_wire,
-    evaluate_camera_shake, evaluate_camera_vibrate, evaluate_particles, parse_obj,
+    CameraShakeMode, CameraShakeParams as SceneCameraShakeParams, DeformAxis,
+    GradientStop as ParticleGradientStop, MeshData, ParticleBlending, ParticleSystemParams,
+    PositionDistribution, Text3DParams, TextAlignMode, UvMode, VelocityDistribution, Vertex3D,
+    apply_repeater, apply_twist, apply_voronoi_fracture, apply_warp, build_box, build_capsule,
+    build_circle, build_cylinder, build_dodecahedron, build_donut, build_fallback_text_mesh,
+    build_icosahedron, build_octahedron, build_rectangle, build_rounded_box, build_sphere,
+    build_tetrahedron, build_text3d_mesh, build_wire, evaluate_camera_shake, evaluate_particles,
+    parse_obj,
 };
-use zc_shader::{CompileOptions, CompiledCustomShader, UniformValue, pack_uniforms};
+use zc_shader::{CompileOptions, CompiledCustomShader, UniformType, UniformValue, pack_uniforms};
 
 use crate::cache::{FrameCache, FrameCacheKey};
 use crate::compositor::{BlendMode, Compositor2D, LayerTransform2D};
-use crate::context::{GpuContext, RenderError, RenderTarget, TargetPool, readback_rgba8};
+use crate::context::{
+    GpuContext, RenderError, RenderTarget, TargetPool, f32_to_f16_bits, readback_rgba8,
+};
 use crate::effects::{
     EffectParamValue as RegParamValue, EffectParams as RegEffectParams, EffectRegistry,
     EffectTargets, MAX_CUSTOM_PIPELINES, PLUGIN_EFFECT_SHADERS, STANDARD_EFFECT_SHADERS,
@@ -84,6 +93,13 @@ struct CustomVsOut {
     @location(1) v_uv_scaled: vec2<f32>,
 };
 
+struct CustomVsOutBg {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) v_uv: vec2<f32>,
+    @location(1) v_uv_scaled: vec2<f32>,
+    @location(2) bg_coord: vec2<f32>,
+};
+
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> CustomVsOut {
     var pos = array<vec2<f32>, 3>(
@@ -101,6 +117,27 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> CustomVsOut {
     out_v.clip_pos = vec4<f32>(pos[idx], 0.0, 1.0);
     out_v.v_uv = c_uv;
     out_v.v_uv_scaled = c_uv;
+    return out_v;
+}
+
+@vertex
+fn vs_main_bg(@builtin(vertex_index) idx: u32) -> CustomVsOutBg {
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    var uv = array<vec2<f32>, 3>(
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(2.0, 0.0),
+        vec2<f32>(0.0, 2.0),
+    );
+    let c_uv = uv[idx];
+    var out_v: CustomVsOutBg;
+    out_v.clip_pos = vec4<f32>(pos[idx], 0.0, 1.0);
+    out_v.v_uv = c_uv;
+    out_v.v_uv_scaled = c_uv;
+    out_v.bg_coord = c_uv;
     return out_v;
 }
 "#;
@@ -154,6 +191,16 @@ pub struct RenderOverrides {
     pub selected_object_ids: Vec<Uuid>,
 }
 
+/// Frame-level rendering options (transparent alpha export + optional viewport overrides).
+#[derive(Debug, Clone, Default)]
+pub struct RenderFrameOptions {
+    /// When `true`, clears the root sequence canvas to transparent `[0, 0, 0, 0]`
+    /// instead of `sequence.background_color` (for alpha PNG / VP9 yuva420p export).
+    pub transparent_background: bool,
+    /// Optional interactive Editing Camera & selection wireframe overrides.
+    pub overrides: Option<RenderOverrides>,
+}
+
 struct Scene3DOverride<'a> {
     editing_camera: CameraParams,
     selected_object_ids: &'a [Uuid],
@@ -192,24 +239,92 @@ struct CachedCustomPipeline {
 }
 
 /// Immutable evaluation context threaded through property, 3D scene, and effect evaluation.
+#[derive(Clone)]
 struct EvalEnv<'a> {
     frame: f64,
+    abs_frame: f64,
     time: f64,
     fps: f64,
     sequence_resolution: [u32; 2],
     project: &'a Project,
+    sequence: &'a Sequence,
     plugins: &'a PluginRegistry,
-    controls: &'a BTreeMap<String, ExprValue>,
+    controls: &'a RefCell<BTreeMap<String, ExprValue>>,
     parent_props: &'a BTreeMap<String, ExprValue>,
+    active_clip_id: Option<Uuid>,
+    active_layer_id: Option<Uuid>,
+    active_object_id: Option<Uuid>,
+    active_effect_id: Option<Uuid>,
+    active_property_id: Option<String>,
+    expr_stack: &'a RefCell<HashSet<String>>,
 }
 
-/// Context allowing temporal layer effects (`echo`, `smartmotionblur`) to sample
-/// neighbor frames of the active layer without infinite recursion.
+impl<'a> EvalEnv<'a> {
+    fn with_object(&self, object_id: Uuid) -> Self {
+        Self {
+            active_object_id: Some(object_id),
+            ..self.clone()
+        }
+    }
+
+    fn with_effect(&self, effect_id: Uuid) -> Self {
+        Self {
+            active_effect_id: Some(effect_id),
+            ..self.clone()
+        }
+    }
+
+    fn with_layer(&self, layer_id: Uuid) -> Self {
+        Self {
+            active_layer_id: Some(layer_id),
+            active_object_id: None,
+            active_effect_id: None,
+            ..self.clone()
+        }
+    }
+
+    fn with_property(&self, property_id: String) -> Self {
+        Self {
+            active_property_id: Some(property_id),
+            ..self.clone()
+        }
+    }
+
+    fn with_parent_props<'b>(&'b self, parent_props: &'b BTreeMap<String, ExprValue>) -> EvalEnv<'b>
+    where
+        'a: 'b,
+    {
+        EvalEnv {
+            frame: self.frame,
+            abs_frame: self.abs_frame,
+            time: self.time,
+            fps: self.fps,
+            sequence_resolution: self.sequence_resolution,
+            project: self.project,
+            sequence: self.sequence,
+            plugins: self.plugins,
+            controls: self.controls,
+            parent_props,
+            active_clip_id: self.active_clip_id,
+            active_layer_id: self.active_layer_id,
+            active_object_id: self.active_object_id,
+            active_effect_id: self.active_effect_id,
+            active_property_id: self.active_property_id.clone(),
+            expr_stack: self.expr_stack,
+        }
+    }
+}
+
+/// Context allowing temporal layer effects (`echo`, `smartmotionblur`, `timeoffset`,
+/// `posterizetime`, `timeremap`, and Shader+ `timeSample`) to sample neighbor frames
+/// of the active layer without infinite recursion.
 struct TemporalEffectContext<'a> {
     backdrop: &'a RenderTarget,
     layer: &'a Layer,
+    time_curve: Option<&'a PropertyTrack>,
     prefix_effects: &'a [EffectInstance],
     visited_comps: &'a mut Vec<Uuid>,
+    visited_tracks: &'a mut Vec<Uuid>,
     comp_depth: usize,
     scene_override: Option<&'a Scene3DOverride<'a>>,
 }
@@ -230,10 +345,12 @@ pub struct ProjectRenderEngine {
     custom_pipelines: HashMap<u64, CachedCustomPipeline>,
     custom_vs_module: wgpu::ShaderModule,
     custom_sampler: wgpu::Sampler,
+    custom_sampler_repeat: wgpu::Sampler,
     fallback_transparent: RenderTarget,
     fallback_white: RenderTarget,
     cache_tick: u64,
     output_target: Option<RenderTarget>,
+    transparent_background: bool,
 }
 
 impl ProjectRenderEngine {
@@ -272,6 +389,14 @@ impl ProjectRenderEngine {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let custom_sampler_repeat = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("zc-render custom shader repeat-u linear sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let fallback_transparent =
             ctx.create_rgba8_texture("zc-render fallback transparent", 1, 1, &[0, 0, 0, 0])?;
         let fallback_white =
@@ -290,11 +415,25 @@ impl ProjectRenderEngine {
             custom_pipelines: HashMap::new(),
             custom_vs_module,
             custom_sampler,
+            custom_sampler_repeat,
             fallback_transparent,
             fallback_white,
             cache_tick: 0,
             output_target: None,
+            transparent_background: false,
         })
+    }
+
+    /// Configures whether the root sequence canvas clears to transparent `[0, 0, 0, 0]`
+    /// (for transparent PNG / VP9 yuva420p export) instead of `sequence.background_color`.
+    pub fn set_transparent_background(&mut self, enabled: bool) {
+        self.transparent_background = enabled;
+    }
+
+    /// Returns whether transparent root background clearing is currently enabled.
+    #[must_use]
+    pub fn transparent_background(&self) -> bool {
+        self.transparent_background
     }
 
     /// Returns a reference to the underlying GPU context.
@@ -365,6 +504,51 @@ impl ProjectRenderEngine {
         height: u32,
         overrides: Option<&RenderOverrides>,
     ) -> Result<&wgpu::TextureView, RenderError> {
+        let transparent = self.transparent_background;
+        self.render_frame_to_texture_internal(
+            project,
+            plugins,
+            frame,
+            width,
+            height,
+            overrides,
+            transparent,
+        )
+    }
+
+    /// Renders `project` at `frame` with explicit [`RenderFrameOptions`] and returns a
+    /// zero-copy `&wgpu::TextureView`.
+    pub fn render_frame_to_texture_with_options(
+        &mut self,
+        project: &Project,
+        plugins: &PluginRegistry,
+        frame: f64,
+        width: u32,
+        height: u32,
+        options: &RenderFrameOptions,
+    ) -> Result<&wgpu::TextureView, RenderError> {
+        self.render_frame_to_texture_internal(
+            project,
+            plugins,
+            frame,
+            width,
+            height,
+            options.overrides.as_ref(),
+            options.transparent_background || self.transparent_background,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_frame_to_texture_internal(
+        &mut self,
+        project: &Project,
+        plugins: &PluginRegistry,
+        frame: f64,
+        width: u32,
+        height: u32,
+        overrides: Option<&RenderOverrides>,
+        transparent_background: bool,
+    ) -> Result<&wgpu::TextureView, RenderError> {
         self.ctx
             .validate_dimensions(width, height, wgpu::TextureFormat::Rgba8Unorm)?;
 
@@ -375,6 +559,7 @@ impl ProjectRenderEngine {
 
         let mut visited_comps = Vec::with_capacity(4);
         visited_comps.push(project.sequence.id);
+        let mut visited_tracks = Vec::with_capacity(4);
         let final_target = self.render_sequence(
             project,
             &project.sequence,
@@ -383,8 +568,10 @@ impl ProjectRenderEngine {
             width,
             height,
             &mut visited_comps,
+            &mut visited_tracks,
             0,
             overrides,
+            transparent_background,
         )?;
 
         self.targets.trim_unused();
@@ -402,8 +589,55 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, RenderError> {
+        let transparent = self.transparent_background;
+        self.render_frame_rgba8_transparent(project, plugins, frame, width, height, transparent)
+    }
+
+    /// Renders `project` at `frame` with explicit `transparent_background` override and
+    /// reads back tightly packed RGBA8 pixels (`width * height * 4` bytes, top-down).
+    pub fn render_frame_rgba8_transparent(
+        &mut self,
+        project: &Project,
+        plugins: &PluginRegistry,
+        frame: f64,
+        width: u32,
+        height: u32,
+        transparent_background: bool,
+    ) -> Result<Vec<u8>, RenderError> {
         let _ = self.ctx.validate_rgba8_readback_dimensions(width, height)?;
-        let _ = self.render_frame_to_texture(project, plugins, frame, width, height)?;
+        let _ = self.render_frame_to_texture_internal(
+            project,
+            plugins,
+            frame,
+            width,
+            height,
+            None,
+            transparent_background,
+        )?;
+        let Some(target) = self.output_target.as_ref() else {
+            return Err(RenderError::Effect(
+                "output target missing after render".to_owned(),
+            ));
+        };
+        let mut pixels = Vec::new();
+        readback_rgba8(&self.ctx, target, &mut pixels)?;
+        Ok(pixels)
+    }
+
+    /// Renders `project` at `frame` with [`RenderFrameOptions`] and reads back RGBA8 pixels.
+    pub fn render_frame_rgba8_with_options(
+        &mut self,
+        project: &Project,
+        plugins: &PluginRegistry,
+        frame: f64,
+        width: u32,
+        height: u32,
+        options: &RenderFrameOptions,
+    ) -> Result<Vec<u8>, RenderError> {
+        let _ = self.ctx.validate_rgba8_readback_dimensions(width, height)?;
+        let _ = self.render_frame_to_texture_with_options(
+            project, plugins, frame, width, height, options,
+        )?;
         let Some(target) = self.output_target.as_ref() else {
             return Err(RenderError::Effect(
                 "output target missing after render".to_owned(),
@@ -615,21 +849,35 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
         visited_comps: &mut Vec<Uuid>,
+        visited_tracks: &mut Vec<Uuid>,
         comp_depth: usize,
         overrides: Option<&RenderOverrides>,
+        transparent_background: bool,
     ) -> Result<RenderTarget, RenderError> {
-        let fps = f64::from(sequence.fps.max(1));
+        let fps = sequence
+            .exact_fps
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .unwrap_or_else(|| f64::from(sequence.fps.max(1)));
         let empty_props = BTreeMap::new();
-        let empty_controls = BTreeMap::new();
+        let controls_cache = RefCell::new(BTreeMap::new());
+        let expr_stack = RefCell::new(HashSet::new());
         let base_env = EvalEnv {
             frame,
+            abs_frame: frame,
             time: frame / fps,
             fps,
             sequence_resolution: sequence.resolution,
             project,
+            sequence,
             plugins,
-            controls: &empty_controls,
+            controls: &controls_cache,
             parent_props: &empty_props,
+            active_clip_id: None,
+            active_layer_id: None,
+            active_object_id: None,
+            active_effect_id: None,
+            active_property_id: None,
+            expr_stack: &expr_stack,
         };
 
         let editing_active = overrides
@@ -658,8 +906,10 @@ impl ProjectRenderEngine {
                         width,
                         height,
                         visited_comps,
+                        visited_tracks,
                         comp_depth,
                         overrides,
+                        transparent_background,
                     )?;
                     self.compositor.accumulate_motion_blur_sample(
                         &self.ctx,
@@ -691,8 +941,10 @@ impl ProjectRenderEngine {
             width,
             height,
             visited_comps,
+            visited_tracks,
             comp_depth,
             overrides,
+            transparent_background,
         )
     }
 
@@ -707,29 +959,53 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
         visited_comps: &mut Vec<Uuid>,
+        visited_tracks: &mut Vec<Uuid>,
         comp_depth: usize,
         overrides: Option<&RenderOverrides>,
+        transparent_background: bool,
     ) -> Result<RenderTarget, RenderError> {
-        let fps = f64::from(sequence.fps.max(1));
-        let controls = evaluate_sequence_controls(sequence, eval_frame, fps, project, plugins);
+        let fps = sequence
+            .exact_fps
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .unwrap_or_else(|| f64::from(sequence.fps.max(1)));
+        let controls = RefCell::new(BTreeMap::new());
+        let expr_stack = RefCell::new(HashSet::new());
+        // Pre-populate sequence controls lazily (supports forward references & cycle detection).
+        evaluate_sequence_controls_into(
+            sequence,
+            eval_frame,
+            fps,
+            project,
+            plugins,
+            &controls,
+            &expr_stack,
+        );
 
         let mut canvas =
             self.targets
                 .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
-        let bg = sequence.background_color;
-        let bg_a = f64::from(bg[3].clamp(0.0, 1.0));
-        self.compositor.clear_target(
-            &self.ctx,
-            &canvas,
-            wgpu::Color {
-                r: f64::from(bg[0].clamp(0.0, 1.0)) * bg_a,
-                g: f64::from(bg[1].clamp(0.0, 1.0)) * bg_a,
-                b: f64::from(bg[2].clamp(0.0, 1.0)) * bg_a,
-                a: bg_a,
-            },
-        );
+        // P6 P0 & P9 P0: Nested compositions (`comp_depth > 0`) and transparent alpha exports
+        // must clear to transparent `[0, 0, 0, 0]` instead of `sequence.background_color`.
+        if comp_depth > 0 || transparent_background {
+            self.compositor
+                .clear_target(&self.ctx, &canvas, wgpu::Color::TRANSPARENT);
+        } else {
+            let bg = sequence.background_color;
+            let bg_a = f64::from(bg[3].clamp(0.0, 1.0));
+            self.compositor.clear_target(
+                &self.ctx,
+                &canvas,
+                wgpu::Color {
+                    r: f64::from(bg[0].clamp(0.0, 1.0)) * bg_a,
+                    g: f64::from(bg[1].clamp(0.0, 1.0)) * bg_a,
+                    b: f64::from(bg[2].clamp(0.0, 1.0)) * bg_a,
+                    a: bg_a,
+                },
+            );
+        }
 
-        let any_solo = sequence.video_tracks.iter().any(|t| t.enabled && t.solo);
+        // P9 P1-9: Solo state checks `t.solo` regardless of `enabled` (matching Zoidium).
+        let any_solo = sequence.video_tracks.iter().any(|t| t.solo);
 
         // Spec 03 §7.3: render video tracks strictly bottom-to-top (0 -> N - 1).
         for track in &sequence.video_tracks {
@@ -743,29 +1019,49 @@ impl ProjectRenderEngine {
                 {
                     continue;
                 }
-                let clamped_frame = eval_frame.clamp(clip.start, clip.start + clip.length);
-                let local_frame = clamped_frame - clip.start;
+                // P7 P1-7: Unclamped local_frame preserves true motion-blur velocity across boundaries.
+                let local_frame = eval_frame - clip.start;
                 let empty_props = BTreeMap::new();
+                // P7 P0-8: Pass pre-expression keyframed time to clip `time` expression.
+                let raw_time = eval_track_keyframes_only(&clip.time_curve, local_frame)
+                    .as_f64()
+                    .unwrap_or(local_frame / fps);
                 let time_env = EvalEnv {
                     frame: local_frame,
-                    time: local_frame / fps,
+                    abs_frame: eval_frame,
+                    time: raw_time,
                     fps,
                     sequence_resolution: sequence.resolution,
                     project,
+                    sequence,
                     plugins,
                     controls: &controls,
                     parent_props: &empty_props,
+                    active_clip_id: Some(clip.id),
+                    active_layer_id: Some(clip.layer.id),
+                    active_object_id: None,
+                    active_effect_id: None,
+                    active_property_id: Some(format!("prop:clip:{}:time", clip.id)),
+                    expr_stack: &expr_stack,
                 };
                 let clip_time = eval_f64(&clip.time_curve, &time_env);
                 let clip_env = EvalEnv {
                     frame: local_frame,
+                    abs_frame: eval_frame,
                     time: clip_time,
                     fps,
                     sequence_resolution: sequence.resolution,
                     project,
+                    sequence,
                     plugins,
                     controls: &controls,
                     parent_props: &empty_props,
+                    active_clip_id: Some(clip.id),
+                    active_layer_id: Some(clip.layer.id),
+                    active_object_id: None,
+                    active_effect_id: None,
+                    active_property_id: None,
+                    expr_stack: &expr_stack,
                 };
 
                 let scene_override = overrides.and_then(|ov| {
@@ -782,10 +1078,12 @@ impl ProjectRenderEngine {
                 canvas = self.render_and_composite_layer(
                     canvas,
                     &clip.layer,
+                    Some(&clip.time_curve),
                     &clip_env,
                     width,
                     height,
                     visited_comps,
+                    visited_tracks,
                     comp_depth,
                     scene_override.as_ref(),
                 )?;
@@ -800,14 +1098,21 @@ impl ProjectRenderEngine {
         &mut self,
         backdrop: RenderTarget,
         layer: &Layer,
+        time_curve: Option<&PropertyTrack>,
         env: &EvalEnv<'_>,
         width: u32,
         height: u32,
         visited_comps: &mut Vec<Uuid>,
+        visited_tracks: &mut Vec<Uuid>,
         comp_depth: usize,
         scene_override: Option<&Scene3DOverride<'_>>,
     ) -> Result<RenderTarget, RenderError> {
-        let opacity = eval_f32(&layer.opacity, env).clamp(0.0, 1.0);
+        let layer_env = env.with_layer(layer.id);
+        let opacity = eval_f32(
+            &layer.opacity,
+            &layer_env.with_property(format!("prop:layer:{}:opacity", layer.id)),
+        )
+        .clamp(0.0, 1.0);
         let blend_mode = BlendMode::from_token(&layer.blending).unwrap_or(BlendMode::SrcOver);
         if opacity <= 0.0 && blend_mode == BlendMode::SrcOver {
             return Ok(backdrop);
@@ -816,10 +1121,11 @@ impl ProjectRenderEngine {
         let Some(mut layer_target) = self.render_layer_content(
             &backdrop,
             layer,
-            env,
+            &layer_env,
             width,
             height,
             visited_comps,
+            visited_tracks,
             comp_depth,
             scene_override,
         )?
@@ -831,78 +1137,61 @@ impl ProjectRenderEngine {
             let mut temporal_ctx = TemporalEffectContext {
                 backdrop: &backdrop,
                 layer,
+                time_curve,
                 prefix_effects: &[],
                 visited_comps,
+                visited_tracks,
                 comp_depth,
                 scene_override,
             };
             layer_target = self.apply_project_effect_stack_depth(
                 layer_target,
                 &layer.effects,
-                env,
+                &layer_env,
                 0,
                 Some(&mut temporal_ctx),
             )?;
         }
 
-        let seq_w = env.sequence_resolution[0].max(1) as f32;
-        let seq_h = env.sequence_resolution[1].max(1) as f32;
+        // P6 P0: Apply Zoidium Layer Masks (`sequence.layer_masks` or `layer.preserved["zoidiumMasks"]`)
+        // right after layer effects, multiplying premultiplied RGBA by mask coverage via `BlendMode::DstIn`.
+        if let Some(typed_masks) = layer_env.sequence.layer_masks.get(&layer.id)
+            && !typed_masks.is_empty()
+        {
+            layer_target =
+                self.apply_typed_layer_masks(layer_target, layer.id, typed_masks, &layer_env)?;
+        } else if let Some(masks_val) = layer.preserved.get("zoidiumMasks") {
+            layer_target =
+                self.apply_zoidium_layer_masks(layer_target, layer.id, masks_val, &layer_env)?;
+        }
+
+        let seq_w = layer_env.sequence_resolution[0].max(1) as f32;
+        let seq_h = layer_env.sequence_resolution[1].max(1) as f32;
         let scale_x = (width as f32) / seq_w;
         let scale_y = (height as f32) / seq_h;
 
-        let raw_pos = eval_vec2(&layer.position, env);
+        let raw_pos = eval_vec2(
+            &layer.position,
+            &layer_env.with_property(format!("prop:layer:{}:position", layer.id)),
+        );
         let pos = [raw_pos[0] * scale_x, raw_pos[1] * scale_y];
-        let scale = eval_vec2(&layer.scale, env);
-        let rotation = eval_f32(&layer.rotation, env);
-        let raw_anchor = eval_vec2(&layer.anchor, env);
+        let scale = eval_vec2(
+            &layer.scale,
+            &layer_env.with_property(format!("prop:layer:{}:scale", layer.id)),
+        );
+        let rotation = eval_f32(
+            &layer.rotation,
+            &layer_env.with_property(format!("prop:layer:{}:rotation", layer.id)),
+        );
+        let raw_anchor = eval_vec2(
+            &layer.anchor,
+            &layer_env.with_property(format!("prop:layer:{}:anchor", layer.id)),
+        );
         let anchor = [raw_anchor[0] * scale_x, raw_anchor[1] * scale_y];
 
-        let is_identity_transform = pos[0].abs() < 1e-4
-            && pos[1].abs() < 1e-4
-            && (scale[0] - 1.0).abs() < 1e-4
-            && (scale[1] - 1.0).abs() < 1e-4
-            && rotation.abs() < 1e-4
-            && anchor[0].abs() < 1e-4
-            && anchor[1].abs() < 1e-4;
-
-        if matches!(layer.kind, LayerKind::Adjustment)
-            && blend_mode == BlendMode::SrcOver
-            && is_identity_transform
-        {
-            if opacity >= 1.0 - 1e-5 {
-                self.targets.release(backdrop);
-                return Ok(layer_target);
-            }
-            let scaled_bg =
-                self.targets
-                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
-            self.compositor.composite_layer(
-                &self.ctx,
-                &backdrop,
-                &backdrop,
-                &scaled_bg,
-                LayerTransform2D::default(),
-                1.0 - opacity,
-                BlendMode::Src,
-            );
-            let composited =
-                self.targets
-                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
-            self.compositor.composite_layer(
-                &self.ctx,
-                &scaled_bg,
-                &layer_target,
-                &composited,
-                LayerTransform2D::default(),
-                opacity,
-                BlendMode::Plus,
-            );
-            self.targets.release(scaled_bg);
-            self.targets.release(backdrop);
-            self.targets.release(layer_target);
-            return Ok(composited);
-        }
-
+        // P6 P0: Adjustment layers MUST always composite through `compositor.composite_layer`
+        // (never bypassing `SrcOver`), so masked/keyed adjustment pixels with alpha < 1 reveal
+        // the unmodified `backdrop` underneath.
         let transform = LayerTransform2D {
             position: pos,
             scale,
@@ -927,6 +1216,181 @@ impl ProjectRenderEngine {
         Ok(composited)
     }
 
+    /// Captures a single video track's active clip for `LayerInput` (`"source"`, `"masks"`,
+    /// or `"effects-masks"` stages), supporting hidden tracks and guarding against recursion.
+    #[allow(clippy::too_many_arguments)]
+    fn render_track_source(
+        &mut self,
+        track_ref: &str,
+        stage: &str,
+        env: &EvalEnv<'_>,
+        width: u32,
+        height: u32,
+        visited_comps: &mut Vec<Uuid>,
+        visited_tracks: &mut Vec<Uuid>,
+        comp_depth: usize,
+    ) -> Result<Option<RenderTarget>, RenderError> {
+        if comp_depth >= MAX_COMPOSITION_DEPTH || visited_tracks.len() >= MAX_COMPOSITION_DEPTH {
+            return Ok(None);
+        }
+        let target_key = track_ref
+            .strip_prefix("track:id:")
+            .unwrap_or(track_ref)
+            .trim();
+        if target_key.is_empty() {
+            return Ok(None);
+        }
+        let Some(track) = env.sequence.video_tracks.iter().find(|t| {
+            t.id.to_string() == target_key
+                || t.name == target_key
+                || env
+                    .sequence
+                    .track_layer_input_ids
+                    .get(&t.id)
+                    .is_some_and(|s| s == target_key)
+                || t.preserved
+                    .get("zoidiumId")
+                    .or_else(|| t.preserved.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| s == target_key)
+        }) else {
+            return Ok(None);
+        };
+        if visited_tracks.contains(&track.id) {
+            return Ok(None);
+        }
+        let Some(clip) = track.clips.iter().find(|c| {
+            c.length > 0.0 && env.abs_frame >= c.start && env.abs_frame < c.start + c.length
+        }) else {
+            return Ok(None);
+        };
+
+        visited_tracks.push(track.id);
+        let local_frame = env.abs_frame - clip.start;
+        let fps = env.fps.max(1.0);
+        let empty_props = BTreeMap::new();
+        let raw_time = eval_track_keyframes_only(&clip.time_curve, local_frame)
+            .as_f64()
+            .unwrap_or(local_frame / fps);
+        let time_env = EvalEnv {
+            frame: local_frame,
+            abs_frame: env.abs_frame,
+            time: raw_time,
+            fps,
+            sequence_resolution: env.sequence_resolution,
+            project: env.project,
+            sequence: env.sequence,
+            plugins: env.plugins,
+            controls: env.controls,
+            parent_props: &empty_props,
+            active_clip_id: Some(clip.id),
+            active_layer_id: Some(clip.layer.id),
+            active_object_id: None,
+            active_effect_id: None,
+            active_property_id: Some(format!("prop:clip:{}:time", clip.id)),
+            expr_stack: env.expr_stack,
+        };
+        let clip_time = eval_f64(&clip.time_curve, &time_env);
+        let clip_env = EvalEnv {
+            frame: local_frame,
+            abs_frame: env.abs_frame,
+            time: clip_time,
+            fps,
+            sequence_resolution: env.sequence_resolution,
+            project: env.project,
+            sequence: env.sequence,
+            plugins: env.plugins,
+            controls: env.controls,
+            parent_props: &empty_props,
+            active_clip_id: Some(clip.id),
+            active_layer_id: Some(clip.layer.id),
+            active_object_id: None,
+            active_effect_id: None,
+            active_property_id: None,
+            expr_stack: env.expr_stack,
+        };
+
+        let clear_bg =
+            self.targets
+                .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+        self.compositor
+            .clear_target(&self.ctx, &clear_bg, wgpu::Color::TRANSPARENT);
+
+        let content_res = self.render_layer_content(
+            &clear_bg,
+            &clip.layer,
+            &clip_env,
+            width,
+            height,
+            visited_comps,
+            visited_tracks,
+            comp_depth + 1,
+            None,
+        );
+        self.targets.release(clear_bg);
+
+        let mut target = match content_res {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                visited_tracks.pop();
+                return Ok(None);
+            }
+            Err(err) => {
+                visited_tracks.pop();
+                return Err(err);
+            }
+        };
+
+        let run_effects = matches!(stage, "effects-masks" | "effects" | "");
+        let run_masks = matches!(stage, "masks" | "effects-masks" | "");
+
+        if run_effects && !clip.layer.effects.is_empty() {
+            let empty_bg =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+            self.compositor
+                .clear_target(&self.ctx, &empty_bg, wgpu::Color::TRANSPARENT);
+            let mut tctx = TemporalEffectContext {
+                backdrop: &empty_bg,
+                layer: &clip.layer,
+                time_curve: Some(&clip.time_curve),
+                prefix_effects: &[],
+                visited_comps,
+                visited_tracks,
+                comp_depth: comp_depth + 1,
+                scene_override: None,
+            };
+            let fx_res = self.apply_project_effect_stack_depth(
+                target,
+                &clip.layer.effects,
+                &clip_env,
+                0,
+                Some(&mut tctx),
+            );
+            self.targets.release(empty_bg);
+            target = match fx_res {
+                Ok(t) => t,
+                Err(err) => {
+                    visited_tracks.pop();
+                    return Err(err);
+                }
+            };
+        }
+
+        if run_masks && let Some(masks_val) = clip.layer.preserved.get("zoidiumMasks") {
+            match self.apply_zoidium_layer_masks(target, clip.layer.id, masks_val, &clip_env) {
+                Ok(t) => target = t,
+                Err(err) => {
+                    visited_tracks.pop();
+                    return Err(err);
+                }
+            }
+        }
+
+        visited_tracks.pop();
+        Ok(Some(target))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_layer_content(
         &mut self,
@@ -936,9 +1400,15 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
         visited_comps: &mut Vec<Uuid>,
+        visited_tracks: &mut Vec<Uuid>,
         comp_depth: usize,
         scene_override: Option<&Scene3DOverride<'_>>,
     ) -> Result<Option<RenderTarget>, RenderError> {
+        let seq_w = env.sequence_resolution[0].max(1) as f32;
+        let seq_h = env.sequence_resolution[1].max(1) as f32;
+        let scale_x = (width as f32) / seq_w;
+        let scale_y = (height as f32) / seq_h;
+
         match &layer.kind {
             LayerKind::Scene3D {
                 objects,
@@ -983,38 +1453,98 @@ impl ProjectRenderEngine {
                 Ok(Some(dst))
             }
             LayerKind::Image { image } => {
-                let dst = self.targets.acquire(
-                    &self.ctx,
-                    width,
-                    height,
-                    wgpu::TextureFormat::Rgba8Unorm,
-                )?;
+                // P6 P0: Honor `layer.resolution` scaled by preview ratio instead of
+                // magnifying/stretching small images to full composition size.
                 if let Some(asset_id) = image.as_deref()
                     && let Some(tex) = self.ensure_image_asset_texture(env.project, asset_id, true)
                 {
-                    self.blit_aspect_fit(&tex, &dst);
+                    let natural_w = if layer.resolution[0] > 0 {
+                        layer.resolution[0]
+                    } else {
+                        tex.width
+                    };
+                    let natural_h = if layer.resolution[1] > 0 {
+                        layer.resolution[1]
+                    } else {
+                        tex.height
+                    };
+                    let target_w = ((natural_w as f32) * scale_x)
+                        .round()
+                        .max(1.0)
+                        .min(self.ctx.device.limits().max_texture_dimension_2d as f32)
+                        as u32;
+                    let target_h = ((natural_h as f32) * scale_y)
+                        .round()
+                        .max(1.0)
+                        .min(self.ctx.device.limits().max_texture_dimension_2d as f32)
+                        as u32;
+                    let dst = self.targets.acquire(
+                        &self.ctx,
+                        target_w,
+                        target_h,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
+                    self.compositor.blit(&self.ctx, &tex.view, &dst);
+                    Ok(Some(dst))
                 } else {
+                    let dst = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
                     self.compositor
                         .clear_target(&self.ctx, &dst, wgpu::Color::TRANSPARENT);
+                    Ok(Some(dst))
                 }
-                Ok(Some(dst))
             }
             LayerKind::Video { media } => {
-                let dst = self.targets.acquire(
-                    &self.ctx,
-                    width,
-                    height,
-                    wgpu::TextureFormat::Rgba8Unorm,
-                )?;
-                if let Some(asset_id) = media.as_deref()
-                    && let Some(tex) = self.ensure_image_asset_texture(env.project, asset_id, true)
-                {
-                    self.blit_aspect_fit(&tex, &dst);
+                // P6 P0 + P7 P0: Honor `layer.resolution` AND sample video at `env.time`!
+                let sample_time = env.time.max(0.0);
+                let tex_opt = media.as_deref().and_then(|asset_id| {
+                    self.ensure_video_frame_texture(env.project, asset_id, sample_time)
+                        .or_else(|| self.ensure_image_asset_texture(env.project, asset_id, true))
+                });
+                if let Some(tex) = tex_opt {
+                    let natural_w = if layer.resolution[0] > 0 {
+                        layer.resolution[0]
+                    } else {
+                        tex.width
+                    };
+                    let natural_h = if layer.resolution[1] > 0 {
+                        layer.resolution[1]
+                    } else {
+                        tex.height
+                    };
+                    let target_w = ((natural_w as f32) * scale_x)
+                        .round()
+                        .max(1.0)
+                        .min(self.ctx.device.limits().max_texture_dimension_2d as f32)
+                        as u32;
+                    let target_h = ((natural_h as f32) * scale_y)
+                        .round()
+                        .max(1.0)
+                        .min(self.ctx.device.limits().max_texture_dimension_2d as f32)
+                        as u32;
+                    let dst = self.targets.acquire(
+                        &self.ctx,
+                        target_w,
+                        target_h,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
+                    self.compositor.blit(&self.ctx, &tex.view, &dst);
+                    Ok(Some(dst))
                 } else {
+                    let dst = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
                     self.compositor
                         .clear_target(&self.ctx, &dst, wgpu::Color::TRANSPARENT);
+                    Ok(Some(dst))
                 }
-                Ok(Some(dst))
             }
             LayerKind::Composite { layers } => {
                 if comp_depth >= MAX_COMPOSITION_DEPTH {
@@ -1037,12 +1567,14 @@ impl ProjectRenderEngine {
                     nested = self.render_and_composite_layer(
                         nested,
                         child,
+                        None,
                         env,
                         width,
                         height,
                         visited_comps,
+                        visited_tracks,
                         comp_depth + 1,
-                        None,
+                        scene_override,
                     )?;
                 }
                 Ok(Some(nested))
@@ -1066,7 +1598,31 @@ impl ProjectRenderEngine {
                     return Ok(None);
                 };
                 visited_comps.push(*composition_id);
-                let comp_frame = env.time * f64::from(comp_seq.fps.max(1));
+                // P6 P1 + P7 P0: Apply Precomp+ `offset` (in frames) and honor clip `time_curve`
+                // without wrongly re-scaling linear frame indices when parent/child fps match.
+                let offset = env
+                    .sequence
+                    .precomp_offsets
+                    .get(&layer.id)
+                    .copied()
+                    .or_else(|| {
+                        layer.preserved.get("offset").and_then(|v| {
+                            v.as_f64()
+                                .or_else(|| v.get("value").and_then(serde_json::Value::as_f64))
+                        })
+                    })
+                    .unwrap_or(0.0);
+                let comp_fps = comp_seq
+                    .exact_fps
+                    .filter(|f| f.is_finite() && *f > 0.0)
+                    .unwrap_or_else(|| f64::from(comp_seq.fps.max(1)));
+                let comp_frame = if (env.time * env.fps - env.frame).abs() < 1e-6
+                    && (comp_fps - env.fps).abs() < 1e-6
+                {
+                    env.frame + offset
+                } else {
+                    env.time * comp_fps + offset
+                };
                 let result = self.render_sequence(
                     env.project,
                     comp_seq,
@@ -1075,8 +1631,10 @@ impl ProjectRenderEngine {
                     width,
                     height,
                     visited_comps,
+                    visited_tracks,
                     comp_depth + 1,
                     None,
+                    true,
                 );
                 visited_comps.pop();
                 result.map(Some)
@@ -1108,7 +1666,19 @@ impl ProjectRenderEngine {
                 )?;
                 Ok(Some(target))
             }
-            LayerKind::CameraLayer { .. } | LayerKind::Plugin { .. } => Ok(None),
+            LayerKind::Plugin {
+                plugin_type,
+                payload,
+            } => {
+                if plugin_type == "zoidium:shape-plus/shape-layer" {
+                    let target =
+                        self.render_shape_plus_2d(layer.id, payload, env, width, height)?;
+                    Ok(Some(target))
+                } else {
+                    Ok(None)
+                }
+            }
+            LayerKind::CameraLayer { .. } => Ok(None),
         }
     }
 
@@ -1313,60 +1883,41 @@ impl ProjectRenderEngine {
         env: &EvalEnv<'_>,
         out: &mut CollectedScene3D,
     ) {
-        for obj in objects {
-            if !eval_bool(&obj.enabled, env, true) {
+        let eval_graph = evaluate_scene_graph_3d(objects, parent_world, env);
+        for node in &eval_graph.nodes {
+            if !node.render_enabled {
                 continue;
             }
-
-            let pos = eval_vec3(&obj.position, env);
-            let rot = eval_vec3(&obj.rotation, env);
-            let mut scale = eval_vec3(&obj.scale, env);
-            if matches!(obj.kind, Object3DKind::Camera(_)) {
-                for s in &mut scale {
-                    if s.abs() < 1e-6 {
-                        *s = 1.0;
-                    }
-                }
-            }
-            let local_tf = Transform3D {
-                position: Vec3::from_array(pos),
-                rotation: Vec3::from_array(rot),
-                scale: Vec3::from_array(scale),
-                euler_order: map_euler_order(obj.euler_order),
-            };
-            let world = parent_world * local_tf.to_matrix();
+            let obj = node.obj;
+            let world = node.world_mat;
+            let obj_env = env.with_object(obj.id);
+            let node_env = obj_env.with_parent_props(&node.parent_props);
 
             match &obj.kind {
-                Object3DKind::Group {
-                    custom_properties,
-                    children,
-                    ..
-                } => {
-                    let mut child_props = env.parent_props.clone();
-                    for cp in custom_properties {
-                        let val = eval_property_track(&cp.track, env);
-                        child_props.insert(cp.name.clone(), property_value_to_expr(&val));
-                    }
-                    let child_env = EvalEnv {
-                        frame: env.frame,
-                        time: env.time,
-                        fps: env.fps,
-                        sequence_resolution: env.sequence_resolution,
-                        project: env.project,
-                        plugins: env.plugins,
-                        controls: env.controls,
-                        parent_props: &child_props,
-                    };
-                    self.collect_scene_objects(children, world, &child_env, out);
-                }
+                Object3DKind::Group { .. } | Object3DKind::Dummy { .. } => {}
                 Object3DKind::Camera(cam) => {
+                    let parent_mat = node
+                        .parent
+                        .map_or(parent_world, |p| eval_graph.nodes[p].world_mat);
+                    let cam_params = build_camera_params_from_node(
+                        cam,
+                        obj,
+                        parent_mat,
+                        node.local_pos,
+                        node.local_rot,
+                        node.local_scale,
+                        node.euler_order,
+                        &node_env,
+                        out.viewport_dims,
+                    );
                     if out.camera.is_none() {
-                        out.camera = Some(build_camera_params(cam, world, env, out.viewport_dims));
+                        out.camera = Some(cam_params);
                     }
-                    let zoom = eval_f32(&cam.zoom, env).max(1e-4);
+                    let zoom = eval_f32(&cam.zoom, &node_env).max(1e-4);
                     let fov_deg = match cam.kind {
                         CameraKind::Perspective => {
-                            let fov_rad = eval_f32(&cam.fov, env).clamp(1.0, 179.0).to_radians();
+                            let fov_rad =
+                                eval_f32(&cam.fov, &node_env).clamp(1.0, 179.0).to_radians();
                             let effective_fov = (2.0 * ((fov_rad * 0.5).tan() / zoom).atan())
                                 .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians());
                             effective_fov.to_degrees()
@@ -1386,12 +1937,15 @@ impl ProjectRenderEngine {
                     });
                 }
                 Object3DKind::Light(light) => {
-                    let color = eval_color_rgb(&light.color, env, [1.0, 1.0, 1.0]);
-                    let ground = eval_color_rgb(&light.ground_color, env, [0.2, 0.2, 0.2]);
-                    let target_local = Vec3::from_array(eval_vec3(&light.target, env));
-                    let target_world = parent_world.transform_point3(target_local);
-                    let intensity = eval_f32(&light.intensity, env);
-                    let angle_deg = eval_f32(&light.angle, env);
+                    let color = eval_color_rgb(&light.color, &node_env, [1.0, 1.0, 1.0]);
+                    let ground = eval_color_rgb(&light.ground_color, &node_env, [0.2, 0.2, 0.2]);
+                    // P5 P1: CM3 light.target lives in world space (parent === null),
+                    // updated in-place by TrackTo `solveLightAim` when constrained.
+                    let target_world = node
+                        .light_target_world
+                        .unwrap_or_else(|| Vec3::from_array(eval_vec3(&light.target, &node_env)));
+                    let intensity = eval_f32(&light.intensity, &node_env);
+                    let angle_deg = eval_f32(&light.angle, &node_env);
                     let kind = map_light_kind(light.kind);
                     let position = world.w_axis.truncate().to_array();
                     let target = target_world.to_array();
@@ -1422,8 +1976,8 @@ impl ProjectRenderEngine {
                     });
                 }
                 Object3DKind::Shape3D(shape) => {
-                    if let Some((mesh, bounds)) = self.ensure_shape_mesh(obj, shape, env) {
-                        let mat_eval = self.evaluate_material(obj.material.as_ref(), env);
+                    if let Some((mesh, bounds)) = self.ensure_shape_mesh(obj, shape, &node_env) {
+                        let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
                         out.meshes.push(PreparedMeshSpec {
                             object_id: obj.id,
                             world_aabb: transform_aabb_world(bounds, world),
@@ -1440,8 +1994,9 @@ impl ProjectRenderEngine {
                     }
                 }
                 Object3DKind::Text3D(text_data) => {
-                    if let Some((mesh, bounds)) = self.ensure_text3d_mesh(obj, text_data, env) {
-                        let mat_eval = self.evaluate_material(obj.material.as_ref(), env);
+                    if let Some((mesh, bounds)) = self.ensure_text3d_mesh(obj, text_data, &node_env)
+                    {
+                        let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
                         out.meshes.push(PreparedMeshSpec {
                             object_id: obj.id,
                             world_aabb: transform_aabb_world(bounds, world),
@@ -1458,8 +2013,9 @@ impl ProjectRenderEngine {
                     }
                 }
                 Object3DKind::Model(model_data) => {
-                    if let Some((mesh, bounds)) = self.ensure_model_mesh(obj, model_data, env) {
-                        let mat_eval = self.evaluate_material(obj.material.as_ref(), env);
+                    if let Some((mesh, bounds)) = self.ensure_model_mesh(obj, model_data, &node_env)
+                    {
+                        let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
                         out.meshes.push(PreparedMeshSpec {
                             object_id: obj.id,
                             world_aabb: transform_aabb_world(bounds, world),
@@ -1480,9 +2036,9 @@ impl ProjectRenderEngine {
                         continue;
                     }
                     let sim_time = if pdata.time.animated || pdata.time.expression.is_some() {
-                        eval_f32(&pdata.time, env)
+                        eval_f32(&pdata.time, &node_env)
                     } else {
-                        let base = eval_f32(&pdata.time, env);
+                        let base = eval_f32(&pdata.time, &node_env);
                         if base.abs() > 1e-6 {
                             base
                         } else {
@@ -1567,10 +2123,12 @@ impl ProjectRenderEngine {
                         });
                     }
                     if !instances.is_empty() {
+                        // P5 P0: Particle sprite textures are straight-alpha (not premultiplied)
+                        // so `PARTICLE_WGSL` doesn't double-premultiply `tex.rgb * tex.a^2`.
                         let sprite = pdata
                             .texture
                             .as_deref()
-                            .and_then(|id| self.ensure_image_asset_texture(env.project, id, true));
+                            .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
                         out.particles.push(PreparedParticlesSpec {
                             instances,
                             sprite,
@@ -1582,7 +2140,6 @@ impl ProjectRenderEngine {
                         });
                     }
                 }
-                Object3DKind::Dummy { .. } => {}
             }
         }
     }
@@ -2057,7 +2614,7 @@ impl ProjectRenderEngine {
     }
 
     // -----------------------------------------------------------------------
-    // 2D Shapes & 2D Text Layer Rendering
+    // 2D Shapes, Shape+, Layer Masks & 2D Text Layer Rendering
     // -----------------------------------------------------------------------
 
     fn render_preset_shape_2d(
@@ -2069,10 +2626,11 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<RenderTarget, RenderError> {
-        let style = extract_shape_style(shapes, env);
-        let mut h = fnv1a_hash64(b"preset_shape_2d");
+        let mut h = fnv1a_hash64(b"preset_shape_2d_v2");
         h = hash_u64(h, u64::from(width));
         h = hash_u64(h, u64::from(height));
+        h = hash_u64(h, u64::from(env.sequence_resolution[0]));
+        h = hash_u64(h, u64::from(env.sequence_resolution[1]));
         h = hash_u64(
             h,
             match preset {
@@ -2080,7 +2638,7 @@ impl ProjectRenderEngine {
                 PresetShapeKind::Rectangle => 2,
             },
         );
-        h = hash_shape_style(h, &style);
+        h = hash_shape_nodes(h, shapes, env);
 
         let key = TextureCacheKey {
             asset_key: format!("layer:{layer_id}"),
@@ -2090,7 +2648,7 @@ impl ProjectRenderEngine {
         let tex = if let Some(cached) = self.touch_cached_texture(&key) {
             cached
         } else {
-            let rgba = rasterize_preset_shape(preset, &style, width, height);
+            let rgba = rasterize_preset_shape_nodes(preset, shapes, env, width, height);
             let created =
                 self.ctx
                     .create_rgba8_texture("zc-preset-shape-2d", width, height, &rgba)?;
@@ -2112,12 +2670,12 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<RenderTarget, RenderError> {
-        let style = extract_shape_style(shapes, env);
-        let mut h = fnv1a_hash64(b"shape_2d");
+        let mut h = fnv1a_hash64(b"shape_2d_v2");
         h = hash_u64(h, u64::from(width));
         h = hash_u64(h, u64::from(height));
+        h = hash_u64(h, u64::from(env.sequence_resolution[0]));
+        h = hash_u64(h, u64::from(env.sequence_resolution[1]));
         h = hash_shape_nodes(h, shapes, env);
-        h = hash_shape_style(h, &style);
 
         let key = TextureCacheKey {
             asset_key: format!("shape2d:{layer_id}"),
@@ -2127,7 +2685,7 @@ impl ProjectRenderEngine {
         let tex = if let Some(cached) = self.touch_cached_texture(&key) {
             cached
         } else {
-            let rgba = rasterize_shape_nodes(shapes, &style, env, width, height);
+            let rgba = rasterize_shape_nodes(shapes, env, width, height);
             let created = self
                 .ctx
                 .create_rgba8_texture("zc-shape-2d", width, height, &rgba)?;
@@ -2139,6 +2697,181 @@ impl ProjectRenderEngine {
                 .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
         self.compositor.blit(&self.ctx, &tex.view, &dst);
         Ok(dst)
+    }
+
+    fn render_shape_plus_2d(
+        &mut self,
+        layer_id: Uuid,
+        payload: &serde_json::Value,
+        env: &EvalEnv<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<RenderTarget, RenderError> {
+        let mut h = fnv1a_hash64(b"shape_plus_2d");
+        h = hash_u64(h, u64::from(width));
+        h = hash_u64(h, u64::from(height));
+        h = hash_u64(h, u64::from(env.sequence_resolution[0]));
+        h = hash_u64(h, u64::from(env.sequence_resolution[1]));
+        h = hash_f64(h, env.frame);
+        if let Ok(bytes) = serde_json::to_vec(payload) {
+            h = hash_u64(h, fnv1a_hash64(&bytes));
+        }
+        let key = TextureCacheKey {
+            asset_key: format!("shapeplus:{layer_id}"),
+            content_hash: h,
+            premultiply: true,
+        };
+        let tex = if let Some(cached) = self.touch_cached_texture(&key) {
+            cached
+        } else {
+            let rgba = rasterize_shape_plus_payload(payload, env, width, height);
+            let created =
+                self.ctx
+                    .create_rgba8_texture("zc-shape-plus-2d", width, height, &rgba)?;
+            self.insert_cached_texture(key, created)
+        };
+        let dst =
+            self.targets
+                .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+        self.compositor.blit(&self.ctx, &tex.view, &dst);
+        Ok(dst)
+    }
+
+    fn apply_typed_layer_masks(
+        &mut self,
+        layer_target: RenderTarget,
+        layer_id: Uuid,
+        typed_masks: &[zc_project::LayerMask],
+        env: &EvalEnv<'_>,
+    ) -> Result<RenderTarget, RenderError> {
+        let mut masks = Vec::new();
+        for m in typed_masks.iter().take(32) {
+            if !m.enabled {
+                continue;
+            }
+            let flat: Vec<f32> = if !m.path.channels.is_empty() {
+                m.path.channels.iter().map(|ch| eval_f32(ch, env)).collect()
+            } else {
+                match eval_property_track(&m.path, env) {
+                    PropertyValue::Json(v) => eval_json_anim_f32_array(Some(&v), env.frame),
+                    _ => Vec::new(),
+                }
+            };
+            let vcount = if m.vertex_ids.is_empty() {
+                flat.len() / 6
+            } else {
+                m.vertex_ids.len()
+            }
+            .min(256);
+            let mut vertices = Vec::with_capacity(vcount);
+            for i in 0..vcount {
+                let b = i * 6;
+                if b + 5 < flat.len() {
+                    vertices.push(BezierVertex2D {
+                        point: [flat[b], flat[b + 1]],
+                        in_h: [flat[b + 2], flat[b + 3]],
+                        out_h: [flat[b + 4], flat[b + 5]],
+                    });
+                }
+            }
+            let mode = match m.mode {
+                zc_project::MaskMode::Add => "add",
+                zc_project::MaskMode::Subtract => "subtract",
+                zc_project::MaskMode::Intersect => "intersect",
+            }
+            .to_owned();
+            masks.push(EvaluatedZoidiumMask {
+                vertices,
+                closed: m.closed,
+                mode,
+                feather: (m.feather as f32).clamp(0.0, 500.0),
+                expansion: (m.expansion as f32).clamp(-128.0, 128.0),
+                opacity: (m.opacity as f32).clamp(0.0, 1.0),
+                invert: m.invert,
+            });
+        }
+        self.apply_evaluated_masks(layer_target, layer_id, &masks, env)
+    }
+
+    fn apply_zoidium_layer_masks(
+        &mut self,
+        layer_target: RenderTarget,
+        layer_id: Uuid,
+        masks_val: &serde_json::Value,
+        env: &EvalEnv<'_>,
+    ) -> Result<RenderTarget, RenderError> {
+        let Some(arr) = masks_val.as_array() else {
+            return Ok(layer_target);
+        };
+        if arr.is_empty() {
+            return Ok(layer_target);
+        }
+        let masks = evaluate_zoidium_masks(arr, env);
+        self.apply_evaluated_masks(layer_target, layer_id, &masks, env)
+    }
+
+    fn apply_evaluated_masks(
+        &mut self,
+        layer_target: RenderTarget,
+        layer_id: Uuid,
+        masks: &[EvaluatedZoidiumMask],
+        env: &EvalEnv<'_>,
+    ) -> Result<RenderTarget, RenderError> {
+        if masks.is_empty() {
+            return Ok(layer_target);
+        }
+        let w = layer_target.width;
+        let h = layer_target.height;
+        let mut hash = fnv1a_hash64(b"zoidium_masks_v1");
+        hash = hash_u64(hash, u64::from(w));
+        hash = hash_u64(hash, u64::from(h));
+        hash = hash_u64(hash, u64::from(env.sequence_resolution[0]));
+        hash = hash_u64(hash, u64::from(env.sequence_resolution[1]));
+        for m in masks {
+            hash = hash_u64(hash, u64::from(m.closed));
+            hash = hash_u64(hash, u64::from(m.invert));
+            hash = hash_u64(hash, fnv1a_hash64(m.mode.as_bytes()));
+            hash = hash_u64(hash, u64::from(m.feather.to_bits()));
+            hash = hash_u64(hash, u64::from(m.expansion.to_bits()));
+            hash = hash_u64(hash, u64::from(m.opacity.to_bits()));
+            hash = hash_u64(hash, m.vertices.len() as u64);
+            for v in &m.vertices {
+                for &c in &[
+                    v.point[0], v.point[1], v.in_h[0], v.in_h[1], v.out_h[0], v.out_h[1],
+                ] {
+                    hash = hash_u64(hash, u64::from(c.to_bits()));
+                }
+            }
+        }
+        let key = TextureCacheKey {
+            asset_key: format!("zmask:{layer_id}"),
+            content_hash: hash,
+            premultiply: false,
+        };
+        let mask_tex = if let Some(cached) = self.touch_cached_texture(&key) {
+            cached
+        } else {
+            let cov_rgba = rasterize_zoidium_masks_rgba8(masks, env.sequence_resolution, w, h);
+            let created = self
+                .ctx
+                .create_rgba8_texture("zc-zoidium-mask", w, h, &cov_rgba)?;
+            self.insert_cached_texture(key, created)
+        };
+        let masked = self
+            .targets
+            .acquire(&self.ctx, w, h, wgpu::TextureFormat::Rgba8Unorm)?;
+        // Premultiplied DstIn: outputs `layer_target * mask_tex.a` on all 4 channels.
+        self.compositor.composite_layer(
+            &self.ctx,
+            &layer_target,
+            &mask_tex,
+            &masked,
+            LayerTransform2D::default(),
+            1.0,
+            BlendMode::DstIn,
+        );
+        self.targets.release(layer_target);
+        Ok(masked)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2153,15 +2886,29 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<RenderTarget, RenderError> {
-        let style = extract_shape_style(shapes, env);
-        let fill = style.fill.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        let seq_w = env.sequence_resolution[0].max(1) as f32;
         let seq_h = env.sequence_resolution[1].max(1) as f32;
-        let preview_scale = (height as f32) / seq_h;
-        let px_size = ((size.max(8) as f32) * preview_scale)
-            .max(1.0)
-            .min(height as f32);
+        let scale_x = (width as f32) / seq_w;
+        let scale_y = (height as f32) / seq_h;
+        let preview_scale = scale_y;
+        // P6 P1: Remove the `.max(8)` and `.min(height as f32)` clamps that broke small
+        // text (`size < 8`) and large kinetic typography (`size > seq_h`).
+        let px_size = ((size.max(1) as f32) * preview_scale).max(0.5);
+        let curve_segments = (px_size / 8.0).clamp(8.0, 24.0).round() as u32;
 
-        let mut h = fnv1a_hash64(b"text_2d");
+        // P6 P0: Evaluate ordered paint operations (Fill & Stroke) and node transforms from `shapes`.
+        let mut paint_ops = collect_ordered_shape_ops(shapes, env);
+        if paint_ops.is_empty() {
+            paint_ops.push(EvalPaintOp::Fill([1.0, 1.0, 1.0, 1.0]));
+        }
+        let has_stroke = paint_ops
+            .iter()
+            .any(|op| matches!(op, EvalPaintOp::Stroke(_, w) if *w > 0.0));
+        let text_transform = extract_primary_shape_transform(shapes, env);
+
+        let font_bytes = resolve_font_bytes(env.project, font);
+
+        let mut h = fnv1a_hash64(b"text_2d_v2");
         h = hash_u64(h, fnv1a_hash64(text.as_bytes()));
         if let Some(f) = font {
             h = hash_u64(h, fnv1a_hash64(f.as_bytes()));
@@ -2170,6 +2917,7 @@ impl ProjectRenderEngine {
             }
         }
         h = hash_u64(h, u64::from(px_size.to_bits()));
+        h = hash_u64(h, u64::from(curve_segments));
         let mesh_key = MeshCacheKey {
             object_id: layer_id,
             content_hash: h,
@@ -2182,7 +2930,7 @@ impl ProjectRenderEngine {
                 text: text.to_owned(),
                 height: px_size,
                 thickness: 0.0,
-                curve_segments: 5,
+                curve_segments,
                 bevel_enabled: false,
                 bevel_thickness: 0.0,
                 bevel_size: 0.0,
@@ -2192,9 +2940,7 @@ impl ProjectRenderEngine {
                 letter_spacing: 0.0,
                 line_height: 1.2,
             };
-            let mesh = font
-                .and_then(|id| env.project.assets.get(id))
-                .and_then(|rec| rec.bytes.as_deref())
+            let mesh = font_bytes
                 .and_then(|bytes| build_text3d_mesh(bytes, &params).ok())
                 .filter(|m| !m.indices.is_empty())
                 .or_else(|| {
@@ -2219,9 +2965,31 @@ impl ProjectRenderEngine {
             return Ok(color);
         };
 
-        let depth =
-            self.targets
-                .acquire(&self.ctx, width, height, wgpu::TextureFormat::Depth32Float)?;
+        // Compose `shapes[0]` (and ancestor group) 2D transform into the 3D ortho model matrix.
+        let model_mat = Mat4::from_translation(Vec3::new(
+            text_transform.position[0] * scale_x,
+            text_transform.position[1] * scale_y,
+            0.0,
+        )) * Mat4::from_rotation_z(text_transform.rotation)
+            * Mat4::from_scale(Vec3::new(
+                text_transform.scale[0],
+                text_transform.scale[1],
+                1.0,
+            ));
+
+        // 2x supersampled render when within texture limits for smooth antialiased glyph edges.
+        let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
+        let ss = if !has_stroke
+            && width * 2 <= max_dim
+            && height * 2 <= max_dim
+            && width * height <= 2_073_600
+        {
+            2u32
+        } else {
+            1u32
+        };
+        let rw = width * ss;
+        let rh = height * ss;
 
         let half_w = (width as f32) * 0.5;
         let half_h = (height as f32) * 0.5;
@@ -2234,20 +3002,125 @@ impl ProjectRenderEngine {
             eye_position: [0.0, 0.0, 10.0],
         };
 
+        if !has_stroke {
+            // Fast GPU path: render fill directly (with 2x SSAA downsample if enabled).
+            let fill = paint_ops
+                .iter()
+                .rev()
+                .find_map(|op| match op {
+                    EvalPaintOp::Fill(c) => Some(*c),
+                    EvalPaintOp::Stroke(_, _) => None,
+                })
+                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let depth =
+                self.targets
+                    .acquire(&self.ctx, rw, rh, wgpu::TextureFormat::Depth32Float)?;
+            let draw = [MeshDrawCall {
+                mesh: cached_mesh.0.as_ref(),
+                model: model_mat.to_cols_array_2d(),
+                normal_matrix: compute_normal_matrix(model_mat),
+                material: MaterialParams {
+                    shading: ShadingModel::Basic,
+                    base_color: [fill[0], fill[1], fill[2]],
+                    opacity: fill[3].clamp(0.0, 1.0),
+                    side: CullSide::Front,
+                    blend: if fill[3] < 0.999 {
+                        MaterialBlend::Normal
+                    } else {
+                        MaterialBlend::Opaque
+                    },
+                    ..Default::default()
+                },
+                albedo_view: None,
+                normal_view: None,
+                matcap_view: None,
+                cast_shadow: false,
+                receive_shadow: false,
+            }];
+            if ss > 1 {
+                let ss_target =
+                    match self
+                        .targets
+                        .acquire(&self.ctx, rw, rh, wgpu::TextureFormat::Rgba8Unorm)
+                    {
+                        Ok(t) => t,
+                        Err(err) => {
+                            self.targets.release(depth);
+                            self.targets.release(color);
+                            return Err(err);
+                        }
+                    };
+                let res = self.scene3d.render(
+                    &self.ctx,
+                    &ss_target,
+                    &depth,
+                    &Scene3DPassInput {
+                        camera,
+                        lights: &[],
+                        meshes: &draw,
+                        particles: &[],
+                        compat_mode: RenderCompatMode::Current,
+                        editing_camera: false,
+                        selection_aabb: None,
+                    },
+                );
+                self.targets.release(depth);
+                return match res {
+                    Ok(()) => {
+                        self.compositor.blit(&self.ctx, &ss_target.view, &color);
+                        self.targets.release(ss_target);
+                        Ok(color)
+                    }
+                    Err(err) => {
+                        self.targets.release(ss_target);
+                        self.targets.release(color);
+                        Err(err)
+                    }
+                };
+            }
+            let res = self.scene3d.render(
+                &self.ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera,
+                    lights: &[],
+                    meshes: &draw,
+                    particles: &[],
+                    compat_mode: RenderCompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            );
+            self.targets.release(depth);
+            return match res {
+                Ok(()) => Ok(color),
+                Err(err) => {
+                    self.targets.release(color);
+                    Err(err)
+                }
+            };
+        }
+
+        // Stroke + Fill ordered path: render opaque white glyph silhouette to `mask_target`,
+        // read back silhouette, compute exact Euclidean signed distance transform (EDT), and
+        // composite all Fill & Stroke DrawOps in exact CM3 order.
+        let mask_target =
+            self.targets
+                .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+        let depth =
+            self.targets
+                .acquire(&self.ctx, width, height, wgpu::TextureFormat::Depth32Float)?;
         let draw = [MeshDrawCall {
             mesh: cached_mesh.0.as_ref(),
-            model: mat4_identity(),
-            normal_matrix: mat4_identity(),
+            model: model_mat.to_cols_array_2d(),
+            normal_matrix: compute_normal_matrix(model_mat),
             material: MaterialParams {
                 shading: ShadingModel::Basic,
-                base_color: [fill[0], fill[1], fill[2]],
-                opacity: fill[3].clamp(0.0, 1.0),
-                side: CullSide::Front,
-                blend: if fill[3] < 0.999 {
-                    MaterialBlend::Normal
-                } else {
-                    MaterialBlend::Opaque
-                },
+                base_color: [1.0, 1.0, 1.0],
+                opacity: 1.0,
+                side: CullSide::Both,
+                blend: MaterialBlend::Opaque,
                 ..Default::default()
             },
             albedo_view: None,
@@ -2256,10 +3129,9 @@ impl ProjectRenderEngine {
             cast_shadow: false,
             receive_shadow: false,
         }];
-
         let res = self.scene3d.render(
             &self.ctx,
-            &color,
+            &mask_target,
             &depth,
             &Scene3DPassInput {
                 camera,
@@ -2272,41 +3144,128 @@ impl ProjectRenderEngine {
             },
         );
         self.targets.release(depth);
-        match res {
-            Ok(()) => Ok(color),
-            Err(err) => {
-                self.targets.release(color);
-                Err(err)
-            }
+        if let Err(err) = res {
+            self.targets.release(mask_target);
+            self.targets.release(color);
+            return Err(err);
         }
+
+        let mut silhouette_rgba = Vec::new();
+        let rb_res = readback_rgba8(&self.ctx, &mask_target, &mut silhouette_rgba);
+        self.targets.release(mask_target);
+        if let Err(err) = rb_res {
+            self.targets.release(color);
+            return Err(err);
+        }
+
+        let shaded = shade_silhouette_with_paint_ops(
+            &silhouette_rgba,
+            width as usize,
+            height as usize,
+            &paint_ops,
+            preview_scale,
+        );
+        let tex = self
+            .ctx
+            .create_rgba8_texture("zc-text2d-stroked", width, height, &shaded)?;
+        self.compositor.blit(&self.ctx, &tex.view, &color);
+        Ok(color)
+    }
+
+    /// Samples a video asset at `time_secs` if it is a video container; returns `None` for
+    /// static images or when video decode is unavailable (caller falls back to image decode).
+    fn ensure_video_frame_texture(
+        &mut self,
+        project: &Project,
+        asset_id: &str,
+        time_secs: f64,
+    ) -> Option<Arc<RenderTarget>> {
+        let record = project.assets.get(asset_id)?;
+        if record.kind != zc_project::AssetKind::Av {
+            return None;
+        }
+        // Quantize timestamp to millisecond bucket for cache reuse.
+        let ms_bucket = (time_secs.max(0.0) * 1000.0).round() as u64;
+        let base_hash = hash_asset_record(record);
+        let key = TextureCacheKey {
+            asset_key: format!("vid:{asset_id}@{ms_bucket}"),
+            content_hash: hash_u64(base_hash, ms_bucket),
+            premultiply: true,
+        };
+        if let Some(cached) = self.touch_cached_texture(&key) {
+            return Some(cached);
+        }
+        // If the asset bytes decode as a regular image (e.g. single-frame still in Av slot), let fallback handle it.
+        if let Some(bytes) = record.bytes.as_deref()
+            && image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|r| r.into_dimensions().ok())
+                .is_some()
+        {
+            return None;
+        }
+        // Best-effort offline video frame extraction via ffmpeg when media bytes or file path exist.
+        let input_path_opt: Option<(std::path::PathBuf, bool)> =
+            if let Some(bytes) = record.bytes.as_deref() {
+                let ext = std::path::Path::new(&record.filename)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("mp4");
+                let tmp = std::env::temp_dir().join(format!("zc_vid_{base_hash:016x}.{ext}"));
+                if !tmp.exists() && std::fs::write(&tmp, bytes).is_err() {
+                    None
+                } else {
+                    Some((tmp, false))
+                }
+            } else {
+                record.url.as_deref().and_then(|u| {
+                    let p = std::path::PathBuf::from(u);
+                    p.exists().then_some((p, false))
+                })
+            };
+        let (input_path, _) = input_path_opt?;
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-ss",
+                &format!("{:.6}", time_secs.max(0.0)),
+                "-i",
+            ])
+            .arg(&input_path)
+            .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
+            .output()
+            .ok()?;
+        if !output.status.success() || output.stdout.is_empty() {
+            return None;
+        }
+        let img = image::load_from_memory(&output.stdout).ok()?.to_rgba8();
+        let (w, h) = img.dimensions();
+        if self
+            .ctx
+            .validate_dimensions(w, h, wgpu::TextureFormat::Rgba8Unorm)
+            .is_err()
+        {
+            return None;
+        }
+        let mut pixels = img.into_raw();
+        for px in pixels.as_chunks_mut::<4>().0 {
+            let a = f32::from(px[3]) / 255.0;
+            px[0] = (f32::from(px[0]) * a).round() as u8;
+            px[1] = (f32::from(px[1]) * a).round() as u8;
+            px[2] = (f32::from(px[2]) * a).round() as u8;
+        }
+        let target = self
+            .ctx
+            .create_rgba8_texture("zc-asset-video-frame", w, h, &pixels)
+            .ok()?;
+        Some(self.insert_cached_texture(key, target))
     }
 
     // -----------------------------------------------------------------------
     // Decoded Image Texture Cache
     // -----------------------------------------------------------------------
-
-    fn blit_aspect_fit(&mut self, src: &RenderTarget, dst: &RenderTarget) {
-        let src_w = src.width.max(1) as f32;
-        let src_h = src.height.max(1) as f32;
-        let dst_w = dst.width.max(1) as f32;
-        let dst_h = dst.height.max(1) as f32;
-        let fit_scale = (dst_w / src_w).min(dst_h / src_h);
-        let transform = LayerTransform2D {
-            position: [0.0, 0.0],
-            scale: [fit_scale, fit_scale],
-            rotation: 0.0,
-            anchor: [0.0, 0.0],
-        };
-        self.compositor.composite_layer(
-            &self.ctx,
-            &self.fallback_transparent,
-            src,
-            dst,
-            transform,
-            1.0,
-            BlendMode::SrcOver,
-        );
-    }
 
     fn ensure_image_asset_texture(
         &mut self,
@@ -2479,26 +3438,37 @@ impl ProjectRenderEngine {
         mut temporal_ctx: Option<&mut TemporalEffectContext<'_>>,
     ) -> Result<RenderTarget, RenderError> {
         for (idx, fx) in effects.iter().enumerate() {
-            if !eval_bool(&fx.enabled, env, true) {
+            if env.sequence.bypassed_effects.contains(&fx.id) {
+                continue;
+            }
+            let fx_env = env.with_effect(fx.id);
+            if !eval_bool(&fx.enabled, &fx_env, true) {
                 continue;
             }
             if let Some(tctx) = temporal_ctx.as_deref_mut() {
                 let mut step_ctx = TemporalEffectContext {
                     backdrop: tctx.backdrop,
                     layer: tctx.layer,
+                    time_curve: tctx.time_curve,
                     prefix_effects: if group_depth == 0 {
                         &effects[..idx]
                     } else {
                         tctx.prefix_effects
                     },
                     visited_comps: tctx.visited_comps,
+                    visited_tracks: tctx.visited_tracks,
                     comp_depth: tctx.comp_depth,
                     scene_override: tctx.scene_override,
                 };
-                source =
-                    self.apply_single_effect(source, fx, env, group_depth, Some(&mut step_ctx))?;
+                source = self.apply_single_effect(
+                    source,
+                    fx,
+                    &fx_env,
+                    group_depth,
+                    Some(&mut step_ctx),
+                )?;
             } else {
-                source = self.apply_single_effect(source, fx, env, group_depth, None)?;
+                source = self.apply_single_effect(source, fx, &fx_env, group_depth, None)?;
             }
         }
         Ok(source)
@@ -2529,16 +3499,7 @@ impl ProjectRenderEngine {
                     let val = eval_property_track(&cp.track, env);
                     group_props.insert(cp.name.clone(), property_value_to_expr(&val));
                 }
-                let child_env = EvalEnv {
-                    frame: env.frame,
-                    time: env.time,
-                    fps: env.fps,
-                    sequence_resolution: env.sequence_resolution,
-                    project: env.project,
-                    plugins: env.plugins,
-                    controls: env.controls,
-                    parent_props: &group_props,
-                };
+                let child_env = env.with_parent_props(&group_props);
                 self.apply_project_effect_stack_depth(
                     source,
                     children,
@@ -2557,7 +3518,18 @@ impl ProjectRenderEngine {
                 if !env.plugins.is_enabled(plugin_id) {
                     return Ok(source);
                 }
-                if lookup_effect_shader(effect_id).is_some() {
+                // Handle temporal & layer-input plugin effects directly in the engine even if
+                // they have no standalone fragment shader in `PLUGIN_EFFECT_SHADERS`.
+                if matches!(
+                    effect_id.as_str(),
+                    "timeoffset"
+                        | "posterizetime"
+                        | "posterizetime-legacy"
+                        | "timeremap"
+                        | "layer-input"
+                        | "layerinput"
+                ) || lookup_effect_shader(effect_id).is_some()
+                {
                     self.apply_builtin_effect(source, effect_id, &fx.params, env, temporal_ctx)
                 } else {
                     debug!(
@@ -2570,7 +3542,13 @@ impl ProjectRenderEngine {
             EffectKind::CustomShader {
                 frag_shader,
                 custom_properties,
-            } => self.apply_custom_glsl_shader(source, frag_shader, custom_properties, env),
+            } => self.apply_custom_glsl_shader(
+                source,
+                frag_shader,
+                custom_properties,
+                env,
+                temporal_ctx,
+            ),
         }
     }
 
@@ -2583,15 +3561,31 @@ impl ProjectRenderEngine {
         height: u32,
     ) -> Result<Option<RenderTarget>, RenderError> {
         let fps = env.fps.max(1.0);
+        let sample_frame = env.frame + frame_offset;
+        let sample_abs_frame = env.abs_frame + frame_offset;
+        // P7 P0-8: Re-evaluate the clip's `time_curve` at `sample_frame` instead of
+        // assuming linear `env.time + frame_offset / fps`!
+        let sample_time = if let Some(tc) = tctx.time_curve {
+            let raw_t = eval_track_keyframes_only(tc, sample_frame)
+                .as_f64()
+                .unwrap_or(sample_frame / fps);
+            let time_env = EvalEnv {
+                frame: sample_frame,
+                abs_frame: sample_abs_frame,
+                time: raw_t,
+                fps,
+                ..env.clone()
+            };
+            eval_f64(tc, &time_env)
+        } else {
+            env.time + frame_offset / fps
+        };
         let sample_env = EvalEnv {
-            frame: env.frame + frame_offset,
-            time: env.time + frame_offset / fps,
+            frame: sample_frame,
+            abs_frame: sample_abs_frame,
+            time: sample_time,
             fps,
-            sequence_resolution: env.sequence_resolution,
-            project: env.project,
-            plugins: env.plugins,
-            controls: env.controls,
-            parent_props: env.parent_props,
+            ..env.clone()
         };
         let Some(mut target) = self.render_layer_content(
             tctx.backdrop,
@@ -2600,6 +3594,7 @@ impl ProjectRenderEngine {
             width,
             height,
             tctx.visited_comps,
+            tctx.visited_tracks,
             tctx.comp_depth,
             tctx.scene_override,
         )?
@@ -2667,6 +3662,11 @@ impl ProjectRenderEngine {
                     reg_params.set(name.clone(), RegParamValue::Bool(v));
                 }
                 PropertyValue::Text(s) | PropertyValue::List(s) | PropertyValue::Shader(s) => {
+                    if effect_id == "colorcurves" && name == "curves" {
+                        let lut =
+                            bake_color_curves_lut_rgba8(&serde_json::Value::String(s.clone()));
+                        reg_params.set("lut", RegParamValue::Lut1D(lut));
+                    }
                     reg_params.set(name.clone(), RegParamValue::String(s));
                 }
                 PropertyValue::Gradient(stops) => {
@@ -2690,18 +3690,227 @@ impl ProjectRenderEngine {
                             reg_params.set("domainMax", RegParamValue::Vec3(domain_max));
                         }
                     } else if aux_tex.is_none() {
-                        aux_tex = self.ensure_image_asset_texture(env.project, &asset_id, true);
+                        // P4 P0-9: `displacementmap` expects straight (unpremultiplied) RGB
+                        // vectors so semi-transparent map texels are not corrupted.
+                        let premultiply = effect_id != "displacementmap";
+                        aux_tex =
+                            self.ensure_image_asset_texture(env.project, &asset_id, premultiply);
                     }
                 }
                 PropertyValue::Asset(None) | PropertyValue::Json(_) => {}
             }
         }
 
+        // P6 P1: Scale built-in CM3 `"mask"` effect pixel parameters (`position`, `size`)
+        // by preview resolution ratio `(width / seq_w, height / seq_h)`.
+        if effect_id == "mask" {
+            let seq_w = env.sequence_resolution[0].max(1) as f32;
+            let seq_h = env.sequence_resolution[1].max(1) as f32;
+            let sx = (width as f32) / seq_w;
+            let sy = (height as f32) / seq_h;
+            let pos = reg_params.vec2_or("position", [0.0, 0.0]);
+            let sz = reg_params.vec2_or("size", [250.0, 250.0]);
+            reg_params.set("position", RegParamValue::Vec2([pos[0] * sx, pos[1] * sy]));
+            reg_params.set("size", RegParamValue::Vec2([sz[0] * sx, sz[1] * sy]));
+        }
+
+        // P6 P0: `layer-input` plugin effect composites another track's capture onto `source`.
+        if matches!(effect_id, "layer-input" | "layerinput")
+            && let Some(tctx) = temporal_ctx
+        {
+            let track_ref = match reg_params
+                .values
+                .get("source")
+                .or_else(|| reg_params.values.get("layer"))
+            {
+                Some(RegParamValue::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let stage = match reg_params.values.get("stage") {
+                Some(RegParamValue::String(s)) => s.as_str(),
+                _ => "effects-masks",
+            };
+            if let Some(captured) = self.render_track_source(
+                &track_ref,
+                stage,
+                env,
+                width,
+                height,
+                tctx.visited_comps,
+                tctx.visited_tracks,
+                tctx.comp_depth,
+            )? {
+                let opacity = reg_params.float_or("opacity", 1.0).clamp(0.0, 1.0);
+                let blend = match reg_params.values.get("blending") {
+                    Some(RegParamValue::String(tok)) => {
+                        BlendMode::from_token(tok).unwrap_or(BlendMode::SrcOver)
+                    }
+                    _ => BlendMode::SrcOver,
+                };
+                let dst = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                )?;
+                self.compositor.composite_layer(
+                    &self.ctx,
+                    &source,
+                    &captured,
+                    &dst,
+                    LayerTransform2D::default(),
+                    opacity,
+                    blend,
+                );
+                self.targets.release(captured);
+                self.targets.release(source);
+                return Ok(dst);
+            }
+            return Ok(source);
+        }
+
+        // P4 P0-2: Temporal `timeoffset` effect.
+        if effect_id == "timeoffset"
+            && let Some(tctx) = temporal_ctx
+        {
+            let offset_frames = f64::from(reg_params.float_or("offset", 0.0));
+            if offset_frames.abs() < 1e-6 || !offset_frames.is_finite() {
+                return Ok(source);
+            }
+            return match self.render_temporal_layer_sample(tctx, env, offset_frames, width, height)
+            {
+                Ok(Some(t)) => {
+                    self.targets.release(source);
+                    Ok(t)
+                }
+                Ok(None) => Ok(source),
+                Err(err) => {
+                    self.targets.release(source);
+                    Err(err)
+                }
+            };
+        }
+
+        // P4 P0-2 + P7 P0: Temporal `posterizetime` / `posterizetime-legacy` effect.
+        if matches!(effect_id, "posterizetime" | "posterizetime-legacy")
+            && let Some(tctx) = temporal_ctx
+        {
+            let target_fps = f64::from(if reg_params.values.contains_key("fps") {
+                reg_params.float_or("fps", 12.0)
+            } else {
+                reg_params.float_or("frameRate", 8.0)
+            });
+            if !target_fps.is_finite() || target_fps <= 0.0 || target_fps >= env.fps {
+                return Ok(source);
+            }
+            let step = env.fps / target_fps;
+            let quantized = (env.frame / step).floor() * step;
+            let delta = quantized - env.frame;
+            if delta.abs() < 1e-6 {
+                return Ok(source);
+            }
+            return match self.render_temporal_layer_sample(tctx, env, delta, width, height) {
+                Ok(Some(t)) => {
+                    self.targets.release(source);
+                    Ok(t)
+                }
+                Ok(None) => Ok(source),
+                Err(err) => {
+                    self.targets.release(source);
+                    Err(err)
+                }
+            };
+        }
+
+        // P4 P0-2 + P7 P0: Temporal `timeremap` effect.
+        if effect_id == "timeremap"
+            && let Some(tctx) = temporal_ctx
+        {
+            let mode = reg_params.int_or("mode", 0);
+            let target_frame = if mode == 1 || reg_params.values.contains_key("sourceTime") {
+                let src_time = f64::from(reg_params.float_or("sourceTime", env.time as f32));
+                src_time * env.fps.max(1.0)
+            } else {
+                let speed = f64::from(reg_params.float_or("speed", 100.0)) / 100.0;
+                env.frame * speed
+            };
+            if !target_frame.is_finite() {
+                return Ok(source);
+            }
+            let delta = target_frame - env.frame;
+            if delta.abs() < 1e-6 {
+                return Ok(source);
+            }
+            let blend_frames = reg_params.int_or("blend", 0) != 0;
+            if blend_frames && (target_frame.fract().abs() > 1e-4) {
+                let f0 = target_frame.floor();
+                let frac = (target_frame - f0).clamp(0.0, 1.0) as f32;
+                let t0 =
+                    self.render_temporal_layer_sample(tctx, env, f0 - env.frame, width, height)?;
+                let t1 = self.render_temporal_layer_sample(
+                    tctx,
+                    env,
+                    f0 + 1.0 - env.frame,
+                    width,
+                    height,
+                )?;
+                match (t0, t1) {
+                    (Some(a), Some(b)) => {
+                        let dst = self.targets.acquire(
+                            &self.ctx,
+                            width,
+                            height,
+                            wgpu::TextureFormat::Rgba8Unorm,
+                        )?;
+                        self.compositor.composite_layer(
+                            &self.ctx,
+                            &a,
+                            &b,
+                            &dst,
+                            LayerTransform2D::default(),
+                            frac,
+                            BlendMode::SrcOver,
+                        );
+                        self.targets.release(a);
+                        self.targets.release(b);
+                        self.targets.release(source);
+                        return Ok(dst);
+                    }
+                    (opt_a, opt_b) => {
+                        if let Some(a) = opt_a {
+                            self.targets.release(a);
+                        }
+                        if let Some(b) = opt_b {
+                            self.targets.release(b);
+                        }
+                        return Ok(source);
+                    }
+                }
+            }
+            return match self.render_temporal_layer_sample(tctx, env, delta, width, height) {
+                Ok(Some(t)) => {
+                    self.targets.release(source);
+                    Ok(t)
+                }
+                Ok(None) => Ok(source),
+                Err(err) => {
+                    self.targets.release(source);
+                    Err(err)
+                }
+            };
+        }
+
         if effect_id == "echo"
             && let Some(tctx) = temporal_ctx
         {
             const MAX_ECHO_TAPS: u32 = 32;
-            let raw_echoes = reg_params.float_or("numberOfEchoes", 4.0);
+            let is_zoidium_schema =
+                reg_params.values.contains_key("echoes") || reg_params.values.contains_key("delay");
+            let raw_echoes = if is_zoidium_schema {
+                reg_params.float_or("echoes", 4.0)
+            } else {
+                reg_params.float_or("numberOfEchoes", 4.0)
+            };
             let num_echoes = if raw_echoes.is_finite() {
                 (raw_echoes.round() as i32).clamp(0, MAX_ECHO_TAPS as i32) as u32
             } else {
@@ -2710,21 +3919,29 @@ impl ProjectRenderEngine {
             if num_echoes == 0 {
                 return Ok(source);
             }
-            let raw_echo_time = reg_params.float_or("echoTime", -0.033);
-            let echo_time_sec = if raw_echo_time.is_finite() {
-                f64::from(raw_echo_time)
+            let frame_step = if is_zoidium_schema {
+                let d = f64::from(reg_params.float_or("delay", 3.0));
+                if d.is_finite() { -d } else { -3.0 }
             } else {
-                -0.033
+                let raw_echo_time = reg_params.float_or("echoTime", -0.033);
+                let echo_time_sec = if raw_echo_time.is_finite() {
+                    f64::from(raw_echo_time)
+                } else {
+                    -0.033
+                };
+                echo_time_sec * env.fps.max(1.0)
             };
             let starting_intensity = if reg_params.values.contains_key("startingIntensity") {
                 reg_params.float_or("startingIntensity", 1.0)
+            } else if reg_params.values.contains_key("opacity") {
+                reg_params.float_or("opacity", 0.75)
             } else {
                 reg_params.float_or("weight", 1.0)
             };
-            let decay = reg_params.float_or("decay", 0.5);
+            let decay = reg_params.float_or("decay", if is_zoidium_schema { 0.75 } else { 0.5 });
             let mut accum = source;
             for k in 1..=num_echoes {
-                let frame_offset = f64::from(k) * echo_time_sec * env.fps.max(1.0);
+                let frame_offset = f64::from(k) * frame_step;
                 let tap_target =
                     match self.render_temporal_layer_sample(tctx, env, frame_offset, width, height)
                     {
@@ -2743,6 +3960,19 @@ impl ProjectRenderEngine {
                 let mut tap_params = reg_params.clone();
                 tap_params.set("startingIntensity", RegParamValue::Float(tap_weight));
                 tap_params.set("weight", RegParamValue::Float(tap_weight));
+                if is_zoidium_schema && !tap_params.values.contains_key("operator") {
+                    // Map Zoidium `composite` (0=over, 1=behind, 2=add, 3=screen, 4=maximum)
+                    // onto EffectRegistry's `operator` enum.
+                    let op = match reg_params.int_or("composite", 0) {
+                        0 => 4, // CompositeInFront
+                        1 => 5, // CompositeInBack
+                        2 => 0, // Add
+                        3 => 3, // Screen
+                        4 => 1, // Maximum
+                        _ => 4,
+                    };
+                    tap_params.set("operator", RegParamValue::Int(op));
+                }
                 let dst = match self.targets.acquire(
                     &self.ctx,
                     width,
@@ -2804,7 +4034,11 @@ impl ProjectRenderEngine {
             if crate::effects::should_bypass(effect_id, &reg_params) {
                 return Ok(source);
             }
-            let prev_target = if env.frame >= 1.0 {
+            // Honor `analysis` mode: 0 = Both, 1 = Previous only, 2 = Next only.
+            let analysis = reg_params.int_or("analysis", 0);
+            let want_prev = analysis != 2;
+            let want_next = analysis != 1;
+            let prev_target = if want_prev && env.frame >= 1.0 {
                 match self.render_temporal_layer_sample(tctx, env, -1.0, width, height) {
                     Ok(t) => t,
                     Err(err) => {
@@ -2815,16 +4049,19 @@ impl ProjectRenderEngine {
             } else {
                 None
             };
-            let next_target = match self.render_temporal_layer_sample(tctx, env, 1.0, width, height)
-            {
-                Ok(t) => t,
-                Err(err) => {
-                    if let Some(prev) = prev_target {
-                        self.targets.release(prev);
+            let next_target = if want_next {
+                match self.render_temporal_layer_sample(tctx, env, 1.0, width, height) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        if let Some(prev) = prev_target {
+                            self.targets.release(prev);
+                        }
+                        self.targets.release(source);
+                        return Err(err);
                     }
-                    self.targets.release(source);
-                    return Err(err);
                 }
+            } else {
+                None
             };
             let dst = match self.targets.acquire(
                 &self.ctx,
@@ -2951,28 +4188,35 @@ impl ProjectRenderEngine {
         frag_shader: &str,
         custom_properties: &[CustomProperty],
         env: &EvalEnv<'_>,
+        mut temporal_ctx: Option<&mut TemporalEffectContext<'_>>,
     ) -> Result<RenderTarget, RenderError> {
         if frag_shader.trim().is_empty() {
             return Ok(source);
         }
 
-        let shader_hash = fnv1a_hash64(frag_shader.as_bytes());
+        // Build CompileOptions from custom_properties (static defines, Dropdown constants,
+        // ZOIDIUM_TIME_SAMPLES) and include defines in the pipeline cache hash (P8 P0-3).
+        let compile_opts = build_custom_shader_compile_options(frag_shader, custom_properties, env);
+        let mut shader_hash = fnv1a_hash64(frag_shader.as_bytes());
+        for (k, v) in &compile_opts.defines {
+            shader_hash = hash_u64(shader_hash, fnv1a_hash64(k.as_bytes()));
+            shader_hash = hash_u64(shader_hash, fnv1a_hash64(v.as_bytes()));
+        }
+
         self.cache_tick = self.cache_tick.wrapping_add(1);
         let tick = self.cache_tick;
 
         if let Some(entry) = self.custom_pipelines.get_mut(&shader_hash) {
             entry.last_used = tick;
         } else {
-            let compiled = match zc_shader::translate_glsl_es100_with_options(
-                frag_shader,
-                &CompileOptions::default(),
-            ) {
-                Ok(c) => c,
-                Err(err) => {
-                    self.targets.release(source);
-                    return Err(RenderError::Shader(err.to_string()));
-                }
-            };
+            let compiled =
+                match zc_shader::translate_glsl_es100_with_options(frag_shader, &compile_opts) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        self.targets.release(source);
+                        return Err(RenderError::Shader(err.to_string()));
+                    }
+                };
 
             let limits = self.ctx.device.limits();
             if u64::from(compiled.uniform_layout.byte_size) > limits.max_uniform_buffer_binding_size
@@ -3064,6 +4308,11 @@ impl ProjectRenderEngine {
                     label: Some("zc-custom-glsl-fs"),
                     source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(&compiled.wgsl)),
                 });
+            let vs_entry = if frag_shader.contains("bgCoord") {
+                "vs_main_bg"
+            } else {
+                "vs_main"
+            };
             let pipeline =
                 self.ctx
                     .device
@@ -3072,7 +4321,7 @@ impl ProjectRenderEngine {
                         layout: Some(&pipeline_layout),
                         vertex: wgpu::VertexState {
                             module: &self.custom_vs_module,
-                            entry_point: Some("vs_main"),
+                            entry_point: Some(vs_entry),
                             compilation_options: wgpu::PipelineCompilationOptions::default(),
                             buffers: &[],
                         },
@@ -3122,51 +4371,275 @@ impl ProjectRenderEngine {
             );
         }
 
-        // Pre-resolve any image assets bound to custom sampler2D uniforms.
+        // Snapshot uniform field types for ctl_* color-to-vec4 promotion without borrowing self.
+        let uniform_field_types: HashMap<String, UniformType> = self.custom_pipelines[&shader_hash]
+            .compiled
+            .uniform_layout
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty))
+            .collect();
+
+        // Populate CM3 + Expressions+ built-in uniforms before custom properties (P8 P0-1, P0-4).
         let mut uniform_values: BTreeMap<String, UniformValue> = BTreeMap::new();
         uniform_values.insert(
             "resolution".to_owned(),
             UniformValue::Vec2([source.width as f32, source.height as f32]),
         );
+        // P8 P0-1: ZoidCraft allocates exact-sized render targets so `uvScale` is `[1.0, 1.0]`.
+        uniform_values.insert("uvScale".to_owned(), UniformValue::Vec2([1.0, 1.0]));
         uniform_values.insert("time".to_owned(), UniformValue::Float(env.time as f32));
         uniform_values.insert("frame".to_owned(), UniformValue::Float(env.frame as f32));
+        uniform_values.insert("fps".to_owned(), UniformValue::Float(env.fps as f32));
+
+        if env.plugins.is_enabled("expressions-plus") {
+            uniform_values.insert("zTime".to_owned(), UniformValue::Float(env.time as f32));
+            uniform_values.insert("zFrame".to_owned(), UniformValue::Float(env.frame as f32));
+            uniform_values.insert("zFps".to_owned(), UniformValue::Float(env.fps as f32));
+
+            let controls_map = env.controls.borrow();
+            let controls_src = if !env.sequence.controls.is_empty() {
+                &env.sequence.controls
+            } else {
+                &env.project.sequence.controls
+            };
+            for ctrl in controls_src {
+                let ctl_name = format!("ctl_{}", sanitize_ctl_name(&ctrl.name));
+                if let Some(val) = controls_map
+                    .get(&ctrl.id)
+                    .or_else(|| controls_map.get(&ctrl.name))
+                {
+                    let declared_ty = uniform_field_types.get(&ctl_name).copied();
+                    if let Some(uval) = expr_value_to_uniform(val, declared_ty) {
+                        uniform_values.insert(ctl_name, uval);
+                    }
+                }
+            }
+        }
 
         let mut extra_textures: HashMap<String, Arc<RenderTarget>> = HashMap::new();
+        let mut repeat_textures: HashSet<String> = HashSet::new();
+        let mut owned_temp_targets: Vec<RenderTarget> = Vec::new();
+        let mut temp_texture_indices: HashMap<String, usize> = HashMap::new();
+        let mut diffuse_aliases: HashSet<String> = HashSet::new();
+
         for cp in custom_properties {
+            // P8 P0-5: Normalize whitespace in custom property names to underscores (`fixPropertyName`).
+            let norm_name = fix_property_name(&cp.name);
+            let shader_kind = cp
+                .metadata
+                .get("type")
+                .and_then(|t| t.get("zoidiumShader"))
+                .and_then(|s| s.get("kind"))
+                .and_then(serde_json::Value::as_str);
+            let is_layer_source = cp
+                .metadata
+                .get("type")
+                .and_then(|t| t.get("_zoidiumShaderLayerSource"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+
             let val = eval_property_track(&cp.track, env);
+
+            // Handle Shader+ timeSample temporal texture binding (P8 P0-3).
+            if shader_kind == Some("timeSample") {
+                let raw_off = val.as_f64().unwrap_or(0.0);
+                let unit = cp
+                    .metadata
+                    .get("type")
+                    .and_then(|t| t.get("zoidiumShader"))
+                    .and_then(|s| s.get("unit"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("frames");
+                let frame_off = if unit.eq_ignore_ascii_case("seconds") {
+                    raw_off * env.fps.max(1.0)
+                } else {
+                    raw_off
+                };
+                if frame_off.abs() < 1e-6 {
+                    diffuse_aliases.insert(norm_name);
+                } else if let Some(tctx) = temporal_ctx.as_deref_mut()
+                    && let Ok(Some(sampled)) = self.render_temporal_layer_sample(
+                        tctx,
+                        env,
+                        frame_off,
+                        source.width,
+                        source.height,
+                    )
+                {
+                    let idx = owned_temp_targets.len();
+                    owned_temp_targets.push(sampled);
+                    temp_texture_indices.insert(norm_name, idx);
+                }
+                continue;
+            }
+
+            // Handle Layer Input track source (`track:id:<id>` or `_zoidiumShaderLayerSource`).
+            if let Some(s) = val.as_str()
+                && (is_layer_source || s.starts_with("track:id:"))
+            {
+                let stage = cp
+                    .metadata
+                    .get("type")
+                    .and_then(|t| t.get("zoidiumLayerStage"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("effects-masks");
+                if let Some(tctx) = temporal_ctx.as_deref_mut()
+                    && let Ok(Some(captured)) = self.render_track_source(
+                        s,
+                        stage,
+                        env,
+                        source.width,
+                        source.height,
+                        tctx.visited_comps,
+                        tctx.visited_tracks,
+                        tctx.comp_depth,
+                    )
+                {
+                    let idx = owned_temp_targets.len();
+                    owned_temp_targets.push(captured);
+                    temp_texture_indices.insert(norm_name, idx);
+                }
+                continue;
+            }
+
             match val {
                 PropertyValue::Number(v) => {
-                    uniform_values.insert(cp.name.clone(), UniformValue::Float(v as f32));
+                    uniform_values.insert(norm_name, UniformValue::Float(v as f32));
                 }
                 PropertyValue::Option(v) => {
-                    uniform_values.insert(cp.name.clone(), UniformValue::Int(v as i32));
+                    uniform_values.insert(norm_name, UniformValue::Int(v as i32));
                 }
                 PropertyValue::Bool(v) => {
-                    uniform_values.insert(cp.name.clone(), UniformValue::Bool(v));
+                    uniform_values.insert(norm_name, UniformValue::Bool(v));
                 }
                 PropertyValue::Vec2(v) => {
-                    uniform_values.insert(
-                        cp.name.clone(),
-                        UniformValue::Vec2([v[0] as f32, v[1] as f32]),
-                    );
+                    uniform_values
+                        .insert(norm_name, UniformValue::Vec2([v[0] as f32, v[1] as f32]));
                 }
                 PropertyValue::Vec3(v) | PropertyValue::Color(v) => {
-                    uniform_values.insert(
-                        cp.name.clone(),
-                        UniformValue::Vec3([v[0] as f32, v[1] as f32, v[2] as f32]),
-                    );
+                    let declared_ty = uniform_field_types.get(&norm_name).copied();
+                    if declared_ty == Some(UniformType::Vec4) {
+                        uniform_values.insert(
+                            norm_name,
+                            UniformValue::Vec4([v[0] as f32, v[1] as f32, v[2] as f32, 1.0]),
+                        );
+                    } else {
+                        uniform_values.insert(
+                            norm_name,
+                            UniformValue::Vec3([v[0] as f32, v[1] as f32, v[2] as f32]),
+                        );
+                    }
                 }
                 PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) => {
                     uniform_values.insert(
-                        cp.name.clone(),
+                        norm_name,
                         UniformValue::Vec4([v[0] as f32, v[1] as f32, v[2] as f32, v[3] as f32]),
                     );
                 }
                 PropertyValue::Asset(Some(asset_id)) => {
-                    if let Some(tex) = self.ensure_image_asset_texture(env.project, &asset_id, true)
+                    // P8 P1-2: Custom `sampler2D` image assets are straight (unpremultiplied) alpha.
+                    if let Some(tex) =
+                        self.ensure_image_asset_texture(env.project, &asset_id, false)
                     {
-                        extra_textures.insert(cp.name.clone(), tex);
+                        extra_textures.insert(norm_name, tex);
                     }
+                }
+                PropertyValue::Gradient(stops) => {
+                    let lut = bake_project_gradient_lut_rgba8(&stops);
+                    let raw: Vec<u8> = lut.iter().flat_map(|px| *px).collect();
+                    if let Ok(tex) = self.ctx.create_rgba8_texture(
+                        "zc-custom-gradient-lut",
+                        lut.len() as u32,
+                        1,
+                        &raw,
+                    ) {
+                        let idx = owned_temp_targets.len();
+                        owned_temp_targets.push(tex);
+                        temp_texture_indices.insert(norm_name.clone(), idx);
+                    }
+                    let cyclic = cp
+                        .metadata
+                        .get("type")
+                        .and_then(|t| t.get("zoidiumShader"))
+                        .and_then(|s| s.get("cyclic"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if cyclic {
+                        repeat_textures.insert(norm_name.clone());
+                    }
+                    let reps = cp
+                        .metadata
+                        .get("type")
+                        .and_then(|t| t.get("zoidiumShader"))
+                        .and_then(|s| s.get("repetitions"))
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(1.0) as f32;
+                    uniform_values.insert(
+                        format!("{norm_name}_repetitions"),
+                        UniformValue::Float(reps),
+                    );
+                }
+                PropertyValue::Curve(curve_json) => {
+                    // P8 P2-2: Bake Shader+ curve LUT into `Rgba16Float` (1024x1) in `[0, 1]`
+                    // with `<Name>_range` uniform for GLSL `mix(range.x, range.y, texel)`.
+                    let (f16_bits, range) = bake_shader_plus_curve_rgba16f(&curve_json);
+                    if let Ok(tex) = self.ctx.create_rgba16f_texture(
+                        "zc-custom-curve-lut-f16",
+                        1024,
+                        1,
+                        &f16_bits,
+                    ) {
+                        let idx = owned_temp_targets.len();
+                        owned_temp_targets.push(tex);
+                        temp_texture_indices.insert(norm_name.clone(), idx);
+                    }
+                    uniform_values.insert(format!("{norm_name}_range"), UniformValue::Vec2(range));
+                }
+                PropertyValue::Json(ref j) if shader_kind == Some("palette") => {
+                    let colors = parse_palette_colors_json(j);
+                    let count = colors.len() as i32;
+                    let mut arr = Vec::with_capacity(16);
+                    for c in colors.iter().take(16) {
+                        arr.push(UniformValue::Vec4(*c));
+                    }
+                    while arr.len() < 16 {
+                        arr.push(UniformValue::Vec4([0.0, 0.0, 0.0, 1.0]));
+                    }
+                    uniform_values.insert(norm_name.clone(), UniformValue::Array(arr));
+                    uniform_values.insert(format!("{norm_name}_count"), UniformValue::Int(count));
+                }
+                PropertyValue::Text(ref s) if shader_kind == Some("palette") => {
+                    if let Ok(j) = serde_json::from_str::<serde_json::Value>(s) {
+                        let colors = parse_palette_colors_json(&j);
+                        let count = colors.len() as i32;
+                        let mut arr = Vec::with_capacity(16);
+                        for c in colors.iter().take(16) {
+                            arr.push(UniformValue::Vec4(*c));
+                        }
+                        while arr.len() < 16 {
+                            arr.push(UniformValue::Vec4([0.0, 0.0, 0.0, 1.0]));
+                        }
+                        uniform_values.insert(norm_name.clone(), UniformValue::Array(arr));
+                        uniform_values
+                            .insert(format!("{norm_name}_count"), UniformValue::Int(count));
+                    }
+                }
+                PropertyValue::Text(ref s) if shader_kind == Some("curve") => {
+                    let parsed = serde_json::from_str::<serde_json::Value>(s)
+                        .unwrap_or(serde_json::Value::Null);
+                    let (f16_bits, range) = bake_shader_plus_curve_rgba16f(&parsed);
+                    if let Ok(tex) = self.ctx.create_rgba16f_texture(
+                        "zc-custom-curve-lut-f16",
+                        1024,
+                        1,
+                        &f16_bits,
+                    ) {
+                        let idx = owned_temp_targets.len();
+                        owned_temp_targets.push(tex);
+                        temp_texture_indices.insert(norm_name.clone(), idx);
+                    }
+                    uniform_values.insert(format!("{norm_name}_range"), UniformValue::Vec2(range));
                 }
                 _ => {}
             }
@@ -3180,6 +4653,9 @@ impl ProjectRenderEngine {
         ) {
             Ok(t) => t,
             Err(err) => {
+                for t in owned_temp_targets {
+                    self.targets.release(t);
+                }
                 self.targets.release(source);
                 return Err(err);
             }
@@ -3208,12 +4684,19 @@ impl ProjectRenderEngine {
             });
         }
         for tb in &cached.compiled.texture_bindings {
-            let view = if tb.is_diffuse {
+            let view = if tb.is_diffuse || diffuse_aliases.contains(&tb.name) {
                 &source.view
+            } else if let Some(&idx) = temp_texture_indices.get(&tb.name) {
+                &owned_temp_targets[idx].view
             } else {
                 extra_textures
                     .get(&tb.name)
                     .map_or(&self.fallback_transparent.view, |t| &t.view)
+            };
+            let sampler = if repeat_textures.contains(&tb.name) {
+                &self.custom_sampler_repeat
+            } else {
+                &self.custom_sampler
             };
             bg_entries.push(wgpu::BindGroupEntry {
                 binding: tb.texture_binding,
@@ -3221,7 +4704,7 @@ impl ProjectRenderEngine {
             });
             bg_entries.push(wgpu::BindGroupEntry {
                 binding: tb.sampler_binding,
-                resource: wgpu::BindingResource::Sampler(&self.custom_sampler),
+                resource: wgpu::BindingResource::Sampler(sampler),
             });
         }
 
@@ -3266,6 +4749,9 @@ impl ProjectRenderEngine {
         // Keep fallback_white reachable so compiler never treats it as dead.
         let _ = &self.fallback_white;
 
+        for t in owned_temp_targets {
+            self.targets.release(t);
+        }
         self.targets.release(source);
         Ok(dst)
     }
@@ -3380,12 +4866,870 @@ fn default_scene_camera(width: u32, height: u32) -> CameraParams {
     )
 }
 
-fn build_camera_params(
+// ---------------------------------------------------------------------------
+// Two-Phase 3D Scene Evaluation, Tarjan SCC Constraints & Camera+ Vibrate
+// ---------------------------------------------------------------------------
+
+struct EvalNode3D<'a> {
+    obj: &'a Object3D,
+    parent: Option<usize>,
+    children: Vec<usize>,
+    render_enabled: bool,
+    local_pos: Vec3,
+    local_rot: Quat,
+    local_scale: Vec3,
+    euler_order: GeomEulerOrder,
+    local_mat: Mat4,
+    world_mat: Mat4,
+    light_target_world: Option<Vec3>,
+    parent_props: BTreeMap<String, ExprValue>,
+}
+
+struct EvaluatedSceneGraph3D<'a> {
+    nodes: Vec<EvalNode3D<'a>>,
+    by_uuid: HashMap<Uuid, usize>,
+}
+
+fn subtree_has_camera(objects: &[Object3D]) -> bool {
+    for obj in objects {
+        match &obj.kind {
+            Object3DKind::Camera(_) => return true,
+            Object3DKind::Group { children, .. } if subtree_has_camera(children) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn evaluate_scene_graph_3d<'a>(
+    objects: &'a [Object3D],
+    root_world: Mat4,
+    env: &EvalEnv<'_>,
+) -> EvaluatedSceneGraph3D<'a> {
+    let mut nodes: Vec<EvalNode3D<'a>> = Vec::new();
+    let mut by_uuid: HashMap<Uuid, usize> = HashMap::new();
+    let mut by_zoidium_id: HashMap<String, usize> = HashMap::new();
+
+    // Phase 1: Flatten hierarchy depth-first, evaluate base local/world transforms.
+    #[allow(clippy::too_many_arguments)]
+    fn flatten<'a>(
+        objects: &'a [Object3D],
+        parent_idx: Option<usize>,
+        parent_world: Mat4,
+        parent_render_enabled: bool,
+        env: &EvalEnv<'_>,
+        nodes: &mut Vec<EvalNode3D<'a>>,
+        by_uuid: &mut HashMap<Uuid, usize>,
+        by_zoidium_id: &mut HashMap<String, usize>,
+    ) {
+        for obj in objects {
+            let obj_env = env.with_object(obj.id);
+            let self_enabled = eval_bool(
+                &obj.enabled,
+                &obj_env.with_property(format!("prop:obj:{}:enabled", obj.id)),
+                true,
+            );
+            let render_enabled = parent_render_enabled && self_enabled;
+            // P5 P2: Disabled Group still updates transforms when it contains a Camera descendant
+            // (matching Zoidium `object3d-enabled.js:mustUpdateGroup`).
+            let has_cam = matches!(&obj.kind, Object3DKind::Group { children, .. } if subtree_has_camera(children));
+            if !render_enabled && !has_cam && obj.constraints.zoidium_id.is_none() {
+                continue;
+            }
+
+            let pos = Vec3::from_array(eval_vec3(
+                &obj.position,
+                &obj_env.with_property(format!("prop:obj:{}:position", obj.id)),
+            ));
+            let rot_euler = Vec3::from_array(eval_vec3(
+                &obj.rotation,
+                &obj_env.with_property(format!("prop:obj:{}:rotation", obj.id)),
+            ));
+            let mut scale = Vec3::from_array(eval_vec3(
+                &obj.scale,
+                &obj_env.with_property(format!("prop:obj:{}:scale", obj.id)),
+            ));
+            if matches!(obj.kind, Object3DKind::Camera(_)) {
+                if scale.x.abs() < 1e-6 {
+                    scale.x = 1.0;
+                }
+                if scale.y.abs() < 1e-6 {
+                    scale.y = 1.0;
+                }
+                if scale.z.abs() < 1e-6 {
+                    scale.z = 1.0;
+                }
+            }
+            let euler_order = map_euler_order(obj.euler_order);
+            let local_rot = euler_to_quat(rot_euler, euler_order);
+            let local_mat = Mat4::from_scale_rotation_translation(scale, local_rot, pos);
+            let world_mat = parent_world * local_mat;
+
+            // P5 P1: CM3 light.target lives in world space (parent === null).
+            let light_target_world = match &obj.kind {
+                Object3DKind::Light(light) => Some(Vec3::from_array(eval_vec3(
+                    &light.target,
+                    &obj_env.with_property(format!("prop:obj:{}:target", obj.id)),
+                ))),
+                _ => None,
+            };
+
+            let idx = nodes.len();
+            nodes.push(EvalNode3D {
+                obj,
+                parent: parent_idx,
+                children: Vec::new(),
+                render_enabled: if matches!(obj.kind, Object3DKind::Camera(_)) {
+                    self_enabled
+                } else {
+                    render_enabled
+                },
+                local_pos: pos,
+                local_rot,
+                local_scale: scale,
+                euler_order,
+                local_mat,
+                world_mat,
+                light_target_world,
+                parent_props: env.parent_props.clone(),
+            });
+            by_uuid.insert(obj.id, idx);
+            if let Some(zid) = obj.constraints.zoidium_id.as_deref()
+                && !zid.is_empty()
+            {
+                by_zoidium_id.insert(zid.to_owned(), idx);
+            }
+            by_zoidium_id.entry(obj.id.to_string()).or_insert(idx);
+
+            if let Some(p) = parent_idx {
+                nodes[p].children.push(idx);
+            }
+
+            if let Object3DKind::Group {
+                custom_properties,
+                children,
+                ..
+            } = &obj.kind
+            {
+                let mut child_props = env.parent_props.clone();
+                for cp in custom_properties {
+                    let val = eval_property_track(&cp.track, &obj_env);
+                    child_props.insert(cp.name.clone(), property_value_to_expr(&val));
+                }
+                let child_env = obj_env.with_parent_props(&child_props);
+                flatten(
+                    children,
+                    Some(idx),
+                    world_mat,
+                    render_enabled,
+                    &child_env,
+                    nodes,
+                    by_uuid,
+                    by_zoidium_id,
+                );
+            }
+        }
+    }
+
+    flatten(
+        objects,
+        None,
+        root_world,
+        true,
+        env,
+        &mut nodes,
+        &mut by_uuid,
+        &mut by_zoidium_id,
+    );
+
+    // Phase 2: Resolve `Follow` and `TrackTo` constraints via iterative Tarjan SCC ordering
+    // (matching Zoidium `constraint-graph.js`, `follow-evaluate.js`, `track-to-evaluate.js`).
+    if env.plugins.is_enabled("constraints") {
+        let mut active_targets: HashMap<usize, (Option<usize>, Option<usize>)> = HashMap::new();
+        let mut fallback_only: Vec<usize> = Vec::new();
+        for (idx, node) in nodes.iter().enumerate() {
+            let follow_target = node.obj.constraints.follow.as_ref().and_then(|f| {
+                by_zoidium_id
+                    .get(&f.target_id)
+                    .copied()
+                    .filter(|&t| t != idx)
+            });
+            if node.obj.constraints.follow.is_some() && follow_target.is_none() {
+                fallback_only.push(idx);
+            }
+            let track_target = node.obj.constraints.track_to.as_ref().and_then(|tr| {
+                let raw_inf = eval_f64(&tr.influence, &env.with_object(node.obj.id));
+                if track_to_influence_weight(raw_inf) > 0.0 {
+                    by_zoidium_id
+                        .get(&tr.target_id)
+                        .copied()
+                        .filter(|&t| t != idx)
+                } else {
+                    None
+                }
+            });
+            if follow_target.is_some() || track_target.is_some() {
+                active_targets.insert(idx, (follow_target, track_target));
+            }
+        }
+
+        // Apply Follow fallback poses for unresolved saved targets.
+        for idx in fallback_only {
+            if let Some(follow) = nodes[idx].obj.constraints.follow.as_ref()
+                && let Some(fb) = follow.fallback_pose.as_ref()
+            {
+                apply_follow_fallback(&mut nodes, idx, root_world, follow, fb);
+            }
+        }
+
+        if !active_targets.is_empty() {
+            let mut graph_nodes: Vec<(usize, Vec<usize>)> =
+                Vec::with_capacity(active_targets.len());
+            for idx in 0..nodes.len() {
+                let Some(&(follow_t, track_t)) = active_targets.get(&idx) else {
+                    continue;
+                };
+                let mut deps: Vec<usize> = Vec::new();
+                for target in [follow_t, track_t].into_iter().flatten() {
+                    if active_targets.contains_key(&target) && !deps.contains(&target) {
+                        deps.push(target);
+                    }
+                    // Strict ancestors of target
+                    let mut cur = nodes[target].parent;
+                    let mut guard = 0;
+                    while let Some(anc) = cur {
+                        if guard >= 10_000 {
+                            break;
+                        }
+                        if active_targets.contains_key(&anc) && !deps.contains(&anc) {
+                            deps.push(anc);
+                        }
+                        cur = nodes[anc].parent;
+                        guard += 1;
+                    }
+                }
+                // Strict ancestors of object
+                let mut cur = nodes[idx].parent;
+                let mut guard = 0;
+                while let Some(anc) = cur {
+                    if guard >= 10_000 {
+                        break;
+                    }
+                    if active_targets.contains_key(&anc) && !deps.contains(&anc) {
+                        deps.push(anc);
+                    }
+                    cur = nodes[anc].parent;
+                    guard += 1;
+                }
+                graph_nodes.push((idx, deps));
+            }
+
+            let (eval_order, cyclic) = order_constraints_tarjan(&graph_nodes);
+            if !cyclic.is_empty() {
+                debug!(
+                    cyclic_count = cyclic.len(),
+                    "skipping cyclic 3D Follow/TrackTo constraints"
+                );
+            }
+
+            for idx in eval_order {
+                let (follow_t, track_t) = active_targets[&idx];
+                if let Some(target_idx) = follow_t
+                    && let Some(follow) = nodes[idx].obj.constraints.follow.as_ref()
+                {
+                    let node_env = env.with_object(nodes[idx].obj.id);
+                    apply_follow_constraint(
+                        &mut nodes, idx, target_idx, root_world, follow, &node_env,
+                    );
+                }
+                if let Some(target_idx) = track_t
+                    && let Some(track_to) = nodes[idx].obj.constraints.track_to.as_ref()
+                {
+                    let node_env = env.with_object(nodes[idx].obj.id);
+                    apply_track_to_constraint(
+                        &mut nodes, idx, target_idx, root_world, track_to, &node_env,
+                    );
+                }
+            }
+        }
+    }
+
+    EvaluatedSceneGraph3D { nodes, by_uuid }
+}
+
+fn propagate_world_matrices(nodes: &mut [EvalNode3D<'_>], idx: usize, root_world: Mat4) {
+    let parent_world = nodes[idx].parent.map_or(root_world, |p| nodes[p].world_mat);
+    nodes[idx].local_mat = Mat4::from_scale_rotation_translation(
+        nodes[idx].local_scale,
+        nodes[idx].local_rot,
+        nodes[idx].local_pos,
+    );
+    nodes[idx].world_mat = parent_world * nodes[idx].local_mat;
+    let children = nodes[idx].children.clone();
+    for child in children {
+        propagate_world_matrices(nodes, child, root_world);
+    }
+}
+
+/// Iterative Tarjan SCC + topological sort matching Zoidium `constraint-graph.js:17-96`.
+/// Returns `(eval_order, cyclic_nodes)` where cyclic nodes are excluded from `eval_order`.
+fn order_constraints_tarjan(nodes: &[(usize, Vec<usize>)]) -> (Vec<usize>, HashSet<usize>) {
+    let by_key: HashMap<usize, &[usize]> = nodes.iter().map(|(k, d)| (*k, d.as_slice())).collect();
+    let mut index_counter = 0usize;
+    let mut indices: HashMap<usize, usize> = HashMap::new();
+    let mut lowlink: HashMap<usize, usize> = HashMap::new();
+    let mut on_stack: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut cyclic: HashSet<usize> = HashSet::new();
+
+    for &(root_key, _) in nodes {
+        if indices.contains_key(&root_key) {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(root_key, 0)];
+        indices.insert(root_key, index_counter);
+        lowlink.insert(root_key, index_counter);
+        index_counter += 1;
+        stack.push(root_key);
+        on_stack.insert(root_key);
+
+        while let Some((frame_key, next_idx)) = work.last_mut() {
+            let key = *frame_key;
+            let deps = by_key.get(&key).copied().unwrap_or(&[]);
+            if *next_idx < deps.len() {
+                let dep = deps[*next_idx];
+                *next_idx += 1;
+                if !by_key.contains_key(&dep) {
+                    continue;
+                }
+                match indices.entry(dep) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(index_counter);
+                        lowlink.insert(dep, index_counter);
+                        index_counter += 1;
+                        stack.push(dep);
+                        on_stack.insert(dep);
+                        work.push((dep, 0));
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        if on_stack.contains(&dep) {
+                            let dep_idx = *entry.get();
+                            let cur_low = lowlink[&key];
+                            if dep_idx < cur_low {
+                                lowlink.insert(key, dep_idx);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            let finished = key;
+            work.pop();
+            if let Some(&(parent_key, _)) = work.last() {
+                let child_low = lowlink[&finished];
+                let parent_low = lowlink[&parent_key];
+                if child_low < parent_low {
+                    lowlink.insert(parent_key, child_low);
+                }
+            }
+            if lowlink[&finished] == indices[&finished] {
+                let mut component = Vec::new();
+                while let Some(member) = stack.pop() {
+                    on_stack.remove(&member);
+                    component.push(member);
+                    if member == finished {
+                        break;
+                    }
+                }
+                let self_loop = component.len() == 1
+                    && by_key
+                        .get(&component[0])
+                        .is_some_and(|d| d.contains(&component[0]));
+                if component.len() > 1 || self_loop {
+                    for member in component {
+                        cyclic.insert(member);
+                    }
+                }
+            }
+        }
+    }
+
+    // Topological post-order DFS over acyclic nodes.
+    let mut order = Vec::with_capacity(nodes.len());
+    let mut state: HashMap<usize, u8> = HashMap::new(); // 1 = visiting, 2 = done
+    fn visit(
+        key: usize,
+        by_key: &HashMap<usize, &[usize]>,
+        cyclic: &HashSet<usize>,
+        state: &mut HashMap<usize, u8>,
+        order: &mut Vec<usize>,
+    ) {
+        if state.get(&key) == Some(&2) || cyclic.contains(&key) {
+            return;
+        }
+        state.insert(key, 1);
+        if let Some(deps) = by_key.get(&key) {
+            for &dep in *deps {
+                if by_key.contains_key(&dep)
+                    && !cyclic.contains(&dep)
+                    && state.get(&dep) != Some(&1)
+                {
+                    visit(dep, by_key, cyclic, state, order);
+                }
+            }
+        }
+        state.insert(key, 2);
+        order.push(key);
+    }
+    for &(key, _) in nodes {
+        visit(key, &by_key, &cyclic, &mut state, &mut order);
+    }
+
+    (order, cyclic)
+}
+
+fn decompose_mat4_trs(mat: Mat4) -> Option<(Vec3, Quat, Vec3)> {
+    let pos = mat.w_axis.truncate();
+    let mut sx = mat.x_axis.truncate().length();
+    let sy = mat.y_axis.truncate().length();
+    let sz = mat.z_axis.truncate().length();
+    if mat.determinant() < 0.0 {
+        sx = -sx;
+    }
+    let scale = Vec3::new(sx, sy, sz);
+    if !pos.is_finite() || !scale.is_finite() {
+        return None;
+    }
+    let c0 = if sx.abs() > 1e-12 {
+        mat.x_axis.truncate() / sx
+    } else {
+        Vec3::X
+    };
+    let c1 = if sy.abs() > 1e-12 {
+        mat.y_axis.truncate() / sy
+    } else {
+        Vec3::Y
+    };
+    let c2 = if sz.abs() > 1e-12 {
+        mat.z_axis.truncate() / sz
+    } else {
+        Vec3::Z
+    };
+    let q = Quat::from_mat3(&Mat3::from_cols(c0, c1, c2)).normalize();
+    if !q.is_finite() {
+        return None;
+    }
+    Some((pos, q, scale))
+}
+
+fn apply_follow_fallback(
+    nodes: &mut [EvalNode3D<'_>],
+    idx: usize,
+    root_world: Mat4,
+    follow: &zc_project::FollowConstraint,
+    fb: &serde_json::Value,
+) {
+    let parsed_owned;
+    let obj = match fb {
+        serde_json::Value::String(s) => {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+                return;
+            };
+            parsed_owned = v;
+            &parsed_owned
+        }
+        other => other,
+    };
+    let (Some(p), Some(q), Some(s)) = (
+        obj.get("p").and_then(serde_json::Value::as_array),
+        obj.get("q").and_then(serde_json::Value::as_array),
+        obj.get("s").and_then(serde_json::Value::as_array),
+    ) else {
+        return;
+    };
+    if p.len() < 3 || q.len() < 4 || s.len() < 3 {
+        return;
+    }
+    let (Some(px), Some(py), Some(pz)) = (p[0].as_f64(), p[1].as_f64(), p[2].as_f64()) else {
+        return;
+    };
+    let (Some(qx), Some(qy), Some(qz), Some(qw)) =
+        (q[0].as_f64(), q[1].as_f64(), q[2].as_f64(), q[3].as_f64())
+    else {
+        return;
+    };
+    let (Some(sx), Some(sy), Some(sz)) = (s[0].as_f64(), s[1].as_f64(), s[2].as_f64()) else {
+        return;
+    };
+    let pos = Vec3::new(px as f32, py as f32, pz as f32);
+    let rot = Quat::from_xyzw(qx as f32, qy as f32, qz as f32, qw as f32).normalize();
+    let scale = Vec3::new(sx as f32, sy as f32, sz as f32);
+    if !pos.is_finite() || !rot.is_finite() || !scale.is_finite() {
+        return;
+    }
+    if follow.follow_position {
+        nodes[idx].local_pos = pos;
+    }
+    if follow.follow_rotation {
+        nodes[idx].local_rot = rot;
+    }
+    if follow.follow_scale {
+        nodes[idx].local_scale = scale;
+    }
+    propagate_world_matrices(nodes, idx, root_world);
+}
+
+fn apply_follow_constraint(
+    nodes: &mut [EvalNode3D<'_>],
+    idx: usize,
+    target_idx: usize,
+    root_world: Mat4,
+    follow: &zc_project::FollowConstraint,
+    env: &EvalEnv<'_>,
+) {
+    let local_space = follow.space == 1;
+    let mut matrix = if local_space {
+        nodes[target_idx].local_mat
+    } else {
+        nodes[target_idx].world_mat
+    };
+    let p_off = Vec3::from_array(eval_vec3(&follow.position_offset, env));
+    let r_off = Vec3::from_array(eval_vec3(&follow.rotation_offset, env));
+    let s_off = Vec3::from_array(eval_vec3(&follow.scale_offset, env));
+    if r_off.length_squared() > 0.0
+        && let Some((pos, rot, scale)) = decompose_mat4_trs(matrix)
+    {
+        let off_q = euler_to_quat(r_off, nodes[idx].euler_order);
+        matrix = Mat4::from_scale_rotation_translation(scale, (rot * off_q).normalize(), pos);
+    }
+    matrix.w_axis.x += p_off.x;
+    matrix.w_axis.y += p_off.y;
+    matrix.w_axis.z += p_off.z;
+    matrix *= Mat4::from_scale(s_off);
+
+    if !local_space && let Some(parent_idx) = nodes[idx].parent {
+        let parent_world = nodes[parent_idx].world_mat;
+        if parent_world.determinant().abs() < 1e-12 {
+            return;
+        }
+        matrix = parent_world.inverse() * matrix;
+    }
+    let Some((pos, rot, scale)) = decompose_mat4_trs(matrix) else {
+        return;
+    };
+    if follow.follow_position {
+        nodes[idx].local_pos = pos;
+    }
+    if follow.follow_rotation {
+        nodes[idx].local_rot = rot;
+    }
+    if follow.follow_scale {
+        nodes[idx].local_scale = scale;
+    }
+    propagate_world_matrices(nodes, idx, root_world);
+}
+
+fn track_to_influence_weight(percent: f64) -> f32 {
+    if !percent.is_finite() || percent <= 0.0 {
+        return 0.0;
+    }
+    (percent / 100.0).clamp(0.0, 1.0) as f32
+}
+
+fn resolve_track_up_axis(track_axis_opt: u32, up_axis_opt: u32) -> usize {
+    let track_axis = (track_axis_opt.min(5) % 3) as usize;
+    let up = if up_axis_opt <= 2 {
+        up_axis_opt as usize
+    } else {
+        1
+    };
+    if up != track_axis {
+        up
+    } else if track_axis == 1 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Exact port of Zoidium `track-to-math.js:trackRotationMatrix`.
+fn track_rotation_matrix3(
+    direction: Vec3,
+    up: Vec3,
+    track_option: u32,
+    up_option: u32,
+) -> Option<Mat3> {
+    if !direction.is_finite() || direction.length_squared() <= 1e-18 {
+        return None;
+    }
+    let forward = direction.normalize();
+    let safe_track = if track_option <= 5 { track_option } else { 2 };
+    let track_axis = (safe_track % 3) as usize;
+    let track_sign = if safe_track < 3 { 1.0_f32 } else { -1.0_f32 };
+    let up_axis = resolve_track_up_axis(safe_track, up_option);
+
+    let mut axes = [Vec3::ZERO; 3];
+    axes[track_axis] = forward * track_sign;
+
+    let candidates = [
+        if up.is_finite() { up } else { Vec3::Y },
+        Vec3::new(0.0, 0.0, -1.0),
+        Vec3::X,
+    ];
+    let mut up_dir: Option<Vec3> = None;
+    for cand in candidates {
+        if cand.length_squared() <= 1e-18 {
+            continue;
+        }
+        let unit = cand.normalize();
+        let along = unit.dot(axes[track_axis]);
+        let proj = unit - axes[track_axis] * along;
+        if proj.length_squared() > 1e-18 && along.abs() < 1.0 - 1e-6 {
+            up_dir = Some(proj.normalize());
+            break;
+        }
+    }
+    axes[up_axis] = up_dir?;
+    let third = 3 - track_axis - up_axis;
+    axes[third] = axes[(third + 1) % 3].cross(axes[(third + 2) % 3]);
+    Some(Mat3::from_cols(axes[0], axes[1], axes[2]))
+}
+
+/// Exact port of Zoidium `track-to-math.js:solveTrackTo`.
+fn solve_track_to_quat(
+    direction_world: Vec3,
+    parent_linear: Mat3,
+    own_local_rot: Quat,
+    weight: f32,
+    track_option: u32,
+    up_option: u32,
+) -> Option<Quat> {
+    if weight <= 0.0 {
+        return None;
+    }
+    if parent_linear.determinant().abs() < 1e-12 {
+        return None;
+    }
+    let parent_inv = parent_linear.inverse();
+    let local_dir = parent_inv * direction_world;
+    let local_up = parent_inv * Vec3::Y;
+    let rot_m3 = track_rotation_matrix3(local_dir, local_up, track_option, up_option)?;
+    let tracked = Quat::from_mat3(&rot_m3).normalize();
+    let own = if own_local_rot.is_finite() && own_local_rot.length_squared() > 1e-12 {
+        own_local_rot.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let result = own.slerp(tracked, weight.clamp(0.0, 1.0)).normalize();
+    result.is_finite().then_some(result)
+}
+
+/// Exact port of Zoidium `track-to-math.js:solveLightAim`.
+fn solve_light_aim_world(
+    origin: Vec3,
+    own_aim: Vec3,
+    target_point: Vec3,
+    weight: f32,
+) -> Option<Vec3> {
+    if weight <= 0.0 || !origin.is_finite() || !target_point.is_finite() {
+        return None;
+    }
+    let to_target = target_point - origin;
+    let target_dist = to_target.length();
+    if target_dist.is_nan() || target_dist <= 1e-9 {
+        return None;
+    }
+    if weight >= 1.0 || !own_aim.is_finite() {
+        return Some(target_point);
+    }
+    let to_own = own_aim - origin;
+    let own_dist = to_own.length();
+    if own_dist.is_nan() || own_dist <= 1e-9 {
+        return None;
+    }
+    let a = to_own / own_dist;
+    let b = to_target / target_dist;
+    let cos_angle = a.dot(b).clamp(-1.0, 1.0);
+    let angle = cos_angle.acos();
+    let dir = if angle < 1e-7 {
+        b
+    } else if PI - angle < 1e-5 {
+        let axis = a
+            .cross(Vec3::Y)
+            .try_normalize()
+            .or_else(|| a.cross(Vec3::X).try_normalize())
+            .unwrap_or(Vec3::X);
+        Quat::from_axis_angle(axis, angle * weight) * a
+    } else {
+        let sin_a = angle.sin();
+        let ra = ((1.0 - weight) * angle).sin() / sin_a;
+        let rb = (weight * angle).sin() / sin_a;
+        a * ra + b * rb
+    };
+    let dist = own_dist + (target_dist - own_dist) * weight;
+    let point = origin + dir * dist;
+    point.is_finite().then_some(point)
+}
+
+fn apply_track_to_constraint(
+    nodes: &mut [EvalNode3D<'_>],
+    idx: usize,
+    target_idx: usize,
+    root_world: Mat4,
+    track_to: &zc_project::TrackToConstraint,
+    env: &EvalEnv<'_>,
+) {
+    let raw_inf = eval_f64(&track_to.influence, env);
+    let weight = track_to_influence_weight(raw_inf);
+    if weight <= 0.0 {
+        return;
+    }
+    let obj_pos = nodes[idx].world_mat.w_axis.truncate();
+    let target_pos = nodes[target_idx].world_mat.w_axis.truncate();
+
+    if let Object3DKind::Light(light) = &nodes[idx].obj.kind {
+        if matches!(
+            light.kind,
+            ProjectLightKind::Spot | ProjectLightKind::Directional
+        ) {
+            let own_aim = nodes[idx].light_target_world.unwrap_or(Vec3::ZERO);
+            if let Some(aim) = solve_light_aim_world(obj_pos, own_aim, target_pos, weight) {
+                nodes[idx].light_target_world = Some(aim);
+            }
+        }
+        return;
+    }
+
+    let parent_linear = nodes[idx]
+        .parent
+        .map_or(Mat3::IDENTITY, |p| Mat3::from_mat4(nodes[p].world_mat));
+    if let Some(solved) = solve_track_to_quat(
+        target_pos - obj_pos,
+        parent_linear,
+        nodes[idx].local_rot,
+        weight,
+        track_to.track_axis,
+        track_to.up_axis,
+    ) {
+        nodes[idx].local_rot = solved;
+        propagate_world_matrices(nodes, idx, root_world);
+    }
+}
+
+/// Exact port of Zoidium `zoidium/shared/random.js:vibrateHashNoise`.
+fn vibrate_hash_noise(index: f64, seed: f64) -> f64 {
+    let r = ((index + 1.0) * 12.9898 + seed * 78.233).sin() * 43758.5453;
+    (r - r.floor()) * 2.0 - 1.0
+}
+
+/// Exact port of Zoidium `zoidium/shared/random.js:vibrateSampleNoise`.
+fn vibrate_sample_noise(x: f64, seed: f64, stepped: bool) -> f64 {
+    let i = x.floor();
+    let mut a = x - i;
+    if stepped {
+        a = (a + 0.5).floor();
+    }
+    a = a * a * (3.0 - 2.0 * a);
+    vibrate_hash_noise(i, seed) * (1.0 - a) + vibrate_hash_noise(i + 1.0, seed) * a
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_camera_params_from_node(
     cam: &zc_project::CameraData,
-    base_world: Mat4,
+    obj: &Object3D,
+    parent_world: Mat4,
+    mut local_pos: Vec3,
+    local_rot: Quat,
+    local_scale: Vec3,
+    euler_order: GeomEulerOrder,
     env: &EvalEnv<'_>,
     viewport_dims: [f32; 2],
 ) -> CameraParams {
+    let mut local_euler = zc_geom::quat_to_euler(local_rot, euler_order);
+
+    // P5 P0: Camera+ Vibrate uses Zoidium's exact sine-hash noise, channel seeds
+    // (`seed + 17*h` for pos, `seed + 101 + 17*f` for rot), `env.frame` time base,
+    // degree->radian rotation conversion, and additive local position + Euler offsets.
+    if env.plugins.is_enabled("camera-plus")
+        && let Some(vib) = cam.vibrate.as_ref()
+        && vib.enabled
+    {
+        let seed = f64::from(vib.seed);
+        let t = env.frame;
+        let stepped = vib.regular_pulse
+            || obj
+                .preserved
+                .get("vibrate.regularPulse")
+                .or_else(|| obj.preserved.get("regularPulse"))
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|v| v >= 0.5);
+        let relative = vib.relative
+            || obj
+                .preserved
+                .get("vibrate.relative")
+                .or_else(|| obj.preserved.get("relative"))
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|v| v >= 0.5);
+
+        let pos_amp = eval_vec3(&vib.position_amplitude, env);
+        let rot_amp_deg = eval_vec3(&vib.rotation_amplitude, env);
+        let pos_freq = f64::from(eval_f32(&vib.position_frequency, env)).max(0.0);
+        let rot_freq = f64::from(eval_f32(&vib.rotation_frequency, env)).max(0.0);
+
+        let enable_pos = vib.enable_position
+            || obj
+                .preserved
+                .get("vibrate.enablePosition")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|v| v >= 0.5);
+        let enable_rot = vib.enable_rotation
+            || obj
+                .preserved
+                .get("vibrate.enableRotation")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|v| v >= 0.5);
+
+        if enable_pos {
+            let base = local_pos.to_array();
+            let mut out = base;
+            for h in 0..3 {
+                let mut scale = f64::from(pos_amp[h]);
+                if relative {
+                    scale *= 0.01 * f64::from(base[h].abs());
+                }
+                out[h] += (vibrate_sample_noise(t * pos_freq, seed + 17.0 * (h as f64), stepped)
+                    * scale) as f32;
+            }
+            local_pos = Vec3::from_array(out);
+        }
+        if enable_rot {
+            let base = local_euler.to_array();
+            let mut out = base;
+            for f in 0..3 {
+                let mut scale = f64::from(rot_amp_deg[f]);
+                if relative {
+                    scale *= 0.01 * f64::from(base[f].abs());
+                }
+                out[f] +=
+                    (vibrate_sample_noise(t * rot_freq, seed + 101.0 + 17.0 * (f as f64), stepped)
+                        * scale
+                        * (std::f64::consts::PI / 180.0)) as f32;
+            }
+            local_euler = Vec3::from_array(out);
+        }
+    }
+
+    let local_tf = Transform3D {
+        position: local_pos,
+        rotation: local_euler,
+        scale: local_scale,
+        euler_order,
+    };
+    let base_world = parent_world * local_tf.to_matrix();
+    build_camera_params_without_vibrate(cam, base_world, env, viewport_dims)
+}
+
+fn eval_camera_shake_matrix(cam: &zc_project::CameraData, env: &EvalEnv<'_>) -> Mat4 {
     let shake_amp = eval_f64(&cam.shake_amplitude, env);
     let shake_speed = eval_f64(&cam.shake_speed, env);
     let shake_params = SceneCameraShakeParams {
@@ -3425,25 +5769,25 @@ fn build_camera_params(
             cam.shake.smooth[3] >= 0.5,
         ],
     };
+    evaluate_camera_shake(env.frame, shake_amp, shake_speed, &shake_params)
+}
 
-    let shake_mat = evaluate_camera_shake(env.frame, shake_amp, shake_speed, &shake_params);
-    let mut world = base_world * shake_mat;
+fn build_camera_params_without_vibrate(
+    cam: &zc_project::CameraData,
+    base_world: Mat4,
+    env: &EvalEnv<'_>,
+    viewport_dims: [f32; 2],
+) -> CameraParams {
+    let world = base_world * eval_camera_shake_matrix(cam, env);
+    build_camera_params_from_world(cam, world, env, viewport_dims)
+}
 
-    if env.plugins.is_enabled("camera-plus")
-        && let Some(vib) = cam.vibrate.as_ref()
-        && vib.enabled
-    {
-        let vib_params = CameraPlusVibrateParams {
-            seed: vib.seed,
-            position_amplitude: Vec3::from_array(eval_vec3(&vib.position_amplitude, env)),
-            rotation_amplitude_rad: Vec3::from_array(eval_vec3(&vib.rotation_amplitude, env)),
-            frequency: eval_f32(&vib.frequency, env),
-        };
-        let off = evaluate_camera_vibrate(env.time, &vib_params);
-        let vib_tf = Transform3D::new(off.position, off.rotation_rad, Vec3::ONE);
-        world *= vib_tf.to_matrix();
-    }
-
+fn build_camera_params_from_world(
+    cam: &zc_project::CameraData,
+    world: Mat4,
+    env: &EvalEnv<'_>,
+    viewport_dims: [f32; 2],
+) -> CameraParams {
     let view_mat = if world.determinant().abs() > 1e-10 {
         world.inverse()
     } else {
@@ -3564,10 +5908,470 @@ fn map_text_align(align: Text3DAlign) -> TextAlignMode {
 // PropertyTrack Evaluation (`zc-anim` + `zc-expr` + `zc-plugin`)
 // ---------------------------------------------------------------------------
 
+type ResolvedPropertyTrack<'a> = (
+    &'a PropertyTrack,
+    Option<&'a VideoClip>,
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<Uuid>,
+);
+
 struct EngineExprContext<'a> {
     env: &'a EvalEnv<'a>,
     track: &'a PropertyTrack,
     base_value: &'a PropertyValue,
+    self_prop_id: HandleId,
+}
+
+impl<'a> EngineExprContext<'a> {
+    fn find_clip_by_id(&self, clip_id: Uuid) -> Option<&'a VideoClip> {
+        for track in &self.env.sequence.video_tracks {
+            if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
+                return Some(clip);
+            }
+        }
+        None
+    }
+
+    fn find_layer_owner(&self, layer_id: Uuid) -> Option<(&'a VideoClip, &'a Layer)> {
+        fn find_in_layer(layer: &Layer, target: Uuid) -> Option<&Layer> {
+            if layer.id == target {
+                return Some(layer);
+            }
+            if let LayerKind::Composite { layers } = &layer.kind {
+                for child in layers {
+                    if let Some(found) = find_in_layer(child, target) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        for track in &self.env.sequence.video_tracks {
+            for clip in &track.clips {
+                if let Some(layer) = find_in_layer(&clip.layer, layer_id) {
+                    return Some((clip, layer));
+                }
+            }
+        }
+        None
+    }
+
+    fn find_object_owner(
+        &self,
+        obj_id: Uuid,
+    ) -> Option<(&'a VideoClip, &'a Layer, Option<Uuid>, &'a Object3D)> {
+        fn walk_objs(
+            objs: &[Object3D],
+            parent_id: Option<Uuid>,
+            target: Uuid,
+        ) -> Option<(Option<Uuid>, &Object3D)> {
+            for o in objs {
+                if o.id == target {
+                    return Some((parent_id, o));
+                }
+                if let Object3DKind::Group { children, .. } = &o.kind
+                    && let Some(found) = walk_objs(children, Some(o.id), target)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        fn walk_layer(layer: &Layer, target: Uuid) -> Option<(&Layer, Option<Uuid>, &Object3D)> {
+            match &layer.kind {
+                LayerKind::Scene3D { objects, .. } => {
+                    walk_objs(objects, None, target).map(|(p, o)| (layer, p, o))
+                }
+                LayerKind::Composite { layers } => {
+                    layers.iter().find_map(|child| walk_layer(child, target))
+                }
+                _ => None,
+            }
+        }
+        for track in &self.env.sequence.video_tracks {
+            for clip in &track.clips {
+                if let Some((layer, parent_obj, obj)) = walk_layer(&clip.layer, obj_id) {
+                    return Some((clip, layer, parent_obj, obj));
+                }
+            }
+        }
+        None
+    }
+
+    fn find_effect_owner(
+        &self,
+        fx_id: Uuid,
+    ) -> Option<(&'a VideoClip, &'a Layer, Option<Uuid>, &'a EffectInstance)> {
+        fn walk_fx(
+            effects: &[EffectInstance],
+            parent_fx: Option<Uuid>,
+            target: Uuid,
+        ) -> Option<(Option<Uuid>, &EffectInstance)> {
+            for fx in effects {
+                if fx.id == target {
+                    return Some((parent_fx, fx));
+                }
+                if let EffectKind::EffectGroup { children, .. } = &fx.kind
+                    && let Some(found) = walk_fx(children, Some(fx.id), target)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        fn walk_layer(
+            layer: &Layer,
+            target: Uuid,
+        ) -> Option<(&Layer, Option<Uuid>, &EffectInstance)> {
+            if let Some((p, fx)) = walk_fx(&layer.effects, None, target) {
+                return Some((layer, p, fx));
+            }
+            if let LayerKind::Composite { layers } = &layer.kind {
+                for child in layers {
+                    if let Some(found) = walk_layer(child, target) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        for track in &self.env.sequence.video_tracks {
+            for clip in &track.clips {
+                if let Some((layer, parent_fx, fx)) = walk_layer(&clip.layer, fx_id) {
+                    return Some((clip, layer, parent_fx, fx));
+                }
+            }
+        }
+        None
+    }
+
+    fn resolve_property_track(&self, id: &HandleId) -> Option<ResolvedPropertyTrack<'a>> {
+        if id == &self.self_prop_id {
+            let clip = self
+                .env
+                .active_clip_id
+                .and_then(|cid| self.find_clip_by_id(cid));
+            return Some((
+                self.track,
+                clip,
+                self.env.active_layer_id,
+                self.env.active_object_id,
+                self.env.active_effect_id,
+            ));
+        }
+        let s = id.as_str();
+        let rest = s.strip_prefix("prop:")?;
+        if let Some(after) = rest.strip_prefix("clip:") {
+            let (uuid_str, prop_name) = after.split_once(':')?;
+            let clip_id = Uuid::parse_str(uuid_str).ok()?;
+            let clip = self.find_clip_by_id(clip_id)?;
+            if prop_name.eq_ignore_ascii_case("time") {
+                return Some((
+                    &clip.time_curve,
+                    Some(clip),
+                    Some(clip.layer.id),
+                    None,
+                    None,
+                ));
+            }
+            return None;
+        }
+        if let Some(after) = rest.strip_prefix("layer:") {
+            let (uuid_str, prop_name) = after.split_once(':')?;
+            let layer_id = Uuid::parse_str(uuid_str).ok()?;
+            let (clip, layer) = self.find_layer_owner(layer_id)?;
+            let track = lookup_layer_property_track(layer, prop_name)?;
+            return Some((track, Some(clip), Some(layer.id), None, None));
+        }
+        if let Some(after) = rest.strip_prefix("obj:") {
+            let (uuid_str, prop_name) = after.split_once(':')?;
+            let obj_id = Uuid::parse_str(uuid_str).ok()?;
+            let (clip, layer, _, obj) = self.find_object_owner(obj_id)?;
+            let track = lookup_object_property_track(obj, prop_name)?;
+            return Some((track, Some(clip), Some(layer.id), Some(obj.id), None));
+        }
+        if let Some(after) = rest.strip_prefix("fx:") {
+            let (uuid_str, prop_name) = after.split_once(':')?;
+            let fx_id = Uuid::parse_str(uuid_str).ok()?;
+            let (clip, layer, _, fx) = self.find_effect_owner(fx_id)?;
+            let track = lookup_effect_property_track(fx, prop_name)?;
+            return Some((track, Some(clip), Some(layer.id), None, Some(fx.id)));
+        }
+        None
+    }
+
+    fn resolve_target_world_matrix(
+        &self,
+        owner: Option<&HandleId>,
+    ) -> Result<(Mat4, &'a VideoClip, &'a Layer, Option<Uuid>), ExprError> {
+        let target_obj_id = if let Some(h) = owner {
+            if let Some(u) = h
+                .as_str()
+                .strip_prefix("obj:")
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                Some(u)
+            } else {
+                self.env.active_object_id
+            }
+        } else {
+            self.env.active_object_id
+        };
+        if let Some(obj_id) = target_obj_id
+            && let Some((clip, layer, _, _)) = self.find_object_owner(obj_id)
+            && let LayerKind::Scene3D { objects, .. } = &layer.kind
+        {
+            let cycle_key = format!("world:{obj_id}");
+            if !self.env.expr_stack.borrow_mut().insert(cycle_key.clone()) {
+                return Err(ExprError::CycleDetected(cycle_key));
+            }
+            let local_frame = self.env.abs_frame - clip.start;
+            let fps = self.env.fps.max(1.0);
+            let scene_env = EvalEnv {
+                frame: local_frame,
+                abs_frame: self.env.abs_frame,
+                time: local_frame / fps,
+                fps,
+                active_clip_id: Some(clip.id),
+                active_layer_id: Some(layer.id),
+                active_object_id: None,
+                active_effect_id: None,
+                active_property_id: None,
+                ..self.env.clone()
+            };
+            let graph = evaluate_scene_graph_3d(objects, Mat4::IDENTITY, &scene_env);
+            self.env.expr_stack.borrow_mut().remove(&cycle_key);
+            if let Some(&idx) = graph.by_uuid.get(&obj_id) {
+                return Ok((graph.nodes[idx].world_mat, clip, layer, Some(obj_id)));
+            }
+        }
+        // Fallback: find active layer or first 3D scene in sequence.
+        if let Some(layer_id) = self.env.active_layer_id
+            && let Some((clip, layer)) = self.find_layer_owner(layer_id)
+        {
+            return Ok((Mat4::IDENTITY, clip, layer, None));
+        }
+        for track in &self.env.sequence.video_tracks {
+            for clip in &track.clips {
+                if clip.length > 0.0
+                    && self.env.abs_frame >= clip.start
+                    && self.env.abs_frame < clip.start + clip.length
+                    && matches!(clip.layer.kind, LayerKind::Scene3D { .. })
+                {
+                    return Ok((Mat4::IDENTITY, clip, &clip.layer, None));
+                }
+            }
+        }
+        Err(ExprError::RuntimeError(
+            "Expression could not find a 3D scene".to_owned(),
+        ))
+    }
+
+    fn resolve_scene_camera_gl(
+        &self,
+        clip: &'a VideoClip,
+        layer: &'a Layer,
+    ) -> Result<(Mat4, Mat4), ExprError> {
+        let LayerKind::Scene3D { objects, .. } = &layer.kind else {
+            return Err(ExprError::RuntimeError(
+                "toScreen()/fromScreen() requires a 3D scene camera".to_owned(),
+            ));
+        };
+        let cycle_key = format!("cam:{}", layer.id);
+        if !self.env.expr_stack.borrow_mut().insert(cycle_key.clone()) {
+            return Err(ExprError::CycleDetected(cycle_key));
+        }
+        let local_frame = self.env.abs_frame - clip.start;
+        let fps = self.env.fps.max(1.0);
+        let scene_env = EvalEnv {
+            frame: local_frame,
+            abs_frame: self.env.abs_frame,
+            time: local_frame / fps,
+            fps,
+            active_clip_id: Some(clip.id),
+            active_layer_id: Some(layer.id),
+            active_object_id: None,
+            active_effect_id: None,
+            active_property_id: None,
+            ..self.env.clone()
+        };
+        let graph = evaluate_scene_graph_3d(objects, Mat4::IDENTITY, &scene_env);
+        let mut cam_out: Option<(Mat4, Mat4)> = None;
+        let res_w = self.env.sequence_resolution[0].max(1) as f32;
+        let res_h = self.env.sequence_resolution[1].max(1) as f32;
+        let aspect = res_w / res_h;
+
+        for node in &graph.nodes {
+            if !node.render_enabled {
+                continue;
+            }
+            if let Object3DKind::Camera(cam) = &node.obj.kind {
+                let obj_env = scene_env.with_object(node.obj.id);
+                let node_env = obj_env.with_parent_props(&node.parent_props);
+                let parent_mat = node
+                    .parent
+                    .map_or(Mat4::IDENTITY, |p| graph.nodes[p].world_mat);
+                let params = build_camera_params_from_node(
+                    cam,
+                    node.obj,
+                    parent_mat,
+                    node.local_pos,
+                    node.local_rot,
+                    node.local_scale,
+                    node.euler_order,
+                    &node_env,
+                    [res_w, res_h],
+                );
+                let view = Mat4::from_cols_array_2d(&params.view);
+                let zoom = eval_f32(&cam.zoom, &node_env).max(1e-4);
+                let near = (cam.near as f32).max(1e-4);
+                let far = (cam.far as f32).max(near + 1.0);
+                // GL NDC depth [-1, +1] matching Zoidium `world.js:5-14`.
+                let proj_gl = match cam.kind {
+                    CameraKind::Perspective => {
+                        let fov_rad = eval_f32(&cam.fov, &node_env).clamp(1.0, 179.0).to_radians();
+                        let eff_fov = (2.0 * ((fov_rad * 0.5).tan() / zoom).atan())
+                            .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians())
+                            .to_degrees();
+                        zc_geom::CameraProjection::Perspective {
+                            fov_deg: eff_fov,
+                            aspect,
+                            near,
+                            far,
+                        }
+                        .to_gl_matrix()
+                    }
+                    CameraKind::Orthographic => {
+                        let half_h = (0.05 * res_h) / zoom;
+                        let half_w = half_h * aspect;
+                        zc_geom::CameraProjection::Orthographic {
+                            left: -half_w,
+                            right: half_w,
+                            top: half_h,
+                            bottom: -half_h,
+                            near,
+                            far,
+                        }
+                        .to_gl_matrix()
+                    }
+                };
+                cam_out = Some((view, proj_gl));
+                break;
+            }
+        }
+        self.env.expr_stack.borrow_mut().remove(&cycle_key);
+        cam_out.ok_or_else(|| {
+            ExprError::RuntimeError("Expression could not find a rendering camera".to_owned())
+        })
+    }
+}
+
+fn lookup_layer_property_track<'a>(layer: &'a Layer, name: &str) -> Option<&'a PropertyTrack> {
+    let key = name.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "position" | "pos" => Some(&layer.position),
+        "scale" => Some(&layer.scale),
+        "rotation" | "rot" => Some(&layer.rotation),
+        "anchor" | "anchorpoint" | "anchor point" => Some(&layer.anchor),
+        "opacity" => Some(&layer.opacity),
+        _ => None,
+    }
+}
+
+fn lookup_object_property_track<'a>(obj: &'a Object3D, name: &str) -> Option<&'a PropertyTrack> {
+    let key = name.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "position" | "pos" => return Some(&obj.position),
+        "rotation" | "rot" => return Some(&obj.rotation),
+        "scale" => return Some(&obj.scale),
+        "enabled" | "visible" => return Some(&obj.enabled),
+        _ => {}
+    }
+    match &obj.kind {
+        Object3DKind::Camera(cam) => match key.as_str() {
+            "fov" => Some(&cam.fov),
+            "zoom" => Some(&cam.zoom),
+            "shakeamplitude" | "shake amplitude" => Some(&cam.shake_amplitude),
+            "shakespeed" | "shake speed" => Some(&cam.shake_speed),
+            _ => None,
+        },
+        Object3DKind::Light(light) => match key.as_str() {
+            "color" => Some(&light.color),
+            "groundcolor" | "ground color" => Some(&light.ground_color),
+            "target" => Some(&light.target),
+            "intensity" => Some(&light.intensity),
+            "angle" => Some(&light.angle),
+            _ => None,
+        },
+        Object3DKind::Group {
+            custom_properties, ..
+        } => custom_properties
+            .iter()
+            .find(|cp| cp.name == name || cp.name.eq_ignore_ascii_case(name))
+            .map(|cp| &cp.track),
+        Object3DKind::Particles(p) => (key == "time").then_some(&p.time),
+        Object3DKind::Model(m) => m.model_properties.get(name).or_else(|| {
+            m.model_properties
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+        }),
+        _ => None,
+    }
+}
+
+fn lookup_effect_property_track<'a>(
+    fx: &'a EffectInstance,
+    name: &str,
+) -> Option<&'a PropertyTrack> {
+    if name.eq_ignore_ascii_case("enabled") {
+        return Some(&fx.enabled);
+    }
+    if let Some(t) = fx.params.get(name) {
+        return Some(t);
+    }
+    if let Some((_, t)) = fx.params.iter().find(|(k, _)| {
+        k.eq_ignore_ascii_case(name) || fix_property_name(k).eq_ignore_ascii_case(name)
+    }) {
+        return Some(t);
+    }
+    match &fx.kind {
+        EffectKind::EffectGroup {
+            custom_properties, ..
+        }
+        | EffectKind::CustomShader {
+            custom_properties, ..
+        } => custom_properties
+            .iter()
+            .find(|cp| {
+                cp.name == name
+                    || cp.name.eq_ignore_ascii_case(name)
+                    || fix_property_name(&cp.name).eq_ignore_ascii_case(name)
+            })
+            .map(|cp| &cp.track),
+        _ => None,
+    }
+}
+
+fn sorted_unique_key_frames(track: &PropertyTrack) -> Vec<f64> {
+    let mut frames: Vec<f64> = if !track.channels.is_empty() {
+        track
+            .channels
+            .iter()
+            .flat_map(|ch| ch.keyframes.iter().map(|k| k.frame))
+            .collect()
+    } else {
+        track.keyframes.iter().map(|k| k.frame).collect()
+    };
+    frames.sort_by(f64::total_cmp);
+    let mut dedup: Vec<f64> = Vec::with_capacity(frames.len());
+    for f in frames {
+        if dedup.last().is_none_or(|&prev| (f - prev).abs() > 1e-9) {
+            dedup.push(f);
+        }
+    }
+    dedup
 }
 
 impl ExprContext for EngineExprContext<'_> {
@@ -3591,19 +6395,241 @@ impl ExprContext for EngineExprContext<'_> {
         self.env.parent_props.clone()
     }
 
-    fn property_value_at_time(&self, id: &HandleId, seconds: f64) -> Result<ExprValue, ExprError> {
-        if self.this_property_id().as_ref() == Some(id) {
-            let sample_frame = seconds * self.env.fps;
-            let raw = eval_track_keyframes_only(self.track, sample_frame);
-            Ok(property_value_to_expr(&raw))
+    fn this_property_id(&self) -> Option<HandleId> {
+        Some(self.self_prop_id.clone())
+    }
+
+    fn this_object_id(&self) -> Option<HandleId> {
+        self.env
+            .active_object_id
+            .map(|id| HandleId::new(format!("obj:{id}")))
+    }
+
+    fn this_layer_id(&self) -> Option<HandleId> {
+        self.env
+            .active_layer_id
+            .map(|id| HandleId::new(format!("layer:{id}")))
+    }
+
+    fn this_clip_id(&self) -> Option<HandleId> {
+        self.env
+            .active_clip_id
+            .map(|id| HandleId::new(format!("clip:{id}")))
+    }
+
+    fn handle_name(&self, id: &HandleId) -> Option<String> {
+        let s = id.as_str();
+        if s == "seq" {
+            return Some(self.env.sequence.name.clone());
+        }
+        if let Some(u) = s
+            .strip_prefix("clip:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            return self.find_clip_by_id(u).map(|c| c.name.clone());
+        }
+        if let Some(u) = s
+            .strip_prefix("layer:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            return self.find_layer_owner(u).map(|(_, l)| l.name.clone());
+        }
+        if let Some(u) = s.strip_prefix("obj:").and_then(|v| Uuid::parse_str(v).ok()) {
+            return self.find_object_owner(u).map(|(_, _, _, o)| o.name.clone());
+        }
+        if let Some(u) = s.strip_prefix("fx:").and_then(|v| Uuid::parse_str(v).ok()) {
+            return self.find_effect_owner(u).map(|(_, _, _, f)| f.name.clone());
+        }
+        if let Some(rest) = s.strip_prefix("prop:")
+            && let Some((_, prop_name)) = rest.rsplit_once(':')
+        {
+            return Some(prop_name.to_owned());
+        }
+        None
+    }
+
+    fn parent_of(&self, id: &HandleId, levels: usize) -> Result<Option<HandleRef>, ExprError> {
+        if levels == 0 {
+            return Ok(None);
+        }
+        let mut current: Option<HandleRef> = if let Some(rest) = id.as_str().strip_prefix("prop:") {
+            if let Some(after) = rest.strip_prefix("obj:") {
+                after
+                    .split_once(':')
+                    .map(|(u, _)| HandleRef::Object(HandleId::new(format!("obj:{u}"))))
+            } else if let Some(after) = rest.strip_prefix("fx:") {
+                after
+                    .split_once(':')
+                    .map(|(u, _)| HandleRef::Effect(HandleId::new(format!("fx:{u}"))))
+            } else if let Some(after) = rest.strip_prefix("layer:") {
+                after
+                    .split_once(':')
+                    .map(|(u, _)| HandleRef::Layer(HandleId::new(format!("layer:{u}"))))
+            } else if let Some(after) = rest.strip_prefix("clip:") {
+                after
+                    .split_once(':')
+                    .map(|(u, _)| HandleRef::Clip(HandleId::new(format!("clip:{u}"))))
+            } else {
+                None
+            }
+        } else if let Some(u) = id
+            .as_str()
+            .strip_prefix("obj:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            self.find_object_owner(u).map(|(_, layer, parent_obj, _)| {
+                if let Some(po) = parent_obj {
+                    HandleRef::Object(HandleId::new(format!("obj:{po}")))
+                } else {
+                    HandleRef::Layer(HandleId::new(format!("layer:{}", layer.id)))
+                }
+            })
+        } else if let Some(u) = id
+            .as_str()
+            .strip_prefix("fx:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            self.find_effect_owner(u).map(|(_, layer, parent_fx, _)| {
+                if let Some(pf) = parent_fx {
+                    HandleRef::Effect(HandleId::new(format!("fx:{pf}")))
+                } else {
+                    HandleRef::Layer(HandleId::new(format!("layer:{}", layer.id)))
+                }
+            })
+        } else if let Some(u) = id
+            .as_str()
+            .strip_prefix("layer:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            self.find_layer_owner(u)
+                .map(|(clip, _)| HandleRef::Clip(HandleId::new(format!("clip:{}", clip.id))))
+        } else if id.as_str().starts_with("clip:") {
+            Some(HandleRef::Sequence)
         } else {
-            self.property_value(id)
+            None
+        };
+
+        for _ in 1..levels {
+            let Some(ref cur) = current else {
+                return Ok(None);
+            };
+            current = match cur {
+                HandleRef::Object(hid)
+                | HandleRef::Effect(hid)
+                | HandleRef::Layer(hid)
+                | HandleRef::Clip(hid)
+                | HandleRef::Property(hid) => self.parent_of(hid, 1)?,
+                HandleRef::Sequence | HandleRef::Controls => None,
+            };
+        }
+        Ok(current)
+    }
+
+    fn property_value(&self, id: &HandleId) -> Result<ExprValue, ExprError> {
+        if id == &self.self_prop_id {
+            return Ok(self.value());
+        }
+        // Special sequence-level properties (`thisComp.property("Resolution")`, etc.)
+        if let Some(seq_prop) = id.as_str().strip_prefix("prop:seq:") {
+            return match seq_prop.to_ascii_lowercase().as_str() {
+                "resolution" => Ok(ExprValue::vec2(
+                    f64::from(self.env.sequence_resolution[0]),
+                    f64::from(self.env.sequence_resolution[1]),
+                )),
+                "rate" | "fps" => Ok(ExprValue::Number(self.env.fps)),
+                "length" | "duration" => Ok(ExprValue::Number(self.env.sequence.length_frames)),
+                _ => Err(ExprError::NotFound(format!(
+                    "sequence property '{seq_prop}'"
+                ))),
+            };
+        }
+
+        let key = id.as_str().to_owned();
+        if !self.env.expr_stack.borrow_mut().insert(key.clone()) {
+            return Err(ExprError::CycleDetected(key));
+        }
+
+        let res = if let Some((track, clip_opt, layer_id, obj_id, fx_id)) =
+            self.resolve_property_track(id)
+        {
+            let fps = self.env.fps.max(1.0);
+            let target_local_frame =
+                clip_opt.map_or(self.env.abs_frame, |c| self.env.abs_frame - c.start);
+            let target_time = if let Some(c) = clip_opt {
+                eval_track_keyframes_only(&c.time_curve, target_local_frame)
+                    .as_f64()
+                    .unwrap_or(target_local_frame / fps)
+            } else {
+                target_local_frame / fps
+            };
+            let target_env = EvalEnv {
+                frame: target_local_frame,
+                abs_frame: self.env.abs_frame,
+                time: target_time,
+                fps,
+                active_clip_id: clip_opt.map(|c| c.id),
+                active_layer_id: layer_id,
+                active_object_id: obj_id,
+                active_effect_id: fx_id,
+                active_property_id: Some(key.clone()),
+                ..self.env.clone()
+            };
+            let val = eval_property_track_checked(track, &target_env)?;
+            Ok(property_value_to_expr(&val))
+        } else {
+            Err(ExprError::NotFound(format!("property '{}'", id.as_str())))
+        };
+
+        self.env.expr_stack.borrow_mut().remove(&key);
+        res
+    }
+
+    fn property_value_at_time(&self, id: &HandleId, seconds: f64) -> Result<ExprValue, ExprError> {
+        let sample_frame = seconds * self.env.fps;
+        if id == &self.self_prop_id {
+            // P7 P0-7: Sample grouped multi-channel tracks cleanly without running expressions.
+            let raw = eval_track_base_only(self.track, sample_frame);
+            return Ok(property_value_to_expr(&raw));
+        }
+        if let Some((track, _, _, _, _)) = self.resolve_property_track(id) {
+            let raw = eval_track_base_only(track, sample_frame);
+            return Ok(property_value_to_expr(&raw));
+        }
+        self.property_value(id)
+    }
+
+    fn property_velocity(&self, id: &HandleId, at_time: f64) -> Result<ExprValue, ExprError> {
+        // P7 P0-7: Zoidium differentiates around `frame / fps` with `dt = 0.01` (`inv_2dt = 50`).
+        let dt = 0.01;
+        let center_t = if id == &self.self_prop_id && self.env.fps > 0.0 {
+            self.env.frame / self.env.fps
+        } else {
+            at_time
+        };
+        let v_plus = self.property_value_at_time(id, center_t + dt)?;
+        let v_minus = self.property_value_at_time(id, center_t - dt)?;
+        let inv_2dt = 1.0 / (2.0 * dt);
+        match (&v_plus, &v_minus) {
+            (ExprValue::Number(a), ExprValue::Number(b)) => {
+                Ok(ExprValue::Number((a - b) * inv_2dt))
+            }
+            (ExprValue::Array(a), ExprValue::Array(b)) => {
+                let len = a.len().max(b.len());
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    let va = a.get(i).and_then(ExprValue::as_f64).unwrap_or(0.0);
+                    let vb = b.get(i).and_then(ExprValue::as_f64).unwrap_or(0.0);
+                    out.push(ExprValue::Number((va - vb) * inv_2dt));
+                }
+                Ok(ExprValue::Array(out))
+            }
+            _ => Ok(ExprValue::Number(0.0)),
         }
     }
 
     fn property_num_keys(&self, id: &HandleId) -> usize {
-        if self.this_property_id().as_ref() == Some(id) {
-            self.track.keyframes.len()
+        if let Some((track, _, _, _, _)) = self.resolve_property_track(id) {
+            sorted_unique_key_frames(track).len()
         } else {
             0
         }
@@ -3614,19 +6640,22 @@ impl ExprContext for EngineExprContext<'_> {
         id: &HandleId,
         index_1based: usize,
     ) -> Result<KeyframeRecord, ExprError> {
-        if self.this_property_id().as_ref() == Some(id)
-            && index_1based >= 1
-            && let Some(kf) = self.track.keyframes.get(index_1based - 1)
+        if index_1based >= 1
+            && let Some((track, _, _, _, _)) = self.resolve_property_track(id)
         {
-            return Ok(KeyframeRecord {
-                index: index_1based,
-                time: if self.env.fps > 0.0 {
-                    kf.frame / self.env.fps
-                } else {
-                    0.0
-                },
-                value: property_value_to_expr(&kf.value),
-            });
+            let frames = sorted_unique_key_frames(track);
+            if let Some(&kf_frame) = frames.get(index_1based - 1) {
+                let val = eval_track_base_only(track, kf_frame);
+                return Ok(KeyframeRecord {
+                    index: index_1based,
+                    time: if self.env.fps > 0.0 {
+                        kf_frame / self.env.fps
+                    } else {
+                        0.0
+                    },
+                    value: property_value_to_expr(&val),
+                });
+            }
         }
         Err(ExprError::RangeError(format!(
             "keyframe index {index_1based} out of range on '{}'",
@@ -3634,49 +6663,630 @@ impl ExprContext for EngineExprContext<'_> {
         )))
     }
 
-    fn control(&self, name: &str, stable_id: Option<&str>) -> Result<ExprValue, ExprError> {
-        if let Some(sid) = stable_id
-            && let Some(val) = self.env.controls.get(sid)
+    fn layer(&self, query: &NameOrIndex) -> Result<HandleId, ExprError> {
+        match query {
+            NameOrIndex::Index(idx) => {
+                if *idx >= 1
+                    && let Some(track) = self.env.sequence.video_tracks.get((*idx - 1) as usize)
+                    && let Some(clip) = track.clips.iter().find(|c| {
+                        c.length > 0.0
+                            && self.env.abs_frame >= c.start
+                            && self.env.abs_frame < c.start + c.length
+                    })
+                {
+                    return Ok(HandleId::new(format!("layer:{}", clip.layer.id)));
+                }
+                Err(ExprError::NotFound(format!("layer index {idx}")))
+            }
+            NameOrIndex::Name(name) => {
+                for track in &self.env.sequence.video_tracks {
+                    for clip in &track.clips {
+                        if clip.length > 0.0
+                            && self.env.abs_frame >= clip.start
+                            && self.env.abs_frame < clip.start + clip.length
+                            && (clip.layer.name == *name
+                                || clip.name == *name
+                                || track.name == *name)
+                        {
+                            return Ok(HandleId::new(format!("layer:{}", clip.layer.id)));
+                        }
+                    }
+                }
+                for track in &self.env.sequence.video_tracks {
+                    for clip in &track.clips {
+                        if clip.length > 0.0
+                            && self.env.abs_frame >= clip.start
+                            && self.env.abs_frame < clip.start + clip.length
+                            && (clip.layer.name.eq_ignore_ascii_case(name)
+                                || clip.name.eq_ignore_ascii_case(name))
+                        {
+                            return Ok(HandleId::new(format!("layer:{}", clip.layer.id)));
+                        }
+                    }
+                }
+                Err(ExprError::NotFound(format!("layer '{name}'")))
+            }
+        }
+    }
+
+    fn effect(&self, owner: Option<&HandleId>, name: &str) -> Result<HandleId, ExprError> {
+        fn find_fx<'b>(effects: &'b [EffectInstance], name: &str) -> Option<&'b EffectInstance> {
+            for fx in effects {
+                if fx.name == name {
+                    return Some(fx);
+                }
+                match &fx.kind {
+                    EffectKind::Standard(id) if id == name => return Some(fx),
+                    EffectKind::Plugin { effect_id, .. } if effect_id == name => return Some(fx),
+                    EffectKind::EffectGroup { children, .. } => {
+                        if let Some(found) = find_fx(children, name) {
+                            return Some(found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            effects.iter().find(|fx| fx.name.eq_ignore_ascii_case(name))
+        }
+
+        let target_layer_id = owner
+            .and_then(|h| {
+                h.as_str()
+                    .strip_prefix("layer:")
+                    .and_then(|u| Uuid::parse_str(u).ok())
+            })
+            .or(self.env.active_layer_id);
+
+        if let Some(owner_h) = owner
+            && let Some(u) = owner_h
+                .as_str()
+                .strip_prefix("fx:")
+                .and_then(|v| Uuid::parse_str(v).ok())
+            && let Some((_, _, _, parent_fx)) = self.find_effect_owner(u)
+            && let EffectKind::EffectGroup { children, .. } = &parent_fx.kind
+            && let Some(found) = find_fx(children, name)
         {
-            return Ok(val.clone());
+            return Ok(HandleId::new(format!("fx:{}", found.id)));
         }
-        if let Some(val) = self.env.controls.get(name) {
-            return Ok(val.clone());
+
+        if let Some(lid) = target_layer_id
+            && let Some((_, layer)) = self.find_layer_owner(lid)
+            && let Some(found) = find_fx(&layer.effects, name)
+        {
+            return Ok(HandleId::new(format!("fx:{}", found.id)));
         }
-        Err(ExprError::NotFound(format!("control '{name}'")))
+        Err(ExprError::NotFound(format!("effect '{name}'")))
+    }
+
+    fn effect_param(&self, effect_id: &HandleId, param: &str) -> Result<HandleId, ExprError> {
+        if let Some(u) = effect_id
+            .as_str()
+            .strip_prefix("fx:")
+            .and_then(|v| Uuid::parse_str(v).ok())
+            && let Some((_, _, _, fx)) = self.find_effect_owner(u)
+            && lookup_effect_property_track(fx, param).is_some()
+        {
+            return Ok(HandleId::new(format!("prop:fx:{u}:{param}")));
+        }
+        Err(ExprError::NotFound(format!(
+            "effect '{}'.param('{param}')",
+            effect_id.as_str()
+        )))
+    }
+
+    fn object(&self, owner: Option<&HandleId>, name: &str) -> Result<HandleId, ExprError> {
+        fn find_obj<'b>(objs: &'b [Object3D], name: &str) -> Option<&'b Object3D> {
+            for o in objs {
+                if o.name == name {
+                    return Some(o);
+                }
+                if let Object3DKind::Group { children, .. } = &o.kind
+                    && let Some(found) = find_obj(children, name)
+                {
+                    return Some(found);
+                }
+            }
+            for o in objs {
+                if o.name.eq_ignore_ascii_case(name) {
+                    return Some(o);
+                }
+                if let Object3DKind::Group { children, .. } = &o.kind
+                    && let Some(found) = find_obj(children, name)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        if let Some(owner_h) = owner {
+            if let Some(u) = owner_h
+                .as_str()
+                .strip_prefix("obj:")
+                .and_then(|v| Uuid::parse_str(v).ok())
+                && let Some((_, _, _, parent_obj)) = self.find_object_owner(u)
+                && let Object3DKind::Group { children, .. } = &parent_obj.kind
+                && let Some(found) = find_obj(children, name)
+            {
+                return Ok(HandleId::new(format!("obj:{}", found.id)));
+            }
+            if let Some(u) = owner_h
+                .as_str()
+                .strip_prefix("layer:")
+                .and_then(|v| Uuid::parse_str(v).ok())
+                && let Some((_, layer)) = self.find_layer_owner(u)
+                && let LayerKind::Scene3D { objects, .. } = &layer.kind
+                && let Some(found) = find_obj(objects, name)
+            {
+                return Ok(HandleId::new(format!("obj:{}", found.id)));
+            }
+        }
+
+        if let Some(lid) = self.env.active_layer_id
+            && let Some((_, layer)) = self.find_layer_owner(lid)
+            && let LayerKind::Scene3D { objects, .. } = &layer.kind
+            && let Some(found) = find_obj(objects, name)
+        {
+            return Ok(HandleId::new(format!("obj:{}", found.id)));
+        }
+        Err(ExprError::NotFound(format!("object '{name}'")))
+    }
+
+    fn property(&self, owner: Option<&HandleId>, name: &str) -> Result<HandleId, ExprError> {
+        if let Some(owner_h) = owner {
+            let s = owner_h.as_str();
+            if s == "seq" {
+                return Ok(HandleId::new(format!("prop:seq:{name}")));
+            }
+            if let Some(u) = s.strip_prefix("obj:").and_then(|v| Uuid::parse_str(v).ok())
+                && let Some((_, _, _, obj)) = self.find_object_owner(u)
+                && lookup_object_property_track(obj, name).is_some()
+            {
+                return Ok(HandleId::new(format!("prop:obj:{u}:{name}")));
+            }
+            if let Some(u) = s.strip_prefix("fx:").and_then(|v| Uuid::parse_str(v).ok())
+                && let Some((_, _, _, fx)) = self.find_effect_owner(u)
+                && lookup_effect_property_track(fx, name).is_some()
+            {
+                return Ok(HandleId::new(format!("prop:fx:{u}:{name}")));
+            }
+            if let Some(u) = s
+                .strip_prefix("layer:")
+                .and_then(|v| Uuid::parse_str(v).ok())
+                && let Some((_, layer)) = self.find_layer_owner(u)
+                && lookup_layer_property_track(layer, name).is_some()
+            {
+                return Ok(HandleId::new(format!("prop:layer:{u}:{name}")));
+            }
+            if let Some(u) = s
+                .strip_prefix("clip:")
+                .and_then(|v| Uuid::parse_str(v).ok())
+                && self.find_clip_by_id(u).is_some()
+                && name.eq_ignore_ascii_case("time")
+            {
+                return Ok(HandleId::new(format!("prop:clip:{u}:time")));
+            }
+            return Err(ExprError::NotFound(format!(
+                "property '{name}' on '{}'",
+                owner_h.as_str()
+            )));
+        }
+
+        // Unqualified property lookup: try active object -> active effect -> active layer -> active clip.
+        if let Some(oid) = self.env.active_object_id
+            && let Some((_, _, _, obj)) = self.find_object_owner(oid)
+            && lookup_object_property_track(obj, name).is_some()
+        {
+            return Ok(HandleId::new(format!("prop:obj:{oid}:{name}")));
+        }
+        if let Some(fid) = self.env.active_effect_id
+            && let Some((_, _, _, fx)) = self.find_effect_owner(fid)
+            && lookup_effect_property_track(fx, name).is_some()
+        {
+            return Ok(HandleId::new(format!("prop:fx:{fid}:{name}")));
+        }
+        if let Some(lid) = self.env.active_layer_id
+            && let Some((_, layer)) = self.find_layer_owner(lid)
+            && lookup_layer_property_track(layer, name).is_some()
+        {
+            return Ok(HandleId::new(format!("prop:layer:{lid}:{name}")));
+        }
+        if let Some(cid) = self.env.active_clip_id
+            && name.eq_ignore_ascii_case("time")
+        {
+            return Ok(HandleId::new(format!("prop:clip:{cid}:time")));
+        }
+        Err(ExprError::NotFound(format!("property '{name}'")))
+    }
+
+    fn prop(&self, path: &str) -> Result<HandleId, ExprError> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(ExprError::NotFound("empty prop path".to_owned()));
+        }
+        if let Some(rel) = trimmed.strip_prefix("./") {
+            return self.property(None, rel);
+        }
+        if let Some(rel) = trimmed.strip_prefix("../") {
+            let cur_owner = self
+                .this_object_id()
+                .or_else(|| self.this_layer_id())
+                .or_else(|| self.this_clip_id());
+            if let Some(cur_h) = cur_owner
+                && let Ok(Some(parent_ref)) = self.parent_of(&cur_h, 1)
+            {
+                let parent_id = match parent_ref {
+                    HandleRef::Object(h)
+                    | HandleRef::Layer(h)
+                    | HandleRef::Clip(h)
+                    | HandleRef::Effect(h)
+                    | HandleRef::Property(h) => Some(h),
+                    HandleRef::Sequence => Some(HandleId::new("seq")),
+                    HandleRef::Controls => None,
+                };
+                return self.property(parent_id.as_ref(), rel);
+            }
+            return Err(ExprError::NotFound(format!("prop('{path}')")));
+        }
+
+        let parts: Vec<&str> = trimmed
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return Err(ExprError::NotFound(format!("prop('{path}')")));
+        }
+        if parts.len() == 1 {
+            return self.property(None, parts[0]);
+        }
+        let mut current = self.layer(&NameOrIndex::Name(parts[0].to_owned()))?;
+        for seg in &parts[1..parts.len() - 1] {
+            if let Ok(obj_h) = self.object(Some(&current), seg) {
+                current = obj_h;
+            } else if let Ok(fx_h) = self.effect(Some(&current), seg) {
+                current = fx_h;
+            } else {
+                return Err(ExprError::NotFound(format!(
+                    "prop('{path}') segment '{seg}'"
+                )));
+            }
+        }
+        self.property(Some(&current), parts[parts.len() - 1])
+    }
+
+    fn control(&self, name: &str, stable_id: Option<&str>) -> Result<ExprValue, ExprError> {
+        // P7 P0-2: When explicit `stable_id` is given, NEVER fall back to `name`.
+        let ctrl_opt = if let Some(sid) = stable_id {
+            self.env
+                .sequence
+                .controls
+                .iter()
+                .find(|c| c.id == sid)
+                .or_else(|| {
+                    self.env
+                        .project
+                        .sequence
+                        .controls
+                        .iter()
+                        .find(|c| c.id == sid)
+                })
+        } else {
+            self.env
+                .sequence
+                .controls
+                .iter()
+                .find(|c| c.name == name)
+                .or_else(|| {
+                    self.env
+                        .project
+                        .sequence
+                        .controls
+                        .iter()
+                        .find(|c| c.name == name)
+                })
+        };
+
+        if let Some(ctrl) = ctrl_opt {
+            if let Some(cached) = self.env.controls.borrow().get(&ctrl.id).cloned() {
+                return Ok(cached);
+            }
+            // Lazy evaluation with cycle detection (supports forward references between controls).
+            let cycle_key = format!("ctrl:{}", ctrl.id);
+            if !self.env.expr_stack.borrow_mut().insert(cycle_key.clone()) {
+                return Err(ExprError::CycleDetected(cycle_key));
+            }
+            let empty_props = BTreeMap::new();
+            let ctrl_env = EvalEnv {
+                frame: self.env.abs_frame,
+                abs_frame: self.env.abs_frame,
+                time: self.env.abs_frame / self.env.fps.max(1.0),
+                fps: self.env.fps.max(1.0),
+                sequence_resolution: self.env.sequence_resolution,
+                project: self.env.project,
+                sequence: self.env.sequence,
+                plugins: self.env.plugins,
+                controls: self.env.controls,
+                parent_props: &empty_props,
+                active_clip_id: None,
+                active_layer_id: None,
+                active_object_id: None,
+                active_effect_id: None,
+                active_property_id: Some(cycle_key.clone()),
+                expr_stack: self.env.expr_stack,
+            };
+            let evaluated = eval_sequence_control_value(ctrl, &ctrl_env);
+            self.env.expr_stack.borrow_mut().remove(&cycle_key);
+            if let Ok(val) = &evaluated {
+                let mut map = self.env.controls.borrow_mut();
+                map.insert(ctrl.id.clone(), val.clone());
+                map.insert(ctrl.name.clone(), val.clone());
+            }
+            return evaluated;
+        }
+
+        // Fallback to pre-populated cache map (for unit tests injecting synthetic controls).
+        if let Some(sid) = stable_id {
+            return self
+                .env
+                .controls
+                .borrow()
+                .get(sid)
+                .cloned()
+                .ok_or_else(|| ExprError::NotFound(format!("control '{name}' (id '{sid}')")));
+        }
+        self.env
+            .controls
+            .borrow()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ExprError::NotFound(format!("control '{name}'")))
+    }
+
+    fn to_world(&self, owner: Option<&HandleId>, local: [f64; 3]) -> Result<[f64; 3], ExprError> {
+        let (world_mat, _, _, _) = self.resolve_target_world_matrix(owner)?;
+        let p = world_mat.transform_point3(Vec3::new(
+            local[0] as f32,
+            local[1] as f32,
+            local[2] as f32,
+        ));
+        Ok([f64::from(p.x), f64::from(p.y), f64::from(p.z)])
+    }
+
+    fn from_world(&self, owner: Option<&HandleId>, world: [f64; 3]) -> Result<[f64; 3], ExprError> {
+        let (world_mat, _, _, _) = self.resolve_target_world_matrix(owner)?;
+        if world_mat.determinant().abs() < 1e-12 {
+            return Err(ExprError::RuntimeError(
+                "Expression cannot invert a zero-scale transform".to_owned(),
+            ));
+        }
+        let p = world_mat.inverse().transform_point3(Vec3::new(
+            world[0] as f32,
+            world[1] as f32,
+            world[2] as f32,
+        ));
+        Ok([f64::from(p.x), f64::from(p.y), f64::from(p.z)])
+    }
+
+    fn world_position(&self, owner: Option<&HandleId>) -> Result<[f64; 3], ExprError> {
+        let (world_mat, _, _, _) = self.resolve_target_world_matrix(owner)?;
+        let p = world_mat.w_axis.truncate();
+        Ok([f64::from(p.x), f64::from(p.y), f64::from(p.z)])
+    }
+
+    fn world_rotation(&self, owner: Option<&HandleId>) -> Result<[f64; 3], ExprError> {
+        let (world_mat, _, _, _) = self.resolve_target_world_matrix(owner)?;
+        let e = mat4_to_euler(world_mat, GeomEulerOrder::XYZ);
+        Ok([f64::from(e.x), f64::from(e.y), f64::from(e.z)])
+    }
+
+    fn to_screen(&self, owner: Option<&HandleId>, local: [f64; 3]) -> Result<[f64; 3], ExprError> {
+        let (world_mat, clip, layer, _) = self.resolve_target_world_matrix(owner)?;
+        let (view, proj_gl) = self.resolve_scene_camera_gl(clip, layer)?;
+        let world_p = world_mat.transform_point3(Vec3::new(
+            local[0] as f32,
+            local[1] as f32,
+            local[2] as f32,
+        ));
+        let clip_v = proj_gl * (view * world_p.extend(1.0));
+        if clip_v.w.abs() < 1e-12 {
+            return Err(ExprError::RuntimeError(
+                "toScreen() singular camera projection".to_owned(),
+            ));
+        }
+        let ndc = clip_v.truncate() / clip_v.w;
+        let res_w = self.env.sequence_resolution[0].max(1) as f32;
+        let res_h = self.env.sequence_resolution[1].max(1) as f32;
+        let px = (ndc.x + 1.0) * res_w * 0.5;
+        let py = (1.0 - ndc.y) * res_h * 0.5;
+
+        // Apply scene layer's 2D transform in sequence pixels (matching `world.js:154-155`).
+        let layer_env = EvalEnv {
+            frame: self.env.abs_frame - clip.start,
+            abs_frame: self.env.abs_frame,
+            active_clip_id: Some(clip.id),
+            active_layer_id: Some(layer.id),
+            active_object_id: None,
+            active_effect_id: None,
+            active_property_id: None,
+            ..self.env.clone()
+        };
+        let lpos = eval_vec2(&layer.position, &layer_env);
+        let lscale = eval_vec2(&layer.scale, &layer_env);
+        let lrot = eval_f32(&layer.rotation, &layer_env);
+        let layer_mat = Mat4::from_scale_rotation_translation(
+            Vec3::new(lscale[0], lscale[1], 1.0),
+            Quat::from_rotation_z(lrot),
+            Vec3::new(lpos[0], lpos[1], 0.0),
+        );
+        let lp = layer_mat.transform_point3(Vec3::new(px - res_w * 0.5, res_h * 0.5 - py, 0.0));
+        Ok([
+            f64::from(lp.x + res_w * 0.5),
+            f64::from(res_h * 0.5 - lp.y),
+            f64::from(ndc.z),
+        ])
+    }
+
+    fn from_screen(
+        &self,
+        owner: Option<&HandleId>,
+        screen: [f64; 3],
+    ) -> Result<[f64; 3], ExprError> {
+        let (world_mat, clip, layer, _) = self.resolve_target_world_matrix(owner)?;
+        if world_mat.determinant().abs() < 1e-12 {
+            return Err(ExprError::RuntimeError(
+                "Expression cannot invert a zero-scale transform".to_owned(),
+            ));
+        }
+        let (view, proj_gl) = self.resolve_scene_camera_gl(clip, layer)?;
+        let res_w = self.env.sequence_resolution[0].max(1) as f32;
+        let res_h = self.env.sequence_resolution[1].max(1) as f32;
+
+        let layer_env = EvalEnv {
+            frame: self.env.abs_frame - clip.start,
+            abs_frame: self.env.abs_frame,
+            active_clip_id: Some(clip.id),
+            active_layer_id: Some(layer.id),
+            active_object_id: None,
+            active_effect_id: None,
+            active_property_id: None,
+            ..self.env.clone()
+        };
+        let lpos = eval_vec2(&layer.position, &layer_env);
+        let lscale = eval_vec2(&layer.scale, &layer_env);
+        let lrot = eval_f32(&layer.rotation, &layer_env);
+        let layer_mat = Mat4::from_scale_rotation_translation(
+            Vec3::new(lscale[0], lscale[1], 1.0),
+            Quat::from_rotation_z(lrot),
+            Vec3::new(lpos[0], lpos[1], 0.0),
+        );
+        if layer_mat.determinant().abs() < 1e-12 {
+            return Err(ExprError::RuntimeError(
+                "Expression cannot invert a zero-scale layer".to_owned(),
+            ));
+        }
+        let un_layer = layer_mat.inverse().transform_point3(Vec3::new(
+            screen[0] as f32 - res_w * 0.5,
+            res_h * 0.5 - screen[1] as f32,
+            0.0,
+        ));
+        let sx = un_layer.x + res_w * 0.5;
+        let sy = res_h * 0.5 - un_layer.y;
+        let ndc = Vec4::new(
+            sx * 2.0 / res_w - 1.0,
+            1.0 - sy * 2.0 / res_h,
+            screen[2] as f32,
+            1.0,
+        );
+        let vp = proj_gl * view;
+        if vp.determinant().abs() < 1e-12 {
+            return Err(ExprError::RuntimeError(
+                "fromScreen() singular camera matrix".to_owned(),
+            ));
+        }
+        let world_h = vp.inverse() * ndc;
+        if world_h.w.abs() < 1e-12 {
+            return Err(ExprError::RuntimeError(
+                "fromScreen() singular unproject".to_owned(),
+            ));
+        }
+        let world_p = world_h.truncate() / world_h.w;
+        let local_p = world_mat.inverse().transform_point3(world_p);
+        Ok([
+            f64::from(local_p.x),
+            f64::from(local_p.y),
+            f64::from(local_p.z),
+        ])
     }
 }
 
-fn evaluate_sequence_controls(
+fn eval_sequence_control_value(
+    ctrl: &zc_project::SequenceControl,
+    env: &EvalEnv<'_>,
+) -> Result<ExprValue, ExprError> {
+    let raw = eval_property_track_checked(&ctrl.track, env)?;
+    let mut expr_val = property_value_to_expr(&raw);
+    // P7 P0-2: Coerce Checkbox string values `"0"`/`"1"` to numeric `0.0`/`1.0`.
+    if ctrl.kind == SequenceControlKind::Checkbox {
+        expr_val = match expr_val {
+            ExprValue::String(s) => ExprValue::Number(s.trim().parse::<f64>().unwrap_or(0.0)),
+            ExprValue::Bool(b) => ExprValue::Number(if b { 1.0 } else { 0.0 }),
+            other => other,
+        };
+    }
+    Ok(expr_val)
+}
+
+fn evaluate_sequence_controls_into(
     sequence: &Sequence,
     frame: f64,
     fps: f64,
     project: &Project,
     plugins: &PluginRegistry,
-) -> BTreeMap<String, ExprValue> {
-    let mut map = BTreeMap::new();
+    controls: &RefCell<BTreeMap<String, ExprValue>>,
+    expr_stack: &RefCell<HashSet<String>>,
+) {
     let empty_props = BTreeMap::new();
     for ctrl in &sequence.controls {
+        if controls.borrow().contains_key(&ctrl.id) {
+            continue;
+        }
+        let cycle_key = format!("ctrl:{}", ctrl.id);
+        if !expr_stack.borrow_mut().insert(cycle_key.clone()) {
+            continue;
+        }
         let env = EvalEnv {
             frame,
+            abs_frame: frame,
             time: frame / fps,
             fps,
             sequence_resolution: sequence.resolution,
             project,
+            sequence,
             plugins,
-            controls: &map,
+            controls,
             parent_props: &empty_props,
+            active_clip_id: None,
+            active_layer_id: None,
+            active_object_id: None,
+            active_effect_id: None,
+            active_property_id: Some(cycle_key.clone()),
+            expr_stack,
         };
-        let evaluated = property_value_to_expr(&eval_property_track(&ctrl.track, &env));
-        map.insert(ctrl.id.clone(), evaluated.clone());
-        map.insert(ctrl.name.clone(), evaluated);
+        if let Ok(evaluated) = eval_sequence_control_value(ctrl, &env) {
+            let mut map = controls.borrow_mut();
+            map.insert(ctrl.id.clone(), evaluated.clone());
+            map.insert(ctrl.name.clone(), evaluated);
+        }
+        expr_stack.borrow_mut().remove(&cycle_key);
     }
-    map
 }
 
 fn eval_property_track(track: &PropertyTrack, env: &EvalEnv<'_>) -> PropertyValue {
+    match eval_property_track_checked(track, env) {
+        Ok(val) => val,
+        Err(_) => eval_track_base_only(track, env.frame),
+    }
+}
+
+fn eval_property_track_checked(
+    track: &PropertyTrack,
+    env: &EvalEnv<'_>,
+) -> Result<PropertyValue, ExprError> {
+    let has_expr = track
+        .expression
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+
+    // P7 P0-7: When a grouped track has its own expression, compute raw keyframed base_value
+    // without running child channel expressions. When it has NO expression, evaluate channels
+    // with their own expressions!
     let base_value = if !track.channels.is_empty() {
-        eval_channel_tracks(track, env)
+        if has_expr {
+            eval_track_base_only(track, env.frame)
+        } else {
+            eval_channel_tracks(track, env)
+        }
     } else {
         eval_track_keyframes_only(track, env.frame)
     };
@@ -3689,28 +7299,44 @@ fn eval_property_track(track: &PropertyTrack, env: &EvalEnv<'_>) -> PropertyValu
         } else {
             EvalConfig::vanilla()
         };
+        let self_prop_id = HandleId::new(
+            env.active_property_id
+                .clone()
+                .unwrap_or_else(|| "thisProperty".to_owned()),
+        );
         let ctx = EngineExprContext {
             env,
             track,
             base_value: &base_value,
+            self_prop_id,
         };
         let outcome = zc_expr::eval_with_fallback(expr_src, &ctx, &config);
         if let Some(err) = outcome.error {
+            if matches!(err, ExprError::CycleDetected(_)) {
+                return Err(err);
+            }
             debug!(expression = expr_src, error = %err, "expression fallback to base value");
-            return base_value;
+            return Ok(base_value);
         }
-        return coerce_expr_value(&outcome.value, &base_value);
+        return Ok(coerce_expr_value(&outcome.value, &base_value));
     }
 
-    base_value
+    Ok(base_value)
 }
 
-fn eval_channel_tracks(track: &PropertyTrack, env: &EvalEnv<'_>) -> PropertyValue {
-    let mut comps = Vec::with_capacity(track.channels.len());
-    for ch in &track.channels {
-        comps.push(eval_f64(ch, env));
+fn eval_track_base_only(track: &PropertyTrack, frame: f64) -> PropertyValue {
+    if !track.channels.is_empty() {
+        let mut comps = Vec::with_capacity(track.channels.len());
+        for ch in &track.channels {
+            comps.push(eval_track_keyframes_only(ch, frame).as_f64().unwrap_or(0.0));
+        }
+        return assemble_channel_value(&track.value, &comps);
     }
-    match (&track.value, comps.len()) {
+    eval_track_keyframes_only(track, frame)
+}
+
+fn assemble_channel_value(template: &PropertyValue, comps: &[f64]) -> PropertyValue {
+    match (template, comps.len()) {
         (PropertyValue::Color(_), 3..) => PropertyValue::Color([comps[0], comps[1], comps[2]]),
         (PropertyValue::ColorRgba(_), 4..) => {
             PropertyValue::ColorRgba([comps[0], comps[1], comps[2], comps[3]])
@@ -3719,13 +7345,25 @@ fn eval_channel_tracks(track: &PropertyTrack, env: &EvalEnv<'_>) -> PropertyValu
         (_, 3) => PropertyValue::Vec3([comps[0], comps[1], comps[2]]),
         (_, 4..) => PropertyValue::Vec4([comps[0], comps[1], comps[2], comps[3]]),
         (_, 1) => PropertyValue::Number(comps[0]),
-        _ => track.value.clone(),
+        _ => template.clone(),
     }
 }
 
+fn eval_channel_tracks(track: &PropertyTrack, env: &EvalEnv<'_>) -> PropertyValue {
+    let mut comps = Vec::with_capacity(track.channels.len());
+    for ch in &track.channels {
+        comps.push(eval_f64(ch, env));
+    }
+    assemble_channel_value(&track.value, &comps)
+}
+
 fn eval_track_keyframes_only(track: &PropertyTrack, frame: f64) -> PropertyValue {
-    let use_keyframes = (track.animated || track.static_behavior == ProjectStaticBehavior::Linear)
-        && !track.keyframes.is_empty();
+    // P7 P1-3: Whenever a track has multiple keyframes, evaluate the full keyframe curve
+    // (matching CM3 `PZ.property.dynamic.keyframes.prototype.get`).
+    let use_keyframes = !track.keyframes.is_empty()
+        && (track.animated
+            || track.static_behavior == ProjectStaticBehavior::Linear
+            || track.keyframes.len() > 1);
     if !use_keyframes {
         return track.value.clone();
     }
@@ -3760,16 +7398,19 @@ fn eval_track_keyframes_only(track: &PropertyTrack, frame: f64) -> PropertyValue
         return k0.value.clone();
     }
 
-    // Spec 02 §1.5 & zc-anim parity: incoming segment `[k0, k1]` is controlled by `k1`'s tween,
-    // using `k0.control_points[1]` (`out_tangent`) and `k1.control_points[0]` (`in_tangent`).
-    let tween_code = if k1.tween != 0 {
-        k1.tween as u16
-    } else if k1.is_bezier {
-        (1u16 << 8) | u16::from(k1.easing_index.max(1))
+    // P7 P1-2: Decode `k1.tween` directly. Hold (`(tween & 0xFF) == 0`) ALWAYS takes
+    // precedence (never falling back to stale `easing_index` / `is_bezier`), and Bezier
+    // strictly requires `(tween >> 8) == 1` matching CM3 / Easing+.
+    let ease_idx = (k1.tween & 0xFF) as u8;
+    if ease_idx == 0 {
+        return k0.value.clone();
+    }
+    let is_bezier = (k1.tween >> 8) == 1;
+    let (mode, easing) = if is_bezier {
+        (InterpolationMode::Bezier, zc_anim::EasingKind::Linear)
     } else {
-        u16::from(k1.easing_index)
+        InterpolationMode::from_cm3_tween_code(u16::from(ease_idx))
     };
-    let (mode, easing) = InterpolationMode::from_cm3_tween_code(tween_code);
     if mode == InterpolationMode::Discrete {
         return k0.value.clone();
     }
@@ -4520,50 +8161,347 @@ fn bake_project_gradient_lut_rgba8(stops: &[ProjectGradientStop]) -> Vec<[u8; 4]
         .collect()
 }
 
-fn bake_color_curves_lut_rgba8(curve_json: &serde_json::Value) -> Vec<[u8; 4]> {
-    let sample_channel = |key: &str, t: f32| -> f32 {
-        let Some(pts) = curve_json.get(key).and_then(serde_json::Value::as_array) else {
-            return t;
-        };
-        let mut parsed: Vec<(f32, f32)> = pts
-            .iter()
-            .filter_map(|p| {
-                let arr = p.as_array()?;
-                if arr.len() < 2 {
-                    return None;
+/// Normalizes whitespace in custom property names to underscores matching CM3 `fixPropertyName`.
+fn fix_property_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect()
+}
+
+/// Sanitizes a Sequence Control name for Expressions+ GLSL `ctl_<Name>` uniforms (`[^A-Za-z0-9_]` -> `_`).
+fn sanitize_ctl_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn expr_value_to_uniform(
+    val: &ExprValue,
+    declared_ty: Option<UniformType>,
+) -> Option<UniformValue> {
+    match val {
+        ExprValue::Number(n) => Some(UniformValue::Float(*n as f32)),
+        ExprValue::Bool(b) => Some(UniformValue::Bool(*b)),
+        ExprValue::Array(arr) => {
+            let nums: Vec<f32> = arr
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            match nums.len() {
+                0 => None,
+                1 => Some(UniformValue::Float(nums[0])),
+                2 => Some(UniformValue::Vec2([nums[0], nums[1]])),
+                3 => {
+                    if declared_ty == Some(UniformType::Vec4) {
+                        Some(UniformValue::Vec4([nums[0], nums[1], nums[2], 1.0]))
+                    } else {
+                        Some(UniformValue::Vec3([nums[0], nums[1], nums[2]]))
+                    }
                 }
-                Some((arr[0].as_f64()? as f32, arr[1].as_f64()? as f32))
-            })
-            .collect();
-        if parsed.is_empty() {
-            return t;
-        }
-        parsed.sort_by(|a, b| a.0.total_cmp(&b.0));
-        if t <= parsed[0].0 {
-            return parsed[0].1.clamp(0.0, 1.0);
-        }
-        let last = parsed[parsed.len() - 1];
-        if t >= last.0 {
-            return last.1.clamp(0.0, 1.0);
-        }
-        for pair in parsed.windows(2) {
-            if t <= pair[1].0 {
-                let span = (pair[1].0 - pair[0].0).max(1e-6);
-                let u = ((t - pair[0].0) / span).clamp(0.0, 1.0);
-                return (pair[0].1 + (pair[1].1 - pair[0].1) * u).clamp(0.0, 1.0);
+                _ => Some(UniformValue::Vec4([nums[0], nums[1], nums[2], nums[3]])),
             }
         }
-        last.1.clamp(0.0, 1.0)
+        _ => None,
+    }
+}
+
+fn build_custom_shader_compile_options(
+    frag_shader: &str,
+    custom_properties: &[CustomProperty],
+    env: &EvalEnv<'_>,
+) -> CompileOptions {
+    let mut opts = CompileOptions::default();
+    let mut has_time_samples = frag_shader.contains("ZOIDIUM_TIME_SAMPLES");
+
+    for cp in custom_properties {
+        let norm_name = fix_property_name(&cp.name);
+        let type_obj = cp.metadata.get("type");
+        let shader_kind = type_obj
+            .and_then(|t| t.get("zoidiumShader"))
+            .and_then(|s| s.get("kind"))
+            .and_then(serde_json::Value::as_str);
+        if shader_kind == Some("timeSample") {
+            has_time_samples = true;
+        }
+        let is_layer_source = type_obj
+            .and_then(|t| t.get("_zoidiumShaderLayerSource"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let is_texture_or_array = is_layer_source
+            || matches!(
+                shader_kind,
+                Some("gradient" | "curve" | "palette" | "text" | "path" | "timeSample")
+            )
+            || matches!(
+                cp.track.value,
+                PropertyValue::Asset(_) | PropertyValue::Gradient(_) | PropertyValue::Curve(_)
+            );
+
+        // Emit `Name_Item` constants for Dropdown / StaticDropdown if referenced in source.
+        if let Some(items_str) = type_obj
+            .and_then(|t| t.get("items"))
+            .and_then(serde_json::Value::as_str)
+        {
+            for (idx, raw_item) in items_str.split(';').enumerate() {
+                let clean = sanitize_ctl_name(raw_item.trim());
+                if !clean.is_empty() {
+                    let const_name = format!("{norm_name}_{clean}");
+                    if frag_shader.contains(&const_name) {
+                        opts.defines.insert(const_name, idx.to_string());
+                    }
+                }
+            }
+        }
+
+        // Native static `#define <Name> <value>` when `dynamic == false` and not texture/array.
+        let is_dynamic = type_obj
+            .and_then(|t| t.get("dynamic"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if (!is_dynamic || shader_kind == Some("staticDropdown")) && !is_texture_or_array {
+            let val = eval_property_track(&cp.track, env);
+            let define_val = match val {
+                PropertyValue::Number(v) => Some(format!("{v}")),
+                PropertyValue::Option(v) => Some(format!("{v}")),
+                PropertyValue::Bool(v) => Some(if v { "1" } else { "0" }.to_owned()),
+                PropertyValue::Vec2(v) => Some(format!("vec2({}, {})", v[0], v[1])),
+                PropertyValue::Vec3(v) | PropertyValue::Color(v) => {
+                    Some(format!("vec3({}, {}, {})", v[0], v[1], v[2]))
+                }
+                PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) => {
+                    Some(format!("vec4({}, {}, {}, {})", v[0], v[1], v[2], v[3]))
+                }
+                _ => None,
+            };
+            if let Some(dv) = define_val {
+                opts.defines.insert(norm_name, dv);
+            }
+        }
+    }
+
+    if has_time_samples {
+        opts.defines
+            .insert("ZOIDIUM_TIME_SAMPLES".to_owned(), "1".to_owned());
+    }
+    opts
+}
+
+fn parse_palette_colors_json(val: &serde_json::Value) -> Vec<[f32; 4]> {
+    let arr_opt = val
+        .as_array()
+        .or_else(|| val.get("colors").and_then(serde_json::Value::as_array));
+    let Some(arr) = arr_opt else {
+        return Vec::new();
     };
+    let mut out = Vec::with_capacity(arr.len().min(16));
+    for item in arr.iter().take(16) {
+        if let Some(rgba) = parse_json_rgba(item) {
+            out.push(rgba);
+        }
+    }
+    out
+}
+
+/// Evaluates Fritsch-Butland monotone cubic Hermite spline (matching Zoidium `graph-curves.js:102-148`).
+fn eval_monotone_cubic_curve(points: &[(f32, f32)], t: f32) -> f32 {
+    if points.is_empty() {
+        return t.clamp(0.0, 1.0);
+    }
+    if points.len() == 1 || t <= points[0].0 {
+        return points[0].1.clamp(0.0, 1.0);
+    }
+    let last = points[points.len() - 1];
+    if t >= last.0 {
+        return last.1.clamp(0.0, 1.0);
+    }
+    let n = points.len();
+    let mut dxs = Vec::with_capacity(n - 1);
+    let mut secants = Vec::with_capacity(n - 1);
+    for i in 0..(n - 1) {
+        let dx = (points[i + 1].0 - points[i].0).max(1e-6);
+        dxs.push(dx);
+        secants.push((points[i + 1].1 - points[i].1) / dx);
+    }
+    let mut slopes = vec![0.0_f32; n];
+    slopes[0] = secants[0];
+    slopes[n - 1] = secants[n - 2];
+    for i in 1..(n - 1) {
+        let a = secants[i - 1];
+        let b = secants[i];
+        if a * b <= 0.0 {
+            slopes[i] = 0.0;
+        } else {
+            let w1 = 2.0 * dxs[i] + dxs[i - 1];
+            let w2 = dxs[i] + 2.0 * dxs[i - 1];
+            slopes[i] = (w1 + w2) / (w1 / a + w2 / b);
+        }
+    }
+
+    let mut seg = 0;
+    for i in 0..(n - 1) {
+        if t <= points[i + 1].0 {
+            seg = i;
+            break;
+        }
+    }
+    let h = dxs[seg];
+    let u = ((t - points[seg].0) / h).clamp(0.0, 1.0);
+    let u2 = u * u;
+    let u3 = u2 * u;
+    let h00 = 2.0 * u3 - 3.0 * u2 + 1.0;
+    let h10 = u3 - 2.0 * u2 + u;
+    let h01 = -2.0 * u3 + 3.0 * u2;
+    let h11 = u3 - u2;
+    (h00 * points[seg].1
+        + h10 * h * slopes[seg]
+        + h01 * points[seg + 1].1
+        + h11 * h * slopes[seg + 1])
+        .clamp(0.0, 1.0)
+}
+
+fn parse_curve_points(val: Option<&serde_json::Value>) -> Option<Vec<(f32, f32)>> {
+    let arr = val?.as_array()?;
+    let mut parsed: Vec<(f32, f32)> = arr
+        .iter()
+        .filter_map(|p| {
+            if let Some(a) = p.as_array()
+                && a.len() >= 2
+            {
+                Some((a[0].as_f64()? as f32, a[1].as_f64()? as f32))
+            } else if let Some(obj) = p.as_object() {
+                let x = obj.get("x").and_then(serde_json::Value::as_f64)? as f32;
+                let y = obj.get("y").and_then(serde_json::Value::as_f64)? as f32;
+                Some((x, y))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if parsed.is_empty() {
+        return None;
+    }
+    parsed.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Deduplicate points within 0.0001 in X (matching Zoidium `graph-curves.js:52-68`).
+    let mut dedup: Vec<(f32, f32)> = Vec::with_capacity(parsed.len().min(16));
+    for pt in parsed {
+        if dedup.last().is_none_or(|prev| (pt.0 - prev.0).abs() > 1e-4) {
+            dedup.push((pt.0.clamp(0.0, 1.0), pt.1.clamp(0.0, 1.0)));
+            if dedup.len() >= 16 {
+                break;
+            }
+        }
+    }
+    Some(dedup)
+}
+
+/// Bakes a Shader+ Curve LUT to 1024×1 `Rgba16Float` (`Vec<u16>` of 1024*4 half-float bits)
+/// strictly in `[0, 1]` and returns `(f16_bits, range)` (P8 P1-4, P2-2).
+fn bake_shader_plus_curve_rgba16f(curve_json: &serde_json::Value) -> (Vec<u16>, [f32; 2]) {
+    let parsed_owned;
+    let obj = match curve_json {
+        serde_json::Value::String(s) => {
+            parsed_owned =
+                serde_json::from_str::<serde_json::Value>(s).unwrap_or(serde_json::Value::Null);
+            &parsed_owned
+        }
+        other => other,
+    };
+    let range = obj
+        .get("range")
+        .and_then(serde_json::Value::as_array)
+        .filter(|a| a.len() >= 2)
+        .map_or([0.0_f32, 1.0_f32], |a| {
+            [
+                a[0].as_f64().unwrap_or(0.0) as f32,
+                a[1].as_f64().unwrap_or(1.0) as f32,
+            ]
+        });
+
+    let channels_obj = obj.get("channels").unwrap_or(obj);
+    let common_pts = parse_curve_points(
+        channels_obj
+            .get("common")
+            .or_else(|| channels_obj.get("composite"))
+            .or_else(|| channels_obj.get("rgb"))
+            .or_else(|| obj.get("points")),
+    );
+    let r_pts = parse_curve_points(channels_obj.get("red").or_else(|| channels_obj.get("r")));
+    let g_pts = parse_curve_points(channels_obj.get("green").or_else(|| channels_obj.get("g")));
+    let b_pts = parse_curve_points(channels_obj.get("blue").or_else(|| channels_obj.get("b")));
+    let is_rgb = r_pts.is_some() || g_pts.is_some() || b_pts.is_some();
+
+    let mut out = Vec::with_capacity(1024 * 4);
+    for i in 0..1024 {
+        let t = (i as f32) / 1023.0;
+        let common = common_pts
+            .as_deref()
+            .map_or(t, |pts| eval_monotone_cubic_curve(pts, t));
+        let (r, g, b, a) = if is_rgb {
+            let rv = r_pts
+                .as_deref()
+                .map_or(t, |pts| eval_monotone_cubic_curve(pts, t));
+            let gv = g_pts
+                .as_deref()
+                .map_or(t, |pts| eval_monotone_cubic_curve(pts, t));
+            let bv = b_pts
+                .as_deref()
+                .map_or(t, |pts| eval_monotone_cubic_curve(pts, t));
+            (rv, gv, bv, common)
+        } else {
+            // Single mode writes `[common, common, common, common]` per Zoidium `bake.js:136`.
+            (common, common, common, common)
+        };
+        out.push(f32_to_f16_bits(r));
+        out.push(f32_to_f16_bits(g));
+        out.push(f32_to_f16_bits(b));
+        out.push(f32_to_f16_bits(a));
+    }
+    (out, range)
+}
+
+fn bake_color_curves_lut_rgba8(curve_json: &serde_json::Value) -> Vec<[u8; 4]> {
+    // P4 P0-23: Parse stringified JSON curves from Zoidium `.pz` files, support both
+    // `composite`/`red`/`green`/`blue` and `rgb`/`r`/`g`/`b`/`a`, and use Fritsch-Butland
+    // monotone cubic Hermite interpolation instead of piecewise linear.
+    let parsed_owned;
+    let obj = match curve_json {
+        serde_json::Value::String(s) => {
+            parsed_owned =
+                serde_json::from_str::<serde_json::Value>(s).unwrap_or(serde_json::Value::Null);
+            &parsed_owned
+        }
+        other => other,
+    };
+    let master_pts = parse_curve_points(obj.get("composite").or_else(|| obj.get("rgb")));
+    let r_pts = parse_curve_points(obj.get("red").or_else(|| obj.get("r")));
+    let g_pts = parse_curve_points(obj.get("green").or_else(|| obj.get("g")));
+    let b_pts = parse_curve_points(obj.get("blue").or_else(|| obj.get("b")));
+    let a_pts = parse_curve_points(obj.get("alpha").or_else(|| obj.get("a")));
 
     let mut lut = Vec::with_capacity(256);
     for i in 0..256 {
         let t = i as f32 / 255.0;
-        let master = sample_channel("rgb", t);
-        let r = sample_channel("r", master);
-        let g = sample_channel("g", master);
-        let b = sample_channel("b", master);
-        let a = sample_channel("a", t);
+        let master = master_pts
+            .as_deref()
+            .map_or(t, |pts| eval_monotone_cubic_curve(pts, t));
+        let r = r_pts
+            .as_deref()
+            .map_or(master, |pts| eval_monotone_cubic_curve(pts, master));
+        let g = g_pts
+            .as_deref()
+            .map_or(master, |pts| eval_monotone_cubic_curve(pts, master));
+        let b = b_pts
+            .as_deref()
+            .map_or(master, |pts| eval_monotone_cubic_curve(pts, master));
+        let a = a_pts
+            .as_deref()
+            .map_or(t, |pts| eval_monotone_cubic_curve(pts, t));
         lut.push([
             (r * 255.0).round() as u8,
             (g * 255.0).round() as u8,
@@ -4709,49 +8647,122 @@ fn parse_cube_lut_bytes(
     None
 }
 
+// ---------------------------------------------------------------------------
+// 2D Vector Rasterizer: Shape2D, PresetShape2D, Shape+, Text2D Stroke & Masks
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
-struct ShapeStyle2D {
-    fill: Option<[f32; 4]>,
-    stroke: Option<([f32; 4], f32)>,
+enum EvalPaintOp {
+    Fill([f32; 4]),
+    Stroke([f32; 4], f32),
 }
 
-fn extract_shape_style(nodes: &[Shape2DNode], env: &EvalEnv<'_>) -> ShapeStyle2D {
-    let mut fill = None;
-    let mut stroke = None;
-    collect_shape_style(nodes, env, &mut fill, &mut stroke);
-    if fill.is_none() && stroke.is_none() {
-        fill = Some([1.0, 1.0, 1.0, 1.0]);
+#[derive(Debug, Clone, Copy)]
+struct ShapeTransform2D {
+    position: [f32; 2],
+    rotation: f32,
+    scale: [f32; 2],
+}
+
+impl Default for ShapeTransform2D {
+    fn default() -> Self {
+        Self {
+            position: [0.0, 0.0],
+            rotation: 0.0,
+            scale: [1.0, 1.0],
+        }
     }
-    ShapeStyle2D { fill, stroke }
 }
 
-fn collect_shape_style(
-    nodes: &[Shape2DNode],
-    env: &EvalEnv<'_>,
-    fill: &mut Option<[f32; 4]>,
-    stroke: &mut Option<([f32; 4], f32)>,
-) {
-    for node in nodes {
-        for op in &node.operations {
-            match op {
-                DrawOp::Fill { color } => {
-                    *fill = Some(eval_color_rgba(color, env, [1.0, 1.0, 1.0, 1.0]));
-                }
-                DrawOp::Stroke {
-                    color,
-                    size,
-                    opacity,
-                } => {
-                    let rgb = eval_color_rgb(color, env, [1.0, 1.0, 1.0]);
-                    let w = eval_f32(size, env).max(0.0);
-                    let a = eval_f32(opacity, env).clamp(0.0, 1.0);
-                    *stroke = Some(([rgb[0], rgb[1], rgb[2], a], w));
-                }
+#[derive(Debug, Clone)]
+struct PolySubPath {
+    points: Vec<Vec2>,
+    closed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BezierVertex2D {
+    point: [f32; 2],
+    in_h: [f32; 2],
+    out_h: [f32; 2],
+}
+
+#[derive(Debug, Clone)]
+struct EvaluatedZoidiumMask {
+    vertices: Vec<BezierVertex2D>,
+    closed: bool,
+    mode: String,
+    feather: f32,
+    expansion: f32,
+    opacity: f32,
+    invert: bool,
+}
+
+fn resolve_font_bytes<'a>(project: &'a Project, font: Option<&str>) -> Option<&'a [u8]> {
+    let font_key = font?;
+    if let Some(rec) = project.assets.get(font_key)
+        && let Some(bytes) = rec.bytes.as_deref()
+    {
+        return Some(bytes);
+    }
+    // Fallback lookup by URL, filename, or legacy `.pz` asset key in `project.assets`.
+    for rec in project.assets.values() {
+        let matches = rec.url.as_deref() == Some(font_key)
+            || rec.filename == font_key
+            || rec
+                .preserved
+                .get("legacy_pz_asset_key")
+                .and_then(serde_json::Value::as_str)
+                == Some(font_key);
+        if matches && let Some(bytes) = rec.bytes.as_deref() {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+fn eval_draw_op(op: &DrawOp, env: &EvalEnv<'_>) -> EvalPaintOp {
+    match op {
+        DrawOp::Fill { color } => {
+            EvalPaintOp::Fill(eval_color_rgba(color, env, [1.0, 1.0, 1.0, 1.0]))
+        }
+        DrawOp::Stroke {
+            color,
+            size,
+            opacity,
+        } => {
+            let rgba = eval_color_rgba(color, env, [1.0, 1.0, 1.0, 1.0]);
+            let w = eval_f32(size, env).max(0.0);
+            let a = (eval_f32(opacity, env).clamp(0.0, 1.0)) * rgba[3].clamp(0.0, 1.0);
+            EvalPaintOp::Stroke([rgba[0], rgba[1], rgba[2], a], w)
+        }
+    }
+}
+
+fn collect_ordered_shape_ops(nodes: &[Shape2DNode], env: &EvalEnv<'_>) -> Vec<EvalPaintOp> {
+    let mut ops = Vec::new();
+    fn walk(nodes: &[Shape2DNode], env: &EvalEnv<'_>, out: &mut Vec<EvalPaintOp>) {
+        for node in nodes {
+            if let Shape2DKind::Group { children } = &node.kind {
+                walk(children, env, out);
+            }
+            for op in &node.operations {
+                out.push(eval_draw_op(op, env));
             }
         }
-        if let Shape2DKind::Group { children } = &node.kind {
-            collect_shape_style(children, env, fill, stroke);
-        }
+    }
+    walk(nodes, env, &mut ops);
+    ops
+}
+
+fn extract_primary_shape_transform(nodes: &[Shape2DNode], env: &EvalEnv<'_>) -> ShapeTransform2D {
+    let Some(first) = nodes.first() else {
+        return ShapeTransform2D::default();
+    };
+    ShapeTransform2D {
+        position: eval_vec2(&first.position, env),
+        rotation: eval_f32(&first.rotation, env),
+        scale: eval_vec2(&first.scale, env),
     }
 }
 
@@ -4767,6 +8778,24 @@ fn hash_shape_nodes(mut h: u64, nodes: &[Shape2DNode], env: &EvalEnv<'_>) -> u64
         h = hash_u64(h, u64::from(rot.to_bits()));
         h = hash_u64(h, u64::from(sc[0].to_bits()));
         h = hash_u64(h, u64::from(sc[1].to_bits()));
+        h = hash_u64(h, node.operations.len() as u64);
+        for op in &node.operations {
+            match eval_draw_op(op, env) {
+                EvalPaintOp::Fill(c) => {
+                    h = hash_u64(h, 11);
+                    for ch in c {
+                        h = hash_u64(h, u64::from(ch.to_bits()));
+                    }
+                }
+                EvalPaintOp::Stroke(c, w) => {
+                    h = hash_u64(h, 12);
+                    for ch in c {
+                        h = hash_u64(h, u64::from(ch.to_bits()));
+                    }
+                    h = hash_u64(h, u64::from(w.to_bits()));
+                }
+            }
+        }
         match &node.kind {
             Shape2DKind::Group { children } => {
                 h = hash_u64(h, 1);
@@ -4783,103 +8812,1862 @@ fn hash_shape_nodes(mut h: u64, nodes: &[Shape2DNode], env: &EvalEnv<'_>) -> u64
     h
 }
 
-fn hash_shape_style(mut h: u64, style: &ShapeStyle2D) -> u64 {
-    if let Some(f) = style.fill {
-        for c in f {
-            h = hash_u64(h, u64::from(c.to_bits()));
-        }
-    }
-    if let Some((c, w)) = style.stroke {
-        for ch in c {
-            h = hash_u64(h, u64::from(ch.to_bits()));
-        }
-        h = hash_u64(h, u64::from(w.to_bits()));
-    }
-    h
+/// CM3 Y-up affine transform for a `Shape2DNode` with CM3's `(0.5, -0.5)` half-pixel pivot
+/// (matching `convert-native.js:154-173` and Spec 03 §2.3).
+fn cm3_shape_node_mat3(position: [f32; 2], rotation: f32, scale: [f32; 2]) -> Mat3 {
+    let (s, c) = rotation.sin_cos();
+    let sx = scale[0];
+    let sy = scale[1];
+    // T(0.5, -0.5) * T(pos) * R(rot) * S(scale) * T(-0.5, 0.5)
+    let m00 = sx * c;
+    let m10 = sx * s;
+    let m01 = -sy * s;
+    let m11 = sy * c;
+    let tx = position[0] + 0.5 - (m00 * 0.5 - m01 * 0.5);
+    let ty = position[1] - 0.5 - (m10 * 0.5 - m11 * 0.5);
+    Mat3::from_cols(
+        Vec3::new(m00, m10, 0.0),
+        Vec3::new(m01, m11, 0.0),
+        Vec3::new(tx, ty, 1.0),
+    )
 }
 
-fn rasterize_preset_shape(
+fn transform_point_2d(m: Mat3, p: Vec2) -> Vec2 {
+    let v = m * Vec3::new(p.x, p.y, 1.0);
+    Vec2::new(v.x, v.y)
+}
+
+fn flatten_quad_bezier(p0: Vec2, p1: Vec2, p2: Vec2, out: &mut Vec<Vec2>, tol_sq: f32, depth: u32) {
+    let mid = (p0 + p2) * 0.5;
+    if depth >= 8 || p1.distance_squared(mid) <= tol_sq {
+        out.push(p2);
+        return;
+    }
+    let p01 = (p0 + p1) * 0.5;
+    let p12 = (p1 + p2) * 0.5;
+    let p012 = (p01 + p12) * 0.5;
+    flatten_quad_bezier(p0, p01, p012, out, tol_sq, depth + 1);
+    flatten_quad_bezier(p012, p12, p2, out, tol_sq, depth + 1);
+}
+
+fn flatten_cubic_bezier(
+    p0: Vec2,
+    p1: Vec2,
+    p2: Vec2,
+    p3: Vec2,
+    out: &mut Vec<Vec2>,
+    tol_sq: f32,
+    depth: u32,
+) {
+    let d1 = point_to_segment_dist_sq(p1, p0, p3);
+    let d2 = point_to_segment_dist_sq(p2, p0, p3);
+    if depth >= 8 || (d1 <= tol_sq && d2 <= tol_sq) {
+        out.push(p3);
+        return;
+    }
+    let p01 = (p0 + p1) * 0.5;
+    let p12 = (p1 + p2) * 0.5;
+    let p23 = (p2 + p3) * 0.5;
+    let p012 = (p01 + p12) * 0.5;
+    let p123 = (p12 + p23) * 0.5;
+    let p0123 = (p012 + p123) * 0.5;
+    flatten_cubic_bezier(p0, p01, p012, p0123, out, tol_sq, depth + 1);
+    flatten_cubic_bezier(p0123, p123, p23, p3, out, tol_sq, depth + 1);
+}
+
+fn point_to_segment_dist_sq(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let ab = b - a;
+    let len_sq = ab.length_squared();
+    if len_sq <= 1e-12 {
+        return p.distance_squared(a);
+    }
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    p.distance_squared(a + ab * t)
+}
+
+/// Parses CM3 `Shape2DKind::Path { path }` (OpenType/Canvas `commands` array, raw array of
+/// `[x, y]` points, or SVG path string) into Y-up sequence-pixel polylines.
+fn parse_shape2d_path_json(path_json: &serde_json::Value) -> Vec<PolySubPath> {
+    // 1. OpenType / CM3 `{ commands: [{ type: "M"|"L"|"Q"|"C"|"Z", x, y, x1, y1, x2, y2 }] }`
+    if let Some(cmds) = path_json
+        .get("commands")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| {
+            path_json
+                .as_array()
+                .filter(|a| a.first().is_some_and(|v| v.get("type").is_some()))
+        })
+    {
+        let mut subpaths = Vec::new();
+        let mut cur_pts: Vec<Vec2> = Vec::new();
+        let mut cursor = Vec2::ZERO;
+        let tol_sq = 0.0625_f32; // 0.25 px flattening tolerance
+        for cmd in cmds {
+            let kind = cmd
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            // CM3/OpenType path commands store Y-down; flip Y into Y-up sequence space
+            // matching Zoidium `convert-native.js:142-146`.
+            let pt = |kx: &str, ky: &str| -> Vec2 {
+                let x = cmd
+                    .get(kx)
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                let y = cmd
+                    .get(ky)
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                Vec2::new(x, -y)
+            };
+            match kind {
+                "M" | "m" => {
+                    if cur_pts.len() >= 2 {
+                        subpaths.push(PolySubPath {
+                            points: std::mem::take(&mut cur_pts),
+                            closed: false,
+                        });
+                    } else {
+                        cur_pts.clear();
+                    }
+                    let p = pt("x", "y");
+                    cursor = if kind == "m" { cursor + p } else { p };
+                    cur_pts.push(cursor);
+                }
+                "L" | "l" => {
+                    let p = pt("x", "y");
+                    cursor = if kind == "l" { cursor + p } else { p };
+                    cur_pts.push(cursor);
+                }
+                "Q" | "q" => {
+                    let c1 = pt("x1", "y1");
+                    let p = pt("x", "y");
+                    let (a1, a2) = if kind == "q" {
+                        (cursor + c1, cursor + p)
+                    } else {
+                        (c1, p)
+                    };
+                    flatten_quad_bezier(cursor, a1, a2, &mut cur_pts, tol_sq, 0);
+                    cursor = a2;
+                }
+                "C" | "c" => {
+                    let c1 = pt("x1", "y1");
+                    let c2 = pt("x2", "y2");
+                    let p = pt("x", "y");
+                    let (a1, a2, a3) = if kind == "c" {
+                        (cursor + c1, cursor + c2, cursor + p)
+                    } else {
+                        (c1, c2, p)
+                    };
+                    flatten_cubic_bezier(cursor, a1, a2, a3, &mut cur_pts, tol_sq, 0);
+                    cursor = a3;
+                }
+                "Z" | "z" => {
+                    if cur_pts.len() >= 2 {
+                        subpaths.push(PolySubPath {
+                            points: std::mem::take(&mut cur_pts),
+                            closed: true,
+                        });
+                    } else {
+                        cur_pts.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if cur_pts.len() >= 2 {
+            subpaths.push(PolySubPath {
+                points: cur_pts,
+                closed: false,
+            });
+        }
+        return subpaths;
+    }
+
+    // 2. Direct array of `[x, y]` points (already Y-up sequence coordinates).
+    if let Some(arr) = path_json.as_array() {
+        let pts: Vec<Vec2> = arr
+            .iter()
+            .filter_map(|p| {
+                let a = p.as_array()?;
+                if a.len() < 2 {
+                    return None;
+                }
+                Some(Vec2::new(a[0].as_f64()? as f32, a[1].as_f64()? as f32))
+            })
+            .collect();
+        if pts.len() >= 2 {
+            return vec![PolySubPath {
+                points: pts,
+                closed: true,
+            }];
+        }
+    }
+
+    // 3. SVG path string `"M x y L x y ... Z"`.
+    if let Some(svg) = path_json.as_str() {
+        return parse_svg_path_string(svg);
+    }
+
+    Vec::new()
+}
+
+fn parse_svg_path_string(d: &str) -> Vec<PolySubPath> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    for ch in d.chars() {
+        if ch.is_ascii_alphabetic() {
+            if !buf.is_empty() {
+                tokens.push(std::mem::take(&mut buf));
+            }
+            tokens.push(ch.to_string());
+        } else if ch == ',' || ch.is_whitespace() {
+            if !buf.is_empty() {
+                tokens.push(std::mem::take(&mut buf));
+            }
+        } else if ch == '-' && !buf.is_empty() && !buf.ends_with(['e', 'E']) {
+            tokens.push(std::mem::take(&mut buf));
+            buf.push(ch);
+        } else {
+            buf.push(ch);
+        }
+    }
+    if !buf.is_empty() {
+        tokens.push(buf);
+    }
+
+    let mut subpaths = Vec::new();
+    let mut cur_pts: Vec<Vec2> = Vec::new();
+    let mut cursor = Vec2::ZERO;
+    let mut start_pt = Vec2::ZERO;
+    let mut cmd = "";
+    let mut i = 0;
+    let tol_sq = 0.0625_f32;
+    let next_f32 = |idx: &mut usize| -> Option<f32> {
+        let v = tokens.get(*idx)?.parse::<f32>().ok()?;
+        *idx += 1;
+        Some(v)
+    };
+
+    while i < tokens.len() {
+        if tokens[i].len() == 1 && tokens[i].as_bytes()[0].is_ascii_alphabetic() {
+            cmd = &tokens[i];
+            i += 1;
+            if cmd == "Z" || cmd == "z" {
+                if cur_pts.len() >= 2 {
+                    subpaths.push(PolySubPath {
+                        points: std::mem::take(&mut cur_pts),
+                        closed: true,
+                    });
+                } else {
+                    cur_pts.clear();
+                }
+                cursor = start_pt;
+                continue;
+            }
+        }
+        match cmd {
+            "M" | "m" => {
+                let (Some(x), Some(y)) = (next_f32(&mut i), next_f32(&mut i)) else {
+                    break;
+                };
+                if cur_pts.len() >= 2 {
+                    subpaths.push(PolySubPath {
+                        points: std::mem::take(&mut cur_pts),
+                        closed: false,
+                    });
+                } else {
+                    cur_pts.clear();
+                }
+                let p = Vec2::new(x, -y);
+                cursor = if cmd == "m" { cursor + p } else { p };
+                start_pt = cursor;
+                cur_pts.push(cursor);
+                cmd = if cmd == "m" { "l" } else { "L" };
+            }
+            "L" | "l" => {
+                let (Some(x), Some(y)) = (next_f32(&mut i), next_f32(&mut i)) else {
+                    break;
+                };
+                let p = Vec2::new(x, -y);
+                cursor = if cmd == "l" { cursor + p } else { p };
+                cur_pts.push(cursor);
+            }
+            "H" | "h" => {
+                let Some(x) = next_f32(&mut i) else {
+                    break;
+                };
+                cursor.x = if cmd == "h" { cursor.x + x } else { x };
+                cur_pts.push(cursor);
+            }
+            "V" | "v" => {
+                let Some(y) = next_f32(&mut i) else {
+                    break;
+                };
+                cursor.y = if cmd == "v" { cursor.y - y } else { -y };
+                cur_pts.push(cursor);
+            }
+            "Q" | "q" => {
+                let (Some(x1), Some(y1), Some(x), Some(y)) = (
+                    next_f32(&mut i),
+                    next_f32(&mut i),
+                    next_f32(&mut i),
+                    next_f32(&mut i),
+                ) else {
+                    break;
+                };
+                let c1 = Vec2::new(x1, -y1);
+                let p = Vec2::new(x, -y);
+                let (a1, a2) = if cmd == "q" {
+                    (cursor + c1, cursor + p)
+                } else {
+                    (c1, p)
+                };
+                flatten_quad_bezier(cursor, a1, a2, &mut cur_pts, tol_sq, 0);
+                cursor = a2;
+            }
+            "C" | "c" => {
+                let (Some(x1), Some(y1), Some(x2), Some(y2), Some(x), Some(y)) = (
+                    next_f32(&mut i),
+                    next_f32(&mut i),
+                    next_f32(&mut i),
+                    next_f32(&mut i),
+                    next_f32(&mut i),
+                    next_f32(&mut i),
+                ) else {
+                    break;
+                };
+                let c1 = Vec2::new(x1, -y1);
+                let c2 = Vec2::new(x2, -y2);
+                let p = Vec2::new(x, -y);
+                let (a1, a2, a3) = if cmd == "c" {
+                    (cursor + c1, cursor + c2, cursor + p)
+                } else {
+                    (c1, c2, p)
+                };
+                flatten_cubic_bezier(cursor, a1, a2, a3, &mut cur_pts, tol_sq, 0);
+                cursor = a3;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    if cur_pts.len() >= 2 {
+        subpaths.push(PolySubPath {
+            points: cur_pts,
+            closed: false,
+        });
+    }
+    subpaths
+}
+
+fn canonical_preset_subpath(preset: PresetShapeKind) -> PolySubPath {
+    // P6 P0: CM3 canonical preset shapes are 200x200 (radius 100 circle / [-100, 100]^2 square)
+    // centered at (0, 0), matching `convert-native.js:129-136`.
+    match preset {
+        PresetShapeKind::Rectangle => PolySubPath {
+            points: vec![
+                Vec2::new(-100.0, -100.0),
+                Vec2::new(100.0, -100.0),
+                Vec2::new(100.0, 100.0),
+                Vec2::new(-100.0, 100.0),
+            ],
+            closed: true,
+        },
+        PresetShapeKind::Ellipse => {
+            let r = 100.0_f32;
+            let k = 0.552_284_8_f32 * r;
+            let mut pts = vec![Vec2::new(r, 0.0)];
+            let tol = 0.04_f32;
+            flatten_cubic_bezier(
+                Vec2::new(r, 0.0),
+                Vec2::new(r, k),
+                Vec2::new(k, r),
+                Vec2::new(0.0, r),
+                &mut pts,
+                tol,
+                0,
+            );
+            flatten_cubic_bezier(
+                Vec2::new(0.0, r),
+                Vec2::new(-k, r),
+                Vec2::new(-r, k),
+                Vec2::new(-r, 0.0),
+                &mut pts,
+                tol,
+                0,
+            );
+            flatten_cubic_bezier(
+                Vec2::new(-r, 0.0),
+                Vec2::new(-r, -k),
+                Vec2::new(-k, -r),
+                Vec2::new(0.0, -r),
+                &mut pts,
+                tol,
+                0,
+            );
+            flatten_cubic_bezier(
+                Vec2::new(0.0, -r),
+                Vec2::new(k, -r),
+                Vec2::new(r, -k),
+                Vec2::new(r, 0.0),
+                &mut pts,
+                tol,
+                0,
+            );
+            PolySubPath {
+                points: pts,
+                closed: true,
+            }
+        }
+    }
+}
+
+fn flatten_bezier_vertices(vertices: &[BezierVertex2D], closed: bool, tol_sq: f32) -> PolySubPath {
+    if vertices.is_empty() {
+        return PolySubPath {
+            points: Vec::new(),
+            closed,
+        };
+    }
+    let mut pts = vec![Vec2::from_array(vertices[0].point)];
+    let seg_count = if closed {
+        vertices.len()
+    } else {
+        vertices.len().saturating_sub(1)
+    };
+    for i in 0..seg_count {
+        let a = vertices[i];
+        let b = vertices[(i + 1) % vertices.len()];
+        let p0 = Vec2::from_array(a.point);
+        let p3 = Vec2::from_array(b.point);
+        let h1 = Vec2::from_array(a.out_h);
+        let h2 = Vec2::from_array(b.in_h);
+        if h1.length_squared() <= 1e-10 && h2.length_squared() <= 1e-10 {
+            pts.push(p3);
+        } else {
+            flatten_cubic_bezier(p0, p0 + h1, p3 + h2, p3, &mut pts, tol_sq, 0);
+        }
+    }
+    PolySubPath {
+        points: pts,
+        closed,
+    }
+}
+
+/// Premultiplied source-over blend of `src` (straight color + coverage) onto premultiplied `dst`.
+#[inline]
+fn blend_over_premul(dst: &mut [f32; 4], color: [f32; 4], cov: f32) {
+    let a = (color[3].clamp(0.0, 1.0) * cov.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    if a <= 1e-6 {
+        return;
+    }
+    let inv = 1.0 - a;
+    dst[0] = color[0] * a + dst[0] * inv;
+    dst[1] = color[1] * a + dst[1] * inv;
+    dst[2] = color[2] * a + dst[2] * inv;
+    dst[3] = a + dst[3] * inv;
+}
+
+/// Supersampled scanline polygon fill (even-odd or nonzero winding) in render-target pixels
+/// (top-left origin, `+Y` down) writing premultiplied color over `fb`.
+fn rasterize_fill_subpaths(
+    subpaths: &[PolySubPath],
+    color: [f32; 4],
+    even_odd: bool,
+    width: usize,
+    height: usize,
+    fb: &mut [[f32; 4]],
+) {
+    if width == 0 || height == 0 || color[3] <= 1e-6 {
+        return;
+    }
+    struct Edge {
+        y0: f32,
+        y1: f32,
+        x0: f32,
+        slope: f32,
+        dir: i32,
+    }
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut min_y = height as f32;
+    let mut max_y = 0.0_f32;
+
+    for sp in subpaths {
+        let n = sp.points.len();
+        if n < 3 {
+            continue;
+        }
+        for i in 0..n {
+            let a = sp.points[i];
+            let b = sp.points[(i + 1) % n];
+            if (a.y - b.y).abs() < 1e-7 {
+                continue;
+            }
+            let (top, bot, dir) = if a.y < b.y { (a, b, 1) } else { (b, a, -1) };
+            min_y = min_y.min(top.y);
+            max_y = max_y.max(bot.y);
+            edges.push(Edge {
+                y0: top.y,
+                y1: bot.y,
+                x0: top.x,
+                slope: (bot.x - top.x) / (bot.y - top.y),
+                dir,
+            });
+        }
+    }
+    if edges.is_empty() {
+        return;
+    }
+
+    let y_start = (min_y.floor() as isize).clamp(0, height as isize) as usize;
+    let y_end = (max_y.ceil() as isize).clamp(0, height as isize) as usize;
+    if y_start >= y_end {
+        return;
+    }
+
+    // 4x supersampling on sub-1024px targets, 2x on larger targets for crisp AA + speed.
+    let ss: usize = if width * height <= 512 * 512 { 4 } else { 2 };
+    let inv_ss = 1.0 / (ss as f32);
+    let inv_ss_sq = 1.0 / ((ss * ss) as f32);
+    let mut crossings: Vec<(f32, i32)> = Vec::with_capacity(32);
+    let mut row_cov = vec![0.0_f32; width];
+
+    for y in y_start..y_end {
+        row_cov.fill(0.0);
+        for sy in 0..ss {
+            let sample_y = (y as f32) + ((sy as f32) + 0.5) * inv_ss;
+            crossings.clear();
+            for e in &edges {
+                if sample_y >= e.y0 && sample_y < e.y1 {
+                    let x = e.x0 + (sample_y - e.y0) * e.slope;
+                    crossings.push((x, e.dir));
+                }
+            }
+            if crossings.is_empty() {
+                continue;
+            }
+            crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+            if even_odd {
+                let mut idx = 0;
+                while idx + 1 < crossings.len() {
+                    let x_left = crossings[idx].0;
+                    let x_right = crossings[idx + 1].0;
+                    idx += 2;
+                    let px0 = (x_left.floor() as isize).clamp(0, width as isize) as usize;
+                    let px1 = (x_right.ceil() as isize).clamp(0, width as isize) as usize;
+                    for (px, slot) in row_cov[px0..px1].iter_mut().enumerate() {
+                        let fx = (px0 + px) as f32;
+                        for sx in 0..ss {
+                            let sample_x = fx + ((sx as f32) + 0.5) * inv_ss;
+                            if sample_x >= x_left && sample_x < x_right {
+                                *slot += inv_ss_sq;
+                            }
+                        }
+                    }
+                }
+            } else {
+                let mut winding = 0i32;
+                let mut span_start = 0.0_f32;
+                for &(x, dir) in &crossings {
+                    let prev_in = winding != 0;
+                    winding += dir;
+                    let now_in = winding != 0;
+                    if !prev_in && now_in {
+                        span_start = x;
+                    } else if prev_in && !now_in {
+                        let x_left = span_start;
+                        let x_right = x;
+                        let px0 = (x_left.floor() as isize).clamp(0, width as isize) as usize;
+                        let px1 = (x_right.ceil() as isize).clamp(0, width as isize) as usize;
+                        for (px, slot) in row_cov[px0..px1].iter_mut().enumerate() {
+                            let fx = (px0 + px) as f32;
+                            for sx in 0..ss {
+                                let sample_x = fx + ((sx as f32) + 0.5) * inv_ss;
+                                if sample_x >= x_left && sample_x < x_right {
+                                    *slot += inv_ss_sq;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let row_off = y * width;
+        for (x, &cov) in row_cov.iter().enumerate() {
+            if cov > 0.0 {
+                blend_over_premul(&mut fb[row_off + x], color, cov);
+            }
+        }
+    }
+}
+
+/// Self-overlap-free antialiased SDF stroke rasterizer for flattened polylines in pixel space.
+fn rasterize_stroke_subpaths(
+    subpaths: &[PolySubPath],
+    color: [f32; 4],
+    stroke_width_px: f32,
+    width: usize,
+    height: usize,
+    fb: &mut [[f32; 4]],
+) {
+    if width == 0 || height == 0 || stroke_width_px <= 0.0 || color[3] <= 1e-6 {
+        return;
+    }
+    let half_w = stroke_width_px * 0.5;
+    let margin = half_w + 1.5;
+    let margin_sq = margin * margin;
+
+    // Collect segments with per-segment bounding boxes.
+    let mut segs: Vec<(Vec2, Vec2, f32, f32, f32, f32)> = Vec::new();
+    let mut g_min_x = width as f32;
+    let mut g_max_x = 0.0_f32;
+    let mut g_min_y = height as f32;
+    let mut g_max_y = 0.0_f32;
+    for sp in subpaths {
+        let n = sp.points.len();
+        if n < 2 {
+            continue;
+        }
+        let count = if sp.closed { n } else { n - 1 };
+        for i in 0..count {
+            let a = sp.points[i];
+            let b = sp.points[(i + 1) % n];
+            let min_x = a.x.min(b.x) - margin;
+            let max_x = a.x.max(b.x) + margin;
+            let min_y = a.y.min(b.y) - margin;
+            let max_y = a.y.max(b.y) + margin;
+            g_min_x = g_min_x.min(min_x);
+            g_max_x = g_max_x.max(max_x);
+            g_min_y = g_min_y.min(min_y);
+            g_max_y = g_max_y.max(max_y);
+            segs.push((a, b, min_x, max_x, min_y, max_y));
+        }
+    }
+    if segs.is_empty() {
+        return;
+    }
+
+    let x0 = (g_min_x.floor() as isize).clamp(0, width as isize) as usize;
+    let x1 = (g_max_x.ceil() as isize).clamp(0, width as isize) as usize;
+    let y0 = (g_min_y.floor() as isize).clamp(0, height as isize) as usize;
+    let y1 = (g_max_y.ceil() as isize).clamp(0, height as isize) as usize;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    // Store minimum squared distance per pixel across all segments so overlapping joints never double-blend.
+    let bw = x1 - x0;
+    let bh = y1 - y0;
+    let mut min_dist_sq = vec![f32::INFINITY; bw * bh];
+    for &(a, b, smin_x, smax_x, smin_y, smax_y) in &segs {
+        let sx0 = (smin_x.floor() as isize).clamp(x0 as isize, x1 as isize) as usize;
+        let sx1 = (smax_x.ceil() as isize).clamp(x0 as isize, x1 as isize) as usize;
+        let sy0 = (smin_y.floor() as isize).clamp(y0 as isize, y1 as isize) as usize;
+        let sy1 = (smax_y.ceil() as isize).clamp(y0 as isize, y1 as isize) as usize;
+        for y in sy0..sy1 {
+            let py = y as f32 + 0.5;
+            let row = (y - y0) * bw;
+            for x in sx0..sx1 {
+                let px = x as f32 + 0.5;
+                let d2 = point_to_segment_dist_sq(Vec2::new(px, py), a, b);
+                if d2 < margin_sq {
+                    let slot = &mut min_dist_sq[row + (x - x0)];
+                    if d2 < *slot {
+                        *slot = d2;
+                    }
+                }
+            }
+        }
+    }
+
+    for y in y0..y1 {
+        let fb_row = y * width;
+        let d_row = (y - y0) * bw;
+        for x in x0..x1 {
+            let d2 = min_dist_sq[d_row + (x - x0)];
+            if d2.is_finite() {
+                let cov = (half_w + 0.5 - d2.sqrt()).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    blend_over_premul(&mut fb[fb_row + x], color, cov);
+                }
+            }
+        }
+    }
+}
+
+fn fb_to_rgba8(fb: &[[f32; 4]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(fb.len() * 4);
+    for px in fb {
+        out.push((px[0].clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((px[1].clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((px[2].clamp(0.0, 1.0) * 255.0).round() as u8);
+        out.push((px[3].clamp(0.0, 1.0) * 255.0).round() as u8);
+    }
+    out
+}
+
+fn map_seq_subpaths_to_pixels(
+    subpaths: &[PolySubPath],
+    mat: Mat3,
+    seq_res: [u32; 2],
+    width: u32,
+    height: u32,
+) -> Vec<PolySubPath> {
+    let seq_w = seq_res[0].max(1) as f32;
+    let seq_h = seq_res[1].max(1) as f32;
+    let sx = (width as f32) / seq_w;
+    let sy = (height as f32) / seq_h;
+    let cx = (width as f32) * 0.5;
+    let cy = (height as f32) * 0.5;
+    subpaths
+        .iter()
+        .map(|sp| PolySubPath {
+            points: sp
+                .points
+                .iter()
+                .map(|&p| {
+                    let tp = transform_point_2d(mat, p);
+                    Vec2::new(cx + tp.x * sx, cy - tp.y * sy)
+                })
+                .collect(),
+            closed: sp.closed,
+        })
+        .collect()
+}
+
+fn apply_paint_ops_to_subpaths(
+    pixel_subpaths: &[PolySubPath],
+    ops: &[EvalPaintOp],
+    preview_scale: f32,
+    width: usize,
+    height: usize,
+    fb: &mut [[f32; 4]],
+) {
+    for op in ops {
+        match op {
+            EvalPaintOp::Fill(c) => {
+                rasterize_fill_subpaths(pixel_subpaths, *c, false, width, height, fb);
+            }
+            EvalPaintOp::Stroke(c, w) => {
+                let scaled_w = *w * preview_scale;
+                rasterize_stroke_subpaths(pixel_subpaths, *c, scaled_w, width, height, fb);
+            }
+        }
+    }
+}
+
+fn rasterize_preset_shape_nodes(
     preset: PresetShapeKind,
-    style: &ShapeStyle2D,
+    shapes: &[Shape2DNode],
+    env: &EvalEnv<'_>,
     width: u32,
     height: u32,
 ) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
-    let mut out = vec![0u8; w * h * 4];
-    let cx = (width as f32) * 0.5;
-    let cy = (height as f32) * 0.5;
-    let rx = ((width as f32) * 0.35).max(1.0);
-    let ry = ((height as f32) * 0.35).max(1.0);
+    let mut fb = vec![[0.0_f32; 4]; w * h];
+    let canonical = vec![canonical_preset_subpath(preset)];
+    let preview_scale = ((width as f32) / (env.sequence_resolution[0].max(1) as f32)
+        + (height as f32) / (env.sequence_resolution[1].max(1) as f32))
+        * 0.5;
 
-    for y in 0..h {
-        let py = (y as f32 + 0.5) - cy;
-        for x in 0..w {
-            let px = (x as f32 + 0.5) - cx;
-            let sdf = match preset {
-                PresetShapeKind::Ellipse => {
-                    let nx = px / rx;
-                    let ny = py / ry;
-                    let r = (nx * nx + ny * ny).sqrt();
-                    (r - 1.0) * rx.min(ry)
+    if shapes.is_empty() {
+        let px_paths = map_seq_subpaths_to_pixels(
+            &canonical,
+            Mat3::IDENTITY,
+            env.sequence_resolution,
+            width,
+            height,
+        );
+        apply_paint_ops_to_subpaths(
+            &px_paths,
+            &[EvalPaintOp::Fill([1.0, 1.0, 1.0, 1.0])],
+            preview_scale,
+            w,
+            h,
+            &mut fb,
+        );
+        return fb_to_rgba8(&fb);
+    }
+
+    for node in shapes {
+        let pos = eval_vec2(&node.position, env);
+        let rot = eval_f32(&node.rotation, env);
+        let sc = eval_vec2(&node.scale, env);
+        let mat = cm3_shape_node_mat3(pos, rot, sc);
+        let mut ops: Vec<EvalPaintOp> = node
+            .operations
+            .iter()
+            .map(|op| eval_draw_op(op, env))
+            .collect();
+        if ops.is_empty() {
+            ops.push(EvalPaintOp::Fill([1.0, 1.0, 1.0, 1.0]));
+        }
+        let px_paths =
+            map_seq_subpaths_to_pixels(&canonical, mat, env.sequence_resolution, width, height);
+        apply_paint_ops_to_subpaths(&px_paths, &ops, preview_scale, w, h, &mut fb);
+    }
+    fb_to_rgba8(&fb)
+}
+
+fn rasterize_shape_nodes(
+    shapes: &[Shape2DNode],
+    env: &EvalEnv<'_>,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let mut fb = vec![[0.0_f32; 4]; w * h];
+    let preview_scale = ((width as f32) / (env.sequence_resolution[0].max(1) as f32)
+        + (height as f32) / (env.sequence_resolution[1].max(1) as f32))
+        * 0.5;
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_node(
+        node: &Shape2DNode,
+        parent_mat: Mat3,
+        inherited_ops: &[EvalPaintOp],
+        env: &EvalEnv<'_>,
+        preview_scale: f32,
+        width: u32,
+        height: u32,
+        fb: &mut [[f32; 4]],
+    ) {
+        let pos = eval_vec2(&node.position, env);
+        let rot = eval_f32(&node.rotation, env);
+        let sc = eval_vec2(&node.scale, env);
+        let world_mat = parent_mat * cm3_shape_node_mat3(pos, rot, sc);
+        let mut combined_ops: Vec<EvalPaintOp> = node
+            .operations
+            .iter()
+            .map(|op| eval_draw_op(op, env))
+            .collect();
+        combined_ops.extend_from_slice(inherited_ops);
+
+        match &node.kind {
+            Shape2DKind::Group { children } => {
+                for child in children {
+                    render_node(
+                        child,
+                        world_mat,
+                        &combined_ops,
+                        env,
+                        preview_scale,
+                        width,
+                        height,
+                        fb,
+                    );
                 }
-                PresetShapeKind::Rectangle => {
-                    let dx = px.abs() - rx;
-                    let dy = py.abs() - ry;
-                    dx.max(dy)
+            }
+            Shape2DKind::Path { path } => {
+                let raw_paths = parse_shape2d_path_json(path);
+                if raw_paths.is_empty() {
+                    return;
                 }
+                let px_paths = map_seq_subpaths_to_pixels(
+                    &raw_paths,
+                    world_mat,
+                    env.sequence_resolution,
+                    width,
+                    height,
+                );
+                let ops_slice: &[EvalPaintOp] = if combined_ops.is_empty() {
+                    &[EvalPaintOp::Fill([1.0, 1.0, 1.0, 1.0])]
+                } else {
+                    &combined_ops
+                };
+                apply_paint_ops_to_subpaths(
+                    &px_paths,
+                    ops_slice,
+                    preview_scale,
+                    width as usize,
+                    height as usize,
+                    fb,
+                );
+            }
+        }
+    }
+
+    for node in shapes {
+        render_node(
+            node,
+            Mat3::IDENTITY,
+            &[],
+            env,
+            preview_scale,
+            width,
+            height,
+            &mut fb,
+        );
+    }
+    fb_to_rgba8(&fb)
+}
+
+// ---------------------------------------------------------------------------
+// Shape+ (`zoidium:shape-plus/shape-layer`) Vector Contents Evaluator
+// ---------------------------------------------------------------------------
+
+fn eval_json_anim_number(val: Option<&serde_json::Value>, frame: f64, default: f32) -> f32 {
+    let Some(v) = val else {
+        return default;
+    };
+    if let Some(n) = v.as_f64() {
+        return n as f32;
+    }
+    if let Some(b) = v.as_bool() {
+        return if b { 1.0 } else { 0.0 };
+    }
+    if let Some(s) = v.as_str()
+        && let Ok(n) = s.trim().parse::<f64>()
+    {
+        return n as f32;
+    }
+    if let Some(kfs) = v.get("keyframes").and_then(serde_json::Value::as_array)
+        && !kfs.is_empty()
+    {
+        let mut pts: Vec<(f64, f64)> = kfs
+            .iter()
+            .filter_map(|k| {
+                let f = k.get("frame").and_then(serde_json::Value::as_f64)?;
+                let val = k.get("value").and_then(serde_json::Value::as_f64)?;
+                Some((f, val))
+            })
+            .collect();
+        if !pts.is_empty() {
+            pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if frame <= pts[0].0 {
+                return pts[0].1 as f32;
+            }
+            if frame >= pts[pts.len() - 1].0 {
+                return pts[pts.len() - 1].1 as f32;
+            }
+            for w in pts.windows(2) {
+                if frame <= w[1].0 {
+                    let span = (w[1].0 - w[0].0).max(1e-9);
+                    let u = ((frame - w[0].0) / span).clamp(0.0, 1.0);
+                    return (w[0].1 + (w[1].1 - w[0].1) * u) as f32;
+                }
+            }
+        }
+    }
+    if let Some(inner) = v.get("value") {
+        return eval_json_anim_number(Some(inner), frame, default);
+    }
+    default
+}
+
+fn eval_json_anim_vec2(val: Option<&serde_json::Value>, frame: f64, default: [f32; 2]) -> [f32; 2] {
+    let Some(v) = val else {
+        return default;
+    };
+    if let Some(arr) = v.as_array()
+        && arr.len() >= 2
+    {
+        return [
+            arr[0].as_f64().unwrap_or(f64::from(default[0])) as f32,
+            arr[1].as_f64().unwrap_or(f64::from(default[1])) as f32,
+        ];
+    }
+    if let Some(objs) = v.get("objects").and_then(serde_json::Value::as_array)
+        && objs.len() >= 2
+    {
+        return [
+            eval_json_anim_number(Some(&objs[0]), frame, default[0]),
+            eval_json_anim_number(Some(&objs[1]), frame, default[1]),
+        ];
+    }
+    if let Some(inner) = v.get("value") {
+        return eval_json_anim_vec2(Some(inner), frame, default);
+    }
+    default
+}
+
+fn eval_json_anim_color(
+    val: Option<&serde_json::Value>,
+    frame: f64,
+    default: [f32; 4],
+) -> [f32; 4] {
+    let Some(v) = val else {
+        return default;
+    };
+    if let Some(rgba) = parse_json_rgba(v) {
+        return rgba;
+    }
+    if let Some(objs) = v.get("objects").and_then(serde_json::Value::as_array)
+        && objs.len() >= 3
+    {
+        let r = eval_json_anim_number(Some(&objs[0]), frame, default[0]);
+        let g = eval_json_anim_number(Some(&objs[1]), frame, default[1]);
+        let b = eval_json_anim_number(Some(&objs[2]), frame, default[2]);
+        let a = objs.get(3).map_or(default[3], |o| {
+            eval_json_anim_number(Some(o), frame, default[3])
+        });
+        let scale = if r > 1.0 || g > 1.0 || b > 1.0 {
+            1.0 / 255.0
+        } else {
+            1.0
+        };
+        return [
+            (r * scale).clamp(0.0, 1.0),
+            (g * scale).clamp(0.0, 1.0),
+            (b * scale).clamp(0.0, 1.0),
+            a.clamp(0.0, 1.0),
+        ];
+    }
+    if let Some(inner) = v.get("value") {
+        return eval_json_anim_color(Some(inner), frame, default);
+    }
+    default
+}
+
+fn eval_json_anim_f32_array(val: Option<&serde_json::Value>, frame: f64) -> Vec<f32> {
+    let Some(v) = val else {
+        return Vec::new();
+    };
+    if let Some(arr) = v.as_array() {
+        return arr
+            .iter()
+            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+            .collect();
+    }
+    if let Some(objs) = v.get("objects").and_then(serde_json::Value::as_array) {
+        return objs
+            .iter()
+            .map(|o| eval_json_anim_number(Some(o), frame, 0.0))
+            .collect();
+    }
+    if let Some(kfs) = v.get("keyframes").and_then(serde_json::Value::as_array)
+        && !kfs.is_empty()
+    {
+        let mut pts: Vec<(f64, Vec<f32>)> = kfs
+            .iter()
+            .filter_map(|k| {
+                let f = k.get("frame").and_then(serde_json::Value::as_f64)?;
+                let arr = k.get("value").and_then(serde_json::Value::as_array)?;
+                Some((
+                    f,
+                    arr.iter()
+                        .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                        .collect(),
+                ))
+            })
+            .collect();
+        if !pts.is_empty() {
+            pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if frame <= pts[0].0 {
+                return pts[0].1.clone();
+            }
+            if frame >= pts[pts.len() - 1].0 {
+                return pts[pts.len() - 1].1.clone();
+            }
+            for w in pts.windows(2) {
+                if frame <= w[1].0 {
+                    let span = (w[1].0 - w[0].0).max(1e-9);
+                    let u = ((frame - w[0].0) / span).clamp(0.0, 1.0) as f32;
+                    let len = w[0].1.len().min(w[1].1.len());
+                    return (0..len)
+                        .map(|i| w[0].1[i] + (w[1].1[i] - w[0].1[i]) * u)
+                        .collect();
+                }
+            }
+        }
+    }
+    if let Some(inner) = v.get("value") {
+        return eval_json_anim_f32_array(Some(inner), frame);
+    }
+    Vec::new()
+}
+
+fn shape_plus_group_mat3(props: Option<&serde_json::Value>, frame: f64) -> Mat3 {
+    let pos = eval_json_anim_vec2(props.and_then(|p| p.get("position")), frame, [0.0, 0.0]);
+    let anchor = eval_json_anim_vec2(props.and_then(|p| p.get("anchor")), frame, [0.0, 0.0]);
+    let scale = eval_json_anim_vec2(props.and_then(|p| p.get("scale")), frame, [1.0, 1.0]);
+    let rot = eval_json_anim_number(props.and_then(|p| p.get("rotation")), frame, 0.0);
+    zc_geom::Transform2D {
+        position: Vec2::from_array(pos),
+        rotation: rot,
+        scale: Vec2::from_array(scale),
+        anchor: Vec2::from_array(anchor),
+    }
+    .to_mat3()
+}
+
+fn shape_plus_primitive_subpath(item: &serde_json::Value, frame: f64) -> Option<PolySubPath> {
+    let kind = item.get("kind").and_then(serde_json::Value::as_str)?;
+    let props = item.get("properties");
+    let center = eval_json_anim_vec2(props.and_then(|p| p.get("position")), frame, [0.0, 0.0]);
+    let tol_sq = 0.04_f32;
+
+    let mut verts: Vec<BezierVertex2D> = Vec::new();
+    let mut closed = true;
+    match kind {
+        "rectangle" => {
+            let sz = eval_json_anim_vec2(props.and_then(|p| p.get("size")), frame, [200.0, 200.0]);
+            let hw = sz[0].abs() * 0.5;
+            let hh = sz[1].abs() * 0.5;
+            let r = eval_json_anim_number(props.and_then(|p| p.get("roundness")), frame, 0.0)
+                .clamp(0.0, hw.min(hh));
+            let k = 0.552_284_8_f32 * r;
+            if r <= 1e-4 {
+                for pt in [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]] {
+                    verts.push(BezierVertex2D {
+                        point: [pt[0] + center[0], pt[1] + center[1]],
+                        in_h: [0.0, 0.0],
+                        out_h: [0.0, 0.0],
+                    });
+                }
+            } else {
+                let raw = [
+                    ([-hw + r, -hh], [-k, 0.0], [0.0, 0.0]),
+                    ([hw - r, -hh], [0.0, 0.0], [k, 0.0]),
+                    ([hw, -hh + r], [0.0, -k], [0.0, 0.0]),
+                    ([hw, hh - r], [0.0, 0.0], [0.0, k]),
+                    ([hw - r, hh], [k, 0.0], [0.0, 0.0]),
+                    ([-hw + r, hh], [0.0, 0.0], [-k, 0.0]),
+                    ([-hw, hh - r], [0.0, k], [0.0, 0.0]),
+                    ([-hw, -hh + r], [0.0, 0.0], [0.0, -k]),
+                ];
+                for (pt, inh, outh) in raw {
+                    verts.push(BezierVertex2D {
+                        point: [pt[0] + center[0], pt[1] + center[1]],
+                        in_h: inh,
+                        out_h: outh,
+                    });
+                }
+            }
+        }
+        "ellipse" => {
+            let sz = eval_json_anim_vec2(props.and_then(|p| p.get("size")), frame, [200.0, 200.0]);
+            let rx = sz[0].abs() * 0.5;
+            let ry = sz[1].abs() * 0.5;
+            let k = 0.552_284_8_f32;
+            let raw = [
+                ([rx, 0.0], [0.0, -ry * k], [0.0, ry * k]),
+                ([0.0, ry], [rx * k, 0.0], [-rx * k, 0.0]),
+                ([-rx, 0.0], [0.0, ry * k], [0.0, -ry * k]),
+                ([0.0, -ry], [-rx * k, 0.0], [rx * k, 0.0]),
+            ];
+            for (pt, inh, outh) in raw {
+                verts.push(BezierVertex2D {
+                    point: [pt[0] + center[0], pt[1] + center[1]],
+                    in_h: inh,
+                    out_h: outh,
+                });
+            }
+        }
+        "polystar" => {
+            let count = eval_json_anim_number(props.and_then(|p| p.get("points")), frame, 5.0)
+                .round()
+                .clamp(3.0, 128.0) as usize;
+            let is_star = props
+                .and_then(|p| p.get("mode"))
+                .and_then(serde_json::Value::as_str)
+                != Some("polygon");
+            let outer_r =
+                eval_json_anim_number(props.and_then(|p| p.get("outerRadius")), frame, 100.0);
+            let inner_r =
+                eval_json_anim_number(props.and_then(|p| p.get("innerRadius")), frame, 50.0);
+            let rot = eval_json_anim_number(props.and_then(|p| p.get("rotation")), frame, 0.0);
+            let n = count * if is_star { 2 } else { 1 };
+            for i in 0..n {
+                let theta = rot + std::f32::consts::FRAC_PI_2 + (i as f32 / n as f32) * TAU;
+                let r = if is_star && i % 2 == 1 {
+                    inner_r
+                } else {
+                    outer_r
+                };
+                verts.push(BezierVertex2D {
+                    point: [center[0] + r * theta.cos(), center[1] + r * theta.sin()],
+                    in_h: [0.0, 0.0],
+                    out_h: [0.0, 0.0],
+                });
+            }
+        }
+        "path" => {
+            let values = eval_json_anim_f32_array(props.and_then(|p| p.get("path")), frame);
+            let num_verts = item
+                .get("vertexIds")
+                .and_then(serde_json::Value::as_array)
+                .map_or(values.len() / 6, |a| a.len());
+            for i in 0..num_verts {
+                let base = i * 6;
+                if base + 5 < values.len() {
+                    verts.push(BezierVertex2D {
+                        point: [values[base], values[base + 1]],
+                        in_h: [values[base + 2], values[base + 3]],
+                        out_h: [values[base + 4], values[base + 5]],
+                    });
+                }
+            }
+            closed = eval_json_anim_number(props.and_then(|p| p.get("closed")), frame, 1.0) >= 0.5;
+        }
+        _ => return None,
+    }
+    Some(flatten_bezier_vertices(&verts, closed, tol_sq))
+}
+
+fn trim_subpath(
+    sp: &PolySubPath,
+    start_pct: f32,
+    end_pct: f32,
+    offset_rad: f32,
+) -> Option<PolySubPath> {
+    if sp.points.len() < 2 {
+        return None;
+    }
+    let s = (start_pct / 100.0).clamp(0.0, 1.0);
+    let e = (end_pct / 100.0).clamp(0.0, 1.0);
+    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+    if (hi - lo) <= 1e-5 {
+        return None;
+    }
+    if (lo <= 1e-5) && (hi >= 1.0 - 1e-5) && offset_rad.abs() <= 1e-5 {
+        return Some(sp.clone());
+    }
+    let mut ring = sp.points.clone();
+    if sp.closed && ring.last() != ring.first() {
+        ring.push(ring[0]);
+    }
+    let mut lengths = vec![0.0_f32; ring.len()];
+    for i in 1..ring.len() {
+        lengths[i] = lengths[i - 1] + ring[i].distance(ring[i - 1]);
+    }
+    let total = *lengths.last().unwrap_or(&0.0);
+    if total <= 1e-6 {
+        return None;
+    }
+    let off = (offset_rad / TAU).rem_euclid(1.0);
+    let d0 = ((lo + off).rem_euclid(1.0)) * total;
+    let d1 = ((hi + off).rem_euclid(1.0)) * total;
+    let sample = |dist: f32| -> Vec2 {
+        let clamped = dist.clamp(0.0, total);
+        for i in 1..lengths.len() {
+            if clamped <= lengths[i] {
+                let seg = (lengths[i] - lengths[i - 1]).max(1e-6);
+                let t = ((clamped - lengths[i - 1]) / seg).clamp(0.0, 1.0);
+                return ring[i - 1].lerp(ring[i], t);
+            }
+        }
+        *ring.last().unwrap()
+    };
+    let mut out = Vec::new();
+    let emit_span = |a: f32, b: f32, dst: &mut Vec<Vec2>| {
+        dst.push(sample(a));
+        for (idx, &len) in lengths.iter().enumerate() {
+            if len > a && len < b {
+                dst.push(ring[idx]);
+            }
+        }
+        dst.push(sample(b));
+    };
+    if d0 <= d1 {
+        emit_span(d0, d1, &mut out);
+    } else {
+        emit_span(d0, total, &mut out);
+        emit_span(0.0, d1, &mut out);
+    }
+    Some(PolySubPath {
+        points: out,
+        closed: false,
+    })
+}
+
+fn rasterize_shape_plus_payload(
+    payload: &serde_json::Value,
+    env: &EvalEnv<'_>,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let mut fb = vec![[0.0_f32; 4]; w * h];
+    let Some(contents) = payload
+        .get("contents")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return fb_to_rgba8(&fb);
+    };
+    let preview_scale = ((width as f32) / (env.sequence_resolution[0].max(1) as f32)
+        + (height as f32) / (env.sequence_resolution[1].max(1) as f32))
+        * 0.5;
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_contents(
+        items: &[serde_json::Value],
+        mat: Mat3,
+        opacity_mult: f32,
+        env: &EvalEnv<'_>,
+        preview_scale: f32,
+        width: u32,
+        height: u32,
+        fb: &mut [[f32; 4]],
+    ) {
+        let mut paths: Vec<PolySubPath> = Vec::new();
+        for item in items {
+            let Some(kind) = item.get("kind").and_then(serde_json::Value::as_str) else {
+                continue;
             };
-            let px_col = shade_sdf_pixel(sdf, style);
-            let idx = (y * w + x) * 4;
-            out[idx..idx + 4].copy_from_slice(&px_col);
+            let props = item.get("properties");
+            match kind {
+                "rectangle" | "ellipse" | "polystar" | "path" => {
+                    if let Some(sp) = shape_plus_primitive_subpath(item, env.frame) {
+                        paths.push(sp);
+                    }
+                }
+                "trim" => {
+                    let s =
+                        eval_json_anim_number(props.and_then(|p| p.get("start")), env.frame, 0.0);
+                    let e =
+                        eval_json_anim_number(props.and_then(|p| p.get("end")), env.frame, 100.0);
+                    let off =
+                        eval_json_anim_number(props.and_then(|p| p.get("offset")), env.frame, 0.0);
+                    paths = paths
+                        .iter()
+                        .filter_map(|sp| trim_subpath(sp, s, e, off))
+                        .collect();
+                }
+                "group" => {
+                    let gmat = mat * shape_plus_group_mat3(props, env.frame);
+                    let gop =
+                        eval_json_anim_number(props.and_then(|p| p.get("opacity")), env.frame, 1.0)
+                            .clamp(0.0, 1.0);
+                    if let Some(sub) = item.get("contents").and_then(serde_json::Value::as_array) {
+                        render_contents(
+                            sub,
+                            gmat,
+                            opacity_mult * gop,
+                            env,
+                            preview_scale,
+                            width,
+                            height,
+                            fb,
+                        );
+                    }
+                }
+                "fill" | "gradientFill" => {
+                    if paths.is_empty() {
+                        continue;
+                    }
+                    let mut col = eval_json_anim_color(
+                        props.and_then(|p| p.get("color")),
+                        env.frame,
+                        [1.0, 1.0, 1.0, 1.0],
+                    );
+                    let op =
+                        eval_json_anim_number(props.and_then(|p| p.get("opacity")), env.frame, 1.0)
+                            .clamp(0.0, 1.0);
+                    col[3] = (col[3] * op * opacity_mult).clamp(0.0, 1.0);
+                    let even_odd = props
+                        .and_then(|p| p.get("fillRule"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("even-odd");
+                    let px_paths = map_seq_subpaths_to_pixels(
+                        &paths,
+                        mat,
+                        env.sequence_resolution,
+                        width,
+                        height,
+                    );
+                    rasterize_fill_subpaths(
+                        &px_paths,
+                        col,
+                        even_odd,
+                        width as usize,
+                        height as usize,
+                        fb,
+                    );
+                }
+                "stroke" | "gradientStroke" => {
+                    if paths.is_empty() {
+                        continue;
+                    }
+                    let mut col = eval_json_anim_color(
+                        props.and_then(|p| p.get("color")),
+                        env.frame,
+                        [1.0, 1.0, 1.0, 1.0],
+                    );
+                    let op =
+                        eval_json_anim_number(props.and_then(|p| p.get("opacity")), env.frame, 1.0)
+                            .clamp(0.0, 1.0);
+                    let sw =
+                        eval_json_anim_number(props.and_then(|p| p.get("width")), env.frame, 2.0)
+                            .max(0.0);
+                    col[3] = (col[3] * op * opacity_mult).clamp(0.0, 1.0);
+                    let px_paths = map_seq_subpaths_to_pixels(
+                        &paths,
+                        mat,
+                        env.sequence_resolution,
+                        width,
+                        height,
+                    );
+                    rasterize_stroke_subpaths(
+                        &px_paths,
+                        col,
+                        sw * preview_scale,
+                        width as usize,
+                        height as usize,
+                        fb,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    render_contents(
+        contents,
+        Mat3::IDENTITY,
+        1.0,
+        env,
+        preview_scale,
+        width,
+        height,
+        &mut fb,
+    );
+    fb_to_rgba8(&fb)
+}
+
+// ---------------------------------------------------------------------------
+// Exact 2D Euclidean Distance Transform (Felzenszwalb-Huttenlocher O(W*H))
+// Used for Text2D DrawOp::Stroke and zoidiumMasks SDF expansion.
+// ---------------------------------------------------------------------------
+
+fn edt_1d(f: &[f32], d: &mut [f32], v: &mut [usize], z: &mut [f32]) {
+    let n = f.len();
+    if n == 0 {
+        return;
+    }
+    let mut k = 0usize;
+    v[0] = 0;
+    z[0] = f32::NEG_INFINITY;
+    z[1] = f32::INFINITY;
+
+    for q in 1..n {
+        let fq = f[q];
+        loop {
+            let vk = v[k];
+            let s = ((fq + (q * q) as f32) - (f[vk] + (vk * vk) as f32))
+                / (2.0 * (q as f32 - vk as f32));
+            if s <= z[k] {
+                if k == 0 {
+                    break;
+                }
+                k -= 1;
+            } else {
+                k += 1;
+                v[k] = q;
+                z[k] = s;
+                z[k + 1] = f32::INFINITY;
+                break;
+            }
+        }
+    }
+
+    k = 0;
+    for (q, dq) in d.iter_mut().enumerate().take(n) {
+        let qf = q as f32;
+        while z[k + 1] < qf {
+            k += 1;
+        }
+        let dx = qf - (v[k] as f32);
+        *dq = dx * dx + f[v[k]];
+    }
+}
+
+/// Computes exact 2D Euclidean distance to `true` cells in `mask` (`width * height`).
+fn compute_edt_2d(mask: &[bool], width: usize, height: usize) -> Vec<f32> {
+    const INF: f32 = 1e12;
+    let mut grid = vec![INF; width * height];
+    for (dst, &m) in grid.iter_mut().zip(mask.iter()) {
+        if m {
+            *dst = 0.0;
+        }
+    }
+    let max_dim = width.max(height).max(1);
+    let mut f_buf = vec![0.0_f32; max_dim];
+    let mut d_buf = vec![0.0_f32; max_dim];
+    let mut v_buf = vec![0usize; max_dim];
+    let mut z_buf = vec![0.0_f32; max_dim + 1];
+
+    // Columns
+    for x in 0..width {
+        for y in 0..height {
+            f_buf[y] = grid[y * width + x];
+        }
+        edt_1d(
+            &f_buf[..height],
+            &mut d_buf[..height],
+            &mut v_buf[..height],
+            &mut z_buf[..=height],
+        );
+        for y in 0..height {
+            grid[y * width + x] = d_buf[y];
+        }
+    }
+    // Rows
+    for y in 0..height {
+        let row = &mut grid[y * width..(y + 1) * width];
+        f_buf[..width].copy_from_slice(row);
+        edt_1d(
+            &f_buf[..width],
+            &mut d_buf[..width],
+            &mut v_buf[..width],
+            &mut z_buf[..=width],
+        );
+        for x in 0..width {
+            row[x] = d_buf[x].sqrt();
+        }
+    }
+    grid
+}
+
+/// Computes signed distance (`> 0` inside, `< 0` outside) from a binary coverage plane.
+fn compute_signed_distance_2d(inside: &[bool], width: usize, height: usize) -> Vec<f32> {
+    let dist_to_inside = compute_edt_2d(inside, width, height);
+    let outside: Vec<bool> = inside.iter().map(|&b| !b).collect();
+    let dist_to_outside = compute_edt_2d(&outside, width, height);
+    let mut sdf = Vec::with_capacity(inside.len());
+    for i in 0..inside.len() {
+        if inside[i] {
+            sdf.push((dist_to_outside[i] - 0.5).max(0.0));
+        } else {
+            sdf.push(-(dist_to_inside[i] - 0.5).max(0.0));
+        }
+    }
+    sdf
+}
+
+fn shade_silhouette_with_paint_ops(
+    silhouette_rgba: &[u8],
+    width: usize,
+    height: usize,
+    paint_ops: &[EvalPaintOp],
+    preview_scale: f32,
+) -> Vec<u8> {
+    let n = width * height;
+    let mut inside = vec![false; n];
+    let mut fill_cov = vec![0.0_f32; n];
+    for (i, px) in silhouette_rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+        .take(n)
+    {
+        let cov = f32::from(px[3]) / 255.0;
+        fill_cov[i] = cov;
+        inside[i] = cov >= 0.5;
+    }
+    let sdf = compute_signed_distance_2d(&inside, width, height);
+    let mut fb = vec![[0.0_f32; 4]; n];
+
+    for op in paint_ops {
+        match op {
+            EvalPaintOp::Fill(c) => {
+                for i in 0..n {
+                    if fill_cov[i] > 0.0 {
+                        blend_over_premul(&mut fb[i], *c, fill_cov[i]);
+                    }
+                }
+            }
+            EvalPaintOp::Stroke(c, stroke_w) => {
+                let scaled_w = (*stroke_w * preview_scale).max(0.0);
+                if scaled_w <= 0.0 || c[3] <= 1e-6 {
+                    continue;
+                }
+                let half = scaled_w * 0.5;
+                for i in 0..n {
+                    let cov = (half + 0.5 - sdf[i].abs()).clamp(0.0, 1.0);
+                    if cov > 0.0 {
+                        blend_over_premul(&mut fb[i], *c, cov);
+                    }
+                }
+            }
+        }
+    }
+    fb_to_rgba8(&fb)
+}
+
+// ---------------------------------------------------------------------------
+// Zoidium Layer Masks (`zoidiumMasks`) Evaluator & Rasterizer (P6 P0)
+// ---------------------------------------------------------------------------
+
+fn evaluate_zoidium_masks(
+    arr: &[serde_json::Value],
+    env: &EvalEnv<'_>,
+) -> Vec<EvaluatedZoidiumMask> {
+    let mut out = Vec::new();
+    for item in arr.iter().take(32) {
+        let props = item.get("properties").unwrap_or(item);
+        let enabled = eval_json_anim_number(
+            props.get("enabled").or_else(|| item.get("enabled")),
+            env.frame,
+            1.0,
+        );
+        if enabled < 0.5 {
+            continue;
+        }
+        let closed = eval_json_anim_number(
+            props.get("closed").or_else(|| item.get("closed")),
+            env.frame,
+            1.0,
+        ) >= 0.5;
+        let mode = props
+            .get("mode")
+            .or_else(|| item.get("mode"))
+            .and_then(|v| {
+                v.as_str()
+                    .or_else(|| v.get("value").and_then(serde_json::Value::as_str))
+            })
+            .unwrap_or("add")
+            .to_ascii_lowercase();
+        let feather = eval_json_anim_number(
+            props.get("feather").or_else(|| item.get("feather")),
+            env.frame,
+            0.0,
+        )
+        .clamp(0.0, 500.0);
+        let expansion = eval_json_anim_number(
+            props.get("expansion").or_else(|| item.get("expansion")),
+            env.frame,
+            0.0,
+        )
+        .clamp(-128.0, 128.0);
+        let opacity = eval_json_anim_number(
+            props.get("opacity").or_else(|| item.get("opacity")),
+            env.frame,
+            1.0,
+        )
+        .clamp(0.0, 1.0);
+        let invert = eval_json_anim_number(
+            props.get("invert").or_else(|| item.get("invert")),
+            env.frame,
+            0.0,
+        ) >= 0.5;
+
+        let mut vertices = Vec::new();
+        if let Some(verts_arr) = item.get("vertices").and_then(serde_json::Value::as_array) {
+            for v in verts_arr.iter().take(256) {
+                let p = eval_json_anim_vec2(v.get("point"), env.frame, [0.0, 0.0]);
+                let inh = eval_json_anim_vec2(v.get("in"), env.frame, [0.0, 0.0]);
+                let outh = eval_json_anim_vec2(v.get("out"), env.frame, [0.0, 0.0]);
+                vertices.push(BezierVertex2D {
+                    point: p,
+                    in_h: inh,
+                    out_h: outh,
+                });
+            }
+        } else {
+            let flat =
+                eval_json_anim_f32_array(props.get("path").or_else(|| item.get("path")), env.frame);
+            let vcount = item
+                .get("vertexIds")
+                .and_then(serde_json::Value::as_array)
+                .map_or(flat.len() / 6, |a| a.len())
+                .min(256);
+            for i in 0..vcount {
+                let b = i * 6;
+                if b + 5 < flat.len() {
+                    vertices.push(BezierVertex2D {
+                        point: [flat[b], flat[b + 1]],
+                        in_h: [flat[b + 2], flat[b + 3]],
+                        out_h: [flat[b + 4], flat[b + 5]],
+                    });
+                }
+            }
+        }
+
+        out.push(EvaluatedZoidiumMask {
+            vertices,
+            closed,
+            mode,
+            feather,
+            expansion,
+            opacity,
+            invert,
+        });
+    }
+    out
+}
+
+fn fill_polygon_even_odd_plane(points: &[Vec2], width: usize, height: usize, alpha: &mut [f32]) {
+    if points.len() < 3 {
+        return;
+    }
+    let mut edges: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(points.len());
+    for i in 0..points.len() {
+        let a = points[i];
+        let b = points[(i + 1) % points.len()];
+        if (a.y - b.y).abs() < 1e-7 {
+            continue;
+        }
+        let (top, bot) = if a.y < b.y { (a, b) } else { (b, a) };
+        edges.push((top.y, bot.y, top.x, (bot.x - top.x) / (bot.y - top.y)));
+    }
+    let mut crossings = Vec::with_capacity(16);
+    for y in 0..height {
+        let sy = y as f32 + 0.5;
+        crossings.clear();
+        for &(y0, y1, x0, slope) in &edges {
+            if sy >= y0 && sy < y1 {
+                crossings.push(x0 + (sy - y0) * slope);
+            }
+        }
+        if crossings.is_empty() {
+            continue;
+        }
+        crossings.sort_by(f32::total_cmp);
+        let row = y * width;
+        let mut idx = 0;
+        while idx + 1 < crossings.len() {
+            let x0 = ((crossings[idx] - 0.5).ceil() as isize).max(0) as usize;
+            let x1 = ((crossings[idx + 1] - 0.5).floor() as isize).min(width as isize - 1);
+            if x1 >= x0 as isize {
+                for x in x0..=(x1 as usize) {
+                    alpha[row + x] = 1.0;
+                }
+            }
+            idx += 2;
+        }
+    }
+}
+
+/// Sliding-window clamped box blur matching Zoidium `mask-raster.js:76-111`.
+fn mask_box_blur_1d(
+    src: &[f32],
+    width: usize,
+    height: usize,
+    radius: usize,
+    transpose: bool,
+) -> Vec<f32> {
+    if radius == 0 || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let major = if transpose { height } else { width };
+    let minor = if transpose { width } else { height };
+    let window = (2 * radius + 1) as f32;
+    let r = radius as isize;
+    let mut out = vec![0.0_f32; src.len()];
+    let get = |m: usize, i: isize| -> f32 {
+        let clamped = i.clamp(0, major as isize - 1) as usize;
+        if transpose {
+            src[clamped * width + m]
+        } else {
+            src[m * width + clamped]
+        }
+    };
+    for m in 0..minor {
+        let mut sum = 0.0_f32;
+        for k in -r..=r {
+            sum += get(m, k);
+        }
+        for i in 0..major {
+            let val = sum / window;
+            if transpose {
+                out[i * width + m] = val;
+            } else {
+                out[m * width + i] = val;
+            }
+            sum += get(m, i as isize + r + 1) - get(m, i as isize - r);
         }
     }
     out
 }
 
-fn rasterize_shape_nodes(
-    _shapes: &[Shape2DNode],
-    style: &ShapeStyle2D,
-    _env: &EvalEnv<'_>,
+fn mask_feather_3pass(mut channel: Vec<f32>, width: usize, height: usize, radius: f32) -> Vec<f32> {
+    let clamped = (radius.round() as isize).clamp(0, width.max(height) as isize) as usize;
+    if clamped == 0 {
+        return channel;
+    }
+    for _ in 0..3 {
+        channel = mask_box_blur_1d(&channel, width, height, clamped, false);
+        channel = mask_box_blur_1d(&channel, width, height, clamped, true);
+    }
+    channel
+}
+
+fn combine_mask_value(base: f32, alpha: f32, mode: &str, is_first: bool) -> f32 {
+    if is_first {
+        return if mode == "subtract" { 0.0 } else { alpha };
+    }
+    match mode {
+        "add" => base + alpha * (1.0 - base),
+        "subtract" => base * (1.0 - alpha),
+        _ => base.min(alpha),
+    }
+}
+
+/// Rasterizes evaluated `zoidiumMasks` into RGBA8 `[cov, cov, cov, cov]` following Zoidium's
+/// exact pipeline: fill/expand -> 3-pass box feather -> opacity -> invert -> ordered combine.
+fn rasterize_zoidium_masks_rgba8(
+    masks: &[EvaluatedZoidiumMask],
+    seq_res: [u32; 2],
     width: u32,
     height: u32,
 ) -> Vec<u8> {
-    rasterize_preset_shape(PresetShapeKind::Rectangle, style, width, height)
-}
+    let w = width as usize;
+    let h = height as usize;
+    let sx = (width as f32) / (seq_res[0].max(1) as f32);
+    let sy = (height as f32) / (seq_res[1].max(1) as f32);
+    let scale = (sx + sy) * 0.5;
+    let mut coverage = vec![0.0_f32; w * h];
+    let mut first = true;
 
-fn shade_sdf_pixel(sdf: f32, style: &ShapeStyle2D) -> [u8; 4] {
-    let mut col = [0.0_f32; 4]; // premultiplied RGBA
+    for mask in masks {
+        let mut scratch = vec![0.0_f32; w * h];
+        if mask.vertices.len() >= 2 {
+            // Scale mask vertices from top-left Y-down sequence pixels to target pixels.
+            let scaled_verts: Vec<BezierVertex2D> = mask
+                .vertices
+                .iter()
+                .map(|v| BezierVertex2D {
+                    point: [v.point[0] * sx, v.point[1] * sy],
+                    in_h: [v.in_h[0] * sx, v.in_h[1] * sy],
+                    out_h: [v.out_h[0] * sx, v.out_h[1] * sy],
+                })
+                .collect();
+            // Auto-close open paths for fill coverage (`mask-raster.js:30-35`).
+            let flat = flatten_bezier_vertices(&scaled_verts, true, 0.0625);
+            fill_polygon_even_odd_plane(&flat.points, w, h, &mut scratch);
 
-    if let Some(fill) = style.fill {
-        let cov = (0.5 - sdf).clamp(0.0, 1.0);
-        let a = fill[3].clamp(0.0, 1.0) * cov;
-        col = [fill[0] * a, fill[1] * a, fill[2] * a, a];
+            if mask.expansion.abs() > 1e-4 {
+                let inside: Vec<bool> = scratch.iter().map(|&v| v >= 0.5).collect();
+                let sdf = compute_signed_distance_2d(&inside, w, h);
+                let exp_px = mask.expansion * scale;
+                for (slot, &sd) in scratch.iter_mut().zip(sdf.iter()) {
+                    *slot = (0.5 + sd + exp_px).clamp(0.0, 1.0);
+                }
+            }
+        }
+
+        let channel = if mask.feather > 0.0 {
+            mask_feather_3pass(scratch, w, h, mask.feather * scale)
+        } else {
+            scratch
+        };
+
+        for (cov_slot, &ch) in coverage.iter_mut().zip(channel.iter()) {
+            let mut alpha = ch * mask.opacity;
+            // P6 P0: `invert` happens AFTER `opacity` (matching `mask-raster.js:146-147`).
+            if mask.invert {
+                alpha = 1.0 - alpha;
+            }
+            alpha = alpha.clamp(0.0, 1.0);
+            *cov_slot = combine_mask_value(*cov_slot, alpha, &mask.mode, first);
+        }
+        first = false;
     }
 
-    if let Some((stroke, stroke_w)) = style.stroke
-        && stroke_w > 0.0
-    {
-        let half = stroke_w * 0.5;
-        let cov = (half + 0.5 - sdf.abs()).clamp(0.0, 1.0);
-        let sa = stroke[3].clamp(0.0, 1.0) * cov;
-        let sr = stroke[0] * sa;
-        let sg = stroke[1] * sa;
-        let sb = stroke[2] * sa;
-        let inv = 1.0 - sa;
-        col = [
-            sr + col[0] * inv,
-            sg + col[1] * inv,
-            sb + col[2] * inv,
-            sa + col[3] * inv,
-        ];
+    let mut out = Vec::with_capacity(w * h * 4);
+    for c in coverage {
+        let b = (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        out.extend_from_slice(&[b, b, b, b]);
     }
-
-    [
-        (col[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-        (col[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-        (col[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-        (col[3].clamp(0.0, 1.0) * 255.0).round() as u8,
-    ]
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -4995,11 +10783,53 @@ fn count_non_black_rgb_pixels(rgba: &[u8]) -> usize {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
+    fn test_eval_env<'a>(
+        project: &'a Project,
+        plugins: &'a PluginRegistry,
+        controls: &'a RefCell<BTreeMap<String, ExprValue>>,
+        parent_props: &'a BTreeMap<String, ExprValue>,
+        expr_stack: &'a RefCell<HashSet<String>>,
+        frame: f64,
+        time: f64,
+        fps: f64,
+    ) -> EvalEnv<'a> {
+        EvalEnv {
+            frame,
+            abs_frame: frame,
+            time,
+            fps,
+            sequence_resolution: project.sequence.resolution,
+            project,
+            sequence: &project.sequence,
+            plugins,
+            controls,
+            parent_props,
+            active_clip_id: project
+                .sequence
+                .video_tracks
+                .first()
+                .and_then(|t| t.clips.first())
+                .map(|c| c.id),
+            active_layer_id: project
+                .sequence
+                .video_tracks
+                .first()
+                .and_then(|t| t.clips.first())
+                .map(|c| c.layer.id),
+            active_object_id: None,
+            active_effect_id: None,
+            active_property_id: None,
+            expr_stack,
+        }
+    }
+
     #[test]
     fn property_track_evaluates_keyframes_bezier_and_expression_modes() {
         let project = Project::new_cm3_default();
-        let controls = BTreeMap::new();
+        let controls = RefCell::new(BTreeMap::new());
         let props = BTreeMap::new();
+        let stack = RefCell::new(HashSet::new());
 
         // Linear keyframe track: 0 -> 100 across frames 0..=10
         let mut linear = PropertyTrack::number(0.0);
@@ -5010,16 +10840,16 @@ mod tests {
         ];
 
         let plus_plugins = PluginRegistry::new();
-        let env_mid = EvalEnv {
-            frame: 5.0,
-            time: 5.0 / 30.0,
-            fps: 30.0,
-            sequence_resolution: project.sequence.resolution,
-            project: &project,
-            plugins: &plus_plugins,
-            controls: &controls,
-            parent_props: &props,
-        };
+        let env_mid = test_eval_env(
+            &project,
+            &plus_plugins,
+            &controls,
+            &props,
+            &stack,
+            5.0,
+            5.0 / 30.0,
+            30.0,
+        );
         assert!((eval_f64(&linear, &env_mid) - 50.0).abs() < 1e-6);
 
         // Expression using `const` succeeds with Expressions+ enabled, falls back to base
@@ -5030,16 +10860,16 @@ mod tests {
 
         let mut vanilla_plugins = PluginRegistry::new();
         vanilla_plugins.disable_all_optional();
-        let env_vanilla = EvalEnv {
-            frame: 5.0,
-            time: 5.0 / 30.0,
-            fps: 30.0,
-            sequence_resolution: project.sequence.resolution,
-            project: &project,
-            plugins: &vanilla_plugins,
-            controls: &controls,
-            parent_props: &props,
-        };
+        let env_vanilla = test_eval_env(
+            &project,
+            &vanilla_plugins,
+            &controls,
+            &props,
+            &stack,
+            5.0,
+            5.0 / 30.0,
+            30.0,
+        );
         let vanilla_val = eval_f64(&expr_track, &env_vanilla);
         assert!((vanilla_val - 42.0).abs() < 1e-6);
     }
@@ -5268,8 +11098,9 @@ mod tests {
     fn bezier_keyframe_segment_evaluates_persisted_control_points() {
         let project = Project::new_cm3_default();
         let plugins = PluginRegistry::new();
-        let controls = BTreeMap::new();
+        let controls = RefCell::new(BTreeMap::new());
         let parent_props = BTreeMap::new();
+        let stack = RefCell::new(HashSet::new());
         let bezier_tween = (1u32 << 8) | 1;
         let track = PropertyTrack {
             animated: true,
@@ -5294,16 +11125,16 @@ mod tests {
             ],
             channels: Vec::new(),
         };
-        let env = EvalEnv {
-            frame: 15.0,
-            time: 0.5,
-            fps: 30.0,
-            sequence_resolution: project.sequence.resolution,
-            project: &project,
-            plugins: &plugins,
-            controls: &controls,
-            parent_props: &parent_props,
-        };
+        let env = test_eval_env(
+            &project,
+            &plugins,
+            &controls,
+            &parent_props,
+            &stack,
+            15.0,
+            0.5,
+            30.0,
+        );
         let val = eval_f64(&track, &env);
         // With aggressive ease-out handles (out=[1,1], in=[-1,0]), midpoint value is far above linear 0.5.
         assert!(
@@ -5369,25 +11200,28 @@ DOMAIN_MAX 0.9 0.8 0.7
 
     #[test]
     fn ortho_camera_respects_viewport_aspect_and_sequence_resolution() {
-        let project = Project::new_cm3_default();
+        let mut project = Project::new_cm3_default();
+        project.sequence.resolution = [500, 500];
         let plugins = PluginRegistry::new();
-        let controls = BTreeMap::new();
+        let controls = RefCell::new(BTreeMap::new());
         let parent_props = BTreeMap::new();
-        let env = EvalEnv {
-            frame: 0.0,
-            time: 0.0,
-            fps: 30.0,
-            sequence_resolution: [500, 500],
-            project: &project,
-            plugins: &plugins,
-            controls: &controls,
-            parent_props: &parent_props,
-        };
+        let stack = RefCell::new(HashSet::new());
+        let env = test_eval_env(
+            &project,
+            &plugins,
+            &controls,
+            &parent_props,
+            &stack,
+            0.0,
+            0.0,
+            30.0,
+        );
         let cam = zc_project::CameraData {
             kind: CameraKind::Orthographic,
             ..Default::default()
         };
-        let params = build_camera_params(&cam, Mat4::IDENTITY, &env, [200.0, 100.0]);
+        let params =
+            build_camera_params_without_vibrate(&cam, Mat4::IDENTITY, &env, [200.0, 100.0]);
         // half_h = 0.05 * 500 = 25.0 -> proj[1][1] = 1 / 25.0
         // aspect = 2.0 -> half_w = 50.0 -> proj[0][0] = 1 / 50.0
         assert!((params.proj[1][1] - (1.0 / 25.0)).abs() < 1e-5);
@@ -5442,14 +11276,27 @@ DOMAIN_MAX 0.9 0.8 0.7
             "expected semi-transparent Text2D alpha ~128 without double-blend, got {max_alpha}"
         );
 
-        // 2. PrecompRef is blocked when precomp-plus plugin is disabled.
+        // 2. PrecompRef is blocked when precomp-plus plugin is disabled, and renders its
+        // child tracks over a transparent nested canvas when enabled (P6 P0).
         let mut precomp_proj = Project::new_cm3_default();
         precomp_proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
         let comp_id = Uuid::new_v4();
-        let comp_seq = Sequence {
-            background_color: [1.0, 0.0, 0.0, 1.0],
-            ..Default::default()
-        };
+        let mut comp_seq = Project::new_cm3_default().sequence;
+        comp_seq.video_tracks[0].clips[0].layer.kind = LayerKind::Generator;
+        comp_seq.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .push(EffectInstance {
+                id: Uuid::new_v4(),
+                name: "RedFill".to_owned(),
+                enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+                kind: EffectKind::CustomShader {
+                    frag_shader: "precision mediump float; void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }".to_owned(),
+                    custom_properties: Vec::new(),
+                },
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            });
         precomp_proj.compositions.insert(comp_id, comp_seq);
         precomp_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::PrecompRef {
             composition_id: comp_id,
@@ -5557,6 +11404,625 @@ DOMAIN_MAX 0.9 0.8 0.7
         assert!(
             smb_px.as_chunks::<4>().0.iter().any(|p| p[2] > 100),
             "smartmotionblur must bind temporal neighbor frames instead of no-oping"
+        );
+    }
+
+    #[test]
+    fn hold_tween_beats_stale_easing_and_bezier_flags() {
+        let mut hold_kf = PropertyKeyframe::linear(10.0, PropertyValue::Number(100.0));
+        hold_kf.tween = 0; // Hold! Even though easing_index == 1 and we set is_bezier = true.
+        hold_kf.easing_index = 1;
+        hold_kf.is_bezier = true;
+
+        let track = PropertyTrack {
+            animated: true,
+            expression: None,
+            static_behavior: ProjectStaticBehavior::Constant,
+            value: PropertyValue::Number(0.0),
+            keyframes: vec![
+                PropertyKeyframe::linear(0.0, PropertyValue::Number(10.0)),
+                hold_kf,
+            ],
+            channels: Vec::new(),
+        };
+        let mid = eval_track_keyframes_only(&track, 5.0).as_f64().unwrap();
+        assert!(
+            (mid - 10.0).abs() < 1e-6,
+            "Hold (tween == 0) must hold start value 10.0, got {mid}"
+        );
+
+        // Strict bit-8 Bezier check: tween = (3 << 8) | 1 = 769 is NOT Bezier, uses linear ease 1.
+        let non_bezier = PropertyKeyframe::from_cm3_tween(
+            10.0,
+            PropertyValue::Number(100.0),
+            (3 << 8) | 1,
+            [[-1.0, 0.0], [1.0, 1.0]],
+            false,
+        );
+        let track2 = PropertyTrack {
+            animated: false, // Multi-keyframe track still evaluates even when animated == false!
+            expression: None,
+            static_behavior: ProjectStaticBehavior::Constant,
+            value: PropertyValue::Number(0.0),
+            keyframes: vec![
+                PropertyKeyframe::linear(0.0, PropertyValue::Number(0.0)),
+                non_bezier,
+            ],
+            channels: Vec::new(),
+        };
+        let mid2 = eval_track_keyframes_only(&track2, 5.0).as_f64().unwrap();
+        assert!(
+            (mid2 - 50.0).abs() < 1e-6,
+            "tween=(3<<8)|1 must evaluate linear (50.0), got {mid2}"
+        );
+    }
+
+    #[test]
+    fn constraints_tarjan_scc_follow_track_to_light_world_target_and_vibrate() {
+        let mut proj = Project::new_cm3_default();
+        let mut plugins = PluginRegistry::new();
+        plugins.enable("constraints").expect("enable constraints");
+        plugins.enable("camera-plus").expect("enable camera-plus");
+        let controls = RefCell::new(BTreeMap::new());
+        let parent_props = BTreeMap::new();
+        let stack = RefCell::new(HashSet::new());
+
+        // Target cube at (10, 0, 0)
+        let mut target_obj = Object3D::new_shape_3d("Target", Shape3DKind::Box { size: [1.0; 3] });
+        target_obj.position = PropertyTrack::vec3([10.0, 0.0, 0.0]);
+        target_obj.constraints.zoidium_id = Some("target_1".to_owned());
+
+        // Follower follows Target with +5 Y offset
+        let mut follower = Object3D::new_shape_3d("Follower", Shape3DKind::Box { size: [1.0; 3] });
+        follower.constraints.zoidium_id = Some("follower_1".to_owned());
+        follower.constraints.follow = Some(zc_project::FollowConstraint {
+            target_id: "target_1".to_owned(),
+            space: 0,
+            follow_position: true,
+            follow_rotation: false,
+            follow_scale: false,
+            position_offset: PropertyTrack::vec3([0.0, 5.0, 0.0]),
+            rotation_offset: PropertyTrack::vec3([0.0, 0.0, 0.0]),
+            scale_offset: PropertyTrack::vec3([1.0, 1.0, 1.0]),
+            fallback_pose: None,
+        });
+
+        // Tracker at origin tracks Follower (chained dependency: Follower -> Target, Tracker -> Follower)
+        let mut tracker = Object3D::new_shape_3d("Tracker", Shape3DKind::Box { size: [1.0; 3] });
+        tracker.position = PropertyTrack::vec3([0.0, 5.0, 0.0]);
+        tracker.constraints.zoidium_id = Some("tracker_1".to_owned());
+        tracker.constraints.track_to = Some(zc_project::TrackToConstraint {
+            target_id: "follower_1".to_owned(),
+            track_axis: 2, // +Z points toward follower at (10, 5, 0) => +X direction
+            up_axis: 1,    // +Y up
+            influence: PropertyTrack::number(100.0),
+        });
+
+        // Spot light inside a translated Group: target MUST stay in world space (P5 P1)
+        let mut spot = Object3D::new_spot_light();
+        spot.position = PropertyTrack::vec3([0.0, 10.0, 0.0]);
+        if let Object3DKind::Light(ref mut l) = spot.kind {
+            l.target = PropertyTrack::vec3([2.0, 3.0, 4.0]);
+        }
+        let mut grp = Object3D::new(
+            "OffsetGroup",
+            Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: vec![spot],
+            },
+        );
+        grp.position = PropertyTrack::vec3([100.0, 200.0, 300.0]);
+
+        // Cyclic pair A <-> B must be skipped cleanly without infinite loop or panic
+        let mut cyc_a = Object3D::new_shape_3d("CycA", Shape3DKind::Box { size: [1.0; 3] });
+        cyc_a.constraints.zoidium_id = Some("cyc_a".to_owned());
+        cyc_a.constraints.track_to = Some(zc_project::TrackToConstraint {
+            target_id: "cyc_b".to_owned(),
+            track_axis: 2,
+            up_axis: 1,
+            influence: PropertyTrack::number(100.0),
+        });
+        let mut cyc_b = Object3D::new_shape_3d("CycB", Shape3DKind::Box { size: [1.0; 3] });
+        cyc_b.constraints.zoidium_id = Some("cyc_b".to_owned());
+        cyc_b.constraints.track_to = Some(zc_project::TrackToConstraint {
+            target_id: "cyc_a".to_owned(),
+            track_axis: 2,
+            up_axis: 1,
+            influence: PropertyTrack::number(100.0),
+        });
+
+        // Put tracker BEFORE follower in authored order to verify topological sort!
+        let objs = vec![tracker, follower, target_obj, grp, cyc_a, cyc_b];
+        proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Scene3D {
+            objects: objs.clone(),
+            shadow_mode: ProjectCompatMode::Current,
+        };
+        let env = test_eval_env(
+            &proj,
+            &plugins,
+            &controls,
+            &parent_props,
+            &stack,
+            0.0,
+            0.0,
+            30.0,
+        );
+        let graph = evaluate_scene_graph_3d(&objs, Mat4::IDENTITY, &env);
+
+        let f_idx = graph.by_uuid[&objs[1].id];
+        let f_pos = graph.nodes[f_idx].world_mat.w_axis.truncate();
+        assert!(
+            (f_pos - Vec3::new(10.0, 5.0, 0.0)).length() < 1e-4,
+            "Follow constraint must place follower at (10, 5, 0), got {f_pos:?}"
+        );
+
+        let tr_idx = graph.by_uuid[&objs[0].id];
+        let tr_forward = graph.nodes[tr_idx].world_mat.z_axis.truncate().normalize();
+        assert!(
+            (tr_forward - Vec3::X).length() < 1e-4,
+            "TrackTo +Z must aim along +X toward follower at (10, 5, 0), got {tr_forward:?}"
+        );
+
+        // Spot light inside group at (100, 200, 300): light position moves, target stays world (2,3,4).
+        let spot_node = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.obj.kind, Object3DKind::Light(_)))
+            .expect("spot node");
+        assert!(
+            (spot_node.world_mat.w_axis.truncate() - Vec3::new(100.0, 210.0, 300.0)).length()
+                < 1e-4
+        );
+        assert!(
+            (spot_node.light_target_world.unwrap() - Vec3::new(2.0, 3.0, 4.0)).length() < 1e-4,
+            "light.target must stay in world space, got {:?}",
+            spot_node.light_target_world
+        );
+
+        // Verify Camera+ Vibrate exact sine-hash noise & degree->radian additive Euler.
+        let cam = zc_project::CameraData {
+            vibrate: Some(zc_project::CameraVibrateParams {
+                enabled: true,
+                seed: 42,
+                position_amplitude: PropertyTrack::vec3([10.0, 0.0, 0.0]),
+                rotation_amplitude: PropertyTrack::vec3([0.0, 15.0, 0.0]), // 15 degrees
+                frequency: PropertyTrack::number(0.5),
+                regular_pulse: false,
+                relative: false,
+                enable_position: true,
+                enable_rotation: true,
+                position_frequency: PropertyTrack::number(0.5),
+                rotation_frequency: PropertyTrack::number(0.5),
+            }),
+            ..Default::default()
+        };
+        let env_f3 = test_eval_env(
+            &proj,
+            &plugins,
+            &controls,
+            &parent_props,
+            &stack,
+            3.0,
+            0.1,
+            30.0,
+        );
+        let cam_obj = Object3D::new("Cam+", Object3DKind::Camera(Box::new(cam.clone())));
+        let cam_p = build_camera_params_from_node(
+            &cam,
+            &cam_obj,
+            Mat4::IDENTITY,
+            Vec3::new(0.0, 0.0, 80.0),
+            Quat::IDENTITY,
+            Vec3::ONE,
+            GeomEulerOrder::XYZ,
+            &env_f3,
+            [1920.0, 1080.0],
+        );
+        let expected_dx = (vibrate_sample_noise(3.0 * 0.5, 42.0, false) * 10.0) as f32;
+        assert!(
+            (cam_p.eye_position[0] - expected_dx).abs() < 1e-4,
+            "Camera+ Vibrate X offset must match Zoidium sine hash ({expected_dx}), got {}",
+            cam_p.eye_position[0]
+        );
+    }
+
+    #[test]
+    fn expr_context_cross_property_cycle_detection_controls_and_world_coords() {
+        let mut proj = Project::new_cm3_default();
+        let mut plugins = PluginRegistry::new();
+        plugins.enable("expressions-plus").expect("enable expr+");
+
+        // Add Sequence Control
+        proj.sequence.controls.push(zc_project::SequenceControl {
+            id: "ctl_gain_id".to_owned(),
+            name: "Gain".to_owned(),
+            kind: SequenceControlKind::Slider,
+            track: PropertyTrack::number(3.0),
+            preserved: BTreeMap::new(),
+        });
+
+        let mut box_a = Object3D::new_shape_3d("BoxA", Shape3DKind::Box { size: [1.0; 3] });
+        box_a.position = PropertyTrack::vec3([12.0, 4.0, 0.0]);
+        let mut box_b = Object3D::new_shape_3d("BoxB", Shape3DKind::Box { size: [1.0; 3] });
+        // Cross-object read + control lookup
+        box_b.position = PropertyTrack {
+            animated: true,
+            expression: Some(
+                "var p = thisLayer.object('BoxA').property('position').value; [p[0] * control('Gain', 'ctl_gain_id'), p[1], 0]"
+                    .to_owned(),
+            ),
+            static_behavior: ProjectStaticBehavior::Constant,
+            value: PropertyValue::Vec3([0.0, 0.0, 0.0]),
+            keyframes: Vec::new(),
+            channels: Vec::new(),
+        };
+        let box_a_id = box_a.id;
+        let box_b_id = box_b.id;
+
+        let cam = Object3D::new_perspective_camera();
+        proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Scene3D {
+            objects: vec![cam, box_a, box_b],
+            shadow_mode: ProjectCompatMode::Current,
+        };
+
+        let controls = RefCell::new(BTreeMap::new());
+        let parent_props = BTreeMap::new();
+        let stack = RefCell::new(HashSet::new());
+        let env = test_eval_env(
+            &proj,
+            &plugins,
+            &controls,
+            &parent_props,
+            &stack,
+            0.0,
+            0.0,
+            30.0,
+        );
+
+        let LayerKind::Scene3D { objects, .. } = &proj.sequence.video_tracks[0].clips[0].layer.kind
+        else {
+            unreachable!();
+        };
+        let pos_b = eval_vec3(
+            &objects[2].position,
+            &env.with_object(box_b_id)
+                .with_property(format!("prop:obj:{box_b_id}:position")),
+        );
+        assert!(
+            (pos_b[0] - 36.0).abs() < 1e-4 && (pos_b[1] - 4.0).abs() < 1e-4,
+            "cross-property expression + control() must evaluate to [36, 4, 0], got {pos_b:?}"
+        );
+
+        // Strict control(name, wrong_id) must fail (never fall back to name!)
+        let strict_track = PropertyTrack::number_with_expr(99.0, "control('Gain', 'wrong_id')");
+        assert!((eval_f64(&strict_track, &env) - 99.0).abs() < 1e-6);
+
+        // worldPosition() on BoxA returns [12, 4, 0]
+        let wp_track = PropertyTrack::number_with_expr(0.0, "thisObject.worldPosition()[0]");
+        let wp_x = eval_f64(&wp_track, &env.with_object(box_a_id));
+        assert!(
+            (wp_x - 12.0).abs() < 1e-4,
+            "thisObject.worldPosition()[0] must be 12.0, got {wp_x}"
+        );
+    }
+
+    #[test]
+    fn gpu_parity_uvscale_transparent_adjustment_precomp_shapes_text_and_masks() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        plugins.enable("expressions-plus").expect("enable expr+");
+        plugins.enable("precomp-plus").expect("enable precomp+");
+
+        // 1. P8 P0: `uvScale` == [1,1], space-normalized property names (`"My Color"` -> `My_Color`),
+        //    and `zTime`/`zFrame`/`zFps`/`ctl_*` uniforms in custom GLSL shaders.
+        let mut shader_proj = Project::new_cm3_default();
+        shader_proj.sequence.fps = 30;
+        shader_proj
+            .sequence
+            .controls
+            .push(zc_project::SequenceControl {
+                id: "c1".to_owned(),
+                name: "Blue Boost".to_owned(),
+                kind: SequenceControlKind::Slider,
+                track: PropertyTrack::number(0.5),
+                preserved: BTreeMap::new(),
+            });
+        shader_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Generator;
+        shader_proj.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .push(EffectInstance {
+                id: Uuid::new_v4(),
+                name: "UvScaleAndCtl".to_owned(),
+                enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+                kind: EffectKind::CustomShader {
+                    frag_shader: r#"
+                        precision mediump float;
+                        varying vec2 vUvScaled;
+                        uniform vec2 uvScale;
+                        uniform float Style_Amount;
+                        uniform float ctl_Blue_Boost;
+                        uniform float zFps;
+                        void main() {
+                            float r = uvScale.x * Style_Amount;
+                            float g = (zFps > 29.0 && zFps < 31.0) ? uvScale.y : 0.0;
+                            float b = ctl_Blue_Boost;
+                            gl_FragColor = vec4(r, g, b, 1.0);
+                        }
+                    "#
+                    .to_owned(),
+                    custom_properties: vec![CustomProperty {
+                        name: "Style Amount".to_owned(), // space must normalize to Style_Amount!
+                        prop_type: Some(0),
+                        track: PropertyTrack::number(0.75),
+                        metadata: BTreeMap::new(),
+                    }],
+                },
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            });
+        let spx = engine
+            .render_frame_rgba8(&shader_proj, &plugins, 0.0, 16, 16)
+            .expect("custom shader uvScale/ctl render");
+        assert!(
+            (180..=205).contains(&spx[0]) && spx[1] > 240 && (115..=140).contains(&spx[2]),
+            "expected uvScale=[1,1], Style_Amount=0.75, zFps=30, ctl_Blue_Boost=0.5 -> ~(191,255,128), got {:?}",
+            &spx[0..4]
+        );
+
+        // 2. P9 P0: Transparent background export clears root canvas to alpha == 0.
+        let mut empty_proj = Project::new_cm3_default();
+        empty_proj.sequence.background_color = [0.2, 0.3, 0.4, 1.0];
+        empty_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Generator;
+        let opaque_px = engine
+            .render_frame_rgba8(&empty_proj, &plugins, 0.0, 16, 16)
+            .expect("opaque render");
+        assert_eq!(opaque_px[3], 255);
+        engine.set_transparent_background(true);
+        let transp_px = engine
+            .render_frame_rgba8(&empty_proj, &plugins, 0.0, 16, 16)
+            .expect("transparent render");
+        engine.set_transparent_background(false);
+        assert_eq!(
+            &transp_px[0..4],
+            &[0, 0, 0, 0],
+            "transparent_background must clear root canvas to [0,0,0,0]"
+        );
+
+        // 3. P6 P0: Adjustment layer with alpha-zeroing mask preserves lower track backdrop!
+        let mut adj_proj = Project::new_cm3_default();
+        adj_proj.sequence.background_color = [0.0, 0.0, 1.0, 1.0]; // Opaque blue backdrop
+        adj_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Adjustment;
+        adj_proj.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .push(EffectInstance {
+                id: Uuid::new_v4(),
+                name: "HalfMask".to_owned(),
+                enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+                kind: EffectKind::CustomShader {
+                    // Left half outputs red opaque, right half outputs transparent (alpha 0)
+                    frag_shader: "precision mediump float; varying vec2 vUv; void main() { gl_FragColor = vUv.x < 0.5 ? vec4(1.0, 0.0, 0.0, 1.0) : vec4(0.0); }".to_owned(),
+                    custom_properties: Vec::new(),
+                },
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            });
+        let adj_px = engine
+            .render_frame_rgba8(&adj_proj, &plugins, 0.0, 16, 16)
+            .expect("adjustment alpha render");
+        let left_px = &adj_px[(8 * 16 + 2) * 4..(8 * 16 + 2) * 4 + 4];
+        let right_px = &adj_px[(8 * 16 + 13) * 4..(8 * 16 + 13) * 4 + 4];
+        assert!(
+            left_px[0] > 240 && left_px[2] < 15,
+            "left half must be red: {left_px:?}"
+        );
+        assert!(
+            right_px[2] > 240 && right_px[3] == 255,
+            "right half where Adjustment alpha==0 must reveal blue backdrop, got {right_px:?}"
+        );
+
+        // 4. P6 P0 + P7 P0: PrecompRef clears nested canvas to transparent & honors `offset`.
+        let mut pre_proj = Project::new_cm3_default();
+        pre_proj.sequence.background_color = [0.0, 1.0, 0.0, 1.0]; // Green background below precomp
+        let comp_id = Uuid::new_v4();
+        // Default opaque black background_color!
+        let mut comp_seq = Sequence {
+            fps: 30,
+            length_frames: 120.0,
+            ..Default::default()
+        };
+        // Put a red clip starting at frame 10 inside nested comp
+        let mut nested_clip = Project::new_cm3_default().sequence.video_tracks[0].clips[0].clone();
+        nested_clip.start = 10.0;
+        nested_clip.length = 20.0;
+        nested_clip.layer.kind = LayerKind::Generator;
+        nested_clip.layer.effects.push(EffectInstance {
+            id: Uuid::new_v4(),
+            name: "Red".to_owned(),
+            enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+            kind: EffectKind::CustomShader {
+                frag_shader: "precision mediump float; void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }".to_owned(),
+                custom_properties: Vec::new(),
+            },
+            params: BTreeMap::new(),
+            preserved: BTreeMap::new(),
+        });
+        comp_seq.video_tracks.push(zc_project::VideoTrack {
+            id: Uuid::new_v4(),
+            name: "V1".to_owned(),
+            enabled: true,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![nested_clip],
+            preserved: BTreeMap::new(),
+        });
+        pre_proj.compositions.insert(comp_id, comp_seq);
+        pre_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::PrecompRef {
+            composition_id: comp_id,
+        };
+        // At frame 0 with offset 0: nested comp has no active clips -> MUST stay transparent -> green bg shows!
+        let pre_f0 = engine
+            .render_frame_rgba8(&pre_proj, &plugins, 0.0, 16, 16)
+            .expect("precomp frame 0");
+        assert!(
+            pre_f0[1] > 240 && pre_f0[0] < 15,
+            "empty PrecompRef frame must be transparent and show green bg, got {:?}",
+            &pre_f0[0..4]
+        );
+        // With offset = 15 frames at parent frame 0: nested comp evaluates frame 15 -> red clip shows!
+        pre_proj.sequence.video_tracks[0].clips[0]
+            .layer
+            .preserved
+            .insert("offset".to_owned(), serde_json::json!(15.0));
+        let pre_off = engine
+            .render_frame_rgba8(&pre_proj, &plugins, 0.0, 16, 16)
+            .expect("precomp offset 15");
+        assert!(
+            pre_off[0] > 240 && pre_off[1] < 15,
+            "PrecompRef with offset=15 must show red nested clip at frame 0, got {:?}",
+            &pre_off[0..4]
+        );
+
+        // 5. P6 P0: Shape2D Bezier path + PresetShape2D canonical 200x200 + Text2D transform/stroke + zoidiumMasks.
+        let mut shape_proj = Project::new_cm3_default();
+        shape_proj.sequence.resolution = [100, 100];
+        shape_proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        // A small 20x20 square centered at (25, 0) in sequence coords (shifted right of center!)
+        shape_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Shape2D {
+            shapes: vec![Shape2DNode {
+                id: Uuid::new_v4(),
+                name: "Square".to_owned(),
+                kind: Shape2DKind::Path {
+                    path: serde_json::json!({
+                        "commands": [
+                            {"type": "M", "x": -10.0, "y": -10.0},
+                            {"type": "L", "x":  10.0, "y": -10.0},
+                            {"type": "L", "x":  10.0, "y":  10.0},
+                            {"type": "L", "x": -10.0, "y":  10.0},
+                            {"type": "Z"}
+                        ]
+                    }),
+                },
+                position: PropertyTrack::vec2([25.0, 0.0]),
+                rotation: PropertyTrack::number(0.0),
+                scale: PropertyTrack::vec2([1.0, 1.0]),
+                operations: vec![DrawOp::Fill {
+                    color: PropertyTrack::constant(PropertyValue::ColorRgba([1.0, 0.0, 0.0, 1.0])),
+                }],
+                preserved: BTreeMap::new(),
+            }],
+        };
+        let sh_px = engine
+            .render_frame_rgba8(&shape_proj, &plugins, 0.0, 100, 100)
+            .expect("shape2d render");
+        let center_sh = &sh_px[(50 * 100 + 50) * 4..(50 * 100 + 50) * 4 + 4];
+        let right_sh = &sh_px[(50 * 100 + 75) * 4..(50 * 100 + 75) * 4 + 4];
+        assert!(
+            center_sh[0] < 10 && right_sh[0] > 240,
+            "Shape2D path shifted to x=+25 must be black at center {center_sh:?} and red at x=75 {right_sh:?}"
+        );
+
+        // Text2D with DrawOp::Stroke + node position shift
+        let mut txt_proj = Project::new_cm3_default();
+        txt_proj.sequence.resolution = [128, 128];
+        txt_proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        txt_proj.sequence.video_tracks[0].clips[0].layer.kind = LayerKind::Text2D {
+            text: "I".to_owned(),
+            font: None,
+            size: 64,
+            shapes: vec![Shape2DNode {
+                id: Uuid::new_v4(),
+                name: "TextNode".to_owned(),
+                kind: Shape2DKind::Group {
+                    children: Vec::new(),
+                },
+                position: PropertyTrack::vec2([0.0, 0.0]),
+                rotation: PropertyTrack::number(0.0),
+                scale: PropertyTrack::vec2([1.0, 1.0]),
+                operations: vec![
+                    DrawOp::Stroke {
+                        color: PropertyTrack::color([0.0, 1.0, 0.0]),
+                        size: PropertyTrack::number(10.0),
+                        opacity: PropertyTrack::number(1.0),
+                    },
+                    DrawOp::Fill {
+                        color: PropertyTrack::constant(PropertyValue::ColorRgba([
+                            1.0, 0.0, 0.0, 1.0,
+                        ])),
+                    },
+                ],
+                preserved: BTreeMap::new(),
+            }],
+        };
+        let txt_px = engine
+            .render_frame_rgba8(&txt_proj, &plugins, 0.0, 128, 128)
+            .expect("text2d stroke render");
+        let has_red_fill = txt_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[0] > 200 && p[1] < 50);
+        let has_green_stroke = txt_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[1] > 200 && p[0] < 50);
+        assert!(
+            has_red_fill && has_green_stroke,
+            "Text2D must render both Fill (red={has_red_fill}) and DrawOp::Stroke (green={has_green_stroke})"
+        );
+
+        // zoidiumMasks: square mask over left half of a full white Generator
+        let mut mask_proj = Project::new_cm3_default();
+        mask_proj.sequence.resolution = [64, 64];
+        mask_proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        let mask_layer = &mut mask_proj.sequence.video_tracks[0].clips[0].layer;
+        mask_layer.kind = LayerKind::Generator;
+        mask_layer.effects.push(EffectInstance {
+            id: Uuid::new_v4(),
+            name: "White".to_owned(),
+            enabled: PropertyTrack::constant(PropertyValue::Bool(true)),
+            kind: EffectKind::CustomShader {
+                frag_shader: "precision mediump float; void main() { gl_FragColor = vec4(1.0); }"
+                    .to_owned(),
+                custom_properties: Vec::new(),
+            },
+            params: BTreeMap::new(),
+            preserved: BTreeMap::new(),
+        });
+        mask_layer.preserved.insert(
+            "zoidiumMasks".to_owned(),
+            serde_json::json!([{
+                "enabled": 1,
+                "closed": 1,
+                "mode": "add",
+                "feather": 0,
+                "expansion": 0,
+                "opacity": 1,
+                "invert": 0,
+                "vertices": [
+                    {"point": [0, 0], "in": [0, 0], "out": [0, 0]},
+                    {"point": [32, 0], "in": [0, 0], "out": [0, 0]},
+                    {"point": [32, 64], "in": [0, 0], "out": [0, 0]},
+                    {"point": [0, 64], "in": [0, 0], "out": [0, 0]}
+                ]
+            }]),
+        );
+        let m_px = engine
+            .render_frame_rgba8(&mask_proj, &plugins, 0.0, 64, 64)
+            .expect("zoidiumMasks render");
+        let m_left = &m_px[(32 * 64 + 10) * 4..(32 * 64 + 10) * 4 + 4];
+        let m_right = &m_px[(32 * 64 + 50) * 4..(32 * 64 + 50) * 4 + 4];
+        assert!(
+            m_left[0] > 240 && m_right[0] < 10,
+            "zoidiumMasks must keep left half white {m_left:?} and mask right half black {m_right:?}"
         );
     }
 }

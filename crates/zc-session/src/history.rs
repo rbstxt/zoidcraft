@@ -185,6 +185,12 @@ impl<T> UndoStack<T> {
         self.saved_revision != Some(self.current_revision)
     }
 
+    /// Monotonic revision identifier of the current state.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.current_revision
+    }
+
     /// Marks the current revision as saved (clears [`Self::is_dirty`]).
     pub fn mark_saved(&mut self) {
         self.saved_revision = Some(self.current_revision);

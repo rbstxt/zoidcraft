@@ -15,6 +15,7 @@ use zc_anim::{
 use zc_color::{Hsl, Rgb, ThemePalette};
 use zc_session::{Command, Session, SessionProperty};
 
+use super::gestures::{GestureClassifier, ScrollDevice, pointer_on_layer, unoccluded_hover_pos};
 use super::theme::{Cm3Icon, paint_cm3_icon};
 
 // ---------------------------------------------------------------------------
@@ -214,6 +215,7 @@ pub struct GraphEditorState {
     pub drag_state: GraphDragState,
     pub snap_guide_frame: Option<f64>,
     pub window_focused: bool,
+    pub gesture_classifier: GestureClassifier,
     collapsed: bool,
     maximized: bool,
     link_axes: bool,
@@ -254,6 +256,7 @@ impl GraphEditorState {
             drag_state: GraphDragState::None,
             snap_guide_frame: None,
             window_focused: true,
+            gesture_classifier: GestureClassifier::new(),
             collapsed: false,
             maximized: false,
             link_axes: false,
@@ -1055,10 +1058,8 @@ pub fn show_graph_editor_panel(
     let canvas_rect =
         Rect::from_min_max(pos2(right_rect.left(), ruler_rect.bottom()), right_rect.max);
 
-    // Graph Editor keyboard shortcuts when hovered and no text field has focus.
-    if !ui.ctx().egui_wants_keyboard_input()
-        && main_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or(Pos2::ZERO)))
-    {
+    // Graph Editor keyboard shortcuts when unoccluded-hovered and no text field has focus.
+    if !ui.ctx().egui_wants_keyboard_input() && unoccluded_hover_pos(ui, main_rect).is_some() {
         let (k_f, k_bslash, k_h, k_v, k_s, k_i, k_t, k_r, k_k, k_n) = ui.input(|i| {
             let no_mod = !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt;
             (
@@ -1319,6 +1320,109 @@ fn show_channel_track_list(
 // Top Frame Ruler (Scrubbing Synced with ViewX / ZoomX)
 // ---------------------------------------------------------------------------
 
+fn handle_graph_wheel_and_pinch(
+    ui: &Ui,
+    state: &mut GraphEditorState,
+    rect: Rect,
+    hovered: bool,
+    is_ruler: bool,
+) {
+    if !hovered {
+        return;
+    }
+    let Some(anchor) = unoccluded_hover_pos(ui, rect) else {
+        return;
+    };
+    let g = ui.input(|i| state.gesture_classifier.sample(i));
+
+    // Note: `zoom_x` and `zoom_y` are units per CSS pixel (smaller = zoomed IN).
+    // Dividing by `fx` / `fy` (> 1.0 = zoom in) shrinks units/px while preserving `anchor`.
+    let apply_zoom = |state: &mut GraphEditorState, fx: f64, fy: f64| {
+        let anchor_f = state.screen_x_to_frame(anchor.x, rect);
+        let anchor_v = state.screen_y_to_value(anchor.y, rect);
+        if (fx - 1.0).abs() > 1e-6 {
+            state.zoom_x = (state.zoom_x / fx).clamp(1e-4, 500.0);
+            state.center_x = anchor_f - f64::from(anchor.x - rect.center().x) * state.zoom_x;
+        }
+        if !is_ruler && (fy - 1.0).abs() > 1e-6 {
+            state.zoom_y = (state.zoom_y / fy).clamp(1e-6, 10000.0);
+            state.center_y = anchor_v + f64::from(anchor.y - rect.center().y) * state.zoom_y;
+        }
+    };
+
+    // 1. True trackpad pinch (`Event::Zoom` / multi-touch).
+    if g.has_pinch() {
+        let z = f64::from(g.pinch_zoom).clamp(0.5, 2.0);
+        if is_ruler {
+            apply_zoom(state, z, 1.0);
+        } else if g.modifiers.alt {
+            apply_zoom(state, 1.0, z);
+        } else {
+            apply_zoom(state, z, z);
+        }
+        return;
+    }
+
+    // 2. Ctrl/Cmd + Wheel (egui 0.37 folds this into `zoom_delta()` and zeroes `smooth_scroll_delta`).
+    if g.has_mod_wheel_zoom() {
+        let z = f64::from(g.mod_wheel_zoom).clamp(0.5, 2.0);
+        if is_ruler {
+            apply_zoom(state, z, 1.0);
+        } else if g.modifiers.alt {
+            apply_zoom(state, 1.0, z);
+        } else {
+            apply_zoom(state, z, z);
+        }
+        return;
+    }
+
+    // 3. Shift + Wheel -> pan X only.
+    if g.modifiers.shift && g.has_scroll() {
+        state.center_x -= f64::from(g.scroll_delta.x + g.scroll_delta.y) * state.zoom_x;
+        return;
+    }
+
+    // 4. Alt + Wheel -> zoom Y (or zoom X on the ruler).
+    if g.modifiers.alt && (g.scroll_delta.y.abs() > 0.01 || g.raw_wheel_points.y.abs() > 0.01) {
+        let dy = if g.scroll_delta.y.abs() > 0.01 {
+            g.scroll_delta.y
+        } else {
+            g.raw_wheel_points.y
+        };
+        let z = (f64::from(dy) * 0.0025).clamp(-0.4, 0.4).exp();
+        if is_ruler {
+            apply_zoom(state, z, 1.0);
+        } else {
+            apply_zoom(state, 1.0, z);
+        }
+        return;
+    }
+
+    if !g.has_scroll() {
+        return;
+    }
+
+    // 5. Trackpad two-finger scroll -> smooth 2D pan (X only on the ruler).
+    if g.device == ScrollDevice::Trackpad {
+        state.center_x -= f64::from(g.scroll_delta.x) * state.zoom_x;
+        if !is_ruler {
+            state.center_y += f64::from(g.scroll_delta.y) * state.zoom_y;
+        }
+        return;
+    }
+
+    // 6. Discrete mouse wheel -> horizontal tilt pans X, vertical notches zoom X around pointer.
+    if g.scroll_delta.x.abs() > 0.01 {
+        state.center_x -= f64::from(g.scroll_delta.x) * state.zoom_x;
+    }
+    if g.scroll_delta.y.abs() > 0.01 {
+        let z = (f64::from(g.scroll_delta.y) * 0.0025)
+            .clamp(-0.4, 0.4)
+            .exp();
+        apply_zoom(state, z, 1.0);
+    }
+}
+
 fn show_graph_ruler(
     ui: &mut Ui,
     session: &mut Session,
@@ -1335,6 +1439,7 @@ fn show_graph_ruler(
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
     }
+    handle_graph_wheel_and_pinch(ui, state, rect, resp.hovered(), true);
 
     if matches!(state.drag_state, GraphDragState::None)
         && (resp.drag_started_by(PointerButton::Primary)
@@ -1446,47 +1551,23 @@ fn show_curve_canvas(
         Sense::click_and_drag(),
     );
 
-    let (pointer_pos, scroll_delta, modifiers, middle_down, primary_down) = ui.input(|i| {
+    let wants_kb = ui.ctx().egui_wants_keyboard_input();
+    let (pointer_pos, modifiers, middle_down, primary_down, space_down) = ui.input(|i| {
         (
-            i.pointer.latest_pos(),
-            i.smooth_scroll_delta,
+            i.pointer.hover_pos().or_else(|| i.pointer.latest_pos()),
             i.modifiers,
             i.pointer.middle_down(),
             i.pointer.primary_down(),
+            !wants_kb && i.key_down(egui::Key::Space),
         )
     });
 
-    // Wheel zoom, Shift+Wheel pan, and horizontal trackpad scroll pan when hovered.
-    if resp.hovered() && (scroll_delta.x.abs() > 0.01 || scroll_delta.y.abs() > 0.01) {
-        let anchor = pointer_pos.unwrap_or(rect.center());
-        if modifiers.shift {
-            state.center_x -= f64::from(scroll_delta.y + scroll_delta.x) * state.zoom_x;
-        } else if scroll_delta.x.abs() > scroll_delta.y.abs() {
-            state.center_x -= f64::from(scroll_delta.x) * state.zoom_x;
-        } else {
-            if scroll_delta.x.abs() > 0.01 {
-                state.center_x -= f64::from(scroll_delta.x) * state.zoom_x;
-            }
-            let factor = (-f64::from(scroll_delta.y) * 0.0025).clamp(-0.4, 0.4).exp();
-            let anchor_f = state.screen_x_to_frame(anchor.x, rect);
-            let anchor_v = state.screen_y_to_value(anchor.y, rect);
+    // Trackpad pinch, Ctrl/Cmd+Wheel, Alt/Shift+Wheel, two-finger 2D pan, and mouse wheel zoom.
+    handle_graph_wheel_and_pinch(ui, state, rect, resp.hovered(), false);
 
-            let zoom_both = modifiers.ctrl || modifiers.command;
-            let zoom_y_only = modifiers.alt;
-
-            if !zoom_y_only {
-                state.zoom_x = (state.zoom_x * factor).clamp(1e-4, 500.0);
-                state.center_x = anchor_f - f64::from(anchor.x - rect.center().x) * state.zoom_x;
-            }
-            if zoom_both || zoom_y_only {
-                state.zoom_y = (state.zoom_y * factor).clamp(1e-6, 10000.0);
-                state.center_y = anchor_v + f64::from(anchor.y - rect.center().y) * state.zoom_y;
-            }
-        }
-    }
-
-    // Middle-drag pan (or LMB pan when Pan tool is active in Graph Editor 2).
-    let pan_active = middle_down || (graph_plus && state.pan_tool && primary_down);
+    // Middle-drag pan, Space+Left-drag pan, or LMB pan when Pan tool is active.
+    let pan_active =
+        middle_down || (((graph_plus && state.pan_tool) || space_down) && primary_down);
     if pan_active {
         if let Some(pos) = pointer_pos {
             match &mut state.drag_state {
@@ -1497,7 +1578,7 @@ fn show_curve_canvas(
                     state.center_y += f64::from(d.y) * state.zoom_y;
                     ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 }
-                GraphDragState::None if rect.contains(pos) => {
+                GraphDragState::None if rect.contains(pos) && pointer_on_layer(ui, pos) => {
                     state.drag_state = GraphDragState::Panning { last_pos: pos };
                     ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 }
@@ -1506,7 +1587,7 @@ fn show_curve_canvas(
         }
     } else if matches!(state.drag_state, GraphDragState::Panning { .. }) {
         state.drag_state = GraphDragState::None;
-    } else if graph_plus && state.pan_tool && resp.hovered() {
+    } else if ((graph_plus && state.pan_tool) || space_down) && resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::Grab);
     }
 
@@ -1592,7 +1673,7 @@ fn show_curve_canvas(
     // Handle click selection first (toggles Shift+Click exactly once; never double-toggle across
     // drag_started_by and clicked_by), then hit-test Bezier handles & keyframe drags.
     let mut hit_handled = false;
-    if !(graph_plus && state.pan_tool) {
+    if !(graph_plus && state.pan_tool) && !space_down {
         if resp.clicked_by(PointerButton::Primary)
             && let Some(pos) = resp.interact_pointer_pos()
         {
@@ -1743,10 +1824,10 @@ fn show_curve_canvas(
     if graph_plus && state.show_help_card {
         let card = Rect::from_min_size(
             pos2(
-                (rect.right() - 238.0).max(rect.left() + 8.0),
+                (rect.right() - 266.0).max(rect.left() + 8.0),
                 rect.top() + 8.0,
             ),
-            vec2(230.0, 142.0),
+            vec2(258.0, 178.0),
         );
         painter.rect(
             card,
@@ -1756,10 +1837,12 @@ fn show_curve_canvas(
             StrokeKind::Inside,
         );
         let lines = [
-            "Graph Editor 2 Shortcuts",
-            "Wheel / Ctrl+Wheel: Zoom X / XY",
+            "Graph Editor Shortcuts & Gestures",
+            "Trackpad: 2-finger pan XY / Pinch XY",
+            "Alt+Pinch: Zoom Y   Ruler: X only",
+            "Wheel / Cmd+Wheel: Zoom X / XY",
             "Alt+Wheel / Shift+Wheel: Zoom Y / Pan",
-            "MMB / H: Pan    V: Marquee",
+            "Space+Drag / MMB / H: Pan  V: Select",
             "\\: Fit all      F: Frame selected",
             "S: Snap  I: Bezier  T: Link  R: Flat",
             "K: +Key  N: Norm    Del: Delete",
@@ -3756,7 +3839,7 @@ fn show_g2_toolbar(
                     let (btn_rect, resp) = ui.allocate_exact_size(custom_size, Sense::click());
                     let resp = resp
                         .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text("Custom easings (33 CM3 curves)");
+                        .on_hover_text("Custom easings (33 built-in curves)");
                     let p = ui.painter();
                     p.rect(
                         btn_rect,
@@ -4649,6 +4732,224 @@ mod tests {
         assert_eq!(
             parse_cubic_bezier_str("1.5, 0.0, -0.5, 1.0"),
             Some([1.0, 0.0, 0.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn headless_graph_editor_pinch_cmd_scroll_trackpad_pan_and_ruler_x_only() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let mut state = GraphEditorState::new();
+        state.open = true;
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0));
+        // Curve canvas center is comfortably inside the right-hand canvas in both Vanilla and Graph+ modes.
+        let canvas_pos = pos2(560.0, 320.0);
+
+        let step = |session: &mut Session,
+                    state: &mut GraphEditorState,
+                    time: f64,
+                    modifiers: egui::Modifiers,
+                    mut events: Vec<egui::Event>| {
+            events.insert(0, egui::Event::ModifiersChanged(modifiers));
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let _ = show_graph_editor_panel(ui, session, state, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+        };
+
+        // Prime layout.
+        step(
+            &mut session,
+            &mut state,
+            0.0,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(canvas_pos)],
+        );
+
+        // 1. Trackpad pinch on curve canvas zooms BOTH X and Y in (shrinks units/px!).
+        let (zx0, zy0) = (state.zoom_x, state.zoom_y);
+        step(
+            &mut session,
+            &mut state,
+            0.016,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(canvas_pos),
+                egui::Event::Zoom(1.25),
+            ],
+        );
+        assert!(
+            state.zoom_x < zx0,
+            "pinch zoom-in must shrink zoom_x (units/px)"
+        );
+        assert!(
+            state.zoom_y < zy0,
+            "pinch zoom-in must shrink zoom_y (units/px)"
+        );
+
+        // 2. Alt + Trackpad pinch zooms Y only.
+        let (zx1, zy1) = (state.zoom_x, state.zoom_y);
+        step(
+            &mut session,
+            &mut state,
+            0.032,
+            egui::Modifiers::ALT,
+            vec![
+                egui::Event::PointerMoved(canvas_pos),
+                egui::Event::Zoom(1.25),
+            ],
+        );
+        assert!(
+            (state.zoom_x - zx1).abs() < 1e-9,
+            "Alt+Pinch must not alter zoom_x"
+        );
+        assert!(state.zoom_y < zy1, "Alt+Pinch must zoom Y");
+
+        // 3. Cmd+Scroll on curve canvas zooms BOTH X and Y (regression test for egui 0.37).
+        let (zx2, zy2) = (state.zoom_x, state.zoom_y);
+        step(
+            &mut session,
+            &mut state,
+            0.064,
+            egui::Modifiers::COMMAND,
+            vec![
+                egui::Event::PointerMoved(canvas_pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+            ],
+        );
+        assert!(state.zoom_x < zx2, "Cmd+Scroll must zoom X in");
+        assert!(state.zoom_y < zy2, "Cmd+Scroll must zoom Y in");
+
+        // 4. Trackpad two-finger scroll pans BOTH X and Y without zooming either axis.
+        let (cx_before, cy_before) = (state.center_x, state.center_y);
+        let (zx3, zy3) = (state.zoom_x, state.zoom_y);
+        step(
+            &mut session,
+            &mut state,
+            0.35,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(canvas_pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(12.0, -8.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Trackpad,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            (state.zoom_x - zx3).abs() < 1e-9,
+            "trackpad pan must not zoom X"
+        );
+        assert!(
+            (state.zoom_y - zy3).abs() < 1e-9,
+            "trackpad pan must not zoom Y"
+        );
+        assert!(
+            state.center_x < cx_before,
+            "positive trackpad dx pans center_x left"
+        );
+        assert!(
+            state.center_y < cy_before,
+            "negative trackpad dy pans center_y down"
+        );
+
+        // 5. Ruler gestures always affect X only (never zoom_y or center_y).
+        let ruler_ctx = egui::Context::default();
+        let ruler_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, TOP_RULER_HEIGHT));
+        let ruler_hover = pos2(300.0, 15.0);
+        let step_ruler = |session: &mut Session,
+                          state: &mut GraphEditorState,
+                          time: f64,
+                          modifiers: egui::Modifiers,
+                          mut events: Vec<egui::Event>| {
+            events.insert(0, egui::Event::ModifiersChanged(modifiers));
+            let raw = egui::RawInput {
+                screen_rect: Some(ruler_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut full = ruler_ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let mut act = GraphEditorAction::default();
+                        show_graph_ruler(ui, session, state, ruler_rect, true, &mut act);
+                    });
+            });
+            full.textures_delta.clear();
+        };
+
+        step_ruler(
+            &mut session,
+            &mut state,
+            0.0,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(ruler_hover)],
+        );
+        let (zx_r, zy_r) = (state.zoom_x, state.zoom_y);
+        step_ruler(
+            &mut session,
+            &mut state,
+            0.016,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(ruler_hover),
+                egui::Event::Zoom(1.25),
+            ],
+        );
+        assert!(state.zoom_x < zx_r, "ruler pinch must zoom X");
+        assert!(
+            (state.zoom_y - zy_r).abs() < 1e-9,
+            "ruler pinch must leave zoom_y unchanged"
+        );
+
+        let (cx_r, cy_r) = (state.center_x, state.center_y);
+        step_ruler(
+            &mut session,
+            &mut state,
+            0.032,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(ruler_hover),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(10.0, -15.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Trackpad,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            state.center_x < cx_r,
+            "ruler trackpad pan must move center_x"
+        );
+        assert!(
+            (state.center_y - cy_r).abs() < 1e-9,
+            "ruler trackpad pan must leave center_y unchanged"
         );
     }
 }

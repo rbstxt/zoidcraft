@@ -47,9 +47,10 @@ pub struct GradientStop {
     pub color: [f32; 4],
 }
 
-/// Samples a sorted slice of gradient stops at `t in [0, 1]`.
-#[must_use]
-pub fn sample_gradient(stops: &[GradientStop], t: f32) -> [f32; 4] {
+/// CM3 particle gradient texture width (`DataTexture(Uint8Array(128), 32, 1)`).
+pub const CM3_GRADIENT_LUT_SIZE: usize = 32;
+
+fn sample_sorted_gradient(stops: &[GradientStop], t: f32) -> [f32; 4] {
     if stops.is_empty() {
         return [1.0, 1.0, 1.0, 1.0];
     }
@@ -79,6 +80,17 @@ pub fn sample_gradient(stops: &[GradientStop], t: f32) -> [f32; 4] {
     last.color
 }
 
+/// Samples a slice of gradient stops (sorted or unsorted) at `t in [0, 1]`.
+#[must_use]
+pub fn sample_gradient(stops: &[GradientStop], t: f32) -> [f32; 4] {
+    if stops.len() > 1 && !stops.windows(2).all(|w| w[0].position <= w[1].position) {
+        let mut sorted = stops.to_vec();
+        sorted.sort_by(|a, b| a.position.total_cmp(&b.position));
+        return sample_sorted_gradient(&sorted, t);
+    }
+    sample_sorted_gradient(stops, t)
+}
+
 /// Bakes gradient stops into a fixed-length 1D RGBA LUT (default 256 samples).
 #[must_use]
 pub fn bake_gradient_lut(stops: &[GradientStop], resolution: usize) -> Vec<[f32; 4]> {
@@ -89,6 +101,108 @@ pub fn bake_gradient_lut(stops: &[GradientStop], resolution: usize) -> Vec<[f32;
         lut.push(sample_gradient(stops, i as f32 / denom));
     }
     lut
+}
+
+/// Exact CM3 `PZ.object3d.particles.redrawGradient` 32-texel RGBA8 LUT baker.
+///
+/// Evaluates `stops` at `t = i / 32.0` (`i = 0..32`), quantizing each channel with `floor`
+/// (`floor(r * 255 * a)` when `premultiply == true`, matching CM3's `Math.floor(r.r * r.a)`).
+#[must_use]
+pub fn bake_cm3_gradient_lut_rgba8(
+    stops: &[GradientStop],
+    premultiply: bool,
+) -> [[u8; 4]; CM3_GRADIENT_LUT_SIZE] {
+    let mut lut = [[0_u8; 4]; CM3_GRADIENT_LUT_SIZE];
+    if stops.is_empty() {
+        return [[255, 255, 255, 255]; CM3_GRADIENT_LUT_SIZE];
+    }
+    let mut sorted = stops.to_vec();
+    sorted.sort_by(|a, b| a.position.total_cmp(&b.position));
+    for (i, slot) in lut.iter_mut().enumerate() {
+        let t = (i as f32) / (CM3_GRADIENT_LUT_SIZE as f32);
+        let c = sample_sorted_gradient(&sorted, t);
+        let a = c[3].clamp(0.0, 1.0);
+        let scale = if premultiply { 255.0 * a } else { 255.0 };
+        *slot = [
+            (c[0].clamp(0.0, 1.0) * scale).floor().clamp(0.0, 255.0) as u8,
+            (c[1].clamp(0.0, 1.0) * scale).floor().clamp(0.0, 255.0) as u8,
+            (c[2].clamp(0.0, 1.0) * scale).floor().clamp(0.0, 255.0) as u8,
+            (255.0 * a).floor().clamp(0.0, 255.0) as u8,
+        ];
+    }
+    lut
+}
+
+/// Samples a 32-texel CM3 RGBA8 gradient LUT using WebGL `LinearFilter` + `ClampToEdge`
+/// texel-center addressing (`pos = clamp(u * 32 - 0.5, 0, 31)`).
+#[must_use]
+pub fn sample_cm3_gradient_lut(lut: &[[u8; 4]; CM3_GRADIENT_LUT_SIZE], u: f32) -> [f32; 4] {
+    let pos = (u.clamp(0.0, 1.0) * (CM3_GRADIENT_LUT_SIZE as f32) - 0.5)
+        .clamp(0.0, (CM3_GRADIENT_LUT_SIZE - 1) as f32);
+    let i0 = pos.floor() as usize;
+    let i1 = (i0 + 1).min(CM3_GRADIENT_LUT_SIZE - 1);
+    let frac = pos - (i0 as f32);
+    let inv255 = 1.0 / 255.0;
+    let a = lut[i0];
+    let b = lut[i1];
+    [
+        (f32::from(a[0]) + (f32::from(b[0]) - f32::from(a[0])) * frac) * inv255,
+        (f32::from(a[1]) + (f32::from(b[1]) - f32::from(a[1])) * frac) * inv255,
+        (f32::from(a[2]) + (f32::from(b[2]) - f32::from(a[2])) * frac) * inv255,
+        (f32::from(a[3]) + (f32::from(b[3]) - f32::from(a[3])) * frac) * inv255,
+    ]
+}
+
+/// Converts CM3 vertex shader `vAngle` (radians) to billboard quad vertex rotation (radians).
+///
+/// CM3's fragment shader rotates UVs by `-vAngle` (`c = cos(-vAngle), s = sin(-vAngle)`),
+/// producing a visual **clockwise** rotation for `+vAngle`. Rotating billboard quad vertices
+/// requires `-vAngle` to produce the same visual direction.
+#[must_use]
+pub fn cm3_quad_rotation_rad(v_angle_rad: f32) -> f32 {
+    -v_angle_rad
+}
+
+/// Exact CM3 particle fragment shader UV rotation (`core-1.0.102.js` `PZ.object3d.particles.fragmentShader`).
+///
+/// Input `point_coord` is `gl_PointCoord` in `[0, 1]^2` (top-left origin).
+#[must_use]
+pub fn cm3_rotate_point_sprite_uv(point_coord: [f32; 2], v_angle_rad: f32) -> [f32; 2] {
+    let x = point_coord[0] - 0.5;
+    let y = 1.0 - point_coord[1] - 0.5;
+    let (s, c) = (-v_angle_rad).sin_cos();
+    [c * x + s * y + 0.5, c * y - s * x + 0.5]
+}
+
+/// Composes a straight-alpha particle sprite sample with a premultiplied gradient color without
+/// double-premultiplying (`gl_FragColor = tcolor * vColor` in CM3).
+///
+/// When `sprite_is_premultiplied` is `true`, `sprite_rgba` already has RGB multiplied by `sprite_a`,
+/// so multiplying directly by `v_color_premul` (`[r*a, g*a, b*a, a]`) yields exact single premultiplication.
+/// When `sprite_is_premultiplied` is `false` (straight sprite), `sprite_rgba.rgb` is multiplied by
+/// `sprite_rgba.a` once before multiplying by `v_color_premul`.
+#[must_use]
+pub fn compose_particle_fragment_premul(
+    sprite_rgba: [f32; 4],
+    v_color_premul: [f32; 4],
+    sprite_is_premultiplied: bool,
+) -> [f32; 4] {
+    let s_rgb = if sprite_is_premultiplied {
+        [sprite_rgba[0], sprite_rgba[1], sprite_rgba[2]]
+    } else {
+        let sa = sprite_rgba[3].clamp(0.0, 1.0);
+        [
+            sprite_rgba[0] * sa,
+            sprite_rgba[1] * sa,
+            sprite_rgba[2] * sa,
+        ]
+    };
+    [
+        s_rgb[0] * v_color_premul[0],
+        s_rgb[1] * v_color_premul[1],
+        s_rgb[2] * v_color_premul[2],
+        sprite_rgba[3] * v_color_premul[3],
+    ]
 }
 
 /// Stateless deterministic CM3 particle system parameters (Spec 03 §3.8).
@@ -149,6 +263,49 @@ impl Default for ParticleSystemParams {
     }
 }
 
+impl ParticleSystemParams {
+    /// Zoidium's deterministic default particle system (`plugins/core/particle-defaults.js:60-72`).
+    #[must_use]
+    pub fn zoidium_default() -> Self {
+        let size_val = 38.0 / 255.0;
+        Self {
+            count: 400,
+            rate: 200.0,
+            lifetime: 3.0,
+            position_dist: PositionDistribution::Box,
+            origin: Vec3::ZERO,
+            position_spread: Vec3::splat(20.0),
+            radius: 0.0,
+            radius_spread: 0.0,
+            velocity_dist: VelocityDistribution::Box,
+            velocity: Vec3::ZERO,
+            velocity_spread: Vec3::splat(100.0),
+            radial_velocity: 0.0,
+            radial_velocity_spread: 0.0,
+            gravity: Vec3::ZERO,
+            initial_angle_deg: 0.0,
+            angle_spread_deg: 0.0,
+            angular_velocity_deg: 0.0,
+            angular_velocity_spread_deg: 0.0,
+            blending: ParticleBlending::Normal,
+            color_gradient: vec![
+                GradientStop {
+                    position: 0.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+                GradientStop {
+                    position: 1.0,
+                    color: [1.0, 1.0, 1.0, 0.0],
+                },
+            ],
+            size_gradient: vec![GradientStop {
+                position: 0.0,
+                color: [size_val, size_val, size_val, 1.0],
+            }],
+        }
+    }
+}
+
 /// Evaluated per-particle instance data at a specific simulation timestamp.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ParticleInstance {
@@ -159,17 +316,13 @@ pub struct ParticleInstance {
     pub alive: bool,
 }
 
-/// Evaluates a single particle `pid` at simulation clock `time` (seconds).
-#[must_use]
-pub fn evaluate_particle(pid: u32, time: f32, params: &ParticleSystemParams) -> ParticleInstance {
+fn evaluate_particle_kinematics(
+    pid: u32,
+    time: f32,
+    params: &ParticleSystemParams,
+) -> Option<(Vec3, f32, f32, bool)> {
     if params.rate <= 0.0 || params.lifetime <= 0.0 {
-        return ParticleInstance {
-            position: params.origin.to_array(),
-            size: 0.0,
-            color: [0.0, 0.0, 0.0, 0.0],
-            angle: 0.0,
-            alive: false,
-        };
+        return None;
     }
 
     let delay = pid as f32 / params.rate;
@@ -178,7 +331,8 @@ pub fn evaluate_particle(pid: u32, time: f32, params: &ParticleSystemParams) -> 
     let cycles_floor = (elapsed / params.lifetime).floor();
     let tau = elapsed - cycles_floor * params.lifetime;
     let cycle = cycles_floor + 1.0;
-    let seed = (u64::from(pid) + 1) as f32;
+    // Exact CM3 `pid` indexing (`0..number-1`): same `pid` drives delay AND every rand() call.
+    let seed = pid as f32;
     let k = seed * cycle;
     let u = (tau / params.lifetime).clamp(0.0, 1.0);
 
@@ -229,6 +383,25 @@ pub fn evaluate_particle(pid: u32, time: f32, params: &ParticleSystemParams) -> 
         .to_radians();
     let angle = a0 + omega * tau;
 
+    Some((pos, angle, u, alive))
+}
+
+/// Evaluates a single particle `pid` (`0..count-1`) at simulation clock `time` (seconds).
+///
+/// Returns straight (unpremultiplied) RGBA in `color` and CM3 vertex-shader `vAngle` (radians)
+/// in `angle` (use [`cm3_quad_rotation_rad`] when rotating billboard quad vertices).
+#[must_use]
+pub fn evaluate_particle(pid: u32, time: f32, params: &ParticleSystemParams) -> ParticleInstance {
+    let Some((pos, angle, u, alive)) = evaluate_particle_kinematics(pid, time, params) else {
+        return ParticleInstance {
+            position: params.origin.to_array(),
+            size: 0.0,
+            color: [0.0, 0.0, 0.0, 0.0],
+            angle: 0.0,
+            alive: false,
+        };
+    };
+
     let size = sample_gradient(&params.size_gradient, u)[0];
     let color = if alive {
         sample_gradient(&params.color_gradient, u)
@@ -243,6 +416,60 @@ pub fn evaluate_particle(pid: u32, time: f32, params: &ParticleSystemParams) -> 
         angle,
         alive,
     }
+}
+
+/// Evaluates a single particle `pid` using exact CM3 32-texel RGBA8 `DataTexture` gradient LUT
+/// sampling (`redrawGradient` with `LinearFilter` + `ClampToEdge`).
+///
+/// When `premultiplied_color` is `true`, `color` matches CM3's `vColor` (premultiplied RGB by alpha)
+/// directly; when `false`, RGB is unpremultiplied while still preserving 32-texel LUT quantization.
+#[must_use]
+pub fn evaluate_particle_cm3_lut(
+    pid: u32,
+    time: f32,
+    params: &ParticleSystemParams,
+    color_lut: &[[u8; 4]; CM3_GRADIENT_LUT_SIZE],
+    size_lut: &[[u8; 4]; CM3_GRADIENT_LUT_SIZE],
+) -> ParticleInstance {
+    let Some((pos, angle, u, alive)) = evaluate_particle_kinematics(pid, time, params) else {
+        return ParticleInstance {
+            position: params.origin.to_array(),
+            size: 0.0,
+            color: [0.0, 0.0, 0.0, 0.0],
+            angle: 0.0,
+            alive: false,
+        };
+    };
+
+    let size = sample_cm3_gradient_lut(size_lut, u)[0];
+    let color = if alive {
+        sample_cm3_gradient_lut(color_lut, u)
+    } else {
+        [0.0, 0.0, 0.0, 0.0]
+    };
+
+    ParticleInstance {
+        position: pos.to_array(),
+        size: if alive { size } else { 0.0 },
+        color,
+        angle,
+        alive,
+    }
+}
+
+/// Evaluates all `params.count` particles deterministically at `time` (seconds) using exact CM3
+/// 32-texel RGBA8 gradient LUTs (`premultiply_color = true` yields CM3 `vColor` premultiplied RGBA).
+#[must_use]
+pub fn evaluate_particles_cm3_lut(
+    time: f32,
+    params: &ParticleSystemParams,
+    premultiply_color: bool,
+) -> Vec<ParticleInstance> {
+    let color_lut = bake_cm3_gradient_lut_rgba8(&params.color_gradient, premultiply_color);
+    let size_lut = bake_cm3_gradient_lut_rgba8(&params.size_gradient, false);
+    (0..params.count)
+        .map(|pid| evaluate_particle_cm3_lut(pid, time, params, &color_lut, &size_lut))
+        .collect()
 }
 
 /// Evaluates all `params.count` particles deterministically at `time` (seconds).

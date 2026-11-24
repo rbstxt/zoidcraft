@@ -214,6 +214,93 @@ impl GpuContext {
 
         Ok(target)
     }
+
+    /// Allocates an `Rgba16Float` texture and uploads tightly packed IEEE-754 half-float
+    /// RGBA16F texels (`width * height * 4` `u16` values, 8 bytes per texel).
+    pub fn create_rgba16f_texture(
+        &self,
+        label: &str,
+        width: u32,
+        height: u32,
+        rgba_f16_bits: &[u16],
+    ) -> Result<RenderTarget, RenderError> {
+        let expected_bytes =
+            self.validate_dimensions(width, height, wgpu::TextureFormat::Rgba16Float)?;
+        let bytes: &[u8] = bytemuck::cast_slice(rgba_f16_bits);
+        if bytes.len() != expected_bytes {
+            return Err(RenderError::InvalidBufferSize {
+                expected: expected_bytes,
+                actual: bytes.len(),
+            });
+        }
+
+        let target = RenderTarget::new(
+            self,
+            width,
+            height,
+            wgpu::TextureFormat::Rgba16Float,
+            Some(label),
+        )?;
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 8),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        Ok(target)
+    }
+}
+
+/// Converts a 32-bit IEEE-754 float to IEEE-754 binary16 (half-float) bit representation.
+#[must_use]
+pub fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x007F_FFFF;
+
+    if exp == 0xFF {
+        // Inf or NaN
+        return if frac == 0 {
+            sign | 0x7C00
+        } else {
+            sign | 0x7E00 | ((frac >> 13) as u16)
+        };
+    }
+
+    let unbiased = exp - 127 + 15;
+    if unbiased >= 31 {
+        return sign | 0x7C00;
+    }
+    if unbiased <= 0 {
+        if unbiased < -10 {
+            return sign;
+        }
+        let mantissa = (frac | 0x0080_0000) >> (1 - unbiased);
+        let rounded = (mantissa + 0x1000) >> 13;
+        return sign | (rounded as u16);
+    }
+
+    let rounded = frac + 0x1000;
+    if rounded >= 0x0080_0000 {
+        return sign | (((unbiased + 1) as u16) << 10);
+    }
+    sign | ((unbiased as u16) << 10) | ((rounded >> 13) as u16)
 }
 
 /// Owned 2D GPU texture and default view used as a render target or depth buffer.

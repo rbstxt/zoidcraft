@@ -15,6 +15,92 @@ pub const DEFAULT_FONT_PRESET: &str = "/assets/fonts/2d/bebas.ttf";
 /// Default CM3 layer blend mode token.
 pub const DEFAULT_BLENDING: &str = "BLEND_SRC_OVER";
 
+/// Canonical CM3 `PZ.layer.blendModes` token table in exact CM3 index order (`0..=42`).
+///
+/// Note indices `23..=24` are `BLEND_INVERT`, `BLEND_INVERT_RGB`, followed by
+/// `25..=34` = `BLEND_LINEARDODGE..BLEND_LUMINOSITY`, and `35..=42` = `BLEND_PLUS..BLEND_BLUE`.
+pub const CM3_BLEND_MODE_TOKENS: [&str; 43] = [
+    "BLEND_ZERO",
+    "BLEND_SRC",
+    "BLEND_DST",
+    "BLEND_SRC_OVER",
+    "BLEND_DST_OVER",
+    "BLEND_SRC_IN",
+    "BLEND_DST_IN",
+    "BLEND_SRC_OUT",
+    "BLEND_DST_OUT",
+    "BLEND_SRC_ATOP",
+    "BLEND_DST_ATOP",
+    "BLEND_XOR",
+    "BLEND_MULTIPLY",
+    "BLEND_SCREEN",
+    "BLEND_OVERLAY",
+    "BLEND_DARKEN",
+    "BLEND_LIGHTEN",
+    "BLEND_COLORDODGE",
+    "BLEND_COLORBURN",
+    "BLEND_HARDLIGHT",
+    "BLEND_SOFTLIGHT",
+    "BLEND_DIFFERENCE",
+    "BLEND_EXCLUSION",
+    "BLEND_INVERT",
+    "BLEND_INVERT_RGB",
+    "BLEND_LINEARDODGE",
+    "BLEND_LINEARBURN",
+    "BLEND_VIVIDLIGHT",
+    "BLEND_LINEARLIGHT",
+    "BLEND_PINLIGHT",
+    "BLEND_HARDMIX",
+    "BLEND_HUE",
+    "BLEND_SATURATION",
+    "BLEND_COLOR",
+    "BLEND_LUMINOSITY",
+    "BLEND_PLUS",
+    "BLEND_PLUS_DARKER",
+    "BLEND_MINUS",
+    "BLEND_CONTRAST",
+    "BLEND_INVERT_OVG",
+    "BLEND_RED",
+    "BLEND_GREEN",
+    "BLEND_BLUE",
+];
+
+/// Looks up a CM3 layer blend mode token by its exact `PZ.layer.blendModes` index (`0..43`).
+#[must_use]
+pub fn cm3_blend_mode_from_index(index: usize) -> Option<&'static str> {
+    CM3_BLEND_MODE_TOKENS.get(index).copied()
+}
+
+/// Normalizes a blend mode token case-insensitively to its canonical uppercase CM3 token
+/// when recognized, preserving unknown tokens verbatim.
+#[must_use]
+pub fn normalize_blend_mode_token(token: &str) -> String {
+    let trimmed = token.trim();
+    if let Some(canonical) = CM3_BLEND_MODE_TOKENS
+        .iter()
+        .find(|&&t| t.eq_ignore_ascii_case(trimmed))
+    {
+        return (*canonical).to_owned();
+    }
+    match trimmed.to_ascii_uppercase().as_str() {
+        "BLEND_COLOR_DODGE" | "COLOR_DODGE" | "COLORDODGE" => "BLEND_COLORDODGE".to_owned(),
+        "BLEND_COLOR_BURN" | "COLOR_BURN" | "COLORBURN" => "BLEND_COLORBURN".to_owned(),
+        "BLEND_HARD_LIGHT" | "HARD_LIGHT" | "HARDLIGHT" => "BLEND_HARDLIGHT".to_owned(),
+        "BLEND_SOFT_LIGHT" | "SOFT_LIGHT" | "SOFTLIGHT" => "BLEND_SOFTLIGHT".to_owned(),
+        "BLEND_LINEAR_DODGE" | "LINEAR_DODGE" | "LINEARDODGE" => "BLEND_LINEARDODGE".to_owned(),
+        "BLEND_LINEAR_BURN" | "LINEAR_BURN" | "LINEARBURN" => "BLEND_LINEARBURN".to_owned(),
+        "BLEND_VIVID_LIGHT" | "VIVID_LIGHT" | "VIVIDLIGHT" => "BLEND_VIVIDLIGHT".to_owned(),
+        "BLEND_LINEAR_LIGHT" | "LINEAR_LIGHT" | "LINEARLIGHT" => "BLEND_LINEARLIGHT".to_owned(),
+        "BLEND_PIN_LIGHT" | "PIN_LIGHT" | "PINLIGHT" => "BLEND_PINLIGHT".to_owned(),
+        "BLEND_HARD_MIX" | "HARD_MIX" | "HARDMIX" => "BLEND_HARDMIX".to_owned(),
+        "BLEND_ADD" | "ADD" | "PLUS" => "BLEND_PLUS".to_owned(),
+        "BLEND_ADD_DARKER" | "PLUS_DARKER" => "BLEND_PLUS_DARKER".to_owned(),
+        "BLEND_SUBTRACT" | "SUBTRACT" | "MINUS" => "BLEND_MINUS".to_owned(),
+        "NORMAL" | "SRC_OVER" => "BLEND_SRC_OVER".to_owned(),
+        _ => trimmed.to_owned(),
+    }
+}
+
 /// Current `.zcraft` project document schema version.
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
 
@@ -345,7 +431,7 @@ impl PropertyTrack {
         let rate = f64::from(fps.max(1));
         let duration_secs = length_frames / rate;
         Self {
-            animated: true,
+            animated: false,
             expression: None,
             static_behavior: StaticBehavior::Linear,
             value: PropertyValue::Number(0.0),
@@ -383,6 +469,9 @@ pub struct Project {
     /// Nested compositions managed by Precomp+.
     #[serde(default)]
     pub compositions: BTreeMap<Uuid, Sequence>,
+    /// Mapping from Zoidium Precomp+ string composition IDs (e.g. `"comp-..."`) to `compositions` UUIDs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub composition_ids: BTreeMap<String, Uuid>,
     /// Required plugin IDs (e.g. `"expressions-plus"`, `"precomp-plus"`).
     #[serde(default)]
     pub plugin_requirements: BTreeSet<String>,
@@ -455,6 +544,14 @@ impl Project {
             video_tracks: vec![video_track],
             audio_tracks: vec![audio_track],
             clip_links: BTreeMap::new(),
+            exact_fps: None,
+            layer_masks: BTreeMap::new(),
+            precomp_offsets: BTreeMap::new(),
+            camera_layer_objects: BTreeMap::new(),
+            scene_backdrops: BTreeMap::new(),
+            layer_3d_props: BTreeMap::new(),
+            track_layer_input_ids: BTreeMap::new(),
+            bypassed_effects: BTreeSet::new(),
             preserved: BTreeMap::new(),
         };
 
@@ -465,6 +562,7 @@ impl Project {
             media: Vec::new(),
             sequence,
             compositions: BTreeMap::new(),
+            composition_ids: BTreeMap::new(),
             plugin_requirements: BTreeSet::new(),
             imported_from_pz_version: None,
             preserved: BTreeMap::new(),
@@ -619,6 +717,12 @@ pub struct MotionBlurSettings {
     pub samples: PropertyTrack,
     #[serde(default = "default_motion_blur_shutter")]
     pub shutter: PropertyTrack,
+    /// Camera+ motion blur frame tracking mode (`0=auto, 1=previous, 2=next`).
+    #[serde(default)]
+    pub track_frame: u32,
+    /// Camera+ motion blur sensitivity (`0..200`, default `100`).
+    #[serde(default = "default_motion_blur_sensitivity")]
+    pub sensitivity: f64,
 }
 
 impl Default for MotionBlurSettings {
@@ -626,6 +730,123 @@ impl Default for MotionBlurSettings {
         Self {
             enabled: false,
             samples: default_motion_blur_samples(),
+            shutter: default_motion_blur_shutter(),
+            track_frame: 0,
+            sensitivity: default_motion_blur_sensitivity(),
+        }
+    }
+}
+
+/// Boolean mask combination mode for Shape+ layer masks (`zoidiumMasks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskMode {
+    #[default]
+    Add,
+    Subtract,
+    Intersect,
+}
+
+impl MaskMode {
+    #[must_use]
+    pub fn from_token(token: &str) -> Self {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "subtract" => Self::Subtract,
+            "intersect" => Self::Intersect,
+            _ => Self::Add,
+        }
+    }
+}
+
+/// Shape+ layer path mask attached to a layer (`zoidiumMasks`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayerMask {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: MaskMode,
+    #[serde(default)]
+    pub invert: bool,
+    #[serde(default)]
+    pub feather: f64,
+    #[serde(default)]
+    pub expansion: f64,
+    #[serde(default = "default_one_f64")]
+    pub opacity: f64,
+    #[serde(default)]
+    pub closed: bool,
+    #[serde(default)]
+    pub vertex_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vertex_modes: BTreeMap<String, String>,
+    pub path: PropertyTrack,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub preserved: BTreeMap<String, serde_json::Value>,
+}
+
+/// Zoidium Scene3D backdrop settings (`zoidiumBackdropMode`/`Color`/`Opacity`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneBackdrop {
+    #[serde(default)]
+    pub mode: u32,
+    #[serde(default)]
+    pub color: [f64; 3],
+    #[serde(default = "default_opacity_one")]
+    pub opacity: PropertyTrack,
+}
+
+impl Default for SceneBackdrop {
+    fn default() -> Self {
+        Self {
+            mode: 0,
+            color: [0.0, 0.0, 0.0],
+            opacity: default_opacity_one(),
+        }
+    }
+}
+
+/// Camera+ 3D layer transform & motion-blur multiplier tracks attached to any `Layer`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Layer3DProps {
+    #[serde(default)]
+    pub depth: PropertyTrack,
+    #[serde(default)]
+    pub rotation_x: PropertyTrack,
+    #[serde(default)]
+    pub rotation_y: PropertyTrack,
+    #[serde(default = "default_opacity_one")]
+    pub motion_blur_amount: PropertyTrack,
+}
+
+impl Default for Layer3DProps {
+    fn default() -> Self {
+        Self {
+            depth: PropertyTrack::number(0.0),
+            rotation_x: PropertyTrack::number(0.0),
+            rotation_y: PropertyTrack::number(0.0),
+            motion_blur_amount: PropertyTrack::number(1.0),
+        }
+    }
+}
+
+/// Camera+ per-camera motion blur parameters (`properties.motionBlur`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CameraMotionBlurParams {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_camera_mb_samples")]
+    pub samples: u32,
+    #[serde(default = "default_motion_blur_shutter")]
+    pub shutter: PropertyTrack,
+}
+
+impl Default for CameraMotionBlurParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            samples: default_camera_mb_samples(),
             shutter: default_motion_blur_shutter(),
         }
     }
@@ -690,6 +911,30 @@ pub struct Sequence {
     /// Stable UUID clip link groups keyed by link group ID.
     #[serde(default)]
     pub clip_links: BTreeMap<u32, Vec<Uuid>>,
+    /// Exact floating-point sequence frame rate when fractional (e.g. `29.97`, `23.976`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_fps: Option<f64>,
+    /// Shape+ layer masks (`zoidiumMasks`) indexed by `Layer.id`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub layer_masks: BTreeMap<Uuid, Vec<LayerMask>>,
+    /// Precomp+ frame offsets (`offset`) indexed by `Layer.id`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub precomp_offsets: BTreeMap<Uuid, f64>,
+    /// Full 3D camera object trees for Camera+ `CameraLayer` (type 9) indexed by `Layer.id`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub camera_layer_objects: BTreeMap<Uuid, Vec<Object3D>>,
+    /// Scene3D backdrop settings (`zoidiumBackdropMode`/`Color`/`Opacity`) indexed by `Layer.id`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub scene_backdrops: BTreeMap<Uuid, SceneBackdrop>,
+    /// Camera+ 3D layer transform properties (`depth`/`rotationX`/`rotationY`/`motionBlurAmount`) indexed by `Layer.id`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub layer_3d_props: BTreeMap<Uuid, Layer3DProps>,
+    /// Layer Input stable track identifiers (`_zoidiumLayerInputId`) indexed by `VideoTrack.id`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub track_layer_input_ids: BTreeMap<Uuid, String>,
+    /// Effect IDs marked `zoidiumBypassed: true` (independent of `EffectInstance.enabled`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub bypassed_effects: BTreeSet<Uuid>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub preserved: BTreeMap<String, serde_json::Value>,
 }
@@ -709,6 +954,14 @@ impl Default for Sequence {
             video_tracks: Vec::new(),
             audio_tracks: Vec::new(),
             clip_links: BTreeMap::new(),
+            exact_fps: None,
+            layer_masks: BTreeMap::new(),
+            precomp_offsets: BTreeMap::new(),
+            camera_layer_objects: BTreeMap::new(),
+            scene_backdrops: BTreeMap::new(),
+            layer_3d_props: BTreeMap::new(),
+            track_layer_input_ids: BTreeMap::new(),
+            bypassed_effects: BTreeSet::new(),
             preserved: BTreeMap::new(),
         }
     }
@@ -1139,6 +1392,27 @@ pub struct Text3DData {
     pub position_mode: Text3DAlign,
     #[serde(default)]
     pub text_scale_mode: CompatMode,
+    /// Text+ letter spacing (`-200..200`, default `0`).
+    #[serde(default)]
+    pub spacing: f64,
+    /// Text+ dynamic character index offset (default `0`).
+    #[serde(default)]
+    pub character_index_offset: PropertyTrack,
+    /// Text+ dynamic character count override (default `0`).
+    #[serde(default)]
+    pub character_count_override: PropertyTrack,
+    /// Text+ bevel side (`0 = outside`, `1 = inside`, default `0`).
+    #[serde(default)]
+    pub bevel_side: u32,
+    /// Text+ bevel segment detail (`1..100`, default `3`).
+    #[serde(default = "default_bevel_detail")]
+    pub bevel_detail: u32,
+    /// Text+ bevel profile (`0 = flat`, `1 = round`, default `1`).
+    #[serde(default = "default_bevel_profile")]
+    pub bevel_profile: u32,
+    /// Text+ bevel tension (`0..1`, default `0.5`).
+    #[serde(default = "default_bevel_tension")]
+    pub bevel_tension: f64,
 }
 
 impl Default for Text3DData {
@@ -1153,6 +1427,13 @@ impl Default for Text3DData {
             bevel_size: 0.5,
             position_mode: Text3DAlign::Center,
             text_scale_mode: CompatMode::Current,
+            spacing: 0.0,
+            character_index_offset: PropertyTrack::number(0.0),
+            character_count_override: PropertyTrack::number(0.0),
+            bevel_side: 0,
+            bevel_detail: default_bevel_detail(),
+            bevel_profile: default_bevel_profile(),
+            bevel_tension: default_bevel_tension(),
         }
     }
 }
@@ -1351,10 +1632,16 @@ impl Default for CameraShakeParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CameraDofParams {
     pub enabled: bool,
+    /// Optional animated `depthOfField.enabled` track (`Option(0|1)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_track: Option<PropertyTrack>,
     pub focus_distance: PropertyTrack,
+    /// Camera+ aperture (`0..40`, default `3.0`).
     pub aperture: PropertyTrack,
     pub focus_area_width: PropertyTrack,
+    /// Near blur level in percent (`0..400`, default `100.0`).
     pub near_blur: PropertyTrack,
+    /// Far blur level in percent (`0..400`, default `100.0`).
     pub far_blur: PropertyTrack,
 }
 
@@ -1362,11 +1649,12 @@ impl Default for CameraDofParams {
     fn default() -> Self {
         Self {
             enabled: false,
+            enabled_track: None,
             focus_distance: PropertyTrack::number(80.0),
-            aperture: PropertyTrack::number(2.8),
+            aperture: PropertyTrack::number(3.0),
             focus_area_width: PropertyTrack::number(0.0),
-            near_blur: PropertyTrack::number(1.0),
-            far_blur: PropertyTrack::number(1.0),
+            near_blur: PropertyTrack::number(100.0),
+            far_blur: PropertyTrack::number(100.0),
         }
     }
 }
@@ -1377,18 +1665,37 @@ pub struct CameraVibrateParams {
     pub enabled: bool,
     pub seed: u32,
     pub position_amplitude: PropertyTrack,
+    /// Rotation amplitude in **degrees** (`* PI / 180` at evaluation time).
     pub rotation_amplitude: PropertyTrack,
     pub frequency: PropertyTrack,
+    #[serde(default)]
+    pub regular_pulse: bool,
+    #[serde(default)]
+    pub relative: bool,
+    #[serde(default)]
+    pub enable_position: bool,
+    #[serde(default)]
+    pub enable_rotation: bool,
+    #[serde(default = "default_vibrate_frequency")]
+    pub position_frequency: PropertyTrack,
+    #[serde(default = "default_vibrate_frequency")]
+    pub rotation_frequency: PropertyTrack,
 }
 
 impl Default for CameraVibrateParams {
     fn default() -> Self {
         Self {
-            enabled: false,
-            seed: 1,
+            enabled: true,
+            seed: 0,
             position_amplitude: PropertyTrack::vec3([0.0, 0.0, 0.0]),
             rotation_amplitude: PropertyTrack::vec3([0.0, 0.0, 0.0]),
-            frequency: PropertyTrack::number(1.0),
+            frequency: default_vibrate_frequency(),
+            regular_pulse: false,
+            relative: false,
+            enable_position: false,
+            enable_rotation: false,
+            position_frequency: default_vibrate_frequency(),
+            rotation_frequency: default_vibrate_frequency(),
         }
     }
 }
@@ -1409,6 +1716,24 @@ pub struct CameraData {
     pub dof: Option<CameraDofParams>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vibrate: Option<CameraVibrateParams>,
+    /// Camera+ active camera toggle (`active`, default `true`).
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Camera+ focal length in mm (`1..10000`, default `35.0`).
+    #[serde(default = "default_focal_length")]
+    pub focal_length: PropertyTrack,
+    /// Camera+ horizontal film gate width in mm (default `36.0`).
+    #[serde(default = "default_film_gate")]
+    pub film_gate: f64,
+    /// Camera+ horizontal film offset (`-1000..1000`, default `0.0`).
+    #[serde(default)]
+    pub film_offset_x: PropertyTrack,
+    /// Camera+ vertical film offset (`-1000..1000`, default `0.0`).
+    #[serde(default)]
+    pub film_offset_y: PropertyTrack,
+    /// Camera+ per-camera motion blur settings (`properties.motionBlur`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_blur: Option<CameraMotionBlurParams>,
 }
 
 impl Default for CameraData {
@@ -1424,6 +1749,12 @@ impl Default for CameraData {
             shake: CameraShakeParams::default(),
             dof: None,
             vibrate: None,
+            active: true,
+            focal_length: default_focal_length(),
+            film_gate: default_film_gate(),
+            film_offset_x: PropertyTrack::number(0.0),
+            film_offset_y: PropertyTrack::number(0.0),
+            motion_blur: None,
         }
     }
 }
@@ -1622,6 +1953,9 @@ pub struct CustomPbrMaterial {
     pub center: PropertyTrack,
     pub rotation: PropertyTrack,
     pub reflection: bool,
+    /// True for Material+ `"uvcustom"` (normalized UVs); false for native CM3 `"custom"`.
+    #[serde(default)]
+    pub uv_normalized: bool,
 }
 
 impl Default for CustomPbrMaterial {
@@ -1644,6 +1978,7 @@ impl Default for CustomPbrMaterial {
             center: PropertyTrack::vec2([0.0, 0.0]),
             rotation: PropertyTrack::number(0.0),
             reflection: false,
+            uv_normalized: false,
         }
     }
 }
@@ -1678,6 +2013,24 @@ pub struct PbrPlusMaterial {
     pub center: PropertyTrack,
     pub rotation: PropertyTrack,
     pub reflection_intensity: f64,
+    /// Optional animated `normalScale` track (preserves keyframes/expressions alongside `normal_scale`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_scale_track: Option<PropertyTrack>,
+    /// Optional animated `reflectionIntensity` track (preserves keyframes/expressions alongside `reflection_intensity`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflection_intensity_track: Option<PropertyTrack>,
+    /// Dynamic emissive intensity multiplier (default `1.0`).
+    #[serde(default = "default_opacity_one")]
+    pub emissive_intensity: PropertyTrack,
+    /// Alpha cutoff threshold (`0..1`, default `0.0`).
+    #[serde(default)]
+    pub alpha_test: f64,
+    /// Environment reflection toggle (`reflection`, default `false`).
+    #[serde(default)]
+    pub reflection: bool,
+    /// Ambient occlusion texture asset key (`aoTexture`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ao_texture: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub preserved: BTreeMap<String, serde_json::Value>,
 }
@@ -1706,6 +2059,12 @@ impl Default for PbrPlusMaterial {
             center: PropertyTrack::vec2([0.0, 0.0]),
             rotation: PropertyTrack::number(0.0),
             reflection_intensity: 1.0,
+            normal_scale_track: None,
+            reflection_intensity_track: None,
+            emissive_intensity: default_opacity_one(),
+            alpha_test: 0.0,
+            reflection: false,
+            ao_texture: None,
             preserved: BTreeMap::new(),
         }
     }
@@ -1759,7 +2118,7 @@ impl Default for ImagePlusMaterial {
         Self {
             texture: None,
             opacity: PropertyTrack::number(1.0),
-            transparent: true,
+            transparent: false,
             blending: 1,
             wrap: 1,
             repeat: PropertyTrack::vec2([1.0, 1.0]),
@@ -2015,6 +2374,42 @@ fn default_motion_blur_samples() -> PropertyTrack {
 
 fn default_motion_blur_shutter() -> PropertyTrack {
     PropertyTrack::number(0.5)
+}
+
+const fn default_motion_blur_sensitivity() -> f64 {
+    100.0
+}
+
+const fn default_camera_mb_samples() -> u32 {
+    4
+}
+
+const fn default_one_f64() -> f64 {
+    1.0
+}
+
+const fn default_bevel_detail() -> u32 {
+    3
+}
+
+const fn default_bevel_profile() -> u32 {
+    1
+}
+
+const fn default_bevel_tension() -> f64 {
+    0.5
+}
+
+fn default_vibrate_frequency() -> PropertyTrack {
+    PropertyTrack::number(2.0)
+}
+
+fn default_focal_length() -> PropertyTrack {
+    PropertyTrack::number(35.0)
+}
+
+const fn default_film_gate() -> f64 {
+    36.0
 }
 
 #[cfg(test)]

@@ -418,11 +418,10 @@ pub fn is_forbidden_ident(name: &str) -> bool {
 pub fn is_vanilla_global(name: &str) -> bool {
     matches!(
         name,
-        // Context globals
+        // Context globals (Zoidium CM3 `PZ.expression.parse`: frame, time, methods, properties)
         "frame"
             | "time"
-            | "fps"
-            | "value"
+            | "methods"
             | "properties"
             | "Math"
             // Standard ES primitives / helpers
@@ -2005,6 +2004,535 @@ fn collect_expr_invalidated_vars(expr: &Expr, fresh_locals: &mut BTreeSet<String
         Expr::Sequence(items) => {
             for e in items {
                 collect_expr_invalidated_vars(e, fresh_locals);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extended-Mode & Unseeded-Random Static Classification (Zoidium compiler.js)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when `program` uses Expressions+ syntax or API features
+/// (matching Zoidium `plugins/expressions-plus/compiler.js:478-633`).
+///
+/// Pure-CM3 programs (`is_extended == false`) preserve CM3's 3-arg `linear`/`ease`
+/// (ignoring extra arguments) and vector-only `clamp`, while extended programs opt
+/// into 5-arg AE `linear`/`ease` and scalar `clamp`.
+pub fn is_extended(program: &Program) -> bool {
+    let mut root_locals = BTreeSet::new();
+    let _ = collect_hoisted_decls(&program.body, &mut root_locals, 0);
+    program
+        .body
+        .iter()
+        .any(|stmt| stmt_is_extended(stmt, &root_locals))
+}
+
+fn is_cm3_method_name(name: &str) -> bool {
+    matches!(
+        name,
+        "add"
+            | "sub"
+            | "mul"
+            | "div"
+            | "clamp"
+            | "dot"
+            | "cross"
+            | "normalize"
+            | "length"
+            | "wave"
+            | "lerp"
+            | "linear"
+            | "catmullRom"
+            | "ease"
+            | "random"
+            | "gaussRandom"
+            | "shake"
+    )
+}
+
+fn is_cm3_math_name(name: &str) -> bool {
+    matches!(
+        name,
+        "E" | "LN2"
+            | "LN10"
+            | "LOG2E"
+            | "LOG10E"
+            | "PI"
+            | "SQRT1_2"
+            | "SQRT2"
+            | "abs"
+            | "acos"
+            | "acosh"
+            | "asin"
+            | "asinh"
+            | "atan"
+            | "atan2"
+            | "atanh"
+            | "cbrt"
+            | "ceil"
+            | "clz32"
+            | "cos"
+            | "cosh"
+            | "exp"
+            | "expm1"
+            | "floor"
+            | "fround"
+            | "hypot"
+            | "imul"
+            | "log"
+            | "log1p"
+            | "log2"
+            | "log10"
+            | "max"
+            | "min"
+            | "pow"
+            | "round"
+            | "sign"
+            | "sin"
+            | "sinh"
+            | "sqrt"
+            | "tan"
+            | "tanh"
+            | "trunc"
+    )
+}
+
+fn is_extended_ident(name: &str, locals: &BTreeSet<String>) -> bool {
+    if locals.contains(name) {
+        return false;
+    }
+    if matches!(name, "frame" | "time" | "methods" | "properties") {
+        return false;
+    }
+    if is_cm3_method_name(name) || is_cm3_math_name(name) {
+        return false;
+    }
+    // Any API_NAMES or PURE_NAMES (including fps, value, Math, Array, Number, String,
+    // Boolean, Object, JSON, parseFloat, parseInt, isNaN, isFinite, Infinity, NaN,
+    // undefined, wiggle, seedRandom, easeIn, easeOut, thisProperty, thisComp, etc.)
+    // marks the program as extended, matching `compiler.js:493-494`.
+    true
+}
+
+fn pattern_is_extended(pattern: &Pattern, locals: &BTreeSet<String>) -> bool {
+    match pattern {
+        Pattern::Ident(_) => false,
+        Pattern::Array(elems) => {
+            if elems.iter().any(|e| !matches!(e, ArrayPatternElem::Hole)) {
+                return true;
+            }
+            elems.iter().any(|e| match e {
+                ArrayPatternElem::Hole | ArrayPatternElem::Rest(_) => false,
+                ArrayPatternElem::Binding { default, .. } => default
+                    .as_ref()
+                    .is_some_and(|d| expr_is_extended(d, locals)),
+            })
+        }
+        Pattern::Object(props) => !props.is_empty(),
+    }
+}
+
+fn stmt_is_extended(stmt: &Stmt, locals: &BTreeSet<String>) -> bool {
+    match stmt {
+        Stmt::Empty | Stmt::Break | Stmt::Continue => false,
+        Stmt::Return(_) | Stmt::Throw(_) | Stmt::FunctionDecl(_) | Stmt::ForOf(_) => true,
+        Stmt::Expr(e) => expr_is_extended(e, locals),
+        Stmt::Block(stmts) => stmts.iter().any(|s| stmt_is_extended(s, locals)),
+        Stmt::VarDecl { kind, decls } => {
+            if *kind != VarKind::Var {
+                return true;
+            }
+            decls.iter().any(|d| {
+                pattern_is_extended(&d.pattern, locals)
+                    || d.init.as_ref().is_some_and(|e| expr_is_extended(e, locals))
+            })
+        }
+        Stmt::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_is_extended(test, locals)
+                || stmt_is_extended(consequent, locals)
+                || alternate
+                    .as_ref()
+                    .is_some_and(|a| stmt_is_extended(a, locals))
+        }
+        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+            expr_is_extended(test, locals) || stmt_is_extended(body, locals)
+        }
+        Stmt::For(f) => {
+            let init_ext = f.init.as_ref().is_some_and(|init| match init {
+                ForInit::VarDecl { kind, decls } => {
+                    *kind != VarKind::Var
+                        || decls.iter().any(|d| {
+                            pattern_is_extended(&d.pattern, locals)
+                                || d.init.as_ref().is_some_and(|e| expr_is_extended(e, locals))
+                        })
+                }
+                ForInit::Expr(e) => expr_is_extended(e, locals),
+            });
+            init_ext
+                || f.test.as_ref().is_some_and(|e| expr_is_extended(e, locals))
+                || f.update
+                    .as_ref()
+                    .is_some_and(|e| expr_is_extended(e, locals))
+                || stmt_is_extended(&f.body, locals)
+        }
+        Stmt::ForIn(f) => {
+            f.kind.is_some_and(|k| k != VarKind::Var)
+                || pattern_is_extended(&f.target, locals)
+                || expr_is_extended(&f.object, locals)
+                || stmt_is_extended(&f.body, locals)
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            expr_is_extended(discriminant, locals)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().is_some_and(|e| expr_is_extended(e, locals))
+                        || c.consequent.iter().any(|s| stmt_is_extended(s, locals))
+                })
+        }
+        Stmt::Try(t) => {
+            t.block.iter().any(|s| stmt_is_extended(s, locals))
+                || t.catch_param
+                    .as_ref()
+                    .is_some_and(|p| pattern_is_extended(p, locals))
+                || t.catch_body.as_ref().is_some_and(|cb| {
+                    let mut catch_locals = locals.clone();
+                    if let Some(p) = &t.catch_param {
+                        let _ = collect_pattern_names(p, &mut catch_locals, 0);
+                    }
+                    cb.iter().any(|s| stmt_is_extended(s, &catch_locals))
+                })
+                || t.finally_body
+                    .as_ref()
+                    .is_some_and(|fb| fb.iter().any(|s| stmt_is_extended(s, locals)))
+        }
+    }
+}
+
+fn expr_is_extended(expr: &Expr, locals: &BTreeSet<String>) -> bool {
+    match expr {
+        Expr::Literal(Literal::Undefined) => true,
+        Expr::Literal(_) => false,
+        Expr::Ident(name) => is_extended_ident(name, locals),
+        Expr::Template(_) | Expr::OptionalChain { .. } | Expr::Function(_) => true,
+        Expr::Array(elems) => elems.iter().any(|elem| match elem {
+            ArrayElem::Spread(_) => true,
+            ArrayElem::Expr(e) => expr_is_extended(e, locals),
+        }),
+        Expr::Object(props) => props.iter().any(|prop| match prop {
+            ObjectProp::Spread(_) => true,
+            ObjectProp::KeyValue { key, value } => {
+                matches!(key, ObjectKey::Computed(_)) || expr_is_extended(value, locals)
+            }
+        }),
+        Expr::Unary { expr, .. } => expr_is_extended(expr, locals),
+        Expr::Update { target, .. } => target_is_extended(target, locals),
+        Expr::Binary { left, right, .. } => {
+            expr_is_extended(left, locals) || expr_is_extended(right, locals)
+        }
+        Expr::Logical { op, left, right } => {
+            *op == LogicalOp::Nullish
+                || expr_is_extended(left, locals)
+                || expr_is_extended(right, locals)
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_is_extended(test, locals)
+                || expr_is_extended(consequent, locals)
+                || expr_is_extended(alternate, locals)
+        }
+        Expr::Assign { target, value, .. } => {
+            target_is_extended(target, locals) || expr_is_extended(value, locals)
+        }
+        Expr::Member { object, prop } => {
+            let prop_extended = !locals.contains(prop)
+                && !is_cm3_method_name(prop)
+                && !is_cm3_math_name(prop)
+                && !matches!(prop.as_str(), "frame" | "time" | "methods" | "properties");
+            prop_extended || expr_is_extended(object, locals)
+        }
+        Expr::Index { object, index } => {
+            expr_is_extended(object, locals) || expr_is_extended(index, locals)
+        }
+        Expr::Call { callee, args } => {
+            expr_is_extended(callee, locals)
+                || args.iter().any(|a| match a {
+                    CallArg::Spread(_) => true,
+                    CallArg::Expr(e) => expr_is_extended(e, locals),
+                })
+        }
+        Expr::Sequence(items) => items.iter().any(|e| expr_is_extended(e, locals)),
+    }
+}
+
+fn target_is_extended(target: &AssignTarget, locals: &BTreeSet<String>) -> bool {
+    match target {
+        AssignTarget::Ident(name) => is_extended_ident(name, locals),
+        AssignTarget::Member { object, prop } => {
+            let prop_extended = !locals.contains(prop)
+                && !is_cm3_method_name(prop)
+                && !is_cm3_math_name(prop)
+                && !matches!(prop.as_str(), "frame" | "time" | "methods" | "properties");
+            prop_extended || expr_is_extended(object, locals)
+        }
+        AssignTarget::Index { object, index } => {
+            expr_is_extended(object, locals) || expr_is_extended(index, locals)
+        }
+    }
+}
+
+/// Returns `true` if `program` contains a 0-argument `random()` call and no `seedRandom(...)` call,
+/// matching Zoidium `engine.js:53-54` diagnostic classification.
+pub fn has_unseeded_zero_arg_random(program: &Program) -> bool {
+    let mut has_zero_random = false;
+    let mut has_seed_random = false;
+    for stmt in &program.body {
+        scan_random_calls_stmt(stmt, &mut has_zero_random, &mut has_seed_random);
+    }
+    has_zero_random && !has_seed_random
+}
+
+fn scan_random_calls_stmt(stmt: &Stmt, has_zero_random: &mut bool, has_seed_random: &mut bool) {
+    match stmt {
+        Stmt::Empty | Stmt::Break | Stmt::Continue => {}
+        Stmt::Expr(e) | Stmt::Throw(e) => {
+            scan_random_calls_expr(e, has_zero_random, has_seed_random);
+        }
+        Stmt::Return(opt) => {
+            if let Some(e) = opt {
+                scan_random_calls_expr(e, has_zero_random, has_seed_random);
+            }
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                scan_random_calls_stmt(s, has_zero_random, has_seed_random);
+            }
+        }
+        Stmt::VarDecl { decls, .. } => {
+            for d in decls {
+                if let Some(init) = &d.init {
+                    scan_random_calls_expr(init, has_zero_random, has_seed_random);
+                }
+            }
+        }
+        Stmt::FunctionDecl(f) => {
+            for s in &f.body {
+                scan_random_calls_stmt(s, has_zero_random, has_seed_random);
+            }
+        }
+        Stmt::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            scan_random_calls_expr(test, has_zero_random, has_seed_random);
+            scan_random_calls_stmt(consequent, has_zero_random, has_seed_random);
+            if let Some(alt) = alternate {
+                scan_random_calls_stmt(alt, has_zero_random, has_seed_random);
+            }
+        }
+        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+            scan_random_calls_expr(test, has_zero_random, has_seed_random);
+            scan_random_calls_stmt(body, has_zero_random, has_seed_random);
+        }
+        Stmt::For(f) => {
+            if let Some(init) = &f.init {
+                match init {
+                    ForInit::VarDecl { decls, .. } => {
+                        for d in decls {
+                            if let Some(e) = &d.init {
+                                scan_random_calls_expr(e, has_zero_random, has_seed_random);
+                            }
+                        }
+                    }
+                    ForInit::Expr(e) => {
+                        scan_random_calls_expr(e, has_zero_random, has_seed_random);
+                    }
+                }
+            }
+            if let Some(t) = &f.test {
+                scan_random_calls_expr(t, has_zero_random, has_seed_random);
+            }
+            if let Some(u) = &f.update {
+                scan_random_calls_expr(u, has_zero_random, has_seed_random);
+            }
+            scan_random_calls_stmt(&f.body, has_zero_random, has_seed_random);
+        }
+        Stmt::ForOf(f) => {
+            scan_random_calls_expr(&f.iterable, has_zero_random, has_seed_random);
+            scan_random_calls_stmt(&f.body, has_zero_random, has_seed_random);
+        }
+        Stmt::ForIn(f) => {
+            scan_random_calls_expr(&f.object, has_zero_random, has_seed_random);
+            scan_random_calls_stmt(&f.body, has_zero_random, has_seed_random);
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            scan_random_calls_expr(discriminant, has_zero_random, has_seed_random);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    scan_random_calls_expr(t, has_zero_random, has_seed_random);
+                }
+                for s in &c.consequent {
+                    scan_random_calls_stmt(s, has_zero_random, has_seed_random);
+                }
+            }
+        }
+        Stmt::Try(t) => {
+            for s in &t.block {
+                scan_random_calls_stmt(s, has_zero_random, has_seed_random);
+            }
+            if let Some(cb) = &t.catch_body {
+                for s in cb {
+                    scan_random_calls_stmt(s, has_zero_random, has_seed_random);
+                }
+            }
+            if let Some(fb) = &t.finally_body {
+                for s in fb {
+                    scan_random_calls_stmt(s, has_zero_random, has_seed_random);
+                }
+            }
+        }
+    }
+}
+
+fn scan_random_calls_expr(expr: &Expr, has_zero_random: &mut bool, has_seed_random: &mut bool) {
+    match expr {
+        Expr::Literal(_) | Expr::Ident(_) => {}
+        Expr::Template(parts) => {
+            for p in parts {
+                if let TemplatePart::Expr(e) = p {
+                    scan_random_calls_expr(e, has_zero_random, has_seed_random);
+                }
+            }
+        }
+        Expr::Array(elems) => {
+            for elem in elems {
+                match elem {
+                    ArrayElem::Expr(e) | ArrayElem::Spread(e) => {
+                        scan_random_calls_expr(e, has_zero_random, has_seed_random);
+                    }
+                }
+            }
+        }
+        Expr::Object(props) => {
+            for prop in props {
+                match prop {
+                    ObjectProp::KeyValue { key, value } => {
+                        if let ObjectKey::Computed(k) = key {
+                            scan_random_calls_expr(k, has_zero_random, has_seed_random);
+                        }
+                        scan_random_calls_expr(value, has_zero_random, has_seed_random);
+                    }
+                    ObjectProp::Spread(e) => {
+                        scan_random_calls_expr(e, has_zero_random, has_seed_random);
+                    }
+                }
+            }
+        }
+        Expr::Unary { expr, .. } => {
+            scan_random_calls_expr(expr, has_zero_random, has_seed_random);
+        }
+        Expr::Update { target, .. } => match target.as_ref() {
+            AssignTarget::Ident(_) => {}
+            AssignTarget::Member { object, .. } => {
+                scan_random_calls_expr(object, has_zero_random, has_seed_random);
+            }
+            AssignTarget::Index { object, index } => {
+                scan_random_calls_expr(object, has_zero_random, has_seed_random);
+                scan_random_calls_expr(index, has_zero_random, has_seed_random);
+            }
+        },
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            scan_random_calls_expr(left, has_zero_random, has_seed_random);
+            scan_random_calls_expr(right, has_zero_random, has_seed_random);
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            scan_random_calls_expr(test, has_zero_random, has_seed_random);
+            scan_random_calls_expr(consequent, has_zero_random, has_seed_random);
+            scan_random_calls_expr(alternate, has_zero_random, has_seed_random);
+        }
+        Expr::Assign { value, .. } => {
+            scan_random_calls_expr(value, has_zero_random, has_seed_random);
+        }
+        Expr::Member { object, .. } => {
+            scan_random_calls_expr(object, has_zero_random, has_seed_random);
+        }
+        Expr::Index { object, index } => {
+            scan_random_calls_expr(object, has_zero_random, has_seed_random);
+            scan_random_calls_expr(index, has_zero_random, has_seed_random);
+        }
+        Expr::Call { callee, args } => {
+            if let Expr::Ident(name) = callee.as_ref() {
+                if name == "random" && args.is_empty() {
+                    *has_zero_random = true;
+                } else if name == "seedRandom" {
+                    *has_seed_random = true;
+                }
+            } else if let Expr::Member { object, prop } = callee.as_ref()
+                && matches!(object.as_ref(), Expr::Ident(o) if o == "methods")
+                && prop == "random"
+                && args.is_empty()
+            {
+                *has_zero_random = true;
+            }
+            scan_random_calls_expr(callee, has_zero_random, has_seed_random);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => {
+                        scan_random_calls_expr(e, has_zero_random, has_seed_random);
+                    }
+                }
+            }
+        }
+        Expr::OptionalChain { base, ops } => {
+            scan_random_calls_expr(base, has_zero_random, has_seed_random);
+            for op in ops {
+                match op {
+                    ChainOp::Member { .. } => {}
+                    ChainOp::Index { index, .. } => {
+                        scan_random_calls_expr(index, has_zero_random, has_seed_random);
+                    }
+                    ChainOp::Call { args, .. } => {
+                        for a in args {
+                            match a {
+                                CallArg::Expr(e) | CallArg::Spread(e) => {
+                                    scan_random_calls_expr(e, has_zero_random, has_seed_random);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Function(f) => match &f.body {
+            FunctionBody::Block(stmts) => {
+                for s in stmts {
+                    scan_random_calls_stmt(s, has_zero_random, has_seed_random);
+                }
+            }
+            FunctionBody::Expr(e) => {
+                scan_random_calls_expr(e, has_zero_random, has_seed_random);
+            }
+        },
+        Expr::Sequence(items) => {
+            for e in items {
+                scan_random_calls_expr(e, has_zero_random, has_seed_random);
             }
         }
     }

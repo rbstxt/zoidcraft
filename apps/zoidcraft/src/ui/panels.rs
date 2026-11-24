@@ -179,7 +179,7 @@ pub enum ExportRateControl {
 
 impl ExportRateControl {
     pub const ALL: [Self; 3] = [Self::Crf, Self::Bitrate, Self::Cm3Preset];
-    pub const LABELS: [&'static str; 3] = ["Quality (CRF)", "Bitrate (Mbps)", "CM3 Quality Preset"];
+    pub const LABELS: [&'static str; 3] = ["Quality (CRF)", "Bitrate (Mbps)", "Quality Preset"];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -418,6 +418,8 @@ pub struct PanelsState {
     expanded_vec_props: BTreeSet<(String, String)>,
     inspector_root_indent: bool,
     inspector_tx_owner: Option<(String, String)>,
+    inspector_tx_label: Option<String>,
+    inspector_tx_has_edits: bool,
     inspector_tx_owner_seen: bool,
 }
 
@@ -462,14 +464,95 @@ impl Default for PanelsState {
             expanded_vec_props: BTreeSet::new(),
             inspector_root_indent: false,
             inspector_tx_owner: None,
+            inspector_tx_label: None,
+            inspector_tx_has_edits: false,
             inspector_tx_owner_seen: false,
         }
     }
 }
 
+fn clear_inspector_tx_state(state: &mut PanelsState) {
+    state.inspector_tx_owner = None;
+    state.inspector_tx_label = None;
+    state.inspector_tx_has_edits = false;
+}
+
 fn commit_inspector_tx_if_open(session: &mut Session, state: &mut PanelsState) {
-    if state.inspector_tx_owner.take().is_some() && session.history.is_in_transaction() {
-        let _ = session.commit_transaction(true);
+    let had_owner = state.inspector_tx_owner.is_some();
+    let had_edits = state.inspector_tx_has_edits;
+    clear_inspector_tx_state(state);
+    if had_owner && session.history.is_in_transaction() {
+        if had_edits {
+            let _ = session.commit_transaction(true);
+        } else {
+            let _ = session.cancel_transaction();
+        }
+    }
+}
+
+fn close_existing_tx_before_start(session: &mut Session, state: &mut PanelsState) {
+    if session.history.is_in_transaction() {
+        if state.inspector_tx_owner.is_some() && !state.inspector_tx_has_edits {
+            let _ = session.cancel_transaction();
+        } else {
+            let _ = session.commit_transaction(true);
+        }
+        clear_inspector_tx_state(state);
+    } else if state.inspector_tx_owner.is_some() {
+        clear_inspector_tx_state(state);
+    }
+}
+
+fn begin_inspector_tx(
+    session: &mut Session,
+    state: &mut PanelsState,
+    target_id: &str,
+    owner_key: &str,
+    label: impl Into<String>,
+) -> bool {
+    let label = label.into();
+    if session.begin_transaction(label.clone()).is_ok() {
+        state.inspector_tx_owner = Some((target_id.to_owned(), owner_key.to_owned()));
+        state.inspector_tx_label = Some(label);
+        state.inspector_tx_has_edits = false;
+        state.inspector_tx_owner_seen = true;
+        true
+    } else {
+        false
+    }
+}
+
+fn run_atomic_commit_outside_foreign_tx(
+    session: &mut Session,
+    state: &mut PanelsState,
+    commit_fn: impl FnOnce(&mut Session),
+) {
+    if session.history.is_in_transaction() && state.inspector_tx_owner.is_some() {
+        let saved_owner = state.inspector_tx_owner.take();
+        let saved_label = state.inspector_tx_label.take();
+        let had_edits = state.inspector_tx_has_edits;
+        let was_seen = state.inspector_tx_owner_seen;
+        state.inspector_tx_has_edits = false;
+
+        if had_edits {
+            let _ = session.commit_transaction(true);
+        } else {
+            let _ = session.cancel_transaction();
+        }
+
+        commit_fn(session);
+
+        if !had_edits && let Some(owner) = saved_owner {
+            let label = saved_label.unwrap_or_else(|| format!("edit {}", owner.1));
+            if session.begin_transaction(label.clone()).is_ok() {
+                state.inspector_tx_owner = Some(owner);
+                state.inspector_tx_label = Some(label);
+                state.inspector_tx_has_edits = false;
+                state.inspector_tx_owner_seen = was_seen;
+            }
+        }
+    } else {
+        commit_fn(session);
     }
 }
 
@@ -501,7 +584,7 @@ pub fn show_side_panel(
     state.inspector_tx_owner_seen = false;
     state.inspector_root_indent = false;
     if !session.history.is_in_transaction() {
-        state.inspector_tx_owner = None;
+        clear_inspector_tx_state(state);
     }
 
     match tab {
@@ -646,7 +729,7 @@ const MEDIA_PRESETS: &[MediaPreset] = &[
     MediaPreset {
         kind: "zoidium:shape-plus/shape-layer",
         title: "Shape+",
-        subtitle: "Animated AE-style vector layer",
+        subtitle: "Animated 2D vector layer",
         icon: MediaCardIcon::Shape,
         required_plugin: Some("shape-plus"),
     },
@@ -1126,7 +1209,7 @@ fn add_clip_with_asset(session: &mut Session, kind: &str, title: &str, asset_id:
         }
     };
 
-    let _ = session.begin_transaction(format!("add {title}"));
+    let started_tx = session.begin_transaction(format!("add {title}")).is_ok();
 
     let (track_id, start) = if let Some(pair) = chosen {
         pair
@@ -1141,7 +1224,9 @@ fn add_clip_with_asset(session: &mut Session, kind: &str, title: &str, asset_id:
         {
             (tid.to_owned(), desired_start)
         } else {
-            let _ = session.cancel_transaction();
+            if started_tx && session.history.is_in_transaction() {
+                let _ = session.cancel_transaction();
+            }
             return;
         }
     };
@@ -1195,7 +1280,7 @@ fn add_clip_with_asset(session: &mut Session, kind: &str, title: &str, asset_id:
         let _ = session.selection.select_clip(cid, Some(kind), false);
     }
 
-    if session.history.is_in_transaction() {
+    if started_tx && session.history.is_in_transaction() {
         let _ = session.commit_transaction(true);
     }
 }
@@ -1261,64 +1346,69 @@ fn show_sequence_tab(
                         },
                     );
                     let owns_res_tx = owns_inspector_tx(state, "sequence", "resolution");
+                    let res_cmd = || Command::SetResolution {
+                        width: res_vec[0].round().clamp(16.0, 7680.0) as u32,
+                        height: res_vec[1].round().clamp(16.0, 7680.0) as u32,
+                    };
                     if ev.cancelled {
                         if owns_res_tx {
                             if session.history.is_in_transaction() {
                                 let _ = session.cancel_transaction();
                             }
-                            state.inspector_tx_owner = None;
+                            clear_inspector_tx_state(state);
                         }
                     } else if ev.started && ev.committed {
-                        let cmd = Command::SetResolution {
-                            width: res_vec[0].round().clamp(16.0, 7680.0) as u32,
-                            height: res_vec[1].round().clamp(16.0, 7680.0) as u32,
-                        };
                         if owns_res_tx {
                             if ev.changed {
-                                let _ = session.execute(cmd);
+                                let _ = session.execute(res_cmd());
+                                state.inspector_tx_has_edits = true;
                             }
                             if session.history.is_in_transaction() {
                                 let _ = session.commit_transaction(true);
                             }
-                            state.inspector_tx_owner = None;
+                            clear_inspector_tx_state(state);
                         } else {
-                            if session.history.is_in_transaction() {
-                                let _ = session.commit_transaction(true);
-                                state.inspector_tx_owner = None;
-                            }
+                            close_existing_tx_before_start(session, state);
                             if ev.changed {
-                                let _ = session.execute(cmd);
+                                let _ = session.execute(res_cmd());
                             }
                         }
-                        if session.begin_transaction("set resolution").is_ok() {
-                            state.inspector_tx_owner =
-                                Some(("sequence".to_owned(), "resolution".to_owned()));
-                            state.inspector_tx_owner_seen = true;
-                        }
+                        begin_inspector_tx(
+                            session,
+                            state,
+                            "sequence",
+                            "resolution",
+                            "set resolution",
+                        );
                     } else {
                         if ev.started && !ev.committed {
-                            if session.history.is_in_transaction() {
-                                let _ = session.commit_transaction(true);
-                                state.inspector_tx_owner = None;
-                            }
-                            if session.begin_transaction("set resolution").is_ok() {
-                                state.inspector_tx_owner =
-                                    Some(("sequence".to_owned(), "resolution".to_owned()));
-                                state.inspector_tx_owner_seen = true;
-                            }
+                            close_existing_tx_before_start(session, state);
+                            begin_inspector_tx(
+                                session,
+                                state,
+                                "sequence",
+                                "resolution",
+                                "set resolution",
+                            );
                         }
                         let owns_res_tx = owns_inspector_tx(state, "sequence", "resolution");
-                        if ev.changed || (ev.committed && owns_res_tx) {
-                            let _ = session.execute(Command::SetResolution {
-                                width: res_vec[0].round().clamp(16.0, 7680.0) as u32,
-                                height: res_vec[1].round().clamp(16.0, 7680.0) as u32,
+                        if ev.changed && ev.committed && !ev.started && !owns_res_tx {
+                            run_atomic_commit_outside_foreign_tx(session, state, |session| {
+                                let _ = session.execute(res_cmd());
                             });
-                        }
-                        if ev.committed && owns_res_tx {
-                            if session.history.is_in_transaction() {
-                                let _ = session.commit_transaction(true);
+                        } else {
+                            if ev.changed || (ev.committed && owns_res_tx) {
+                                let _ = session.execute(res_cmd());
+                                if owns_res_tx {
+                                    state.inspector_tx_has_edits = true;
+                                }
                             }
-                            state.inspector_tx_owner = None;
+                            if ev.committed && owns_res_tx {
+                                if session.history.is_in_transaction() {
+                                    let _ = session.commit_transaction(true);
+                                }
+                                clear_inspector_tx_state(state);
+                            }
                         }
                     }
 
@@ -1348,52 +1438,48 @@ fn show_sequence_tab(
                             if session.history.is_in_transaction() {
                                 let _ = session.cancel_transaction();
                             }
-                            state.inspector_tx_owner = None;
+                            clear_inspector_tx_state(state);
                         }
                     } else if ev.started && ev.committed {
                         if owns_fps_tx {
                             if ev.changed {
                                 let _ = session.execute(Command::SetFps { fps });
+                                state.inspector_tx_has_edits = true;
                             }
                             if session.history.is_in_transaction() {
                                 let _ = session.commit_transaction(true);
                             }
-                            state.inspector_tx_owner = None;
+                            clear_inspector_tx_state(state);
                         } else {
-                            if session.history.is_in_transaction() {
-                                let _ = session.commit_transaction(true);
-                                state.inspector_tx_owner = None;
-                            }
+                            close_existing_tx_before_start(session, state);
                             if ev.changed {
                                 let _ = session.execute(Command::SetFps { fps });
                             }
                         }
-                        if session.begin_transaction("set fps").is_ok() {
-                            state.inspector_tx_owner =
-                                Some(("sequence".to_owned(), "fps".to_owned()));
-                            state.inspector_tx_owner_seen = true;
-                        }
+                        begin_inspector_tx(session, state, "sequence", "fps", "set fps");
                     } else {
                         if ev.started && !ev.committed {
-                            if session.history.is_in_transaction() {
-                                let _ = session.commit_transaction(true);
-                                state.inspector_tx_owner = None;
-                            }
-                            if session.begin_transaction("set fps").is_ok() {
-                                state.inspector_tx_owner =
-                                    Some(("sequence".to_owned(), "fps".to_owned()));
-                                state.inspector_tx_owner_seen = true;
-                            }
+                            close_existing_tx_before_start(session, state);
+                            begin_inspector_tx(session, state, "sequence", "fps", "set fps");
                         }
                         let owns_fps_tx = owns_inspector_tx(state, "sequence", "fps");
-                        if ev.changed || (ev.committed && owns_fps_tx) {
-                            let _ = session.execute(Command::SetFps { fps });
-                        }
-                        if ev.committed && owns_fps_tx {
-                            if session.history.is_in_transaction() {
-                                let _ = session.commit_transaction(true);
+                        if ev.changed && ev.committed && !ev.started && !owns_fps_tx {
+                            run_atomic_commit_outside_foreign_tx(session, state, |session| {
+                                let _ = session.execute(Command::SetFps { fps });
+                            });
+                        } else {
+                            if ev.changed || (ev.committed && owns_fps_tx) {
+                                let _ = session.execute(Command::SetFps { fps });
+                                if owns_fps_tx {
+                                    state.inspector_tx_has_edits = true;
+                                }
                             }
-                            state.inspector_tx_owner = None;
+                            if ev.committed && owns_fps_tx {
+                                if session.history.is_in_transaction() {
+                                    let _ = session.commit_transaction(true);
+                                }
+                                clear_inspector_tx_state(state);
+                            }
                         }
                     }
 
@@ -1648,7 +1734,7 @@ fn show_sequence_tab(
             );
 
             if reset_seq {
-                let _ = session.begin_transaction("reset sequence");
+                let started_tx = session.begin_transaction("reset sequence").is_ok();
                 let _ = session.execute(Command::SetResolution {
                     width: 1920,
                     height: 1080,
@@ -1657,7 +1743,7 @@ fn show_sequence_tab(
                 let _ = session.execute(Command::ResetPropertyList {
                     target_id: "sequence".to_owned(),
                 });
-                if session.history.is_in_transaction() {
+                if started_tx && session.history.is_in_transaction() {
                     let _ = session.commit_transaction(true);
                 }
             }
@@ -1794,7 +1880,7 @@ fn show_edit_tab(
                             .properties
                             .get("time")
                             .is_some_and(|p| p.animated);
-                        let _ = session.begin_transaction("reset properties");
+                        let started_tx = session.begin_transaction("reset properties").is_ok();
                         if time_animated {
                             let _ = session.execute(Command::TogglePropertyAnimated {
                                 target_id: clip_id.clone(),
@@ -1807,7 +1893,7 @@ fn show_edit_tab(
                             property: "time".to_owned(),
                             value: json!(0.0),
                         });
-                        if session.history.is_in_transaction() {
+                        if started_tx && session.history.is_in_transaction() {
                             let _ = session.commit_transaction(true);
                         }
                     }
@@ -2507,8 +2593,8 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
     if session.plugins.is_enabled("optical-flares") {
         items.push(FuzzyItem {
             id: "zoidium:optical-flares/flare".into(),
-            category: "Optical Flares".into(),
-            name: "Optical Flare".into(),
+            category: "Lens Flares".into(),
+            name: "Lens Flare".into(),
             desc: "3D depth-occluded lens flare".into(),
         });
     }
@@ -2517,17 +2603,17 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
         for (id, name, desc) in [
             (
                 "zoidium:trapcode-suite/particular",
-                "Particular",
+                "3D Particle Emitter",
                 "Deterministic 3D fluid particle sim",
             ),
             (
                 "zoidium:trapcode-suite/form",
-                "Form",
+                "Particle Lattice",
                 "Deformable 3D particle lattice",
             ),
             (
                 "zoidium:trapcode-suite/plexus",
-                "Plexus",
+                "Point Cloud Network",
                 "Procedural point & edge cloud",
             ),
             (
@@ -2543,7 +2629,7 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
         ] {
             items.push(FuzzyItem {
                 id: id.into(),
-                category: "Rowbyte & Red Giant Suite".into(),
+                category: "Particle & Light Suite".into(),
                 name: name.into(),
                 desc: desc.into(),
             });
@@ -3061,7 +3147,7 @@ fn apply_object_drop(
     }
 
     if alt_clone {
-        let _ = session.begin_transaction("clone object");
+        let started_tx = session.begin_transaction("clone object").is_ok();
         if let Ok(res) = session.execute(Command::DuplicateObject3D {
             clip_id: clip.id.clone(),
             object_id: src_id.to_owned(),
@@ -3074,7 +3160,7 @@ fn apply_object_drop(
                 index: target_idx,
             });
         }
-        if session.history.is_in_transaction() {
+        if started_tx && session.history.is_in_transaction() {
             let _ = session.commit_transaction(true);
         }
     } else {
@@ -4713,7 +4799,7 @@ fn show_constraint_target_rows(
         },
     );
     if track_changed {
-        let _ = session.begin_transaction("set track to");
+        let started_tx = session.begin_transaction("set track to").is_ok();
         if track_idx == 0 {
             let _ = session.execute(Command::SetPropertyValue {
                 target_id: obj_id.to_owned(),
@@ -4737,7 +4823,7 @@ fn show_constraint_target_rows(
                 value: json!(targets[track_idx - 1].0),
             });
         }
-        if session.history.is_in_transaction() {
+        if started_tx && session.history.is_in_transaction() {
             let _ = session.commit_transaction(true);
         }
     }
@@ -4798,7 +4884,7 @@ fn show_constraint_target_rows(
         },
     );
     if follow_changed {
-        let _ = session.begin_transaction("set follow");
+        let started_tx = session.begin_transaction("set follow").is_ok();
         if follow_idx == 0 {
             let _ = session.execute(Command::SetPropertyValue {
                 target_id: obj_id.to_owned(),
@@ -4822,7 +4908,7 @@ fn show_constraint_target_rows(
                 value: json!(targets[follow_idx - 1].0),
             });
         }
-        if session.history.is_in_transaction() {
+        if started_tx && session.history.is_in_transaction() {
             let _ = session.commit_transaction(true);
         }
     }
@@ -4843,7 +4929,7 @@ fn apply_paired_scalar_scrub(
             if session.history.is_in_transaction() {
                 let _ = session.cancel_transaction();
             }
-            state.inspector_tx_owner = None;
+            clear_inspector_tx_state(state);
         }
         return;
     }
@@ -4860,16 +4946,14 @@ fn apply_paired_scalar_scrub(
                     property: b.0.to_owned(),
                     value: json!(b.1),
                 });
+                state.inspector_tx_has_edits = true;
             }
             if session.history.is_in_transaction() {
                 let _ = session.commit_transaction(true);
             }
-            state.inspector_tx_owner = None;
+            clear_inspector_tx_state(state);
         } else {
-            if session.history.is_in_transaction() {
-                let _ = session.commit_transaction(true);
-                state.inspector_tx_owner = None;
-            }
+            close_existing_tx_before_start(session, state);
             if ev.changed {
                 let opened_atomic = session
                     .begin_transaction(format!("edit {owner_key}"))
@@ -4889,36 +4973,48 @@ fn apply_paired_scalar_scrub(
                 }
             }
         }
-        if session
-            .begin_transaction(format!("edit {owner_key}"))
-            .is_ok()
-        {
-            state.inspector_tx_owner = Some((target_id.to_owned(), owner_key.to_owned()));
-            state.inspector_tx_owner_seen = true;
-        }
+        begin_inspector_tx(
+            session,
+            state,
+            target_id,
+            owner_key,
+            format!("edit {owner_key}"),
+        );
         return;
     }
-    let mut opened_atomic = false;
     if ev.started && !ev.committed {
-        if session.history.is_in_transaction() {
-            let _ = session.commit_transaction(true);
-            state.inspector_tx_owner = None;
-        }
-        if session
-            .begin_transaction(format!("edit {owner_key}"))
-            .is_ok()
-        {
-            state.inspector_tx_owner = Some((target_id.to_owned(), owner_key.to_owned()));
-            state.inspector_tx_owner_seen = true;
-        }
+        close_existing_tx_before_start(session, state);
+        begin_inspector_tx(
+            session,
+            state,
+            target_id,
+            owner_key,
+            format!("edit {owner_key}"),
+        );
     }
     let owns_tx = owns_inspector_tx(state, target_id, owner_key);
-    if ev.changed || (ev.committed && owns_tx) {
-        if ev.committed && !owns_tx && !session.history.is_in_transaction() {
-            opened_atomic = session
+    if ev.changed && ev.committed && !ev.started && !owns_tx {
+        run_atomic_commit_outside_foreign_tx(session, state, |session| {
+            let opened_atomic = session
                 .begin_transaction(format!("edit {owner_key}"))
                 .is_ok();
-        }
+            let _ = session.execute(Command::SetPropertyValue {
+                target_id: target_id.to_owned(),
+                property: a.0.to_owned(),
+                value: json!(a.1),
+            });
+            let _ = session.execute(Command::SetPropertyValue {
+                target_id: target_id.to_owned(),
+                property: b.0.to_owned(),
+                value: json!(b.1),
+            });
+            if opened_atomic && session.history.is_in_transaction() {
+                let _ = session.commit_transaction(true);
+            }
+        });
+        return;
+    }
+    if ev.changed || (ev.committed && owns_tx) {
         let _ = session.execute(Command::SetPropertyValue {
             target_id: target_id.to_owned(),
             property: a.0.to_owned(),
@@ -4929,16 +5025,15 @@ fn apply_paired_scalar_scrub(
             property: b.0.to_owned(),
             value: json!(b.1),
         });
+        if owns_tx {
+            state.inspector_tx_has_edits = true;
+        }
     }
-    if opened_atomic {
+    if ev.committed && owns_tx {
         if session.history.is_in_transaction() {
             let _ = session.commit_transaction(true);
         }
-    } else if ev.committed && owns_tx {
-        if session.history.is_in_transaction() {
-            let _ = session.commit_transaction(true);
-        }
-        state.inspector_tx_owner = None;
+        clear_inspector_tx_state(state);
     }
 }
 
@@ -5086,7 +5181,7 @@ fn build_effect_picker_items(session: &Session) -> Vec<FuzzyItem> {
             id: desc.id.to_owned(),
             category: effect_category_label(desc.category).to_owned(),
             name: desc.display_name.to_owned(),
-            desc: format!("CM3 standard ({} pass)", desc.passes),
+            desc: format!("Standard ({} pass)", desc.passes),
         });
     }
 
@@ -5097,21 +5192,25 @@ fn build_effect_picker_items(session: &Session) -> Vec<FuzzyItem> {
             .is_none_or(|pid| session.plugins.is_enabled(pid));
         if allowed {
             let pid = desc.plugin_id.unwrap_or("zoidium");
+            let plugin_label = session
+                .plugins
+                .get(pid)
+                .map_or("Extension", |p| p.name.as_str());
             items.push(FuzzyItem {
                 id: format!("zoidium:{pid}/{}", desc.id),
                 category: format!("Plugin: {}", effect_category_label(desc.category)),
                 name: desc.display_name.to_owned(),
-                desc: format!("from {pid}"),
+                desc: format!("from {plugin_label}"),
             });
         }
     }
 
-    // ZSMB lightweight plugin effect when enabled
+    // Lightweight motion blur plugin effect when enabled
     if session.plugins.is_enabled("smart-motion-blur-lite") {
         items.push(FuzzyItem {
             id: "zoidium:smart-motion-blur-lite/zsmb".into(),
             category: "Plugin: Blur & Sharpen".into(),
-            name: "ZSMB (Smart Motion Blur Lite)".into(),
+            name: "Smart Motion Blur Lite".into(),
             desc: "Single-neighbor optical-flow motion blur".into(),
         });
     }
@@ -5193,10 +5292,8 @@ fn show_effects_tab(
                     FuzzyPickerEvent::Selected(kind) => {
                         commit_inspector_tx_if_open(session, state);
                         let display = items.iter().find(|i| i.id == kind).map(|i| i.name.clone());
-                        let wrap_tx = kind == "customshader";
-                        if wrap_tx {
-                            let _ = session.begin_transaction("add custom shader");
-                        }
+                        let started_tx = kind == "customshader"
+                            && session.begin_transaction("add custom shader").is_ok();
                         if let Ok(res) = session.execute(Command::AddEffect {
                             clip_id: clip_id.clone(),
                             kind: kind.clone(),
@@ -5213,7 +5310,7 @@ fn show_effects_tab(
                             }
                             let _ = session.selection.select_effect(fx_id, &kind, false);
                         }
-                        if wrap_tx && session.history.is_in_transaction() {
+                        if started_tx && session.history.is_in_transaction() {
                             let _ = session.commit_transaction(true);
                         }
                         state.add_effect_open = false;
@@ -6313,45 +6410,53 @@ fn render_template_param(
                     if session.history.is_in_transaction() {
                         let _ = session.cancel_transaction();
                     }
-                    state.inspector_tx_owner = None;
+                    clear_inspector_tx_state(state);
                 }
             } else {
                 if ev.changed && !ev.committed && !owns_grad_tx {
-                    if session.history.is_in_transaction() {
-                        let _ = session.commit_transaction(true);
-                        state.inspector_tx_owner = None;
-                    }
-                    if session.begin_transaction(format!("edit {key}")).is_ok() {
-                        state.inspector_tx_owner = Some((target_id.to_owned(), key.to_owned()));
-                        state.inspector_tx_owner_seen = true;
-                    }
+                    close_existing_tx_before_start(session, state);
+                    begin_inspector_tx(session, state, target_id, key, format!("edit {key}"));
                 }
                 let owns_grad_tx = owns_inspector_tx(state, target_id, key);
                 if ev.changed
                     && let Ok(v) = serde_json::to_value(&stops)
                 {
-                    let cmd = if animated {
-                        Command::SetKeyframe {
-                            target_id: target_id.to_owned(),
-                            property: key.to_owned(),
-                            frame: resolve_kf_write_frame(session, prop_opt.as_ref(), local_frame),
-                            value: v,
-                            tween: None,
-                        }
-                    } else {
-                        Command::SetPropertyValue {
-                            target_id: target_id.to_owned(),
-                            property: key.to_owned(),
-                            value: v,
-                        }
+                    let exec_grad = |session: &mut Session| {
+                        let cmd = if animated {
+                            Command::SetKeyframe {
+                                target_id: target_id.to_owned(),
+                                property: key.to_owned(),
+                                frame: resolve_kf_write_frame(
+                                    session,
+                                    prop_opt.as_ref(),
+                                    local_frame,
+                                ),
+                                value: v,
+                                tween: None,
+                            }
+                        } else {
+                            Command::SetPropertyValue {
+                                target_id: target_id.to_owned(),
+                                property: key.to_owned(),
+                                value: v,
+                            }
+                        };
+                        let _ = session.execute(cmd);
                     };
-                    let _ = session.execute(cmd);
+                    if ev.committed && !owns_grad_tx {
+                        run_atomic_commit_outside_foreign_tx(session, state, exec_grad);
+                    } else {
+                        exec_grad(session);
+                        if owns_grad_tx {
+                            state.inspector_tx_has_edits = true;
+                        }
+                    }
                 }
                 if ev.committed && owns_grad_tx {
                     if session.history.is_in_transaction() {
                         let _ = session.commit_transaction(true);
                     }
-                    state.inspector_tx_owner = None;
+                    clear_inspector_tx_state(state);
                 }
             }
         }
@@ -6513,7 +6618,7 @@ fn render_template_param(
         PropertyValue::Json(_) => {
             let btn_label = match effect_kind {
                 "nodeeffect" => "Open Node Editor",
-                "magiclooks" => "Open Looks Editor",
+                "magiclooks" => "Open Color Looks Editor",
                 _ => "Edit JSON",
             };
             panel_property_row(
@@ -8164,7 +8269,7 @@ fn zoidium_plugin_summary<'a>(id: &str, fallback: &'a str) -> &'a str {
         "shape-plus" => "Animated vector layers & pen masks",
         "constraints" => "Track To & Follow 3D constraints",
         // Adjustment Extensions
-        "native-fx" => "Temporal FX, curves, drop shadow & SMB",
+        "native-fx" => "Temporal FX, curves, drop shadow & motion blur",
         "openzoid-legacy" => "JPEG Damage, VHS, Datamosh & ASCII FX",
         "magic-looks" => "Color grading, film looks & 3D LUTs",
         "node-effect" => "Visual GPU shader node graph",
@@ -8707,7 +8812,7 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                             paint_outlined_plugin_badge_at(
                                 &text_painter,
                                 Pos2::new(badge_x, badge_y),
-                                "CM3 compatible",
+                                "Standard",
                                 Color32::from_rgb(0x2d, 0x30, 0x37),
                                 theme.value(),
                                 Color32::from_rgb(0xb2, 0xbc, 0xd5),
@@ -8717,7 +8822,7 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                             paint_outlined_plugin_badge_at(
                                 &text_painter,
                                 Pos2::new(badge_x, badge_y),
-                                "Zoidium only",
+                                "Extended",
                                 Color32::from_rgb(0x38, 0x28, 0x28),
                                 WARNING_BAR,
                                 DANGER_TEXT,
@@ -8801,13 +8906,13 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                         ui.allocate_ui(Vec2::new(half_w, 26.0), |ui| {
                             if cm3_prop_button(
                                 ui,
-                                "Vanilla CM3",
+                                "Core Mode",
                                 ButtonVariant::Normal,
                                 true,
                                 theme,
                             )
                             .on_hover_text(
-                                "Disable all optional Zoidium plugins to restore Vanilla CM3",
+                                "Disable all optional plugins to enter Core Mode",
                             )
                             .clicked()
                             {
@@ -8823,7 +8928,7 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                                             ));
                                         } else {
                                             state.plugin_notice =
-                                                Some("Switched to Vanilla CM3 Mode.".to_owned());
+                                                Some("Switched to Core Mode.".to_owned());
                                         }
                                     }
                                     Err(err) => {
@@ -9335,7 +9440,7 @@ fn show_settings_tab(
                                         ui,
                                         Id::unique("settings_editor_layout"),
                                         &mut state.settings_editor_layout,
-                                        &["Clipmaker 3"],
+                                        &["Classic"],
                                         dd_w,
                                         viewport_rect,
                                         theme,
@@ -9570,7 +9675,7 @@ fn show_settings_tab(
                                 ui,
                                 Id::unique("settings_gradient_editor"),
                                 &mut state.settings_gradient_editor,
-                                &["Zoidium", "Classic"],
+                                &["Modern", "Classic"],
                                 78.0,
                                 viewport_rect,
                                 theme,
@@ -9991,8 +10096,8 @@ fn show_about_tab(ui: &mut Ui, session: &Session, theme: &Cm3Theme) {
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(
-                                "Clean-room native Rust + wgpu motion-graphics & 3D video editor \
-                                 implementing ClipMaker 3 workflows and toggleable Zoidium extensions.",
+                                "Native Rust + wgpu motion-graphics & 3D video editor \
+                                 with modular built-in extensions.",
                             )
                             .font(theme.font(FONT_SMALL))
                             .color(TEXT_PRIMARY),
@@ -10117,7 +10222,7 @@ fn show_inspector_floating_windows(
                     }
 
                     ui.add_space(4.0);
-                    ScrollArea::vertical()
+                    let scroll_out = ScrollArea::vertical()
                         .id_salt("shader_code_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -10130,6 +10235,14 @@ fn show_inspector_floating_windows(
                                     .code_editor(),
                             );
                         });
+                    if crate::ui::gestures::unoccluded_hover_pos(ui, scroll_out.inner_rect)
+                        .is_some()
+                    {
+                        let zoom = ui.input(|i| i.zoom_delta());
+                        if zoom.is_finite() && (zoom - 1.0).abs() > 1e-4 {
+                            editor.font_px = (editor.font_px * zoom).clamp(10.0, 24.0);
+                        }
+                    }
                 },
             );
 
@@ -10752,13 +10865,38 @@ fn apply_scrub_to_session(
     ev: ScrubEvent,
     state: &mut PanelsState,
 ) {
-    let owns_tx = owns_inspector_tx(state, target_id, prop_name);
+    apply_scrub_to_session_with_owner_key(
+        session,
+        target_id,
+        prop_name,
+        prop_name,
+        animated,
+        local_frame,
+        value,
+        ev,
+        state,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_scrub_to_session_with_owner_key(
+    session: &mut Session,
+    target_id: &str,
+    prop_name: &str,
+    tx_owner_key: &str,
+    animated: bool,
+    local_frame: f64,
+    value: Value,
+    ev: ScrubEvent,
+    state: &mut PanelsState,
+) {
+    let owns_tx = owns_inspector_tx(state, target_id, tx_owner_key);
     if ev.cancelled {
         if owns_tx {
             if session.history.is_in_transaction() {
                 let _ = session.cancel_transaction();
             }
-            state.inspector_tx_owner = None;
+            clear_inspector_tx_state(state);
         }
         return;
     }
@@ -10773,16 +10911,14 @@ fn apply_scrub_to_session(
                     local_frame,
                     value,
                 );
+                state.inspector_tx_has_edits = true;
             }
             if session.history.is_in_transaction() {
                 let _ = session.commit_transaction(true);
             }
-            state.inspector_tx_owner = None;
+            clear_inspector_tx_state(state);
         } else {
-            if session.history.is_in_transaction() {
-                let _ = session.commit_transaction(true);
-                state.inspector_tx_owner = None;
-            }
+            close_existing_tx_before_start(session, state);
             if ev.changed {
                 execute_prop_value_command(
                     session,
@@ -10794,37 +10930,43 @@ fn apply_scrub_to_session(
                 );
             }
         }
-        if session
-            .begin_transaction(format!("edit {prop_name}"))
-            .is_ok()
-        {
-            state.inspector_tx_owner = Some((target_id.to_owned(), prop_name.to_owned()));
-            state.inspector_tx_owner_seen = true;
-        }
+        begin_inspector_tx(
+            session,
+            state,
+            target_id,
+            tx_owner_key,
+            format!("edit {prop_name}"),
+        );
         return;
     }
     if ev.started && !ev.committed {
-        if session.history.is_in_transaction() {
-            let _ = session.commit_transaction(true);
-            state.inspector_tx_owner = None;
-        }
-        if session
-            .begin_transaction(format!("edit {prop_name}"))
-            .is_ok()
-        {
-            state.inspector_tx_owner = Some((target_id.to_owned(), prop_name.to_owned()));
-            state.inspector_tx_owner_seen = true;
-        }
+        close_existing_tx_before_start(session, state);
+        begin_inspector_tx(
+            session,
+            state,
+            target_id,
+            tx_owner_key,
+            format!("edit {prop_name}"),
+        );
     }
-    let owns_tx = owns_inspector_tx(state, target_id, prop_name);
+    let owns_tx = owns_inspector_tx(state, target_id, tx_owner_key);
+    if ev.changed && ev.committed && !ev.started && !owns_tx {
+        run_atomic_commit_outside_foreign_tx(session, state, |session| {
+            execute_prop_value_command(session, target_id, prop_name, animated, local_frame, value);
+        });
+        return;
+    }
     if ev.changed || (ev.committed && owns_tx) {
         execute_prop_value_command(session, target_id, prop_name, animated, local_frame, value);
+        if owns_tx {
+            state.inspector_tx_has_edits = true;
+        }
     }
     if ev.committed && owns_tx {
         if session.history.is_in_transaction() {
             let _ = session.commit_transaction(true);
         }
-        state.inspector_tx_owner = None;
+        clear_inspector_tx_state(state);
     }
 }
 
@@ -10847,32 +10989,45 @@ fn apply_color_picker_to_session(
             if session.history.is_in_transaction() {
                 let _ = session.cancel_transaction();
             }
-            state.inspector_tx_owner = None;
+            clear_inspector_tx_state(state);
         }
         return;
     }
     if cev.changed && !cev.committed && !owns_tx {
-        if session.history.is_in_transaction() {
-            let _ = session.commit_transaction(true);
-            state.inspector_tx_owner = None;
-        }
-        if session
-            .begin_transaction(format!("edit {prop_name}"))
-            .is_ok()
-        {
-            state.inspector_tx_owner = Some((target_id.to_owned(), prop_name.to_owned()));
-            state.inspector_tx_owner_seen = true;
-        }
+        close_existing_tx_before_start(session, state);
+        begin_inspector_tx(
+            session,
+            state,
+            target_id,
+            prop_name,
+            format!("edit {prop_name}"),
+        );
     }
     let owns_tx = owns_inspector_tx(state, target_id, prop_name);
     if cev.changed {
-        execute_prop_value_command(session, target_id, prop_name, animated, local_frame, value);
+        if cev.committed && !owns_tx {
+            run_atomic_commit_outside_foreign_tx(session, state, |session| {
+                execute_prop_value_command(
+                    session,
+                    target_id,
+                    prop_name,
+                    animated,
+                    local_frame,
+                    value,
+                );
+            });
+        } else {
+            execute_prop_value_command(session, target_id, prop_name, animated, local_frame, value);
+            if owns_tx {
+                state.inspector_tx_has_edits = true;
+            }
+        }
     }
     if cev.committed && owns_tx {
         if session.history.is_in_transaction() {
             let _ = session.commit_transaction(true);
         }
-        state.inspector_tx_owner = None;
+        clear_inspector_tx_state(state);
     }
 }
 
@@ -11175,8 +11330,9 @@ fn show_session_vec2_prop(
 
     // Expanded individual X / Y axis rows
     if expanded {
-        let mut axis_ev = ScrubEvent::default();
         for (axis, axis_lbl) in [(0usize, "X"), (1usize, "Y")] {
+            let axis_owner_key = format!("{prop_key}::axis{axis}");
+            touch_inspector_tx_owner(state, target_id, &axis_owner_key);
             let ev = panel_property_row(
                 ui,
                 axis_lbl,
@@ -11196,18 +11352,18 @@ fn show_session_vec2_prop(
                     )
                 },
             );
-            axis_ev = axis_ev.merge(ev);
+            apply_scrub_to_session_with_owner_key(
+                session,
+                target_id,
+                prop_key,
+                &axis_owner_key,
+                animated,
+                local_frame,
+                json!(val),
+                ev,
+                state,
+            );
         }
-        apply_scrub_to_session(
-            session,
-            target_id,
-            prop_key,
-            animated,
-            local_frame,
-            json!(val),
-            axis_ev,
-            state,
-        );
     }
 }
 
@@ -11355,8 +11511,9 @@ fn show_session_vec3_prop(
 
     // Expanded individual X / Y / Z axis rows
     if expanded {
-        let mut axis_ev = ScrubEvent::default();
         for (axis, axis_lbl) in [(0usize, "X"), (1usize, "Y"), (2usize, "Z")] {
+            let axis_owner_key = format!("{prop_key}::axis{axis}");
+            touch_inspector_tx_owner(state, target_id, &axis_owner_key);
             let ev = panel_property_row(
                 ui,
                 axis_lbl,
@@ -11376,18 +11533,18 @@ fn show_session_vec3_prop(
                     )
                 },
             );
-            axis_ev = axis_ev.merge(ev);
+            apply_scrub_to_session_with_owner_key(
+                session,
+                target_id,
+                prop_key,
+                &axis_owner_key,
+                animated,
+                local_frame,
+                json!(val),
+                ev,
+                state,
+            );
         }
-        apply_scrub_to_session(
-            session,
-            target_id,
-            prop_key,
-            animated,
-            local_frame,
-            json!(val),
-            axis_ev,
-            state,
-        );
     }
 }
 
@@ -12224,34 +12381,41 @@ fn show_session_curve_prop(
     }
     let owns_curve_tx = owns_inspector_tx(state, target_id, prop_key);
     if changed && !committed && !owns_curve_tx {
-        if session.history.is_in_transaction() {
-            let _ = session.commit_transaction(true);
-            state.inspector_tx_owner = None;
-        }
-        if session
-            .begin_transaction(format!("edit {prop_key}"))
-            .is_ok()
-        {
-            state.inspector_tx_owner = Some((target_id.to_owned(), prop_key.to_owned()));
-            state.inspector_tx_owner_seen = true;
-        }
+        close_existing_tx_before_start(session, state);
+        begin_inspector_tx(
+            session,
+            state,
+            target_id,
+            prop_key,
+            format!("edit {prop_key}"),
+        );
     }
     let owns_curve_tx = owns_inspector_tx(state, target_id, prop_key);
     if changed {
         if let Some(obj) = curve_val.as_object_mut() {
             obj.insert(ch_key.to_owned(), json!(pts));
         }
-        let _ = session.execute(Command::SetPropertyValue {
-            target_id: target_id.to_owned(),
-            property: prop_key.to_owned(),
-            value: curve_val,
-        });
+        let exec_curve = |session: &mut Session| {
+            let _ = session.execute(Command::SetPropertyValue {
+                target_id: target_id.to_owned(),
+                property: prop_key.to_owned(),
+                value: curve_val,
+            });
+        };
+        if committed && !owns_curve_tx {
+            run_atomic_commit_outside_foreign_tx(session, state, exec_curve);
+        } else {
+            exec_curve(session);
+            if owns_curve_tx {
+                state.inspector_tx_has_edits = true;
+            }
+        }
     }
     if committed && owns_curve_tx {
         if session.history.is_in_transaction() {
             let _ = session.commit_transaction(true);
         }
-        state.inspector_tx_owner = None;
+        clear_inspector_tx_state(state);
     }
 
     ui.data_mut(|d| d.insert_temp(id, ui_st));
@@ -13226,5 +13390,295 @@ mod tests {
             session.document().video_tracks[0].clips[0].objects_3d.len(),
             count_before
         );
+    }
+
+    #[test]
+    fn expanded_sub_axis_text_edit_commit_preserves_parent_pending_drag_tx() {
+        let mut session = Session::new();
+        let mut state = PanelsState::default();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+
+        // Parent inline vector row starts PendingDrag on pointer-down (0 edits so far).
+        apply_scrub_to_session(
+            &mut session,
+            &clip_id,
+            "position",
+            false,
+            0.0,
+            json!([0.0, 0.0]),
+            ScrubEvent {
+                started: true,
+                changed: false,
+                committed: false,
+                cancelled: false,
+            },
+            &mut state,
+        );
+        assert!(session.history.is_in_transaction());
+        assert!(owns_inspector_tx(&state, &clip_id, "position"));
+        assert!(!state.inspector_tx_has_edits);
+
+        // Same frame: expanded X sub-axis blurs its TextEdit with a committed value.
+        // Because its tx_owner_key ("position::axis0") is distinct from parent ("position"),
+        // it must NOT prematurely close parent's PendingDrag tx AND must commit outside it.
+        apply_scrub_to_session_with_owner_key(
+            &mut session,
+            &clip_id,
+            "position",
+            "position::axis0",
+            false,
+            0.0,
+            json!([42.0, 0.0]),
+            ScrubEvent {
+                started: false,
+                changed: true,
+                committed: true,
+                cancelled: false,
+            },
+            &mut state,
+        );
+        assert!(session.history.is_in_transaction());
+        assert!(owns_inspector_tx(&state, &clip_id, "position"));
+        assert!(!state.inspector_tx_has_edits);
+
+        // Same frame: an unchanged sub-axis Y blur must also leave parent's PendingDrag tx open.
+        apply_scrub_to_session_with_owner_key(
+            &mut session,
+            &clip_id,
+            "position",
+            "position::axis1",
+            false,
+            0.0,
+            json!([42.0, 0.0]),
+            ScrubEvent {
+                started: false,
+                changed: false,
+                committed: true,
+                cancelled: false,
+            },
+            &mut state,
+        );
+        assert!(session.history.is_in_transaction());
+        assert!(owns_inspector_tx(&state, &clip_id, "position"));
+
+        // Next frame: parent transitions PendingDrag -> TextEdit and cancels its tx.
+        // Sub-axis X's committed value [42.0, 0.0] must be preserved!
+        apply_scrub_to_session(
+            &mut session,
+            &clip_id,
+            "position",
+            false,
+            0.0,
+            json!([42.0, 0.0]),
+            ScrubEvent {
+                started: false,
+                changed: false,
+                committed: false,
+                cancelled: true,
+            },
+            &mut state,
+        );
+        assert!(!session.history.is_in_transaction());
+        assert!(state.inspector_tx_owner.is_none());
+        let pos = eval_prop_vec2(
+            lookup_session_prop(&session, &clip_id, "position").as_ref(),
+            0.0,
+            [0.0, 0.0],
+        );
+        assert!((pos[0] - 42.0).abs() < 1e-6 && pos[1].abs() < 1e-6);
+    }
+
+    #[test]
+    fn upward_click_from_text_edit_to_pending_drag_preserves_committed_edit() {
+        let mut session = Session::new();
+        let mut state = PanelsState::default();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+
+        // 1. Scrub TextEdit (lower widget "rotation") -> upward click onto upper widget ("opacity").
+        let undo_before = session.history.undo_len();
+        apply_scrub_to_session(
+            &mut session,
+            &clip_id,
+            "opacity",
+            false,
+            0.0,
+            json!(1.0),
+            ScrubEvent {
+                started: true,
+                changed: false,
+                committed: false,
+                cancelled: false,
+            },
+            &mut state,
+        );
+        assert!(session.history.is_in_transaction());
+        assert!(owns_inspector_tx(&state, &clip_id, "opacity"));
+
+        apply_scrub_to_session(
+            &mut session,
+            &clip_id,
+            "rotation",
+            false,
+            0.0,
+            json!(45.0),
+            ScrubEvent {
+                started: false,
+                changed: true,
+                committed: true,
+                cancelled: false,
+            },
+            &mut state,
+        );
+        assert!(session.history.is_in_transaction());
+        assert!(owns_inspector_tx(&state, &clip_id, "opacity"));
+        assert!(!state.inspector_tx_has_edits);
+
+        // Pointer-up on upper widget: PendingDrag -> TextEdit cancels opacity's tx.
+        apply_scrub_to_session(
+            &mut session,
+            &clip_id,
+            "opacity",
+            false,
+            0.0,
+            json!(1.0),
+            ScrubEvent {
+                started: false,
+                changed: false,
+                committed: false,
+                cancelled: true,
+            },
+            &mut state,
+        );
+        assert!(!session.history.is_in_transaction());
+        assert_eq!(session.history.undo_len(), undo_before + 1);
+        let rot = eval_prop_f64(
+            lookup_session_prop(&session, &clip_id, "rotation").as_ref(),
+            0.0,
+            0.0,
+        );
+        assert!((rot - 45.0).abs() < 1e-6);
+
+        // 2. Atomic color-picker commit (hex/swatch) while upper widget holds unedited PendingDrag.
+        apply_scrub_to_session(
+            &mut session,
+            &clip_id,
+            "opacity",
+            false,
+            0.0,
+            json!(1.0),
+            ScrubEvent {
+                started: true,
+                changed: false,
+                committed: false,
+                cancelled: false,
+            },
+            &mut state,
+        );
+        apply_color_picker_to_session(
+            &mut session,
+            &clip_id,
+            "backgroundColor",
+            false,
+            0.0,
+            json!([0.25, 0.5, 0.75]),
+            super::super::controls::ColorPickerEvent {
+                started: false,
+                changed: true,
+                committed: true,
+                cancelled: false,
+                eyedropper_clicked: false,
+            },
+            &mut state,
+        );
+        assert!(session.history.is_in_transaction());
+        assert!(owns_inspector_tx(&state, &clip_id, "opacity"));
+        apply_scrub_to_session(
+            &mut session,
+            &clip_id,
+            "opacity",
+            false,
+            0.0,
+            json!(1.0),
+            ScrubEvent {
+                started: false,
+                changed: false,
+                committed: false,
+                cancelled: true,
+            },
+            &mut state,
+        );
+        assert!(!session.history.is_in_transaction());
+        let bg = eval_prop_vec3(
+            lookup_session_prop(&session, &clip_id, "backgroundColor").as_ref(),
+            0.0,
+            [0.0, 0.0, 0.0],
+        );
+        assert!(
+            (bg[0] - 0.25).abs() < 1e-6
+                && (bg[1] - 0.5).abs() < 1e-6
+                && (bg[2] - 0.75).abs() < 1e-6
+        );
+
+        // 3. Paired scalar atomic commit while upper widget holds unedited PendingDrag.
+        let undo_before_paired = session.history.undo_len();
+        apply_scrub_to_session(
+            &mut session,
+            &clip_id,
+            "opacity",
+            false,
+            0.0,
+            json!(1.0),
+            ScrubEvent {
+                started: true,
+                changed: false,
+                committed: false,
+                cancelled: false,
+            },
+            &mut state,
+        );
+        apply_paired_scalar_scrub(
+            &mut session,
+            &clip_id,
+            "paired_test",
+            ("propA", 3.0),
+            ("propB", 7.0),
+            ScrubEvent {
+                started: false,
+                changed: true,
+                committed: true,
+                cancelled: false,
+            },
+            &mut state,
+        );
+        assert!(session.history.is_in_transaction());
+        assert!(owns_inspector_tx(&state, &clip_id, "opacity"));
+        apply_scrub_to_session(
+            &mut session,
+            &clip_id,
+            "opacity",
+            false,
+            0.0,
+            json!(1.0),
+            ScrubEvent {
+                started: false,
+                changed: false,
+                committed: false,
+                cancelled: true,
+            },
+            &mut state,
+        );
+        assert!(!session.history.is_in_transaction());
+        assert_eq!(session.history.undo_len(), undo_before_paired + 1);
+        let a = eval_prop_f64(
+            lookup_session_prop(&session, &clip_id, "propA").as_ref(),
+            0.0,
+            0.0,
+        );
+        let b = eval_prop_f64(
+            lookup_session_prop(&session, &clip_id, "propB").as_ref(),
+            0.0,
+            0.0,
+        );
+        assert!((a - 3.0).abs() < 1e-6 && (b - 7.0).abs() < 1e-6);
     }
 }

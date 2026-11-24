@@ -20,7 +20,29 @@ const MAX_UNIFORM_ARRAY_LEN: u32 = 1024;
 /// Maximum custom shader uniform block byte size (matches WebGPU minimum 64 KiB UBO binding limit).
 const MAX_UNIFORM_BUFFER_BYTES: u32 = 65_536;
 
+/// Normalizes a ClipMaker 3 / Shader+ custom property display name into its GLSL uniform / define
+/// identifier by replacing every whitespace character with `_` (matching CM3's `fixPropertyName`).
+pub fn fix_property_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect()
+}
+
+const INCLUDE_TEMPORAL: &str = r#"
+vec2 zTimeMotion(sampler2D before, sampler2D after, vec2 uv, vec2 texel) {
+    vec3 weights = vec3(0.2126, 0.7152, 0.0722);
+    float change = dot(texture2D(after, uv).rgb - texture2D(before, uv).rgb, weights);
+    vec2 gradient = vec2(
+        dot(texture2D(before, uv + vec2(texel.x, 0.0)).rgb - texture2D(before, uv - vec2(texel.x, 0.0)).rgb, weights),
+        dot(texture2D(before, uv + vec2(0.0, texel.y)).rgb - texture2D(before, uv - vec2(0.0, texel.y)).rgb, weights)) * 0.5;
+    return clamp(-change * gradient / max(dot(gradient, gradient), 0.0001), vec2(-4.0), vec2(4.0)) * texel;
+}
+"#;
+
 const INCLUDE_GRADIENT: &str = r#"
+vec4 zGradient(sampler2D s, float t) { return texture2D(s, vec2((clamp(t, 0.0, 1.0) * 255.0 + 0.5) / 256.0, 0.5)); }
+vec4 zGradientCycle(sampler2D s, float t) { return zGradient(s, fract(t)); }
+vec4 zGradientCycle(sampler2D s, float t, float repetitions) { return zGradient(s, fract(t * repetitions)); }
 float zGradientUv(float t, float repetitions) {
     float reps = max(repetitions, 0.0001);
     float scaled = t * reps;
@@ -30,29 +52,32 @@ float zGradientUv(float t, float repetitions) {
 float zGradientUvClamp(float t) {
     return (0.5 + clamp(t, 0.0, 1.0) * 255.0) / 256.0;
 }
-float zSrgbToLinearChannel(float c) {
-    return c <= 0.04045 ? c / 12.92 : pow(max((c + 0.055) / 1.055, 0.0), 2.4);
-}
+#ifndef _ZC_HAS_SRGB_HELPERS
+#define _ZC_HAS_SRGB_HELPERS 1
 vec3 zSrgbToLinear(vec3 c) {
-    return vec3(
-        zSrgbToLinearChannel(c.r),
-        zSrgbToLinearChannel(c.g),
-        zSrgbToLinearChannel(c.b)
-    );
-}
-float zLinearToSrgbChannel(float c) {
-    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(max(c, 0.0), 1.0 / 2.4) - 0.055;
+    return mix(c / 12.92, pow(max((c + 0.055) / 1.055, vec3(0.0)), vec3(2.4)), step(vec3(0.04045), c));
 }
 vec3 zLinearToSrgb(vec3 c) {
-    return vec3(
-        zLinearToSrgbChannel(c.r),
-        zLinearToSrgbChannel(c.g),
-        zLinearToSrgbChannel(c.b)
-    );
+    return mix(c * 12.92, 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
 }
+#endif
 "#;
 
 const INCLUDE_CURVE: &str = r#"
+float zCurve(sampler2D s, float x, vec2 range) { return mix(range.x, range.y, texture2D(s, vec2((clamp(x, 0.0, 1.0) * 1023.0 + 0.5) / 1024.0, 0.5)).r); }
+float zCurve(sampler2D s, float x) { return zCurve(s, x, vec2(0.0, 1.0)); }
+vec4 zCurves(sampler2D s, vec4 x, vec2 range) {
+    vec4 y = vec4(
+        texture2D(s, vec2((clamp(x.r, 0.0, 1.0) * 1023.0 + 0.5) / 1024.0, 0.5)).r,
+        texture2D(s, vec2((clamp(x.g, 0.0, 1.0) * 1023.0 + 0.5) / 1024.0, 0.5)).g,
+        texture2D(s, vec2((clamp(x.b, 0.0, 1.0) * 1023.0 + 0.5) / 1024.0, 0.5)).b,
+        texture2D(s, vec2((clamp(x.a, 0.0, 1.0) * 1023.0 + 0.5) / 1024.0, 0.5)).a
+    );
+    return mix(vec4(range.x), vec4(range.y), y);
+}
+vec4 zCurves(sampler2D s, vec4 x) { return zCurves(s, x, vec2(0.0, 1.0)); }
+vec3 zCurves(sampler2D s, vec3 x, vec2 range) { return zCurves(s, vec4(x, 0.0), range).rgb; }
+vec3 zCurves(sampler2D s, vec3 x) { return zCurves(s, x, vec2(0.0, 1.0)); }
 float zCurveUv(float t) {
     return (0.5 + clamp(t, 0.0, 1.0) * 1023.0) / 1024.0;
 }
@@ -62,6 +87,8 @@ float zCurveMapRange(float v, vec2 range) {
 "#;
 
 const INCLUDE_TEXT: &str = r#"
+float zText(sampler2D s, vec2 uv) { return texture2D(s, uv).a; }
+float zGlyph(sampler2D s, vec2 grid, float index, vec2 uv) { return texture2D(s, vec2((mod(index, grid.x) + uv.x) / grid.x, (grid.y - floor(index / grid.x) - 1.0 + uv.y) / grid.y)).a; }
 float zTextSdfAlpha(float dist, float edge, float softness) {
     float s = max(softness, 0.0001);
     return smoothstep(edge - s, edge + s, dist);
@@ -73,10 +100,336 @@ float zTextSdfAlphaAA(float dist, float edge) {
 vec2 zTextAtlasUv(vec2 localUv, float glyphIndex, vec2 grid) {
     vec2 safeGrid = max(grid, vec2(1.0));
     float col = mod(glyphIndex, safeGrid.x);
-    float row = floor(glyphIndex / safeGrid.x);
+    float row = safeGrid.y - floor(glyphIndex / safeGrid.x) - 1.0;
     return (vec2(col, row) + clamp(localUv, vec2(0.0), vec2(1.0))) / safeGrid;
 }
 "#;
+
+const INCLUDE_HASH: &str = r#"
+float zHash(float p) { return fract(sin(p * 127.1) * 43758.5453); }
+float zHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float zHash(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+"#;
+
+const INCLUDE_NOISE: &str = r#"
+// #include <zoidium/hash>
+float zNoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(zHash(i), zHash(i + vec2(1.0, 0.0)), f.x),
+        mix(zHash(i + vec2(0.0, 1.0)), zHash(i + vec2(1.0)), f.x), f.y);
+}
+float zNoise(vec3 p) {
+    vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+    float a = mix(mix(zHash(i), zHash(i + vec3(1.0, 0.0, 0.0)), f.x),
+        mix(zHash(i + vec3(0.0, 1.0, 0.0)), zHash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y);
+    float b = mix(mix(zHash(i + vec3(0.0, 0.0, 1.0)), zHash(i + vec3(1.0, 0.0, 1.0)), f.x),
+        mix(zHash(i + vec3(0.0, 1.0, 1.0)), zHash(i + vec3(1.0)), f.x), f.y);
+    return mix(a, b, f.z);
+}
+"#;
+
+const INCLUDE_COLOR: &str = r#"
+#ifndef _ZC_HAS_SRGB_HELPERS
+#define _ZC_HAS_SRGB_HELPERS 1
+vec3 zSrgbToLinear(vec3 c) {
+    return mix(c / 12.92, pow(max((c + 0.055) / 1.055, vec3(0.0)), vec3(2.4)), step(vec3(0.04045), c));
+}
+vec3 zLinearToSrgb(vec3 c) {
+    return mix(c * 12.92, 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+#endif
+vec3 zHsvToRgb(vec3 c) {
+    vec3 p = abs(fract(c.xxx + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+}
+vec3 zRgbToHsv(vec3 c) {
+    float hi = max(c.r, max(c.g, c.b)), lo = min(c.r, min(c.g, c.b)), d = hi - lo;
+    float h = d < 0.000001 ? 0.0 : hi == c.r ? mod((c.g - c.b) / d, 6.0) : hi == c.g ? (c.b - c.r) / d + 2.0 : (c.r - c.g) / d + 4.0;
+    return vec3(fract(h / 6.0), hi < 0.000001 ? 0.0 : d / hi, hi);
+}
+"#;
+
+const INCLUDE_SDF: &str = r#"
+float zSdCircle(vec2 p, float radius) { return length(p) - radius; }
+float zSdBox(vec2 p, vec2 halfSize) { vec2 q = abs(p) - halfSize; return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0); }
+float zSdSphere(vec3 p, float radius) { return length(p) - radius; }
+float zSdBox(vec3 p, vec3 halfSize) { vec3 q = abs(p) - halfSize; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0); }
+float zSmoothUnion(float a, float b, float k) { float h = clamp(0.5 + 0.5 * (b - a) / max(k, 0.000001), 0.0, 1.0); return mix(b, a, h) - k * h * (1.0 - h); }
+"#;
+
+/// Adds a `<name>_range` argument to two-argument `zCurve(Name, x)` / `zCurves(Name, x)` calls
+/// for known Shader+ Curve property names, injecting `uniform vec2 <name>_range;` when absent.
+///
+/// Mirrors Zoidium's `bindCurveRanges` in `plugins/shader-plus/glsl-library.js`.
+pub fn bind_curve_ranges<I, S>(source: &str, curve_names: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let names: HashSet<String> = curve_names
+        .into_iter()
+        .map(|s| fix_property_name(s.as_ref()))
+        .collect();
+    bind_helper_arguments(source, &names, &["zCurve", "zCurves"], "_range", "vec2")
+}
+
+/// Adds a `<name>_repetitions` argument to two-argument `zGradientCycle(Name, t)` calls
+/// for known Shader+ Gradient property names, injecting `uniform float <name>_repetitions;`
+/// when absent.
+///
+/// Mirrors Zoidium's `bindGradientCycles` in `plugins/shader-plus/glsl-library.js`.
+pub fn bind_gradient_cycles<I, S>(source: &str, gradient_names: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let names: HashSet<String> = gradient_names
+        .into_iter()
+        .map(|s| fix_property_name(s.as_ref()))
+        .collect();
+    bind_helper_arguments(source, &names, &["zGradientCycle"], "_repetitions", "float")
+}
+
+fn bind_helper_arguments(
+    source: &str,
+    names: &HashSet<String>,
+    fn_names: &[&str],
+    suffix: &str,
+    uniform_ty: &str,
+) -> String {
+    if names.is_empty() {
+        return source.to_string();
+    }
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut edits: Vec<(usize, String)> = Vec::new();
+    let mut declarations: Vec<String> = Vec::new();
+    let mut decl_seen: HashSet<String> = HashSet::new();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if is_ident_start_byte(bytes[i]) {
+            let start = i;
+            i += 1;
+            while i < len && is_ident_continue_byte(bytes[i]) {
+                i += 1;
+            }
+            let ident = &source[start..i];
+            if fn_names.contains(&ident) {
+                let mut j = i;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < len && bytes[j] == b'(' {
+                    let mut k = j + 1;
+                    while k < len && bytes[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if k < len && is_ident_start_byte(bytes[k]) {
+                        let name_start = k;
+                        k += 1;
+                        while k < len && is_ident_continue_byte(bytes[k]) {
+                            k += 1;
+                        }
+                        let prop_name = &source[name_start..k];
+                        let mut after_name = k;
+                        while after_name < len && bytes[after_name].is_ascii_whitespace() {
+                            after_name += 1;
+                        }
+                        if after_name < len
+                            && bytes[after_name] == b','
+                            && names.contains(prop_name)
+                        {
+                            // Scan the rest of this call (starting right after the first `,`)
+                            // to check whether there are any more top-level commas.
+                            let mut depth = 1_usize;
+                            let mut commas = 1_usize;
+                            let mut scan = after_name + 1;
+                            while scan < len && depth > 0 {
+                                if bytes[scan] == b'/' && scan + 1 < len && bytes[scan + 1] == b'*'
+                                {
+                                    scan += 2;
+                                    while scan + 1 < len
+                                        && !(bytes[scan] == b'*' && bytes[scan + 1] == b'/')
+                                    {
+                                        scan += 1;
+                                    }
+                                    scan = (scan + 2).min(len);
+                                    continue;
+                                }
+                                if bytes[scan] == b'/' && scan + 1 < len && bytes[scan + 1] == b'/'
+                                {
+                                    while scan < len && bytes[scan] != b'\n' {
+                                        scan += 1;
+                                    }
+                                    continue;
+                                }
+                                match bytes[scan] {
+                                    b'(' => depth += 1,
+                                    b')' => depth -= 1,
+                                    b',' if depth == 1 => commas += 1,
+                                    _ => {}
+                                }
+                                scan += 1;
+                            }
+                            if depth == 0 && commas == 1 {
+                                edits.push((scan - 1, format!(", {prop_name}{suffix}")));
+                                if decl_seen.insert(prop_name.to_string()) {
+                                    declarations.push(prop_name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let ch = source[i..].chars().next().unwrap_or(' ');
+        i += ch.len_utf8();
+    }
+
+    if edits.is_empty() {
+        return source.to_string();
+    }
+
+    edits.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let mut result = source.to_string();
+    for (at, text) in edits {
+        result.insert_str(at, &text);
+    }
+
+    // Check which `<name><suffix>` uniforms are already declared (ignoring comments).
+    let stripped = strip_comments_and_join_continuations(&result).join("\n");
+    let stripped_tokens = tokenize(&stripped);
+    let mut missing = Vec::new();
+    for name in declarations {
+        let target_uniform = format!("{name}{suffix}");
+        let already_declared =
+            has_uniform_decl_tokens(&stripped_tokens, uniform_ty, &target_uniform);
+        if !already_declared {
+            missing.push(format!("uniform {uniform_ty} {target_uniform};"));
+        }
+    }
+
+    if !missing.is_empty() {
+        let insert_at = find_after_last_precision(&result);
+        let decl_block = format!("\n{}\n", missing.join("\n"));
+        result.insert_str(insert_at, &decl_block);
+    }
+
+    result
+}
+
+fn has_uniform_decl_tokens(tokens: &[Token], expected_ty: &str, expected_name: &str) -> bool {
+    let mut i = 0;
+    while i < tokens.len() {
+        if matches!(&tokens[i], Token::Ident(kw) if kw == "uniform") {
+            let mut j = next_non_newline(tokens, i + 1);
+            if let Some(Token::Ident(q)) = tokens.get(j)
+                && is_precision_qual(q)
+            {
+                j = next_non_newline(tokens, j + 1);
+            }
+            if matches!(tokens.get(j), Some(Token::Ident(ty)) if ty == expected_ty) {
+                j = next_non_newline(tokens, j + 1);
+                while j < tokens.len() {
+                    if matches!(tokens.get(j), Some(Token::Ident(n)) if n == expected_name) {
+                        let after = next_non_newline(tokens, j + 1);
+                        if matches!(tokens.get(after), Some(Token::Punct(p)) if p == ";" || p == ",")
+                        {
+                            return true;
+                        }
+                    }
+                    if matches!(tokens.get(j), Some(Token::Punct(p)) if p == ";") {
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn find_after_last_precision(source: &str) -> usize {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut last_end = 0;
+
+    while i < len {
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if is_ident_start_byte(bytes[i]) {
+            let start = i;
+            i += 1;
+            while i < len && is_ident_continue_byte(bytes[i]) {
+                i += 1;
+            }
+            if &source[start..i] == "precision" {
+                // Match `\bprecision\s+\w+\s+\w+\s*;`
+                let mut j = i;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let q_start = j;
+                while j < len && is_ident_continue_byte(bytes[j]) {
+                    j += 1;
+                }
+                if j > q_start {
+                    while j < len && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    let t_start = j;
+                    while j < len && is_ident_continue_byte(bytes[j]) {
+                        j += 1;
+                    }
+                    if j > t_start {
+                        while j < len && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j < len && bytes[j] == b';' {
+                            last_end = j + 1;
+                            i = j + 1;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let ch = source[i..].chars().next().unwrap_or(' ');
+        i += ch.len_utf8();
+    }
+
+    last_end
+}
 
 /// Errors emitted while preprocessing, translating, validating, or lowering a custom shader.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -128,6 +481,9 @@ pub enum UniformType {
     Uvec2,
     Uvec3,
     Uvec4,
+    Bvec2,
+    Bvec3,
+    Bvec4,
     Mat2,
     Mat3,
     Mat4,
@@ -150,6 +506,9 @@ impl UniformType {
             "uvec2" => Some(Self::Uvec2),
             "uvec3" => Some(Self::Uvec3),
             "uvec4" => Some(Self::Uvec4),
+            "bvec2" => Some(Self::Bvec2),
+            "bvec3" => Some(Self::Bvec3),
+            "bvec4" => Some(Self::Bvec4),
             "mat2" => Some(Self::Mat2),
             "mat3" => Some(Self::Mat3),
             "mat4" => Some(Self::Mat4),
@@ -157,17 +516,43 @@ impl UniformType {
         }
     }
 
+    const fn glsl_name(self) -> &'static str {
+        match self {
+            Self::Float => "float",
+            Self::Int => "int",
+            Self::Uint => "uint",
+            Self::Bool => "bool",
+            Self::Vec2 => "vec2",
+            Self::Vec3 => "vec3",
+            Self::Vec4 => "vec4",
+            Self::Ivec2 => "ivec2",
+            Self::Ivec3 => "ivec3",
+            Self::Ivec4 => "ivec4",
+            Self::Uvec2 => "uvec2",
+            Self::Uvec3 => "uvec3",
+            Self::Uvec4 => "uvec4",
+            Self::Bvec2 => "bvec2",
+            Self::Bvec3 => "bvec3",
+            Self::Bvec4 => "bvec4",
+            Self::Mat2 => "mat2",
+            Self::Mat3 => "mat3",
+            Self::Mat4 => "mat4",
+        }
+    }
+
     /// Base alignment in bytes under `std140` rules.
     pub const fn base_alignment(self) -> u32 {
         match self {
             Self::Float | Self::Int | Self::Uint | Self::Bool => 4,
-            Self::Vec2 | Self::Ivec2 | Self::Uvec2 => 8,
+            Self::Vec2 | Self::Ivec2 | Self::Uvec2 | Self::Bvec2 => 8,
             Self::Vec3
             | Self::Vec4
             | Self::Ivec3
             | Self::Ivec4
             | Self::Uvec3
             | Self::Uvec4
+            | Self::Bvec3
+            | Self::Bvec4
             | Self::Mat2
             | Self::Mat3
             | Self::Mat4 => 16,
@@ -178,9 +563,9 @@ impl UniformType {
     pub const fn byte_size(self) -> u32 {
         match self {
             Self::Float | Self::Int | Self::Uint | Self::Bool => 4,
-            Self::Vec2 | Self::Ivec2 | Self::Uvec2 => 8,
-            Self::Vec3 | Self::Ivec3 | Self::Uvec3 => 12,
-            Self::Vec4 | Self::Ivec4 | Self::Uvec4 => 16,
+            Self::Vec2 | Self::Ivec2 | Self::Uvec2 | Self::Bvec2 => 8,
+            Self::Vec3 | Self::Ivec3 | Self::Uvec3 | Self::Bvec3 => 12,
+            Self::Vec4 | Self::Ivec4 | Self::Uvec4 | Self::Bvec4 => 16,
             Self::Mat2 => 32,
             Self::Mat3 => 48,
             Self::Mat4 => 64,
@@ -194,19 +579,22 @@ impl UniformType {
 
     /// GLSL 450 storage type used inside `ZcCustomUniforms`.
     ///
-    /// - `bool` is stored as `uint` for WGSL uniform host-shareability.
+    /// - `bool`/`bvec*` are stored as `uint`/`uvec*` for WGSL uniform host-shareability.
+    /// - `mat2` is stored as `vec4[2]` (or `vec4[2*N]` for arrays) because WGSL uniform
+    ///   `mat2x2<f32>` cannot express `std140`'s 16-byte column stride.
     /// - Scalar and `vec2` arrays are stored as 4-component vectors so WGSL uniform arrays
     ///   keep their natural 16-byte stride without requiring unsupported `@stride` attributes.
     const fn ubo_glsl_type(self, is_array: bool) -> &'static str {
         if is_array {
             match self {
-                Self::Float | Self::Vec2 | Self::Vec4 => "vec4",
+                Self::Float | Self::Vec2 | Self::Vec4 | Self::Mat2 => "vec4",
                 Self::Int | Self::Ivec2 | Self::Ivec4 => "ivec4",
-                Self::Uint | Self::Bool | Self::Uvec2 | Self::Uvec4 => "uvec4",
+                Self::Uint | Self::Bool | Self::Uvec2 | Self::Uvec4 | Self::Bvec2 | Self::Bvec4 => {
+                    "uvec4"
+                }
                 Self::Vec3 => "vec3",
                 Self::Ivec3 => "ivec3",
-                Self::Uvec3 => "uvec3",
-                Self::Mat2 => "mat2",
+                Self::Uvec3 | Self::Bvec3 => "uvec3",
                 Self::Mat3 => "mat3",
                 Self::Mat4 => "mat4",
             }
@@ -217,14 +605,13 @@ impl UniformType {
                 Self::Uint | Self::Bool => "uint",
                 Self::Vec2 => "vec2",
                 Self::Vec3 => "vec3",
-                Self::Vec4 => "vec4",
+                Self::Vec4 | Self::Mat2 => "vec4",
                 Self::Ivec2 => "ivec2",
                 Self::Ivec3 => "ivec3",
                 Self::Ivec4 => "ivec4",
-                Self::Uvec2 => "uvec2",
-                Self::Uvec3 => "uvec3",
-                Self::Uvec4 => "uvec4",
-                Self::Mat2 => "mat2",
+                Self::Uvec2 | Self::Bvec2 => "uvec2",
+                Self::Uvec3 | Self::Bvec3 => "uvec3",
+                Self::Uvec4 | Self::Bvec4 => "uvec4",
                 Self::Mat3 => "mat3",
                 Self::Mat4 => "mat4",
             }
@@ -234,17 +621,36 @@ impl UniformType {
     const fn array_swizzle(self) -> Option<&'static str> {
         match self {
             Self::Float | Self::Int | Self::Uint | Self::Bool => Some(".x"),
-            Self::Vec2 | Self::Ivec2 | Self::Uvec2 => Some(".xy"),
+            Self::Vec2 | Self::Ivec2 | Self::Uvec2 | Self::Bvec2 => Some(".xy"),
             Self::Vec3
             | Self::Vec4
             | Self::Ivec3
             | Self::Ivec4
             | Self::Uvec3
             | Self::Uvec4
+            | Self::Bvec3
+            | Self::Bvec4
             | Self::Mat2
             | Self::Mat3
             | Self::Mat4 => None,
         }
+    }
+
+    const fn needs_array_unpack(self) -> bool {
+        matches!(
+            self,
+            Self::Float
+                | Self::Int
+                | Self::Uint
+                | Self::Bool
+                | Self::Vec2
+                | Self::Ivec2
+                | Self::Uvec2
+                | Self::Bvec2
+                | Self::Bvec3
+                | Self::Bvec4
+                | Self::Mat2
+        )
     }
 }
 
@@ -319,6 +725,9 @@ pub enum UniformValue {
     Uvec2([u32; 2]),
     Uvec3([u32; 3]),
     Uvec4([u32; 4]),
+    Bvec2([bool; 2]),
+    Bvec3([bool; 3]),
+    Bvec4([bool; 4]),
     /// Column-major 2x2 matrix `[c0r0, c0r1, c1r0, c1r1]`.
     Mat2([f32; 4]),
     /// Column-major 3x3 matrix.
@@ -443,21 +852,29 @@ pub fn translate_glsl_es100_with_options(
         FragCoordResY::None
     };
 
-    let rewritten_tokens = rewrite_body(
+    let mut rewrite_state = RewriteState::default();
+    let rewritten_tokens = strip_unreachable_after_return(rewrite_body(
         &body_tokens,
         &uniform_map,
+        &extracted.struct_uniforms,
+        &extracted.struct_defs,
+        &extracted.const_ints,
         &sampler_set,
+        &extracted.cube_samplers,
         &sampler_fns,
         &user_fns,
         frag_coord_res_y,
+        &mut rewrite_state,
         &mut budget,
-    )?;
+    )?);
     let body_glsl = render_tokens(&rewritten_tokens);
 
     let glsl450_source = assemble_glsl450(
         &extracted.extra_varyings,
         &extracted.uniforms,
         &texture_bindings,
+        &extracted.cube_samplers,
+        &rewrite_state,
         &body_glsl,
     );
 
@@ -470,10 +887,11 @@ pub fn translate_glsl_es100_with_options(
     let mut validator = Validator::new(ValidationFlags::all(), Capabilities::empty());
     let module_info = validator
         .validate(&module)
-        .map_err(|err| ShaderError::Validation(err.to_string()))?;
+        .map_err(|err| ShaderError::Validation(err.emit_to_string(&glsl450_source)))?;
 
-    let wgsl = wgsl::write_string(&module, &module_info, WriterFlags::empty())
+    let raw_wgsl = wgsl::write_string(&module, &module_info, WriterFlags::empty())
         .map_err(|err| ShaderError::WgslEmit(err.to_string()))?;
+    let wgsl = maybe_prepend_derivative_uniformity_diagnostic(raw_wgsl);
 
     Ok(CompiledCustomShader {
         wgsl,
@@ -483,18 +901,76 @@ pub fn translate_glsl_es100_with_options(
     })
 }
 
+fn wgsl_uses_implicit_derivatives(wgsl: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "textureSample(",
+        "textureSampleBias(",
+        "dpdx(",
+        "dpdxCoarse(",
+        "dpdxFine(",
+        "dpdy(",
+        "dpdyCoarse(",
+        "dpdyFine(",
+        "fwidth(",
+        "fwidthCoarse(",
+        "fwidthFine(",
+    ];
+    NEEDLES.iter().any(|needle| wgsl.contains(needle))
+}
+
+fn maybe_prepend_derivative_uniformity_diagnostic(wgsl: String) -> String {
+    if !wgsl_uses_implicit_derivatives(&wgsl)
+        || wgsl.contains("diagnostic(off, derivative_uniformity)")
+    {
+        return wgsl;
+    }
+    // Insert right after any leading `enable ...;` directives so global directives stay valid.
+    let mut insert_pos = 0;
+    for line in wgsl.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("enable ") || trimmed.is_empty() {
+            insert_pos += line.len();
+        } else {
+            break;
+        }
+    }
+    let mut out = String::with_capacity(wgsl.len() + 48);
+    out.push_str(&wgsl[..insert_pos]);
+    out.push_str("diagnostic(off, derivative_uniformity);\n");
+    out.push_str(&wgsl[insert_pos..]);
+    out
+}
+
 /// Packs live uniform values into a `std140`-aligned byte buffer matching `layout`.
 ///
 /// Missing uniforms remain zero-initialized. Numeric values coerce cleanly between `Float`,
 /// `Int`, `Uint`, and `Bool` to match ClipMaker 3 / Shader+ dynamic property storage.
+/// Keys containing whitespace are matched via [`fix_property_name`] when no exact key matches.
 pub fn pack_uniforms(
     layout: &UniformBlockLayout,
     values: &BTreeMap<String, UniformValue>,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; layout.byte_size as usize];
+    let normalized_lookup: Option<HashMap<String, &UniformValue>> =
+        if values.keys().any(|k| k.chars().any(char::is_whitespace)) {
+            let mut map = HashMap::with_capacity(values.len());
+            for (k, v) in values {
+                if k.chars().any(char::is_whitespace) {
+                    map.entry(fix_property_name(k)).or_insert(v);
+                }
+            }
+            Some(map)
+        } else {
+            None
+        };
 
     for field in &layout.fields {
-        let Some(value) = values.get(&field.name) else {
+        let value = values.get(&field.name).or_else(|| {
+            normalized_lookup
+                .as_ref()
+                .and_then(|map| map.get(&field.name).copied())
+        });
+        let Some(value) = value else {
             continue;
         };
 
@@ -610,6 +1086,71 @@ fn write_uniform_element(buf: &mut [u8], offset: usize, ty: UniformType, value: 
                     v[2].max(0) as u32,
                     v[3].max(0) as u32,
                 ],
+                _ => [0; 4],
+            };
+            write_u32_slice(buf, offset, &v);
+        }
+        UniformType::Bvec2 => {
+            let v = match *value {
+                UniformValue::Bvec2(v) => [u32::from(v[0]), u32::from(v[1])],
+                UniformValue::Uvec2(v) => [u32::from(v[0] != 0), u32::from(v[1] != 0)],
+                UniformValue::Ivec2(v) => [u32::from(v[0] != 0), u32::from(v[1] != 0)],
+                UniformValue::Vec2(v) => [u32::from(v[0] != 0.0), u32::from(v[1] != 0.0)],
+                UniformValue::Bool(b) => [u32::from(b); 2],
+                _ => [0; 2],
+            };
+            write_u32_slice(buf, offset, &v);
+        }
+        UniformType::Bvec3 => {
+            let v = match *value {
+                UniformValue::Bvec3(v) => [u32::from(v[0]), u32::from(v[1]), u32::from(v[2])],
+                UniformValue::Uvec3(v) => [
+                    u32::from(v[0] != 0),
+                    u32::from(v[1] != 0),
+                    u32::from(v[2] != 0),
+                ],
+                UniformValue::Ivec3(v) => [
+                    u32::from(v[0] != 0),
+                    u32::from(v[1] != 0),
+                    u32::from(v[2] != 0),
+                ],
+                UniformValue::Vec3(v) => [
+                    u32::from(v[0] != 0.0),
+                    u32::from(v[1] != 0.0),
+                    u32::from(v[2] != 0.0),
+                ],
+                UniformValue::Bool(b) => [u32::from(b); 3],
+                _ => [0; 3],
+            };
+            write_u32_slice(buf, offset, &v);
+        }
+        UniformType::Bvec4 => {
+            let v = match *value {
+                UniformValue::Bvec4(v) => [
+                    u32::from(v[0]),
+                    u32::from(v[1]),
+                    u32::from(v[2]),
+                    u32::from(v[3]),
+                ],
+                UniformValue::Uvec4(v) => [
+                    u32::from(v[0] != 0),
+                    u32::from(v[1] != 0),
+                    u32::from(v[2] != 0),
+                    u32::from(v[3] != 0),
+                ],
+                UniformValue::Ivec4(v) => [
+                    u32::from(v[0] != 0),
+                    u32::from(v[1] != 0),
+                    u32::from(v[2] != 0),
+                    u32::from(v[3] != 0),
+                ],
+                UniformValue::Vec4(v) => [
+                    u32::from(v[0] != 0.0),
+                    u32::from(v[1] != 0.0),
+                    u32::from(v[2] != 0.0),
+                    u32::from(v[3] != 0.0),
+                ],
+                UniformValue::Bool(b) => [u32::from(b); 4],
                 _ => [0; 4],
             };
             write_u32_slice(buf, offset, &v);
@@ -746,6 +1287,7 @@ impl PpState {
             ("GL_ES", "1"),
             ("GL_FRAGMENT_PRECISION_HIGH", "1"),
             ("GL_OES_standard_derivatives", "1"),
+            ("GL_EXT_shader_texture_lod", "1"),
             ("__VERSION__", "100"),
         ] {
             macros.insert(
@@ -760,16 +1302,17 @@ impl PpState {
             }
         }
         for (k, v) in &options.defines {
+            let norm_key = fix_property_name(k);
             let trimmed = v.trim();
             macros.insert(
-                k.clone(),
+                norm_key.clone(),
                 MacroDef {
                     params: None,
                     body: trimmed.to_string(),
                 },
             );
             if let Some(n) = parse_int_literal_i64(trimmed).and_then(|x| u32::try_from(x).ok()) {
-                int_defines.insert(k.clone(), n);
+                int_defines.insert(norm_key, n);
             }
         }
         Self {
@@ -802,9 +1345,14 @@ fn lookup_include<'a>(name: &str, options: &'a CompileOptions) -> Option<&'a str
         return Some(custom.as_str());
     }
     match name {
+        "zoidium/temporal" => Some(INCLUDE_TEMPORAL),
         "zoidium/gradient" => Some(INCLUDE_GRADIENT),
         "zoidium/curve" => Some(INCLUDE_CURVE),
         "zoidium/text" => Some(INCLUDE_TEXT),
+        "zoidium/hash" => Some(INCLUDE_HASH),
+        "zoidium/noise" => Some(INCLUDE_NOISE),
+        "zoidium/color" => Some(INCLUDE_COLOR),
+        "zoidium/sdf" => Some(INCLUDE_SDF),
         _ => None,
     }
 }
@@ -1824,6 +2372,7 @@ fn preprocess_lines_into(
                     if behavior == "disable"
                         || behavior == "warn"
                         || ext_name == "GL_OES_standard_derivatives"
+                        || ext_name == "GL_EXT_shader_texture_lod"
                     {
                         continue;
                     }
@@ -2108,16 +2657,7 @@ fn tokenize(src: &str) -> Vec<Token> {
 // ---------------------------------------------------------------------------
 
 fn reject_unsupported_features(tokens: &[Token]) -> Result<(), ShaderError> {
-    const FORBIDDEN_IDENTS: &[&str] = &[
-        "texture2DLodEXT",
-        "texture2DGradEXT",
-        "texture2DProjLodEXT",
-        "texture2DProjGradEXT",
-        "textureCubeLodEXT",
-        "textureCubeGradEXT",
-        "gl_FragDepthEXT",
-        "gl_FragData",
-    ];
+    const FORBIDDEN_IDENTS: &[&str] = &["gl_FragDepthEXT", "gl_FragData"];
 
     for tok in tokens {
         if let Token::Ident(name) = tok
@@ -2141,6 +2681,20 @@ struct UniformDecl {
 }
 
 #[derive(Debug, Clone)]
+struct StructFieldDecl {
+    ty_name: String,
+    name: String,
+    array_len: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct StructUniformDecl {
+    name: String,
+    struct_type: String,
+    array_len: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
 struct VaryingDecl {
     ty: String,
     name: String,
@@ -2149,7 +2703,11 @@ struct VaryingDecl {
 
 struct ExtractedDecls {
     uniforms: Vec<UniformDecl>,
+    struct_uniforms: HashMap<String, StructUniformDecl>,
+    struct_defs: HashMap<String, Vec<StructFieldDecl>>,
+    const_ints: HashMap<String, u32>,
     samplers: Vec<String>,
+    cube_samplers: HashSet<String>,
     extra_varyings: Vec<VaryingDecl>,
     body_tokens: Vec<Token>,
 }
@@ -2191,8 +2749,12 @@ fn extract_declarations(
 ) -> Result<ExtractedDecls, ShaderError> {
     let mut uniforms: Vec<UniformDecl> = Vec::new();
     let mut uniform_types: HashMap<String, (UniformType, Option<u32>)> = HashMap::new();
+    let mut struct_uniforms: HashMap<String, StructUniformDecl> = HashMap::new();
+    let mut struct_defs: HashMap<String, Vec<StructFieldDecl>> = HashMap::new();
+    let mut const_ints: HashMap<String, u32> = int_defines.clone();
     let mut samplers: Vec<String> = Vec::new();
     let mut sampler_seen: HashSet<String> = HashSet::new();
+    let mut cube_samplers: HashSet<String> = HashSet::new();
     let mut extra_varyings: Vec<VaryingDecl> = Vec::new();
     let mut varying_seen: HashSet<String> = HashSet::new();
     let mut body_tokens: Vec<Token> = Vec::with_capacity(tokens.len());
@@ -2212,6 +2774,20 @@ fn extract_declarations(
                 body_tokens.push(tokens[i].clone());
                 i += 1;
             }
+            Token::Ident(kw) if brace_depth == 0 && kw == "struct" => {
+                if let Some((struct_name, fields)) =
+                    parse_top_level_struct_def(tokens, i, &const_ints)
+                {
+                    struct_defs.insert(struct_name, fields);
+                }
+                body_tokens.push(tokens[i].clone());
+                i += 1;
+            }
+            Token::Ident(kw) if brace_depth == 0 && kw == "const" => {
+                collect_top_level_const_ints(tokens, i, &mut const_ints);
+                body_tokens.push(tokens[i].clone());
+                i += 1;
+            }
             Token::Ident(kw) if brace_depth == 0 && kw == "precision" => {
                 // Strip `precision <qual> <type>;`
                 while i < tokens.len() && !matches!(&tokens[i], Token::Punct(p) if p == ";") {
@@ -2228,7 +2804,7 @@ fn extract_declarations(
                     i = parse_varying_decl(
                         tokens,
                         next_i + 1,
-                        int_defines,
+                        &const_ints,
                         &mut extra_varyings,
                         &mut varying_seen,
                     )?;
@@ -2241,7 +2817,7 @@ fn extract_declarations(
                 i = parse_varying_decl(
                     tokens,
                     i + 1,
-                    int_defines,
+                    &const_ints,
                     &mut extra_varyings,
                     &mut varying_seen,
                 )?;
@@ -2250,11 +2826,14 @@ fn extract_declarations(
                 i = parse_uniform_decl(
                     tokens,
                     i + 1,
-                    int_defines,
+                    &const_ints,
+                    &struct_defs,
                     &mut uniforms,
                     &mut uniform_types,
+                    &mut struct_uniforms,
                     &mut samplers,
                     &mut sampler_seen,
+                    &mut cube_samplers,
                 )?;
             }
             _ => {
@@ -2266,10 +2845,214 @@ fn extract_declarations(
 
     Ok(ExtractedDecls {
         uniforms,
+        struct_uniforms,
+        struct_defs,
+        const_ints,
         samplers,
+        cube_samplers,
         extra_varyings,
         body_tokens,
     })
+}
+
+fn collect_top_level_const_ints(
+    tokens: &[Token],
+    const_idx: usize,
+    const_ints: &mut HashMap<String, u32>,
+) {
+    let mut i = next_non_newline(tokens, const_idx + 1);
+    if let Some(Token::Ident(q)) = tokens.get(i)
+        && is_precision_qual(q)
+    {
+        i = next_non_newline(tokens, i + 1);
+    }
+    if !matches!(tokens.get(i), Some(Token::Ident(ty)) if ty == "int" || ty == "uint") {
+        return;
+    }
+    i = next_non_newline(tokens, i + 1);
+
+    while i < tokens.len() {
+        let Some(Token::Ident(name)) = tokens.get(i) else {
+            return;
+        };
+        let var_name = name.clone();
+        i = next_non_newline(tokens, i + 1);
+        if matches!(tokens.get(i), Some(Token::Punct(p)) if p == "=") {
+            i = next_non_newline(tokens, i + 1);
+            let expr_start = i;
+            let mut paren_depth: usize = 0;
+            let mut bracket_depth: usize = 0;
+            while i < tokens.len() {
+                match &tokens[i] {
+                    Token::Punct(p) if p == "(" => paren_depth += 1,
+                    Token::Punct(p) if p == ")" => paren_depth = paren_depth.saturating_sub(1),
+                    Token::Punct(p) if p == "[" => bracket_depth += 1,
+                    Token::Punct(p) if p == "]" => bracket_depth = bracket_depth.saturating_sub(1),
+                    Token::Punct(p)
+                        if paren_depth == 0 && bracket_depth == 0 && (p == "," || p == ";") =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if let Some(val) = eval_const_int_tokens(&tokens[expr_start..i], const_ints)
+                && let Ok(u) = u32::try_from(val)
+            {
+                const_ints.insert(var_name, u);
+            }
+        }
+        match tokens.get(i) {
+            Some(Token::Punct(p)) if p == "," => {
+                i = next_non_newline(tokens, i + 1);
+            }
+            _ => return,
+        }
+    }
+}
+
+fn parse_top_level_struct_def(
+    tokens: &[Token],
+    struct_idx: usize,
+    const_ints: &HashMap<String, u32>,
+) -> Option<(String, Vec<StructFieldDecl>)> {
+    let name_idx = next_non_newline(tokens, struct_idx + 1);
+    let Token::Ident(struct_name) = tokens.get(name_idx)? else {
+        return None;
+    };
+    let open_brace = next_non_newline(tokens, name_idx + 1);
+    if !matches!(tokens.get(open_brace), Some(Token::Punct(p)) if p == "{") {
+        return None;
+    }
+
+    let mut fields = Vec::new();
+    let mut i = next_non_newline(tokens, open_brace + 1);
+    while i < tokens.len() {
+        if matches!(tokens.get(i), Some(Token::Punct(p)) if p == "}") {
+            return Some((struct_name.clone(), fields));
+        }
+        if let Some(Token::Ident(q)) = tokens.get(i)
+            && is_precision_qual(q)
+        {
+            i = next_non_newline(tokens, i + 1);
+        }
+        let Token::Ident(ty_name) = tokens.get(i)? else {
+            return None;
+        };
+        let field_ty = ty_name.clone();
+        i = next_non_newline(tokens, i + 1);
+        while i < tokens.len() {
+            let Token::Ident(field_name) = tokens.get(i)? else {
+                return None;
+            };
+            i = next_non_newline(tokens, i + 1);
+            let mut array_len = None;
+            if matches!(tokens.get(i), Some(Token::Punct(p)) if p == "[") {
+                let (len_val, after_bracket) =
+                    parse_array_len_bracket(tokens, i, const_ints, field_name).ok()?;
+                array_len = Some(len_val);
+                i = next_non_newline(tokens, after_bracket);
+            }
+            fields.push(StructFieldDecl {
+                ty_name: field_ty.clone(),
+                name: field_name.clone(),
+                array_len,
+            });
+            match tokens.get(i) {
+                Some(Token::Punct(p)) if p == "," => {
+                    i = next_non_newline(tokens, i + 1);
+                }
+                Some(Token::Punct(p)) if p == ";" => {
+                    i = next_non_newline(tokens, i + 1);
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    None
+}
+
+fn flatten_struct_uniform_fields(
+    prefix: &str,
+    struct_name: &str,
+    struct_defs: &HashMap<String, Vec<StructFieldDecl>>,
+    uniforms: &mut Vec<UniformDecl>,
+    uniform_types: &mut HashMap<String, (UniformType, Option<u32>)>,
+    sampler_seen: &HashSet<String>,
+    depth: usize,
+) -> Result<(), ShaderError> {
+    if depth > 16 {
+        return Err(ShaderError::InvalidUniformDeclaration(format!(
+            "struct uniform `{prefix}` exceeds maximum nesting depth"
+        )));
+    }
+    let Some(fields) = struct_defs.get(struct_name) else {
+        return Err(ShaderError::InvalidUniformDeclaration(format!(
+            "unsupported uniform struct type `{struct_name}`"
+        )));
+    };
+    for field in fields {
+        let member_prefix = format!("{prefix}.{}", field.name);
+        if let Some(ty) = UniformType::from_glsl(&field.ty_name) {
+            if sampler_seen.contains(&member_prefix) {
+                return Err(ShaderError::DuplicateUniform {
+                    name: member_prefix,
+                });
+            }
+            if let Some(&(prev_ty, prev_len)) = uniform_types.get(&member_prefix) {
+                if prev_ty != ty || prev_len != field.array_len {
+                    return Err(ShaderError::DuplicateUniform {
+                        name: member_prefix,
+                    });
+                }
+            } else {
+                uniform_types.insert(member_prefix.clone(), (ty, field.array_len));
+                uniforms.push(UniformDecl {
+                    name: member_prefix,
+                    ty,
+                    array_len: field.array_len,
+                });
+            }
+        } else if struct_defs.contains_key(&field.ty_name) {
+            if let Some(len) = field.array_len {
+                if len == 0 || len > MAX_UNIFORM_ARRAY_LEN {
+                    return Err(ShaderError::InvalidUniformDeclaration(format!(
+                        "struct uniform array `{member_prefix}` length {len} exceeds allowed range"
+                    )));
+                }
+                for idx in 0..len {
+                    let elem_prefix = format!("{member_prefix}[{idx}]");
+                    flatten_struct_uniform_fields(
+                        &elem_prefix,
+                        &field.ty_name,
+                        struct_defs,
+                        uniforms,
+                        uniform_types,
+                        sampler_seen,
+                        depth + 1,
+                    )?;
+                }
+            } else {
+                flatten_struct_uniform_fields(
+                    &member_prefix,
+                    &field.ty_name,
+                    struct_defs,
+                    uniforms,
+                    uniform_types,
+                    sampler_seen,
+                    depth + 1,
+                )?;
+            }
+        } else {
+            return Err(ShaderError::InvalidUniformDeclaration(format!(
+                "unsupported uniform struct field type `{}` in `{struct_name}`",
+                field.ty_name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_varying_decl(
@@ -2319,7 +3102,11 @@ fn parse_varying_decl(
             i = next_non_newline(tokens, after_bracket);
         }
 
-        if name != "vUv" && name != "vUvScaled" && varying_seen.insert(name.clone()) {
+        if name != "vUv"
+            && name != "vUvScaled"
+            && name != "bgCoord"
+            && varying_seen.insert(name.clone())
+        {
             extra_varyings.push(VaryingDecl {
                 ty: ty.clone(),
                 name,
@@ -2346,14 +3133,18 @@ fn parse_varying_decl(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_uniform_decl(
     tokens: &[Token],
     mut i: usize,
     int_defines: &HashMap<String, u32>,
+    struct_defs: &HashMap<String, Vec<StructFieldDecl>>,
     uniforms: &mut Vec<UniformDecl>,
     uniform_types: &mut HashMap<String, (UniformType, Option<u32>)>,
+    struct_uniforms: &mut HashMap<String, StructUniformDecl>,
     samplers: &mut Vec<String>,
     sampler_seen: &mut HashSet<String>,
+    cube_samplers: &mut HashSet<String>,
 ) -> Result<usize, ShaderError> {
     i = next_non_newline(tokens, i);
     if let Some(Token::Ident(q)) = tokens.get(i)
@@ -2373,7 +3164,9 @@ fn parse_uniform_decl(
     i = next_non_newline(tokens, i + 1);
 
     let is_sampler2d = ty_ident == "sampler2D";
-    let uniform_ty = if is_sampler2d {
+    let is_sampler_cube = ty_ident == "samplerCube";
+    let is_struct = !is_sampler2d && !is_sampler_cube && struct_defs.contains_key(ty_ident);
+    let uniform_ty = if is_sampler2d || is_sampler_cube || is_struct {
         None
     } else {
         Some(UniformType::from_glsl(ty_ident).ok_or_else(|| {
@@ -2415,20 +3208,75 @@ fn parse_uniform_decl(
             }
         }
 
-        if is_sampler2d {
+        if is_sampler2d || is_sampler_cube {
             if array_len.is_some() {
                 return Err(ShaderError::InvalidUniformDeclaration(format!(
-                    "sampler2D arrays are not supported (`{name}`)"
+                    "{ty_ident} arrays are not supported (`{name}`)"
                 )));
             }
-            if uniform_types.contains_key(&name) {
+            if uniform_types.contains_key(&name) || struct_uniforms.contains_key(&name) {
                 return Err(ShaderError::DuplicateUniform { name });
             }
-            if sampler_seen.insert(name.clone()) {
+            if sampler_seen.contains(&name) {
+                if cube_samplers.contains(&name) != is_sampler_cube {
+                    return Err(ShaderError::DuplicateUniform { name });
+                }
+            } else {
+                sampler_seen.insert(name.clone());
+                if is_sampler_cube {
+                    cube_samplers.insert(name.clone());
+                }
                 samplers.push(name);
             }
+        } else if is_struct {
+            if sampler_seen.contains(&name) || uniform_types.contains_key(&name) {
+                return Err(ShaderError::DuplicateUniform { name });
+            }
+            if let Some(prev) = struct_uniforms.get(&name) {
+                if prev.struct_type != ty_ident || prev.array_len != array_len {
+                    return Err(ShaderError::DuplicateUniform { name });
+                }
+            } else {
+                if let Some(len) = array_len {
+                    if len == 0 || len > MAX_UNIFORM_ARRAY_LEN {
+                        return Err(ShaderError::InvalidUniformDeclaration(format!(
+                            "uniform struct array `{name}` length {len} exceeds allowed range 1..={MAX_UNIFORM_ARRAY_LEN}"
+                        )));
+                    }
+                    for idx in 0..len {
+                        let elem_prefix = format!("{name}[{idx}]");
+                        flatten_struct_uniform_fields(
+                            &elem_prefix,
+                            ty_ident,
+                            struct_defs,
+                            uniforms,
+                            uniform_types,
+                            sampler_seen,
+                            0,
+                        )?;
+                    }
+                } else {
+                    flatten_struct_uniform_fields(
+                        &name,
+                        ty_ident,
+                        struct_defs,
+                        uniforms,
+                        uniform_types,
+                        sampler_seen,
+                        0,
+                    )?;
+                }
+                struct_uniforms.insert(
+                    name.clone(),
+                    StructUniformDecl {
+                        name,
+                        struct_type: ty_ident.to_string(),
+                        array_len,
+                    },
+                );
+            }
         } else if let Some(ty) = uniform_ty {
-            if sampler_seen.contains(&name) {
+            if sampler_seen.contains(&name) || struct_uniforms.contains_key(&name) {
                 return Err(ShaderError::DuplicateUniform { name });
             }
             if let Some(&(prev_ty, prev_len)) = uniform_types.get(&name) {
@@ -2811,11 +3659,13 @@ fn is_glsl_builtin_type(ident: &str) -> bool {
             | "mat3"
             | "mat4"
             | "sampler2D"
+            | "samplerCube"
     )
 }
 
 /// Identifiers that are valid user names in GLSL ES 1.00 but collide with GLSL 450 / Vulkan
-/// keywords or the GLSL 450 `texture()`/`textureProj()` built-ins emitted by this shim.
+/// keywords or the GLSL 450 `texture()`/`textureProj()`/`textureLod()`/`textureGrad()` built-ins
+/// emitted by this shim.
 fn is_glsl450_escaped_ident(name: &str) -> bool {
     matches!(
         name,
@@ -2855,6 +3705,10 @@ fn is_glsl450_escaped_ident(name: &str) -> bool {
             | "sampler"
             | "texture"
             | "textureProj"
+            | "textureLod"
+            | "textureGrad"
+            | "textureProjLod"
+            | "textureProjGrad"
     )
 }
 
@@ -2864,6 +3718,24 @@ fn escape_glsl450_ident(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// Converts a `UniformDecl::name` (which may be a flattened struct member like `uLight.color`
+/// or `uLights[0].color`) into a valid GLSL 450 identifier for `ZcCustomUniforms`.
+fn ubo_field_ident(name: &str) -> String {
+    if !name.contains(['.', '[', ']']) {
+        return escape_glsl450_ident(name);
+    }
+    let mut out = String::from("_zc_sf_");
+    for ch in name.chars() {
+        match ch {
+            '.' => out.push_str("__"),
+            '[' => out.push_str("_i"),
+            ']' => out.push('_'),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn first_single_ident(arg: &[Token]) -> Option<&str> {
@@ -2955,6 +3827,8 @@ enum ScopeKind {
 struct ScopeFrame {
     vars: HashSet<String>,
     samplers: HashSet<String>,
+    cube_samplers: HashSet<String>,
+    const_ints: HashMap<String, i64>,
     kind: ScopeKind,
 }
 
@@ -2963,14 +3837,34 @@ impl ScopeFrame {
         Self {
             vars: HashSet::new(),
             samplers: HashSet::new(),
+            cube_samplers: HashSet::new(),
+            const_ints: HashMap::new(),
             kind,
         }
     }
 }
 
+#[derive(Debug, Default)]
+struct RewriteState {
+    /// Names of `mat2[N]` uniforms indexed dynamically (`_zc_load_<ubo_field>(int)`).
+    mat2_array_loaders: HashSet<String>,
+    /// Names of widened uniform arrays passed bare (`_zc_unpack_<ubo_field>()`).
+    array_unpackers: HashSet<String>,
+    /// Whether any non-const `normalize(...)` call was rewritten to `_zc_normalize(...)`.
+    uses_zc_normalize: bool,
+    /// Whether any non-const `pow(...)` call was rewritten to `_zc_pow(...)`.
+    uses_zc_pow: bool,
+    /// Whether `_zc_flip_grad` is referenced.
+    uses_flip_grad: bool,
+}
+
 struct RewriteCtx<'a> {
     uniforms: &'a HashMap<&'a str, &'a UniformDecl>,
+    struct_uniforms: &'a HashMap<String, StructUniformDecl>,
+    struct_defs: &'a HashMap<String, Vec<StructFieldDecl>>,
+    global_const_ints: &'a HashMap<String, u32>,
     samplers: &'a HashSet<&'a str>,
+    cube_samplers: &'a HashSet<String>,
     sampler_fns: &'a SamplerFnMap,
     user_fns: &'a HashSet<String>,
     frag_coord_res_y: FragCoordResY,
@@ -3106,10 +4000,9 @@ fn collect_function_info(tokens: &[Token]) -> Result<(SamplerFnMap, HashSet<Stri
                         user_fns.insert(fn_name.clone());
                         let mut sampler_indices = HashSet::new();
                         for (idx, &(lo, hi)) in param_ranges.iter().enumerate() {
-                            if tokens[lo..hi]
-                                .iter()
-                                .any(|t| matches!(t, Token::Ident(s) if s == "sampler2D"))
-                            {
+                            if tokens[lo..hi].iter().any(|t| {
+                                matches!(t, Token::Ident(s) if s == "sampler2D" || s == "samplerCube")
+                            }) {
                                 sampler_indices.insert(idx);
                             }
                         }
@@ -3174,25 +4067,225 @@ fn pop_completed_for_scopes(scopes: &mut Vec<ScopeFrame>, next_is_else: bool) {
     }
 }
 
+fn is_cube_sampler_in_scope(
+    name: &str,
+    cube_samplers: &HashSet<String>,
+    scopes: &[ScopeFrame],
+) -> bool {
+    for scope in scopes.iter().rev() {
+        if scope.cube_samplers.contains(name) {
+            return true;
+        }
+        if scope.samplers.contains(name) || scope.vars.contains(name) {
+            return false;
+        }
+    }
+    cube_samplers.contains(name)
+}
+
+fn eval_const_int_with_scopes(
+    tokens: &[Token],
+    scopes: &[ScopeFrame],
+    global_const_ints: &HashMap<String, u32>,
+) -> Option<(i64, bool)> {
+    // Build effective map respecting shadowing from inner to outer scopes.
+    let mut effective: HashMap<String, u32> = global_const_ints.clone();
+    let mut local_names: HashSet<String> = HashSet::new();
+    for scope in scopes.iter().skip(1) {
+        for var in &scope.vars {
+            if !scope.const_ints.contains_key(var) {
+                effective.remove(var);
+                local_names.remove(var);
+            }
+        }
+        for (k, &v) in &scope.const_ints {
+            if let Ok(u) = u32::try_from(v) {
+                effective.insert(k.clone(), u);
+                local_names.insert(k.clone());
+            } else {
+                effective.remove(k);
+                local_names.remove(k);
+            }
+        }
+    }
+    let uses_local = tokens
+        .iter()
+        .any(|t| matches!(t, Token::Ident(name) if local_names.contains(name)));
+    let val = eval_const_int_tokens(tokens, &effective)?;
+    Some((val, uses_local))
+}
+
+fn emit_non_array_uniform_read(out: &mut Vec<Token>, decl: &UniformDecl) {
+    let field_id = ubo_field_ident(&decl.name);
+    match decl.ty {
+        UniformType::Bool => {
+            out.push(Token::Punct("(".to_string()));
+            out.push(Token::Ident("_zc_u".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident(field_id));
+            out.push(Token::Punct("!=".to_string()));
+            out.push(Token::Number("0u".to_string()));
+            out.push(Token::Punct(")".to_string()));
+        }
+        UniformType::Bvec2 | UniformType::Bvec3 | UniformType::Bvec4 => {
+            let zero_ty = match decl.ty {
+                UniformType::Bvec2 => "uvec2",
+                UniformType::Bvec3 => "uvec3",
+                _ => "uvec4",
+            };
+            out.push(Token::Ident("notEqual".to_string()));
+            out.push(Token::Punct("(".to_string()));
+            out.push(Token::Ident("_zc_u".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident(field_id));
+            out.push(Token::Punct(",".to_string()));
+            out.push(Token::Ident(zero_ty.to_string()));
+            out.push(Token::Punct("(".to_string()));
+            out.push(Token::Number("0u".to_string()));
+            out.push(Token::Punct(")".to_string()));
+            out.push(Token::Punct(")".to_string()));
+        }
+        UniformType::Mat2 => {
+            out.push(Token::Punct("(".to_string()));
+            out.push(Token::Ident("mat2".to_string()));
+            out.push(Token::Punct("(".to_string()));
+            out.push(Token::Ident("_zc_u".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident(field_id.clone()));
+            out.push(Token::Punct("[".to_string()));
+            out.push(Token::Number("0".to_string()));
+            out.push(Token::Punct("]".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident("xy".to_string()));
+            out.push(Token::Punct(",".to_string()));
+            out.push(Token::Ident("_zc_u".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident(field_id));
+            out.push(Token::Punct("[".to_string()));
+            out.push(Token::Number("1".to_string()));
+            out.push(Token::Punct("]".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident("xy".to_string()));
+            out.push(Token::Punct(")".to_string()));
+            out.push(Token::Punct(")".to_string()));
+        }
+        _ => {
+            out.push(Token::Ident("_zc_u".to_string()));
+            out.push(Token::Punct(".".to_string()));
+            out.push(Token::Ident(field_id));
+        }
+    }
+}
+
+fn emit_bare_array_uniform_read(
+    out: &mut Vec<Token>,
+    decl: &UniformDecl,
+    state: &mut RewriteState,
+) {
+    let field_id = ubo_field_ident(&decl.name);
+    if decl.ty.needs_array_unpack() {
+        state.array_unpackers.insert(decl.name.clone());
+        out.push(Token::Ident(format!("_zc_unpack_{field_id}")));
+        out.push(Token::Punct("(".to_string()));
+        out.push(Token::Punct(")".to_string()));
+    } else {
+        out.push(Token::Ident("_zc_u".to_string()));
+        out.push(Token::Punct(".".to_string()));
+        out.push(Token::Ident(field_id));
+    }
+}
+
+fn emit_struct_uniform_expr(
+    out: &mut Vec<Token>,
+    prefix: &str,
+    struct_name: &str,
+    ctx: &RewriteCtx<'_>,
+    state: &mut RewriteState,
+    depth: usize,
+) -> Result<(), ShaderError> {
+    if depth > 16 {
+        return Err(ShaderError::GlslParse(format!(
+            "struct uniform `{prefix}` exceeds maximum nesting depth"
+        )));
+    }
+    let Some(fields) = ctx.struct_defs.get(struct_name) else {
+        return Err(ShaderError::GlslParse(format!(
+            "unknown struct type `{struct_name}`"
+        )));
+    };
+    out.push(Token::Ident(escape_glsl450_ident(struct_name)));
+    out.push(Token::Punct("(".to_string()));
+    for (idx, field) in fields.iter().enumerate() {
+        if idx > 0 {
+            out.push(Token::Punct(",".to_string()));
+        }
+        let member_key = format!("{prefix}.{}", field.name);
+        if let Some(decl) = ctx.uniforms.get(member_key.as_str()) {
+            if decl.array_len.is_some() {
+                emit_bare_array_uniform_read(out, decl, state);
+            } else {
+                emit_non_array_uniform_read(out, decl);
+            }
+        } else if ctx.struct_defs.contains_key(&field.ty_name) {
+            if let Some(len) = field.array_len {
+                out.push(Token::Ident(escape_glsl450_ident(&field.ty_name)));
+                out.push(Token::Punct("[".to_string()));
+                out.push(Token::Number(len.to_string()));
+                out.push(Token::Punct("]".to_string()));
+                out.push(Token::Punct("(".to_string()));
+                for k in 0..len {
+                    if k > 0 {
+                        out.push(Token::Punct(",".to_string()));
+                    }
+                    let elem_prefix = format!("{member_key}[{k}]");
+                    emit_struct_uniform_expr(
+                        out,
+                        &elem_prefix,
+                        &field.ty_name,
+                        ctx,
+                        state,
+                        depth + 1,
+                    )?;
+                }
+                out.push(Token::Punct(")".to_string()));
+            } else {
+                emit_struct_uniform_expr(out, &member_key, &field.ty_name, ctx, state, depth + 1)?;
+            }
+        }
+    }
+    out.push(Token::Punct(")".to_string()));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rewrite_body(
     tokens: &[Token],
     uniforms: &HashMap<&str, &UniformDecl>,
+    struct_uniforms: &HashMap<String, StructUniformDecl>,
+    struct_defs: &HashMap<String, Vec<StructFieldDecl>>,
+    global_const_ints: &HashMap<String, u32>,
     samplers: &HashSet<&str>,
+    cube_samplers: &HashSet<String>,
     sampler_fns: &SamplerFnMap,
     user_fns: &HashSet<String>,
     frag_coord_res_y: FragCoordResY,
+    state: &mut RewriteState,
     budget: &mut RewriteBudget,
 ) -> Result<Vec<Token>, ShaderError> {
     let ctx = RewriteCtx {
         uniforms,
+        struct_uniforms,
+        struct_defs,
+        global_const_ints,
         samplers,
+        cube_samplers,
         sampler_fns,
         user_fns,
         frag_coord_res_y,
     };
     let mut scopes: Vec<ScopeFrame> = vec![ScopeFrame::new(ScopeKind::Root)];
-    let mut user_types: HashSet<String> = HashSet::new();
-    rewrite_slice(tokens, &ctx, &mut scopes, &mut user_types, 0, budget)
+    let mut user_types: HashSet<String> = struct_defs.keys().cloned().collect();
+    rewrite_slice(tokens, &ctx, &mut scopes, &mut user_types, state, 0, budget)
 }
 
 fn rewrite_slice(
@@ -3200,6 +4293,7 @@ fn rewrite_slice(
     ctx: &RewriteCtx<'_>,
     scopes: &mut Vec<ScopeFrame>,
     user_types: &mut HashSet<String>,
+    state: &mut RewriteState,
     depth: usize,
     budget: &mut RewriteBudget,
 ) -> Result<Vec<Token>, ShaderError> {
@@ -3211,9 +4305,12 @@ fn rewrite_slice(
     let mut out = Vec::with_capacity(tokens.len());
     let mut pending_scope_vars: Vec<String> = Vec::new();
     let mut pending_scope_samplers: Vec<String> = Vec::new();
+    let mut pending_scope_cube_samplers: Vec<String> = Vec::new();
     let mut pending_decl_var: Option<String> = None;
     let mut decl_in_progress = false;
     let mut decl_expecting_name = false;
+    let mut decl_is_const = false;
+    let mut decl_type_is_int = false;
     let mut decl_paren_depth: usize = 0;
     let mut in_param_list = false;
     let mut param_paren_depth: usize = 0;
@@ -3255,6 +4352,7 @@ fn rewrite_slice(
                 out.push(Token::Preprocessor(rewrite_preprocessor_line(
                     line,
                     ctx,
+                    state,
                     depth + 1,
                     budget,
                 )?));
@@ -3270,9 +4368,14 @@ fn rewrite_slice(
                 for samp in pending_scope_samplers.drain(..) {
                     new_scope.samplers.insert(samp);
                 }
+                for cube in pending_scope_cube_samplers.drain(..) {
+                    new_scope.cube_samplers.insert(cube);
+                }
                 scopes.push(new_scope);
                 decl_in_progress = false;
                 decl_expecting_name = false;
+                decl_is_const = false;
+                decl_type_is_int = false;
                 in_param_list = false;
                 out.push(tokens[i].clone());
                 i += 1;
@@ -3289,6 +4392,8 @@ fn rewrite_slice(
                 pop_completed_for_scopes(scopes, next_is_else);
                 decl_in_progress = false;
                 decl_expecting_name = false;
+                decl_is_const = false;
+                decl_type_is_int = false;
                 out.push(tokens[i].clone());
                 i += 1;
                 continue;
@@ -3297,9 +4402,12 @@ fn rewrite_slice(
                 flush_pending_decl(&mut pending_decl_var, scopes);
                 decl_in_progress = false;
                 decl_expecting_name = false;
+                decl_is_const = false;
+                decl_type_is_int = false;
                 if !in_param_list {
                     pending_scope_vars.clear();
                     pending_scope_samplers.clear();
+                    pending_scope_cube_samplers.clear();
                 }
                 let next_i = next_non_newline(tokens, i + 1);
                 let next_is_else =
@@ -3346,6 +4454,8 @@ fn rewrite_slice(
                             }
                             decl_in_progress = false;
                             decl_expecting_name = false;
+                            decl_is_const = false;
+                            decl_type_is_int = false;
                             top.kind = ScopeKind::ForBodyStart;
                         }
                     }
@@ -3357,6 +4467,70 @@ fn rewrite_slice(
             Token::Punct(p) if p == "," && decl_in_progress && decl_paren_depth == 0 => {
                 flush_pending_decl(&mut pending_decl_var, scopes);
                 decl_expecting_name = true;
+                out.push(tokens[i].clone());
+                i += 1;
+                continue;
+            }
+            Token::Punct(p)
+                if p == "="
+                    && decl_is_const
+                    && decl_type_is_int
+                    && decl_paren_depth == 0
+                    && pending_decl_var.is_some() =>
+            {
+                // Peek initializer expression for local `const int/uint` so `[N]` array sizes
+                // can be constant-folded for Naga 30.0.2.
+                if let Some(var_name) = pending_decl_var.as_ref() {
+                    let expr_start = next_non_newline(tokens, i + 1);
+                    let mut scan = expr_start;
+                    let mut pd: usize = 0;
+                    let mut bd: usize = 0;
+                    while scan < tokens.len() {
+                        match &tokens[scan] {
+                            Token::Punct(sp) if sp == "(" => pd += 1,
+                            Token::Punct(sp) if sp == ")" => pd = pd.saturating_sub(1),
+                            Token::Punct(sp) if sp == "[" => bd += 1,
+                            Token::Punct(sp) if sp == "]" => bd = bd.saturating_sub(1),
+                            Token::Punct(sp) if pd == 0 && bd == 0 && (sp == "," || sp == ";") => {
+                                break;
+                            }
+                            _ => {}
+                        }
+                        scan += 1;
+                    }
+                    if let Some((val, _)) = eval_const_int_with_scopes(
+                        &tokens[expr_start..scan],
+                        scopes,
+                        ctx.global_const_ints,
+                    ) && let Some(current_scope) = scopes.last_mut()
+                    {
+                        current_scope.const_ints.insert(var_name.clone(), val);
+                    }
+                }
+                out.push(tokens[i].clone());
+                i += 1;
+                continue;
+            }
+            Token::Punct(p) if p == "[" && scopes.len() > 1 => {
+                if let Some((inner, after_bracket)) = parse_bracket_expr(tokens, i)
+                    && let Some((val, uses_local)) =
+                        eval_const_int_with_scopes(&inner, scopes, ctx.global_const_ints)
+                    && uses_local
+                    && val >= 0
+                {
+                    out.push(Token::Punct("[".to_string()));
+                    out.push(Token::Number(val.to_string()));
+                    out.push(Token::Punct("]".to_string()));
+                    budget.charge(2)?;
+                    i = after_bracket;
+                    continue;
+                }
+                out.push(tokens[i].clone());
+                i += 1;
+                continue;
+            }
+            Token::Ident(name) if !prev_is_dot && name == "const" => {
+                decl_is_const = true;
                 out.push(tokens[i].clone());
                 i += 1;
                 continue;
@@ -3381,16 +4555,21 @@ fn rewrite_slice(
             }
             Token::Ident(name)
                 if !prev_is_dot
-                    && name == "sampler2D"
+                    && (name == "sampler2D" || name == "samplerCube")
                     && in_param_list
                     && param_paren_depth == 1 =>
             {
+                let is_cube = name == "samplerCube";
+                let glsl450_tex_ty = if is_cube { "textureCube" } else { "texture2D" };
                 let next_i = next_non_newline(tokens, i + 1);
                 if let Some(Token::Ident(var_name)) = tokens.get(next_i) {
                     pending_scope_vars.push(var_name.clone());
                     pending_scope_samplers.push(var_name.clone());
+                    if is_cube {
+                        pending_scope_cube_samplers.push(var_name.clone());
+                    }
                     let esc_var = escape_glsl450_ident(var_name);
-                    out.push(Token::Ident("texture2D".to_string()));
+                    out.push(Token::Ident(glsl450_tex_ty.to_string()));
                     out.push(Token::Ident(esc_var.clone()));
                     out.push(Token::Punct(",".to_string()));
                     out.push(Token::Ident("sampler".to_string()));
@@ -3399,7 +4578,7 @@ fn rewrite_slice(
                     i = next_i + 1;
                     continue;
                 }
-                out.push(Token::Ident("texture2D".to_string()));
+                out.push(Token::Ident(glsl450_tex_ty.to_string()));
                 out.push(Token::Punct(",".to_string()));
                 out.push(Token::Ident("sampler".to_string()));
                 budget.charge(2)?;
@@ -3414,6 +4593,9 @@ fn rewrite_slice(
                 } else {
                     tokens[i].clone()
                 };
+                if decl_is_const && (name == "int" || name == "uint") {
+                    decl_type_is_int = true;
+                }
                 let next_i = next_non_newline(tokens, i + 1);
                 if let Some(Token::Ident(var_name)) = tokens.get(next_i) {
                     let after_name = next_non_newline(tokens, next_i + 1);
@@ -3421,6 +4603,8 @@ fn rewrite_slice(
                         // Function declaration / definition: enter parameter list tracking.
                         in_param_list = true;
                         param_paren_depth = 0;
+                        decl_is_const = false;
+                        decl_type_is_int = false;
                         out.push(emitted_type);
                         i += 1;
                         continue;
@@ -3464,6 +4648,78 @@ fn rewrite_slice(
                 i += 1;
                 continue;
             }
+            Token::Ident(name) if name == "gl_PointCoord" && !prev_is_dot => {
+                out.push(Token::Ident("vec2".to_string()));
+                out.push(Token::Punct("(".to_string()));
+                out.push(Token::Number("0.5".to_string()));
+                out.push(Token::Punct(")".to_string()));
+                budget.charge(3)?;
+                i += 1;
+                continue;
+            }
+            Token::Ident(name)
+                if name == "bgCoord"
+                    && !prev_is_dot
+                    && !is_shadowed("bgCoord", scopes)
+                    && !ctx.uniforms.contains_key("bgCoord")
+                    && !ctx.struct_uniforms.contains_key("bgCoord")
+                    && !ctx.samplers.contains("bgCoord") =>
+            {
+                out.push(Token::Ident("vUv".to_string()));
+                i += 1;
+                continue;
+            }
+            Token::Ident(name)
+                if !prev_is_dot
+                    && scopes.len() > 1
+                    && !decl_is_const
+                    && (name == "normalize" || name == "pow")
+                    && !is_shadowed(name, scopes)
+                    && !ctx.user_fns.contains(name.as_str())
+                    && matches!(
+                        tokens.get(next_non_newline(tokens, i + 1)),
+                        Some(Token::Punct(p)) if p == "("
+                    ) =>
+            {
+                let next_i = next_non_newline(tokens, i + 1);
+                let expected_args = if name == "normalize" { 1 } else { 2 };
+                if let Some((arg_ranges, after_call)) = parse_call_arg_ranges(tokens, next_i)?
+                    && arg_ranges.len() == expected_args
+                {
+                    let helper_name = if name == "normalize" {
+                        state.uses_zc_normalize = true;
+                        "_zc_normalize"
+                    } else {
+                        state.uses_zc_pow = true;
+                        "_zc_pow"
+                    };
+                    let before_len = out.len();
+                    out.push(Token::Ident(helper_name.to_string()));
+                    out.push(Token::Punct("(".to_string()));
+                    for (arg_idx, &(lo, hi)) in arg_ranges.iter().enumerate() {
+                        if arg_idx > 0 {
+                            out.push(Token::Punct(",".to_string()));
+                        }
+                        let rewritten_arg = rewrite_slice(
+                            &tokens[lo..hi],
+                            ctx,
+                            scopes,
+                            user_types,
+                            state,
+                            depth + 1,
+                            budget,
+                        )?;
+                        out.extend(rewritten_arg);
+                    }
+                    out.push(Token::Punct(")".to_string()));
+                    budget.charge(out.len().saturating_sub(before_len))?;
+                    i = after_call;
+                    continue;
+                }
+                out.push(tokens[i].clone());
+                i += 1;
+                continue;
+            }
             Token::Ident(name)
                 if !prev_is_dot
                     && name == "dFdy"
@@ -3479,8 +4735,15 @@ fn rewrite_slice(
                     && arg_ranges.len() == 1
                 {
                     let (lo, hi) = arg_ranges[0];
-                    let rewritten_arg =
-                        rewrite_slice(&tokens[lo..hi], ctx, scopes, user_types, depth + 1, budget)?;
+                    let rewritten_arg = rewrite_slice(
+                        &tokens[lo..hi],
+                        ctx,
+                        scopes,
+                        user_types,
+                        state,
+                        depth + 1,
+                        budget,
+                    )?;
                     let before_len = out.len();
                     out.push(Token::Punct("(".to_string()));
                     out.push(Token::Punct("-".to_string()));
@@ -3504,10 +4767,20 @@ fn rewrite_slice(
                         tokens.get(next_non_newline(tokens, i + 1)),
                         Some(Token::Punct(p)) if p == "("
                     )
-                    && (matches!(name.as_str(), "texture2D" | "texture2DProj")
-                        || (name == "texture"
-                            && !ctx.user_fns.contains("texture")
-                            && !is_shadowed("texture", scopes))) =>
+                    && (matches!(
+                        name.as_str(),
+                        "texture2D"
+                            | "texture2DProj"
+                            | "texture2DLodEXT"
+                            | "texture2DGradEXT"
+                            | "texture2DProjLodEXT"
+                            | "texture2DProjGradEXT"
+                            | "textureCube"
+                            | "textureCubeLodEXT"
+                            | "textureCubeGradEXT"
+                    ) || (name == "texture"
+                        && !ctx.user_fns.contains("texture")
+                        && !is_shadowed("texture", scopes))) =>
             {
                 let next_i = next_non_newline(tokens, i + 1);
                 if let Some((arg_ranges, after_call)) = parse_call_arg_ranges(tokens, next_i)?
@@ -3516,13 +4789,31 @@ fn rewrite_slice(
                         first_single_ident(&tokens[arg_ranges[0].0..arg_ranges[0].1])
                     && is_sampler_in_scope(tex_ident, ctx.samplers, scopes)
                 {
-                    let is_proj = name == "texture2DProj";
-                    let fn_name = if is_proj { "textureProj" } else { "texture" };
+                    let is_cube =
+                        matches!(
+                            name.as_str(),
+                            "textureCube" | "textureCubeLodEXT" | "textureCubeGradEXT"
+                        ) || is_cube_sampler_in_scope(tex_ident, ctx.cube_samplers, scopes);
+                    let is_proj = matches!(
+                        name.as_str(),
+                        "texture2DProj" | "texture2DProjLodEXT" | "texture2DProjGradEXT"
+                    );
+                    let is_grad_2d =
+                        matches!(name.as_str(), "texture2DGradEXT" | "texture2DProjGradEXT");
+                    let fn_name = match name.as_str() {
+                        "texture2DProj" => "textureProj",
+                        "texture2DLodEXT" | "textureCubeLodEXT" => "textureLod",
+                        "texture2DGradEXT" | "textureCubeGradEXT" => "textureGrad",
+                        "texture2DProjLodEXT" => "textureProjLod",
+                        "texture2DProjGradEXT" => "textureProjGrad",
+                        _ => "texture",
+                    };
+                    let sampler_ctor = if is_cube { "samplerCube" } else { "sampler2D" };
                     let esc_tex = escape_glsl450_ident(tex_ident);
                     let before_len = out.len();
                     out.push(Token::Ident(fn_name.to_string()));
                     out.push(Token::Punct("(".to_string()));
-                    out.push(Token::Ident("sampler2D".to_string()));
+                    out.push(Token::Ident(sampler_ctor.to_string()));
                     out.push(Token::Punct("(".to_string()));
                     out.push(Token::Ident(esc_tex.clone()));
                     out.push(Token::Punct(",".to_string()));
@@ -3535,10 +4826,11 @@ fn rewrite_slice(
                             ctx,
                             scopes,
                             user_types,
+                            state,
                             depth + 1,
                             budget,
                         )?;
-                        if arg_idx == 0 {
+                        if arg_idx == 0 && !is_cube {
                             // Convert logical CM3 bottom-left UV to WebGPU top-left texture UV at the sampling boundary.
                             let helper = if is_proj {
                                 "_zc_flip_uv_proj"
@@ -3546,6 +4838,13 @@ fn rewrite_slice(
                                 "_zc_flip_uv"
                             };
                             out.push(Token::Ident(helper.to_string()));
+                            out.push(Token::Punct("(".to_string()));
+                            out.extend(rewritten_arg);
+                            out.push(Token::Punct(")".to_string()));
+                        } else if is_grad_2d && (arg_idx == 1 || arg_idx == 2) {
+                            // Flip Y derivatives to match V-flipped texture sampling.
+                            state.uses_flip_grad = true;
+                            out.push(Token::Ident("_zc_flip_grad".to_string()));
                             out.push(Token::Punct("(".to_string()));
                             out.extend(rewritten_arg);
                             out.push(Token::Punct(")".to_string()));
@@ -3599,6 +4898,7 @@ fn rewrite_slice(
                                 ctx,
                                 scopes,
                                 user_types,
+                                state,
                                 depth + 1,
                                 budget,
                             )?;
@@ -3617,53 +4917,192 @@ fn rewrite_slice(
             Token::Ident(name)
                 if !prev_is_dot
                     && !is_shadowed(name, scopes)
-                    && ctx.uniforms.contains_key(name.as_str()) =>
+                    && ctx.struct_uniforms.contains_key(name.as_str()) =>
             {
-                let decl = ctx.uniforms[name.as_str()];
-                let esc_field = escape_glsl450_ident(&decl.name);
-                if decl.array_len.is_some() {
+                let sdecl = &ctx.struct_uniforms[name.as_str()];
+                let before_len = out.len();
+                if let Some(len) = sdecl.array_len {
                     let next_i = next_non_newline(tokens, i + 1);
-                    if let Some(swizzle) = decl.ty.array_swizzle()
-                        && matches!(tokens.get(next_i), Some(Token::Punct(p)) if p == "[")
+                    if matches!(tokens.get(next_i), Some(Token::Punct(p)) if p == "[")
                         && let Some((idx_tokens, after_bracket)) =
                             parse_bracket_expr(tokens, next_i)
                     {
-                        let rewritten_idx =
-                            rewrite_slice(&idx_tokens, ctx, scopes, user_types, depth + 1, budget)?;
-                        if decl.ty == UniformType::Bool {
+                        if let Some((val, _)) =
+                            eval_const_int_with_scopes(&idx_tokens, scopes, ctx.global_const_ints)
+                            && val >= 0
+                            && (val as u32) < len
+                        {
+                            let elem_prefix = format!("{}[{val}]", sdecl.name);
+                            emit_struct_uniform_expr(
+                                &mut out,
+                                &elem_prefix,
+                                &sdecl.struct_type,
+                                ctx,
+                                state,
+                                0,
+                            )?;
+                        } else {
+                            let rewritten_idx = rewrite_slice(
+                                &idx_tokens,
+                                ctx,
+                                scopes,
+                                user_types,
+                                state,
+                                depth + 1,
+                                budget,
+                            )?;
+                            out.push(Token::Ident(escape_glsl450_ident(&sdecl.struct_type)));
+                            out.push(Token::Punct("[".to_string()));
+                            out.push(Token::Number(len.to_string()));
+                            out.push(Token::Punct("]".to_string()));
                             out.push(Token::Punct("(".to_string()));
-                        }
-                        out.push(Token::Ident("_zc_u".to_string()));
-                        out.push(Token::Punct(".".to_string()));
-                        out.push(Token::Ident(esc_field));
-                        out.push(Token::Punct("[".to_string()));
-                        out.extend(rewritten_idx);
-                        out.push(Token::Punct("]".to_string()));
-                        out.push(Token::Punct(".".to_string()));
-                        out.push(Token::Ident(swizzle.trim_start_matches('.').to_string()));
-                        if decl.ty == UniformType::Bool {
-                            out.push(Token::Punct("!=".to_string()));
-                            out.push(Token::Number("0u".to_string()));
+                            for k in 0..len {
+                                if k > 0 {
+                                    out.push(Token::Punct(",".to_string()));
+                                }
+                                let elem_prefix = format!("{}[{k}]", sdecl.name);
+                                emit_struct_uniform_expr(
+                                    &mut out,
+                                    &elem_prefix,
+                                    &sdecl.struct_type,
+                                    ctx,
+                                    state,
+                                    0,
+                                )?;
+                            }
                             out.push(Token::Punct(")".to_string()));
+                            out.push(Token::Punct("[".to_string()));
+                            out.extend(rewritten_idx);
+                            out.push(Token::Punct("]".to_string()));
                         }
+                        budget.charge(out.len().saturating_sub(before_len))?;
                         i = after_bracket;
                         continue;
                     }
-                    out.push(Token::Ident("_zc_u".to_string()));
-                    out.push(Token::Punct(".".to_string()));
-                    out.push(Token::Ident(esc_field));
-                } else if decl.ty == UniformType::Bool {
+                    out.push(Token::Ident(escape_glsl450_ident(&sdecl.struct_type)));
+                    out.push(Token::Punct("[".to_string()));
+                    out.push(Token::Number(len.to_string()));
+                    out.push(Token::Punct("]".to_string()));
                     out.push(Token::Punct("(".to_string()));
-                    out.push(Token::Ident("_zc_u".to_string()));
-                    out.push(Token::Punct(".".to_string()));
-                    out.push(Token::Ident(esc_field));
-                    out.push(Token::Punct("!=".to_string()));
-                    out.push(Token::Number("0u".to_string()));
+                    for k in 0..len {
+                        if k > 0 {
+                            out.push(Token::Punct(",".to_string()));
+                        }
+                        let elem_prefix = format!("{}[{k}]", sdecl.name);
+                        emit_struct_uniform_expr(
+                            &mut out,
+                            &elem_prefix,
+                            &sdecl.struct_type,
+                            ctx,
+                            state,
+                            0,
+                        )?;
+                    }
                     out.push(Token::Punct(")".to_string()));
                 } else {
-                    out.push(Token::Ident("_zc_u".to_string()));
-                    out.push(Token::Punct(".".to_string()));
-                    out.push(Token::Ident(esc_field));
+                    emit_struct_uniform_expr(
+                        &mut out,
+                        &sdecl.name,
+                        &sdecl.struct_type,
+                        ctx,
+                        state,
+                        0,
+                    )?;
+                }
+                budget.charge(out.len().saturating_sub(before_len))?;
+                i += 1;
+                continue;
+            }
+            Token::Ident(name)
+                if !prev_is_dot
+                    && !is_shadowed(name, scopes)
+                    && ctx.uniforms.contains_key(name.as_str()) =>
+            {
+                let decl = ctx.uniforms[name.as_str()];
+                let field_id = ubo_field_ident(&decl.name);
+                if decl.array_len.is_some() {
+                    let next_i = next_non_newline(tokens, i + 1);
+                    if matches!(tokens.get(next_i), Some(Token::Punct(p)) if p == "[")
+                        && let Some((idx_tokens, after_bracket)) =
+                            parse_bracket_expr(tokens, next_i)
+                    {
+                        let rewritten_idx = rewrite_slice(
+                            &idx_tokens,
+                            ctx,
+                            scopes,
+                            user_types,
+                            state,
+                            depth + 1,
+                            budget,
+                        )?;
+                        let before_len = out.len();
+                        if decl.ty == UniformType::Mat2 {
+                            state.mat2_array_loaders.insert(decl.name.clone());
+                            out.push(Token::Ident(format!("_zc_load_{field_id}")));
+                            out.push(Token::Punct("(".to_string()));
+                            out.push(Token::Ident("int".to_string()));
+                            out.push(Token::Punct("(".to_string()));
+                            out.extend(rewritten_idx);
+                            out.push(Token::Punct(")".to_string()));
+                            out.push(Token::Punct(")".to_string()));
+                        } else if matches!(
+                            decl.ty,
+                            UniformType::Bvec2 | UniformType::Bvec3 | UniformType::Bvec4
+                        ) {
+                            let zero_ty = match decl.ty {
+                                UniformType::Bvec2 => "uvec2",
+                                UniformType::Bvec3 => "uvec3",
+                                _ => "uvec4",
+                            };
+                            out.push(Token::Ident("notEqual".to_string()));
+                            out.push(Token::Punct("(".to_string()));
+                            out.push(Token::Ident("_zc_u".to_string()));
+                            out.push(Token::Punct(".".to_string()));
+                            out.push(Token::Ident(field_id));
+                            out.push(Token::Punct("[".to_string()));
+                            out.extend(rewritten_idx);
+                            out.push(Token::Punct("]".to_string()));
+                            if let Some(swizzle) = decl.ty.array_swizzle() {
+                                out.push(Token::Punct(".".to_string()));
+                                out.push(Token::Ident(swizzle.trim_start_matches('.').to_string()));
+                            }
+                            out.push(Token::Punct(",".to_string()));
+                            out.push(Token::Ident(zero_ty.to_string()));
+                            out.push(Token::Punct("(".to_string()));
+                            out.push(Token::Number("0u".to_string()));
+                            out.push(Token::Punct(")".to_string()));
+                            out.push(Token::Punct(")".to_string()));
+                        } else {
+                            if decl.ty == UniformType::Bool {
+                                out.push(Token::Punct("(".to_string()));
+                            }
+                            out.push(Token::Ident("_zc_u".to_string()));
+                            out.push(Token::Punct(".".to_string()));
+                            out.push(Token::Ident(field_id));
+                            out.push(Token::Punct("[".to_string()));
+                            out.extend(rewritten_idx);
+                            out.push(Token::Punct("]".to_string()));
+                            if let Some(swizzle) = decl.ty.array_swizzle() {
+                                out.push(Token::Punct(".".to_string()));
+                                out.push(Token::Ident(swizzle.trim_start_matches('.').to_string()));
+                            }
+                            if decl.ty == UniformType::Bool {
+                                out.push(Token::Punct("!=".to_string()));
+                                out.push(Token::Number("0u".to_string()));
+                                out.push(Token::Punct(")".to_string()));
+                            }
+                        }
+                        budget.charge(out.len().saturating_sub(before_len))?;
+                        i = after_bracket;
+                        continue;
+                    }
+                    let before_len = out.len();
+                    emit_bare_array_uniform_read(&mut out, decl, state);
+                    budget.charge(out.len().saturating_sub(before_len))?;
+                } else {
+                    let before_len = out.len();
+                    emit_non_array_uniform_read(&mut out, decl);
+                    budget.charge(out.len().saturating_sub(before_len))?;
                 }
                 i += 1;
                 continue;
@@ -3683,9 +5122,105 @@ fn rewrite_slice(
     Ok(out)
 }
 
+/// Removes unreachable statements following an unconditional block-level `return ...;` up to the
+/// enclosing `}` (or `case`/`default` label).
+///
+/// Naga 30.0.2's GLSL frontend rejects dead code containing function calls after an unconditional
+/// `return;` (such as `mosaic.glsl`'s `#ifdef GL_EXT_shader_texture_lod ... return; #endif`
+/// fallback loop) with `Expression not visited by the appropriate statement`.
+fn strip_unreachable_after_return(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut brace_depth: usize = 0;
+    let mut paren_depth: usize = 0;
+    let mut prev_is_block_stmt_boundary = false;
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        if brace_depth > 0
+            && paren_depth == 0
+            && prev_is_block_stmt_boundary
+            && matches!(tok, Token::Ident(kw) if kw == "return")
+        {
+            // Emit `return ...;` up through its terminating `;`.
+            let mut ret_pd: usize = 0;
+            while i < tokens.len() {
+                let t = &tokens[i];
+                out.push(t.clone());
+                match t {
+                    Token::Punct(p) if p == "(" => ret_pd += 1,
+                    Token::Punct(p) if p == ")" => ret_pd = ret_pd.saturating_sub(1),
+                    Token::Punct(p) if p == ";" && ret_pd == 0 => {
+                        i += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            // Skip unreachable tokens in the same block until matching `}` or `case`/`default`.
+            let mut nested_braces: usize = 0;
+            while i < tokens.len() {
+                match &tokens[i] {
+                    Token::Punct(p) if p == "{" => {
+                        nested_braces += 1;
+                        i += 1;
+                    }
+                    Token::Punct(p) if p == "}" => {
+                        if nested_braces == 0 {
+                            break;
+                        }
+                        nested_braces -= 1;
+                        i += 1;
+                    }
+                    Token::Ident(kw) if nested_braces == 0 && (kw == "case" || kw == "default") => {
+                        break;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            prev_is_block_stmt_boundary = true;
+            continue;
+        }
+
+        match tok {
+            Token::Punct(p) if p == "{" => {
+                brace_depth += 1;
+                prev_is_block_stmt_boundary = true;
+            }
+            Token::Punct(p) if p == "}" => {
+                brace_depth = brace_depth.saturating_sub(1);
+                prev_is_block_stmt_boundary = true;
+            }
+            Token::Punct(p) if p == "(" => {
+                paren_depth += 1;
+                prev_is_block_stmt_boundary = false;
+            }
+            Token::Punct(p) if p == ")" => {
+                paren_depth = paren_depth.saturating_sub(1);
+                prev_is_block_stmt_boundary = false;
+            }
+            Token::Punct(p) if p == ";" || p == ":" => {
+                prev_is_block_stmt_boundary = true;
+            }
+            Token::Newline => {}
+            _ => {
+                prev_is_block_stmt_boundary = false;
+            }
+        }
+        out.push(tok.clone());
+        i += 1;
+    }
+
+    out
+}
+
 fn rewrite_preprocessor_line(
     line: &str,
     ctx: &RewriteCtx<'_>,
+    state: &mut RewriteState,
     depth: usize,
     budget: &mut RewriteBudget,
 ) -> Result<String, ShaderError> {
@@ -3742,12 +5277,13 @@ fn rewrite_preprocessor_line(
     let mut root_scope = ScopeFrame::new(ScopeKind::Root);
     root_scope.vars = macro_params;
     let mut scopes = vec![root_scope];
-    let mut user_types = HashSet::new();
+    let mut user_types: HashSet<String> = ctx.struct_defs.keys().cloned().collect();
     let rewritten = rewrite_slice(
         &body_tokens,
         ctx,
         &mut scopes,
         &mut user_types,
+        state,
         depth,
         budget,
     )?;
@@ -3825,6 +5361,8 @@ fn assemble_glsl450(
     extra_varyings: &[VaryingDecl],
     uniforms: &[UniformDecl],
     texture_bindings: &[TextureBinding],
+    cube_samplers: &HashSet<String>,
+    rewrite_state: &RewriteState,
     body_glsl: &str,
 ) -> String {
     let mut src = String::with_capacity(body_glsl.len() + 512);
@@ -3832,6 +5370,7 @@ fn assemble_glsl450(
     src.push_str("#define GL_ES 1\n");
     src.push_str("#define GL_FRAGMENT_PRECISION_HIGH 1\n");
     src.push_str("#define GL_OES_standard_derivatives 1\n");
+    src.push_str("#define GL_EXT_shader_texture_lod 1\n");
 
     src.push_str("\nlayout(location = 0) in vec2 vUv;\n");
     src.push_str("layout(location = 1) in vec2 vUvScaled;\n");
@@ -3864,14 +5403,83 @@ fn assemble_glsl450(
         src.push_str("\nlayout(set = 0, binding = 0, std140) uniform ZcCustomUniforms {\n");
         for u in uniforms {
             let glsl_ty = u.ty.ubo_glsl_type(u.array_len.is_some());
-            let esc_name = escape_glsl450_ident(&u.name);
+            let field_id = ubo_field_ident(&u.name);
             if let Some(len) = u.array_len {
-                src.push_str(&format!("    {glsl_ty} {esc_name}[{len}];\n"));
+                if u.ty == UniformType::Mat2 {
+                    src.push_str(&format!(
+                        "    vec4 {field_id}[{}];\n",
+                        len.saturating_mul(2)
+                    ));
+                } else {
+                    src.push_str(&format!("    {glsl_ty} {field_id}[{len}];\n"));
+                }
+            } else if u.ty == UniformType::Mat2 {
+                src.push_str(&format!("    vec4 {field_id}[2];\n"));
             } else {
-                src.push_str(&format!("    {glsl_ty} {esc_name};\n"));
+                src.push_str(&format!("    {glsl_ty} {field_id};\n"));
             }
         }
         src.push_str("} _zc_u;\n");
+
+        // Emit dynamic loaders for `uniform mat2 A[N]` indexed reads.
+        for u in uniforms {
+            if u.ty == UniformType::Mat2
+                && u.array_len.is_some()
+                && rewrite_state.mat2_array_loaders.contains(&u.name)
+            {
+                let field_id = ubo_field_ident(&u.name);
+                src.push_str(&format!(
+                    "mat2 _zc_load_{field_id}(int _zc_i) {{ return mat2(_zc_u.{field_id}[_zc_i * 2].xy, _zc_u.{field_id}[_zc_i * 2 + 1].xy); }}\n"
+                ));
+            }
+        }
+
+        // Emit unpack helpers for widened uniform arrays passed bare to functions.
+        for u in uniforms {
+            if let Some(len) = u.array_len
+                && u.ty.needs_array_unpack()
+                && rewrite_state.array_unpackers.contains(&u.name)
+            {
+                let field_id = ubo_field_ident(&u.name);
+                let glsl_ty = u.ty.glsl_name();
+                src.push_str(&format!(
+                    "{glsl_ty}[{len}] _zc_unpack_{field_id}() {{ return {glsl_ty}[{len}]("
+                ));
+                for idx in 0..len {
+                    if idx > 0 {
+                        src.push_str(", ");
+                    }
+                    match u.ty {
+                        UniformType::Bool => {
+                            src.push_str(&format!("(_zc_u.{field_id}[{idx}].x != 0u)"));
+                        }
+                        UniformType::Bvec2 => {
+                            src.push_str(&format!(
+                                "notEqual(_zc_u.{field_id}[{idx}].xy, uvec2(0u))"
+                            ));
+                        }
+                        UniformType::Bvec3 => {
+                            src.push_str(&format!("notEqual(_zc_u.{field_id}[{idx}], uvec3(0u))"));
+                        }
+                        UniformType::Bvec4 => {
+                            src.push_str(&format!("notEqual(_zc_u.{field_id}[{idx}], uvec4(0u))"));
+                        }
+                        UniformType::Mat2 => {
+                            let c0 = idx * 2;
+                            let c1 = idx * 2 + 1;
+                            src.push_str(&format!(
+                                "mat2(_zc_u.{field_id}[{c0}].xy, _zc_u.{field_id}[{c1}].xy)"
+                            ));
+                        }
+                        _ => {
+                            let swizzle = u.ty.array_swizzle().unwrap_or("");
+                            src.push_str(&format!("_zc_u.{field_id}[{idx}]{swizzle}"));
+                        }
+                    }
+                }
+                src.push_str("); }\n");
+            }
+        }
     }
 
     let emit_uv_helpers = !texture_bindings.is_empty() || body_glsl.contains("_zc_flip_uv");
@@ -3879,8 +5487,13 @@ fn assemble_glsl450(
         src.push('\n');
         for tb in texture_bindings {
             let esc_name = escape_glsl450_ident(&tb.name);
+            let tex_ty = if cube_samplers.contains(&tb.name) {
+                "textureCube"
+            } else {
+                "texture2D"
+            };
             src.push_str(&format!(
-                "layout(set = {}, binding = {}) uniform texture2D {esc_name};\n",
+                "layout(set = {}, binding = {}) uniform {tex_ty} {esc_name};\n",
                 tb.group, tb.texture_binding
             ));
             src.push_str(&format!(
@@ -3897,6 +5510,21 @@ fn assemble_glsl450(
                 "vec4 _zc_flip_uv_proj(vec4 uvw) { return vec4(uvw.x, uvw.w - uvw.y, uvw.z, uvw.w); }\n",
             );
         }
+    }
+    if rewrite_state.uses_flip_grad || body_glsl.contains("_zc_flip_grad") {
+        src.push_str("vec2 _zc_flip_grad(vec2 g) { return vec2(g.x, -g.y); }\n");
+    }
+    if rewrite_state.uses_zc_normalize {
+        src.push_str("float _zc_normalize(float v) { return v / abs(v); }\n");
+        src.push_str("vec2 _zc_normalize(vec2 v) { return normalize(v); }\n");
+        src.push_str("vec3 _zc_normalize(vec3 v) { return normalize(v); }\n");
+        src.push_str("vec4 _zc_normalize(vec4 v) { return normalize(v); }\n");
+    }
+    if rewrite_state.uses_zc_pow {
+        src.push_str("float _zc_pow(float x, float y) { return pow(x, y); }\n");
+        src.push_str("vec2 _zc_pow(vec2 x, vec2 y) { return pow(x, y); }\n");
+        src.push_str("vec3 _zc_pow(vec3 x, vec3 y) { return pow(x, y); }\n");
+        src.push_str("vec4 _zc_pow(vec4 x, vec4 y) { return pow(x, y); }\n");
     }
 
     src.push('\n');

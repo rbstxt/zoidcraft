@@ -8,12 +8,16 @@ use egui::{
     Shape, Stroke, StrokeKind, TextEdit, Ui, pos2, vec2,
 };
 use serde_json::Value;
+use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
 use zc_color::{Hsl, Rgb, ThemePalette, choose_clip_label_color};
 use zc_session::{
     Command, KeyframeRef, Session, SessionClip, SessionProperty, SessionTrack,
     TIME_FORMAT_FRAME_NUMBER, TIME_FORMAT_TIMECODE_FRAMES, TIME_FORMAT_TIMECODE_MS, TrackKind,
 };
 
+use super::gestures::{
+    GestureClassifier, ScrollDevice, pointer_on_layer, rect_contains_unoccluded_pointer,
+};
 use super::theme::{Cm3Icon, TEXT_MUTED, TEXT_PRIMARY, paint_cm3_icon};
 
 // ---------------------------------------------------------------------------
@@ -352,6 +356,8 @@ pub struct TimelineViewState {
     pub box_selected_clips: BTreeSet<String>,
     pub keyframe_area_height: f32,
     pub cached_frame_spans: Vec<(f64, f64)>,
+    pub gesture_classifier: GestureClassifier,
+    track_height_accum: f32,
     scrollbar_drag_offset: Option<f32>,
     kf_splitter_drag: Option<(f32, f32)>,
 }
@@ -387,6 +393,8 @@ impl TimelineViewState {
             box_selected_clips: BTreeSet::new(),
             keyframe_area_height: KEYFRAME_AREA_HEIGHT,
             cached_frame_spans: Vec::new(),
+            gesture_classifier: GestureClassifier::new(),
+            track_height_accum: 0.0,
             scrollbar_drag_offset: None,
             kf_splitter_drag: None,
         }
@@ -691,7 +699,10 @@ pub fn show_timeline(
 
     let pointer_pos = ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.latest_pos()));
     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
-    if primary_pressed && let Some(pos) = pointer_pos {
+    if primary_pressed
+        && let Some(pos) = pointer_pos
+        && pointer_on_layer(ui, pos)
+    {
         state.focused = panel_rect.contains(pos);
     }
 
@@ -783,11 +794,12 @@ pub fn show_timeline(
     let initial_max_scroll_x = (initial_seq_px - f64::from(content_width) + 200.0).max(0.0);
     state.scroll_x = state.scroll_x.clamp(0.0, initial_max_scroll_x);
 
-    // Handle wheel zoom/scroll & middle-mouse panning over the panel.
+    // Handle wheel zoom/scroll, trackpad pinch/pan & middle-mouse panning over the panel.
     handle_wheel_and_middle_pan(
         ui,
         state,
         panel_rect,
+        ruler_rect,
         kf_header_rect,
         video_header_rect,
         audio_header_rect,
@@ -1063,6 +1075,7 @@ fn handle_wheel_and_middle_pan(
     ui: &mut Ui,
     state: &mut TimelineViewState,
     panel_rect: Rect,
+    ruler_rect: Rect,
     kf_header_rect: Rect,
     video_header_rect: Rect,
     audio_header_rect: Rect,
@@ -1072,17 +1085,15 @@ fn handle_wheel_and_middle_pan(
     content_left: f32,
     max_scroll_x: f64,
 ) {
-    let (hover_pos, scroll_delta, modifiers, middle_down, pointer_delta) = ui.input(|i| {
+    let (hover_pos, g, middle_down) = ui.input(|i| {
         (
             i.pointer.hover_pos(),
-            i.smooth_scroll_delta,
-            i.modifiers,
+            state.gesture_classifier.sample(i),
             i.pointer.middle_down(),
-            i.pointer.delta(),
         )
     });
 
-    // Middle-mouse drag smooth panning.
+    // Middle-mouse drag smooth panning (occlusion-safe).
     if middle_down {
         if let Some(pos) = hover_pos {
             match &mut state.drag_state {
@@ -1099,9 +1110,10 @@ fn handle_wheel_and_middle_pan(
                     }
                     ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 }
-                TimelineDragState::None if panel_rect.contains(pos) => {
+                TimelineDragState::None
+                    if rect_contains_unoccluded_pointer(ui, panel_rect, pos) =>
+                {
                     state.drag_state = TimelineDragState::MiddlePanning { last_pos: pos };
-                    let _ = pointer_delta;
                     ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 }
                 _ => {}
@@ -1114,47 +1126,105 @@ fn handle_wheel_and_middle_pan(
     let Some(pos) = hover_pos else {
         return;
     };
-    if !panel_rect.contains(pos) || (scroll_delta.x.abs() < 0.01 && scroll_delta.y.abs() < 0.01) {
+    if !rect_contains_unoccluded_pointer(ui, panel_rect, pos) {
         return;
     }
 
-    let ctrl_or_cmd = modifiers.ctrl || modifiers.command;
-    if ctrl_or_cmd {
-        // Ctrl/Cmd + Wheel over video/audio track headers resizes row height by ±5 px ([20, 100]).
-        let sign = if scroll_delta.y > 0.0 { 5.0 } else { -5.0 };
-        if video_header_rect.contains(pos) {
-            state.video_track_height = (state.video_track_height + sign).clamp(20.0, 100.0);
-            return;
-        }
-        if audio_header_rect.contains(pos) {
-            state.audio_track_height = (state.audio_track_height + sign).clamp(20.0, 100.0);
+    let anchor_x = f64::from((pos.x - content_left).max(0.0));
+
+    // 1. Trackpad pinch-to-zoom (`Event::Zoom` / multi-touch), strictly cursor-anchored.
+    if g.has_pinch() {
+        state.zoom_by(f64::from(g.pinch_zoom).clamp(0.5, 2.0), anchor_x);
+        return;
+    }
+
+    // 2. Ctrl/Cmd + Scroll (egui 0.37 folds Ctrl/Cmd+Wheel into `zoom_delta()` and zeroes `smooth_scroll_delta`).
+    if g.has_mod_wheel_zoom() || (g.ctrl_or_cmd && g.raw_wheel_points.y.abs() > 0.01) {
+        if video_header_rect.contains(pos) || audio_header_rect.contains(pos) {
+            // Smoothly accumulate track height changes so one 40 pt mouse notch = ±5 px
+            // while fine trackpad deltas never slam track height across [20, 100].
+            let raw_dy = if g.raw_wheel_points.y.abs() > 0.01 {
+                g.raw_wheel_points.y
+            } else {
+                g.mod_wheel_zoom.ln() / 0.005
+            };
+            state.track_height_accum += raw_dy * 0.125;
+            if state.track_height_accum.abs() >= 1.0 {
+                let step = state.track_height_accum.trunc();
+                state.track_height_accum -= step;
+                if video_header_rect.contains(pos) {
+                    state.video_track_height = (state.video_track_height + step).clamp(20.0, 100.0);
+                } else {
+                    state.audio_track_height = (state.audio_track_height + step).clamp(20.0, 100.0);
+                }
+            }
             return;
         }
 
-        // Ctrl/Cmd + Wheel elsewhere zooms strictly anchored at cursor X.
-        let steps = (f64::from(scroll_delta.y) / 24.0).clamp(-6.0, 6.0);
-        let factor = ZOOM_STEP_FACTOR.powf(steps);
-        let anchor_x = f64::from((pos.x - content_left).max(0.0));
+        let factor = if g.has_mod_wheel_zoom() {
+            f64::from(g.mod_wheel_zoom).clamp(0.5, 2.0)
+        } else {
+            let steps = (f64::from(g.raw_wheel_points.y) / 24.0).clamp(-6.0, 6.0);
+            ZOOM_STEP_FACTOR.powf(steps)
+        };
         state.zoom_by(factor, anchor_x);
         return;
     }
 
-    if modifiers.shift || scroll_delta.x.abs() > scroll_delta.y.abs() {
-        let horiz = if modifiers.shift && scroll_delta.y.abs() > 0.01 {
-            -scroll_delta.y
+    // 3. Alt + Scroll zooms anchored at cursor X.
+    if g.modifiers.alt && (g.scroll_delta.y.abs() > 0.01 || g.raw_wheel_points.y.abs() > 0.01) {
+        let dy = if g.scroll_delta.y.abs() > 0.01 {
+            g.scroll_delta.y
         } else {
-            -scroll_delta.x
+            g.raw_wheel_points.y
         };
+        let factor = (f64::from(dy) * 0.003).clamp(-0.35, 0.35).exp();
+        state.zoom_by(factor, anchor_x);
+        return;
+    }
+
+    if !g.has_scroll() {
+        return;
+    }
+
+    // 4. Shift + Scroll pans horizontally.
+    if g.modifiers.shift {
+        let horiz = -(g.scroll_delta.x + g.scroll_delta.y);
         state.scroll_x = (state.scroll_x + f64::from(horiz)).clamp(0.0, max_scroll_x);
-    } else {
-        // Plain vertical wheel scrolls hovered track pane (bottom-up for video, top-down for keyframes/audio).
-        let step = -scroll_delta.y;
-        if kf_lanes_rect.contains(pos) || kf_header_rect.contains(pos) {
-            state.keyframe_scroll_y = (state.keyframe_scroll_y + step).max(0.0);
-        } else if video_lanes_rect.contains(pos) || video_header_rect.contains(pos) {
-            state.video_scroll_y = (state.video_scroll_y - step).max(0.0);
-        } else if audio_lanes_rect.contains(pos) || audio_header_rect.contains(pos) {
-            state.audio_scroll_y = (state.audio_scroll_y + step).max(0.0);
+        return;
+    }
+
+    // 5. Two-finger trackpad & mouse-wheel scrolling: apply X and Y independently without axis-fight,
+    //    with mild dominant-axis noise suppression on trackpad so straight pans stay steady.
+    let mut dx = g.scroll_delta.x;
+    let mut dy = g.scroll_delta.y;
+    if g.device == ScrollDevice::Trackpad {
+        if dx.abs() > dy.abs() * 6.0 {
+            dy = 0.0;
+        } else if dy.abs() > dx.abs() * 6.0 {
+            dx = 0.0;
+        }
+    }
+
+    if dx.abs() > 0.01 {
+        state.scroll_x = (state.scroll_x - f64::from(dx)).clamp(0.0, max_scroll_x);
+    }
+
+    if dy.abs() > 0.01 {
+        if ruler_rect.contains(pos) {
+            if g.device == ScrollDevice::MouseWheel || dx.abs() < 0.01 {
+                state.scroll_x = (state.scroll_x - f64::from(dy)).clamp(0.0, max_scroll_x);
+            }
+        } else {
+            // Vertical scroll on hovered track pane (bottom-up for video, top-down for keyframes/audio).
+            let step = -dy;
+            if kf_lanes_rect.contains(pos) || kf_header_rect.contains(pos) {
+                state.keyframe_scroll_y = (state.keyframe_scroll_y + step).max(0.0);
+            } else if video_lanes_rect.contains(pos) || video_header_rect.contains(pos) {
+                state.video_scroll_y = (state.video_scroll_y - step).max(0.0);
+            } else if audio_lanes_rect.contains(pos) || audio_header_rect.contains(pos) {
+                state.audio_scroll_y = (state.audio_scroll_y + step).max(0.0);
+            }
         }
     }
 }
@@ -2486,6 +2556,85 @@ fn paint_header_toggle(
     resp.clicked_by(PointerButton::Primary)
 }
 
+fn eval_time_property_at(prop: &SessionProperty, local_frame: f64, fallback: f64) -> f64 {
+    if prop.keyframes.is_empty() {
+        return prop.default_value.as_f64().unwrap_or(fallback);
+    }
+    let first = &prop.keyframes[0];
+    if prop.keyframes.len() == 1 || local_frame <= first.frame {
+        return first.value.as_f64().unwrap_or(fallback);
+    }
+    let last = &prop.keyframes[prop.keyframes.len() - 1];
+    if local_frame >= last.frame {
+        return last.value.as_f64().unwrap_or(fallback);
+    }
+    let idx = prop
+        .keyframes
+        .partition_point(|k| k.frame <= local_frame)
+        .clamp(1, prop.keyframes.len() - 1);
+    let k0 = &prop.keyframes[idx - 1];
+    let k1 = &prop.keyframes[idx];
+    let v0 = k0.value.as_f64().unwrap_or(fallback);
+    let v1 = k1.value.as_f64().unwrap_or(fallback);
+    let span = k1.frame - k0.frame;
+    if span <= 1e-9 {
+        return v0;
+    }
+    let (mode, easing) = InterpolationMode::from_cm3_tween_code(k1.tween);
+    match mode {
+        InterpolationMode::Discrete => {
+            if local_frame < k1.frame {
+                v0
+            } else {
+                v1
+            }
+        }
+        InterpolationMode::Interpolated => {
+            let u = ((local_frame - k0.frame) / span).clamp(0.0, 1.0);
+            v0 + (v1 - v0) * eval_easing(easing, u)
+        }
+        InterpolationMode::Bezier => eval_segment_bezier(
+            BezierSegment {
+                start_frame: k0.frame,
+                start_value: v0,
+                out_tangent: k0.control_points[1],
+                end_frame: k1.frame,
+                end_value: v1,
+                in_tangent: k1.control_points[0],
+            },
+            local_frame,
+        ),
+    }
+}
+
+fn eval_clip_media_time(clip: &SessionClip, u: f64, fps: f64) -> f64 {
+    if clip.time_animated
+        && let Some(prop) = clip.properties.get("time")
+        && !prop.keyframes.is_empty()
+    {
+        let local_frame = u.clamp(0.0, 1.0) * clip.length.max(0.0);
+        return eval_time_property_at(prop, local_frame, clip.time_start).max(0.0);
+    }
+    if (clip.time_end - clip.time_start).abs() > 1e-9 {
+        let start = clip.time_start.max(0.0);
+        let end = clip.time_end.max(0.0);
+        return (start + (end - start) * u).max(0.0);
+    }
+    // Explicit freeze-frame (`time_start == time_end` with non-zero time or an explicit `time` track):
+    // sample the frozen instant rather than stretching across `clip.length / fps`.
+    if clip.time_start > 0.0
+        || clip.time_animated
+        || clip
+            .properties
+            .get("time")
+            .is_some_and(|p| !p.keyframes.is_empty())
+    {
+        return clip.time_start.max(0.0);
+    }
+    // Uninitialized legacy clip (`0..0` with no `time` keyframes): play 1x from 0.
+    (u * (clip.length / fps.max(1.0)).max(0.0)).max(0.0)
+}
+
 fn waveform_peak_slice_for_column(
     clip: &SessionClip,
     fps: f64,
@@ -2494,21 +2643,40 @@ fn waveform_peak_slice_for_column(
     width: i32,
 ) -> (usize, usize) {
     let w_f = f64::from(width.max(1));
-    let (media_start, media_end) = if (clip.time_end - clip.time_start).abs() > 1e-9 {
-        (clip.time_start.max(0.0), clip.time_end.max(0.0))
-    } else {
-        let start = clip.time_start.max(0.0);
-        (start, start + (clip.length / fps.max(1.0)).max(0.0))
-    };
     let u0 = f64::from(x.max(0)) / w_f;
     let u1 = f64::from(x.max(0) + 1) / w_f;
-    let a = media_start + (media_end - media_start) * u0;
-    let b = media_start + (media_end - media_start) * u1;
+    let a = eval_clip_media_time(clip, u0, fps);
+    let b = eval_clip_media_time(clip, u1, fps);
     let (t_lo, t_hi) = if a <= b { (a, b) } else { (b, a) };
     let idx0 = (t_lo * points_per_sec).floor().max(0.0) as usize;
     let idx1 = (t_hi * points_per_sec).ceil().max(0.0) as usize;
     let count = idx1.saturating_sub(idx0).max(1);
     (idx0, count)
+}
+
+/// Computes the vertical screen span `(y_top, y_bot)` for a symmetric signed min/max peak column.
+/// Returns `None` for pure silence (`hi <= 0 && lo >= 0`) so silent regions draw no spurious 1 px bar.
+fn compute_waveform_column_y(hi: i16, lo: i16, inner_top: f32, inner_h: f32) -> Option<(f32, f32)> {
+    let pos = hi.max(0);
+    let neg = (-lo).max(0);
+    if pos == 0 && neg == 0 {
+        return None;
+    }
+    let center_y = inner_top + inner_h * 0.5;
+    let half_h = inner_h * 0.5;
+    let pos_h = (pos as f32 / 127.0).clamp(0.0, 1.0) * half_h;
+    let neg_h = (neg as f32 / 128.0).clamp(0.0, 1.0) * half_h;
+    let mut y_top = center_y - pos_h;
+    let mut y_bot = center_y + neg_h;
+    if y_bot - y_top < 1.0 {
+        y_top = center_y - 0.5;
+        y_bot = center_y + 0.5;
+    }
+    let inner_bottom = inner_top + inner_h;
+    Some((
+        y_top.clamp(inner_top, inner_bottom),
+        y_bot.clamp(inner_top, inner_bottom),
+    ))
 }
 
 fn paint_audio_clip_waveform(
@@ -2519,6 +2687,12 @@ fn paint_audio_clip_waveform(
     fps: f64,
     peaks: Option<&AudioWaveformPeaks>,
 ) {
+    let Some(pk) = peaks else {
+        return;
+    };
+    if pk.max_buf.is_empty() || pk.max_buf.len() != pk.min_buf.len() || pk.points_per_sec <= 0.0 {
+        return;
+    }
     let w = (clip_rect.width() - 2.0).floor() as i32;
     if w < 1 {
         return;
@@ -2526,48 +2700,27 @@ fn paint_audio_clip_waveform(
     let inner_left = clip_rect.left() + 1.0;
     let x_start = ((visible_rect.left() - inner_left).floor() as i32).clamp(0, w);
     let x_end = ((visible_rect.right() - inner_left).ceil() as i32).clamp(0, w);
+    let inner_top = clip_rect.top() + 1.0;
     let inner_h = (clip_rect.height() - 2.0).max(1.0);
-    let base_y = clip_rect.bottom() - 1.0;
 
-    if let Some(pk) = peaks
-        && !pk.max_buf.is_empty()
-        && pk.max_buf.len() == pk.min_buf.len()
-    {
-        for x in x_start..x_end {
-            let (idx, count) = waveform_peak_slice_for_column(clip, fps, pk.points_per_sec, x, w);
-            let mut hi = 0_i16;
-            let mut lo = 0_i16;
-            for p in 0..count {
-                if let Some(&mx) = pk.max_buf.get(idx + p) {
-                    hi = hi.max(i16::from(mx));
-                }
-                if let Some(&mn) = pk.min_buf.get(idx + p) {
-                    lo = lo.min(i16::from(mn));
-                }
+    for x in x_start..x_end {
+        let (idx, count) = waveform_peak_slice_for_column(clip, fps, pk.points_per_sec, x, w);
+        let mut hi = 0_i16;
+        let mut lo = 0_i16;
+        for p in 0..count {
+            if let Some(&mx) = pk.max_buf.get(idx + p) {
+                hi = hi.max(i16::from(mx));
             }
-            let amp = (hi - lo).unsigned_abs() as f32 / 255.0;
-            let bar_h = (amp * inner_h).max(1.0);
-            let sx = inner_left + x as f32 + 0.5;
-            painter.line_segment(
-                [pos2(sx, base_y - bar_h), pos2(sx, base_y)],
-                Stroke::new(1.0, COLOR_WAVEFORM),
-            );
+            if let Some(&mn) = pk.min_buf.get(idx + p) {
+                lo = lo.min(i16::from(mn));
+            }
         }
-    } else {
-        // Deterministic procedural peak bar preview when decoded peaks are not yet cached.
-        let seed = string_hash(&clip.id);
-        let mut x = x_start;
-        while x < x_end {
-            let u = f32::from((seed.wrapping_add((x as u32).wrapping_mul(17)) % 97) as u8) / 97.0;
-            let env = 0.28 + 0.52 * ((x as f32 * 0.11 + (seed % 13) as f32).sin().abs());
-            let amp = (env * (0.55 + 0.45 * u)).clamp(0.08, 0.92);
-            let bar_h = amp * inner_h;
+        if let Some((y_top, y_bot)) = compute_waveform_column_y(hi, lo, inner_top, inner_h) {
             let sx = inner_left + x as f32 + 0.5;
             painter.line_segment(
-                [pos2(sx, base_y - bar_h), pos2(sx, base_y)],
+                [pos2(sx, y_top), pos2(sx, y_bot)],
                 Stroke::new(1.0, COLOR_WAVEFORM),
             );
-            x += 2;
         }
     }
 }
@@ -3805,5 +3958,307 @@ mod tests {
         assert_eq!(divider_top, 712.0);
         assert_eq!(divider_top + DIVIDER_HEIGHT, 716.0);
         assert!(!TimelineViewState::new().video_audio_split_custom);
+    }
+
+    #[test]
+    fn waveform_skips_silence_renders_symmetric_peaks_and_handles_freeze_and_time_curve() {
+        // Silence yields None (no spurious 1 px bar).
+        assert_eq!(compute_waveform_column_y(0, 0, 10.0, 40.0), None);
+        // Symmetric peak spans symmetrically around center (10 + 20 = 30).
+        let (y_top, y_bot) = compute_waveform_column_y(127, -128, 10.0, 40.0).expect("loud");
+        assert!((y_top - 10.0).abs() < 1e-3);
+        assert!((y_bot - 50.0).abs() < 1e-3);
+        // Positive-only signal rises above center without extending below center (after min 1px).
+        let (pt, pb) = compute_waveform_column_y(64, 0, 10.0, 40.0).expect("pos");
+        assert!(pt < 30.0);
+        assert!((pb - 30.0).abs() < 1e-3);
+
+        // Freeze-frame clip (`time_start == time_end > 0`) samples the frozen instant for every column.
+        let freeze_clip = SessionClip {
+            id: "freeze".to_string(),
+            kind: "audio".to_string(),
+            name: "Freeze".to_string(),
+            start: 0.0,
+            length: 60.0,
+            time_start: 0.75,
+            time_end: 0.75,
+            time_animated: false,
+            media_length: Some(2.0),
+            source_clip_id: None,
+            properties: BTreeMap::new(),
+            objects_3d: Vec::new(),
+            effects: Vec::new(),
+        };
+        let (f_idx0, _) = waveform_peak_slice_for_column(&freeze_clip, 30.0, 100.0, 0, 50);
+        let (f_idx_end, _) = waveform_peak_slice_for_column(&freeze_clip, 30.0, 100.0, 49, 50);
+        assert_eq!(f_idx0, 75);
+        assert_eq!(f_idx_end, 75);
+
+        // Animated non-linear `time` curve samples interior keyframes instead of linear endpoints.
+        let mut props = BTreeMap::new();
+        props.insert(
+            "time".to_string(),
+            SessionProperty {
+                animated: true,
+                expression: None,
+                default_value: serde_json::json!(0.0),
+                keyframes: vec![
+                    zc_session::SessionKeyframe {
+                        frame: 0.0,
+                        value: serde_json::json!(0.0),
+                        tween: 1,
+                        control_points: [[-10.0, 0.0], [10.0, 0.0]],
+                        continuous_tangent: true,
+                        value_kind: None,
+                    },
+                    zc_session::SessionKeyframe {
+                        frame: 30.0,
+                        value: serde_json::json!(1.5),
+                        tween: 1,
+                        control_points: [[-10.0, 0.0], [10.0, 0.0]],
+                        continuous_tangent: true,
+                        value_kind: None,
+                    },
+                    zc_session::SessionKeyframe {
+                        frame: 60.0,
+                        value: serde_json::json!(0.5),
+                        tween: 1,
+                        control_points: [[-10.0, 0.0], [10.0, 0.0]],
+                        continuous_tangent: true,
+                        value_kind: None,
+                    },
+                ],
+            },
+        );
+        let anim_clip = SessionClip {
+            id: "anim".to_string(),
+            kind: "audio".to_string(),
+            name: "Anim".to_string(),
+            start: 0.0,
+            length: 60.0,
+            time_start: 0.0,
+            time_end: 0.5,
+            time_animated: true,
+            media_length: Some(2.0),
+            source_clip_id: None,
+            properties: props,
+            objects_3d: Vec::new(),
+            effects: Vec::new(),
+        };
+        // Midpoint column (x = 25 of 50 -> local frame 30) should sample around 1.5 s (idx ~150).
+        let (mid_idx, _) = waveform_peak_slice_for_column(&anim_clip, 30.0, 100.0, 25, 50);
+        assert!(
+            (145..=155).contains(&mid_idx),
+            "expected animated time curve midpoint near 1.5s (idx 150), got {mid_idx}"
+        );
+    }
+
+    #[test]
+    fn headless_timeline_pinch_cmd_scroll_trackpad_pan_and_occlusion() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        for _ in 0..3 {
+            let _ = session.execute(Command::AddAudioTrack { name: None });
+        }
+        let mut state = TimelineViewState::new();
+        state.scroll_x = 120.0;
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 260.0));
+        let lane_pos = pos2(480.0, 160.0);
+        let video_header_pos = pos2(100.0, 120.0);
+
+        let step = |session: &mut Session,
+                    state: &mut TimelineViewState,
+                    time: f64,
+                    modifiers: egui::Modifiers,
+                    mut events: Vec<egui::Event>,
+                    occlude_with_window: bool| {
+            events.insert(0, egui::Event::ModifiersChanged(modifiers));
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let _ = show_timeline(ui, session, state, &palette);
+                    });
+                if occlude_with_window {
+                    egui::Window::new("Floating Overlay")
+                        .fixed_pos(pos2(300.0, 40.0))
+                        .fixed_size(vec2(360.0, 200.0))
+                        .show(ui.ctx(), |ui| {
+                            ui.label("Overlay");
+                            ui.allocate_space(vec2(360.0, 200.0));
+                        });
+                }
+            });
+            full.textures_delta.clear();
+        };
+
+        // Prime layer hit-testing.
+        step(
+            &mut session,
+            &mut state,
+            0.0,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(lane_pos)],
+            false,
+        );
+
+        // 1. Trackpad pinch zooms timeline anchored at cursor X.
+        let z0 = state.zoom;
+        let anchor_x = f64::from(lane_pos.x - HEADER_WIDTH);
+        let frame_before = px_to_frame(state.scroll_x + anchor_x, session.document().fps, z0);
+        step(
+            &mut session,
+            &mut state,
+            0.016,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(lane_pos), egui::Event::Zoom(1.25)],
+            false,
+        );
+        assert!(state.zoom > z0 * 1.2);
+        let frame_after = px_to_frame(
+            state.scroll_x + anchor_x,
+            session.document().fps,
+            state.zoom,
+        );
+        assert!(
+            (frame_before - frame_after).abs() < 1e-3,
+            "pinch zoom must preserve frame under cursor"
+        );
+
+        // 2. Cmd+Scroll zooms timeline (regression test for egui 0.37 zeroing smooth_scroll_delta).
+        let z1 = state.zoom;
+        step(
+            &mut session,
+            &mut state,
+            0.032,
+            egui::Modifiers::COMMAND,
+            vec![
+                egui::Event::PointerMoved(lane_pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+            ],
+            false,
+        );
+        assert!(state.zoom > z1, "Cmd+Scroll must zoom timeline in");
+
+        // 3. Cmd+Scroll over video track header adjusts track height smoothly.
+        let h0 = state.video_track_height;
+        step(
+            &mut session,
+            &mut state,
+            0.050,
+            egui::Modifiers::COMMAND,
+            vec![
+                egui::Event::PointerMoved(video_header_pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+            ],
+            false,
+        );
+        assert!(
+            state.video_track_height > h0,
+            "Cmd+Scroll over header must grow track height"
+        );
+
+        // 4. Two-finger diagonal trackpad pan scrolls X and Y simultaneously without axis-fight.
+        let scroll_x_before = state.scroll_x;
+        let scroll_y_before = state.audio_scroll_y;
+        let audio_pos = pos2(480.0, 210.0);
+        step(
+            &mut session,
+            &mut state,
+            0.070,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(audio_pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(-16.0, -14.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Trackpad,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            false,
+        );
+        assert!(
+            state.scroll_x > scroll_x_before,
+            "diagonal trackpad pan must move scroll_x"
+        );
+        assert!(
+            state.audio_scroll_y > scroll_y_before,
+            "diagonal trackpad pan must move audio_scroll_y"
+        );
+
+        // 5. Occlusion safety: floating window above timeline blocks pinch and scroll completely.
+        // Prime window layer across two frames (frame 1: egui sizing pass with interactable=false,
+        // frame 2: first visible pass with interactable=true) so layer_id_at(lane_pos) sees it.
+        step(
+            &mut session,
+            &mut state,
+            0.10,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(lane_pos)],
+            true,
+        );
+        step(
+            &mut session,
+            &mut state,
+            0.11,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(lane_pos)],
+            true,
+        );
+        let z_occ = state.zoom;
+        let sx_occ = state.scroll_x;
+        let vy_occ = state.video_scroll_y;
+        step(
+            &mut session,
+            &mut state,
+            0.12,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(lane_pos),
+                egui::Event::Zoom(1.4),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(-20.0, -20.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Trackpad,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            true,
+        );
+        assert!(
+            (state.zoom - z_occ).abs() < 1e-9,
+            "occluded timeline must ignore pinch"
+        );
+        assert!(
+            (state.scroll_x - sx_occ).abs() < 1e-9,
+            "occluded timeline must ignore scroll X"
+        );
+        assert!(
+            (state.video_scroll_y - vy_occ).abs() < 1e-6,
+            "occluded timeline must ignore scroll Y"
+        );
     }
 }

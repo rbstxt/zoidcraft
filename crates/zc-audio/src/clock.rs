@@ -14,7 +14,16 @@ use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::AudioError;
-use crate::decode::STANDARD_SAMPLE_RATE;
+use crate::decode::{STANDARD_SAMPLE_RATE, f32_to_pcm16};
+
+/// Maximum time (500 ms) a live CPAL stream callback may go silent before `exact_frame()`
+/// falls back to monotonic wall-clock advancement so playback never freezes on device sleep.
+const CALLBACK_STALL_TIMEOUT_NANOS: u64 = 500_000_000;
+
+/// Shared pre-mixed stereo audio buffer (`[L, R]` at 48 kHz).
+type SharedStereoMix = Arc<Vec<[f32; 2]>>;
+/// Shared swappable slot for a loop-head stereo buffer.
+type LoopHeadSlot = Arc<Mutex<Option<SharedStereoMix>>>;
 
 /// Bounded pre-mixed 48 kHz stereo audio window anchored at timeline frame `origin_frame`.
 #[derive(Debug, Clone)]
@@ -79,6 +88,8 @@ struct ClockShared {
     /// Exact submission sample index where `callback_latched_epoch` first began rendering,
     /// eliminating any 1-buffer skip when seek/resume races an in-flight callback.
     callback_epoch_start_sample: AtomicU64,
+    /// Monotonic timestamp (`now_nanos`) when the live audio callback last executed (`0` = never).
+    last_callback_nanos: AtomicU64,
     speed_bits: AtomicU64,
     fps_bits: AtomicU64,
     total_frames_bits: AtomicU64,
@@ -114,6 +125,7 @@ impl ClockShared {
             output_latency_samples: AtomicU64::new(0),
             callback_latched_epoch: AtomicU64::new(0),
             callback_epoch_start_sample: AtomicU64::new(0),
+            last_callback_nanos: AtomicU64::new(0),
             speed_bits: AtomicU64::new(0.0_f64.to_bits()),
             fps_bits: AtomicU64::new(clean_fps.to_bits()),
             total_frames_bits: AtomicU64::new(clean_total.to_bits()),
@@ -213,15 +225,33 @@ impl ClockShared {
 
         let raw_frame = if snap.hardware_clock_active {
             let latched_epoch = self.callback_latched_epoch.load(Ordering::Acquire);
+            let live_stream = self.active_stream_id.load(Ordering::Acquire) != 0;
             if latched_epoch != snap.epoch_id {
-                // Audio callback has not yet started rendering this epoch; hold at anchor frame.
-                snap.anchor_exact_frame
+                // Audio callback has not yet started rendering this epoch; hold at anchor frame
+                // unless a live CPAL stream callback has stalled past the heartbeat timeout.
+                if live_stream
+                    && now_nanos.saturating_sub(wall_anchor_nanos) >= CALLBACK_STALL_TIMEOUT_NANOS
+                {
+                    let elapsed_sec = (now_nanos.saturating_sub(wall_anchor_nanos) as f64) * 1e-9;
+                    snap.anchor_exact_frame + elapsed_sec * snap.fps * snap.speed
+                } else {
+                    snap.anchor_exact_frame
+                }
             } else {
                 let anchor = self.callback_epoch_start_sample.load(Ordering::Acquire);
                 let hw = self.audible_sample_count();
                 let elapsed_samples = hw.saturating_sub(anchor) as f64;
                 let elapsed_sec = elapsed_samples / f64::from(snap.sample_rate);
-                snap.anchor_exact_frame + elapsed_sec * snap.fps * snap.speed
+                let last_cb = self.last_callback_nanos.load(Ordering::Acquire);
+                let stall_extra_sec = if live_stream
+                    && last_cb != 0
+                    && now_nanos.saturating_sub(last_cb) >= CALLBACK_STALL_TIMEOUT_NANOS
+                {
+                    (now_nanos.saturating_sub(last_cb) as f64) * 1e-9
+                } else {
+                    0.0
+                };
+                snap.anchor_exact_frame + (elapsed_sec + stall_extra_sec) * snap.fps * snap.speed
             }
         } else {
             let elapsed_sec = (now_nanos.saturating_sub(wall_anchor_nanos) as f64) * 1e-9;
@@ -441,14 +471,14 @@ impl MasterPlaybackClock {
         self.exact_frame().round().max(0.0) as u64
     }
 
-    /// Current timeline time in seconds (`current_frame / fps`).
+    /// Current timeline time in seconds (`exact_frame / fps`), preserving fractional sample precision.
     #[must_use]
     pub fn current_time_secs(&self) -> f64 {
         let snap = self.snapshot();
         if snap.fps <= 0.0 {
             0.0
         } else {
-            self.current_frame() as f64 / snap.fps
+            self.exact_frame() / snap.fps
         }
     }
 
@@ -709,6 +739,9 @@ impl MasterPlaybackClock {
                 snap.sample_rate = device_sr;
                 snap.hardware_clock_active = true;
                 *wall_anchor_nanos = ctx.now_nanos;
+                self.shared
+                    .last_callback_nanos
+                    .store(ctx.now_nanos, Ordering::Release);
             });
 
         let shared_cb = Arc::clone(&self.shared);
@@ -718,19 +751,34 @@ impl MasterPlaybackClock {
 
         let ch_usize = usize::from(device_channels);
         let mix_sr = f64::from(STANDARD_SAMPLE_RATE);
-        let (mix_origin_frame, stereo_mix_48k) = match window {
-            Some(w) => (w.origin_frame, Some(w.samples)),
-            None => (0.0, None),
+
+        let window_slot = Arc::new(Mutex::new(window.clone()));
+        let window_gen = Arc::new(AtomicU64::new(0));
+        let loop_head_slot: LoopHeadSlot = Arc::new(Mutex::new(None));
+        let loop_head_gen = Arc::new(AtomicU64::new(0));
+
+        let mut cb_state = CallbackMixState {
+            active_window: window,
+            seen_window_gen: 0,
+            window_slot: Arc::clone(&window_slot),
+            window_gen: Arc::clone(&window_gen),
+            active_loop_head: None,
+            seen_loop_head_gen: 0,
+            loop_head_slot: Arc::clone(&loop_head_slot),
+            loop_head_gen: Arc::clone(&loop_head_gen),
         };
 
         let stream_result = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
                 config,
                 move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                    render_callback_frames_windowed(
+                    cb_state.poll_updates();
+                    let (origin, mix) = cb_state.active_mix();
+                    render_callback_frames_windowed_with_loop_head(
                         &shared_cb,
-                        stereo_mix_48k.as_deref(),
-                        mix_origin_frame,
+                        mix,
+                        origin,
+                        cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
                         Some(info),
@@ -741,18 +789,41 @@ impl MasterPlaybackClock {
                 err_fn,
                 None,
             ),
-            SampleFormat::I16 => device.build_output_stream(
+            SampleFormat::F64 => device.build_output_stream(
                 config,
-                move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
-                    render_callback_frames_windowed(
+                move |data: &mut [f64], info: &cpal::OutputCallbackInfo| {
+                    cb_state.poll_updates();
+                    let (origin, mix) = cb_state.active_mix();
+                    render_callback_frames_windowed_with_loop_head(
                         &shared_cb,
-                        stereo_mix_48k.as_deref(),
-                        mix_origin_frame,
+                        mix,
+                        origin,
+                        cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
                         Some(info),
                         data,
-                        |s| (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16,
+                        f32_to_f64_sample,
+                    );
+                },
+                err_fn,
+                None,
+            ),
+            SampleFormat::I16 => device.build_output_stream(
+                config,
+                move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
+                    cb_state.poll_updates();
+                    let (origin, mix) = cb_state.active_mix();
+                    render_callback_frames_windowed_with_loop_head(
+                        &shared_cb,
+                        mix,
+                        origin,
+                        cb_state.active_loop_head.as_deref(),
+                        mix_sr,
+                        ch_usize,
+                        Some(info),
+                        data,
+                        f32_to_pcm16,
                     );
                 },
                 err_fn,
@@ -761,15 +832,98 @@ impl MasterPlaybackClock {
             SampleFormat::U16 => device.build_output_stream(
                 config,
                 move |data: &mut [u16], info: &cpal::OutputCallbackInfo| {
-                    render_callback_frames_windowed(
+                    cb_state.poll_updates();
+                    let (origin, mix) = cb_state.active_mix();
+                    render_callback_frames_windowed_with_loop_head(
                         &shared_cb,
-                        stereo_mix_48k.as_deref(),
-                        mix_origin_frame,
+                        mix,
+                        origin,
+                        cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
                         Some(info),
                         data,
                         |s| ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * f32::from(u16::MAX)).round() as u16,
+                    );
+                },
+                err_fn,
+                None,
+            ),
+            SampleFormat::I32 => device.build_output_stream(
+                config,
+                move |data: &mut [i32], info: &cpal::OutputCallbackInfo| {
+                    cb_state.poll_updates();
+                    let (origin, mix) = cb_state.active_mix();
+                    render_callback_frames_windowed_with_loop_head(
+                        &shared_cb,
+                        mix,
+                        origin,
+                        cb_state.active_loop_head.as_deref(),
+                        mix_sr,
+                        ch_usize,
+                        Some(info),
+                        data,
+                        f32_to_i32_sample,
+                    );
+                },
+                err_fn,
+                None,
+            ),
+            SampleFormat::U32 => device.build_output_stream(
+                config,
+                move |data: &mut [u32], info: &cpal::OutputCallbackInfo| {
+                    cb_state.poll_updates();
+                    let (origin, mix) = cb_state.active_mix();
+                    render_callback_frames_windowed_with_loop_head(
+                        &shared_cb,
+                        mix,
+                        origin,
+                        cb_state.active_loop_head.as_deref(),
+                        mix_sr,
+                        ch_usize,
+                        Some(info),
+                        data,
+                        f32_to_u32_sample,
+                    );
+                },
+                err_fn,
+                None,
+            ),
+            SampleFormat::I8 => device.build_output_stream(
+                config,
+                move |data: &mut [i8], info: &cpal::OutputCallbackInfo| {
+                    cb_state.poll_updates();
+                    let (origin, mix) = cb_state.active_mix();
+                    render_callback_frames_windowed_with_loop_head(
+                        &shared_cb,
+                        mix,
+                        origin,
+                        cb_state.active_loop_head.as_deref(),
+                        mix_sr,
+                        ch_usize,
+                        Some(info),
+                        data,
+                        f32_to_i8_sample,
+                    );
+                },
+                err_fn,
+                None,
+            ),
+            SampleFormat::U8 => device.build_output_stream(
+                config,
+                move |data: &mut [u8], info: &cpal::OutputCallbackInfo| {
+                    cb_state.poll_updates();
+                    let (origin, mix) = cb_state.active_mix();
+                    render_callback_frames_windowed_with_loop_head(
+                        &shared_cb,
+                        mix,
+                        origin,
+                        cb_state.active_loop_head.as_deref(),
+                        mix_sr,
+                        ch_usize,
+                        Some(info),
+                        data,
+                        f32_to_u8_sample,
                     );
                 },
                 err_fn,
@@ -803,7 +957,111 @@ impl MasterPlaybackClock {
             shared: Arc::clone(&self.shared),
             sample_rate: device_sr,
             channels: device_channels,
+            window_slot,
+            window_gen,
+            loop_head_slot,
+            loop_head_gen,
         })
+    }
+}
+
+#[inline]
+fn f32_to_f64_sample(s: f32) -> f64 {
+    if s.is_finite() {
+        f64::from(s.clamp(-1.0, 1.0))
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn f32_to_i32_sample(s: f32) -> i32 {
+    if !s.is_finite() {
+        return 0;
+    }
+    let c = s.clamp(-1.0, 1.0);
+    let scaled = if c < 0.0 {
+        f64::from(c) * 2_147_483_648.0
+    } else {
+        f64::from(c) * 2_147_483_647.0
+    };
+    scaled
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+#[inline]
+fn f32_to_u32_sample(s: f32) -> u32 {
+    if !s.is_finite() {
+        return u32::MAX / 2;
+    }
+    let c = f64::from(s.clamp(-1.0, 1.0));
+    ((c * 0.5 + 0.5) * f64::from(u32::MAX))
+        .round()
+        .clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+#[inline]
+fn f32_to_i8_sample(s: f32) -> i8 {
+    if !s.is_finite() {
+        return 0;
+    }
+    let c = s.clamp(-1.0, 1.0);
+    let scaled = if c < 0.0 {
+        f64::from(c) * 128.0
+    } else {
+        f64::from(c) * 127.0
+    };
+    scaled.round().clamp(f64::from(i8::MIN), f64::from(i8::MAX)) as i8
+}
+
+#[inline]
+fn f32_to_u8_sample(s: f32) -> u8 {
+    if !s.is_finite() {
+        return 128;
+    }
+    let c = s.clamp(-1.0, 1.0);
+    ((c * 0.5 + 0.5) * f32::from(u8::MAX))
+        .round()
+        .clamp(0.0, f32::from(u8::MAX)) as u8
+}
+
+struct CallbackMixState {
+    active_window: Option<AudioMixWindow>,
+    seen_window_gen: u64,
+    window_slot: Arc<Mutex<Option<AudioMixWindow>>>,
+    window_gen: Arc<AtomicU64>,
+    active_loop_head: Option<SharedStereoMix>,
+    seen_loop_head_gen: u64,
+    loop_head_slot: LoopHeadSlot,
+    loop_head_gen: Arc<AtomicU64>,
+}
+
+impl CallbackMixState {
+    #[inline]
+    fn poll_updates(&mut self) {
+        let current_gen = self.window_gen.load(Ordering::Acquire);
+        if current_gen != self.seen_window_gen
+            && let Ok(guard) = self.window_slot.try_lock()
+        {
+            self.active_window = guard.clone();
+            self.seen_window_gen = current_gen;
+        }
+        let loop_gen = self.loop_head_gen.load(Ordering::Acquire);
+        if loop_gen != self.seen_loop_head_gen
+            && let Ok(guard) = self.loop_head_slot.try_lock()
+        {
+            self.active_loop_head = guard.clone();
+            self.seen_loop_head_gen = loop_gen;
+        }
+    }
+
+    #[inline]
+    fn active_mix(&self) -> (f64, Option<&Vec<[f32; 2]>>) {
+        match self.active_window.as_ref() {
+            Some(w) => (w.origin_frame, Some(w.samples.as_ref())),
+            None => (0.0, None),
+        }
     }
 }
 
@@ -832,10 +1090,11 @@ fn render_callback_frames<T, F>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_callback_frames_windowed<T, F>(
+fn render_callback_frames_windowed_with_loop_head<T, F>(
     shared: &ClockShared,
     mix: Option<&Vec<[f32; 2]>>,
     mix_origin_frame: f64,
+    loop_head: Option<&Vec<[f32; 2]>>,
     mix_sample_rate: f64,
     channels: usize,
     info: Option<&cpal::OutputCallbackInfo>,
@@ -847,6 +1106,9 @@ fn render_callback_frames_windowed<T, F>(
     if channels == 0 || output.is_empty() {
         return;
     }
+    shared
+        .last_callback_nanos
+        .store(shared.now_nanos(), Ordering::Release);
     let frame_count = (output.len() / channels) as u64;
     let snap = shared.read_snapshot();
     // Read the current submitted sample cursor BEFORE filling, then advance it AFTER
@@ -876,29 +1138,39 @@ fn render_callback_frames_windowed<T, F>(
             shared.callback_epoch_start_sample.load(Ordering::Relaxed)
         };
 
-        if let Some(mix_vec) = mix {
-            let mix_slice = mix_vec.as_slice();
-            let mix_len = mix_slice.len();
+        if mix.is_some() || loop_head.is_some() {
+            let sample_slice =
+                |slice: &[[f32; 2]], origin: f64, exact_frame: f64| -> Option<[f32; 2]> {
+                    let len = slice.len();
+                    if len == 0 {
+                        return None;
+                    }
+                    let timeline_sec = (exact_frame - origin) / snap.fps;
+                    let pos = timeline_sec * mix_sample_rate;
+                    if pos >= 0.0 && (pos.floor() as usize) < len {
+                        let idx0 = pos.floor() as usize;
+                        let idx1 = (idx0 + 1).min(len - 1);
+                        let frac = (pos - idx0 as f64) as f32;
+                        let a = slice[idx0];
+                        let b = slice[idx1];
+                        Some([a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac])
+                    } else {
+                        None
+                    }
+                };
 
             for (i, frame_chunk) in output.chunks_exact_mut(channels).enumerate() {
                 let hw = start_hw.saturating_add(i as u64);
                 let (exact_frame, hit_stop) =
                     ClockShared::evaluate_at_sample_from(&snap, hw, epoch_anchor);
-                let sample_pair = if hit_stop || mix_len == 0 {
+                let sample_pair = if hit_stop {
                     [0.0_f32, 0.0_f32]
                 } else {
-                    let timeline_sec = (exact_frame - mix_origin_frame) / snap.fps;
-                    let pos = timeline_sec * mix_sample_rate;
-                    if pos >= 0.0 && (pos.floor() as usize) < mix_len {
-                        let idx0 = pos.floor() as usize;
-                        let idx1 = (idx0 + 1).min(mix_len - 1);
-                        let frac = (pos - idx0 as f64) as f32;
-                        let a = mix_slice[idx0];
-                        let b = mix_slice[idx1];
-                        [a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac]
-                    } else {
-                        [0.0, 0.0]
-                    }
+                    mix.and_then(|m| sample_slice(m.as_slice(), mix_origin_frame, exact_frame))
+                        .or_else(|| {
+                            loop_head.and_then(|lh| sample_slice(lh.as_slice(), 0.0, exact_frame))
+                        })
+                        .unwrap_or([0.0_f32, 0.0_f32])
                 };
 
                 for (ch_idx, slot) in frame_chunk.iter_mut().enumerate() {
@@ -941,6 +1213,33 @@ fn render_callback_frames_windowed<T, F>(
         .fetch_add(frame_count, Ordering::Release);
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn render_callback_frames_windowed<T, F>(
+    shared: &ClockShared,
+    mix: Option<&Vec<[f32; 2]>>,
+    mix_origin_frame: f64,
+    mix_sample_rate: f64,
+    channels: usize,
+    info: Option<&cpal::OutputCallbackInfo>,
+    output: &mut [T],
+    convert: F,
+) where
+    F: Fn(f32) -> T,
+{
+    render_callback_frames_windowed_with_loop_head(
+        shared,
+        mix,
+        mix_origin_frame,
+        None,
+        mix_sample_rate,
+        channels,
+        info,
+        output,
+        convert,
+    );
+}
+
 /// RAII handle owning a live `cpal` output stream attached to a [`MasterPlaybackClock`].
 ///
 /// Dropping this handle cleanly detaches the clock back to wall-clock fallback mode and
@@ -951,6 +1250,10 @@ pub struct AudioOutputHandle {
     shared: Arc<ClockShared>,
     sample_rate: u32,
     channels: u16,
+    window_slot: Arc<Mutex<Option<AudioMixWindow>>>,
+    window_gen: Arc<AtomicU64>,
+    loop_head_slot: LoopHeadSlot,
+    loop_head_gen: Arc<AtomicU64>,
 }
 
 impl AudioOutputHandle {
@@ -964,6 +1267,30 @@ impl AudioOutputHandle {
     #[must_use]
     pub const fn channels(&self) -> u16 {
         self.channels
+    }
+
+    /// Seamlessly swaps the active [`AudioMixWindow`] used by the live audio callback
+    /// without dropping or recreating the underlying OS audio stream.
+    pub fn update_window(&self, window: Option<AudioMixWindow>) {
+        let mut guard = self
+            .window_slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = window;
+        drop(guard);
+        self.window_gen.fetch_add(1, Ordering::Release);
+    }
+
+    /// Supplies a pre-mixed loop-head audio buffer anchored at frame `0.0` so looping
+    /// timelines longer than one window never emit silence at the loop wrap seam.
+    pub fn set_loop_head(&self, loop_head: Option<Arc<Vec<[f32; 2]>>>) {
+        let mut guard = self
+            .loop_head_slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = loop_head;
+        drop(guard);
+        self.loop_head_gen.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1231,6 +1558,75 @@ mod tests {
         assert_eq!(
             clock.shared.output_latency_samples.load(Ordering::Acquire),
             0
+        );
+    }
+
+    #[test]
+    fn current_time_secs_preserves_fractional_sample_precision() {
+        let clock = MasterPlaybackClock::new(30.0, 300.0);
+        clock.set_hardware_clock_mode(true, STANDARD_SAMPLE_RATE);
+        clock.play();
+
+        // Advance 0.25s = 12,000 samples => exact_frame = 7.5 => current_time_secs = 0.25,
+        // NOT round(7.5) / 30 = 8 / 30 = 0.266667.
+        clock.advance_hardware_samples(12_000);
+        assert!((clock.exact_frame() - 7.5).abs() < 1e-6);
+        assert!(
+            (clock.current_time_secs() - 0.25).abs() < 1e-6,
+            "expected exact 0.25s, got {}",
+            clock.current_time_secs()
+        );
+    }
+
+    #[test]
+    fn hardware_clock_falls_back_to_wall_clock_when_live_callback_stalls() {
+        let clock = MasterPlaybackClock::new(30.0, 300.0);
+        clock.set_hardware_clock_mode(true, STANDARD_SAMPLE_RATE);
+        clock.shared.active_stream_id.store(1, Ordering::Release);
+        clock.play();
+
+        // Simulate wall_anchor_nanos = 0 and now_nanos = 1_000_000_000 (1.0s elapsed without callback latching epoch).
+        let snap = clock.snapshot();
+        let (frame, hit_stop) = clock.shared.evaluate_snapshot_at(&snap, 0, 1_000_000_000);
+        assert!(!hit_stop);
+        assert!(
+            (frame - 30.0).abs() < 1e-6,
+            "stalled unlatched live stream must fall back to wall clock (30.0), got {frame}"
+        );
+    }
+
+    #[test]
+    fn loop_head_eliminates_loop_seam_silence_on_windowed_timeline() {
+        let clock = MasterPlaybackClock::new(30.0, 300.0);
+        clock.set_hardware_clock_mode(true, STANDARD_SAMPLE_RATE);
+        clock.set_loop(true);
+        // Playhead at last frame (299.0), active window starts at frame 240.0.
+        clock.seek_preserving_playback(299.0);
+        clock.play();
+
+        let tail_window = vec![[0.25_f32, 0.25]; 96_000];
+        let loop_head = vec![[0.75_f32, 0.75]; 48_000];
+
+        // 1 frame at 30 fps = 1600 samples at 48 kHz. Rendering 2400 samples spans 299.0..300.5 -> wraps to 0.0..0.5!
+        let mut out = vec![0.0_f32; 2_400 * 2];
+        render_callback_frames_windowed_with_loop_head(
+            &clock.shared,
+            Some(&tail_window),
+            240.0,
+            Some(&loop_head),
+            f64::from(STANDARD_SAMPLE_RATE),
+            2,
+            None,
+            &mut out,
+            |s| s,
+        );
+        // Before wrap (sample 0, frame 299.0): comes from tail_window (0.25)
+        assert!((out[0] - 0.25).abs() < 1e-5);
+        // After wrap (sample 2000, frame ~0.25 < 240.0): seamlessly comes from loop_head (0.75), NOT silence!
+        assert!(
+            (out[2_000 * 2] - 0.75).abs() < 1e-5,
+            "expected loop_head sample 0.75 after wrap, got {}",
+            out[2_000 * 2]
         );
     }
 }

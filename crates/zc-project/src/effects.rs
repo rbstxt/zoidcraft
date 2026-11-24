@@ -470,7 +470,7 @@ const ZOIDIUM_EFFECTS: [EffectDescriptor; 16] = [
     },
     EffectDescriptor {
         id: "magiclooks",
-        display_name: "Magic Looks",
+        display_name: "Color Looks",
         category: EffectCategory::NodeAndGrading,
         passes: 2,
         plugin_id: Some("magic-looks"),
@@ -519,7 +519,7 @@ const ZOIDIUM_EFFECTS: [EffectDescriptor; 16] = [
     },
     EffectDescriptor {
         id: "sglow",
-        display_name: "S_Glow",
+        display_name: "Multi-Scale Glow",
         category: EffectCategory::GlowAndLight,
         passes: 6,
         plugin_id: Some("sglow-hq-v2-preview"),

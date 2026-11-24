@@ -229,7 +229,7 @@ impl ThemeProfileChoice {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Panzoid => "Panzoid Classic",
+            Self::Panzoid => "Classic Dark",
             Self::Signal => "Signal Blue",
             Self::Ember => "Ember Console",
             Self::Moss => "Moss Terminal",

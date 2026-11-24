@@ -15,6 +15,10 @@ use zc_geom::{
 };
 use zc_session::{Command, Session, SessionClip, SessionObject3D, SessionProperty};
 
+use super::gestures::{
+    GestureClassifier, ScrollDevice, pointer_on_layer, rect_contains_unoccluded_pointer,
+};
+
 // ---------------------------------------------------------------------------
 // Visual Constants (Spec 01 §1.5 & §5)
 // ---------------------------------------------------------------------------
@@ -33,6 +37,8 @@ const COLOR_MOTION_ACTIVE: Color32 = Color32::from_rgb(0xe4, 0xe4, 0xe4);
 
 const HANDLE_SIZE_PX: f32 = 10.0;
 const ROTATION_STEM_PX: f32 = 25.0;
+const MIN_ZOOM_2D: f32 = 0.25;
+const MAX_ZOOM_2D: f32 = 16.0;
 
 // ---------------------------------------------------------------------------
 // Exact CM3 Aspect-Fit Canvas Geometry (Spec 01 §1.5)
@@ -169,21 +175,27 @@ impl EditorCameraState {
         self.target += shift;
     }
 
-    /// Dollies the camera toward/away from `target` using multiplicative exponential scaling
-    /// (`distance *= (1.0 + delta_y * 0.0015 * speed_mult).clamp(0.5, 2.0)`).
-    /// Negative `delta_y` zooms in (reduces distance); positive `delta_y` zooms out.
-    pub fn dolly(&mut self, delta_y: f32, speed_mult: f32) {
+    /// Scales camera distance from `target` directly by multiplicative `scale` (clamped to `[0.5, 2.0]`).
+    /// Values `< 1.0` dolly in; values `> 1.0` dolly out.
+    pub fn dolly_scale(&mut self, scale: f32) {
+        if !scale.is_finite() || scale <= 0.0 {
+            return;
+        }
         let offset = self.position - self.target;
         let dist = offset.length().max(0.5);
-        let factor = (1.0 + delta_y * 0.0015 * speed_mult).clamp(0.5, 2.0);
-        let next_dist = (dist * factor).clamp(0.5, 4500.0);
-        let dir = offset.normalize_or_zero();
-        let dir = if dir.length_squared() < 1e-6 {
-            Vec3::Z
-        } else {
-            dir
-        };
+        let next_dist = (dist * scale.clamp(0.5, 2.0)).clamp(0.5, 4500.0);
+        let dir = normalized_or(offset, Vec3::Z);
         self.position = self.target + dir * next_dist;
+    }
+
+    /// Dollies the camera toward/away from `target` using true exponential scaling
+    /// (`distance *= exp(delta_y * 0.0015 * speed_mult)`, clamped to `[0.5, 2.0]`) so
+    /// small back-and-forth trackpad deltas have zero cumulative drift.
+    /// Negative `delta_y` zooms in (reduces distance); positive `delta_y` zooms out.
+    pub fn dolly(&mut self, delta_y: f32, speed_mult: f32) {
+        let exponent =
+            (delta_y * 0.0015 * speed_mult).clamp(-std::f32::consts::LN_2, std::f32::consts::LN_2);
+        self.dolly_scale(exponent.exp());
     }
 
     /// Projects a 3D world point onto `canvas_rect` screen coordinates (returns `None` behind camera).
@@ -497,6 +509,7 @@ pub enum ViewportDragState {
     None,
     CameraOrbit,
     CameraPan,
+    Canvas2DPan,
     Transform2D(Transform2DDrag),
     MotionPathKey(MotionPathDrag),
 }
@@ -507,6 +520,7 @@ pub struct ViewportAction {
     pub camera_changed: bool,
     pub transform_modified: bool,
     pub canvas_rect: Option<Rect>,
+    pub panel_rect: Option<Rect>,
 }
 
 /// Persistent UI state for the main 3D/2D Viewport panel.
@@ -517,6 +531,12 @@ pub struct ViewportState {
     pub focused: bool,
     pub transparency_grid: bool,
     pub motion_path_visible: bool,
+    /// 2D preview canvas zoom multiplier (`1.0` = 100% aspect-fit, clamped `[0.25, 16.0]`).
+    pub zoom_2d: f32,
+    /// 2D preview canvas pan offset in CSS pixels relative to the aspect-fit center.
+    pub pan_2d: Vec2,
+    /// Sticky trackpad vs discrete mouse-wheel gesture classifier.
+    pub gesture_classifier: GestureClassifier,
 }
 
 impl Default for ViewportState {
@@ -534,7 +554,64 @@ impl ViewportState {
             focused: false,
             transparency_grid: false,
             motion_path_visible: false,
+            zoom_2d: 1.0,
+            pan_2d: Vec2::ZERO,
+            gesture_classifier: GestureClassifier::new(),
         }
+    }
+
+    /// Returns `true` when the 2D preview view is zoomed or panned away from 100% fit.
+    #[must_use]
+    pub fn is_2d_view_transformed(&self) -> bool {
+        (self.zoom_2d - 1.0).abs() > 0.005 || self.pan_2d.length() > 1.0
+    }
+
+    /// Resets 2D preview canvas zoom and pan back to 100% centered aspect-fit.
+    pub fn reset_2d_view(&mut self) {
+        self.zoom_2d = 1.0;
+        self.pan_2d = Vec2::ZERO;
+    }
+
+    /// Zooms the 2D preview canvas by multiplicative `factor` while keeping `anchor`
+    /// stationary in screen coordinates relative to `panel_rect.center()`.
+    pub fn zoom_2d_at(&mut self, panel_rect: Rect, anchor: Pos2, factor: f32) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let old_zoom = self.zoom_2d.clamp(MIN_ZOOM_2D, MAX_ZOOM_2D);
+        let new_zoom = (old_zoom * factor).clamp(MIN_ZOOM_2D, MAX_ZOOM_2D);
+        let ratio = new_zoom / old_zoom;
+        if (ratio - 1.0).abs() <= 1e-6 {
+            return;
+        }
+        let rel = anchor - panel_rect.center();
+        self.pan_2d = rel + (self.pan_2d - rel) * ratio;
+        self.zoom_2d = new_zoom;
+        if (self.zoom_2d - 1.0).abs() < 0.005 && self.pan_2d.length() < 2.0 {
+            self.zoom_2d = 1.0;
+            self.pan_2d = Vec2::ZERO;
+        }
+    }
+
+    /// Pans the 2D preview canvas by `delta` CSS pixels with soft clamping so the canvas
+    /// remains reachable inside `panel_rect`.
+    pub fn pan_2d_by(&mut self, delta: Vec2, panel_rect: Rect, fit_rect: Rect) {
+        if !delta.x.is_finite() || !delta.y.is_finite() {
+            return;
+        }
+        self.pan_2d += delta;
+        self.clamp_pan_2d(panel_rect, fit_rect);
+    }
+
+    /// Keeps at least a small margin of the 2D canvas overlapping `panel_rect`.
+    pub fn clamp_pan_2d(&mut self, panel_rect: Rect, fit_rect: Rect) {
+        let scaled = fit_rect.size() * self.zoom_2d.clamp(MIN_ZOOM_2D, MAX_ZOOM_2D);
+        let keep_x = (scaled.x * 0.5).min(64.0);
+        let keep_y = (scaled.y * 0.5).min(64.0);
+        let max_pan_x = (panel_rect.width() * 0.5 + scaled.x * 0.5 - keep_x).max(0.0);
+        let max_pan_y = (panel_rect.height() * 0.5 + scaled.y * 0.5 - keep_y).max(0.0);
+        self.pan_2d.x = self.pan_2d.x.clamp(-max_pan_x, max_pan_x);
+        self.pan_2d.y = self.pan_2d.y.clamp(-max_pan_y, max_pan_y);
     }
 
     /// Cancels an active 2D transform or motion-path drag and rolls back its undo transaction.
@@ -561,12 +638,11 @@ impl ViewportState {
 /// Returns `true` only when `pos` is directly on the viewport's egui layer (not covered by
 /// any floating window, popup, dropdown, or modal) and no eyedropper capture is active.
 fn pointer_on_viewport_layer(ui: &Ui, pos: Pos2) -> bool {
-    ui.ctx().layer_id_at(pos) == Some(ui.layer_id())
-        && !ui.ctx().output(|o| o.cursor_icon == CursorIcon::Crosshair)
+    pointer_on_layer(ui, pos)
 }
 
 fn pointer_hits_viewport(ui: &Ui, pos: Pos2, bounds: Rect) -> bool {
-    bounds.contains(pos) && pointer_on_viewport_layer(ui, pos)
+    rect_contains_unoccluded_pointer(ui, bounds, pos)
 }
 
 fn is_selected_clip_scene3d(session: &Session) -> bool {
@@ -591,21 +667,40 @@ fn is_editing_camera_active(session: &Session) -> bool {
         .is_editing_camera_active(&session.playback, selected_clip_is_scene)
 }
 
-fn paint_transparency_grid(painter: &egui::Painter, canvas_rect: Rect) {
+fn paint_transparency_grid(painter: &egui::Painter, canvas_rect: Rect, visible_rect: Rect) {
     const CELL: f32 = 8.0;
-    painter.rect_filled(canvas_rect, CornerRadius::ZERO, COLOR_CHECKER_DARK);
-    let cols = (canvas_rect.width() / CELL).ceil().max(0.0) as usize;
-    let rows = (canvas_rect.height() / CELL).ceil().max(0.0) as usize;
+    if !visible_rect.is_positive() {
+        return;
+    }
+    painter.rect_filled(visible_rect, CornerRadius::ZERO, COLOR_CHECKER_DARK);
+    let col_start = ((visible_rect.left() - canvas_rect.left()) / CELL)
+        .floor()
+        .max(0.0) as usize;
+    let col_end = ((visible_rect.right() - canvas_rect.left()) / CELL)
+        .ceil()
+        .max(0.0) as usize;
+    let row_start = ((visible_rect.top() - canvas_rect.top()) / CELL)
+        .floor()
+        .max(0.0) as usize;
+    let row_end = ((visible_rect.bottom() - canvas_rect.top()) / CELL)
+        .ceil()
+        .max(0.0) as usize;
     let mut mesh = egui::Mesh::default();
-    for row in 0..rows {
-        let y0 = canvas_rect.top() + row as f32 * CELL;
-        let y1 = (y0 + CELL).min(canvas_rect.bottom());
-        for col in 0..cols {
+    for row in row_start..row_end {
+        let y0 = (canvas_rect.top() + row as f32 * CELL).max(visible_rect.top());
+        let y1 = (canvas_rect.top() + (row + 1) as f32 * CELL).min(visible_rect.bottom());
+        if y1 <= y0 {
+            continue;
+        }
+        for col in col_start..col_end {
             if (row + col) % 2 != 0 {
                 continue;
             }
-            let x0 = canvas_rect.left() + col as f32 * CELL;
-            let x1 = (x0 + CELL).min(canvas_rect.right());
+            let x0 = (canvas_rect.left() + col as f32 * CELL).max(visible_rect.left());
+            let x1 = (canvas_rect.left() + (col + 1) as f32 * CELL).min(visible_rect.right());
+            if x1 <= x0 {
+                continue;
+            }
             let base = mesh.vertices.len() as u32;
             mesh.colored_vertex(pos2(x0, y0), COLOR_CHECKER_LIGHT);
             mesh.colored_vertex(pos2(x1, y0), COLOR_CHECKER_LIGHT);
@@ -624,11 +719,13 @@ fn paint_transparency_grid(painter: &egui::Painter, canvas_rect: Rect) {
 /// changes, locked tracks, or out-of-range frames NEVER leave stuck drags or leaked
 /// undo transactions (`TransactionAlreadyActive`).
 fn reconcile_active_drag_pre(ui: &Ui, session: &mut Session, state: &mut ViewportState) {
-    let (primary_down, secondary_down, middle_down) = ui.input(|i| {
+    let wants_kb = ui.ctx().egui_wants_keyboard_input();
+    let (primary_down, secondary_down, middle_down, space_down) = ui.input(|i| {
         (
             i.pointer.primary_down(),
             i.pointer.secondary_down(),
             i.pointer.middle_down(),
+            !wants_kb && i.key_down(egui::Key::Space),
         )
     });
     let editing_camera_active = is_editing_camera_active(session);
@@ -641,7 +738,14 @@ fn reconcile_active_drag_pre(ui: &Ui, session: &mut Session, state: &mut Viewpor
             }
         }
         ViewportDragState::CameraPan => {
-            if !editing_camera_active || !(secondary_down || middle_down) {
+            if !editing_camera_active
+                || !(secondary_down || middle_down || (space_down && primary_down))
+            {
+                state.drag_state = ViewportDragState::None;
+            }
+        }
+        ViewportDragState::Canvas2DPan => {
+            if editing_camera_active || !(middle_down || (space_down && primary_down)) {
                 state.drag_state = ViewportDragState::None;
             }
         }
@@ -677,11 +781,13 @@ fn reconcile_active_drag_pre(ui: &Ui, session: &mut Session, state: &mut Viewpor
 /// Post-pass safety net ensuring any drag whose mouse button is no longer held is immediately
 /// committed/cleared and cannot leak an open transaction to the next frame.
 fn reconcile_active_drag_post(ui: &Ui, session: &mut Session, state: &mut ViewportState) {
-    let (primary_down, secondary_down, middle_down) = ui.input(|i| {
+    let wants_kb = ui.ctx().egui_wants_keyboard_input();
+    let (primary_down, secondary_down, middle_down, space_down) = ui.input(|i| {
         (
             i.pointer.primary_down(),
             i.pointer.secondary_down(),
             i.pointer.middle_down(),
+            !wants_kb && i.key_down(egui::Key::Space),
         )
     });
 
@@ -703,7 +809,12 @@ fn reconcile_active_drag_post(ui: &Ui, session: &mut Session, state: &mut Viewpo
         ViewportDragState::CameraOrbit if !primary_down => {
             state.drag_state = ViewportDragState::None;
         }
-        ViewportDragState::CameraPan if !(secondary_down || middle_down) => {
+        ViewportDragState::CameraPan
+            if !(secondary_down || middle_down || (space_down && primary_down)) =>
+        {
+            state.drag_state = ViewportDragState::None;
+        }
+        ViewportDragState::Canvas2DPan if !(middle_down || (space_down && primary_down)) => {
             state.drag_state = ViewportDragState::None;
         }
         _ => {}
@@ -738,21 +849,57 @@ pub fn show_viewport(
     }
 
     let [seq_w, seq_h] = session.document().resolution;
-    let canvas_rect = compute_canvas_rect(panel_rect, seq_w, seq_h);
-    action.canvas_rect = Some(canvas_rect);
+    let fit_rect = compute_canvas_rect(panel_rect, seq_w, seq_h);
     let editing_camera_active = is_editing_camera_active(session);
+
+    // Handle standalone Cmd/Ctrl+0 reset when show_viewport runs without global shortcut dispatch.
+    let mut view_reset_this_frame = false;
+    if !editing_camera_active && !ui.ctx().egui_wants_keyboard_input() {
+        let reset_hotkey = ui.ctx().input_mut(|i| {
+            let cmd = i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::Num0,
+            ));
+            let ctrl = i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL,
+                egui::Key::Num0,
+            ));
+            cmd || ctrl
+        });
+        if reset_hotkey {
+            state.reset_2d_view();
+            view_reset_this_frame = true;
+        }
+    }
+
+    let canvas_rect = if editing_camera_active || !state.is_2d_view_transformed() {
+        fit_rect
+    } else {
+        Rect::from_center_size(
+            fit_rect.center() + state.pan_2d,
+            fit_rect.size() * state.zoom_2d.clamp(MIN_ZOOM_2D, MAX_ZOOM_2D),
+        )
+    };
+    let visible_canvas = canvas_rect.intersect(panel_rect);
+    action.panel_rect = Some(panel_rect);
+    action.canvas_rect = Some(canvas_rect);
 
     // 1. Solid #1d1d1d letterbox background (Spec 01 §1.5).
     let painter = ui.painter().with_clip_rect(panel_rect);
     painter.rect_filled(panel_rect, CornerRadius::ZERO, COLOR_LETTERBOX_BG);
 
-    // 1b. Optional Player+ 8x8 px transparency checkerboard inside `canvas_rect` before GPU texture.
+    // 1b. Optional 8x8 px transparency checkerboard inside `canvas_rect` (strictly clipped to `panel_rect`).
     let show_checker = state.transparency_grid && !editing_camera_active;
-    if show_checker {
-        paint_transparency_grid(&ui.painter().with_clip_rect(canvas_rect), canvas_rect);
+    if show_checker && visible_canvas.is_positive() {
+        paint_transparency_grid(
+            &ui.painter().with_clip_rect(visible_canvas),
+            canvas_rect,
+            visible_canvas,
+        );
     }
 
     // 2. Zero-copy GPU texture presentation directly from zc-render's wgpu::TextureView.
+    //    `painter` is clipped strictly to `panel_rect`, so zoomed/panned canvases never bleed out.
     if let Some(tex_id) = texture_id {
         painter.image(
             tex_id,
@@ -761,8 +908,8 @@ pub fn show_viewport(
             Color32::WHITE,
         );
     } else {
-        if !show_checker {
-            painter.rect_filled(canvas_rect, CornerRadius::ZERO, COLOR_CANVAS_CLEAR);
+        if !show_checker && visible_canvas.is_positive() {
+            painter.rect_filled(visible_canvas, CornerRadius::ZERO, COLOR_CANVAS_CLEAR);
         }
         painter.text(
             canvas_rect.center(),
@@ -803,6 +950,13 @@ pub fn show_viewport(
         );
     }
 
+    // 4b. 2D Zoom/Pan badge overlay (bottom-right of `panel_rect`) when zoomed or panned.
+    let badge_consumed_pointer = if !editing_camera_active && state.is_2d_view_transformed() {
+        paint_and_interact_2d_zoom_badge(ui, state, panel_rect)
+    } else {
+        false
+    };
+
     // 5. Editing Camera (`C`) 3D orbit / pan / dolly controls ONLY when a single 3D Scene clip
     //    is selected AND editing camera is enabled, and not consumed by an overlay drag.
     if editing_camera_active && !overlay_consumed_pointer {
@@ -814,11 +968,210 @@ pub fn show_viewport(
             &panel_resp,
             &mut action,
         );
+    } else if !editing_camera_active
+        && !overlay_consumed_pointer
+        && !badge_consumed_pointer
+        && !view_reset_this_frame
+    {
+        handle_2d_viewport_controls(ui, state, panel_rect, fit_rect, &panel_resp);
     }
 
     reconcile_active_drag_post(ui, session, state);
 
     action
+}
+
+// ---------------------------------------------------------------------------
+// 2D Preview Canvas Zoom / Pan Controls & Badge Overlay
+// ---------------------------------------------------------------------------
+
+fn paint_and_interact_2d_zoom_badge(
+    ui: &mut Ui,
+    state: &mut ViewportState,
+    panel_rect: Rect,
+) -> bool {
+    if panel_rect.width() < 120.0 || panel_rect.height() < 36.0 {
+        return false;
+    }
+    let zoom_pct = (state.zoom_2d * 100.0).round() as i32;
+    let pct_label = format!("{zoom_pct}%");
+    let pct_w = (pct_label.len() as f32 * 6.8 + 12.0).max(44.0);
+    let reset_w = 42.0;
+    let pill_h = 22.0;
+    let pill_w = pct_w + reset_w + 1.0;
+    let margin = 8.0;
+
+    let pill_rect = Rect::from_min_size(
+        pos2(
+            panel_rect.right() - margin - pill_w,
+            panel_rect.bottom() - margin - pill_h,
+        ),
+        vec2(pill_w, pill_h),
+    );
+    let pct_rect = Rect::from_min_size(pill_rect.min, vec2(pct_w, pill_h));
+    let reset_rect = Rect::from_min_size(
+        pos2(pct_rect.right() + 1.0, pill_rect.top()),
+        vec2(reset_w, pill_h),
+    );
+
+    let pct_resp = ui
+        .interact(
+            pct_rect,
+            ui.scope_id().with("viewport_2d_zoom_pct"),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Double-click to reset view (Cmd/Ctrl+0)");
+    let reset_resp = ui
+        .interact(
+            reset_rect,
+            ui.scope_id().with("viewport_2d_zoom_reset"),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Reset view to 100% fit (Cmd/Ctrl+0)");
+
+    let painter = ui.painter().with_clip_rect(panel_rect);
+    painter.rect(
+        pill_rect,
+        CornerRadius::same(3),
+        Color32::from_rgba_unmultiplied(0x1b, 0x1b, 0x1b, 224),
+        Stroke::new(1.0, Color32::from_rgb(0x44, 0x44, 0x44)),
+        StrokeKind::Inside,
+    );
+    if reset_resp.hovered() {
+        painter.rect_filled(
+            reset_rect.shrink(1.0),
+            CornerRadius::same(2),
+            Color32::from_rgb(0x3a, 0x3a, 0x3a),
+        );
+    }
+    painter.line_segment(
+        [
+            pos2(pct_rect.right() + 0.5, pill_rect.top() + 3.0),
+            pos2(pct_rect.right() + 0.5, pill_rect.bottom() - 3.0),
+        ],
+        Stroke::new(1.0, Color32::from_rgb(0x38, 0x38, 0x38)),
+    );
+    painter.text(
+        pct_rect.center(),
+        Align2::CENTER_CENTER,
+        pct_label,
+        FontId::monospace(11.0),
+        Color32::from_rgb(0xd8, 0xd8, 0xd8),
+    );
+    painter.text(
+        reset_rect.center(),
+        Align2::CENTER_CENTER,
+        "Reset",
+        FontId::monospace(10.5),
+        if reset_resp.hovered() {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb(0xac, 0xac, 0xac)
+        },
+    );
+
+    let consumed = pct_resp.hovered()
+        || reset_resp.hovered()
+        || pct_resp.clicked()
+        || pct_resp.double_clicked()
+        || reset_resp.clicked();
+    if reset_resp.clicked_by(PointerButton::Primary)
+        || pct_resp.double_clicked_by(PointerButton::Primary)
+    {
+        state.reset_2d_view();
+    }
+    consumed
+}
+
+fn handle_2d_viewport_controls(
+    ui: &mut Ui,
+    state: &mut ViewportState,
+    panel_rect: Rect,
+    fit_rect: Rect,
+    panel_resp: &egui::Response,
+) {
+    if !matches!(
+        state.drag_state,
+        ViewportDragState::None | ViewportDragState::Canvas2DPan
+    ) {
+        return;
+    }
+
+    let wants_kb = ui.ctx().egui_wants_keyboard_input();
+    let (g, pointer_delta, primary_down, middle_down, hover_pos, space_down) = ui.input(|i| {
+        (
+            state.gesture_classifier.sample(i),
+            i.pointer.delta(),
+            i.pointer.primary_down(),
+            i.pointer.middle_down(),
+            i.pointer.hover_pos(),
+            !wants_kb && i.key_down(egui::Key::Space),
+        )
+    });
+
+    let interact_pos = panel_resp.interact_pointer_pos().or(hover_pos);
+
+    // Double-click empty viewport area resets 2D zoom & pan to 100% fit.
+    if panel_resp.double_clicked_by(PointerButton::Primary)
+        && interact_pos.is_some_and(|p| pointer_hits_viewport(ui, p, panel_rect))
+    {
+        state.reset_2d_view();
+        return;
+    }
+
+    if let Some(pos) = hover_pos
+        && pointer_hits_viewport(ui, pos, panel_rect)
+    {
+        if g.has_pinch() {
+            state.zoom_2d_at(panel_rect, pos, g.pinch_zoom.clamp(0.5, 2.0));
+            state.clamp_pan_2d(panel_rect, fit_rect);
+        } else if g.has_mod_wheel_zoom() {
+            state.zoom_2d_at(panel_rect, pos, g.mod_wheel_zoom.clamp(0.5, 2.0));
+            state.clamp_pan_2d(panel_rect, fit_rect);
+        } else if g.device == ScrollDevice::Trackpad && g.has_scroll() {
+            state.pan_2d_by(g.scroll_delta, panel_rect, fit_rect);
+        } else if g.device == ScrollDevice::MouseWheel && g.has_scroll() {
+            if g.modifiers.shift {
+                let dx = g.scroll_delta.x + g.scroll_delta.y;
+                state.pan_2d_by(vec2(dx, 0.0), panel_rect, fit_rect);
+            } else if g.scroll_delta.y.abs() > 0.01 {
+                let factor = (g.scroll_delta.y * 0.0025).clamp(-0.4, 0.4).exp();
+                state.zoom_2d_at(panel_rect, pos, factor);
+                state.clamp_pan_2d(panel_rect, fit_rect);
+            }
+        }
+    }
+
+    // Middle-drag or Space+Left-drag pans the 2D canvas.
+    if matches!(state.drag_state, ViewportDragState::None)
+        && interact_pos.is_some_and(|p| pointer_hits_viewport(ui, p, panel_rect))
+        && (panel_resp.drag_started_by(PointerButton::Middle)
+            || (space_down && panel_resp.drag_started_by(PointerButton::Primary)))
+    {
+        state.drag_state = ViewportDragState::Canvas2DPan;
+    }
+
+    match state.drag_state {
+        ViewportDragState::Canvas2DPan => {
+            if middle_down || (space_down && primary_down) {
+                if pointer_delta.length_sq() > 0.0 {
+                    state.pan_2d_by(pointer_delta, panel_rect, fit_rect);
+                }
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            } else {
+                state.drag_state = ViewportDragState::None;
+            }
+        }
+        ViewportDragState::None
+            if space_down
+                && hover_pos.is_some_and(|p| pointer_hits_viewport(ui, p, panel_rect)) =>
+        {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -840,29 +1193,23 @@ fn handle_editing_camera_controls(
         return;
     }
 
-    let (
-        modifiers,
-        pointer_delta,
-        scroll_delta,
-        primary_down,
-        secondary_down,
-        middle_down,
-        hover_pos,
-    ) = ui.input(|i| {
-        (
-            i.modifiers,
-            i.pointer.delta(),
-            i.smooth_scroll_delta,
-            i.pointer.primary_down(),
-            i.pointer.secondary_down(),
-            i.pointer.middle_down(),
-            i.pointer.hover_pos(),
-        )
-    });
+    let wants_kb = ui.ctx().egui_wants_keyboard_input();
+    let (g, pointer_delta, primary_down, secondary_down, middle_down, hover_pos, space_down) = ui
+        .input(|i| {
+            (
+                state.gesture_classifier.sample(i),
+                i.pointer.delta(),
+                i.pointer.primary_down(),
+                i.pointer.secondary_down(),
+                i.pointer.middle_down(),
+                i.pointer.hover_pos(),
+                !wants_kb && i.key_down(egui::Key::Space),
+            )
+        });
 
-    let speed_mult = if modifiers.shift {
+    let speed_mult = if g.modifiers.shift {
         2.5
-    } else if modifiers.ctrl || modifiers.command {
+    } else if g.ctrl_or_cmd {
         0.25
     } else {
         1.0
@@ -879,25 +1226,77 @@ fn handle_editing_camera_controls(
         return;
     }
 
-    // Exponential scroll-wheel dolly zoom: `distance *= (1.0 - scroll_y * 0.0015).clamp(0.5, 2.0)`.
+    // Trackpad pinch / rotate / two-finger orbit & pan, plus fixed mouse wheel dolly.
     if let Some(pos) = hover_pos
         && pointer_hits_viewport(ui, pos, panel_rect)
-        && scroll_delta.y.abs() > 0.01
     {
-        state.camera.dolly(-scroll_delta.y, speed_mult);
-        action.camera_changed = true;
+        if g.has_pinch() {
+            let scale = 1.0 / g.pinch_zoom.clamp(0.5, 2.0).powf(speed_mult);
+            state.camera.dolly_scale(scale);
+            action.camera_changed = true;
+        }
+        if g.has_rotate() {
+            // Two-finger twist rotates camera yaw cleanly around target.
+            state.camera.orbit(g.rotate_radians / 0.005, 0.0, 1.0);
+            action.camera_changed = true;
+        }
+
+        if g.device == ScrollDevice::Trackpad {
+            if g.modifiers.shift && g.has_raw_wheel() {
+                // Use un-remapped raw wheel points so egui's Shift->X fold does not drop Y pan.
+                state.camera.pan_viewport(
+                    g.raw_wheel_points.x,
+                    g.raw_wheel_points.y,
+                    canvas_rect.height(),
+                    1.0,
+                );
+                action.camera_changed = true;
+            } else if g.ctrl_or_cmd && (g.has_raw_wheel() || g.has_mod_wheel_zoom()) {
+                let dy = if g.raw_wheel_points.y.abs() > 0.01 {
+                    g.raw_wheel_points.y
+                } else {
+                    g.mod_wheel_zoom.ln() / 0.005
+                };
+                state.camera.dolly(-dy, 0.25);
+                action.camera_changed = true;
+            } else if g.has_scroll() {
+                // Unmodified two-finger trackpad swipe orbits the 3D camera.
+                state.camera.orbit(g.scroll_delta.x, g.scroll_delta.y, 1.0);
+                action.camera_changed = true;
+            }
+        } else if g.has_mod_wheel_zoom() {
+            // Ctrl/Cmd + discrete wheel -> 0.25x precision dolly.
+            let dy = g.mod_wheel_zoom.ln() / 0.005;
+            state.camera.dolly(-dy, 0.25);
+            action.camera_changed = true;
+        } else if g.modifiers.shift
+            && (g.scroll_delta.x.abs() > 0.01 || g.scroll_delta.y.abs() > 0.01)
+        {
+            // Shift + discrete wheel -> 2.5x fast dolly (egui folds vertical wheel into X on Shift).
+            let dy = if g.scroll_delta.y.abs() > 0.01 {
+                g.scroll_delta.y
+            } else {
+                g.scroll_delta.x
+            };
+            state.camera.dolly(-dy, 2.5);
+            action.camera_changed = true;
+        } else if g.scroll_delta.y.abs() > 0.01 {
+            state.camera.dolly(-g.scroll_delta.y, 1.0);
+            action.camera_changed = true;
+        }
     }
 
-    // Left-drag -> orbit; Right-drag or Middle-drag -> pan (guarded by layer hit test).
+    // Left-drag -> orbit; Right-drag, Middle-drag, or Space+Left-drag -> pan.
     if matches!(state.drag_state, ViewportDragState::None)
         && interact_pos.is_some_and(|p| pointer_hits_viewport(ui, p, panel_rect))
     {
-        if panel_resp.drag_started_by(PointerButton::Primary) {
-            state.drag_state = ViewportDragState::CameraOrbit;
-        } else if panel_resp.drag_started_by(PointerButton::Secondary)
+        if panel_resp.drag_started_by(PointerButton::Secondary)
             || panel_resp.drag_started_by(PointerButton::Middle)
+            || (space_down && panel_resp.drag_started_by(PointerButton::Primary))
         {
             state.drag_state = ViewportDragState::CameraPan;
+        } else if panel_resp.drag_started_by(PointerButton::Primary) {
+            state.drag_state = ViewportDragState::CameraOrbit;
         }
     }
 
@@ -916,7 +1315,7 @@ fn handle_editing_camera_controls(
             }
         }
         ViewportDragState::CameraPan => {
-            if secondary_down || middle_down {
+            if secondary_down || middle_down || (space_down && primary_down) {
                 if pointer_delta.length_sq() > 0.0 {
                     state.camera.pan_viewport(
                         pointer_delta.x,
@@ -991,22 +1390,23 @@ fn handle_and_paint_transform_2d(
     let bot_mid = local_to_screen(u_cx, u_max_y);
     let left_mid = local_to_screen(u_min_x, u_cy);
 
-    // Keep the top rotation handle visible & strictly clipped inside `canvas_rect`
-    // (flip stem inward when the outer handle would fall outside `canvas_rect`).
+    // Keep the top rotation handle visible & strictly clipped inside the visible canvas
+    // (flip stem inward when the outer handle would fall outside `visible_canvas`).
+    let visible_canvas = canvas_rect.intersect(panel_rect);
     let rot_outer = local_to_screen(u_cx, u_min_y - ROTATION_STEM_PX);
     let rot_inner = local_to_screen(u_cx, u_min_y + ROTATION_STEM_PX);
     let safe_pad = HANDLE_SIZE_PX * 0.5 + 2.0;
-    let safe_rect = if canvas_rect.width() > safe_pad * 2.0 && canvas_rect.height() > safe_pad * 2.0
-    {
-        canvas_rect.shrink(safe_pad)
-    } else {
-        canvas_rect
-    };
+    let safe_rect =
+        if visible_canvas.width() > safe_pad * 2.0 && visible_canvas.height() > safe_pad * 2.0 {
+            visible_canvas.shrink(safe_pad)
+        } else {
+            visible_canvas
+        };
     let rot_pos = if safe_rect.contains(rot_outer) {
         rot_outer
     } else if safe_rect.contains(rot_inner) {
         rot_inner
-    } else if canvas_rect.expand(2.0).contains(top_mid) {
+    } else if visible_canvas.expand(2.0).contains(top_mid) {
         pos2(
             rot_inner.x.clamp(safe_rect.left(), safe_rect.right()),
             rot_inner.y.clamp(safe_rect.top(), safe_rect.bottom()),
@@ -1028,8 +1428,8 @@ fn handle_and_paint_transform_2d(
     ];
 
     // Paint bounding box (1px #666666 outer box expanded by 1px + 1px #cccccc inner box),
-    // rotation stem, handles & pivot crosshair. Clipped strictly to `canvas_rect`.
-    let painter = ui.painter().with_clip_rect(canvas_rect);
+    // rotation stem, handles & pivot crosshair. Clipped strictly to `visible_canvas`.
+    let painter = ui.painter().with_clip_rect(visible_canvas);
     let tl_out = local_to_screen(u_min_x - 1.0, u_min_y - 1.0);
     let tr_out = local_to_screen(u_max_x + 1.0, u_min_y - 1.0);
     let br_out = local_to_screen(u_max_x + 1.0, u_max_y + 1.0);
@@ -1083,23 +1483,26 @@ fn handle_and_paint_transform_2d(
     }
 
     // Pointer hit-testing & live drag state machine.
-    let (pointer_pos, primary_pressed, primary_down, modifiers) = ui.input(|i| {
+    let wants_kb = ui.ctx().egui_wants_keyboard_input();
+    let (pointer_pos, primary_pressed, primary_down, modifiers, space_down) = ui.input(|i| {
         (
             i.pointer.latest_pos(),
             i.pointer.primary_pressed(),
             i.pointer.primary_down(),
             i.modifiers,
+            !wants_kb && i.key_down(egui::Key::Space),
         )
     });
 
-    // Hover cursor feedback & drag start (skipped on locked tracks or when covered by another layer).
+    // Hover cursor feedback & drag start (skipped on locked tracks, Space-pan, or when covered by another layer).
     // Passive hover intentionally returns `false` so scroll, right/middle pan, and double-click
-    // pass straight through to the Editing Camera controller.
+    // pass straight through to the Editing Camera or 2D Viewport controller.
     if !clip_tf.locked
+        && !space_down
         && matches!(state.drag_state, ViewportDragState::None)
         && let Some(pos) = pointer_pos
         && pointer_hits_viewport(ui, pos, panel_rect)
-        && canvas_rect.expand(HANDLE_SIZE_PX * 0.5).contains(pos)
+        && visible_canvas.expand(HANDLE_SIZE_PX * 0.5).contains(pos)
         && let Some(h) = hit_test_2d_handles(
             &handles,
             pos,
@@ -1109,7 +1512,7 @@ fn handle_and_paint_transform_2d(
             u_min_y,
             u_max_y,
             clip_tf.rotation,
-            canvas_rect,
+            visible_canvas,
         )
     {
         ui.ctx().set_cursor_icon(handle_cursor_icon(h));
@@ -1422,7 +1825,8 @@ fn handle_and_paint_motion_path(
         }
     };
 
-    let painter = ui.painter().with_clip_rect(canvas_rect);
+    let visible_canvas = canvas_rect.intersect(panel_rect);
+    let painter = ui.painter().with_clip_rect(visible_canvas);
 
     // Draw smooth trajectory spline sampled across every keyframe segment (including Bezier).
     for pair in target.keyframes.windows(2) {
@@ -1476,11 +1880,13 @@ fn handle_and_paint_motion_path(
         }
     }
 
-    let (pointer_pos, primary_pressed, primary_down) = ui.input(|i| {
+    let wants_kb = ui.ctx().egui_wants_keyboard_input();
+    let (pointer_pos, primary_pressed, primary_down, space_down) = ui.input(|i| {
         (
             i.pointer.latest_pos(),
             i.pointer.primary_pressed(),
             i.pointer.primary_down(),
+            !wants_kb && i.key_down(egui::Key::Space),
         )
     });
 
@@ -1501,10 +1907,11 @@ fn handle_and_paint_motion_path(
 
         if !started_drag
             && !target.locked
+            && !space_down
             && matches!(state.drag_state, ViewportDragState::None)
             && let Some(ptr) = pointer_pos
             && pointer_hits_viewport(ui, ptr, panel_rect)
-            && canvas_rect.contains(ptr)
+            && visible_canvas.contains(ptr)
             && ptr.distance(sp) <= 9.0
         {
             ui.ctx().set_cursor_icon(CursorIcon::Move);
@@ -2299,5 +2706,335 @@ mod tests {
         );
         assert_eq!(state.camera, EditorCameraState::new());
         assert!(!session.history.is_in_transaction());
+    }
+
+    #[test]
+    fn exponential_dolly_has_zero_roundtrip_drift() {
+        let mut cam = EditorCameraState::new();
+        let d0 = cam.distance();
+        for _ in 0..40 {
+            cam.dolly(12.0, 1.0);
+            cam.dolly(-12.0, 1.0);
+        }
+        assert!(
+            (cam.distance() - d0).abs() < 1e-3,
+            "back-and-forth exponential dolly must not drift: before={d0}, after={}",
+            cam.distance()
+        );
+    }
+
+    #[test]
+    fn viewport_2d_zoom_at_preserves_anchor_and_reset_restores_fit() {
+        let panel = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 450.0));
+        let fit = compute_canvas_rect(panel, 1920, 1080);
+        let anchor = pos2(600.0, 150.0);
+
+        let mut state = ViewportState::new();
+        let norm_before = vec2(
+            (anchor.x - fit.center().x) / fit.width(),
+            (anchor.y - fit.center().y) / fit.height(),
+        );
+        state.zoom_2d_at(panel, anchor, 2.0);
+        assert!((state.zoom_2d - 2.0).abs() < 1e-4);
+        assert!(state.is_2d_view_transformed());
+
+        let zoomed_rect =
+            Rect::from_center_size(fit.center() + state.pan_2d, fit.size() * state.zoom_2d);
+        let norm_after = vec2(
+            (anchor.x - zoomed_rect.center().x) / zoomed_rect.width(),
+            (anchor.y - zoomed_rect.center().y) / zoomed_rect.height(),
+        );
+        assert!(
+            (norm_before - norm_after).length() < 1e-3,
+            "anchor normalized canvas coords must stay fixed across 2D zoom: before={norm_before:?}, after={norm_after:?}"
+        );
+
+        state.reset_2d_view();
+        assert!((state.zoom_2d - 1.0).abs() < 1e-6);
+        assert_eq!(state.pan_2d, Vec2::ZERO);
+        assert!(!state.is_2d_view_transformed());
+    }
+
+    #[test]
+    fn headless_viewport_2d_pinch_cmd_scroll_trackpad_pan_and_cmd0_reset() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        session.playback.editing_camera = false;
+        let mut state = ViewportState::new();
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 360.0));
+        let hover = pos2(440.0, 120.0);
+
+        let step = |session: &mut Session,
+                    state: &mut ViewportState,
+                    time: f64,
+                    modifiers: egui::Modifiers,
+                    mut events: Vec<egui::Event>|
+         -> ViewportAction {
+            events.insert(0, egui::Event::ModifiersChanged(modifiers));
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut action = ViewportAction::default();
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        action = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            action
+        };
+
+        // Frame 0: prime layer hit-test.
+        let a0 = step(
+            &mut session,
+            &mut state,
+            0.0,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(hover)],
+        );
+        let fit = a0.canvas_rect.expect("fit rect");
+
+        // 1. Trackpad pinch zooms 2D canvas around hover anchor.
+        let _ = step(
+            &mut session,
+            &mut state,
+            0.016,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(hover), egui::Event::Zoom(1.5)],
+        );
+        assert!((state.zoom_2d - 1.5).abs() < 1e-3);
+        assert!(
+            state.pan_2d.length() > 1.0,
+            "off-center pinch must shift pan_2d to preserve anchor"
+        );
+
+        // 2. Cmd+Scroll zooms 2D canvas further (egui 0.37 folds into zoom_delta).
+        let z_before_cmd = state.zoom_2d;
+        let _ = step(
+            &mut session,
+            &mut state,
+            0.032,
+            egui::Modifiers::COMMAND,
+            vec![
+                egui::Event::PointerMoved(hover),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+            ],
+        );
+        assert!(
+            state.zoom_2d > z_before_cmd,
+            "Cmd+Scroll must zoom 2D canvas in"
+        );
+
+        // 3. Two-finger trackpad scroll pans 2D canvas smoothly in X and Y.
+        let pan_before = state.pan_2d;
+        let z_before_pan = state.zoom_2d;
+        let _ = step(
+            &mut session,
+            &mut state,
+            0.050,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(hover),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(18.0, -12.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Trackpad,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            (state.zoom_2d - z_before_pan).abs() < 1e-4,
+            "trackpad pan must not zoom"
+        );
+        assert!((state.pan_2d.x - pan_before.x - 18.0).abs() < 1.0);
+        assert!((state.pan_2d.y - pan_before.y - (-12.0)).abs() < 1.0);
+
+        // 4. Cmd+0 resets 2D view back to fit.
+        let a_reset = step(
+            &mut session,
+            &mut state,
+            0.070,
+            egui::Modifiers::COMMAND,
+            vec![
+                egui::Event::PointerMoved(hover),
+                egui::Event::Key {
+                    key: egui::Key::Num0,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+            ],
+        );
+        assert!((state.zoom_2d - 1.0).abs() < 1e-5);
+        assert_eq!(state.pan_2d, Vec2::ZERO);
+        assert_eq!(a_reset.canvas_rect, Some(fit));
+    }
+
+    #[test]
+    fn headless_viewport_3d_editing_camera_pinch_modifier_wheel_and_trackpad_gestures() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session.selection.select_clip(clip_id, Some("scene"), false);
+        session.playback.editing_camera = true;
+
+        let mut state = ViewportState::new();
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 360.0));
+        let hover = pos2(320.0, 180.0);
+
+        let step = |session: &mut Session,
+                    state: &mut ViewportState,
+                    time: f64,
+                    modifiers: egui::Modifiers,
+                    mut events: Vec<egui::Event>|
+         -> ViewportAction {
+            events.insert(0, egui::Event::ModifiersChanged(modifiers));
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut action = ViewportAction::default();
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        action = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            action
+        };
+
+        // Prime layout.
+        let _ = step(
+            &mut session,
+            &mut state,
+            0.0,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(hover)],
+        );
+
+        // 1. Trackpad pinch dollies camera closer.
+        let d0 = state.camera.distance();
+        let a_pinch = step(
+            &mut session,
+            &mut state,
+            0.016,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(hover), egui::Event::Zoom(1.25)],
+        );
+        assert!(a_pinch.camera_changed);
+        assert!(state.camera.distance() < d0);
+
+        // 2. Cmd+Wheel fine dolly (was dead code in egui 0.37).
+        let d1 = state.camera.distance();
+        let a_cmd = step(
+            &mut session,
+            &mut state,
+            0.032,
+            egui::Modifiers::COMMAND,
+            vec![
+                egui::Event::PointerMoved(hover),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+            ],
+        );
+        assert!(a_cmd.camera_changed);
+        assert!(state.camera.distance() < d1);
+
+        // 3. Shift+Wheel fast dolly (was dead code in egui 0.37 because Shift shifts Y -> X).
+        let d2 = state.camera.distance();
+        let a_shift = step(
+            &mut session,
+            &mut state,
+            0.35,
+            egui::Modifiers::SHIFT,
+            vec![
+                egui::Event::PointerMoved(hover),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+            ],
+        );
+        assert!(a_shift.camera_changed);
+        assert!(state.camera.distance() < d2);
+
+        // 4. Two-finger trackpad swipe orbits camera while preserving distance.
+        let pos_before_orbit = state.camera.position;
+        let dist_before_orbit = state.camera.distance();
+        let a_orbit = step(
+            &mut session,
+            &mut state,
+            0.65,
+            egui::Modifiers::NONE,
+            vec![
+                egui::Event::PointerMoved(hover),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(20.0, -12.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Trackpad,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(a_orbit.camera_changed);
+        assert!((state.camera.distance() - dist_before_orbit).abs() < 1e-3);
+        assert!((state.camera.position - pos_before_orbit).length() > 0.1);
+
+        // 5. Shift + two-finger trackpad pans both X and Y (un-remapped raw wheel points).
+        let target_before_pan = state.camera.target;
+        let a_pan = step(
+            &mut session,
+            &mut state,
+            0.68,
+            egui::Modifiers::SHIFT,
+            vec![
+                egui::Event::PointerMoved(hover),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(15.0, 15.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Trackpad,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+            ],
+        );
+        assert!(a_pan.camera_changed);
+        let target_delta = state.camera.target - target_before_pan;
+        assert!(target_delta.length() > 0.1);
+        assert!(
+            target_delta.y.abs() > 1e-3,
+            "Shift+Trackpad pan must preserve vertical Y delta (not folded onto X)"
+        );
     }
 }

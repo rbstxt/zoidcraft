@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::easing::{
     BezierSegment, EasingKind, InterpolationMode, eval_easing, eval_segment_bezier,
+    has_native_bezier_defaults,
 };
 
 /// Tolerance used to match keyframe frame positions for overwrite/removal/navigation.
@@ -587,37 +588,17 @@ impl<T: Animatable> DynamicProperty<T> {
     }
 
     /// Evaluates the property's keyframed/static value at `frame`.
+    ///
+    /// Matches CM3 (`PZ.property.dynamic.keyframes.prototype.get(e)`): always evaluates
+    /// the full keyframe curve (Hold, easings, and Bezier segments) regardless of `animated`
+    /// or `static_behavior`. Single-keyframe static tracks return `keyframes[0]`, and
+    /// 2-keyframe linear tracks linearly interpolate their endpoints.
     pub fn evaluate(&self, frame: f64) -> T {
         if self.keyframes.is_empty() {
             return T::zero();
         }
         if !frame.is_finite() {
             return self.keyframes[0].value.clone();
-        }
-
-        if !self.animated {
-            return match self.static_behavior {
-                StaticBehavior::Constant => self.keyframes[0].value.clone(),
-                StaticBehavior::Linear => {
-                    if self.keyframes.len() == 1 || !T::IS_INTERPOLATABLE {
-                        return self.keyframes[0].value.clone();
-                    }
-                    let first = &self.keyframes[0];
-                    let last = &self.keyframes[self.keyframes.len() - 1];
-                    if frame <= first.frame {
-                        return first.value.clone();
-                    }
-                    if frame >= last.frame {
-                        return last.value.clone();
-                    }
-                    let span = last.frame - first.frame;
-                    if !span.is_finite() || span <= 0.0 {
-                        return first.value.clone();
-                    }
-                    let u = ((frame - first.frame) / span).clamp(0.0, 1.0);
-                    T::lerp(&first.value, &last.value, u)
-                }
-            };
         }
 
         if self.keyframes.len() == 1 || frame <= self.keyframes[0].frame {
@@ -661,18 +642,19 @@ impl<T: Animatable> DynamicProperty<T> {
         T::lerp(&k0.value, &k1.value, e)
     }
 
-    /// Computes per-second velocity using Expressions+'s symmetric `0.01s` finite difference:
-    /// `(valueAtTime(t + 0.005) - valueAtTime(t - 0.005)) / 0.01` (Spec 03 §6.5).
+    /// Computes per-second velocity using Zoidium Expressions+'s symmetric `dt = 0.01s`
+    /// finite difference: `(valueAtTime(t + 0.01) - valueAtTime(t - 0.01)) / 0.02`
+    /// (`plugins/expressions-plus/api.js:118-121`).
     pub fn velocity(&self, frame: f64, fps: f64) -> T {
         if !T::IS_INTERPOLATABLE || !frame.is_finite() || !fps.is_finite() || fps <= 0.0 {
             return T::zero();
         }
-        const HALF_DT_SEC: f64 = 0.005;
-        const INV_DT_SEC: f64 = 100.0; // 1.0 / 0.01
-        let df = HALF_DT_SEC * fps;
+        const DT_SEC: f64 = 0.01;
+        const INV_2DT_SEC: f64 = 50.0; // 1.0 / (2.0 * 0.01)
+        let df = DT_SEC * fps;
         let v_plus = self.evaluate(frame + df);
         let v_minus = self.evaluate(frame - df);
-        T::scale(&T::sub(&v_plus, &v_minus), INV_DT_SEC)
+        T::scale(&T::sub(&v_plus, &v_minus), INV_2DT_SEC)
     }
 
     /// Computes scalar speed (magnitude of [`Self::velocity`]) in units per second.
@@ -841,71 +823,60 @@ impl<T: Animatable> DynamicProperty<T> {
         }
     }
 
-    /// Scales all keyframe frames (and horizontal Bezier handles) by `scale` (rate stretch).
+    /// Scales all keyframe frames (and edited horizontal Bezier handles) by `scale` (rate stretch).
+    ///
+    /// Matches Zoidium Easing+ (`easing-curves.js:314`): segments whose handles are untouched
+    /// native CM3 defaults (`out = [10, 0]`, `in = [-10, 0]`) keep their native default handles.
     pub fn scale_keyframes(&mut self, scale: f64) {
         if !scale.is_finite() || scale <= 0.0 {
             return;
         }
-        for kf in &mut self.keyframes {
+        let len = self.keyframes.len();
+        let seg_is_native_default: Vec<bool> = (0..len.saturating_sub(1))
+            .map(|i| {
+                match (
+                    self.keyframes[i].out_tangent,
+                    self.keyframes[i + 1].in_tangent,
+                ) {
+                    (Some(out_t), Some(in_t)) => has_native_bezier_defaults(out_t, in_t),
+                    _ => false,
+                }
+            })
+            .collect();
+
+        for (i, kf) in self.keyframes.iter_mut().enumerate() {
             kf.frame *= scale;
             if let Some(in_t) = &mut kf.in_tangent {
-                in_t[0] *= scale;
+                let skip = if i > 0 {
+                    seg_is_native_default[i - 1]
+                } else {
+                    (in_t[0] + 10.0).abs() <= 1e-8 && in_t[1].abs() <= 1e-8
+                };
+                if !skip {
+                    in_t[0] *= scale;
+                }
             }
             if let Some(out_t) = &mut kf.out_tangent {
-                out_t[0] *= scale;
+                let skip = if i + 1 < len {
+                    seg_is_native_default[i]
+                } else {
+                    (out_t[0] - 10.0).abs() <= 1e-8 && out_t[1].abs() <= 1e-8
+                };
+                if !skip {
+                    out_t[0] *= scale;
+                }
             }
         }
     }
 }
 
 impl DynamicProperty<f64> {
-    fn integrate_linear_endpoints(
-        first: &Keyframe<f64>,
-        last: &Keyframe<f64>,
-        a: f64,
-        b: f64,
-    ) -> f64 {
-        let f0 = first.frame;
-        let f1 = last.frame;
-        if !f0.is_finite() || !f1.is_finite() {
-            return 0.0;
-        }
-        let mut acc = 0.0;
-        if f1 <= f0 {
-            if a < f0 {
-                acc += first.value * (b.min(f0) - a);
-            }
-            if b > f0 {
-                acc += last.value * (b - a.max(f0));
-            }
-            return acc;
-        }
-        if a < f0 {
-            acc += first.value * (b.min(f0) - a);
-        }
-        let seg_start = a.max(f0);
-        let seg_end = b.min(f1);
-        let dt = seg_end - seg_start;
-        if dt > 0.0 {
-            let slope = (last.value - first.value) / (f1 - f0);
-            let v_start = first.value + slope * (seg_start - f0);
-            acc += 0.5 * slope * dt * dt + v_start * dt;
-        }
-        if b > f1 {
-            acc += last.value * (b - a.max(f1));
-        }
-        acc
-    }
-
     fn integrate_interval(&self, a: f64, b: f64) -> f64 {
         if self.keyframes.len() == 1 {
             return self.keyframes[0].value * (b - a);
         }
         let first = &self.keyframes[0];
         let last = &self.keyframes[self.keyframes.len() - 1];
-        if !self.animated && self.static_behavior == StaticBehavior::Linear {
-            return Self::integrate_linear_endpoints(first, last, a, b);
-        }
         if !first.frame.is_finite() || !last.frame.is_finite() {
             return 0.0;
         }
@@ -955,13 +926,10 @@ impl DynamicProperty<f64> {
     }
 
     /// Piecewise linear / trapezoidal integral of a scalar channel from frame `0` to `frame`
-    /// (Spec 02 §3.3, used for speed-to-phase accumulation).
+    /// (Spec 02 §3.3, matching CM3 `PZ.property.dynamic.keyframes.prototype.integrate`).
     pub fn integrate(&self, frame: f64) -> f64 {
         if self.keyframes.is_empty() || !frame.is_finite() || frame == 0.0 {
             return 0.0;
-        }
-        if !self.animated && self.static_behavior == StaticBehavior::Constant {
-            return self.keyframes[0].value * frame;
         }
         if frame > 0.0 {
             self.integrate_interval(0.0, frame)
@@ -1297,14 +1265,66 @@ mod tests {
         // [-12,-10]: 2*2=4; [-10,-5]: (2+6)/2*5=20; [-5,0]: 6*5=30 => -54
         assert!(approx_eq(p3.integrate(-12.0), -54.0, 1e-12));
 
-        // Bug 12b: static Linear property integrates direct endpoint ramp, matching evaluate.
+        // P1-3: CM3 never branches on `animated` — multi-keyframe tracks evaluate and integrate
+        // all keyframes, Hold segments, easings, and Beziers identically when `animated == false`.
         let mut static_lin = DynamicProperty::new_linear(0.0, 10.0, 10.0);
         static_lin.keyframes.insert(1, Keyframe::hold(5.0, 999.0));
         static_lin.keyframes[2].easing = EasingKind::Hold;
         static_lin.keyframes[2].interpolated = false;
-        assert!(approx_eq(static_lin.evaluate(5.0), 5.0, 1e-12));
-        assert!(approx_eq(static_lin.integrate(10.0), 50.0, 1e-12));
+        assert!(!static_lin.animated);
+        // [0, 5) holds 0.0; [5, 10) holds 999.0; >= 10 is 10.0.
+        assert!(approx_eq(static_lin.evaluate(2.5), 0.0, 1e-12));
+        assert!(approx_eq(static_lin.evaluate(5.0), 999.0, 1e-12));
+        assert!(approx_eq(static_lin.evaluate(7.5), 999.0, 1e-12));
+        assert!(approx_eq(static_lin.evaluate(10.0), 10.0, 1e-12));
+        // Integral: [0,5]: 0*5 = 0; [5,10]: 999*5 = 4995; [10,15]: 10*5 = 50 -> 5045
+        assert!(approx_eq(static_lin.integrate(10.0), 4995.0, 1e-12));
         assert!(approx_eq(static_lin.integrate(-5.0), 0.0, 1e-12));
-        assert!(approx_eq(static_lin.integrate(15.0), 100.0, 1e-12));
+        assert!(approx_eq(static_lin.integrate(15.0), 5045.0, 1e-12));
+    }
+
+    #[test]
+    fn zoidium_p7_animated_false_scale_keyframes_and_velocity_dt_parity() {
+        // P1-3: `animated == false` with Constant static_behavior still evaluates all keyframes
+        // with their easings (matching CM3 `PZ.property.dynamic.keyframes.prototype.get`).
+        let mut prop = DynamicProperty::new_animated(vec![
+            Keyframe::new(0.0, 0.0),
+            Keyframe::with_easing(10.0, 100.0, EasingKind::QuadIn),
+            Keyframe::with_easing(20.0, 200.0, EasingKind::CubicOutIn),
+        ]);
+        prop.animated = false;
+        assert!(approx_eq(prop.evaluate(5.0), 25.0, 1e-12));
+        assert!(approx_eq(prop.evaluate(12.5), 143.75, 1e-12));
+
+        // P2-2: `scale_keyframes` skips rescaling untouched native CM3 default handles
+        // (`[10, 0]` / `[-10, 0]`) while scaling edited Bezier handles.
+        let mut bez = DynamicProperty::new_animated(vec![
+            Keyframe::bezier(0.0, 0.0, [-10.0, 0.0], [10.0, 0.0]),
+            Keyframe::bezier(30.0, 100.0, [-10.0, 0.0], [6.0, 20.0]),
+            Keyframe::bezier(60.0, 200.0, [-12.0, -15.0], [10.0, 0.0]),
+        ]);
+        bez.scale_keyframes(2.0);
+        assert!(approx_eq(bez.keyframes[0].frame, 0.0, 1e-12));
+        assert!(approx_eq(bez.keyframes[1].frame, 60.0, 1e-12));
+        assert!(approx_eq(bez.keyframes[2].frame, 120.0, 1e-12));
+        // Segment 0->1 had untouched native defaults -> unchanged.
+        assert_eq!(bez.keyframes[0].in_tangent, Some([-10.0, 0.0]));
+        assert_eq!(bez.keyframes[0].out_tangent, Some([10.0, 0.0]));
+        assert_eq!(bez.keyframes[1].in_tangent, Some([-10.0, 0.0]));
+        // Segment 1->2 had edited handles -> X scaled by 2, Y unchanged.
+        assert_eq!(bez.keyframes[1].out_tangent, Some([12.0, 20.0]));
+        assert_eq!(bez.keyframes[2].in_tangent, Some([-24.0, -15.0]));
+        // Trailing default out_tangent unchanged.
+        assert_eq!(bez.keyframes[2].out_tangent, Some([10.0, 0.0]));
+
+        // P0-7: velocity uses Zoidium's dt = 0.01s symmetric difference `(v(f+0.01*fps) - v(f-0.01*fps)) / 0.02`.
+        let cubic = DynamicProperty::new_animated(vec![
+            Keyframe::new(0.0, 0.0),
+            Keyframe::with_easing(30.0, 100.0, EasingKind::CubicIn),
+        ]);
+        let f = 15.0;
+        let fps = 30.0;
+        let expected_vel = (cubic.evaluate(f + 0.01 * fps) - cubic.evaluate(f - 0.01 * fps)) / 0.02;
+        assert!(approx_eq(cubic.velocity(f, fps), expected_vel, 1e-12));
     }
 }
