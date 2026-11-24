@@ -2595,3 +2595,207 @@ fn reverse_clip_preserves_hold_segment_interior() {
         "reversed Hold end frame 20 must equal 0.0"
     );
 }
+
+#[test]
+fn codex_round3_precompose_solo_exact_fps_scoped_shadow_freeze_coercion_and_short_hold() {
+    // 1. Precompose preserves solo state on extracted tracks & uses exact_fps on replacement time_curve
+    //    AND scoped `function f(frame) { return frame; } f(1) + frame` still offsets outer `frame`.
+    let mut project = Project::new_cm3_default();
+    project.sequence.fps = 30;
+    project.sequence.exact_fps = Some(29.97);
+    project.sequence.controls.push(zc_project::SequenceControl {
+        id: "ctl-scoped".to_owned(),
+        name: "ScopedExpr".to_owned(),
+        kind: SequenceControlKind::Slider,
+        track: PropertyTrack::number_with_expr(
+            0.0,
+            "function f(frame) { return frame; } f(1) + frame",
+        ),
+        preserved: BTreeMap::new(),
+    });
+    let c_solo_id = Uuid::new_v4();
+    let c_hidden_id = Uuid::new_v4();
+    project.sequence.video_tracks = vec![
+        zc_project::VideoTrack {
+            id: Uuid::new_v4(),
+            name: "V1".to_owned(),
+            enabled: true,
+            solo: true,
+            locked: false,
+            is_3d: false,
+            clips: vec![VideoClip {
+                id: c_solo_id,
+                name: "SoloClip".to_owned(),
+                start: 10.0,
+                length: 30.0,
+                link: None,
+                media: None,
+                time_curve: PropertyTrack::linear_time_curve(30.0, 30),
+                layer: zc_project::Layer::new(
+                    "SoloClip",
+                    LayerKind::Shape2D { shapes: Vec::new() },
+                    [1920, 1080],
+                ),
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        },
+        zc_project::VideoTrack {
+            id: Uuid::new_v4(),
+            name: "V2".to_owned(),
+            enabled: true,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![VideoClip {
+                id: c_hidden_id,
+                name: "HiddenClip".to_owned(),
+                start: 10.0,
+                length: 30.0,
+                link: None,
+                media: None,
+                time_curve: PropertyTrack::linear_time_curve(30.0, 30),
+                layer: zc_project::Layer::new(
+                    "HiddenClip",
+                    LayerKind::Shape2D { shapes: Vec::new() },
+                    [1920, 1080],
+                ),
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        },
+    ];
+
+    let mut session = Session::from_project(project, PluginRegistry::new());
+    let _ = session.plugins.enable("expressions-plus");
+
+    let precomp_res = session
+        .execute(Command::PrecomposeClips {
+            clip_ids: vec![c_solo_id, c_hidden_id],
+            name: "SoloComp".to_owned(),
+        })
+        .unwrap();
+    let comp_id = Uuid::parse_str(precomp_res["comp_id"].as_str().unwrap()).unwrap();
+    let precomp_clip_id = Uuid::parse_str(precomp_res["clip_id"].as_str().unwrap()).unwrap();
+
+    let proj = session.to_project();
+    let child = proj.compositions.get(&comp_id).expect("child comp exists");
+    // Extracted child tracks must preserve their solo flags so hidden non-soloed clip stays hidden.
+    assert!(child.video_tracks.iter().any(|t| t.solo));
+    assert!(child.video_tracks.iter().any(|t| !t.solo));
+
+    // Replacement clip time_curve end must use exact_fps (30.0 / 29.97), not 30.0 / 30.0.
+    let rep_clip = proj
+        .sequence
+        .video_tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .find(|c| c.id == precomp_clip_id)
+        .expect("replacement clip exists");
+    let end_sec = rep_clip
+        .time_curve
+        .keyframes
+        .last()
+        .and_then(|k| k.value.as_f64())
+        .unwrap();
+    assert!(
+        (end_sec - (30.0 / 29.97)).abs() < 1e-6,
+        "replacement time_curve must use exact_fps 29.97, got {end_sec}"
+    );
+
+    // Scoped shadow: `function f(frame) { return frame; } f(1) + frame` must offset ONLY outer `frame`.
+    let rewritten = child.controls[0].track.expression.as_deref().unwrap();
+    assert!(
+        rewritten.contains("function f(frame) { return frame; }")
+            && rewritten.contains("(frame + 10.0)"),
+        "expected outer frame rewritten while inner parameter untouched, got `{rewritten}`"
+    );
+
+    // 2. Freeze coercion: numeric slider control whose expression returns string `"2"` must coerce to number `2`.
+    let mut s2 = Session::new();
+    let _ = s2.plugins.enable("expressions-plus");
+    let vt = s2.document().video_tracks[0].id.clone();
+    let cid_str = s2
+        .execute(Command::AddClip {
+            track_id: vt,
+            kind: "video".to_owned(),
+            name: Some("CoerceClip".to_owned()),
+            start: 0.0,
+            length: 20.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cid = Uuid::parse_str(&cid_str).unwrap();
+    let mut p2 = s2.to_project();
+    p2.sequence.controls.push(zc_project::SequenceControl {
+        id: "ctl-speed".to_owned(),
+        name: "Speed".to_owned(),
+        kind: SequenceControlKind::Slider,
+        track: PropertyTrack::number_with_expr(1.0, "\"2\""),
+        preserved: BTreeMap::new(),
+    });
+    p2.sequence.video_tracks[0].clips[0].time_curve.expression =
+        Some("control(\"Speed\") === 2 ? 5 : 1".to_owned());
+    let mut s2 = Session::from_project(p2, s2.plugins);
+    let frozen = s2
+        .execute(Command::FreezeClipFrame {
+            clip_id: cid,
+            frame: 5.0,
+        })
+        .unwrap()["frozen_time"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (frozen - 5.0).abs() < 1e-9,
+        "FreezeClipFrame must coerce numeric slider expression `\"2\"` to 2, got {frozen}"
+    );
+
+    // 3. Short Hold segment (0.00015 frames) still reverses interior to original left value (0.0).
+    let mut s3 = Session::new();
+    let vt3 = s3.document().video_tracks[0].id.clone();
+    let cid3_str = s3
+        .execute(Command::AddClip {
+            track_id: vt3,
+            kind: "video".to_owned(),
+            name: Some("ShortHold".to_owned()),
+            start: 0.0,
+            length: 1.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cid3 = Uuid::parse_str(&cid3_str).unwrap();
+    s3.execute(Command::SetKeyframe {
+        target_id: cid3_str.clone(),
+        property: "time".to_owned(),
+        frame: 0.5,
+        value: json!(0.0),
+        tween: Some(1),
+    })
+    .unwrap();
+    s3.execute(Command::SetKeyframe {
+        target_id: cid3_str.clone(),
+        property: "time".to_owned(),
+        frame: 0.50015,
+        value: json!(10.0),
+        tween: Some(0),
+    })
+    .unwrap();
+    s3.execute(Command::ReverseClip { clip_id: cid3 }).unwrap();
+    // Reversed interval is [1.0 - 0.50015, 1.0 - 0.5] = [0.49985, 0.5]; midpoint 0.499925 must be 0.0.
+    let mid_val = s3
+        .execute(Command::FreezeClipFrame {
+            clip_id: cid3,
+            frame: 0.499925,
+        })
+        .unwrap()["frozen_time"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (mid_val - 0.0).abs() < 1e-9,
+        "short Hold segment (0.00015f) reversed midpoint must evaluate to 0.0, got {mid_val}"
+    );
+}

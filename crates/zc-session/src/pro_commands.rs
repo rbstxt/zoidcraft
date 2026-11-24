@@ -1048,7 +1048,7 @@ impl Session {
                         id: fresh_vtrack_ids[idx],
                         name: format!("V{}", new_vtracks.len() + 1),
                         enabled: vt.enabled,
-                        solo: false,
+                        solo: vt.solo,
                         locked: false,
                         is_3d: vt.is_3d,
                         clips: extracted,
@@ -1072,7 +1072,7 @@ impl Session {
                         name: format!("A{}", new_atracks.len() + 1),
                         enabled: at.enabled,
                         muted: at.muted,
-                        solo: false,
+                        solo: at.solo,
                         locked: false,
                         clips: extracted,
                         preserved: BTreeMap::new(),
@@ -1164,6 +1164,13 @@ impl Session {
                 resolution,
             );
             layer.id = precomp_layer_id;
+            let mut time_curve = zc_project::PropertyTrack::linear_time_curve(span, fps);
+            // Match `exact_fps` (e.g. 29.97 / 23.976 / 59.94) so the replacement PrecompRef
+            // clip advances 1:1 with child frames without fractional-FPS playback drift.
+            let exact_end_sec = span / effective_fps.max(1.0);
+            if let Some(last_kf) = time_curve.keyframes.last_mut() {
+                last_kf.value = zc_project::PropertyValue::Number(exact_end_sec);
+            }
             let precomp_clip = zc_project::VideoClip {
                 id: precomp_clip_id,
                 name: trimmed.to_owned(),
@@ -1171,7 +1178,7 @@ impl Session {
                 length: span,
                 link: None,
                 media: None,
-                time_curve: zc_project::PropertyTrack::linear_time_curve(span, fps),
+                time_curve,
                 layer,
                 preserved: BTreeMap::new(),
             };
@@ -2213,18 +2220,20 @@ fn reverse_session_keyframes(keyframes: &mut Vec<SessionKeyframe>, duration: f64
             let seg_len = orig_right.frame - orig_left.frame;
             if is_hold_tween(orig_right.tween)
                 && orig_left.value != orig_right.value
-                && seg_len > 2e-4
+                && seg_len > 1e-12
             {
                 // Forward Hold `[t0: v0, t1: v1 (Hold)]` evaluates to `v0` throughout `[t0, t1)`
                 // and jumps to `v1` at `t1`. When reversed to `[d - t1, d - t0]`, keep `v1` at
-                // `new_start` and step to `v0` at `new_start + 1e-4` so the entire reversed
-                // segment interior evaluates to `v0`.
+                // `new_start` and step to `v0` immediately after `new_start` (scaled for short
+                // intervals) so the entire reversed segment interior evaluates to `v0`.
                 let new_start = duration - orig_right.frame;
-                let step_frame = (new_start + 1e-4).min(new_frame - 1e-6);
-                if reversed
-                    .last()
-                    .is_none_or(|prev: &SessionKeyframe| (step_frame - prev.frame).abs() > 1e-9)
-                    && (new_frame - step_frame).abs() > 1e-9
+                let step_offset = (seg_len * 0.25).min(1e-4);
+                let step_frame = new_start + step_offset;
+                if step_frame > new_start
+                    && step_frame < new_frame
+                    && reversed
+                        .last()
+                        .is_none_or(|prev: &SessionKeyframe| step_frame > prev.frame)
                 {
                     let mut step_kf = orig_left.clone();
                     step_kf.frame = step_frame;
@@ -2270,31 +2279,184 @@ fn offset_expr_time_origin(expr: &str, frame_offset: f64, fps: f64) -> String {
         format!("(time - {:?})", -time_offset)
     };
 
-    // Detect if the expression explicitly shadows `frame` or `time` via declaration or parameter.
-    let mut shadows_frame = false;
-    let mut shadows_time = false;
-    let mut i = 0;
-    while i < tokens.len() {
+    // Track lexical scopes so local parameters/bindings (`function f(frame) { return frame; }`,
+    // `(time) => time + 1`, `{ let frame = 0; ... }`) shadow `frame`/`time` ONLY inside their
+    // own scope without suppressing outer references.
+    #[derive(Clone, Copy)]
+    struct ScopeFrame {
+        shadows_frame: bool,
+        shadows_time: bool,
+        is_expr_arrow: bool,
+        expr_paren_depth: usize,
+        expr_bracket_depth: usize,
+    }
+    let mut scopes = vec![ScopeFrame {
+        shadows_frame: false,
+        shadows_time: false,
+        is_expr_arrow: false,
+        expr_paren_depth: 0,
+        expr_bracket_depth: 0,
+    }];
+    let mut pending_block_shadow: Option<(bool, bool)> = None;
+    let mut skip_param_until: usize = 0;
+    let mut replacements: Vec<(usize, usize, &str)> = Vec::new();
+
+    for (idx, tok) in tokens.iter().enumerate() {
         use zc_expr::lexer::TokenKind;
-        match &tokens[i].kind {
+
+        // Close any expression-bodied arrow scopes terminated by outer delimiters.
+        while let Some(top) = scopes.last_mut() {
+            if !top.is_expr_arrow {
+                break;
+            }
+            let closes_arrow = top.expr_paren_depth == 0
+                && top.expr_bracket_depth == 0
+                && matches!(
+                    tok.kind,
+                    TokenKind::Semicolon
+                        | TokenKind::Comma
+                        | TokenKind::RParen
+                        | TokenKind::RBracket
+                        | TokenKind::RBrace
+                );
+            if closes_arrow {
+                scopes.pop();
+            } else {
+                break;
+            }
+        }
+
+        if idx < skip_param_until {
+            continue;
+        }
+
+        match &tok.kind {
+            TokenKind::LBrace => {
+                let (sf, st) = pending_block_shadow.take().unwrap_or((false, false));
+                scopes.push(ScopeFrame {
+                    shadows_frame: sf,
+                    shadows_time: st,
+                    is_expr_arrow: false,
+                    expr_paren_depth: 0,
+                    expr_bracket_depth: 0,
+                });
+                continue;
+            }
+            TokenKind::RBrace => {
+                if scopes.len() > 1 {
+                    scopes.pop();
+                }
+                continue;
+            }
+            TokenKind::LParen => {
+                // Check for arrow parameter list `(a, frame) => ...`
+                let mut depth = 0usize;
+                let mut k = idx;
+                let mut param_sf = false;
+                let mut param_st = false;
+                let mut valid_params = true;
+                while k < tokens.len() {
+                    match &tokens[k].kind {
+                        TokenKind::LParen => depth += 1,
+                        TokenKind::RParen => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        TokenKind::Ident(name) if depth == 1 => {
+                            if name == "frame" {
+                                param_sf = true;
+                            } else if name == "time" {
+                                param_st = true;
+                            }
+                        }
+                        TokenKind::Comma | TokenKind::Eq if depth == 1 => {}
+                        _ if depth == 1 => {
+                            // Still allow default expressions after `=`, only bail on obvious statements.
+                            if matches!(tokens[k].kind, TokenKind::Semicolon) {
+                                valid_params = false;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if valid_params
+                    && k < tokens.len()
+                    && matches!(
+                        tokens.get(k + 1).map(|t| &t.kind),
+                        Some(TokenKind::FatArrow)
+                    )
+                {
+                    if matches!(tokens.get(k + 2).map(|t| &t.kind), Some(TokenKind::LBrace)) {
+                        pending_block_shadow = Some((param_sf, param_st));
+                    } else {
+                        scopes.push(ScopeFrame {
+                            shadows_frame: param_sf,
+                            shadows_time: param_st,
+                            is_expr_arrow: true,
+                            expr_paren_depth: 0,
+                            expr_bracket_depth: 0,
+                        });
+                    }
+                    skip_param_until = k + 2;
+                    continue;
+                }
+                if let Some(top) = scopes.last_mut()
+                    && top.is_expr_arrow
+                {
+                    top.expr_paren_depth += 1;
+                }
+                continue;
+            }
+            TokenKind::RParen => {
+                if let Some(top) = scopes.last_mut()
+                    && top.is_expr_arrow
+                {
+                    top.expr_paren_depth = top.expr_paren_depth.saturating_sub(1);
+                }
+                continue;
+            }
+            TokenKind::LBracket => {
+                if let Some(top) = scopes.last_mut()
+                    && top.is_expr_arrow
+                {
+                    top.expr_bracket_depth += 1;
+                }
+                continue;
+            }
+            TokenKind::RBracket => {
+                if let Some(top) = scopes.last_mut()
+                    && top.is_expr_arrow
+                {
+                    top.expr_bracket_depth = top.expr_bracket_depth.saturating_sub(1);
+                }
+                continue;
+            }
             TokenKind::Var | TokenKind::Let | TokenKind::Const => {
-                if let Some(tok) = tokens.get(i + 1)
-                    && let TokenKind::Ident(name) = &tok.kind
+                if let Some(next_tok) = tokens.get(idx + 1)
+                    && let TokenKind::Ident(name) = &next_tok.kind
+                    && let Some(top) = scopes.last_mut()
                 {
                     if name == "frame" {
-                        shadows_frame = true;
+                        top.shadows_frame = true;
                     } else if name == "time" {
-                        shadows_time = true;
+                        top.shadows_time = true;
                     }
                 }
+                continue;
             }
             TokenKind::Function => {
-                let mut k = i + 1;
+                let mut k = idx + 1;
                 if matches!(tokens.get(k).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
                     k += 1;
                 }
                 if matches!(tokens.get(k).map(|t| &t.kind), Some(TokenKind::LParen)) {
                     let mut depth = 0usize;
+                    let mut param_sf = false;
+                    let mut param_st = false;
                     while k < tokens.len() {
                         match &tokens[k].kind {
                             TokenKind::LParen => depth += 1,
@@ -2306,43 +2468,56 @@ fn offset_expr_time_origin(expr: &str, frame_offset: f64, fps: f64) -> String {
                             }
                             TokenKind::Ident(name) if depth == 1 => {
                                 if name == "frame" {
-                                    shadows_frame = true;
+                                    param_sf = true;
                                 } else if name == "time" {
-                                    shadows_time = true;
+                                    param_st = true;
                                 }
                             }
                             _ => {}
                         }
                         k += 1;
                     }
+                    pending_block_shadow = Some((param_sf, param_st));
+                    skip_param_until = k + 1;
                 }
+                continue;
             }
             TokenKind::Ident(name)
                 if matches!(
-                    tokens.get(i + 1).map(|t| &t.kind),
+                    tokens.get(idx + 1).map(|t| &t.kind),
                     Some(TokenKind::FatArrow)
                 ) =>
             {
-                if name == "frame" {
-                    shadows_frame = true;
-                } else if name == "time" {
-                    shadows_time = true;
+                let param_sf = name == "frame";
+                let param_st = name == "time";
+                if matches!(
+                    tokens.get(idx + 2).map(|t| &t.kind),
+                    Some(TokenKind::LBrace)
+                ) {
+                    pending_block_shadow = Some((param_sf, param_st));
+                } else {
+                    scopes.push(ScopeFrame {
+                        shadows_frame: param_sf,
+                        shadows_time: param_st,
+                        is_expr_arrow: true,
+                        expr_paren_depth: 0,
+                        expr_bracket_depth: 0,
+                    });
                 }
+                skip_param_until = idx + 2;
+                continue;
             }
             _ => {}
         }
-        i += 1;
-    }
 
-    let mut replacements: Vec<(usize, usize, &str)> = Vec::new();
-    for (idx, tok) in tokens.iter().enumerate() {
-        use zc_expr::lexer::TokenKind;
         let TokenKind::Ident(name) = &tok.kind else {
             continue;
         };
-        let repl = if name == "frame" && !shadows_frame {
+        let is_frame_shadowed = scopes.iter().any(|s| s.shadows_frame);
+        let is_time_shadowed = scopes.iter().any(|s| s.shadows_time);
+        let repl = if name == "frame" && !is_frame_shadowed {
             frame_repl.as_str()
-        } else if name == "time" && !shadows_time {
+        } else if name == "time" && !is_time_shadowed {
             time_repl.as_str()
         } else {
             continue;
@@ -2741,7 +2916,11 @@ impl<'a> FreezeExprState<'a> {
                 }
                 return Ok(base_value);
             }
-            return Ok(outcome.value);
+            return Ok(coerce_expr_value_to_track_type(
+                &outcome.value,
+                &track.value,
+                &base_value,
+            ));
         }
 
         Ok(base_value)
@@ -2769,6 +2948,130 @@ impl<'a> FreezeExprState<'a> {
             };
         }
         Ok(expr_val)
+    }
+}
+
+/// Coerces an evaluated expression value to match the target `PropertyTrack`'s expected type,
+/// mirroring `zc_render::engine::coerce_expr_value` so Freeze evaluation matches preview 1:1.
+fn coerce_expr_value_to_track_type(
+    expr: &zc_expr::Value,
+    template: &zc_project::PropertyValue,
+    fallback: &zc_expr::Value,
+) -> zc_expr::Value {
+    use zc_project::PropertyValue;
+    match template {
+        PropertyValue::Number(_) => {
+            let n = expr.to_number();
+            if n.is_finite() {
+                zc_expr::Value::Number(n)
+            } else {
+                fallback.clone()
+            }
+        }
+        PropertyValue::Option(_) => {
+            let n = expr.to_number();
+            if n.is_finite() && n >= 0.0 {
+                zc_expr::Value::Number(n.round())
+            } else {
+                fallback.clone()
+            }
+        }
+        PropertyValue::Bool(_) => zc_expr::Value::Bool(expr.to_bool()),
+        PropertyValue::Vec2(def) => {
+            if let Some(arr) = expr.as_f64_vec() {
+                zc_expr::Value::Array(vec![
+                    zc_expr::Value::Number(
+                        arr.first()
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(def[0]),
+                    ),
+                    zc_expr::Value::Number(
+                        arr.get(1)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(def[1]),
+                    ),
+                ])
+            } else if let Some(n) = expr.as_f64().filter(|v| v.is_finite()) {
+                zc_expr::Value::Array(vec![zc_expr::Value::Number(n), zc_expr::Value::Number(n)])
+            } else {
+                fallback.clone()
+            }
+        }
+        PropertyValue::Vec3(def) | PropertyValue::Color(def) => {
+            if let Some(arr) = expr.as_f64_vec() {
+                zc_expr::Value::Array(vec![
+                    zc_expr::Value::Number(
+                        arr.first()
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(def[0]),
+                    ),
+                    zc_expr::Value::Number(
+                        arr.get(1)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(def[1]),
+                    ),
+                    zc_expr::Value::Number(
+                        arr.get(2)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(def[2]),
+                    ),
+                ])
+            } else if let Some(n) = expr.as_f64().filter(|v| v.is_finite()) {
+                zc_expr::Value::Array(vec![
+                    zc_expr::Value::Number(n),
+                    zc_expr::Value::Number(n),
+                    zc_expr::Value::Number(n),
+                ])
+            } else {
+                fallback.clone()
+            }
+        }
+        PropertyValue::Vec4(def) | PropertyValue::ColorRgba(def) => {
+            if let Some(arr) = expr.as_f64_vec() {
+                zc_expr::Value::Array(vec![
+                    zc_expr::Value::Number(
+                        arr.first()
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(def[0]),
+                    ),
+                    zc_expr::Value::Number(
+                        arr.get(1)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(def[1]),
+                    ),
+                    zc_expr::Value::Number(
+                        arr.get(2)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(def[2]),
+                    ),
+                    zc_expr::Value::Number(
+                        arr.get(3)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(def[3]),
+                    ),
+                ])
+            } else if let Some(n) = expr.as_f64().filter(|v| v.is_finite()) {
+                zc_expr::Value::Array(vec![
+                    zc_expr::Value::Number(n),
+                    zc_expr::Value::Number(n),
+                    zc_expr::Value::Number(n),
+                    zc_expr::Value::Number(n),
+                ])
+            } else {
+                fallback.clone()
+            }
+        }
+        PropertyValue::Text(_) => zc_expr::Value::String(expr.to_js_string()),
+        _ => expr.clone(),
     }
 }
 

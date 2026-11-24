@@ -581,9 +581,20 @@ fn promote_active_composition_for_export(
     let Some(comp_id) = active_composition_id.and_then(|s| Uuid::parse_str(s).ok()) else {
         return;
     };
-    let Some(comp_seq) = project.compositions.remove(&comp_id) else {
+    let Some(mut comp_seq) = project.compositions.remove(&comp_id) else {
         return;
     };
+    // Preserve root-only sequence controls as fallbacks so child expressions referencing
+    // root controls by stable ID or name continue to resolve after swapping `project.sequence`.
+    for root_ctl in &project.sequence.controls {
+        let already_defined = comp_seq
+            .controls
+            .iter()
+            .any(|c| c.id == root_ctl.id || c.name == root_ctl.name);
+        if !already_defined {
+            comp_seq.controls.push(root_ctl.clone());
+        }
+    }
     let prev_root = std::mem::replace(&mut project.sequence, comp_seq);
     project.compositions.insert(prev_root.id, prev_root);
 }
@@ -6948,6 +6959,37 @@ mod tests {
         assert!(
             (mid[0] - 0.25).abs() < 0.02 && (mid[1] - 0.25).abs() < 0.02,
             "exported audio must mix child composition (~0.25), not root (~0.80), got {mid:?}"
+        );
+    }
+
+    #[test]
+    fn promote_active_composition_preserves_root_only_controls_as_fallback() {
+        let mut project = Project::new_cm3_default();
+        let root_ctrl = zc_project::SequenceControl {
+            id: "ctl-global-gain".to_owned(),
+            name: "GlobalGain".to_owned(),
+            kind: zc_project::SequenceControlKind::Slider,
+            track: zc_project::PropertyTrack::constant(zc_project::PropertyValue::Number(0.75)),
+            preserved: BTreeMap::new(),
+        };
+        project.sequence.controls.push(root_ctrl);
+
+        let mut child = Project::new_cm3_default().sequence;
+        let child_id = Uuid::new_v4();
+        child.id = child_id;
+        child.name = "Child".to_owned();
+        child.controls.clear();
+        project.compositions.insert(child_id, child);
+
+        promote_active_composition_for_export(&mut project, Some(&child_id.to_string()));
+        assert_eq!(project.sequence.id, child_id);
+        assert!(
+            project
+                .sequence
+                .controls
+                .iter()
+                .any(|c| c.id == "ctl-global-gain" && c.name == "GlobalGain"),
+            "promoted child export must retain root-only sequence controls as fallbacks"
         );
     }
 }
