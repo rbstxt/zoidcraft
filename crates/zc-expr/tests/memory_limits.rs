@@ -466,4 +466,27 @@ fn rejects_string_repeat_concat_array_and_dag_export_memory_bombs() {
         matches!(err, ExprError::RangeError(_)),
         "expected RangeError for recursive array literal spread, got {err:?}"
     );
+
+    // 28. Distinct large BuiltinFn equality checks must charge byte work (and ASCII vertical tab
+    // whitespace in numeric coercion must remain preserved).
+    let bfn_t0 = std::time::Instant::now();
+    let err = eval(
+        r#"var k = "x".repeat(10000).repeat(400); var a = Math[k]; var b = Math[k]; var n = 0; for (var i = 0; i < 1000000; i++) { if (a === b) n++; } n"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("repeated equality of distinct 4 MiB BuiltinFn names must hit StepLimitExceeded");
+    assert!(
+        matches!(err, ExprError::StepLimitExceeded { .. }),
+        "expected StepLimitExceeded for BuiltinFn equality scan loop, got {err:?}"
+    );
+    assert!(
+        bfn_t0.elapsed() < std::time::Duration::from_secs(5),
+        "BuiltinFn equality scan loop took too long: {:?}",
+        bfn_t0.elapsed()
+    );
+
+    let vt = eval("+\"\\u000B5\"", &ctx, &cfg)
+        .expect("vertical-tab ASCII numeric coercion should succeed");
+    assert_eq!(vt, zc_expr::Value::Number(5.0));
 }

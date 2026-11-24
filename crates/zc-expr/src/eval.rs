@@ -664,7 +664,18 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             RuntimeValue::String(s) => {
                 self.charge_byte_work(s.len())?;
                 let t = if s.is_ascii {
-                    s.as_str().trim_ascii()
+                    let bytes = s.as_bytes();
+                    let is_js_ascii_ws =
+                        |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C);
+                    let start = bytes
+                        .iter()
+                        .position(|&b| !is_js_ascii_ws(b))
+                        .unwrap_or(bytes.len());
+                    let end = bytes[start..]
+                        .iter()
+                        .rposition(|&b| !is_js_ascii_ws(b))
+                        .map_or(start, |i| start + i + 1);
+                    &s.as_str()[start..end]
                 } else {
                     s.trim()
                 };
@@ -2298,7 +2309,16 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             (RuntimeValue::Array(x), RuntimeValue::Array(y)) => x == y,
             (RuntimeValue::Object(x), RuntimeValue::Object(y)) => x == y,
             (RuntimeValue::Closure(x), RuntimeValue::Closure(y)) => x == y,
-            (RuntimeValue::BuiltinFn(x), RuntimeValue::BuiltinFn(y)) => x == y,
+            (RuntimeValue::BuiltinFn(x), RuntimeValue::BuiltinFn(y)) => {
+                if Rc::ptr_eq(&x, &y) {
+                    true
+                } else if x.len() != y.len() {
+                    false
+                } else {
+                    self.charge_byte_work(x.len())?;
+                    x == y
+                }
+            }
             (RuntimeValue::Handle(x), RuntimeValue::Handle(y)) => x == y,
             _ => false,
         })
