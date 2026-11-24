@@ -23,17 +23,25 @@ use crate::settings::{
 };
 use crate::temp_audio::{TempFileGuard, unique_sibling_temp_path, write_temp_stereo_wav_f32};
 
-/// Shared handle to a spawned FFmpeg child process that allows a cancel-watcher thread
-/// to kill a stalled child while guaranteeing the child is always reaped (`wait()`) on
-/// drop/error/cancel/panic (zero zombies, zero leaked descriptors).
+/// Shared handle to a spawned FFmpeg child process that allows cooperative exit polling
+/// and cancellation killing while guaranteeing the child is always reaped (`wait()`) on
+/// drop/error/cancel/panic (zero zombies, zero leaked descriptors, zero signals after reaping).
+struct ChildState {
+    child: Option<Child>,
+    exited: Option<ExitStatus>,
+}
+
 struct SharedChildGuard {
-    child: Arc<Mutex<Option<Child>>>,
+    state: Arc<Mutex<ChildState>>,
 }
 
 impl SharedChildGuard {
     fn new(child: Child) -> Self {
         Self {
-            child: Arc::new(Mutex::new(Some(child))),
+            state: Arc::new(Mutex::new(ChildState {
+                child: Some(child),
+                exited: None,
+            })),
         }
     }
 
@@ -41,12 +49,31 @@ impl SharedChildGuard {
     /// Never signals any numeric PID/PGID after the child has been reaped (preventing PID/PGID reuse kills).
     fn kill_and_reap(&self) {
         let mut guard = self
-            .child
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(mut child) = guard.take() {
+        if let Some(mut child) = guard.child.take() {
             kill_process_tree_and_reap(&mut child);
         }
+    }
+
+    /// Non-blocking check for whether the child has exited, caching its [`ExitStatus`] once reaped.
+    fn try_wait_cached(&self) -> Result<Option<ExitStatus>, ExportError> {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(status) = guard.exited {
+            return Ok(Some(status));
+        }
+        if let Some(child) = guard.child.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            guard.exited = Some(status);
+            let _ = guard.child.take();
+            return Ok(Some(status));
+        }
+        Ok(None)
     }
 
     /// Waits cooperatively for child exit while polling `cancel` every 10 ms so
@@ -57,17 +84,16 @@ impl SharedChildGuard {
                 self.kill_and_reap();
                 return Err(ExportError::Cancelled);
             }
+            if let Some(status) = self.try_wait_cached()? {
+                return Ok(status);
+            }
             {
-                let mut guard = self
-                    .child
+                let guard = self
+                    .state
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner());
-                let Some(child) = guard.as_mut() else {
+                if guard.child.is_none() {
                     return Err(ExportError::Cancelled);
-                };
-                if let Some(status) = child.try_wait()? {
-                    let _ = guard.take();
-                    return Ok(status);
                 }
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -350,24 +376,49 @@ where
 
     let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
     let mut cmd = Command::new(bin);
-    cmd.args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    configure_process_group(&mut cmd);
+    cmd.args(&args).stdout(Stdio::null()).stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|err| {
-        if err.kind() == ErrorKind::NotFound {
-            ExportError::FfmpegNotFound(bin.display().to_string())
-        } else {
-            ExportError::Io(err)
-        }
-    })?;
+    // On Unix, connect FFmpeg's stdin via a SOCK_STREAM UnixStream pair with a bounded
+    // write timeout so the writer thread can always interrupt a blocked write and release
+    // its descriptor and frame buffer if FFmpeg exits early while a descendant holds stdin.
+    #[cfg(unix)]
+    let (mut child, stdin_writer): (Child, Box<dyn Write + Send>) = {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
 
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdin")))?;
+        let (read_sock, write_sock) = UnixStream::pair()?;
+        write_sock.set_write_timeout(Some(Duration::from_millis(50)))?;
+        cmd.stdin(Stdio::from(OwnedFd::from(read_sock)));
+        configure_process_group(&mut cmd);
+
+        let child = cmd.spawn().map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                ExportError::FfmpegNotFound(bin.display().to_string())
+            } else {
+                ExportError::Io(err)
+            }
+        })?;
+        (child, Box::new(write_sock))
+    };
+
+    #[cfg(not(unix))]
+    let (mut child, stdin_writer): (Child, Box<dyn Write + Send>) = {
+        cmd.stdin(Stdio::piped());
+        configure_process_group(&mut cmd);
+
+        let mut child = cmd.spawn().map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                ExportError::FfmpegNotFound(bin.display().to_string())
+            } else {
+                ExportError::Io(err)
+            }
+        })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdin"))
+        })?;
+        (child, Box::new(stdin))
+    };
+
     let stderr = child
         .stderr
         .take()
@@ -376,9 +427,7 @@ where
     let total_frames = settings.total_frames();
 
     // Stage B: Stream frames to FFmpeg over a dedicated stdin writer thread and drain stderr
-    // on a dedicated reader thread. Because the child leads its own process group (Unix) or is
-    // terminated with `/T` (Windows), killing the process tree closes all inherited pipes so
-    // both worker threads exit cleanly and are joined before returning.
+    // on a dedicated reader thread.
     let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
     let stderr_handle = std::thread::spawn(move || {
         let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
@@ -389,12 +438,16 @@ where
     enum WriterOutcome {
         Ok(u32),
         BrokenPipe(u32),
+        Aborted(u32),
         Io(std::io::Error),
     }
 
     let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u8>>(2);
     let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(2);
     let (writer_done_tx, writer_done_rx) = mpsc::channel::<WriterOutcome>();
+    let writer_abort = Arc::new(AtomicBool::new(false));
+    let writer_abort_clone = Arc::clone(&writer_abort);
+    let cancel_writer = Arc::clone(cancel);
 
     // Pre-seed two reusable payload buffers for zero-allocation steady-state streaming.
     let payload_bytes = if needs_padding {
@@ -406,31 +459,66 @@ where
     let _ = recycle_tx.send(vec![0_u8; payload_bytes]);
 
     let writer_handle = std::thread::spawn(move || {
-        let mut stdin_pipe = stdin;
+        let mut stdin_pipe = stdin_writer;
         let mut broken_pipe = false;
+        let mut aborted = false;
         let mut frames_written = 0_u32;
         while let Ok(buf) = frame_rx.recv() {
-            if let Err(err) = stdin_pipe.write_all(&buf) {
-                if err.kind() == ErrorKind::BrokenPipe {
-                    broken_pipe = true;
+            let mut written = 0_usize;
+            while written < buf.len() {
+                if writer_abort_clone.load(Ordering::Acquire)
+                    || cancel_writer.load(Ordering::Acquire)
+                {
+                    aborted = true;
                     break;
                 }
-                let _ = writer_done_tx.send(WriterOutcome::Io(err));
-                return;
+                match stdin_pipe.write(&buf[written..]) {
+                    Ok(0) => {
+                        broken_pipe = true;
+                        break;
+                    }
+                    Ok(n) => written += n,
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(err) if err.kind() == ErrorKind::BrokenPipe => {
+                        broken_pipe = true;
+                        break;
+                    }
+                    Err(err) => {
+                        drop(stdin_pipe);
+                        let _ = writer_done_tx.send(WriterOutcome::Io(err));
+                        return;
+                    }
+                }
+            }
+            if aborted || broken_pipe {
+                break;
             }
             frames_written = frames_written.saturating_add(1);
             let _ = recycle_tx.try_send(buf);
         }
-        if !broken_pipe && let Err(err) = stdin_pipe.flush() {
+        if !aborted
+            && !broken_pipe
+            && let Err(err) = stdin_pipe.flush()
+        {
             if err.kind() == ErrorKind::BrokenPipe {
                 broken_pipe = true;
-            } else {
+            } else if !matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
+                drop(stdin_pipe);
                 let _ = writer_done_tx.send(WriterOutcome::Io(err));
                 return;
             }
         }
         drop(stdin_pipe);
-        let outcome = if broken_pipe {
+        let outcome = if aborted {
+            WriterOutcome::Aborted(frames_written)
+        } else if broken_pipe {
             WriterOutcome::BrokenPipe(frames_written)
         } else {
             WriterOutcome::Ok(frames_written)
@@ -447,21 +535,26 @@ where
     let result = (|| -> Result<(), ExportError> {
         let mut frame_tx_opt = Some(frame_tx);
         let mut writer_outcome: Option<WriterOutcome> = None;
+        let mut child_exited_at: Option<std::time::Instant> = None;
+        const CHILD_EXIT_WRITER_GRACE: Duration = Duration::from_millis(250);
 
         for (offset, frame_index) in (settings.start_frame..settings.end_frame).enumerate() {
             if cancel.load(Ordering::Acquire) {
+                writer_abort.store(true, Ordering::Release);
                 drop(frame_tx_opt.take());
                 child_guard.kill_and_reap();
                 return Err(ExportError::Cancelled);
             }
 
             if let Err(err) = frame_provider.render_frame(frame_index, &mut raw_frame) {
+                writer_abort.store(true, Ordering::Release);
                 drop(frame_tx_opt.take());
                 child_guard.kill_and_reap();
                 return Err(err);
             }
 
             if raw_frame.len() != raw_bytes {
+                writer_abort.store(true, Ordering::Release);
                 drop(frame_tx_opt.take());
                 child_guard.kill_and_reap();
                 return Err(ExportError::InvalidFrameSize {
@@ -472,14 +565,16 @@ where
             }
 
             if cancel.load(Ordering::Acquire) {
+                writer_abort.store(true, Ordering::Release);
                 drop(frame_tx_opt.take());
                 child_guard.kill_and_reap();
                 return Err(ExportError::Cancelled);
             }
 
-            // Acquire a recycled payload buffer cooperatively while checking `cancel`.
+            // Acquire a recycled payload buffer cooperatively while checking `cancel` and early child exit.
             let mut payload_buf = loop {
                 if cancel.load(Ordering::Acquire) {
+                    writer_abort.store(true, Ordering::Release);
                     drop(frame_tx_opt.take());
                     child_guard.kill_and_reap();
                     return Err(ExportError::Cancelled);
@@ -501,13 +596,22 @@ where
                                 }
                             }
                         }
+                        if child_guard.try_wait_cached()?.is_some() {
+                            let exited_at =
+                                *child_exited_at.get_or_insert_with(std::time::Instant::now);
+                            if exited_at.elapsed() >= CHILD_EXIT_WRITER_GRACE {
+                                writer_abort.store(true, Ordering::Release);
+                                drop(frame_tx_opt.take());
+                                break Vec::new();
+                            }
+                        }
                     }
                     Err(RecvTimeoutError::Disconnected) => break Vec::new(),
                 }
             };
 
             if payload_buf.is_empty() {
-                // Writer exited early (e.g., FFmpeg closed stdin); break to collect status/stderr.
+                // Writer exited early or child exited while stdin remained blocked; collect status/stderr.
                 break;
             }
 
@@ -524,12 +628,13 @@ where
                 payload_buf.extend_from_slice(&raw_frame);
             }
 
-            // Deliver frame to the writer thread without ever blocking indefinitely on cancel.
+            // Deliver frame to the writer thread without blocking indefinitely on cancel or early child exit.
             if let Some(tx) = frame_tx_opt.as_ref() {
                 let mut pending = payload_buf;
                 let mut disconnected = false;
                 loop {
                     if cancel.load(Ordering::Acquire) {
+                        writer_abort.store(true, Ordering::Release);
                         drop(frame_tx_opt.take());
                         child_guard.kill_and_reap();
                         return Err(ExportError::Cancelled);
@@ -538,6 +643,15 @@ where
                         Ok(()) => break,
                         Err(TrySendError::Full(returned)) => {
                             pending = returned;
+                            if child_guard.try_wait_cached()?.is_some() {
+                                let exited_at =
+                                    *child_exited_at.get_or_insert_with(std::time::Instant::now);
+                                if exited_at.elapsed() >= CHILD_EXIT_WRITER_GRACE {
+                                    writer_abort.store(true, Ordering::Release);
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
                             std::thread::sleep(Duration::from_millis(5));
                         }
                         Err(TrySendError::Disconnected(_)) => {
@@ -547,6 +661,7 @@ where
                     }
                 }
                 if disconnected {
+                    drop(frame_tx_opt.take());
                     break;
                 }
             }
@@ -561,10 +676,12 @@ where
         // Close the frame channel so the writer thread flushes and drops FFmpeg's stdin.
         drop(frame_tx_opt.take());
 
-        // Wait cooperatively for the writer thread to finish flushing stdin while honoring `cancel`.
+        // Wait cooperatively for the writer thread to finish flushing stdin while honoring `cancel`
+        // and bounded grace after early child exit (in case a descendant kept stdin open).
         if writer_outcome.is_none() {
             loop {
                 if cancel.load(Ordering::Acquire) {
+                    writer_abort.store(true, Ordering::Release);
                     child_guard.kill_and_reap();
                     return Err(ExportError::Cancelled);
                 }
@@ -579,7 +696,23 @@ where
                         writer_outcome = Some(other);
                         break;
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Timeout) => {
+                        if child_guard.try_wait_cached()?.is_some() {
+                            let exited_at =
+                                *child_exited_at.get_or_insert_with(std::time::Instant::now);
+                            if exited_at.elapsed() >= CHILD_EXIT_WRITER_GRACE {
+                                writer_abort.store(true, Ordering::Release);
+                                // Give the interruptible Unix writer a short window to release its fd/buffer.
+                                if let Ok(outcome) =
+                                    writer_done_rx.recv_timeout(Duration::from_millis(150))
+                                {
+                                    writer_finished = true;
+                                    writer_outcome = Some(outcome);
+                                }
+                                break;
+                            }
+                        }
+                    }
                     Err(RecvTimeoutError::Disconnected) => {
                         writer_finished = true;
                         break;
@@ -588,9 +721,10 @@ where
             }
         }
 
-        let frames_written = match writer_outcome {
-            Some(WriterOutcome::Ok(n) | WriterOutcome::BrokenPipe(n)) => n,
-            _ => 0,
+        let (frames_written, writer_aborted) = match writer_outcome {
+            Some(WriterOutcome::Ok(n) | WriterOutcome::BrokenPipe(n)) => (n, false),
+            Some(WriterOutcome::Aborted(n)) => (n, true),
+            _ => (0, true),
         };
 
         let status = child_guard.wait_cancellable(cancel)?;
@@ -631,7 +765,7 @@ where
             });
         }
 
-        if frames_written != total_frames {
+        if writer_aborted || frames_written != total_frames {
             let detail = if stderr_text.trim().is_empty() {
                 format!(
                     "ffmpeg exited after writing only {frames_written} of {total_frames} frames"
@@ -650,8 +784,9 @@ where
         Ok(())
     })();
 
-    // Kill the process tree ONLY if the child is still live (unreaped); never signal a reaped PID/PGID.
+    // Signal writer abort and kill the process tree ONLY if the child is still live (unreaped).
     if result.is_err() || !writer_finished || !stderr_finished {
+        writer_abort.store(true, Ordering::Release);
         child_guard.kill_and_reap();
     }
     if !writer_finished {

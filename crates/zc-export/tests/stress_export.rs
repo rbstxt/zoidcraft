@@ -480,4 +480,59 @@ fn wrapper_leaving_descendant_holding_pipes_does_not_hang_probe_or_export() {
         res.is_ok(),
         "probe should succeed cleanly after terminating descendant: {res:?}"
     );
+
+    // Export wrapper spawns a descendant that holds stdin open without reading, then exits 0
+    // immediately while frames are larger than the OS pipe buffer (256x256x4 = 256 KiB).
+    let export_wrapper = root.path().join("export_stdin_descendant.sh");
+    fs::write(&export_wrapper, "#!/bin/sh\n(sleep 20 <&0) &\nexit 0\n")
+        .expect("write export wrapper");
+    let mut eperms = fs::metadata(&export_wrapper).expect("meta").permissions();
+    eperms.set_mode(0o755);
+    fs::set_permissions(&export_wrapper, eperms).expect("chmod");
+
+    let dest = root.path().join("blocked_stdin.mp4");
+    let original = b"EXISTING-GOOD-MP4".to_vec();
+    fs::write(&dest, &original).expect("write sentinel");
+
+    let settings = ExportSettings {
+        width: 256,
+        height: 256,
+        fps: 30.0,
+        start_frame: 0,
+        end_frame: 4,
+        container: ExportContainer::Mp4,
+        video_codec: VideoCodec::H264,
+        audio_codec: AudioCodec::None,
+        quality: QualityMode::Crf(23),
+        audio_bitrate_kbps: 128,
+        sample_rate: 48_000,
+        transparent_alpha: false,
+        output_path: dest.clone(),
+        ffmpeg_binary: Some(export_wrapper),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let exp_start = std::time::Instant::now();
+    let err = export_video(
+        &settings,
+        None,
+        &cancel,
+        |frame_idx: u32, buf: &mut Vec<u8>| {
+            fill_gradient(buf, 256, 256, frame_idx);
+            Ok(())
+        },
+    )
+    .expect_err("export with early-exiting wrapper whose descendant holds stdin must fail");
+    let exp_elapsed = exp_start.elapsed();
+    assert!(
+        exp_elapsed < std::time::Duration::from_secs(5),
+        "export hung waiting on stdin held by descendant: {exp_elapsed:?}"
+    );
+    assert!(
+        matches!(err, ExportError::FfmpegFailed { .. }),
+        "expected FfmpegFailed for incomplete export, got {err:?}"
+    );
+    assert_eq!(
+        fs::read(&dest).expect("existing destination must remain intact"),
+        original
+    );
 }

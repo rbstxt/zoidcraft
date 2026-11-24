@@ -267,4 +267,104 @@ fn rejects_string_repeat_concat_array_and_dag_export_memory_bombs() {
         "array reverse loop took too long: {:?}",
         arr_t0.elapsed()
     );
+
+    // 16. Function call spread on 4 MiB strings must preflight MAX_ARRAY_LEN before expanding.
+    let spread_t0 = std::time::Instant::now();
+    let err = eval(
+        r#"var s = "x".repeat(10000).repeat(400); function f(...a) { return a.length; } f(...s, ...s, ...s, ...s)"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("spreading 4 MiB string into call arguments must fail immediately");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for call spread bomb, got {err:?}"
+    );
+    assert!(
+        spread_t0.elapsed() < std::time::Duration::from_secs(2),
+        "call spread rejection took too long: {:?}",
+        spread_t0.elapsed()
+    );
+
+    // 17. Lazy string array destructuring and for..of must be O(1) for prefix/break and reject huge rest.
+    let lazy_t0 = std::time::Instant::now();
+    let res = eval(
+        r#"var s = "x".repeat(10000).repeat(400); var hits = 0; for (var i = 0; i < 1000; i++) { var [c] = s; if (c === "x") hits++; for (var ch of s) { if (ch === "x") hits++; break; } } hits"#,
+        &ctx,
+        &cfg,
+    )
+    .expect("lazy prefix destructuring and break for..of on 4 MiB string should finish fast");
+    assert_eq!(res, zc_expr::Value::Number(2000.0));
+    assert!(
+        lazy_t0.elapsed() < std::time::Duration::from_secs(2),
+        "lazy string destructuring/for..of took too long: {:?}",
+        lazy_t0.elapsed()
+    );
+
+    let err = eval(
+        r#"var s = "x".repeat(10000).repeat(400); var [x, ...rest] = s; rest.length"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("string rest destructuring past MAX_ARRAY_LEN must fail immediately");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for string rest destructuring, got {err:?}"
+    );
+
+    // 18. for..in over an object with a 3 MiB key must charge retained snapshot key bytes.
+    let err = eval(
+        r#"var k = "k".repeat(10000).repeat(300); var o = {}; o[k] = 1; var xs = []; for (var i = 0; i < 40; i++) { for (var p in o) { xs.push(p); } } xs.length"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("for..in key snapshot bomb must exceed 64 MiB heap budget");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for for..in key bomb, got {err:?}"
+    );
+
+    // 19. Catchable JSON.stringify escape expansion and large export loops must charge work and
+    // trip StepLimitExceeded quickly without allocating 24 MB escape buffers.
+    for (label, expr) in [
+        (
+            "JSON.stringify control-char escape loop",
+            r#"var s = String.fromCharCode(0).repeat(10000).repeat(400); for (var i = 0; i < 1000; i++) { try { JSON.stringify(s); } catch (e) {} } 0"#,
+        ),
+        (
+            "JSON.stringify oversized array export loop",
+            r#"var s = "x".repeat(200); var a = Array(50000).fill(s); for (var i = 0; i < 1000; i++) { try { JSON.stringify(a); } catch (e) {} } 0"#,
+        ),
+    ] {
+        let t0 = std::time::Instant::now();
+        let err = eval(expr, &ctx, &cfg)
+            .expect_err(&format!("{label} must trip StepLimitExceeded quickly"));
+        assert!(
+            matches!(err, ExprError::StepLimitExceeded { .. }),
+            "expected StepLimitExceeded for {label}, got {err:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "{label} took too long: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    // 20. Cyclic object with 12 MiB of keys must reject cycle immediately before cloning 128 levels.
+    let cyc_t0 = std::time::Instant::now();
+    let err = eval(
+        r#"var k = "z".repeat(10000).repeat(400); var o = {}; o.a = o; o[k + "1"] = 1; o[k + "2"] = 2; o[k + "3"] = 3; JSON.stringify(o)"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("cyclic object export must fail immediately");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for cyclic object export, got {err:?}"
+    );
+    assert!(
+        cyc_t0.elapsed() < std::time::Duration::from_secs(2),
+        "cyclic object rejection took too long: {:?}",
+        cyc_t0.elapsed()
+    );
 }
