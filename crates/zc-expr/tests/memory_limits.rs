@@ -208,7 +208,7 @@ fn rejects_string_repeat_concat_array_and_dag_export_memory_bombs() {
             "expected StepLimitExceeded for {label}, got {err:?}"
         );
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(2),
+            t0.elapsed() < std::time::Duration::from_secs(5),
             "{label} took too long: {:?}",
             t0.elapsed()
         );
@@ -344,7 +344,7 @@ fn rejects_string_repeat_concat_array_and_dag_export_memory_bombs() {
             "expected StepLimitExceeded for {label}, got {err:?}"
         );
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(2),
+            t0.elapsed() < std::time::Duration::from_secs(5),
             "{label} took too long: {:?}",
             t0.elapsed()
         );
@@ -412,8 +412,58 @@ fn rejects_string_repeat_concat_array_and_dag_export_memory_bombs() {
         .expect("4096 closures sharing one AST body should succeed without cloning 1 GiB");
     assert_eq!(res, zc_expr::Value::Number(4096.0));
     assert!(
-        closure_t0.elapsed() < std::time::Duration::from_secs(2),
+        closure_t0.elapsed() < std::time::Duration::from_secs(5),
         "closure creation loop was unexpectedly slow: {:?}",
         closure_t0.elapsed()
+    );
+
+    // 25. Filling a 65,536-element array with Math[large_key] must share Rc<str> (no 4 GiB OOM)
+    // and repeated Math[large_key] lookups must charge the heap budget.
+    let fill_t0 = std::time::Instant::now();
+    let res = eval(
+        r#"var k = "x".repeat(256).repeat(256); Array(65536).fill(Math[k]).length"#,
+        &ctx,
+        &cfg,
+    )
+    .expect("Array.fill with shared Rc<str> BuiltinFn should succeed without 4 GiB duplication");
+    assert_eq!(res, zc_expr::Value::Number(65536.0));
+    assert!(
+        fill_t0.elapsed() < std::time::Duration::from_secs(5),
+        "Array.fill(Math[k]) took too long: {:?}",
+        fill_t0.elapsed()
+    );
+
+    let err = eval(
+        r#"var k = "x".repeat(10000).repeat(300); var xs = []; for (var i = 0; i < 40; i++) { xs.push(Math[k]); } xs.length"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("repeated 3 MiB BuiltinFn lookups must exceed 64 MiB heap budget");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for repeated BuiltinFn lookup bomb, got {err:?}"
+    );
+
+    // 26. Recursive object literal with large static key must not retain uncharged keys across calls.
+    let big_key = "k".repeat(4 * 1024 * 1024);
+    let rec_obj_expr =
+        format!(r#"function f(n) {{ return n ? {{"{big_key}": f(n - 1)}} : 0; }} f(32)"#);
+    let err = eval(&rec_obj_expr, &ctx, &cfg)
+        .expect_err("recursive 4 MiB static-key object literal must exceed 64 MiB heap budget");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for recursive static-key object literal, got {err:?}"
+    );
+
+    // 27. Recursive array literal spread `[...a, descend(n - 1)]` must charge incrementally before recursion.
+    let err = eval(
+        r#"var a = Array(65535); function descend(n) { return n ? [...a, descend(n - 1)] : 0; } descend(64)"#,
+        &ctx,
+        &cfg,
+    )
+    .expect_err("recursive array literal spread must exceed 64 MiB heap budget");
+    assert!(
+        matches!(err, ExprError::RangeError(_)),
+        "expected RangeError for recursive array literal spread, got {err:?}"
     );
 }

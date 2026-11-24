@@ -132,7 +132,7 @@ enum RuntimeValue {
     Array(usize),
     Object(usize),
     Closure(usize),
-    BuiltinFn(String),
+    BuiltinFn(Rc<str>),
     Namespace(NamespaceKind),
     Handle(HandleRef),
 }
@@ -294,6 +294,11 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
     fn alloc_string(&mut self, s: String) -> Result<RuntimeValue, ExprError> {
         self.check_string_alloc(s.len())?;
         Ok(RuntimeValue::String(JsStr::from(s)))
+    }
+
+    fn alloc_builtin_fn(&mut self, name: String) -> Result<RuntimeValue, ExprError> {
+        self.check_string_alloc(name.len())?;
+        Ok(RuntimeValue::BuiltinFn(Rc::from(name)))
     }
 
     fn check_array_alloc(&mut self, elem_count: usize) -> Result<(), ExprError> {
@@ -658,7 +663,11 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             RuntimeValue::Number(n) => n,
             RuntimeValue::String(s) => {
                 self.charge_byte_work(s.len())?;
-                let t = s.trim();
+                let t = if s.is_ascii {
+                    s.as_str().trim_ascii()
+                } else {
+                    s.trim()
+                };
                 if t.is_empty() {
                     0.0
                 } else {
@@ -1544,6 +1553,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                                     "array length exceeds {MAX_ARRAY_LEN} limit"
                                 )));
                             }
+                            self.charge_alloc_bytes(ARRAY_ELEM_BUDGET_BYTES)?;
                             items.push(v);
                         }
                         ArrayElem::Spread(e) => {
@@ -1563,8 +1573,9 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                                             "array length {next_len} exceeds {MAX_ARRAY_LEN} limit"
                                         )));
                                     }
-                                    let spread_items = self.arrays[id].clone();
-                                    items.extend(spread_items);
+                                    self.check_array_alloc(add)?;
+                                    self.charge_work(add)?;
+                                    items.extend_from_slice(&self.arrays[id]);
                                 }
                                 RuntimeValue::String(s) => {
                                     let add = self.string_char_len(&s)?;
@@ -1579,7 +1590,9 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                                             "array length {next_len} exceeds {MAX_ARRAY_LEN} limit"
                                         )));
                                     }
+                                    self.check_array_alloc(add)?;
                                     self.check_string_alloc(s.len())?;
+                                    self.charge_byte_work(s.len())?;
                                     items.extend(
                                         s.chars().map(|c| {
                                             RuntimeValue::String(JsStr::from(c.to_string()))
@@ -1595,33 +1608,54 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                         }
                     }
                 }
-                self.check_array_alloc(items.len())?;
                 Ok(self.alloc_array(items))
             }
             Expr::Object(props) => {
+                enum KeyRef<'k> {
+                    Static(&'k str),
+                    Owned(String),
+                }
+                impl KeyRef<'_> {
+                    fn as_str(&self) -> &str {
+                        match self {
+                            Self::Static(s) => s,
+                            Self::Owned(s) => s.as_str(),
+                        }
+                    }
+                }
                 let mut map = BTreeMap::new();
                 for prop in props {
                     match prop {
                         ObjectProp::KeyValue { key, value } => {
                             let k = match key {
-                                ObjectKey::Static(s) => s.clone(),
+                                ObjectKey::Static(s) => KeyRef::Static(s.as_str()),
                                 ObjectKey::Computed(e) => {
                                     let kv = self.eval_expr(e, env)?;
-                                    self.runtime_to_js_string(&kv)?
+                                    let owned = self.runtime_to_js_string(&kv)?;
+                                    self.check_string_alloc(owned.len())?;
+                                    KeyRef::Owned(owned)
                                 }
                             };
                             let v = self.eval_expr(value, env)?;
-                            if !map.contains_key(&k) {
+                            if !map.contains_key(k.as_str()) {
                                 if map.len() >= MAX_ARRAY_LEN {
                                     return Err(ExprError::RangeError(format!(
                                         "object property count exceeds {MAX_ARRAY_LEN} limit"
                                     )));
                                 }
-                                self.charge_alloc_bytes(
-                                    k.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES),
-                                )?;
+                                let extra_bytes = match &k {
+                                    KeyRef::Static(s) => {
+                                        s.len().saturating_add(ARRAY_ELEM_BUDGET_BYTES)
+                                    }
+                                    KeyRef::Owned(_) => ARRAY_ELEM_BUDGET_BYTES,
+                                };
+                                self.charge_alloc_bytes(extra_bytes)?;
                             }
-                            map.insert(k, v);
+                            let owned_key = match k {
+                                KeyRef::Static(s) => s.to_owned(),
+                                KeyRef::Owned(s) => s,
+                            };
+                            map.insert(owned_key, v);
                         }
                         ObjectProp::Spread(e) => {
                             let val = self.eval_expr(e, env)?;
@@ -1753,13 +1787,13 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             "Math" => return Ok(RuntimeValue::Namespace(NamespaceKind::Math)),
             "isNaN" | "isFinite" | "parseInt" | "parseFloat" => {
-                return Ok(RuntimeValue::BuiltinFn(name.to_string()));
+                return self.alloc_builtin_fn(name.to_string());
             }
             // Exact 17 Vanilla CM3 built-in functions
             "add" | "sub" | "mul" | "div" | "clamp" | "dot" | "cross" | "normalize" | "length"
             | "wave" | "lerp" | "linear" | "catmullRom" | "ease" | "random" | "gaussRandom"
             | "shake" => {
-                return Ok(RuntimeValue::BuiltinFn(name.to_string()));
+                return self.alloc_builtin_fn(name.to_string());
             }
             _ => {}
         }
@@ -1769,7 +1803,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             return Ok(RuntimeValue::Number(c));
         }
         if is_top_level_math_fn(name) {
-            return Ok(RuntimeValue::BuiltinFn(format!("Math.{name}")));
+            return self.alloc_builtin_fn(format!("Math.{name}"));
         }
 
         // Expressions+ globals & handles
@@ -1814,7 +1848,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 | "seedRandom" | "wiggle" | "layer" | "effect" | "object" | "property" | "prop"
                 | "control" | "toWorld" | "fromWorld" | "worldPosition" | "worldRotation"
                 | "toScreen" | "fromScreen" => {
-                    return Ok(RuntimeValue::BuiltinFn(name.to_string()));
+                    return self.alloc_builtin_fn(name.to_string());
                 }
                 _ => {}
             }
@@ -2314,7 +2348,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 if let Some(c) = math_constant(prop) {
                     return Ok(RuntimeValue::Number(c));
                 }
-                Ok(RuntimeValue::BuiltinFn(format!("Math.{prop}")))
+                self.alloc_builtin_fn(format!("Math.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::Number) => match prop {
                 "MAX_SAFE_INTEGER" => Ok(RuntimeValue::Number(9_007_199_254_740_991.0)),
@@ -2323,19 +2357,19 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 "POSITIVE_INFINITY" => Ok(RuntimeValue::Number(f64::INFINITY)),
                 "NEGATIVE_INFINITY" => Ok(RuntimeValue::Number(f64::NEG_INFINITY)),
                 "NaN" => Ok(RuntimeValue::Number(f64::NAN)),
-                _ => Ok(RuntimeValue::BuiltinFn(format!("Number.{prop}"))),
+                _ => self.alloc_builtin_fn(format!("Number.{prop}")),
             },
             RuntimeValue::Namespace(NamespaceKind::Array) => {
-                Ok(RuntimeValue::BuiltinFn(format!("Array.{prop}")))
+                self.alloc_builtin_fn(format!("Array.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::String) => {
-                Ok(RuntimeValue::BuiltinFn(format!("String.{prop}")))
+                self.alloc_builtin_fn(format!("String.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::Object) => {
-                Ok(RuntimeValue::BuiltinFn(format!("Object.{prop}")))
+                self.alloc_builtin_fn(format!("Object.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::Json) => {
-                Ok(RuntimeValue::BuiltinFn(format!("JSON.{prop}")))
+                self.alloc_builtin_fn(format!("JSON.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::Boolean) => Ok(RuntimeValue::Undefined),
             RuntimeValue::Handle(handle) => self.get_handle_property(handle, prop),
