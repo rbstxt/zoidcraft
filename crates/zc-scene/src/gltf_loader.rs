@@ -31,6 +31,10 @@ const MODE_TRIANGLE_STRIP: u32 = 5;
 const MODE_TRIANGLE_FAN: u32 = 6;
 
 const MAX_JSON_DEPTH: usize = 128;
+const MAX_NODE_DEPTH: usize = 128;
+const MAX_SCENE_NODE_VISITS: usize = 4_096;
+const MAX_TOTAL_VERTICES: usize = 2_000_000;
+const MAX_TOTAL_INDICES: usize = 6_000_000;
 
 /// Errors returned while parsing a `.glb` or `.gltf` 2.0 mesh.
 #[derive(Debug, Error)]
@@ -766,7 +770,12 @@ impl<'a> GltfDocument<'a> {
         Ok(out)
     }
 
-    fn build_mesh(&self, mesh_idx: usize) -> Result<MeshData, GltfLoadError> {
+    fn build_mesh(
+        &self,
+        mesh_idx: usize,
+        existing_vertices: usize,
+        existing_indices: usize,
+    ) -> Result<MeshData, GltfLoadError> {
         let meshes = self
             .root
             .get("meshes")
@@ -801,6 +810,59 @@ impl<'a> GltfDocument<'a> {
             let Some(pos_acc) = attrs.get("POSITION").and_then(JsonValue::as_usize) else {
                 continue;
             };
+            let pos_count = self
+                .accessors
+                .get(pos_acc)
+                .ok_or_else(|| {
+                    GltfLoadError::InvalidBuffer(format!("accessor {pos_acc} out of bounds"))
+                })?
+                .count;
+            let projected_verts = existing_vertices
+                .checked_add(combined.vertices.len())
+                .and_then(|v| v.checked_add(pos_count))
+                .ok_or_else(|| {
+                    GltfLoadError::InvalidJson(format!(
+                        "glTF scene exceeds maximum vertex budget of {MAX_TOTAL_VERTICES}"
+                    ))
+                })?;
+            if projected_verts > MAX_TOTAL_VERTICES {
+                return Err(GltfLoadError::InvalidJson(format!(
+                    "glTF scene exceeds maximum vertex budget of {MAX_TOTAL_VERTICES}"
+                )));
+            }
+
+            let raw_index_count =
+                if let Some(i_acc) = prim.get("indices").and_then(JsonValue::as_usize) {
+                    self.accessors
+                        .get(i_acc)
+                        .ok_or_else(|| {
+                            GltfLoadError::InvalidBuffer(format!("accessor {i_acc} out of bounds"))
+                        })?
+                        .count
+                } else {
+                    pos_count
+                };
+            let est_tri_indices = match mode {
+                MODE_TRIANGLES => (raw_index_count / 3).saturating_mul(3),
+                MODE_TRIANGLE_STRIP | MODE_TRIANGLE_FAN => {
+                    raw_index_count.saturating_sub(2).saturating_mul(3)
+                }
+                _ => 0,
+            };
+            let projected_indices = existing_indices
+                .checked_add(combined.indices.len())
+                .and_then(|v| v.checked_add(est_tri_indices))
+                .ok_or_else(|| {
+                    GltfLoadError::InvalidJson(format!(
+                        "glTF scene exceeds maximum index budget of {MAX_TOTAL_INDICES}"
+                    ))
+                })?;
+            if projected_indices > MAX_TOTAL_INDICES {
+                return Err(GltfLoadError::InvalidJson(format!(
+                    "glTF scene exceeds maximum index budget of {MAX_TOTAL_INDICES}"
+                )));
+            }
+
             let positions = self.read_vec3_f32(pos_acc)?;
             if positions.is_empty() {
                 continue;
@@ -991,47 +1053,21 @@ impl<'a> GltfDocument<'a> {
         ))
     }
 
-    fn traverse_node(
-        &self,
-        nodes: &[JsonValue],
-        node_idx: usize,
-        parent_world: Mat4,
-        visited: &mut HashSet<usize>,
-        out: &mut MeshData,
-    ) -> Result<(), GltfLoadError> {
-        if !visited.insert(node_idx) {
-            return Ok(()); // Guard against malformed cycles
-        }
-        let node = nodes.get(node_idx).ok_or_else(|| {
-            GltfLoadError::InvalidJson(format!("node index {node_idx} out of bounds"))
-        })?;
-        let local = Self::node_local_matrix(node)?;
-        let world = parent_world * local;
-
-        if let Some(mesh_idx) = node.get("mesh").and_then(JsonValue::as_usize) {
-            let mut m = self.build_mesh(mesh_idx)?;
-            if !m.vertices.is_empty() {
-                if world != Mat4::IDENTITY {
-                    m.apply_matrix(world);
-                }
-                out.merge(&m);
-            }
-        }
-
-        if let Some(children) = node.get("children").and_then(JsonValue::as_array) {
-            for child in children {
-                if let Some(child_idx) = child.as_usize() {
-                    self.traverse_node(nodes, child_idx, world, visited, out)?;
-                }
-            }
-        }
-
-        visited.remove(&node_idx);
-        Ok(())
-    }
-
     fn assemble_scene(&self) -> Result<MeshData, GltfLoadError> {
+        enum TraversalStep {
+            Enter {
+                node_idx: usize,
+                parent_world: Mat4,
+                depth: usize,
+            },
+            Exit {
+                node_idx: usize,
+            },
+        }
+
         let mut out = MeshData::empty();
+        let mut total_vertices = 0usize;
+        let mut total_indices = 0usize;
 
         if let Some(nodes) = self.root.get("nodes").and_then(JsonValue::as_array)
             && !nodes.is_empty()
@@ -1062,18 +1098,128 @@ impl<'a> GltfDocument<'a> {
                         }
                     }
                 }
-                (0..nodes.len())
+                let roots: Vec<usize> = (0..nodes.len())
                     .filter(|i| !child_set.contains(i))
-                    .collect()
+                    .collect();
+                if roots.is_empty() {
+                    return Err(GltfLoadError::InvalidJson(String::from(
+                        "cyclic glTF node graph has no root nodes",
+                    )));
+                }
+                roots
             };
 
-            let mut visited = HashSet::new();
-            for root_idx in root_indices {
-                self.traverse_node(nodes, root_idx, Mat4::IDENTITY, &mut visited, &mut out)?;
+            let mut active_ancestors = HashSet::new();
+            let mut visits = 0usize;
+            let mut stack = Vec::with_capacity(root_indices.len());
+            for &root_idx in root_indices.iter().rev() {
+                stack.push(TraversalStep::Enter {
+                    node_idx: root_idx,
+                    parent_world: Mat4::IDENTITY,
+                    depth: 0,
+                });
+            }
+
+            while let Some(step) = stack.pop() {
+                match step {
+                    TraversalStep::Exit { node_idx } => {
+                        active_ancestors.remove(&node_idx);
+                    }
+                    TraversalStep::Enter {
+                        node_idx,
+                        parent_world,
+                        depth,
+                    } => {
+                        if depth >= MAX_NODE_DEPTH {
+                            return Err(GltfLoadError::InvalidJson(format!(
+                                "glTF node hierarchy exceeds maximum depth of {MAX_NODE_DEPTH}"
+                            )));
+                        }
+                        if visits >= MAX_SCENE_NODE_VISITS {
+                            return Err(GltfLoadError::InvalidJson(format!(
+                                "glTF scene traversal exceeds maximum node visit budget of {MAX_SCENE_NODE_VISITS}"
+                            )));
+                        }
+                        if !active_ancestors.insert(node_idx) {
+                            return Err(GltfLoadError::InvalidJson(format!(
+                                "cyclic glTF node reference detected at node {node_idx}"
+                            )));
+                        }
+                        visits += 1;
+
+                        let node = nodes.get(node_idx).ok_or_else(|| {
+                            GltfLoadError::InvalidJson(format!(
+                                "node index {node_idx} out of bounds"
+                            ))
+                        })?;
+                        let local = Self::node_local_matrix(node)?;
+                        let world = parent_world * local;
+
+                        if let Some(mesh_idx) = node.get("mesh").and_then(JsonValue::as_usize) {
+                            let mut m = self.build_mesh(mesh_idx, total_vertices, total_indices)?;
+                            if !m.vertices.is_empty() {
+                                let next_verts = total_vertices
+                                    .checked_add(m.vertices.len())
+                                    .filter(|&v| v <= MAX_TOTAL_VERTICES)
+                                    .ok_or_else(|| {
+                                        GltfLoadError::InvalidJson(format!(
+                                            "glTF scene exceeds maximum vertex budget of {MAX_TOTAL_VERTICES}"
+                                        ))
+                                    })?;
+                                let next_idxs = total_indices
+                                    .checked_add(m.indices.len())
+                                    .filter(|&i| i <= MAX_TOTAL_INDICES)
+                                    .ok_or_else(|| {
+                                        GltfLoadError::InvalidJson(format!(
+                                            "glTF scene exceeds maximum index budget of {MAX_TOTAL_INDICES}"
+                                        ))
+                                    })?;
+                                total_vertices = next_verts;
+                                total_indices = next_idxs;
+                                if world != Mat4::IDENTITY {
+                                    m.apply_matrix(world);
+                                }
+                                out.merge(&m);
+                            }
+                        }
+
+                        stack.push(TraversalStep::Exit { node_idx });
+
+                        if let Some(children) = node.get("children").and_then(JsonValue::as_array) {
+                            for child in children.iter().rev() {
+                                if let Some(child_idx) = child.as_usize() {
+                                    stack.push(TraversalStep::Enter {
+                                        node_idx: child_idx,
+                                        parent_world: world,
+                                        depth: depth + 1,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else if let Some(meshes) = self.root.get("meshes").and_then(JsonValue::as_array) {
             for mesh_idx in 0..meshes.len() {
-                let m = self.build_mesh(mesh_idx)?;
+                let m = self.build_mesh(mesh_idx, total_vertices, total_indices)?;
+                let next_verts = total_vertices
+                    .checked_add(m.vertices.len())
+                    .filter(|&v| v <= MAX_TOTAL_VERTICES)
+                    .ok_or_else(|| {
+                        GltfLoadError::InvalidJson(format!(
+                            "glTF scene exceeds maximum vertex budget of {MAX_TOTAL_VERTICES}"
+                        ))
+                    })?;
+                let next_idxs = total_indices
+                    .checked_add(m.indices.len())
+                    .filter(|&i| i <= MAX_TOTAL_INDICES)
+                    .ok_or_else(|| {
+                        GltfLoadError::InvalidJson(format!(
+                            "glTF scene exceeds maximum index budget of {MAX_TOTAL_INDICES}"
+                        ))
+                    })?;
+                total_vertices = next_verts;
+                total_indices = next_idxs;
                 out.merge(&m);
             }
         }
@@ -1271,5 +1417,97 @@ pub fn parse_gltf_or_glb(bytes: &[u8]) -> Result<MeshData, GltfLoadError> {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| GltfLoadError::InvalidJson(String::from("input is not valid UTF-8")))?;
         parse_gltf(text, &[])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn single_triangle_bin() -> Vec<u8> {
+        let mut bin = Vec::new();
+        for p in [[0.0_f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            for c in p {
+                bin.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        for idx in [0_u16, 1, 2] {
+            bin.extend_from_slice(&idx.to_le_bytes());
+        }
+        bin
+    }
+
+    fn wrap_gltf_with_nodes(nodes_json: &str, bin_len: usize) -> String {
+        format!(
+            r#"{{
+              "asset": {{"version": "2.0"}},
+              "scene": 0,
+              "scenes": [{{"nodes": [0]}}],
+              "nodes": [{nodes_json}],
+              "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0}}, "indices": 1}}]}}],
+              "buffers": [{{"byteLength": {bin_len}}}],
+              "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 6}}
+              ],
+              "accessors": [
+                {{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3"}},
+                {{"bufferView": 1, "byteOffset": 0, "componentType": 5123, "count": 3, "type": "SCALAR"}}
+              ]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn deep_node_chain_exceeding_max_depth_returns_err_without_stack_overflow() {
+        let bin = single_triangle_bin();
+        // Build a 256-node linear chain (> MAX_NODE_DEPTH = 128).
+        let chain_len = MAX_NODE_DEPTH + 128;
+        let mut nodes = Vec::with_capacity(chain_len);
+        for i in 0..chain_len {
+            if i + 1 < chain_len {
+                nodes.push(format!(r#"{{"children": [{}]}}"#, i + 1));
+            } else {
+                nodes.push(String::from(r#"{"mesh": 0}"#));
+            }
+        }
+        let gltf = wrap_gltf_with_nodes(&nodes.join(","), bin.len());
+        let err = parse_gltf(&gltf, &[&bin]).expect_err("deep node chain must fail cleanly");
+        assert!(
+            err.to_string().contains("depth"),
+            "expected depth budget error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn diamond_dag_exceeding_max_scene_node_visits_returns_err_cleanly() {
+        let bin = single_triangle_bin();
+        // 16-level diamond DAG where each node points twice to the next level -> 2^16 = 65,536 visits
+        // (> MAX_SCENE_NODE_VISITS = 4,096) while depth is only 16 (< MAX_NODE_DEPTH).
+        let levels = 16;
+        let mut nodes = Vec::with_capacity(levels + 1);
+        for i in 0..levels {
+            nodes.push(format!(r#"{{"children": [{n}, {n}]}}"#, n = i + 1));
+        }
+        nodes.push(String::from(r#"{"mesh": 0}"#));
+        let gltf = wrap_gltf_with_nodes(&nodes.join(","), bin.len());
+        let err =
+            parse_gltf(&gltf, &[&bin]).expect_err("exponential diamond DAG must fail cleanly");
+        assert!(
+            err.to_string().contains("visit budget"),
+            "expected node visit budget error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cyclic_node_graph_returns_err_cleanly() {
+        let bin = single_triangle_bin();
+        let nodes = r#"{"children": [1], "mesh": 0}, {"children": [0]}"#;
+        let gltf = wrap_gltf_with_nodes(nodes, bin.len());
+        let err = parse_gltf(&gltf, &[&bin]).expect_err("cyclic node graph must fail cleanly");
+        assert!(
+            err.to_string().contains("cyclic"),
+            "expected cyclic node error, got: {err}"
+        );
     }
 }

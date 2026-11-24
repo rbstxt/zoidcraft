@@ -21,9 +21,12 @@ pub use meter::{AudioMeterState, METER_ANALYSIS_WINDOW, METER_MIN_PX};
 pub use mixer::{
     AudioClipScheduleItem, AudioClipTrackItem, ClipAudioSampleParams, FlattenedAudioClip,
     MAX_OFFLINE_MIX_SAMPLES, MAX_PRECOMP_AUDIO_DEPTH, apply_gain_and_pan,
-    collect_flattened_audio_clips, effective_playback_rate, mix_flattened_audio_clips,
-    mix_offline_stereo, mix_offline_stereo_animated, mix_project_audio_with_precomps,
-    project_has_active_audio_in_range, try_mix_offline_stereo_animated, try_offline_total_samples,
+    collect_flattened_audio_clips, collect_flattened_audio_clips_with_precomp,
+    effective_playback_rate, mix_flattened_audio_clips, mix_offline_stereo,
+    mix_offline_stereo_animated, mix_project_audio_with_precomps,
+    mix_project_audio_with_precomps_filtered, project_has_active_audio_in_range,
+    project_has_active_audio_in_range_with_precomp, try_mix_offline_stereo_animated,
+    try_offline_total_samples,
 };
 pub use waveform::{DEFAULT_POINTS_PER_SEC, WaveformColumn, WaveformPeaks};
 

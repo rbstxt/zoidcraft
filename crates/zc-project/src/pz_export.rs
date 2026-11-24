@@ -1192,11 +1192,15 @@ fn serialize_layer(
         Map::new()
     };
 
+    let is_plugin_layer = matches!(&layer.kind, LayerKind::Plugin { .. });
     for (k, v) in &layer.preserved {
         if k.starts_with("property.")
             || k.starts_with("childProperty.")
             || matches!(k.as_str(), "compId" | "offset")
         {
+            continue;
+        }
+        if is_plugin_layer && obj.contains_key(k) {
             continue;
         }
         let mut cloned = v.clone();
@@ -1211,6 +1215,9 @@ fn serialize_layer(
         .unwrap_or_default();
     for (k, v) in &layer.preserved {
         if let Some(pk) = k.strip_prefix("property.") {
+            if is_plugin_layer && props.contains_key(pk) {
+                continue;
+            }
             let mut cloned = v.clone();
             remap_json_value(&mut cloned, remap);
             props.insert(pk.to_owned(), cloned);
@@ -1224,6 +1231,9 @@ fn serialize_layer(
         .unwrap_or_default();
     for (k, v) in &layer.preserved {
         if let Some(ck) = k.strip_prefix("childProperty.") {
+            if is_plugin_layer && child_props.contains_key(ck) {
+                continue;
+            }
             let mut cloned = v.clone();
             remap_json_value(&mut cloned, remap);
             child_props.insert(ck.to_owned(), cloned);
@@ -6664,6 +6674,127 @@ mod tests {
         assert_eq!(
             objects[12].preserved.get("zoidiumPluginObjectType"),
             Some(&json!("zoidium:optical-flares/flare"))
+        );
+    }
+
+    #[test]
+    fn shape_plus_payload_edits_survive_pz_round_trip() {
+        let project_json = json!({
+            "version": 3,
+            "sequence": {
+                "properties": {
+                    "name": "ShapePlusEditSeq",
+                    "resolution": [1920, 1080],
+                    "fps": 30,
+                    "length": 60
+                },
+                "videoTracks": [{
+                    "properties": { "name": "V1" },
+                    "clips": [{
+                        "start": 0,
+                        "length": 60,
+                        "properties": { "name": "ShapePlusClip" },
+                        "object": {
+                            "type": "zoidium:shape-plus/shape-layer",
+                            "schemaVersion": 1,
+                            "renderVersion": 2,
+                            "nextId": 7,
+                            "zoidiumShapePlus": true,
+                            "properties": { "name": "Hero Shape+" },
+                            "contents": [{
+                                "id": "p1",
+                                "kind": "path",
+                                "properties": {
+                                    "name": "Original Path",
+                                    "closed": 1,
+                                    "path": { "value": [0, 0, 10, 0, 10, 10] }
+                                }
+                            }]
+                        }
+                    }]
+                }]
+            }
+        });
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let meta = br#"{"version":"1.0.101"}"#;
+            let proj = serde_json::to_vec(&project_json).unwrap();
+            append_ustar_file(&mut builder, "meta", meta).unwrap();
+            append_ustar_file(&mut builder, "project", &proj).unwrap();
+            builder.finish().unwrap();
+        }
+        let pz_bytes = encoder.finish().unwrap();
+
+        let mut imported = import_pz_from_bytes(&pz_bytes).expect("import shape+ pz");
+        let layer = &mut imported.project.sequence.video_tracks[0].clips[0].layer;
+        assert!(
+            !layer.preserved.contains_key("contents"),
+            "import should not duplicate plugin payload-owned `contents` into layer.preserved"
+        );
+        assert!(
+            !layer.preserved.contains_key("schemaVersion"),
+            "import should not duplicate plugin payload-owned `schemaVersion` into layer.preserved"
+        );
+        assert!(
+            !layer.preserved.contains_key("zoidiumShapePlus"),
+            "import should not duplicate plugin payload-owned `zoidiumShapePlus` into layer.preserved"
+        );
+
+        // Also inject a stale `contents` entry into `layer.preserved` to prove export treats
+        // `LayerKind::Plugin.payload` as authoritative even for legacy/deserialized state.
+        layer.preserved.insert(
+            "contents".to_owned(),
+            json!([{ "id": "stale", "kind": "path" }]),
+        );
+        layer
+            .preserved
+            .insert("extraPreservedKey".to_owned(), json!("keep-me"));
+
+        let LayerKind::Plugin {
+            ref mut payload, ..
+        } = layer.kind
+        else {
+            panic!("expected Shape+ Plugin layer");
+        };
+        payload["contents"] = json!([{
+            "id": "p1",
+            "kind": "path",
+            "properties": {
+                "name": "Edited Path",
+                "closed": 0,
+                "path": { "value": [42, 84, 100, 200, 300, 400] }
+            }
+        }]);
+
+        let exported_bytes = export_pz_to_bytes(&imported.project).expect("export mutated shape+");
+        let reimported = import_pz_from_bytes(&exported_bytes).expect("reimport mutated shape+");
+        let roundtripped_layer = &reimported.project.sequence.video_tracks[0].clips[0].layer;
+        let LayerKind::Plugin {
+            ref plugin_type,
+            ref payload,
+        } = roundtripped_layer.kind
+        else {
+            panic!("expected Shape+ Plugin layer after round-trip");
+        };
+        assert_eq!(plugin_type, "zoidium:shape-plus/shape-layer");
+        assert_eq!(
+            payload["contents"][0]["properties"]["name"].as_str(),
+            Some("Edited Path")
+        );
+        assert_eq!(
+            payload["contents"][0]["properties"]["closed"].as_i64(),
+            Some(0)
+        );
+        assert_eq!(
+            payload["contents"][0]["properties"]["path"]["value"],
+            json!([42, 84, 100, 200, 300, 400])
+        );
+        assert_eq!(
+            payload["extraPreservedKey"].as_str(),
+            Some("keep-me"),
+            "missing keys in payload should still be filled from layer.preserved"
         );
     }
 }

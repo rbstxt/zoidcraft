@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
 use zc_audio::{
     AudioBuffer, AudioError, AudioMixWindow, AudioOutputHandle, MasterPlaybackClock,
-    STANDARD_SAMPLE_RATE, WaveformPeaks, apply_gain_and_pan, collect_flattened_audio_clips,
-    decode_audio_bytes, mix_flattened_audio_clips,
+    STANDARD_SAMPLE_RATE, WaveformPeaks, apply_gain_and_pan,
+    collect_flattened_audio_clips_with_precomp, decode_audio_bytes, mix_flattened_audio_clips,
 };
 use zc_export::{
     AudioCodec, ExportContainer as CoreExportContainer, ExportError, ExportProgress, ExportReport,
@@ -35,6 +35,7 @@ use zc_export::{
     probe_ffmpeg,
 };
 use zc_geom::{EulerOrder as GeomEulerOrder, Mat4, Transform3D, Vec3};
+use zc_plugin::PluginRegistry;
 use zc_project::{
     AssetKind, LayerKind, MediaItem, Project, Uuid, export_pz, import_pz, load_zcraft, save_zcraft,
     write_atomic,
@@ -545,6 +546,30 @@ fn is_audio_extension(ext: &str) -> bool {
     )
 }
 
+/// Immutable project & plugin state captured at the moment a job is added to the export queue
+/// so switching projects later cannot cause a queued job to export the wrong project.
+#[derive(Clone)]
+struct ExportQueueSnapshot {
+    project: Project,
+    plugins: PluginRegistry,
+    active_composition_id: Option<String>,
+    decoded_audio: HashMap<String, Arc<AudioBuffer>>,
+}
+
+impl ExportQueueSnapshot {
+    fn effective_fps(&self) -> f64 {
+        let seq = self
+            .active_composition_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .and_then(|uuid| self.project.compositions.get(&uuid))
+            .unwrap_or(&self.project.sequence);
+        seq.exact_fps
+            .unwrap_or_else(|| f64::from(seq.fps.max(1)))
+            .max(1.0)
+    }
+}
+
 struct ZoidCraftApp {
     session: Session,
     theme: Cm3Theme,
@@ -586,6 +611,8 @@ struct ZoidCraftApp {
     retired_exports: Vec<ActiveExportJob>,
     /// Monotonic identifier counter for queued export jobs.
     next_export_job_id: u64,
+    /// Captured project/plugin snapshots keyed by `ExportQueueJob::id`.
+    export_queue_snapshots: HashMap<u64, ExportQueueSnapshot>,
     /// Directory storing periodic `.zcraft` autosave recovery snapshots.
     recovery_dir: PathBuf,
     /// Timestamp of the last autosave tick.
@@ -688,6 +715,7 @@ impl ZoidCraftApp {
             active_export: None,
             retired_exports: Vec::new(),
             next_export_job_id: 1,
+            export_queue_snapshots: HashMap::new(),
             recovery_dir,
             last_autosave_at: Instant::now(),
             last_autosave_revision: init_revision,
@@ -2037,7 +2065,7 @@ impl ZoidCraftApp {
         };
 
         self.workspace.panels.export_queue_running = false;
-        if let Err(msg) = self.spawn_background_export(&ui_cfg, output_path, None) {
+        if let Err(msg) = self.spawn_background_export(&ui_cfg, output_path, None, None) {
             self.workspace.panels.export_status.status_message = msg.clone();
             self.show_toast(msg);
         }
@@ -2098,6 +2126,80 @@ impl ZoidCraftApp {
         chosen
     }
 
+    fn capture_export_queue_snapshot(&mut self) -> ExportQueueSnapshot {
+        let project = self.session.to_project();
+        let plugins = self.session.plugins.clone();
+        let active_composition_id = self
+            .session
+            .document()
+            .active_composition_id
+            .map(|id| id.to_string());
+        let decoded_audio = self
+            .decoded_audio
+            .iter()
+            .filter(|(asset_id, _)| project.assets.contains_key(*asset_id))
+            .map(|(asset_id, buf)| (asset_id.clone(), Arc::clone(buf)))
+            .collect();
+        ExportQueueSnapshot {
+            project,
+            plugins,
+            active_composition_id,
+            decoded_audio,
+        }
+    }
+
+    fn enqueue_export_job(&mut self, ui_cfg: UiExportSettings, output_path: PathBuf) -> u64 {
+        let snapshot = self.capture_export_queue_snapshot();
+        let label = format_export_job_label(&snapshot.project.name, &ui_cfg);
+        let id = self.next_export_job_id;
+        self.next_export_job_id = self.next_export_job_id.saturating_add(1);
+        self.export_queue_snapshots.insert(id, snapshot);
+        queue_add_job(
+            &mut self.workspace.panels.export_queue,
+            id,
+            label,
+            output_path,
+            ui_cfg,
+        );
+        id
+    }
+
+    fn prune_export_queue_snapshots(&mut self) {
+        let queued_ids: HashSet<u64> = self
+            .workspace
+            .panels
+            .export_queue
+            .iter()
+            .filter(|job| job.status == ExportJobStatus::Queued)
+            .map(|job| job.id)
+            .collect();
+        self.export_queue_snapshots
+            .retain(|job_id, _| queued_ids.contains(job_id));
+    }
+
+    #[cfg(test)]
+    fn remove_export_queue_job(&mut self, job_id: u64) {
+        if let Some(pos) = self
+            .workspace
+            .panels
+            .export_queue
+            .iter()
+            .position(|j| j.id == job_id && j.status != ExportJobStatus::Running)
+        {
+            self.workspace.panels.export_queue.remove(pos);
+        }
+        self.export_queue_snapshots.remove(&job_id);
+    }
+
+    #[cfg(test)]
+    fn clear_finished_export_queue(&mut self) {
+        self.workspace
+            .panels
+            .export_queue
+            .retain(|j| matches!(j.status, ExportJobStatus::Queued | ExportJobStatus::Running));
+        self.prune_export_queue_snapshots();
+    }
+
     fn handle_add_to_export_queue(&mut self, ui_cfg: UiExportSettings) {
         if let Err(msg) = self.validate_export_pre_dialog(&ui_cfg) {
             self.workspace.panels.export_status.status_message = msg.clone();
@@ -2108,15 +2210,7 @@ impl ZoidCraftApp {
             return;
         };
         let label = format_export_job_label(&self.session.document().project_name, &ui_cfg);
-        let id = self.next_export_job_id;
-        self.next_export_job_id = self.next_export_job_id.saturating_add(1);
-        queue_add_job(
-            &mut self.workspace.panels.export_queue,
-            id,
-            label.clone(),
-            output_path,
-            ui_cfg,
-        );
+        let _ = self.enqueue_export_job(ui_cfg, output_path);
         self.show_toast(format!("Added to export queue: {label}"));
     }
 
@@ -2135,7 +2229,16 @@ impl ZoidCraftApp {
                 job.status = ExportJobStatus::Running;
                 (job.id, job.output_path.clone(), job.settings.clone())
             };
-            match self.spawn_background_export(&ui_cfg, output_path, Some(job_id)) {
+            let snapshot = self.export_queue_snapshots.remove(&job_id);
+            let launch_result = match snapshot {
+                Some(snap) => {
+                    self.spawn_background_export(&ui_cfg, output_path, Some(job_id), Some(snap))
+                }
+                None => Err(format!(
+                    "Queued export job #{job_id} is missing its captured project snapshot."
+                )),
+            };
+            match launch_result {
                 Ok(()) => return,
                 Err(err) => {
                     if let Some(job) = self
@@ -2160,8 +2263,30 @@ impl ZoidCraftApp {
         ui_cfg: &UiExportSettings,
         output_path: PathBuf,
         queue_job_id: Option<u64>,
+        queued_snapshot: Option<ExportQueueSnapshot>,
     ) -> Result<(), String> {
-        let seq_fps = self.session.document().fps.max(1.0);
+        let (seq_fps, export_project, export_plugins, active_composition_id, audio_source) =
+            if let Some(snap) = queued_snapshot {
+                let fps = snap.effective_fps();
+                (
+                    fps,
+                    snap.project,
+                    snap.plugins,
+                    snap.active_composition_id,
+                    Some(snap.decoded_audio),
+                )
+            } else {
+                let fps = self.session.document().fps.max(1.0);
+                let project = self.session.to_project();
+                let plugins = self.session.plugins.clone();
+                let active_comp = self
+                    .session
+                    .document()
+                    .active_composition_id
+                    .map(|id| id.to_string());
+                (fps, project, plugins, active_comp, None)
+            };
+
         let start_seq_frame = ui_cfg.start_frame.round().max(0.0) as u32;
         let end_seq_frame = (ui_cfg
             .end_frame
@@ -2185,12 +2310,12 @@ impl ZoidCraftApp {
             ));
         }
 
-        // Snapshot project & share only in-range decoded audio Arcs (zero PCM deep-copy).
-        let export_project = self.session.project.clone();
-        let export_plugins = self.session.plugins.clone();
-        let export_audio_buffers = collect_in_range_audio_arcs(
-            &self.session,
-            &self.decoded_audio,
+        // Share only in-range decoded audio Arcs (zero PCM deep-copy) from the snapshot or live session.
+        let audio_cache = audio_source.as_ref().unwrap_or(&self.decoded_audio);
+        let export_audio_buffers = collect_in_range_audio_arcs_for_project(
+            &export_project,
+            export_plugins.is_enabled("precomp-plus"),
+            audio_cache,
             &core_settings,
             start_seq_frame,
             end_seq_frame,
@@ -2203,7 +2328,15 @@ impl ZoidCraftApp {
         let handle = thread::Builder::new()
             .name("zc-export-worker".to_owned())
             .spawn(move || {
-                let export_session = Session::from_project(export_project, export_plugins);
+                let mut export_session = Session::from_project(export_project, export_plugins);
+                if let Some(comp_uuid) = active_composition_id
+                    .as_deref()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    let _ = export_session.execute(Command::SetActiveComposition {
+                        comp_id: Some(comp_uuid),
+                    });
+                }
                 let audio_mix = match build_offline_export_audio(
                     &export_session,
                     &export_audio_buffers,
@@ -3058,6 +3191,7 @@ impl eframe::App for ZoidCraftApp {
 
         self.last_canvas_rect = canvas_rect_this_frame;
         self.last_viewport_rect = viewport_rect_this_frame;
+        self.prune_export_queue_snapshots();
 
         // 6. Process bubbled workspace/panel/timeline actions.
         if let Some((target_id, prop)) = open_graph_target {
@@ -4315,8 +4449,27 @@ fn poll_export_job(
     finished_result
 }
 
+#[cfg(test)]
 fn collect_in_range_audio_arcs(
     session: &Session,
+    cached_buffers: &HashMap<String, Arc<AudioBuffer>>,
+    settings: &CoreExportSettings,
+    start_seq_frame: u32,
+    end_seq_frame: u32,
+) -> HashMap<String, Arc<AudioBuffer>> {
+    collect_in_range_audio_arcs_for_project(
+        &session.project,
+        session.plugins.is_enabled("precomp-plus"),
+        cached_buffers,
+        settings,
+        start_seq_frame,
+        end_seq_frame,
+    )
+}
+
+fn collect_in_range_audio_arcs_for_project(
+    project: &Project,
+    precomp_enabled: bool,
     cached_buffers: &HashMap<String, Arc<AudioBuffer>>,
     settings: &CoreExportSettings,
     start_seq_frame: u32,
@@ -4331,10 +4484,11 @@ fn collect_in_range_audio_arcs(
     {
         return selected;
     }
-    let flattened = collect_flattened_audio_clips(
-        &session.project,
+    let flattened = collect_flattened_audio_clips_with_precomp(
+        project,
         f64::from(start_seq_frame),
         f64::from(end_seq_frame),
+        precomp_enabled,
     );
     for clip in &flattened {
         if let Some(buf) = cached_buffers.get(&clip.asset_id) {
@@ -4430,7 +4584,13 @@ fn compute_audio_mix_hash(
     fps: f64,
     seq_len: f64,
 ) -> u64 {
-    let flattened = collect_flattened_audio_clips(&session.project, 0.0, seq_len.max(1.0));
+    let precomp_enabled = session.plugins.is_enabled("precomp-plus");
+    let flattened = collect_flattened_audio_clips_with_precomp(
+        &session.project,
+        0.0,
+        seq_len.max(1.0),
+        precomp_enabled,
+    );
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut active_clips = 0_usize;
 
@@ -4439,7 +4599,10 @@ fn compute_audio_mix_hash(
     fnv_mix(&mut hash, &session.revision().to_le_bytes());
     fnv_mix(
         &mut hash,
-        &[u8::from(session.plugins.is_enabled("expressions-plus"))],
+        &[
+            u8::from(session.plugins.is_enabled("expressions-plus")),
+            u8::from(precomp_enabled),
+        ],
     );
 
     for clip in &flattened {
@@ -4524,7 +4687,12 @@ fn mix_sequence_audio_stereo(
 ) -> Result<Option<Vec<[f32; 2]>>, String> {
     let range_start = f64::from(start_seq_frame);
     let range_end = f64::from(end_seq_frame);
-    let flattened = collect_flattened_audio_clips(&session.project, range_start, range_end);
+    let flattened = collect_flattened_audio_clips_with_precomp(
+        &session.project,
+        range_start,
+        range_end,
+        session.plugins.is_enabled("precomp-plus"),
+    );
     if flattened.is_empty() {
         return Ok(None);
     }
@@ -4612,8 +4780,12 @@ fn sample_live_audio_meter(
     }
     let safe_fps = fps.max(1.0);
     let dt_frames = (METER_WINDOW as f64 / f64::from(STANDARD_SAMPLE_RATE)) * safe_fps;
-    let flattened =
-        collect_flattened_audio_clips(&session.project, frame, frame + dt_frames.max(1.0));
+    let flattened = collect_flattened_audio_clips_with_precomp(
+        &session.project,
+        frame,
+        frame + dt_frames.max(1.0),
+        session.plugins.is_enabled("precomp-plus"),
+    );
     if flattened.is_empty() {
         return (0.0, 0.0);
     }
@@ -5630,6 +5802,7 @@ mod tests {
             active_export: None,
             retired_exports: Vec::new(),
             next_export_job_id: 1,
+            export_queue_snapshots: HashMap::new(),
             recovery_dir: std::env::temp_dir().join("zoidcraft-test-recovery"),
             last_autosave_at: Instant::now(),
             last_autosave_revision: 0,
@@ -6317,10 +6490,27 @@ mod tests {
             preserved: BTreeMap::new(),
         }];
 
-        let session = Session::from_project(project, zc_plugin::PluginRegistry::new());
-        let fps = session.document().fps;
+        // When `precomp-plus` is disabled, nested Precomp+ audio stays silent (matching video).
+        let disabled_session =
+            Session::from_project(project.clone(), zc_plugin::PluginRegistry::new());
+        let fps = disabled_session.document().fps;
+        assert_eq!(
+            compute_audio_mix_hash(&disabled_session, &cache, fps, 60.0),
+            0,
+            "nested Precomp+ audio must be silent when precomp-plus plugin is disabled"
+        );
+        assert!(
+            mix_sequence_audio_stereo(&disabled_session, &cache, sr, fps, 0, 20)
+                .expect("disabled precomp mix succeeds")
+                .is_none(),
+            "nested Precomp+ audio must not mix when precomp-plus plugin is disabled"
+        );
 
-        // 1. Live audio mix hash detects nested Precomp+ audio.
+        let mut plugins = zc_plugin::PluginRegistry::new();
+        let _ = plugins.enable("precomp-plus");
+        let session = Session::from_project(project, plugins);
+
+        // 1. Live audio mix hash detects nested Precomp+ audio when precomp-plus is enabled.
         assert_ne!(
             compute_audio_mix_hash(&session, &cache, fps, 60.0),
             0,
@@ -6419,5 +6609,98 @@ mod tests {
         assert!((params.eye_position[0] - 25.0).abs() < 1e-4);
         assert!((params.eye_position[1] - 12.0).abs() < 1e-4);
         assert!((params.eye_position[2] - 90.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn queued_export_snapshot_preserves_original_project_across_project_switch_and_cleanup() {
+        let mut app = make_headless_app_for_test();
+
+        // Configure Project A with a distinct name, fps, and active composition.
+        app.session
+            .execute(Command::SetProjectName {
+                name: "Project Alpha".to_owned(),
+            })
+            .expect("rename project A");
+        app.session
+            .execute(Command::SetFps { fps: 60.0 })
+            .expect("set project A fps");
+        let comp_res = app
+            .session
+            .execute(Command::CreateComposition {
+                name: "Alpha Subcomp".to_owned(),
+                resolution: [1280, 720],
+                fps: 48,
+                length_frames: 120,
+            })
+            .expect("create comp");
+        let comp_id_str = comp_res["comp_id"].as_str().unwrap().to_owned();
+        let comp_uuid = Uuid::parse_str(&comp_id_str).unwrap();
+        app.session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(comp_uuid),
+            })
+            .expect("activate comp");
+
+        let cfg_a = UiExportSettings {
+            container: UiExportContainer::Mp4,
+            width: 1280,
+            height: 720,
+            fps: 48.0,
+            ..UiExportSettings::default()
+        };
+        let job_a = app.enqueue_export_job(cfg_a, PathBuf::from("/tmp/alpha_out.mp4"));
+
+        // Switch the active session to a completely different Project B.
+        app.perform_new_project();
+        app.session
+            .execute(Command::SetProjectName {
+                name: "Project Beta".to_owned(),
+            })
+            .expect("rename project B");
+        app.session
+            .execute(Command::SetFps { fps: 24.0 })
+            .expect("set project B fps");
+
+        // Resolving Job A's snapshot MUST return Project A (not Project B!).
+        let snap_a = app
+            .export_queue_snapshots
+            .get(&job_a)
+            .expect("job A snapshot must survive project switch");
+        assert_eq!(snap_a.project.name, "Project Alpha");
+        assert_eq!(
+            snap_a.active_composition_id.as_deref(),
+            Some(comp_id_str.as_str())
+        );
+        assert!((snap_a.effective_fps() - 48.0).abs() < 1e-6);
+        assert_eq!(app.session.document().project_name, "Project Beta");
+
+        // Enqueue jobs for Project B and verify Remove & Clear Finished clean up snapshots.
+        let job_b = app.enqueue_export_job(
+            UiExportSettings::default(),
+            PathBuf::from("/tmp/beta_remove.mp4"),
+        );
+        let job_c = app.enqueue_export_job(
+            UiExportSettings::default(),
+            PathBuf::from("/tmp/beta_finished.mp4"),
+        );
+        assert_eq!(app.export_queue_snapshots.len(), 3);
+
+        app.remove_export_queue_job(job_b);
+        assert!(!app.export_queue_snapshots.contains_key(&job_b));
+        assert_eq!(app.export_queue_snapshots.len(), 2);
+
+        if let Some(job) = app
+            .workspace
+            .panels
+            .export_queue
+            .iter_mut()
+            .find(|j| j.id == job_c)
+        {
+            job.status = ExportJobStatus::Completed;
+        }
+        app.clear_finished_export_queue();
+        assert!(!app.export_queue_snapshots.contains_key(&job_c));
+        assert!(app.export_queue_snapshots.contains_key(&job_a));
+        assert_eq!(app.export_queue_snapshots.len(), 1);
     }
 }

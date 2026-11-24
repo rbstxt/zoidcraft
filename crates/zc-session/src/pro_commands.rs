@@ -928,7 +928,7 @@ impl Session {
         // Flush current document edits into active sequence before extracting clips.
         self.sync_document_to_project();
 
-        let (resolution, fps, bg_color) = {
+        let (resolution, fps, bg_color, mut child_controls) = {
             let seq = self.active_sequence();
             // Validate every requested clip exists and its track is unlocked.
             let mut found = BTreeSet::new();
@@ -957,7 +957,12 @@ impl Session {
                     return Err(SessionError::NotFound(format!("clip '{cid}'")));
                 }
             }
-            (seq.resolution, seq.fps.max(1), seq.background_color)
+            (
+                seq.resolution,
+                seq.fps.max(1),
+                seq.background_color,
+                seq.controls.clone(),
+            )
         };
 
         // Compute bounding span [min_start, max_end] and lowest affected video track index.
@@ -1082,10 +1087,25 @@ impl Session {
                 }
             }
 
-            // Ensure target video track exists for placing the PrecompRef clip.
-            let vt_idx = if let Some(ti) = target_vtrack_idx {
+            // Ensure target video track exists for placing the PrecompRef clip without
+            // overlapping or deleting any unselected clip remaining on the parent timeline.
+            let precomp_end = min_start + span;
+            let track_has_unselected_overlap = |vt: &zc_project::VideoTrack| {
+                vt.clips.iter().any(|c| {
+                    let c_end = c.start + c.length;
+                    c_end > min_start + 1e-6 && c.start < precomp_end - 1e-6
+                })
+            };
+            let vt_idx = if let Some(ti) = target_vtrack_idx
+                && !seq.video_tracks[ti].locked
+                && !track_has_unselected_overlap(&seq.video_tracks[ti])
+            {
                 ti
-            } else if let Some(ti) = seq.video_tracks.iter().position(|t| !t.locked) {
+            } else if let Some(ti) = seq
+                .video_tracks
+                .iter()
+                .position(|t| !t.locked && !track_has_unselected_overlap(t))
+            {
                 ti
             } else {
                 seq.video_tracks.push(zc_project::VideoTrack {
@@ -1126,6 +1146,12 @@ impl Session {
                 .sort_by(|a, b| a.start.total_cmp(&b.start));
         }
 
+        // Preserve parent sequence controls inside the child composition so moved
+        // expressions referencing controls by name or ID evaluate identically.
+        for ctl in &mut child_controls {
+            shift_property_track_keyframes(&mut ctl.track, -min_start);
+        }
+
         if new_vtracks.is_empty() {
             new_vtracks.push(zc_project::VideoTrack {
                 id: parse_uuid_or_new(&self.alloc_uuid_id()),
@@ -1158,6 +1184,7 @@ impl Session {
             fps,
             length_frames: span,
             background_color: bg_color,
+            controls: child_controls,
             video_tracks: new_vtracks,
             audio_tracks: new_atracks,
             layer_masks: moved_layer_masks,
@@ -1175,8 +1202,6 @@ impl Session {
         let active_id = self.document.active_composition_id;
         let active_seq = self.active_sequence().clone();
         self.document = SessionDocument::from_sequence(&self.project, &active_seq, active_id);
-        let vt_idx = target_vtrack_idx.unwrap_or(0);
-        self.resolve_track_overlaps(TrackKind::Video, vt_idx, &precomp_clip_id.to_string());
         self.document.recompute_sequence_length_if_extended();
         self.selection.clear_all();
         self.playback.bump_epoch();
@@ -1882,23 +1907,75 @@ impl Session {
             ));
         }
         let cid_str = clip_id.to_string();
+        let (local_frame, base_time, time_prop_snapshot, time_expr) = {
+            let (track, clip_idx) = self
+                .document
+                .find_clip_mut(&cid_str)
+                .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
+            if track.locked {
+                return Err(SessionError::TrackLocked(track.id.clone()));
+            }
+            let clip = &track.clips[clip_idx];
+            let local_frame = (frame - clip.start).clamp(0.0, clip.length);
+            let base_time = if clip.time_animated {
+                clip.properties
+                    .get("time")
+                    .and_then(|p| eval_session_property_at(p, local_frame).as_f64())
+                    .unwrap_or_else(|| clip.eval_time_at(local_frame))
+            } else {
+                clip.eval_time_at(local_frame)
+            };
+            let time_prop = clip.properties.get("time").cloned();
+            let expr = time_prop
+                .as_ref()
+                .and_then(|p| p.expression.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            (local_frame, base_time, time_prop, expr)
+        };
+
+        let frozen_time = if let Some(expr_src) = time_expr {
+            let fps = self.document.fps.max(1.0);
+            let config = if self.plugins.is_enabled("expressions-plus") {
+                zc_expr::EvalConfig::expressions_plus()
+            } else {
+                zc_expr::EvalConfig::vanilla()
+            };
+            self.sync_document_to_project();
+            let controls = evaluate_sequence_controls_at(
+                &self.active_sequence().controls,
+                frame,
+                fps,
+                &config,
+            );
+            let ctx = FreezeTimeExprContext {
+                local_frame,
+                base_time,
+                fps,
+                time_prop: time_prop_snapshot.as_ref(),
+                controls: &controls,
+            };
+            let outcome = zc_expr::eval_with_fallback(&expr_src, &ctx, &config);
+            if outcome.error.is_none() {
+                let evaluated = outcome.value.to_number();
+                if evaluated.is_finite() {
+                    evaluated
+                } else {
+                    base_time
+                }
+            } else {
+                base_time
+            }
+        } else {
+            base_time
+        };
+
         let (track, clip_idx) = self
             .document
             .find_clip_mut(&cid_str)
             .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
-        if track.locked {
-            return Err(SessionError::TrackLocked(track.id.clone()));
-        }
         let clip = &mut track.clips[clip_idx];
-        let local_frame = (frame - clip.start).clamp(0.0, clip.length);
-        let frozen_time = if clip.time_animated {
-            clip.properties
-                .get("time")
-                .and_then(|p| eval_session_property_at(p, local_frame).as_f64())
-                .unwrap_or_else(|| clip.eval_time_at(local_frame))
-        } else {
-            clip.eval_time_at(local_frame)
-        };
         clip.time_start = frozen_time;
         clip.time_end = frozen_time;
         clip.time_animated = true;
@@ -1934,14 +2011,7 @@ impl Session {
         } else {
             let len = clip.length;
             if let Some(tp) = clip.properties.get_mut("time") {
-                for kf in &mut tp.keyframes {
-                    kf.frame = len - kf.frame;
-                    let old_in = kf.control_points[0];
-                    let old_out = kf.control_points[1];
-                    kf.control_points[0] = [-old_out[0], old_out[1]];
-                    kf.control_points[1] = [-old_in[0], old_in[1]];
-                }
-                tp.keyframes.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+                reverse_session_keyframes(&mut tp.keyframes, len);
             }
             std::mem::swap(&mut clip.time_start, &mut clip.time_end);
         }
@@ -2016,5 +2086,269 @@ impl Session {
             "purged_count": purged.len(),
             "purged_asset_ids": purged,
         }))
+    }
+}
+
+/// Mirrors a CM3 16-bit `tween` code for time-reversed playback so that every
+/// segment `[k_i, k_{i+1}]` satisfies `E_rev(t) = 1 - E(1 - t)`.
+fn mirror_cm3_tween_code(tween: u16) -> u16 {
+    let low = (tween & 0xFF) as u8;
+    if low == 0 {
+        // Hold (`ease_0`) always stays Hold regardless of high bits.
+        return 0;
+    }
+    let mirrored_low: u8 = match low {
+        2 => 3,
+        3 => 2,
+        5 => 6,
+        6 => 5,
+        8 => 9,
+        9 => 8,
+        11 => 12,
+        12 => 11,
+        14 => 15,
+        15 => 14,
+        17 => 18,
+        18 => 17,
+        20 => 21,
+        21 => 20,
+        23 => 24,
+        24 => 23,
+        26 => 27,
+        27 => 26,
+        29 => 30,
+        30 => 29,
+        other => other,
+    };
+    (tween & 0xFF00) | u16::from(mirrored_low)
+}
+
+/// Reverses a sorted keyframe curve across `[0, duration]`, migrating each segment's
+/// CM3 right-endpoint tween code to the new right endpoint with mirrored easing and
+/// mirrored Bezier handles.
+fn reverse_session_keyframes(keyframes: &mut Vec<SessionKeyframe>, duration: f64) {
+    if keyframes.is_empty() {
+        return;
+    }
+    keyframes.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+    let old = std::mem::take(keyframes);
+    let n = old.len();
+    let mut reversed = Vec::with_capacity(n);
+    for j in 0..n {
+        let src = &old[n - 1 - j];
+        let tween = if j == 0 {
+            1
+        } else {
+            // Segment `new[j - 1] -> new[j]` reverses `old[n - 1 - j] -> old[n - j]`,
+            // whose CM3 tween metadata lives on its original right endpoint `old[n - j]`.
+            mirror_cm3_tween_code(old[n - j].tween)
+        };
+        let old_in = src.control_points[0];
+        let old_out = src.control_points[1];
+        let mut kf = src.clone();
+        kf.frame = duration - src.frame;
+        kf.tween = tween;
+        kf.control_points = [[-old_out[0], old_out[1]], [-old_in[0], old_in[1]]];
+        reversed.push(kf);
+    }
+    *keyframes = reversed;
+}
+
+fn json_to_expr_value(val: &Value) -> zc_expr::Value {
+    match val {
+        Value::Null => zc_expr::Value::Null,
+        Value::Bool(b) => zc_expr::Value::Bool(*b),
+        Value::Number(n) => zc_expr::Value::Number(n.as_f64().unwrap_or(0.0)),
+        Value::String(s) => zc_expr::Value::String(s.clone()),
+        Value::Array(items) => {
+            zc_expr::Value::Array(items.iter().map(json_to_expr_value).collect())
+        }
+        Value::Object(map) => zc_expr::Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_expr_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+struct ControlExprContext<'a> {
+    abs_frame: f64,
+    fps: f64,
+    base_value: zc_expr::Value,
+    controls: &'a BTreeMap<String, zc_expr::Value>,
+}
+
+impl zc_expr::ExprContext for ControlExprContext<'_> {
+    fn frame(&self) -> f64 {
+        self.abs_frame
+    }
+
+    fn time(&self) -> f64 {
+        self.abs_frame / self.fps
+    }
+
+    fn fps(&self) -> f64 {
+        self.fps
+    }
+
+    fn value(&self) -> zc_expr::Value {
+        self.base_value.clone()
+    }
+
+    fn control(
+        &self,
+        name: &str,
+        stable_id: Option<&str>,
+    ) -> Result<zc_expr::Value, zc_expr::ExprError> {
+        if let Some(id) = stable_id
+            && let Some(val) = self.controls.get(id)
+        {
+            return Ok(val.clone());
+        }
+        if let Some(val) = self.controls.get(name) {
+            return Ok(val.clone());
+        }
+        Err(zc_expr::ExprError::NotFound(format!("control '{name}'")))
+    }
+}
+
+fn evaluate_sequence_controls_at(
+    controls: &[zc_project::SequenceControl],
+    abs_frame: f64,
+    fps: f64,
+    config: &zc_expr::EvalConfig,
+) -> BTreeMap<String, zc_expr::Value> {
+    let mut evaluated = BTreeMap::new();
+    for ctrl in controls {
+        let session_prop = property_track_to_session(&ctrl.track);
+        let base_json = eval_session_property_at(&session_prop, abs_frame);
+        let base_expr = json_to_expr_value(&base_json);
+        let mut expr_val = if let Some(expr_src) = ctrl
+            .track
+            .expression
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let ctx = ControlExprContext {
+                abs_frame,
+                fps,
+                base_value: base_expr.clone(),
+                controls: &evaluated,
+            };
+            let outcome = zc_expr::eval_with_fallback(expr_src, &ctx, config);
+            if outcome.error.is_none() {
+                outcome.value
+            } else {
+                base_expr
+            }
+        } else {
+            base_expr
+        };
+        if ctrl.kind == zc_project::SequenceControlKind::Checkbox {
+            expr_val = match expr_val {
+                zc_expr::Value::String(s) => {
+                    zc_expr::Value::Number(s.trim().parse::<f64>().unwrap_or(0.0))
+                }
+                zc_expr::Value::Bool(b) => zc_expr::Value::Number(if b { 1.0 } else { 0.0 }),
+                other => other,
+            };
+        }
+        evaluated.insert(ctrl.id.clone(), expr_val.clone());
+        evaluated.insert(ctrl.name.clone(), expr_val);
+    }
+    evaluated
+}
+
+struct FreezeTimeExprContext<'a> {
+    local_frame: f64,
+    base_time: f64,
+    fps: f64,
+    time_prop: Option<&'a SessionProperty>,
+    controls: &'a BTreeMap<String, zc_expr::Value>,
+}
+
+impl zc_expr::ExprContext for FreezeTimeExprContext<'_> {
+    fn frame(&self) -> f64 {
+        self.local_frame
+    }
+
+    fn time(&self) -> f64 {
+        self.base_time
+    }
+
+    fn fps(&self) -> f64 {
+        self.fps
+    }
+
+    fn value(&self) -> zc_expr::Value {
+        zc_expr::Value::Number(self.base_time)
+    }
+
+    fn property_value_at_time(
+        &self,
+        id: &zc_expr::HandleId,
+        seconds: f64,
+    ) -> Result<zc_expr::Value, zc_expr::ExprError> {
+        if self.this_property_id().as_ref() == Some(id) {
+            if let Some(prop) = self.time_prop {
+                let sampled = eval_session_property_at(prop, seconds * self.fps);
+                return Ok(json_to_expr_value(&sampled));
+            }
+            return Ok(self.value());
+        }
+        Err(zc_expr::ExprError::NotFound(format!(
+            "property '{}'",
+            id.as_str()
+        )))
+    }
+
+    fn property_num_keys(&self, id: &zc_expr::HandleId) -> usize {
+        if self.this_property_id().as_ref() == Some(id) {
+            self.time_prop.map_or(0, |p| p.keyframes.len())
+        } else {
+            0
+        }
+    }
+
+    fn property_key(
+        &self,
+        id: &zc_expr::HandleId,
+        index_1based: usize,
+    ) -> Result<zc_expr::KeyframeRecord, zc_expr::ExprError> {
+        if self.this_property_id().as_ref() == Some(id)
+            && index_1based >= 1
+            && let Some(prop) = self.time_prop
+        {
+            let mut sorted: Vec<&SessionKeyframe> = prop.keyframes.iter().collect();
+            sorted.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+            if let Some(kf) = sorted.get(index_1based - 1) {
+                return Ok(zc_expr::KeyframeRecord {
+                    index: index_1based,
+                    time: kf.frame / self.fps,
+                    value: json_to_expr_value(&kf.value),
+                });
+            }
+        }
+        Err(zc_expr::ExprError::RangeError(format!(
+            "keyframe index {index_1based} out of range on property '{}'",
+            id.as_str()
+        )))
+    }
+
+    fn control(
+        &self,
+        name: &str,
+        stable_id: Option<&str>,
+    ) -> Result<zc_expr::Value, zc_expr::ExprError> {
+        if let Some(id) = stable_id
+            && let Some(val) = self.controls.get(id)
+        {
+            return Ok(val.clone());
+        }
+        if let Some(val) = self.controls.get(name) {
+            return Ok(val.clone());
+        }
+        Err(zc_expr::ExprError::NotFound(format!("control '{name}'")))
     }
 }

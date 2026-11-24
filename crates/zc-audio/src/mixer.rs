@@ -538,6 +538,22 @@ pub fn collect_flattened_audio_clips(
     range_start_frame: f64,
     range_end_frame: f64,
 ) -> Vec<FlattenedAudioClip> {
+    collect_flattened_audio_clips_with_precomp(project, range_start_frame, range_end_frame, true)
+}
+
+/// Recursively collects all audible [`FlattenedAudioClip`] items across `project.sequence` and
+/// optionally (when `precomp_enabled` is `true`) nested [`LayerKind::PrecompRef`] compositions
+/// in `project.compositions` overlapping `[range_start_frame, range_end_frame)`.
+///
+/// When `precomp_enabled` is `false`, `LayerKind::PrecompRef` clips are skipped so audio playback
+/// and export match visual rendering when the `precomp-plus` plugin is disabled.
+#[must_use]
+pub fn collect_flattened_audio_clips_with_precomp(
+    project: &Project,
+    range_start_frame: f64,
+    range_end_frame: f64,
+    precomp_enabled: bool,
+) -> Vec<FlattenedAudioClip> {
     if !range_start_frame.is_finite()
         || !range_end_frame.is_finite()
         || range_end_frame <= range_start_frame
@@ -555,6 +571,7 @@ pub fn collect_flattened_audio_clips(
         &[],
         &mut visited,
         0,
+        precomp_enabled,
         &mut out,
     );
     out
@@ -634,7 +651,32 @@ pub fn project_has_active_audio_in_range(
     range_start_frame: f64,
     range_end_frame: f64,
 ) -> bool {
-    let clips = collect_flattened_audio_clips(project, range_start_frame, range_end_frame);
+    project_has_active_audio_in_range_with_precomp(
+        project,
+        range_start_frame,
+        range_end_frame,
+        true,
+    )
+}
+
+/// Returns `true` if `project` has at least one decodable active audio clip (including inside
+/// nested `PrecompRef` compositions when `precomp_enabled` is `true`) overlapping
+/// `[range_start_frame, range_end_frame)`.
+///
+/// Video-only containers returning [`AudioError::NoAudioTrack`] are treated gracefully as silent.
+#[must_use]
+pub fn project_has_active_audio_in_range_with_precomp(
+    project: &Project,
+    range_start_frame: f64,
+    range_end_frame: f64,
+    precomp_enabled: bool,
+) -> bool {
+    let clips = collect_flattened_audio_clips_with_precomp(
+        project,
+        range_start_frame,
+        range_end_frame,
+        precomp_enabled,
+    );
     let mut checked_silent: HashSet<&str> = HashSet::new();
     for clip in &clips {
         if checked_silent.contains(clip.asset_id.as_str()) {
@@ -675,12 +717,39 @@ pub fn mix_project_audio_with_precomps(
     total_seq_frames: f64,
     sample_rate: u32,
 ) -> Result<Option<Vec<[f32; 2]>>, AudioError> {
+    mix_project_audio_with_precomps_filtered(
+        project,
+        start_seq_frame,
+        total_seq_frames,
+        sample_rate,
+        true,
+    )
+}
+
+/// Flattens and mixes all active audio clips (including nested `PrecompRef` compositions when
+/// `precomp_enabled` is `true`) in `project` over
+/// `[start_seq_frame, start_seq_frame + total_seq_frames)` at `sample_rate`.
+///
+/// When `precomp_enabled` is `false`, `LayerKind::PrecompRef` clips are skipped so audio output
+/// agrees with video rendering when the `precomp-plus` plugin is disabled.
+pub fn mix_project_audio_with_precomps_filtered(
+    project: &Project,
+    start_seq_frame: f64,
+    total_seq_frames: f64,
+    sample_rate: u32,
+    precomp_enabled: bool,
+) -> Result<Option<Vec<[f32; 2]>>, AudioError> {
     if !start_seq_frame.is_finite() || !total_seq_frames.is_finite() || total_seq_frames <= 0.0 {
         return Ok(None);
     }
     let root_fps = sequence_effective_fps(&project.sequence);
     let range_end = start_seq_frame + total_seq_frames;
-    let flattened = collect_flattened_audio_clips(project, start_seq_frame, range_end);
+    let flattened = collect_flattened_audio_clips_with_precomp(
+        project,
+        start_seq_frame,
+        range_end,
+        precomp_enabled,
+    );
 
     let mut buffers: HashMap<String, AudioBuffer> = HashMap::new();
     let mut silent_assets: HashSet<String> = HashSet::new();
@@ -1476,6 +1545,7 @@ fn collect_sequence_audio_clips(
     parent_chain: &[ParentCompMap],
     visited_comps: &mut HashSet<Uuid>,
     depth: usize,
+    precomp_enabled: bool,
     out: &mut Vec<FlattenedAudioClip>,
 ) {
     let seq_fps = sequence_effective_fps(seq);
@@ -1534,7 +1604,7 @@ fn collect_sequence_audio_clips(
         }
     }
 
-    if depth >= MAX_PRECOMP_AUDIO_DEPTH {
+    if !precomp_enabled || depth >= MAX_PRECOMP_AUDIO_DEPTH {
         return;
     }
 
@@ -1625,6 +1695,7 @@ fn collect_sequence_audio_clips(
                         &next_chain,
                         visited_comps,
                         depth + 1,
+                        precomp_enabled,
                         out,
                     );
                 }
@@ -2496,5 +2567,91 @@ mod tests {
         let mixed = mix_project_audio_with_precomps(&project, 0.0, 15.0, sr)
             .expect("NoAudioTrack must be treated as silence, not an error");
         assert!(mixed.is_none());
+    }
+
+    #[test]
+    fn precomp_audio_respects_precomp_enabled_flag() {
+        let sr = STANDARD_SAMPLE_RATE;
+        let mut project = Project::new_cm3_default();
+        project.sequence.fps = 30;
+        project.sequence.length_frames = 30.0;
+
+        let tone_wav = make_constant_wav(sr, sr as usize, [0.5, 0.5]);
+        project.assets.insert(
+            "precomp_tone.wav".to_owned(),
+            make_asset("precomp_tone.wav", tone_wav),
+        );
+
+        let comp_id = Uuid::new_v4();
+        let mut child_comp = Sequence {
+            id: comp_id,
+            name: "Nested Audio Comp".to_owned(),
+            fps: 30,
+            length_frames: 30.0,
+            ..Sequence::default()
+        };
+        child_comp.audio_tracks.push(make_audio_track(
+            "ChildAudio",
+            true,
+            false,
+            false,
+            vec![make_audio_clip(
+                0.0,
+                30.0,
+                Some("precomp_tone.wav"),
+                PropertyTrack::linear_time_curve(30.0, 30),
+                PropertyTrack::number(1.0),
+                PropertyTrack::number(0.0),
+                None,
+            )],
+        ));
+
+        let (vtrack, _) = make_precomp_video_track(
+            "PrecompTrack",
+            true,
+            false,
+            0.0,
+            30.0,
+            comp_id,
+            PropertyTrack::linear_time_curve(30.0, 30),
+            None,
+        );
+        project.sequence.video_tracks = vec![vtrack];
+        project.sequence.audio_tracks.clear();
+        project.compositions.insert(comp_id, child_comp);
+
+        // With precomp_enabled = true (and backward-compatible defaults), nested audio is collected & mixed.
+        let clips_enabled = collect_flattened_audio_clips_with_precomp(&project, 0.0, 30.0, true);
+        assert_eq!(clips_enabled.len(), 1);
+        assert!(project_has_active_audio_in_range_with_precomp(
+            &project, 0.0, 30.0, true
+        ));
+        let mixed_enabled = mix_project_audio_with_precomps_filtered(&project, 0.0, 30.0, sr, true)
+            .expect("precomp-enabled mix must succeed")
+            .expect("precomp-enabled mix must produce audible samples");
+        let peak_enabled = mixed_enabled
+            .iter()
+            .fold(0.0_f32, |acc, s| acc.max(s[0].abs()).max(s[1].abs()));
+        assert!(
+            peak_enabled > 0.1,
+            "expected audible nested precomp audio when precomp_enabled=true, got peak={peak_enabled}"
+        );
+
+        // With precomp_enabled = false, PrecompRef clips are skipped and the mix stays silent.
+        let clips_disabled = collect_flattened_audio_clips_with_precomp(&project, 0.0, 30.0, false);
+        assert!(
+            clips_disabled.is_empty(),
+            "PrecompRef audio must be skipped when precomp_enabled=false"
+        );
+        assert!(!project_has_active_audio_in_range_with_precomp(
+            &project, 0.0, 30.0, false
+        ));
+        let mixed_disabled =
+            mix_project_audio_with_precomps_filtered(&project, 0.0, 30.0, sr, false)
+                .expect("precomp-disabled mix must succeed");
+        assert!(
+            mixed_disabled.is_none(),
+            "PrecompRef audio must be silent (None) when precomp_enabled=false"
+        );
     }
 }

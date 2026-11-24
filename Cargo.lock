@@ -4048,6 +4048,7 @@ dependencies = [
  "zc-anim",
  "zc-audio",
  "zc-export",
+ "zc-expr",
  "zc-plugin",
  "zc-project",
  "zc-render",

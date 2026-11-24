@@ -3413,6 +3413,13 @@ fn parse_layer(
         }
     }
 
+    let plugin_payload_obj = match &layer.kind {
+        LayerKind::Plugin {
+            payload: Value::Object(map),
+            ..
+        } => Some(map),
+        _ => None,
+    };
     for (k, v) in obj {
         if !matches!(
             k.as_str(),
@@ -3423,7 +3430,8 @@ fn parse_layer(
                 | "zoidiumShadowMode"
                 | "zoidiumMasks"
                 | "masks"
-        ) {
+        ) && !plugin_payload_obj.is_some_and(|map| map.contains_key(k))
+        {
             layer.preserved.insert(k.clone(), v.clone());
         }
     }

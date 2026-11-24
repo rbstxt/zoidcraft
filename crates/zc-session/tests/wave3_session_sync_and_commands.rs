@@ -1705,3 +1705,426 @@ fn markers_controls_text_split_paste_time_and_assets_are_undoable() {
             .contains_key("asset_orphan")
     );
 }
+
+#[test]
+fn precompose_non_adjacent_clips_preserves_unselected_middle_clip_and_undo() {
+    let mut session = Session::new();
+    let vtrack = session.document().video_tracks[0].id.clone();
+    // Remove default scene clip so track 0 contains only our three test clips.
+    let default_clip_id = session.document().video_tracks[0].clips[0].id.clone();
+    session
+        .execute(Command::DeleteClip {
+            clip_id: default_clip_id,
+        })
+        .unwrap();
+
+    let clip0_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack.clone(),
+            kind: "text2d".to_owned(),
+            name: Some("Clip 0".to_owned()),
+            start: 0.0,
+            length: 30.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let clip1_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack.clone(),
+            kind: "shape2d".to_owned(),
+            name: Some("Middle Unselected".to_owned()),
+            start: 30.0,
+            length: 30.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let clip2_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack,
+            kind: "text2d".to_owned(),
+            name: Some("Clip 2".to_owned()),
+            start: 60.0,
+            length: 30.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let before_proj = session.to_project();
+    assert_eq!(before_proj.sequence.video_tracks.len(), 1);
+    assert_eq!(before_proj.sequence.video_tracks[0].clips.len(), 3);
+
+    // Precompose clip 0 + clip 2 while leaving middle clip 1 unselected.
+    let clip0_uuid = Uuid::parse_str(&clip0_str).unwrap();
+    let clip2_uuid = Uuid::parse_str(&clip2_str).unwrap();
+    let res = session
+        .execute(Command::PrecomposeClips {
+            clip_ids: vec![clip0_uuid, clip2_uuid],
+            name: "Bookends Precomp".to_owned(),
+        })
+        .unwrap();
+    let comp_id = Uuid::parse_str(res["comp_id"].as_str().unwrap()).unwrap();
+    let precomp_clip_str = res["clip_id"].as_str().unwrap().to_owned();
+
+    let after_proj = session.to_project();
+    // Middle unselected clip 1 MUST remain completely intact at [30..60] on track 0!
+    assert_eq!(after_proj.sequence.video_tracks.len(), 2);
+    assert_eq!(after_proj.sequence.video_tracks[0].clips.len(), 1);
+    let kept_middle = &after_proj.sequence.video_tracks[0].clips[0];
+    assert_eq!(kept_middle.id.to_string(), clip1_str);
+    assert!((kept_middle.start - 30.0).abs() < 1e-6);
+    assert!((kept_middle.length - 30.0).abs() < 1e-6);
+
+    // Replacement precomp clip MUST live on the non-overlapping video track 1 at [0..90].
+    assert_eq!(after_proj.sequence.video_tracks[1].clips.len(), 1);
+    let precomp_clip = &after_proj.sequence.video_tracks[1].clips[0];
+    assert_eq!(precomp_clip.id.to_string(), precomp_clip_str);
+    assert!((precomp_clip.start - 0.0).abs() < 1e-6);
+    assert!((precomp_clip.length - 90.0).abs() < 1e-6);
+
+    // Child composition contains only clip 0 and clip 2.
+    let child_comp = &after_proj.compositions[&comp_id];
+    assert_eq!(child_comp.video_tracks[0].clips.len(), 2);
+    assert_eq!(child_comp.video_tracks[0].clips[0].id, clip0_uuid);
+    assert_eq!(child_comp.video_tracks[0].clips[1].id, clip2_uuid);
+
+    // Undo MUST restore exact original tracks, clips, and compositions.
+    session.execute(Command::Undo).unwrap();
+    let undone_proj = session.to_project();
+    assert!(!undone_proj.compositions.contains_key(&comp_id));
+    assert_eq!(undone_proj.sequence.video_tracks.len(), 1);
+    let restored_ids: Vec<String> = undone_proj.sequence.video_tracks[0]
+        .clips
+        .iter()
+        .map(|c| c.id.to_string())
+        .collect();
+    assert_eq!(restored_ids, vec![clip0_str, clip1_str, clip2_str]);
+}
+
+#[test]
+fn precompose_clones_sequence_controls_and_shifts_keyframes_to_child_origin() {
+    let mut project = Project::new_cm3_default();
+    project.sequence.controls.push(zc_project::SequenceControl {
+        id: "ctl-drive-01".to_owned(),
+        name: "Drive".to_owned(),
+        kind: SequenceControlKind::Slider,
+        track: PropertyTrack {
+            animated: true,
+            expression: None,
+            static_behavior: StaticBehavior::Constant,
+            value: PropertyValue::Number(10.0),
+            keyframes: vec![
+                PropertyKeyframe::linear(30.0, PropertyValue::Number(10.0)),
+                PropertyKeyframe::linear(60.0, PropertyValue::Number(80.0)),
+            ],
+            channels: Vec::new(),
+        },
+        preserved: BTreeMap::new(),
+    });
+
+    let mut session = Session::from_project(project, PluginRegistry::new());
+    let vtrack = session.document().video_tracks[0].id.clone();
+    let default_clip_id = session.document().video_tracks[0].clips[0].id.clone();
+    session
+        .execute(Command::DeleteClip {
+            clip_id: default_clip_id,
+        })
+        .unwrap();
+
+    let clip_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack,
+            kind: "text2d".to_owned(),
+            name: Some("Driven Clip".to_owned()),
+            start: 30.0,
+            length: 40.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let clip_uuid = Uuid::parse_str(&clip_str).unwrap();
+
+    let res = session
+        .execute(Command::PrecomposeClips {
+            clip_ids: vec![clip_uuid],
+            name: "Driven Precomp".to_owned(),
+        })
+        .unwrap();
+    let comp_id = Uuid::parse_str(res["comp_id"].as_str().unwrap()).unwrap();
+
+    let proj = session.to_project();
+    let child = &proj.compositions[&comp_id];
+    assert_eq!(child.controls.len(), 1);
+    let ctl = &child.controls[0];
+    assert_eq!(ctl.id, "ctl-drive-01");
+    assert_eq!(ctl.name, "Drive");
+    assert_eq!(ctl.track.keyframes.len(), 2);
+    assert!((ctl.track.keyframes[0].frame - 0.0).abs() < 1e-6);
+    assert!((ctl.track.keyframes[1].frame - 30.0).abs() < 1e-6);
+    assert_eq!(ctl.track.keyframes[0].value, PropertyValue::Number(10.0));
+    assert_eq!(ctl.track.keyframes[1].value, PropertyValue::Number(80.0));
+
+    // Parent sequence control keyframes remain untouched at 30 and 60.
+    assert!((proj.sequence.controls[0].track.keyframes[0].frame - 30.0).abs() < 1e-6);
+    assert!((proj.sequence.controls[0].track.keyframes[1].frame - 60.0).abs() < 1e-6);
+}
+
+#[test]
+fn reverse_clip_migrates_segment_tweens_mirrors_easings_and_mirrors_bezier_handles() {
+    let mut session = Session::new();
+    let vtrack = session.document().video_tracks[0].id.clone();
+
+    // 1. Mixed-tween curve: [0: Linear, 10: Hold (seg 0->10 is Hold), 20: QuadIn (seg 10->20 is QuadIn)]
+    let clip_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack.clone(),
+            kind: "video".to_owned(),
+            name: Some("Mixed Tween Clip".to_owned()),
+            start: 200.0,
+            length: 20.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let clip_uuid = Uuid::parse_str(&clip_str).unwrap();
+
+    session
+        .execute(Command::SetKeyframe {
+            target_id: clip_str.clone(),
+            property: "time".to_owned(),
+            frame: 0.0,
+            value: json!(0.0),
+            tween: Some(1), // Linear (unused leftmost)
+        })
+        .unwrap();
+    session
+        .execute(Command::SetKeyframe {
+            target_id: clip_str.clone(),
+            property: "time".to_owned(),
+            frame: 10.0,
+            value: json!(1.0),
+            tween: Some(0), // Hold for segment 0->10
+        })
+        .unwrap();
+    session
+        .execute(Command::SetKeyframe {
+            target_id: clip_str.clone(),
+            property: "time".to_owned(),
+            frame: 20.0,
+            value: json!(2.0),
+            tween: Some(2), // QuadIn for segment 10->20
+        })
+        .unwrap();
+
+    session
+        .execute(Command::ReverseClip { clip_id: clip_uuid })
+        .unwrap();
+
+    let proj = session.to_project();
+    let kfs = &find_clip(&proj, &clip_str).time_curve.keyframes;
+    assert_eq!(kfs.len(), 3);
+    assert!((kfs[0].frame - 0.0).abs() < 1e-6);
+    assert_eq!(kfs[0].value, PropertyValue::Number(2.0));
+    assert_eq!(
+        kfs[0].tween, 1,
+        "leftmost keyframe tween defaults to Linear"
+    );
+
+    // Reversed segment 0->10 reverses original 10->20 (QuadIn = 2) -> QuadOut = 3!
+    assert!((kfs[1].frame - 10.0).abs() < 1e-6);
+    assert_eq!(kfs[1].value, PropertyValue::Number(1.0));
+    assert_eq!(
+        kfs[1].tween, 3,
+        "reversed segment 0->10 must carry mirrored QuadOut (3)"
+    );
+
+    // Reversed segment 10->20 reverses original 0->10 (Hold = 0) -> Hold = 0!
+    assert!((kfs[2].frame - 20.0).abs() < 1e-6);
+    assert_eq!(kfs[2].value, PropertyValue::Number(0.0));
+    assert_eq!(
+        kfs[2].tween, 0,
+        "reversed segment 10->20 must carry Hold (0)"
+    );
+
+    // 2. Bezier segment curve reversal must mirror curve values identically: f_rev(L - t) == f(t).
+    let bez_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack,
+            kind: "video".to_owned(),
+            name: Some("Bezier Time Clip".to_owned()),
+            start: 240.0,
+            length: 20.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bez_uuid = Uuid::parse_str(&bez_str).unwrap();
+    let mut bez_proj = session.to_project();
+    {
+        let vc = bez_proj.sequence.video_tracks[0]
+            .clips
+            .iter_mut()
+            .find(|c| c.id == bez_uuid)
+            .unwrap();
+        vc.time_curve.animated = true;
+        vc.time_curve.keyframes = vec![
+            PropertyKeyframe {
+                frame: 0.0,
+                value: PropertyValue::Number(0.0),
+                tween: 1,
+                easing_index: 1,
+                is_bezier: false,
+                continuous_tangent: false,
+                control_points: [[-2.0, 0.0], [4.0, 0.8]],
+            },
+            PropertyKeyframe {
+                frame: 20.0,
+                value: PropertyValue::Number(10.0),
+                tween: (1 << 8) | 2, // Bezier + QuadIn low byte
+                easing_index: 2,
+                is_bezier: true,
+                continuous_tangent: false,
+                control_points: [[-6.0, -0.5], [2.0, 0.0]],
+            },
+        ];
+    }
+    let orig_sample = zc_anim::eval_segment_bezier(
+        zc_anim::BezierSegment {
+            start_frame: 0.0,
+            start_value: 0.0,
+            out_tangent: [4.0, 0.8],
+            end_frame: 20.0,
+            end_value: 10.0,
+            in_tangent: [-6.0, -0.5],
+        },
+        6.0,
+    );
+
+    let mut bez_session = Session::from_project(bez_proj, PluginRegistry::new());
+    bez_session
+        .execute(Command::ReverseClip { clip_id: bez_uuid })
+        .unwrap();
+    let rev_proj = bez_session.to_project();
+    let rkfs = &find_clip(&rev_proj, &bez_str).time_curve.keyframes;
+    assert_eq!(rkfs.len(), 2);
+    assert_eq!(
+        rkfs[1].tween,
+        (1 << 8) | 3,
+        "Bezier flag preserved with mirrored low byte"
+    );
+    assert_eq!(rkfs[0].control_points[1], [6.0, -0.5]);
+    assert_eq!(rkfs[1].control_points[0], [-4.0, 0.8]);
+
+    let rev_sample = zc_anim::eval_segment_bezier(
+        zc_anim::BezierSegment {
+            start_frame: rkfs[0].frame,
+            start_value: 10.0,
+            out_tangent: rkfs[0].control_points[1],
+            end_frame: rkfs[1].frame,
+            end_value: 0.0,
+            in_tangent: rkfs[1].control_points[0],
+        },
+        14.0,
+    );
+    assert!(
+        (rev_sample - orig_sample).abs() < 1e-9,
+        "reversed Bezier curve at L - t must match original at t (orig={orig_sample}, rev={rev_sample})"
+    );
+}
+
+#[test]
+fn freeze_clip_frame_evaluates_time_expression_and_sequence_controls() {
+    let mut session = Session::new();
+    let vtrack = session.document().video_tracks[0].id.clone();
+
+    session
+        .execute(Command::AddSequenceControl {
+            name: "TimeBoost".to_owned(),
+            kind: SequenceControlKind::Slider,
+            value: PropertyValue::Number(0.5),
+            min: None,
+            max: None,
+            step: None,
+        })
+        .unwrap();
+
+    // Clip at start=10, length=60 at 30fps -> linear time [0.0..2.0].
+    // At sequence frame 40 -> local_frame = 30 -> base time = 1.0.
+    let clip_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack.clone(),
+            kind: "video".to_owned(),
+            name: Some("Expr Time Clip".to_owned()),
+            start: 10.0,
+            length: 60.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let clip_uuid = Uuid::parse_str(&clip_str).unwrap();
+
+    session
+        .execute(Command::SetExpression {
+            target_id: clip_str.clone(),
+            property: "time".to_owned(),
+            expression: Some("time * 2.0 + 1.0 + control('TimeBoost')".to_owned()),
+        })
+        .unwrap();
+
+    let freeze_res = session
+        .execute(Command::FreezeClipFrame {
+            clip_id: clip_uuid,
+            frame: 40.0,
+        })
+        .unwrap();
+    let frozen_val = freeze_res["frozen_time"].as_f64().unwrap();
+    assert!(
+        (frozen_val - 3.5).abs() < 1e-9,
+        "FreezeClipFrame must freeze expression-evaluated time (3.5), got {frozen_val}"
+    );
+    let proj = session.to_project();
+    let frozen_vc = find_clip(&proj, &clip_str);
+    assert!(!frozen_vc.time_curve.animated);
+    assert_eq!(frozen_vc.time_curve.expression, None);
+    assert_eq!(frozen_vc.time_curve.value, PropertyValue::Number(3.5));
+
+    // Also verify `value + 3.0` expression referencing the base keyframe curve value.
+    let clip2_str = session
+        .execute(Command::AddClip {
+            track_id: vtrack,
+            kind: "video".to_owned(),
+            name: Some("Value Expr Clip".to_owned()),
+            start: 100.0,
+            length: 60.0,
+        })
+        .unwrap()["clip_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let clip2_uuid = Uuid::parse_str(&clip2_str).unwrap();
+    session
+        .execute(Command::SetExpression {
+            target_id: clip2_str.clone(),
+            property: "time".to_owned(),
+            expression: Some("value + 3.0".to_owned()),
+        })
+        .unwrap();
+    let freeze2 = session
+        .execute(Command::FreezeClipFrame {
+            clip_id: clip2_uuid,
+            frame: 130.0,
+        })
+        .unwrap();
+    assert!((freeze2["frozen_time"].as_f64().unwrap() - 4.0).abs() < 1e-9);
+    let proj2 = session.to_project();
+    assert_eq!(find_clip(&proj2, &clip2_str).time_curve.expression, None);
+}

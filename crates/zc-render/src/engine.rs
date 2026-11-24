@@ -4279,8 +4279,9 @@ impl ProjectRenderEngine {
                         let alpha_map = upload_baked(self, "opacity", baked.opacity.as_ref());
 
                         let has_alpha_map = alpha_map.is_some();
-                        let opacity = baked.opacity_factor.clamp(0.0, 1.0);
-                        let blend = if has_alpha_map || opacity < 0.999 {
+                        let opacity_factor = baked.opacity_factor.clamp(0.0, 1.0);
+                        let opacity = if has_alpha_map { 1.0 } else { opacity_factor };
+                        let blend = if has_alpha_map || opacity_factor < 0.999 {
                             MaterialBlend::Normal
                         } else {
                             MaterialBlend::Opaque
@@ -20903,6 +20904,89 @@ DOMAIN_MAX 0.9 0.8 0.7
         assert!(
             lit > 50,
             "Particles+ sprite preset (`star_5`) must render non-blank particles without an external image asset (lit={lit})"
+        );
+    }
+
+    #[test]
+    fn gpu_node_material_constant_opacity_not_applied_twice() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let plugins = PluginRegistry::new();
+
+        let mat_graph = serde_json::json!({
+            "nodes": [
+                { "id": "col", "type": "color", "params": { "color": [1.0, 1.0, 1.0] } },
+                { "id": "op", "type": "float", "params": { "value": 0.5 } },
+                { "id": "out", "type": "pbrOutput" }
+            ],
+            "links": [
+                { "from": "col", "fromPort": "out", "to": "out", "toPort": "emissive" },
+                { "from": "op", "fromPort": "out", "to": "out", "toPort": "opacity" }
+            ]
+        });
+        let spec = MaterialSpec::NodeMaterial {
+            schema_version: 1,
+            resolution: 32,
+            graph: mat_graph.clone(),
+        };
+
+        let mut cube = Object3D::new_shape_3d(
+            "HalfOpacityBox",
+            Shape3DKind::Box {
+                size: [60.0, 60.0, 60.0],
+            },
+        );
+        cube.material = Some(spec.clone());
+        let mut cam = Object3D::new_perspective_camera();
+        cam.position = PropertyTrack::vec3([0.0, 0.0, 72.0]);
+        let mut project = make_test_scene_project(vec![cam, cube], [64, 64]);
+        project.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+
+        let controls = RefCell::new(BTreeMap::new());
+        let parent_props = BTreeMap::new();
+        let expr_stack = RefCell::new(HashSet::new());
+        let env = EvalEnv {
+            frame: 0.0,
+            abs_frame: 0.0,
+            time: 0.0,
+            fps: 30.0,
+            sequence_resolution: [64, 64],
+            project: &project,
+            sequence: &project.sequence,
+            plugins: &plugins,
+            controls: &controls,
+            parent_props: &parent_props,
+            active_clip_id: None,
+            active_layer_id: None,
+            active_object_id: None,
+            active_effect_id: None,
+            active_property_id: None,
+            expr_stack: &expr_stack,
+        };
+        let evaluated = engine.evaluate_material(Some(&spec), &env);
+        assert!(
+            evaluated.alpha_map.is_some(),
+            "wired NodeMaterial opacity should upload alpha_map"
+        );
+        assert!(
+            (evaluated.params.opacity - 1.0).abs() < 1e-6,
+            "when alpha_map is bound, params.opacity must be 1.0 to avoid squaring opacity (got {})",
+            evaluated.params.opacity
+        );
+        assert_eq!(evaluated.params.blend, MaterialBlend::Normal);
+
+        let px = engine
+            .render_frame_rgba8(&project, &plugins, 0.0, 64, 64)
+            .expect("render half-opacity NodeMaterial");
+        let center = (32 * 64 + 32) * 4;
+        let r = px[center];
+        assert!(
+            (110..=145).contains(&r),
+            "constant 0.5 opacity emissive white box over black must render ~128 (0.5), not ~64 (0.25); got center RGBA={:?}",
+            &px[center..center + 4]
         );
     }
 }

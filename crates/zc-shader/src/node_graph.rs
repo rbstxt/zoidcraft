@@ -9,6 +9,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::f64::consts::{PI, SQRT_2, TAU};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +26,7 @@ const MAX_EFFECT_LINKS: usize = 256;
 const MAX_EFFECT_SAMPLES: usize = 256;
 const MAX_MATERIAL_NODES: usize = 200;
 const MAX_MATERIAL_LINKS: usize = 400;
+const MAX_BAKE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct RawNode {
@@ -1939,15 +1942,110 @@ impl Default for BakedNodeMaterialMaps {
     }
 }
 
+/// Tracks live and peak intermediate buffer allocations during `bake_node_material_maps`,
+/// enforcing a strict pre-allocation memory budget.
+#[derive(Debug)]
+struct BakeMemoryTracker {
+    live_bytes: AtomicUsize,
+    peak_bytes: AtomicUsize,
+    budget_bytes: usize,
+}
+
+impl BakeMemoryTracker {
+    fn new(budget_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            live_bytes: AtomicUsize::new(0),
+            peak_bytes: AtomicUsize::new(0),
+            budget_bytes,
+        })
+    }
+
+    fn try_reserve(self: &Arc<Self>, bytes: usize) -> Result<MemoryReservation, String> {
+        let prev = self.live_bytes.load(Ordering::Relaxed);
+        let next = prev.checked_add(bytes).ok_or_else(|| {
+            format!(
+                "NodeMaterial bake memory budget exceeded ({prev} + {bytes} bytes > {} bytes)",
+                self.budget_bytes
+            )
+        })?;
+        if next > self.budget_bytes {
+            return Err(format!(
+                "NodeMaterial bake memory budget exceeded: requested {bytes} bytes with {prev} bytes live (budget {} bytes)",
+                self.budget_bytes
+            ));
+        }
+        self.live_bytes.store(next, Ordering::Relaxed);
+        let peak = self.peak_bytes.load(Ordering::Relaxed);
+        if next > peak {
+            self.peak_bytes.store(next, Ordering::Relaxed);
+        }
+        Ok(MemoryReservation {
+            bytes,
+            tracker: Arc::clone(self),
+        })
+    }
+
+    #[cfg(test)]
+    fn peak_bytes(&self) -> usize {
+        self.peak_bytes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn live_bytes(&self) -> usize {
+        self.live_bytes.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug)]
+struct MemoryReservation {
+    bytes: usize,
+    tracker: Arc<BakeMemoryTracker>,
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        self.tracker
+            .live_bytes
+            .fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct TrackedImageBuf {
+    data: Vec<f32>,
+    _reservation: MemoryReservation,
+}
+
+impl TrackedImageBuf {
+    fn alloc_rgba(size: usize, tracker: &Arc<BakeMemoryTracker>) -> Result<Self, String> {
+        let floats = size
+            .checked_mul(size)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| format!("NodeMaterial buffer size overflow for {size}x{size}"))?;
+        let bytes = floats
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| format!("NodeMaterial byte size overflow for {size}x{size}"))?;
+        let reservation = tracker.try_reserve(bytes)?;
+        Ok(Self {
+            data: vec![0.0f32; floats],
+            _reservation: reservation,
+        })
+    }
+}
+
 /// Internal per-pixel RGBA float buffer in `[0, 1]` (or unbounded for math/UV).
 #[derive(Debug, Clone)]
 enum MatBuf {
     Scalar(f64),
     Uniform([f64; 4]),
-    Image(Vec<f32>), // len == size * size * 4, RGBA in [0, 1] (or raw float)
+    Image(Arc<TrackedImageBuf>), // len == size * size * 4, RGBA in [0, 1] (or raw float)
 }
 
 impl MatBuf {
+    fn from_image(buf: TrackedImageBuf) -> Self {
+        Self::Image(Arc::new(buf))
+    }
+
     fn is_spatial(&self) -> bool {
         matches!(self, Self::Image(_))
     }
@@ -1959,10 +2057,10 @@ impl MatBuf {
             Self::Image(buf) => {
                 let i = px_idx * 4;
                 [
-                    f64::from(buf[i]),
-                    f64::from(buf[i + 1]),
-                    f64::from(buf[i + 2]),
-                    f64::from(buf[i + 3]),
+                    f64::from(buf.data[i]),
+                    f64::from(buf.data[i + 1]),
+                    f64::from(buf.data[i + 2]),
+                    f64::from(buf.data[i + 3]),
                 ]
             }
         }
@@ -1980,9 +2078,9 @@ impl MatBuf {
             }
             Self::Image(buf) => {
                 let i = px_idx * 4;
-                let r = f64::from(buf[i]);
-                let g = f64::from(buf[i + 1]);
-                let b = f64::from(buf[i + 2]);
+                let r = f64::from(buf.data[i]);
+                let g = f64::from(buf.data[i + 1]);
+                let b = f64::from(buf.data[i + 2]);
                 if (r - g).abs() < 1e-7 && (g - b).abs() < 1e-7 {
                     r
                 } else {
@@ -2005,9 +2103,9 @@ impl MatBuf {
                 (c[3] as f32).clamp(0.0, 1.0),
             ],
             Self::Image(buf) => {
-                let n = (buf.len() / 4).max(1) as f64;
+                let n = (buf.data.len() / 4).max(1) as f64;
                 let mut sum = [0.0f64; 4];
-                for px in buf.as_chunks::<4>().0 {
+                for px in buf.data.as_chunks::<4>().0 {
                     sum[0] += f64::from(px[0]);
                     sum[1] += f64::from(px[1]);
                     sum[2] += f64::from(px[2]);
@@ -2053,7 +2151,7 @@ impl MatBuf {
                     .as_chunks_mut::<4>()
                     .0
                     .iter_mut()
-                    .zip(buf.as_chunks::<4>().0.iter())
+                    .zip(buf.data.as_chunks::<4>().0.iter())
                 {
                     dst[0] = (f64::from(src[0]).clamp(0.0, 1.0) * 255.0).round() as u8;
                     dst[1] = (f64::from(src[1]).clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -2477,12 +2575,24 @@ struct FractalParams {
 }
 
 /// Periodic multi-octave fractal lattice noise matching Zoidium `graph-buffers.js:fractalBuffer`.
-fn eval_fractal_buffer(size: usize, fp: FractalParams, uv: Option<&MatBuf>) -> Vec<f32> {
+fn eval_fractal_buffer(
+    size: usize,
+    fp: FractalParams,
+    uv: Option<&MatBuf>,
+    tracker: &Arc<BakeMemoryTracker>,
+) -> Result<TrackedImageBuf, String> {
     let octs = fp.octaves.clamp(1, 8);
     let mut freq_x = fp.scale.round().max(1.0) as usize;
     let mut freq_y = (fp.scale * fp.ratio).round().max(1.0) as usize;
     let mut rng = Mulberry32::new(if fp.seed == 0 { 1 } else { fp.seed });
-    let mut values = vec![0.0f64; size * size];
+    let values_len = size
+        .checked_mul(size)
+        .ok_or_else(|| format!("NodeMaterial fractal size overflow for {size}x{size}"))?;
+    let values_bytes = values_len
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| format!("NodeMaterial fractal byte overflow for {size}x{size}"))?;
+    let _values_reservation = tracker.try_reserve(values_bytes)?;
+    let mut values = vec![0.0f64; values_len];
     let mut amp = 1.0;
     let mut total = 0.0;
 
@@ -2530,19 +2640,19 @@ fn eval_fractal_buffer(size: usize, fp: FractalParams, uv: Option<&MatBuf>) -> V
         freq_y = freq_y.saturating_mul(2);
     }
 
-    let mut out = vec![0.0f32; size * size * 4];
+    let mut out = TrackedImageBuf::alloc_rgba(size, tracker)?;
     for (p, &val) in values.iter().enumerate() {
         let mut n = val / total;
         n = (n - 0.5) * fp.contrast + 0.5;
         n = (n * fp.brightness).clamp(0.0, 1.0);
         let f = n as f32;
         let i = p * 4;
-        out[i] = f;
-        out[i + 1] = f;
-        out[i + 2] = f;
-        out[i + 3] = 1.0;
+        out.data[i] = f;
+        out.data[i + 1] = f;
+        out.data[i + 2] = f;
+        out.data[i + 3] = 1.0;
     }
-    out
+    Ok(out)
 }
 
 fn voronoi_distance(dx: f64, dy: f64, metric: i32, exponent: f64) -> f64 {
@@ -2564,7 +2674,8 @@ fn eval_voronoi_buffers(
     size: usize,
     params: &BTreeMap<String, Value>,
     uv: Option<&MatBuf>,
-) -> (MatBuf, MatBuf, MatBuf) {
+    tracker: &Arc<BakeMemoryTracker>,
+) -> Result<(MatBuf, MatBuf, MatBuf), String> {
     let scale = param_f64(params, &["scale"], 5.0).clamp(0.01, 64.0);
     let randomness = param_f64(params, &["randomness"], 1.0).clamp(0.0, 1.0);
     let seed = param_f64(params, &["seed"], 1.0).round() as i32;
@@ -2584,9 +2695,9 @@ fn eval_voronoi_buffers(
     let squared = feature == 3
         || (feature != 2 && (metric == 0 || (metric == 3 && (exponent - 2.0).abs() < 1e-9)));
 
-    let mut dist_out = vec![0.0f32; size * size * 4];
-    let mut color_out = vec![0.0f32; size * size * 4];
-    let mut pos_out = vec![0.0f32; size * size * 4];
+    let mut dist_out = TrackedImageBuf::alloc_rgba(size, tracker)?;
+    let mut color_out = TrackedImageBuf::alloc_rgba(size, tracker)?;
+    let mut pos_out = TrackedImageBuf::alloc_rgba(size, tracker)?;
 
     for y in 0..size {
         for x in 0..size {
@@ -2677,34 +2788,40 @@ fn eval_voronoi_buffers(
 
             let idx = p * 4;
             let vf = value.clamp(0.0, 1.0) as f32;
-            dist_out[idx] = vf;
-            dist_out[idx + 1] = vf;
-            dist_out[idx + 2] = vf;
-            dist_out[idx + 3] = 1.0;
+            dist_out.data[idx] = vf;
+            dist_out.data[idx + 1] = vf;
+            dist_out.data[idx + 2] = vf;
+            dist_out.data[idx + 3] = 1.0;
 
-            color_out[idx] = proc_hash(near_gx, near_gy, seed.wrapping_add(331)) as f32;
-            color_out[idx + 1] = proc_hash(near_gx, near_gy, seed.wrapping_add(468)) as f32;
-            color_out[idx + 2] = proc_hash(near_gx, near_gy, seed.wrapping_add(605)) as f32;
-            color_out[idx + 3] = 1.0;
+            color_out.data[idx] = proc_hash(near_gx, near_gy, seed.wrapping_add(331)) as f32;
+            color_out.data[idx + 1] = proc_hash(near_gx, near_gy, seed.wrapping_add(468)) as f32;
+            color_out.data[idx + 2] = proc_hash(near_gx, near_gy, seed.wrapping_add(605)) as f32;
+            color_out.data[idx + 3] = 1.0;
 
-            pos_out[idx] = (near_px / scale).clamp(0.0, 1.0) as f32;
-            pos_out[idx + 1] = (near_py / scale).clamp(0.0, 1.0) as f32;
-            pos_out[idx + 2] = 0.0;
-            pos_out[idx + 3] = 1.0;
+            pos_out.data[idx] = (near_px / scale).clamp(0.0, 1.0) as f32;
+            pos_out.data[idx + 1] = (near_py / scale).clamp(0.0, 1.0) as f32;
+            pos_out.data[idx + 2] = 0.0;
+            pos_out.data[idx + 3] = 1.0;
         }
     }
 
-    (
-        MatBuf::Image(dist_out),
-        MatBuf::Image(color_out),
-        MatBuf::Image(pos_out),
-    )
+    Ok((
+        MatBuf::from_image(dist_out),
+        MatBuf::from_image(color_out),
+        MatBuf::from_image(pos_out),
+    ))
 }
 
 /// Converts a height map to a tangent-space normal map using a 3x3 Sobel filter
 /// (wrapping seamlessly at tile boundaries).
-fn height_to_normal_sobel(source: &MatBuf, size: usize, strength: f64, invert: bool) -> MatBuf {
-    let mut out = vec![0.0f32; size * size * 4];
+fn height_to_normal_sobel(
+    source: &MatBuf,
+    size: usize,
+    strength: f64,
+    invert: bool,
+    tracker: &Arc<BakeMemoryTracker>,
+) -> Result<MatBuf, String> {
+    let mut out = TrackedImageBuf::alloc_rgba(size, tracker)?;
     let s = strength.max(0.0) * if invert { -1.0 } else { 1.0 };
     let h_at = |x: isize, y: isize| -> f64 {
         let wx = x.rem_euclid(size as isize) as usize;
@@ -2732,17 +2849,22 @@ fn height_to_normal_sobel(source: &MatBuf, size: usize, strength: f64, invert: b
             let nz = 1.0;
             let len = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-12);
             let i = (x + y * size) * 4;
-            out[i] = ((nx / len) * 0.5 + 0.5) as f32;
-            out[i + 1] = ((ny / len) * 0.5 + 0.5) as f32;
-            out[i + 2] = ((nz / len) * 0.5 + 0.5) as f32;
-            out[i + 3] = 1.0;
+            out.data[i] = ((nx / len) * 0.5 + 0.5) as f32;
+            out.data[i + 1] = ((ny / len) * 0.5 + 0.5) as f32;
+            out.data[i + 2] = ((nz / len) * 0.5 + 0.5) as f32;
+            out.data[i + 3] = 1.0;
         }
     }
-    MatBuf::Image(out)
+    Ok(MatBuf::from_image(out))
 }
 
-fn normalize_tangent_normal(source: &MatBuf, size: usize, strength: f64) -> MatBuf {
-    let mut out = vec![0.0f32; size * size * 4];
+fn normalize_tangent_normal(
+    source: &MatBuf,
+    size: usize,
+    strength: f64,
+    tracker: &Arc<BakeMemoryTracker>,
+) -> Result<MatBuf, String> {
+    let mut out = TrackedImageBuf::alloc_rgba(size, tracker)?;
     for p in 0..(size * size) {
         let c = source.sample_rgba(p);
         let nx = (c[0] * 2.0 - 1.0) * strength;
@@ -2750,12 +2872,12 @@ fn normalize_tangent_normal(source: &MatBuf, size: usize, strength: f64) -> MatB
         let nz = c[2] * 2.0 - 1.0;
         let len = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-12);
         let i = p * 4;
-        out[i] = ((nx / len) * 0.5 + 0.5).clamp(0.0, 1.0) as f32;
-        out[i + 1] = ((ny / len) * 0.5 + 0.5).clamp(0.0, 1.0) as f32;
-        out[i + 2] = ((nz / len) * 0.5 + 0.5).clamp(0.0, 1.0) as f32;
-        out[i + 3] = 1.0;
+        out.data[i] = ((nx / len) * 0.5 + 0.5).clamp(0.0, 1.0) as f32;
+        out.data[i + 1] = ((ny / len) * 0.5 + 0.5).clamp(0.0, 1.0) as f32;
+        out.data[i + 2] = ((nz / len) * 0.5 + 0.5).clamp(0.0, 1.0) as f32;
+        out.data[i + 3] = 1.0;
     }
-    MatBuf::Image(out)
+    Ok(MatBuf::from_image(out))
 }
 
 fn parse_curve_points_channel(val: Option<&Value>) -> Vec<ZoidiumCurvePoint> {
@@ -2838,10 +2960,15 @@ struct MaterialEvaluator<'a> {
     size: usize,
     incoming: BTreeMap<(String, String), (String, String)>,
     outputs: BTreeMap<String, BTreeMap<String, MatBuf>>,
+    tracker: Arc<BakeMemoryTracker>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> MaterialEvaluator<'a> {
+    fn alloc_image(&self) -> Result<TrackedImageBuf, String> {
+        TrackedImageBuf::alloc_rgba(self.size, &self.tracker)
+    }
+
     fn get_input(&self, node_id: &str, aliases: &[&str]) -> Option<&MatBuf> {
         for &alias in aliases {
             if let Some((src_id, src_port)) =
@@ -2935,10 +3062,11 @@ impl<'a> MaterialEvaluator<'a> {
                         transform,
                     },
                     uv.as_ref(),
-                );
+                    &self.tracker,
+                )?;
                 if kind == "dirt" {
                     let radius = param_f64(p, &["radius"], 1.4);
-                    for px in main_buf.as_chunks_mut::<4>().0 {
+                    for px in main_buf.data.as_chunks_mut::<4>().0 {
                         let v = (((1.0 - f64::from(px[0])) - 0.5) * radius + 0.5).clamp(0.0, 1.0)
                             as f32;
                         px[0] = v;
@@ -2947,7 +3075,7 @@ impl<'a> MaterialEvaluator<'a> {
                     }
                 }
                 if kind == "noise" {
-                    let mut col = vec![0.0f32; size * size * 4];
+                    let mut col = self.alloc_image()?;
                     for ch in 0..3 {
                         let cbuf = eval_fractal_buffer(
                             size,
@@ -2961,19 +3089,20 @@ impl<'a> MaterialEvaluator<'a> {
                                 transform: 0,
                             },
                             uv.as_ref(),
-                        );
+                            &self.tracker,
+                        )?;
                         for i in 0..(size * size) {
-                            col[i * 4 + ch] = cbuf[i * 4];
-                            col[i * 4 + 3] = 1.0;
+                            col.data[i * 4 + ch] = cbuf.data[i * 4];
+                            col.data[i * 4 + 3] = 1.0;
                         }
                     }
-                    node_outs.insert("color".to_string(), MatBuf::Image(col));
+                    node_outs.insert("color".to_string(), MatBuf::from_image(col));
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(main_buf));
+                node_outs.insert("out".to_string(), MatBuf::from_image(main_buf));
             }
             "voronoi" => {
                 let uv = self.get_input(&node.id, &["uv"]).cloned();
-                let (dist, col, pos) = eval_voronoi_buffers(size, p, uv.as_ref());
+                let (dist, col, pos) = eval_voronoi_buffers(size, p, uv.as_ref(), &self.tracker)?;
                 node_outs.insert("out".to_string(), dist.clone());
                 node_outs.insert("distance".to_string(), dist);
                 node_outs.insert("color".to_string(), col);
@@ -2994,7 +3123,7 @@ impl<'a> MaterialEvaluator<'a> {
                 let blend_mode = resolve_blend_mode(p, &["blendMode"]);
                 let c1 = param_color3(p, &["color1"], [0.1, 0.1, 0.12]);
                 let c2 = param_color3(p, &["color2"], [1.0, 1.0, 1.0]);
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for y in 0..size {
                     for x in 0..size {
                         let px = x + y * size;
@@ -3030,20 +3159,20 @@ impl<'a> MaterialEvaluator<'a> {
                             cr
                         };
                         let i = px * 4;
-                        out[i] = rgb[0].clamp(0.0, 1.0) as f32;
-                        out[i + 1] = rgb[1].clamp(0.0, 1.0) as f32;
-                        out[i + 2] = rgb[2].clamp(0.0, 1.0) as f32;
-                        out[i + 3] = 1.0;
+                        out.data[i] = rgb[0].clamp(0.0, 1.0) as f32;
+                        out.data[i + 1] = rgb[1].clamp(0.0, 1.0) as f32;
+                        out.data[i + 2] = rgb[2].clamp(0.0, 1.0) as f32;
+                        out.data[i + 3] = 1.0;
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "checker" => {
                 let uv = self.get_input(&node.id, &["uv"]).cloned();
                 let scale = param_f64(p, &["scale"], 8.0).round().max(1.0);
                 let c1 = param_color3(p, &["color1", "a"], [0.0, 0.0, 0.0]);
                 let c2 = param_color3(p, &["color2", "b"], [1.0, 1.0, 1.0]);
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for y in 0..size {
                     for x in 0..size {
                         let px = x + y * size;
@@ -3052,13 +3181,13 @@ impl<'a> MaterialEvaluator<'a> {
                             ((u * scale).floor() as i64 + (v * scale).floor() as i64).rem_euclid(2);
                         let c = if parity == 0 { c1 } else { c2 };
                         let i = px * 4;
-                        out[i] = c[0] as f32;
-                        out[i + 1] = c[1] as f32;
-                        out[i + 2] = c[2] as f32;
-                        out[i + 3] = 1.0;
+                        out.data[i] = c[0] as f32;
+                        out.data[i + 1] = c[1] as f32;
+                        out.data[i + 2] = c[2] as f32;
+                        out.data[i + 3] = 1.0;
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "wave" => {
                 let uv = self.get_input(&node.id, &["uv"]).cloned();
@@ -3082,11 +3211,12 @@ impl<'a> MaterialEvaluator<'a> {
                             transform: 0,
                         },
                         uv.as_ref(),
-                    ))
+                        &self.tracker,
+                    )?)
                 } else {
                     None
                 };
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for y in 0..size {
                     for x in 0..size {
                         let px = x + y * size;
@@ -3103,7 +3233,7 @@ impl<'a> MaterialEvaluator<'a> {
                             u
                         };
                         if let Some(ref db) = dist_buf {
-                            phase += (f64::from(db[px * 4]) - 0.5) * distortion;
+                            phase += (f64::from(db.data[px * 4]) - 0.5) * distortion;
                         }
                         let t = phase - phase.floor();
                         let val = match profile {
@@ -3113,20 +3243,20 @@ impl<'a> MaterialEvaluator<'a> {
                         }
                         .clamp(0.0, 1.0) as f32;
                         let i = px * 4;
-                        out[i] = val;
-                        out[i + 1] = val;
-                        out[i + 2] = val;
-                        out[i + 3] = 1.0;
+                        out.data[i] = val;
+                        out.data[i + 1] = val;
+                        out.data[i + 2] = val;
+                        out.data[i + 3] = 1.0;
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "sineWave" => {
                 let uv = self.get_input(&node.id, &["uv"]).cloned();
                 let scale = param_f64(p, &["scale"], 6.0);
                 let phase = param_f64(p, &["phase"], 0.0);
                 let axis = (param_f64(p, &["axis"], 0.0).round() as i32).clamp(0, 1);
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for y in 0..size {
                     for x in 0..size {
                         let px = x + y * size;
@@ -3135,13 +3265,13 @@ impl<'a> MaterialEvaluator<'a> {
                         let val = (0.5 + 0.5 * ((coord * scale + phase) * TAU).sin())
                             .clamp(0.0, 1.0) as f32;
                         let i = px * 4;
-                        out[i] = val;
-                        out[i + 1] = val;
-                        out[i + 2] = val;
-                        out[i + 3] = 1.0;
+                        out.data[i] = val;
+                        out.data[i + 1] = val;
+                        out.data[i + 2] = val;
+                        out.data[i + 3] = 1.0;
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "brick" => {
                 let uv = self.get_input(&node.id, &["uv"]).cloned();
@@ -3154,8 +3284,8 @@ impl<'a> MaterialEvaluator<'a> {
                 let c1 = param_color3(p, &["color1"], [0.6, 0.17, 0.08]);
                 let c2 = param_color3(p, &["color2"], [0.3, 0.06, 0.03]);
                 let mc = param_color3(p, &["mortarColor"], [0.08, 0.08, 0.08]);
-                let mut col_out = vec![0.0f32; size * size * 4];
-                let mut mortar_out = vec![0.0f32; size * size * 4];
+                let mut col_out = self.alloc_image()?;
+                let mut mortar_out = self.alloc_image()?;
                 for y in 0..size {
                     for x in 0..size {
                         let px = x + y * size;
@@ -3171,22 +3301,22 @@ impl<'a> MaterialEvaluator<'a> {
                         let t = proc_hash(col, row, seed);
                         let i = px * 4;
                         let mv = if is_mortar { 1.0f32 } else { 0.0f32 };
-                        mortar_out[i] = mv;
-                        mortar_out[i + 1] = mv;
-                        mortar_out[i + 2] = mv;
-                        mortar_out[i + 3] = 1.0;
+                        mortar_out.data[i] = mv;
+                        mortar_out.data[i + 1] = mv;
+                        mortar_out.data[i + 2] = mv;
+                        mortar_out.data[i + 3] = 1.0;
                         for ch in 0..3 {
-                            col_out[i + ch] = if is_mortar {
+                            col_out.data[i + ch] = if is_mortar {
                                 mc[ch] as f32
                             } else {
                                 (c1[ch] + (c2[ch] - c1[ch]) * t) as f32
                             };
                         }
-                        col_out[i + 3] = 1.0;
+                        col_out.data[i + 3] = 1.0;
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(col_out));
-                node_outs.insert("mortar".to_string(), MatBuf::Image(mortar_out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(col_out));
+                node_outs.insert("mortar".to_string(), MatBuf::from_image(mortar_out));
             }
             "marble" => {
                 let uv = self.get_input(&node.id, &["uv"]).cloned();
@@ -3207,29 +3337,30 @@ impl<'a> MaterialEvaluator<'a> {
                         transform: 0,
                     },
                     uv.as_ref(),
-                );
-                let mut out = vec![0.0f32; size * size * 4];
+                    &self.tracker,
+                )?;
+                let mut out = self.alloc_image()?;
                 for y in 0..size {
                     for x in 0..size {
                         let px = x + y * size;
                         let (_, v) = coords_at(uv.as_ref(), px, size, x, y);
-                        let coord = v * scale + f64::from(fractal[px * 4]) * veins;
+                        let coord = v * scale + f64::from(fractal.data[px * 4]) * veins;
                         let val = (0.5 + 0.5 * (coord * TAU).sin()).clamp(0.0, 1.0) as f32;
                         let i = px * 4;
-                        out[i] = val;
-                        out[i + 1] = val;
-                        out[i + 2] = val;
-                        out[i + 3] = 1.0;
+                        out.data[i] = val;
+                        out.data[i + 1] = val;
+                        out.data[i + 2] = val;
+                        out.data[i + 3] = 1.0;
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "magic" => {
                 let uv = self.get_input(&node.id, &["uv"]).cloned();
                 let scale = param_f64(p, &["scale"], 5.0).max(0.01);
                 let depth = (param_f64(p, &["depth"], 2.0).round() as usize).clamp(0, 10);
                 let dist = param_f64(p, &["distortion"], 1.0);
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for y in 0..size {
                     for x in 0..size {
                         let px = x + y * size;
@@ -3245,20 +3376,20 @@ impl<'a> MaterialEvaluator<'a> {
                             d = ((-a - c + d) * dist).sin();
                         }
                         let i = px * 4;
-                        out[i] = (a * 0.5 + 0.5) as f32;
-                        out[i + 1] = (c * 0.5 + 0.5) as f32;
-                        out[i + 2] = (d * 0.5 + 0.5) as f32;
-                        out[i + 3] = 1.0;
+                        out.data[i] = (a * 0.5 + 0.5) as f32;
+                        out.data[i + 1] = (c * 0.5 + 0.5) as f32;
+                        out.data[i + 2] = (d * 0.5 + 0.5) as f32;
+                        out.data[i + 3] = 1.0;
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "whiteNoise" => {
                 let uv = self.get_input(&node.id, &["uv"]).cloned();
                 let scale = param_f64(p, &["scale"], 256.0).max(1.0);
                 let seed = param_f64(p, &["seed"], 1.0).round() as i32;
-                let mut val_out = vec![0.0f32; size * size * 4];
-                let mut col_out = vec![0.0f32; size * size * 4];
+                let mut val_out = self.alloc_image()?;
+                let mut col_out = self.alloc_image()?;
                 for y in 0..size {
                     for x in 0..size {
                         let px = x + y * size;
@@ -3267,43 +3398,44 @@ impl<'a> MaterialEvaluator<'a> {
                         let iy = (vv * scale).floor() as i32;
                         let v0 = proc_hash(ix, iy, seed) as f32;
                         let i = px * 4;
-                        val_out[i] = v0;
-                        val_out[i + 1] = v0;
-                        val_out[i + 2] = v0;
-                        val_out[i + 3] = 1.0;
-                        col_out[i] = v0;
-                        col_out[i + 1] = proc_hash(ix, iy, seed.wrapping_add(137)) as f32;
-                        col_out[i + 2] = proc_hash(ix, iy, seed.wrapping_add(274)) as f32;
-                        col_out[i + 3] = 1.0;
+                        val_out.data[i] = v0;
+                        val_out.data[i + 1] = v0;
+                        val_out.data[i + 2] = v0;
+                        val_out.data[i + 3] = 1.0;
+                        col_out.data[i] = v0;
+                        col_out.data[i + 1] = proc_hash(ix, iy, seed.wrapping_add(137)) as f32;
+                        col_out.data[i + 2] = proc_hash(ix, iy, seed.wrapping_add(274)) as f32;
+                        col_out.data[i + 3] = 1.0;
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(val_out));
-                node_outs.insert("color".to_string(), MatBuf::Image(col_out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(val_out));
+                node_outs.insert("color".to_string(), MatBuf::from_image(col_out));
             }
             "colorRamp" => {
                 let fac_in = self.get_input(&node.id, &["factor", "t", "in"]).cloned();
                 let stops = parse_ramp_stops(p);
                 let interp = (param_f64(p, &["interpolation"], 1.0).round() as i32).clamp(0, 3);
                 let default_fac = param_f64(p, &["factor"], 0.5);
-                let mut col_out = vec![0.0f32; size * size * 4];
-                let mut alp_out = vec![0.0f32; size * size * 4];
+                let mut col_out = self.alloc_image()?;
+                let mut alp_out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let f = fac_in.as_ref().map_or(default_fac, |b| b.sample_luma(px));
                     let rgba = eval_ramp_cpu(&stops, f, interp);
                     let i = px * 4;
-                    col_out[i] = rgba[0] as f32;
-                    col_out[i + 1] = rgba[1] as f32;
-                    col_out[i + 2] = rgba[2] as f32;
-                    col_out[i + 3] = rgba[3] as f32;
+                    col_out.data[i] = rgba[0] as f32;
+                    col_out.data[i + 1] = rgba[1] as f32;
+                    col_out.data[i + 2] = rgba[2] as f32;
+                    col_out.data[i + 3] = rgba[3] as f32;
                     let af = rgba[3] as f32;
-                    alp_out[i] = af;
-                    alp_out[i + 1] = af;
-                    alp_out[i + 2] = af;
-                    alp_out[i + 3] = 1.0;
+                    alp_out.data[i] = af;
+                    alp_out.data[i + 1] = af;
+                    alp_out.data[i + 2] = af;
+                    alp_out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(col_out.clone()));
-                node_outs.insert("color".to_string(), MatBuf::Image(col_out));
-                node_outs.insert("alpha".to_string(), MatBuf::Image(alp_out));
+                let col_buf = MatBuf::from_image(col_out);
+                node_outs.insert("out".to_string(), col_buf.clone());
+                node_outs.insert("color".to_string(), col_buf);
+                node_outs.insert("alpha".to_string(), MatBuf::from_image(alp_out));
             }
             "colorizer" => {
                 let src = self.get_input(&node.id, &["a", "in"]).cloned();
@@ -3314,7 +3446,7 @@ impl<'a> MaterialEvaluator<'a> {
                     param_color3(p, &["color4"], [1.0, 1.0, 1.0]),
                     param_color3(p, &["color5"], [1.0, 1.0, 1.0]),
                 ];
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let t = src
                         .as_ref()
@@ -3326,12 +3458,12 @@ impl<'a> MaterialEvaluator<'a> {
                     let c0 = cols[seg];
                     let c1 = cols[seg + 1];
                     let i = px * 4;
-                    out[i] = (c0[0] + (c1[0] - c0[0]) * local) as f32;
-                    out[i + 1] = (c0[1] + (c1[1] - c0[1]) * local) as f32;
-                    out[i + 2] = (c0[2] + (c1[2] - c0[2]) * local) as f32;
-                    out[i + 3] = 1.0;
+                    out.data[i] = (c0[0] + (c1[0] - c0[0]) * local) as f32;
+                    out.data[i + 1] = (c0[1] + (c1[1] - c0[1]) * local) as f32;
+                    out.data[i + 2] = (c0[2] + (c1[2] - c0[2]) * local) as f32;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "mapRange" => {
                 let val_in = self.get_input(&node.id, &["value", "in"]).cloned();
@@ -3348,7 +3480,7 @@ impl<'a> MaterialEvaluator<'a> {
                 } else {
                     1e-12
                 };
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let v = val_in.as_ref().map_or(def_val, |b| b.sample_luma(px));
                     let mut t = (v - from_min) / denom;
@@ -3367,12 +3499,12 @@ impl<'a> MaterialEvaluator<'a> {
                     }
                     let mapped = (to_min + t * (to_max - to_min)) as f32;
                     let i = px * 4;
-                    out[i] = mapped;
-                    out[i + 1] = mapped;
-                    out[i + 2] = mapped;
-                    out[i + 3] = 1.0;
+                    out.data[i] = mapped;
+                    out.data[i + 1] = mapped;
+                    out.data[i + 2] = mapped;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "rgbCurves" => {
                 let src = self.get_input(&node.id, &["color", "a", "in"]).cloned();
@@ -3396,7 +3528,7 @@ impl<'a> MaterialEvaluator<'a> {
                     lut_g[i] = evaluate_zoidium_curve_points(&green, m);
                     lut_b[i] = evaluate_zoidium_curve_points(&blue, m);
                 }
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let c = src
                         .as_ref()
@@ -3405,12 +3537,12 @@ impl<'a> MaterialEvaluator<'a> {
                     let ig = (c[1].clamp(0.0, 1.0) * 255.0).round() as usize;
                     let ib = (c[2].clamp(0.0, 1.0) * 255.0).round() as usize;
                     let i = px * 4;
-                    out[i] = (c[0] + (f64::from(lut_r[ir]) - c[0]) * fac) as f32;
-                    out[i + 1] = (c[1] + (f64::from(lut_g[ig]) - c[1]) * fac) as f32;
-                    out[i + 2] = (c[2] + (f64::from(lut_b[ib]) - c[2]) * fac) as f32;
-                    out[i + 3] = 1.0;
+                    out.data[i] = (c[0] + (f64::from(lut_r[ir]) - c[0]) * fac) as f32;
+                    out.data[i + 1] = (c[1] + (f64::from(lut_g[ig]) - c[1]) * fac) as f32;
+                    out.data[i + 2] = (c[2] + (f64::from(lut_b[ib]) - c[2]) * fac) as f32;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "separateRGB" | "separateHSV" => {
                 let src = self.get_input(&node.id, &["color", "in"]).cloned();
@@ -3421,9 +3553,9 @@ impl<'a> MaterialEvaluator<'a> {
                     ["r", "g", "b"]
                 };
                 let mut chans = [
-                    vec![0.0f32; size * size * 4],
-                    vec![0.0f32; size * size * 4],
-                    vec![0.0f32; size * size * 4],
+                    self.alloc_image()?,
+                    self.alloc_image()?,
+                    self.alloc_image()?,
                 ];
                 for px in 0..(size * size) {
                     let rgba = src
@@ -3437,14 +3569,14 @@ impl<'a> MaterialEvaluator<'a> {
                     let i = px * 4;
                     for c in 0..3 {
                         let f = vals[c] as f32;
-                        chans[c][i] = f;
-                        chans[c][i + 1] = f;
-                        chans[c][i + 2] = f;
-                        chans[c][i + 3] = 1.0;
+                        chans[c].data[i] = f;
+                        chans[c].data[i + 1] = f;
+                        chans[c].data[i + 2] = f;
+                        chans[c].data[i + 3] = 1.0;
                     }
                 }
                 for (k, buf) in keys.into_iter().zip(chans) {
-                    node_outs.insert(k.to_string(), MatBuf::Image(buf));
+                    node_outs.insert(k.to_string(), MatBuf::from_image(buf));
                 }
                 if let Some(first) = node_outs.get(keys[0]).cloned() {
                     node_outs.insert("out".to_string(), first);
@@ -3463,7 +3595,7 @@ impl<'a> MaterialEvaluator<'a> {
                 let d0 = param_f64(p, &[k0], 0.0);
                 let d1 = param_f64(p, &[k1], 0.0);
                 let d2 = param_f64(p, &[k2], 0.0);
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let v0 = b0.as_ref().map_or(d0, |b| b.sample_luma(px));
                     let v1 = b1.as_ref().map_or(d1, |b| b.sample_luma(px));
@@ -3474,12 +3606,12 @@ impl<'a> MaterialEvaluator<'a> {
                         [v0, v1, v2]
                     };
                     let i = px * 4;
-                    out[i] = rgb[0].clamp(0.0, 1.0) as f32;
-                    out[i + 1] = rgb[1].clamp(0.0, 1.0) as f32;
-                    out[i + 2] = rgb[2].clamp(0.0, 1.0) as f32;
-                    out[i + 3] = 1.0;
+                    out.data[i] = rgb[0].clamp(0.0, 1.0) as f32;
+                    out.data[i + 1] = rgb[1].clamp(0.0, 1.0) as f32;
+                    out.data[i + 2] = rgb[2].clamp(0.0, 1.0) as f32;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "colorCorrection" => {
                 let src = self.get_input(&node.id, &["a", "color", "in"]).cloned();
@@ -3488,7 +3620,7 @@ impl<'a> MaterialEvaluator<'a> {
                 let gamma = param_f64(p, &["gamma"], 1.0).max(0.001);
                 let hue = param_f64(p, &["hue"], 0.0) / 360.0;
                 let saturation = param_f64(p, &["saturation"], 1.0);
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let c = src
                         .as_ref()
@@ -3510,47 +3642,47 @@ impl<'a> MaterialEvaluator<'a> {
                         rgb = hsv_to_rgb(sh, (hsv[1] * saturation).clamp(0.0, 1.0), hsv[2]);
                     }
                     let i = px * 4;
-                    out[i] = rgb[0] as f32;
-                    out[i + 1] = rgb[1] as f32;
-                    out[i + 2] = rgb[2] as f32;
-                    out[i + 3] = 1.0;
+                    out.data[i] = rgb[0] as f32;
+                    out.data[i + 1] = rgb[1] as f32;
+                    out.data[i + 2] = rgb[2] as f32;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "invert" => {
                 let src = self.get_input(&node.id, &["a", "color", "in"]).cloned();
                 let strength = param_f64(p, &["strength", "factor"], 1.0).clamp(0.0, 1.0);
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let c = src
                         .as_ref()
                         .map_or([0.5, 0.5, 0.5, 1.0], |b| b.sample_rgba(px));
                     let i = px * 4;
-                    for ch in 0..3 {
-                        out[i + ch] =
-                            (c[ch] + (1.0 - 2.0 * c[ch]) * strength).clamp(0.0, 1.0) as f32;
+                    for (ch, &val) in c.iter().enumerate().take(3) {
+                        out.data[i + ch] =
+                            (val + (1.0 - 2.0 * val) * strength).clamp(0.0, 1.0) as f32;
                     }
-                    out[i + 3] = 1.0;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "clampTexture" => {
                 let src = self.get_input(&node.id, &["a", "in", "value"]).cloned();
                 let lo = param_f64(p, &["min"], 0.0);
                 let hi = param_f64(p, &["max"], 1.0);
                 let (min_v, max_v) = (lo.min(hi), lo.max(hi));
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let c = src
                         .as_ref()
                         .map_or([0.5, 0.5, 0.5, 1.0], |b| b.sample_rgba(px));
                     let i = px * 4;
-                    out[i] = c[0].clamp(min_v, max_v) as f32;
-                    out[i + 1] = c[1].clamp(min_v, max_v) as f32;
-                    out[i + 2] = c[2].clamp(min_v, max_v) as f32;
-                    out[i + 3] = 1.0;
+                    out.data[i] = c[0].clamp(min_v, max_v) as f32;
+                    out.data[i + 1] = c[1].clamp(min_v, max_v) as f32;
+                    out.data[i + 2] = c[2].clamp(min_v, max_v) as f32;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "mix" => {
                 let a = self.get_input(&node.id, &["a", "base"]).cloned();
@@ -3558,7 +3690,7 @@ impl<'a> MaterialEvaluator<'a> {
                 let op_in = self.get_input(&node.id, &["opacity", "factor"]).cloned();
                 let mode = resolve_blend_mode(p, &["mode", "blendMode"]);
                 let def_op = param_f64(p, &["opacity", "factor"], 1.0).clamp(0.0, 1.0);
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let ca = a
                         .as_ref()
@@ -3567,19 +3699,19 @@ impl<'a> MaterialEvaluator<'a> {
                     let op = op_in.as_ref().map_or(def_op, |v| v.sample_luma(px));
                     let rgb = mat_blend_rgb([ca[0], ca[1], ca[2]], [cb[0], cb[1], cb[2]], op, mode);
                     let i = px * 4;
-                    out[i] = rgb[0].clamp(0.0, 1.0) as f32;
-                    out[i + 1] = rgb[1].clamp(0.0, 1.0) as f32;
-                    out[i + 2] = rgb[2].clamp(0.0, 1.0) as f32;
-                    out[i + 3] = 1.0;
+                    out.data[i] = rgb[0].clamp(0.0, 1.0) as f32;
+                    out.data[i + 1] = rgb[1].clamp(0.0, 1.0) as f32;
+                    out.data[i + 2] = rgb[2].clamp(0.0, 1.0) as f32;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "cosineMix" => {
                 let a = self.get_input(&node.id, &["a"]).cloned();
                 let b = self.get_input(&node.id, &["b"]).cloned();
                 let m = param_f64(p, &["mix", "factor"], 0.5).clamp(0.0, 1.0);
                 let t = 0.5 - 0.5 * (PI * m).cos();
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let ca = a
                         .as_ref()
@@ -3587,11 +3719,11 @@ impl<'a> MaterialEvaluator<'a> {
                     let cb = b.as_ref().map_or(ca, |v| v.sample_rgba(px));
                     let i = px * 4;
                     for ch in 0..3 {
-                        out[i + ch] = (ca[ch] + (cb[ch] - ca[ch]) * t) as f32;
+                        out.data[i + ch] = (ca[ch] + (cb[ch] - ca[ch]) * t) as f32;
                     }
-                    out[i + 3] = 1.0;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "multiply" | "add" | "subtract" => {
                 let a = self.get_input(&node.id, &["a"]).cloned();
@@ -3601,7 +3733,7 @@ impl<'a> MaterialEvaluator<'a> {
                     &["value", "b"],
                     if kind == "multiply" { 1.0 } else { 0.0 },
                 );
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let va = a.as_ref().map_or(0.0, |v| v.sample_luma(px));
                     let vb = b.as_ref().map_or(def_b, |v| v.sample_luma(px));
@@ -3612,12 +3744,12 @@ impl<'a> MaterialEvaluator<'a> {
                     }
                     .clamp(0.0, 1.0) as f32;
                     let i = px * 4;
-                    out[i] = res;
-                    out[i + 1] = res;
-                    out[i + 2] = res;
-                    out[i + 3] = 1.0;
+                    out.data[i] = res;
+                    out.data[i + 1] = res;
+                    out.data[i + 2] = res;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "compare" => {
                 let a = self.get_input(&node.id, &["a"]).cloned();
@@ -3625,7 +3757,7 @@ impl<'a> MaterialEvaluator<'a> {
                 let op = (param_f64(p, &["op"], 0.0).round() as i32).clamp(0, 2);
                 let def_b = param_f64(p, &["value"], 0.5);
                 let eps = param_f64(p, &["epsilon"], 0.01);
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {
                     let va = a.as_ref().map_or(0.0, |v| v.sample_luma(px));
                     let vb = b.as_ref().map_or(def_b, |v| v.sample_luma(px));
@@ -3636,12 +3768,12 @@ impl<'a> MaterialEvaluator<'a> {
                     };
                     let f = if hit { 1.0f32 } else { 0.0f32 };
                     let i = px * 4;
-                    out[i] = f;
-                    out[i + 1] = f;
-                    out[i + 2] = f;
-                    out[i + 3] = 1.0;
+                    out.data[i] = f;
+                    out.data[i + 1] = f;
+                    out.data[i + 2] = f;
+                    out.data[i + 3] = 1.0;
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "math" | "legacyMath" => {
                 let a = self.get_input(&node.id, &["a"]).cloned();
@@ -3667,19 +3799,19 @@ impl<'a> MaterialEvaluator<'a> {
                         MatBuf::Scalar(mat_math_op(va, vb, vc, op)),
                     );
                 } else {
-                    let mut out = vec![0.0f32; size * size * 4];
+                    let mut out = self.alloc_image()?;
                     for px in 0..(size * size) {
                         let va = a.as_ref().map_or(def_a, |v| v.sample_luma(px));
                         let vb = b.as_ref().map_or(def_b, |v| v.sample_luma(px));
                         let vc = c.as_ref().map_or(def_c, |v| v.sample_luma(px));
                         let res = mat_math_op(va, vb, vc, op) as f32;
                         let i = px * 4;
-                        out[i] = res;
-                        out[i + 1] = res;
-                        out[i + 2] = res;
-                        out[i + 3] = 1.0;
+                        out.data[i] = res;
+                        out.data[i + 1] = res;
+                        out.data[i + 2] = res;
+                        out.data[i + 3] = 1.0;
                     }
-                    node_outs.insert("out".to_string(), MatBuf::Image(out));
+                    node_outs.insert("out".to_string(), MatBuf::from_image(out));
                 }
             }
             "projection" => {
@@ -3690,7 +3822,7 @@ impl<'a> MaterialEvaluator<'a> {
                 let sy = param_f64(p, &["scaleY"], 1.0).max(0.001);
                 let rot = -param_f64(p, &["rotation"], 0.0) * PI / 180.0;
                 let (sin_a, cos_a) = rot.sin_cos();
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for y in 0..size {
                     for x in 0..size {
                         let u = ((x as f64) / (size as f64) - 0.5 - ox) / sx;
@@ -3713,13 +3845,13 @@ impl<'a> MaterialEvaluator<'a> {
                         ou -= ou.floor();
                         ov -= ov.floor();
                         let i = (x + y * size) * 4;
-                        out[i] = ou as f32;
-                        out[i + 1] = ov as f32;
-                        out[i + 2] = 0.0;
-                        out[i + 3] = 1.0;
+                        out.data[i] = ou as f32;
+                        out.data[i + 1] = ov as f32;
+                        out.data[i + 2] = 0.0;
+                        out.data[i + 3] = 1.0;
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "uvw" => {
                 let src = self.get_input(&node.id, &["a", "uv", "in"]).cloned();
@@ -3729,7 +3861,7 @@ impl<'a> MaterialEvaluator<'a> {
                 let sy = param_f64(p, &["scaleY"], 1.0).max(0.001);
                 let rot = -param_f64(p, &["rotation"], 0.0) * PI / 180.0;
                 let (sin_a, cos_a) = rot.sin_cos();
-                let mut out = vec![0.0f32; size * size * 4];
+                let mut out = self.alloc_image()?;
                 for y in 0..size {
                     for x in 0..size {
                         let u = ((x as f64) / (size as f64) - 0.5 - ox) / sx;
@@ -3743,36 +3875,36 @@ impl<'a> MaterialEvaluator<'a> {
                             let sx_px = ((ru * (size as f64)).floor() as usize).min(size - 1);
                             let sy_px = ((rv * (size as f64)).floor() as usize).min(size - 1);
                             let c = s.sample_rgba(sx_px + sy_px * size);
-                            out[i] = c[0] as f32;
-                            out[i + 1] = c[1] as f32;
-                            out[i + 2] = c[2] as f32;
-                            out[i + 3] = 1.0;
+                            out.data[i] = c[0] as f32;
+                            out.data[i + 1] = c[1] as f32;
+                            out.data[i + 2] = c[2] as f32;
+                            out.data[i + 3] = 1.0;
                         } else {
-                            out[i] = ru as f32;
-                            out[i + 1] = rv as f32;
-                            out[i + 2] = 0.0;
-                            out[i + 3] = 1.0;
+                            out.data[i] = ru as f32;
+                            out.data[i + 1] = rv as f32;
+                            out.data[i + 2] = 0.0;
+                            out.data[i + 3] = 1.0;
                         }
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::Image(out));
+                node_outs.insert("out".to_string(), MatBuf::from_image(out));
             }
             "rgbSpectrum" => {
                 let inp = self.get_input(&node.id, &["t", "in"]).cloned();
                 let wl = param_f64(p, &["wavelength"], 550.0);
                 if let Some(ref src) = inp {
-                    let mut out = vec![0.0f32; size * size * 4];
+                    let mut out = self.alloc_image()?;
                     for px in 0..(size * size) {
                         let w =
                             (380.0 + src.sample_luma(px) * 400.0 + wl - 550.0).clamp(380.0, 780.0);
                         let c = wavelength_color(w);
                         let i = px * 4;
-                        out[i] = c[0] as f32;
-                        out[i + 1] = c[1] as f32;
-                        out[i + 2] = c[2] as f32;
-                        out[i + 3] = 1.0;
+                        out.data[i] = c[0] as f32;
+                        out.data[i + 1] = c[1] as f32;
+                        out.data[i + 2] = c[2] as f32;
+                        out.data[i + 3] = 1.0;
                     }
-                    node_outs.insert("out".to_string(), MatBuf::Image(out));
+                    node_outs.insert("out".to_string(), MatBuf::from_image(out));
                 } else {
                     let c = wavelength_color(wl.clamp(380.0, 780.0));
                     node_outs.insert("out".to_string(), MatBuf::Uniform([c[0], c[1], c[2], 1.0]));
@@ -3783,18 +3915,18 @@ impl<'a> MaterialEvaluator<'a> {
                 let center = param_f64(p, &["center"], 550.0);
                 let width = param_f64(p, &["width"], 60.0);
                 if let Some(ref src) = inp {
-                    let mut out = vec![0.0f32; size * size * 4];
+                    let mut out = self.alloc_image()?;
                     for px in 0..(size * size) {
                         let ct = (380.0 + src.sample_luma(px) * 400.0 + center - 550.0)
                             .clamp(380.0, 780.0);
                         let c = gaussian_spectrum_color(ct, width);
                         let i = px * 4;
-                        out[i] = c[0] as f32;
-                        out[i + 1] = c[1] as f32;
-                        out[i + 2] = c[2] as f32;
-                        out[i + 3] = 1.0;
+                        out.data[i] = c[0] as f32;
+                        out.data[i + 1] = c[1] as f32;
+                        out.data[i + 2] = c[2] as f32;
+                        out.data[i + 3] = 1.0;
                     }
-                    node_outs.insert("out".to_string(), MatBuf::Image(out));
+                    node_outs.insert("out".to_string(), MatBuf::from_image(out));
                 } else {
                     let c = gaussian_spectrum_color(center.clamp(380.0, 780.0), width);
                     node_outs.insert("out".to_string(), MatBuf::Uniform([c[0], c[1], c[2], 1.0]));
@@ -3804,17 +3936,17 @@ impl<'a> MaterialEvaluator<'a> {
                 let inp = self.get_input(&node.id, &["t", "in"]).cloned();
                 let temp = param_f64(p, &["temperature", "kelvin"], 4000.0);
                 if let Some(ref src) = inp {
-                    let mut out = vec![0.0f32; size * size * 4];
+                    let mut out = self.alloc_image()?;
                     for px in 0..(size * size) {
                         let k = 1000.0 + src.sample_luma(px) * 39000.0 + temp - 4000.0;
                         let c = blackbody_color(k);
                         let i = px * 4;
-                        out[i] = c[0] as f32;
-                        out[i + 1] = c[1] as f32;
-                        out[i + 2] = c[2] as f32;
-                        out[i + 3] = 1.0;
+                        out.data[i] = c[0] as f32;
+                        out.data[i + 1] = c[1] as f32;
+                        out.data[i + 2] = c[2] as f32;
+                        out.data[i + 3] = 1.0;
                     }
-                    node_outs.insert("out".to_string(), MatBuf::Image(out));
+                    node_outs.insert("out".to_string(), MatBuf::from_image(out));
                 } else {
                     let c = blackbody_color(temp);
                     node_outs.insert("out".to_string(), MatBuf::Uniform([c[0], c[1], c[2], 1.0]));
@@ -3827,7 +3959,8 @@ impl<'a> MaterialEvaluator<'a> {
                     .unwrap_or(MatBuf::Scalar(0.5));
                 let strength = param_f64(p, &["strength", "distance"], 1.0);
                 let invert = param_f64(p, &["invert"], 0.0) != 0.0;
-                let normal = height_to_normal_sobel(&height, size, strength, invert);
+                let normal =
+                    height_to_normal_sobel(&height, size, strength, invert, &self.tracker)?;
                 node_outs.insert("out".to_string(), normal.clone());
                 node_outs.insert("normal".to_string(), normal);
             }
@@ -3854,16 +3987,27 @@ pub fn bake_node_material_maps(
     graph: &Value,
     resolution: u32,
 ) -> Result<BakedNodeMaterialMaps, String> {
+    let (baked, _tracker) =
+        bake_node_material_maps_with_budget(graph, resolution, MAX_BAKE_MEMORY_BYTES)?;
+    Ok(baked)
+}
+
+fn bake_node_material_maps_with_budget(
+    graph: &Value,
+    resolution: u32,
+    memory_budget_bytes: usize,
+) -> Result<(BakedNodeMaterialMaps, Arc<BakeMemoryTracker>), String> {
     let res = resolution.clamp(32, 1024);
     let size = res as usize;
     let mut baked = BakedNodeMaterialMaps {
         resolution: res,
         ..Default::default()
     };
+    let tracker = BakeMemoryTracker::new(memory_budget_bytes);
 
     let (nodes, links) = parse_raw_graph(graph, MAX_MATERIAL_NODES, MAX_MATERIAL_LINKS)?;
     if nodes.is_empty() {
-        return Ok(baked);
+        return Ok((baked, tracker));
     }
 
     let topo = topological_sort(&nodes, &links)?;
@@ -3881,19 +4025,69 @@ pub fn bake_node_material_maps(
         .iter()
         .find(|n| normalize_material_node_type(&n.kind) == "output")
     else {
-        return Ok(baked);
+        return Ok((baked, tracker));
     };
+
+    // Map each consumer node ID to the deduplicated set of producer node IDs feeding it.
+    let mut producers_by_consumer: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for ((to_node, _), (from_node, _)) in &incoming {
+        producers_by_consumer
+            .entry(to_node.clone())
+            .or_default()
+            .insert(from_node.clone());
+    }
+
+    // Backward reachability walk from the terminal Material Output node so disconnected nodes
+    // are never evaluated and allocate zero bytes.
+    let mut reachable: BTreeSet<String> = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    reachable.insert(output_node.id.clone());
+    queue.push_back(output_node.id.clone());
+    while let Some(curr) = queue.pop_front() {
+        if let Some(producers) = producers_by_consumer.get(&curr) {
+            for prod in producers {
+                if reachable.insert(prod.clone()) {
+                    queue.push_back(prod.clone());
+                }
+            }
+        }
+    }
+
+    // Remaining reachable consumer counts (refcount) per producer node so intermediate buffers
+    // can be dropped immediately after their last consumer finishes reading them.
+    let mut remaining_consumers: BTreeMap<String, usize> = BTreeMap::new();
+    for consumer_id in &reachable {
+        if let Some(producers) = producers_by_consumer.get(consumer_id) {
+            for prod in producers {
+                *remaining_consumers.entry(prod.clone()).or_insert(0) += 1;
+            }
+        }
+    }
 
     let mut eval = MaterialEvaluator {
         size,
         incoming,
         outputs: BTreeMap::new(),
+        tracker: Arc::clone(&tracker),
         _marker: std::marker::PhantomData,
     };
 
     for id in &topo {
+        if !reachable.contains(id) || id == &output_node.id {
+            continue;
+        }
         if let Some(&node) = by_id.get(id.as_str()) {
             eval.eval_node(node)?;
+            if let Some(producers) = producers_by_consumer.get(id) {
+                for prod in producers {
+                    if let Some(rc) = remaining_consumers.get_mut(prod) {
+                        *rc = rc.saturating_sub(1);
+                        if *rc == 0 {
+                            eval.outputs.remove(prod);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3933,18 +4127,20 @@ pub fn bake_node_material_maps(
 
     if let Some(buf) = eval.get_input(out_id, &["normal"]) {
         let normal_buf = if normal_mode == 1 {
-            height_to_normal_sobel(buf, size, normal_strength, false)
+            height_to_normal_sobel(buf, size, normal_strength, false, &eval.tracker)?
         } else {
-            normalize_tangent_normal(buf, size, normal_strength)
+            normalize_tangent_normal(buf, size, normal_strength, &eval.tracker)?
         };
         baked.normal = Some(normal_buf.to_rgba8(size));
     } else if let Some(bump_buf) = eval.get_input(out_id, &["bump"]) {
         // Derive tangent-space normal map via Sobel height-to-normal whenever `bump` is wired.
-        let normal_buf = height_to_normal_sobel(bump_buf, size, normal_strength, false);
+        let normal_buf =
+            height_to_normal_sobel(bump_buf, size, normal_strength, false, &eval.tracker)?;
         baked.normal = Some(normal_buf.to_rgba8(size));
     }
 
-    Ok(baked)
+    drop(eval);
+    Ok((baked, tracker))
 }
 
 #[cfg(test)]
@@ -4206,5 +4402,135 @@ mod tests {
         assert!((maps.roughness_factor - 0.5).abs() < 1e-6);
         assert!(maps.metalness.is_none());
         assert!((maps.metalness_factor - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn node_material_bake_skips_disconnected_nodes() {
+        // Disconnected subgraph includes heavy spatial nodes and an unsupported node type.
+        // Only the constant color node wired to `out.color` is reachable and should allocate 0 image bytes.
+        let graph = json!({
+            "nodes": [
+                { "id": "col", "type": "color", "params": { "color": [0.2, 0.4, 0.8] } },
+                { "id": "dead_vor", "type": "voronoi", "params": { "scale": 8 } },
+                { "id": "dead_noise", "type": "noise", "params": { "scale": 8, "octaves": 6 } },
+                { "id": "dead_bad", "type": "nonExistentNodeType" },
+                { "id": "out", "type": "output" }
+            ],
+            "links": [
+                { "from": "col", "fromPort": "out", "to": "out", "toPort": "color" },
+                { "from": "dead_vor", "fromPort": "out", "to": "dead_bad", "toPort": "in" }
+            ]
+        });
+
+        let (maps, tracker) = bake_node_material_maps_with_budget(&graph, 64, 1024)
+            .expect("disconnected nodes skipped");
+        assert_eq!(
+            tracker.peak_bytes(),
+            0,
+            "disconnected nodes must not allocate any intermediate image bytes"
+        );
+        assert_eq!(tracker.live_bytes(), 0);
+        assert!(maps.color.is_some());
+    }
+
+    #[test]
+    fn node_material_bake_releases_chain_intermediates_eagerly() {
+        // 32-node linear chain at 64x64: each RGBA f32 buffer is 64*64*16 = 65,536 bytes.
+        // Without eager refcount eviction, peak memory would be 32 * 64 KiB = 2 MiB.
+        // With eager eviction, only producer + consumer (2 buffers = 128 KiB) are live at once.
+        let chain_len = 32usize;
+        let res = 64u32;
+        let one_buf_bytes = (res as usize) * (res as usize) * 4 * std::mem::size_of::<f32>();
+
+        let mut nodes = vec![json!({ "id": "n0", "type": "checker", "params": { "scale": 4 } })];
+        let mut links = Vec::new();
+        for i in 1..chain_len {
+            nodes.push(json!({
+                "id": format!("n{i}"),
+                "type": "invert",
+                "params": { "strength": 1.0 }
+            }));
+            links.push(json!({
+                "from": format!("n{}", i - 1),
+                "fromPort": "out",
+                "to": format!("n{i}"),
+                "toPort": "a"
+            }));
+        }
+        nodes.push(json!({ "id": "out", "type": "output" }));
+        links.push(json!({
+            "from": format!("n{}", chain_len - 1),
+            "fromPort": "out",
+            "to": "out",
+            "toPort": "color"
+        }));
+
+        let graph = json!({ "nodes": nodes, "links": links });
+        // Budget of 3 buffers would be impossible without eager release (chain has 32 spatial nodes).
+        let (maps, tracker) = bake_node_material_maps_with_budget(&graph, res, one_buf_bytes * 3)
+            .expect("long chain must succeed within tight budget via eager release");
+        assert!(maps.color.is_some());
+        assert_eq!(
+            tracker.live_bytes(),
+            0,
+            "all intermediate buffers must be freed after bake"
+        );
+        assert!(
+            tracker.peak_bytes() <= one_buf_bytes * 2,
+            "expected peak <= 2 buffers ({} bytes), got {} bytes",
+            one_buf_bytes * 2,
+            tracker.peak_bytes()
+        );
+    }
+
+    #[test]
+    fn node_material_bake_enforces_memory_budget_cleanly() {
+        // Voronoi allocates 3 RGBA f32 buffers (dist, color, position) simultaneously.
+        // Setting budget below 3 buffers (and testing a wide fan-in exceeding MAX_BAKE_MEMORY_BYTES)
+        // must fail cleanly before exceeding the budget.
+        let res = 64u32;
+        let one_buf_bytes = (res as usize) * (res as usize) * 4 * std::mem::size_of::<f32>();
+        let graph = json!({
+            "nodes": [
+                { "id": "v", "type": "voronoi", "params": { "scale": 4 } },
+                { "id": "out", "type": "output" }
+            ],
+            "links": [
+                { "from": "v", "fromPort": "out", "to": "out", "toPort": "color" }
+            ]
+        });
+
+        let err = bake_node_material_maps_with_budget(&graph, res, one_buf_bytes * 2)
+            .expect_err("exceeding bake memory budget must return Err");
+        assert!(
+            err.contains("memory budget exceeded"),
+            "expected memory budget error, got: {err}"
+        );
+
+        // Also verify the default 256 MiB public API budget rejects a wide fan-in at 1024x1024
+        // (6 independent `separateRGB` leaves = 18 * 16 MiB = 288 MiB > 256 MiB when all leaves
+        // are evaluated first by Kahn's topological sort).
+        let mut wide_nodes = Vec::new();
+        let mut wide_links = Vec::new();
+        for i in 0..6 {
+            wide_nodes.push(json!({ "id": format!("s{i}"), "type": "separateRGB" }));
+        }
+        wide_nodes.push(json!({ "id": "m0", "type": "mix" }));
+        wide_links.push(json!({ "from": "s0", "fromPort": "r", "to": "m0", "toPort": "a" }));
+        wide_links.push(json!({ "from": "s1", "fromPort": "r", "to": "m0", "toPort": "b" }));
+        for i in 2..6 {
+            wide_nodes.push(json!({ "id": format!("m{}", i - 1), "type": "mix" }));
+            wide_links.push(json!({ "from": format!("m{}", i - 2), "fromPort": "out", "to": format!("m{}", i - 1), "toPort": "a" }));
+            wide_links.push(json!({ "from": format!("s{i}"), "fromPort": "r", "to": format!("m{}", i - 1), "toPort": "b" }));
+        }
+        wide_nodes.push(json!({ "id": "out", "type": "output" }));
+        wide_links.push(json!({ "from": "m4", "fromPort": "out", "to": "out", "toPort": "color" }));
+        let wide_graph = json!({ "nodes": wide_nodes, "links": wide_links });
+        let public_err = bake_node_material_maps(&wide_graph, 1024)
+            .expect_err("wide 1024x1024 graph exceeding 256 MiB budget must return Err");
+        assert!(
+            public_err.contains("memory budget exceeded"),
+            "expected public API memory budget error, got: {public_err}"
+        );
     }
 }

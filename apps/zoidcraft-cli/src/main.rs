@@ -13,8 +13,11 @@ use std::sync::atomic::AtomicBool;
 
 use clap::{Parser, Subcommand};
 use image::{RgbImage, RgbaImage};
+#[cfg(test)]
+use zc_audio::project_has_active_audio_in_range;
 use zc_audio::{
-    STANDARD_SAMPLE_RATE, mix_project_audio_with_precomps, project_has_active_audio_in_range,
+    STANDARD_SAMPLE_RATE, mix_project_audio_with_precomps_filtered,
+    project_has_active_audio_in_range_with_precomp,
 };
 use zc_export::{
     AudioCodec, ExportContainer, ExportError, ExportSettings, QualityMode, VideoCodec,
@@ -686,11 +689,13 @@ fn mix_project_audio(
     _seq_fps: f64,
     sample_rate: u32,
 ) -> Result<Option<Vec<[f32; 2]>>, String> {
-    mix_project_audio_with_precomps(
+    let plugins = build_plugins_for_project(project);
+    mix_project_audio_with_precomps_filtered(
         project,
         f64::from(start_seq_frame),
         total_seq_frames,
         sample_rate,
+        plugins.is_enabled("precomp-plus"),
     )
     .map_err(|e| format!("failed to mix project audio: {e}"))
 }
@@ -743,6 +748,7 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
     let container = parse_container(args.format, args.out)?;
     let video_codec = parse_video_codec(args.video_codec, container, args.transparent)?;
     let sample_rate = args.sample_rate;
+    let plugins = build_plugins_for_project(&project);
     let has_active_audio = if container.is_audio_only() {
         true
     } else if matches!(
@@ -751,10 +757,11 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
     ) {
         false
     } else {
-        project_has_active_audio_in_range(
+        project_has_active_audio_in_range_with_precomp(
             &project,
             f64::from(args.start_frame),
             f64::from(args.start_frame) + audio_seq_frames,
+            plugins.is_enabled("precomp-plus"),
         )
     };
     let audio_codec = parse_audio_codec(args.audio_codec, container, has_active_audio)?;
@@ -822,7 +829,6 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
         return Ok(());
     }
 
-    let plugins = build_plugins_for_project(&project);
     let mut engine = ProjectRenderEngine::new_headless()
         .map_err(|e| format!("failed to initialize headless GPU renderer: {e}"))?;
     engine.set_transparent_background(args.transparent);
@@ -1488,6 +1494,21 @@ mod tests {
             preserved: std::collections::BTreeMap::new(),
         }];
 
+        // Without `precomp-plus` enabled, CLI audio matches video by skipping PrecompRef clips.
+        assert!(
+            !project_has_active_audio_in_range_with_precomp(&project, 0.0, 15.0, false),
+            "nested Precomp+ audio must be skipped when precomp-plus is disabled"
+        );
+        assert!(
+            mix_project_audio(&project, 0, 15.0, fps, sr)
+                .expect("disabled precomp mix ok")
+                .is_none(),
+            "CLI mixer must skip nested Precomp+ audio when precomp-plus is not required"
+        );
+
+        project
+            .plugin_requirements
+            .insert("precomp-plus".to_owned());
         assert!(project_has_active_audio_in_range(&project, 0.0, 15.0));
         let mixed = mix_project_audio(&project, 0, 15.0, fps, sr)
             .expect("nested audio mix ok")
