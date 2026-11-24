@@ -5,6 +5,7 @@ use std::io::{BufWriter, ErrorKind, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,10 +34,6 @@ impl SharedChildGuard {
         Self {
             child: Arc::new(Mutex::new(Some(child))),
         }
-    }
-
-    fn handle(&self) -> Arc<Mutex<Option<Child>>> {
-        Arc::clone(&self.child)
     }
 
     /// Terminates and reaps the child immediately if still running.
@@ -258,70 +255,84 @@ where
 
     let total_frames = settings.total_frames();
 
-    let watcher_done = AtomicBool::new(false);
+    // Stage B: Stream frames to FFmpeg over a dedicated stdin writer thread and drain stderr
+    // on a dedicated reader thread. Neither thread is tied to `std::thread::scope`, so even if
+    // a wrapper FFmpeg binary spawns a descendant that inherits stdin/stderr, cancelling kills
+    // and reaps the immediate child and returns `ExportError::Cancelled` immediately without
+    // hanging on an orphaned pipe.
+    let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
+        ring.drain_reader(stderr);
+        let _ = stderr_tx.send(ring.into_string_lossy());
+    });
 
-    // Stage B: Stream frames over stdin while concurrently draining stderr and watching `cancel`.
-    // If `cancel` becomes true during a blocked `stdin.write_all` or final mux wait, the watcher
-    // kills FFmpeg immediately, closing its pipe endpoints and unblocking the writer without deadlock.
-    let result = std::thread::scope(|scope| -> Result<(), ExportError> {
-        let stderr_handle = scope.spawn(move || {
-            let mut ring = BoundedStderrBuffer::new(MAX_STDERR_BYTES);
-            ring.drain_reader(stderr);
-            ring.into_string_lossy()
-        });
+    enum WriterOutcome {
+        Ok,
+        BrokenPipe,
+        Io(std::io::Error),
+    }
 
-        let child_guard = SharedChildGuard::new(child);
-        let child_for_watcher = child_guard.handle();
-        let watcher_done_ref = &watcher_done;
-        let _cancel_watcher = scope.spawn(move || {
-            while !watcher_done_ref.load(Ordering::Acquire) {
-                if cancel.load(Ordering::Acquire) {
-                    let mut guard = child_for_watcher
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
-                    if let Some(ch) = guard.as_mut() {
-                        let _ = ch.kill();
-                    }
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u8>>(2);
+    let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(2);
+    let (writer_done_tx, writer_done_rx) = mpsc::channel::<WriterOutcome>();
+
+    // Pre-seed two reusable payload buffers for zero-allocation steady-state streaming.
+    let payload_bytes = if needs_padding {
+        padded_bytes
+    } else {
+        raw_bytes
+    };
+    let _ = recycle_tx.send(vec![0_u8; payload_bytes]);
+    let _ = recycle_tx.send(vec![0_u8; payload_bytes]);
+
+    std::thread::spawn(move || {
+        let mut stdin_pipe = stdin;
+        let mut broken_pipe = false;
+        while let Ok(buf) = frame_rx.recv() {
+            if let Err(err) = stdin_pipe.write_all(&buf) {
+                if err.kind() == ErrorKind::BrokenPipe {
+                    broken_pipe = true;
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                let _ = writer_done_tx.send(WriterOutcome::Io(err));
+                return;
             }
-        });
-
-        struct WatcherStop<'a>(&'a AtomicBool);
-        impl Drop for WatcherStop<'_> {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-            }
+            let _ = recycle_tx.try_send(buf);
         }
-        let _stop_watcher = WatcherStop(&watcher_done);
-
-        let mut stdin_opt = Some(stdin);
-
-        let mut raw_frame = vec![0_u8; raw_bytes];
-        let mut padded_frame = if needs_padding {
-            vec![0_u8; padded_bytes]
+        if !broken_pipe {
+            let _ = stdin_pipe.flush();
+        }
+        drop(stdin_pipe);
+        let outcome = if broken_pipe {
+            WriterOutcome::BrokenPipe
         } else {
-            Vec::new()
+            WriterOutcome::Ok
         };
+        let _ = writer_done_tx.send(outcome);
+    });
 
-        let mut broken_pipe = false;
+    let child_guard = SharedChildGuard::new(child);
+    let mut raw_frame = vec![0_u8; raw_bytes];
+
+    let result = (|| -> Result<(), ExportError> {
+        let mut frame_tx_opt = Some(frame_tx);
 
         for (offset, frame_index) in (settings.start_frame..settings.end_frame).enumerate() {
             if cancel.load(Ordering::Acquire) {
-                drop(stdin_opt.take());
+                drop(frame_tx_opt.take());
                 child_guard.kill_and_reap();
                 return Err(ExportError::Cancelled);
             }
 
             if let Err(err) = frame_provider.render_frame(frame_index, &mut raw_frame) {
-                drop(stdin_opt.take());
+                drop(frame_tx_opt.take());
                 child_guard.kill_and_reap();
                 return Err(err);
             }
 
             if raw_frame.len() != raw_bytes {
-                drop(stdin_opt.take());
+                drop(frame_tx_opt.take());
                 child_guard.kill_and_reap();
                 return Err(ExportError::InvalidFrameSize {
                     frame_index,
@@ -331,39 +342,82 @@ where
             }
 
             if cancel.load(Ordering::Acquire) {
-                drop(stdin_opt.take());
+                drop(frame_tx_opt.take());
                 child_guard.kill_and_reap();
                 return Err(ExportError::Cancelled);
             }
 
-            let payload: &[u8] = if needs_padding {
+            // Acquire a recycled payload buffer cooperatively while checking `cancel`.
+            let mut payload_buf = loop {
+                if cancel.load(Ordering::Acquire) {
+                    drop(frame_tx_opt.take());
+                    child_guard.kill_and_reap();
+                    return Err(ExportError::Cancelled);
+                }
+                match recycle_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(buf) => break buf,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Ok(outcome) = writer_done_rx.try_recv() {
+                            drop(frame_tx_opt.take());
+                            return match outcome {
+                                WriterOutcome::Io(err) => {
+                                    child_guard.kill_and_reap();
+                                    Err(ExportError::Io(err))
+                                }
+                                WriterOutcome::BrokenPipe | WriterOutcome::Ok => {
+                                    // FFmpeg exited early; wait for status & stderr below.
+                                    break Vec::new();
+                                }
+                            };
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break Vec::new(),
+                }
+            };
+
+            if payload_buf.is_empty() {
+                // Writer exited early (e.g., FFmpeg closed stdin); break to collect status/stderr.
+                break;
+            }
+
+            if needs_padding {
                 pad_rgba_frame_into(
                     &raw_frame,
                     (settings.width, settings.height),
                     (enc_w, enc_h),
                     settings.transparent_alpha,
-                    &mut padded_frame,
+                    &mut payload_buf,
                 )?;
-                &padded_frame
             } else {
-                &raw_frame
-            };
+                payload_buf.clear();
+                payload_buf.extend_from_slice(&raw_frame);
+            }
 
-            if let Some(pipe) = stdin_opt.as_mut()
-                && let Err(err) = pipe.write_all(payload)
-            {
-                if cancel.load(Ordering::Acquire) {
-                    drop(stdin_opt.take());
-                    child_guard.kill_and_reap();
-                    return Err(ExportError::Cancelled);
+            // Deliver frame to the writer thread without ever blocking indefinitely on cancel.
+            if let Some(tx) = frame_tx_opt.as_ref() {
+                let mut pending = payload_buf;
+                let mut disconnected = false;
+                loop {
+                    if cancel.load(Ordering::Acquire) {
+                        drop(frame_tx_opt.take());
+                        child_guard.kill_and_reap();
+                        return Err(ExportError::Cancelled);
+                    }
+                    match tx.try_send(pending) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(returned)) => {
+                            pending = returned;
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(TrySendError::Disconnected(_)) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
                 }
-                if err.kind() == ErrorKind::BrokenPipe {
-                    broken_pipe = true;
+                if disconnected {
                     break;
                 }
-                drop(stdin_opt.take());
-                child_guard.kill_and_reap();
-                return Err(ExportError::Io(err));
             }
 
             on_progress(ExportProgress {
@@ -373,21 +427,30 @@ where
             });
         }
 
-        // Flush and close stdin so FFmpeg receives EOF and finishes muxing.
-        if let Some(mut pipe) = stdin_opt.take()
-            && !broken_pipe
-        {
-            let _ = pipe.flush();
-        }
+        // Close the frame channel so the writer thread flushes and drops FFmpeg's stdin.
+        drop(frame_tx_opt.take());
 
-        if cancel.load(Ordering::Acquire) {
-            child_guard.kill_and_reap();
-            return Err(ExportError::Cancelled);
+        // Wait cooperatively for the writer thread to finish flushing stdin while honoring `cancel`.
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                child_guard.kill_and_reap();
+                return Err(ExportError::Cancelled);
+            }
+            match writer_done_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(WriterOutcome::Ok | WriterOutcome::BrokenPipe) => break,
+                Ok(WriterOutcome::Io(err)) => {
+                    child_guard.kill_and_reap();
+                    return Err(ExportError::Io(err));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
         }
 
         let status = child_guard.wait_cancellable(cancel)?;
-        watcher_done.store(true, Ordering::Release);
-        let stderr_text = stderr_handle.join().unwrap_or_default();
+        let stderr_text = stderr_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_default();
 
         if cancel.load(Ordering::Acquire) {
             return Err(ExportError::Cancelled);
@@ -401,7 +464,7 @@ where
         }
 
         Ok(())
-    });
+    })();
 
     // Explicitly keep `temp_audio_guard` alive until FFmpeg has completely exited, then drop it.
     drop(temp_audio_guard);
@@ -431,11 +494,23 @@ fn publish_temp_output(src: &Path, dst: &Path) -> Result<(), ExportError> {
                     ErrorKind::AlreadyExists | ErrorKind::PermissionDenied
                 ) =>
         {
-            if dst.exists() {
-                fs::remove_file(dst)?;
+            if !dst.exists() {
+                return Err(ExportError::Io(err));
             }
-            fs::rename(src, dst)?;
-            Ok(())
+            // Move existing destination aside to a sibling backup first so a failed
+            // final rename can restore the original file untouched.
+            let backup = unique_sibling_temp_path(dst);
+            fs::rename(dst, &backup)?;
+            match fs::rename(src, dst) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&backup);
+                    Ok(())
+                }
+                Err(replace_err) => {
+                    let _ = fs::rename(&backup, dst);
+                    Err(ExportError::Io(replace_err))
+                }
+            }
         }
         Err(err) => Err(ExportError::Io(err)),
     }
@@ -772,7 +847,17 @@ mod tests {
             Err(ExportError::Render("simulated frame failure".to_string()))
         })
         .expect_err("simulated render failure must fail export");
-        assert!(matches!(err, ExportError::Render(_)));
+        if probe_ffmpeg(None).is_ok() {
+            assert!(
+                matches!(err, ExportError::Render(_)),
+                "expected Render error, got {err:?}"
+            );
+        } else {
+            assert!(
+                matches!(err, ExportError::FfmpegNotFound(_)),
+                "expected FfmpegNotFound error when ffmpeg is absent, got {err:?}"
+            );
+        }
         assert_eq!(
             fs::read(&existing_dest).expect("existing destination must remain intact"),
             sentinel

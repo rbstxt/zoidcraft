@@ -180,6 +180,10 @@ impl ClockShared {
     }
 
     /// Mutates the clock atomically under the control-thread seqlock and bumps `epoch_id`.
+    ///
+    /// Anchors `hw_now` to the **submission cursor** (`hardware_sample_count`) so the very next
+    /// audio callback synthesizes sample 0 at the exact requested frame without skipping the
+    /// queued latency interval, while visual playhead queries subtract `output_latency_samples`.
     fn commit_update<F>(&self, bump_epoch: bool, mutate: F) -> u64
     where
         F: FnOnce(&mut PlaybackSnapshot, u64),
@@ -189,7 +193,7 @@ impl ClockShared {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        let hw_now = self.audible_sample_count();
+        let hw_now = self.hardware_sample_count.load(Ordering::Acquire);
         let mut snap = self.read_snapshot_relaxed();
         mutate(&mut snap, hw_now);
 
