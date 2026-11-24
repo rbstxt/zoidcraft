@@ -1915,6 +1915,28 @@ fn paint_header_toggle(
     resp.clicked_by(PointerButton::Primary)
 }
 
+fn waveform_peak_slice_for_column(
+    clip: &SessionClip,
+    fps: f64,
+    points_per_sec: f64,
+    x: i32,
+    width: i32,
+) -> (usize, usize) {
+    let w_f = f64::from(width.max(1));
+    let media_start = clip.time_start.max(0.0);
+    let media_span = if clip.time_end > clip.time_start {
+        clip.time_end - clip.time_start
+    } else {
+        (clip.length / fps.max(1.0)).max(0.0)
+    };
+    let t0 = media_start + media_span * (f64::from(x.max(0)) / w_f);
+    let t1 = media_start + media_span * (f64::from(x.max(0) + 1) / w_f);
+    let idx0 = (t0 * points_per_sec).floor().max(0.0) as usize;
+    let idx1 = (t1 * points_per_sec).ceil().max(0.0) as usize;
+    let count = idx1.saturating_sub(idx0).max(1);
+    (idx0, count)
+}
+
 fn paint_audio_clip_waveform(
     painter: &egui::Painter,
     clip_rect: Rect,
@@ -1936,11 +1958,8 @@ fn paint_audio_clip_waveform(
         && !pk.max_buf.is_empty()
         && pk.max_buf.len() == pk.min_buf.len()
     {
-        let duration_sec = clip.length / fps.max(1.0);
-        let step = (duration_sec * pk.points_per_sec) / f64::from(w.max(1));
         for x in x_start..x_end {
-            let idx = (step * f64::from(x)).floor() as usize;
-            let count = (step.ceil() as usize).max(1);
+            let (idx, count) = waveform_peak_slice_for_column(clip, fps, pk.points_per_sec, x, w);
             let mut hi = 0_i16;
             let mut lo = 0_i16;
             for p in 0..count {
@@ -2973,5 +2992,46 @@ mod tests {
         assert!(p1 < 0.8 && p1 > 0.79);
         let p2 = decay_audio_meter_peak(0.2, 0.5);
         assert!((p2 - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn split_audio_clip_waveform_reads_media_offset_not_asset_start() {
+        // 1.0s asset at 100 peaks/sec: [0..0.5s) is silence (0), [0.5..1.0s) is loud tone (+/-120).
+        let mut min_buf = vec![0_i8; 100];
+        let mut max_buf = vec![0_i8; 100];
+        for i in 50..100 {
+            min_buf[i] = -120;
+            max_buf[i] = 120;
+        }
+        let peaks = AudioWaveformPeaks {
+            points_per_sec: 100.0,
+            min_buf,
+            max_buf,
+        };
+        let right_split_clip = SessionClip {
+            id: "right".to_string(),
+            kind: "audio".to_string(),
+            name: "Split Right".to_string(),
+            start: 15.0,
+            length: 15.0,
+            time_start: 0.5,
+            time_end: 1.0,
+            time_animated: false,
+            media_length: Some(1.0),
+            source_clip_id: None,
+            properties: BTreeMap::new(),
+            objects_3d: Vec::new(),
+            effects: Vec::new(),
+        };
+
+        let (idx, count) =
+            waveform_peak_slice_for_column(&right_split_clip, 30.0, peaks.points_per_sec, 0, 50);
+        assert_eq!(
+            idx, 50,
+            "right split clip column 0 must index from time_start=0.5s"
+        );
+        assert!(count >= 1);
+        assert_eq!(peaks.max_buf[idx], 120);
+        assert_eq!(peaks.min_buf[idx], -120);
     }
 }

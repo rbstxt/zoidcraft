@@ -419,6 +419,8 @@ pub struct Cm3Workspace {
     pub player_plus: PlayerPlusState,
     /// All side-panel inspector states.
     pub panels: PanelsState,
+    /// When `true` (e.g. a modal confirmation dialog is open), suppresses workspace shortcuts.
+    pub suppress_shortcuts: bool,
 }
 
 impl Default for Cm3Workspace {
@@ -451,6 +453,7 @@ impl Cm3Workspace {
             audio_meter: AudioMeterState::default(),
             player_plus: PlayerPlusState::default(),
             panels: PanelsState::default(),
+            suppress_shortcuts: false,
         }
     }
 
@@ -925,7 +928,7 @@ impl Cm3Workspace {
         let rail_focused = self.focused_panel == PanelFocus::ElevatorRail;
 
         // Keyboard navigation when rail has focus (Spec 01 §1.4)
-        if rail_focused && !ui.ctx().egui_wants_keyboard_input() {
+        if rail_focused && !self.suppress_shortcuts && !ui.ctx().egui_wants_keyboard_input() {
             ui.input(|i| {
                 if i.key_pressed(Key::ArrowDown) {
                     self.rail_focus_index = (self.rail_focus_index + 1) % SideTab::ALL.len();
@@ -1416,8 +1419,8 @@ impl Cm3Workspace {
         session: &mut Session,
         actions: &mut Vec<UiAction>,
     ) {
-        // Strict input-focus guard (Spec 01 §6.1)
-        if ctx.egui_wants_keyboard_input() {
+        // Strict input-focus & modal guard (Spec 01 §6.1)
+        if self.suppress_shortcuts || ctx.egui_wants_keyboard_input() {
             return;
         }
 

@@ -348,8 +348,8 @@ struct ZoidCraftApp {
     viewport: ViewportState,
     renderer: Option<ViewportGpuPresenter>,
     current_file: Option<PathBuf>,
-    /// Decoded audio buffers keyed by project `asset_id` (shared across split/duplicated clips).
-    decoded_audio: HashMap<String, AudioBuffer>,
+    /// Decoded audio buffers keyed by project `asset_id` (shared zero-copy across split/duplicated clips and exports).
+    decoded_audio: HashMap<String, Arc<AudioBuffer>>,
     /// Precomputed waveform peaks keyed by project `asset_id`.
     asset_waveform_peaks: HashMap<String, AudioWaveformPeaks>,
     active_export: Option<ActiveExportJob>,
@@ -439,8 +439,12 @@ impl ZoidCraftApp {
         self.status_toast = Some((message.into(), Instant::now()));
     }
 
+    fn has_unsaved_changes(&self) -> bool {
+        self.session.is_dirty() || self.session.history.is_in_transaction()
+    }
+
     fn update_window_title(&mut self, ctx: &egui::Context) {
-        let dirty = if self.session.is_dirty() { "*" } else { "" };
+        let dirty = if self.has_unsaved_changes() { "*" } else { "" };
         let mode_tag = if self.session.plugins.is_vanilla_cm3_mode() {
             " (Vanilla CM3)"
         } else {
@@ -578,7 +582,7 @@ impl ZoidCraftApp {
     }
 
     fn handle_new_project(&mut self) {
-        if self.session.is_dirty() {
+        if self.has_unsaved_changes() {
             self.pending_unsaved_dialog = Some(PendingUnsavedAction::NewProject);
             return;
         }
@@ -616,7 +620,7 @@ impl ZoidCraftApp {
     }
 
     fn handle_open_project(&mut self) {
-        if self.session.is_dirty() {
+        if self.has_unsaved_changes() {
             self.pending_unsaved_dialog = Some(PendingUnsavedAction::OpenProject);
             return;
         }
@@ -870,7 +874,7 @@ impl ZoidCraftApp {
                 self.timeline
                     .audio_peaks
                     .insert(clip_id.to_owned(), ui_peaks);
-                self.decoded_audio.insert(asset_id, audio_buf);
+                self.decoded_audio.insert(asset_id, Arc::new(audio_buf));
             }
         }
 
@@ -906,7 +910,8 @@ impl ZoidCraftApp {
                                 max_buf: peaks.max_peaks().to_vec(),
                             },
                         );
-                        self.decoded_audio.insert(asset_key.to_owned(), buf);
+                        self.decoded_audio
+                            .insert(asset_key.to_owned(), Arc::new(buf));
                     }
                 }
                 if let Some(ui_peaks) = self.asset_waveform_peaks.get(asset_key) {
@@ -1044,10 +1049,16 @@ impl ZoidCraftApp {
             return;
         }
 
-        // Snapshot project & audio buffers for lock-free background export thread.
+        // Snapshot project & share only in-range decoded audio Arcs (zero PCM deep-copy).
         let export_project = self.session.project.clone();
         let export_plugins = self.session.plugins.clone();
-        let export_audio_buffers = self.decoded_audio.clone();
+        let export_audio_buffers = collect_in_range_audio_arcs(
+            &self.session,
+            &self.decoded_audio,
+            &core_settings,
+            start_seq_frame,
+            end_seq_frame,
+        );
 
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = Arc::clone(&cancel);
@@ -1242,6 +1253,9 @@ impl ZoidCraftApp {
                 self.pending_unsaved_dialog = None;
             }
             Some(1) => {
+                if self.session.history.is_in_transaction() {
+                    let _ = self.session.commit_transaction(true);
+                }
                 if self.handle_save_project(true) {
                     self.pending_unsaved_dialog = None;
                     match pending {
@@ -1255,6 +1269,9 @@ impl ZoidCraftApp {
                 }
             }
             Some(2) => {
+                if self.session.history.is_in_transaction() {
+                    let _ = self.session.cancel_transaction();
+                }
                 self.pending_unsaved_dialog = None;
                 match pending {
                     PendingUnsavedAction::NewProject => self.perform_new_project(),
@@ -1364,12 +1381,13 @@ impl eframe::App for ZoidCraftApp {
 
         // 2. Real-time playback tick, audio peak sync, close guard, and export worker polling.
         if ctx.input(|i| i.viewport().close_requested())
-            && self.session.is_dirty()
+            && self.has_unsaved_changes()
             && !self.allow_close_now
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending_unsaved_dialog = Some(PendingUnsavedAction::CloseWindow);
         }
+        self.workspace.suppress_shortcuts = self.pending_unsaved_dialog.is_some();
         self.sync_timeline_audio_peaks();
         self.tick_playback_and_meter(&ctx);
         self.poll_export_worker(&ctx);
@@ -1837,9 +1855,57 @@ fn collect_clip_audio_assets(project: &Project) -> HashMap<String, String> {
     map
 }
 
+fn collect_in_range_audio_arcs(
+    session: &Session,
+    cached_buffers: &HashMap<String, Arc<AudioBuffer>>,
+    settings: &CoreExportSettings,
+    start_seq_frame: u32,
+    end_seq_frame: u32,
+) -> HashMap<String, Arc<AudioBuffer>> {
+    let mut selected = HashMap::new();
+    if settings.container == CoreExportContainer::PngSequence
+        || settings.audio_codec == AudioCodec::None
+        || cached_buffers.is_empty()
+    {
+        return selected;
+    }
+    let clip_assets = collect_clip_audio_assets(&session.project);
+    let doc = session.document();
+    let any_solo = doc.audio_tracks.iter().any(|t| t.enabled && t.solo);
+    let range_start = f64::from(start_seq_frame);
+    let range_end = f64::from(end_seq_frame);
+
+    for track in &doc.audio_tracks {
+        let audible = if any_solo {
+            track.enabled && track.solo
+        } else {
+            track.enabled
+        };
+        if !audible {
+            continue;
+        }
+        for clip in &track.clips {
+            if clip.length <= 0.0
+                || clip.start + clip.length <= range_start
+                || clip.start >= range_end
+            {
+                continue;
+            }
+            if let Some(asset_id) = clip_assets.get(&clip.id)
+                && let Some(buf) = cached_buffers.get(asset_id)
+            {
+                selected
+                    .entry(asset_id.clone())
+                    .or_insert_with(|| Arc::clone(buf));
+            }
+        }
+    }
+    selected
+}
+
 fn build_offline_export_audio(
     session: &Session,
-    cached_buffers: &HashMap<String, AudioBuffer>,
+    cached_buffers: &HashMap<String, Arc<AudioBuffer>>,
     settings: &CoreExportSettings,
     seq_fps: f64,
     start_seq_frame: u32,
@@ -1854,7 +1920,8 @@ fn build_offline_export_audio(
     if clip_assets.is_empty() && cached_buffers.is_empty() {
         return Ok(None);
     }
-    let mut buffers = cached_buffers.clone();
+    // Share Arc references without copying PCM sample data.
+    let mut buffers: HashMap<String, Arc<AudioBuffer>> = HashMap::new();
     let doc = session.document();
     let any_solo = doc.audio_tracks.iter().any(|t| t.enabled && t.solo);
     let mut items = Vec::new();
@@ -1882,18 +1949,23 @@ fn build_offline_export_audio(
                 continue;
             };
             if !buffers.contains_key(asset_id) {
-                let Some(rec) = session.project.assets.get(asset_id) else {
-                    continue;
-                };
-                let Some(bytes) = rec.bytes.as_deref() else {
-                    continue;
-                };
-                let ext = Path::new(&rec.filename)
-                    .extension()
-                    .and_then(|e| e.to_str());
-                let decoded = decode_audio_bytes(bytes, ext)
-                    .map_err(|err| format!("failed to decode audio asset `{asset_id}`: {err}"))?;
-                buffers.insert(asset_id.clone(), decoded);
+                if let Some(cached) = cached_buffers.get(asset_id) {
+                    buffers.insert(asset_id.clone(), Arc::clone(cached));
+                } else {
+                    let Some(rec) = session.project.assets.get(asset_id) else {
+                        continue;
+                    };
+                    let Some(bytes) = rec.bytes.as_deref() else {
+                        continue;
+                    };
+                    let ext = Path::new(&rec.filename)
+                        .extension()
+                        .and_then(|e| e.to_str());
+                    let decoded = decode_audio_bytes(bytes, ext).map_err(|err| {
+                        format!("failed to decode audio asset `{asset_id}`: {err}")
+                    })?;
+                    buffers.insert(asset_id.clone(), Arc::new(decoded));
+                }
             }
             let rate =
                 effective_playback_rate(clip.time_start, clip.time_end, clip.length, seq_fps);
@@ -1940,7 +2012,7 @@ fn build_offline_export_audio(
 
 fn sample_live_audio_meter(
     session: &Session,
-    buffers: &HashMap<String, AudioBuffer>,
+    buffers: &HashMap<String, Arc<AudioBuffer>>,
     frame: f64,
     fps: f64,
 ) -> (f32, f32) {
@@ -2077,9 +2149,9 @@ mod tests {
             "tone.wav".to_owned(),
             wav_bytes.clone(),
         );
-        let decoded = decode_audio_bytes(&wav_bytes, Some("wav")).expect("decode wav");
+        let decoded = Arc::new(decode_audio_bytes(&wav_bytes, Some("wav")).expect("decode wav"));
         let mut cache = HashMap::new();
-        cache.insert(asset_id.clone(), decoded);
+        cache.insert(asset_id.clone(), Arc::clone(&decoded));
 
         let clip_id = session
             .execute(Command::AddClip {
