@@ -2,17 +2,30 @@
 //! gain and equal-power pan law (Spec 03 §1.4 & Spec 04 §4.2).
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::FRAC_PI_2;
+use std::f64::consts::{FRAC_PI_2 as FRAC_PI_2_F64, PI as PI_F64, TAU as TAU_F64};
+use std::path::Path;
+use std::sync::Arc;
+
+use zc_project::{
+    AudioClip, Layer, LayerKind, Project, PropertyTrack, PropertyValue, Sequence, StaticBehavior,
+    Uuid, VideoClip,
+};
 
 use crate::AudioError;
 use crate::decode::{
-    AudioBuffer, MAX_AUDIO_SAMPLE_RATE, MIN_AUDIO_SAMPLE_RATE, downmix_frame_to_stereo,
-    sample_stereo_sinc,
+    AudioBuffer, MAX_AUDIO_SAMPLE_RATE, MIN_AUDIO_SAMPLE_RATE, decode_audio_bytes,
+    downmix_frame_to_stereo, sample_stereo_sinc,
 };
+use crate::expr::{AudioExprContext, eval_audio_expression_or_fallback};
 
 /// Maximum stereo sample frames produced in one offline mix buffer (32M frames = 256 MiB).
 pub const MAX_OFFLINE_MIX_SAMPLES: usize = 32 * 1024 * 1024;
+
+/// Maximum nested Precomp+ composition recursion depth when flattening audio tracks.
+pub const MAX_PRECOMP_AUDIO_DEPTH: usize = 8;
 
 /// Scheduled audio clip on a timeline track for offline mixing.
 #[derive(Debug, Clone, PartialEq)]
@@ -336,6 +349,1291 @@ fn sanitize_and_clamp(v: f32) -> f32 {
     }
 }
 
+/// Resolved audio clip collected from either the root sequence or a nested Precomp+ composition.
+#[derive(Debug, Clone)]
+pub struct FlattenedAudioClip {
+    /// Start frame in root sequence coordinates.
+    pub root_start_frame: f64,
+    /// Duration in root sequence coordinates.
+    pub root_length_frames: f64,
+    /// Asset ID referencing `project.assets` or a caller-supplied decoded buffer map.
+    pub asset_id: String,
+    /// Clip's own local start frame inside its immediate owning sequence.
+    pub own_start_frame: f64,
+    /// Clip's own length in its immediate owning sequence.
+    pub own_length_frames: f64,
+    /// Immediate owning sequence frame rate.
+    pub own_fps: f64,
+    /// Additional media start offset in seconds (from `preserved["media_offset"]`, if present).
+    pub media_offset_sec: f64,
+    /// Nesting depth (`0` = root sequence, `1..=MAX_PRECOMP_AUDIO_DEPTH` = nested precomp).
+    pub depth: usize,
+    parent_chain: Vec<ParentCompMap>,
+    props: CompiledAudioClipProps,
+}
+
+impl FlattenedAudioClip {
+    /// Returns `true` if this clip or any enclosing precomp clip uses a scalar expression.
+    #[must_use]
+    pub fn has_expressions(&self) -> bool {
+        self.props.time_expr.is_some()
+            || self.props.volume_expr.is_some()
+            || self.props.pan_expr.is_some()
+            || self
+                .parent_chain
+                .iter()
+                .any(|p| p.time_expr.is_some() || p.volume_expr.is_some() || p.pan_expr.is_some())
+    }
+
+    /// Evaluates dynamic `media_time_sec`, combined `volume`, and combined `pan` at a
+    /// root-clip-local frame offset (relative to [`Self::root_start_frame`]).
+    ///
+    /// Returns `media_time_sec = -1.0` and `volume = 0.0` when the frame falls outside any
+    /// enclosing precomp clip or the clip's own active span.
+    #[must_use]
+    pub fn evaluate_params(&self, root_local_frame: f64) -> ClipAudioSampleParams {
+        let mut seq_frame = self.root_start_frame + root_local_frame;
+        let mut acc_volume = 1.0_f64;
+        let mut acc_pan = 0.0_f64;
+
+        for parent in &self.parent_chain {
+            let p_local = seq_frame - parent.clip_start;
+            if !p_local.is_finite() || p_local < 0.0 || p_local >= parent.clip_length {
+                return ClipAudioSampleParams {
+                    media_time_sec: -1.0,
+                    volume: 0.0,
+                    pan: 0.0,
+                };
+            }
+            let child_time_sec = eval_time_track(
+                parent.has_time_keyframes,
+                &parent.time_prop,
+                parent.time_expr.as_deref(),
+                p_local,
+                seq_frame,
+                parent.parent_fps,
+                &parent.controls,
+            );
+            let p_vol = eval_scalar_expr_track(
+                &parent.volume_prop,
+                parent.volume_expr.as_deref(),
+                p_local,
+                child_time_sec,
+                seq_frame,
+                parent.parent_fps,
+                &parent.controls,
+            );
+            let p_pan = eval_scalar_expr_track(
+                &parent.pan_prop,
+                parent.pan_expr.as_deref(),
+                p_local,
+                child_time_sec,
+                seq_frame,
+                parent.parent_fps,
+                &parent.controls,
+            );
+            acc_volume *= sanitize_gain_f64(p_vol);
+            acc_pan += sanitize_pan_f64(p_pan);
+
+            seq_frame = if (child_time_sec * parent.parent_fps - p_local).abs() < 1e-6
+                && (parent.child_fps - parent.parent_fps).abs() < 1e-6
+            {
+                p_local + parent.precomp_offset_frames
+            } else {
+                child_time_sec * parent.child_fps + parent.precomp_offset_frames
+            };
+        }
+
+        let own_local = if self.parent_chain.is_empty() {
+            root_local_frame
+        } else {
+            seq_frame - self.own_start_frame
+        };
+        if !own_local.is_finite() || own_local < 0.0 || own_local >= self.own_length_frames {
+            return ClipAudioSampleParams {
+                media_time_sec: -1.0,
+                volume: 0.0,
+                pan: 0.0,
+            };
+        }
+
+        let p = &self.props;
+        let media_time_sec = eval_time_track(
+            p.has_time_keyframes,
+            &p.time,
+            p.time_expr.as_deref(),
+            own_local,
+            seq_frame,
+            self.own_fps,
+            &p.controls,
+        ) + self.media_offset_sec;
+
+        let child_vol = eval_scalar_expr_track(
+            &p.volume,
+            p.volume_expr.as_deref(),
+            own_local,
+            media_time_sec,
+            seq_frame,
+            self.own_fps,
+            &p.controls,
+        );
+        let child_pan = eval_scalar_expr_track(
+            &p.pan,
+            p.pan_expr.as_deref(),
+            own_local,
+            media_time_sec,
+            seq_frame,
+            self.own_fps,
+            &p.controls,
+        );
+
+        let combined_vol = (acc_volume * sanitize_gain_f64(child_vol)).max(0.0);
+        let combined_pan = (acc_pan + sanitize_pan_f64(child_pan)).clamp(-1.0, 1.0);
+
+        ClipAudioSampleParams {
+            media_time_sec,
+            volume: combined_vol as f32,
+            pan: combined_pan as f32,
+        }
+    }
+
+    /// Builds an [`AudioClipScheduleItem`] relative to `range_start_frame` at `root_fps`.
+    #[must_use]
+    pub fn to_schedule_item(&self, range_start_frame: f64, root_fps: f64) -> AudioClipScheduleItem {
+        let p0 = self.evaluate_params(0.0);
+        let p1 = self.evaluate_params(self.root_length_frames);
+        let rate = if p0.media_time_sec >= 0.0 && p1.media_time_sec >= 0.0 {
+            effective_playback_rate(
+                p0.media_time_sec,
+                p1.media_time_sec,
+                self.root_length_frames,
+                root_fps,
+            )
+        } else {
+            1.0
+        };
+        AudioClipScheduleItem {
+            clip_start_frame: self.root_start_frame - range_start_frame,
+            clip_length_frames: self.root_length_frames,
+            media_start_sec: p0.media_time_sec.max(0.0),
+            playback_rate: rate,
+            volume: p0.volume,
+            pan: p0.pan,
+            buffer_id: self.asset_id.clone(),
+        }
+    }
+}
+
+/// Recursively collects all audible [`FlattenedAudioClip`] items across `project.sequence` and
+/// any nested [`LayerKind::PrecompRef`] compositions in `project.compositions` overlapping
+/// `[range_start_frame, range_end_frame)`.
+///
+/// Enforces per-composition `enabled`/`muted`/`solo` (`any_solo`) rules, `precomp_offsets`,
+/// `time_curve` animation/remapping, `media_offset`, parent+child `volume`/`pan` combination,
+/// `Sequence.controls` expression context, cycle detection (`HashSet<Uuid>`), and
+/// [`MAX_PRECOMP_AUDIO_DEPTH`].
+#[must_use]
+pub fn collect_flattened_audio_clips(
+    project: &Project,
+    range_start_frame: f64,
+    range_end_frame: f64,
+) -> Vec<FlattenedAudioClip> {
+    if !range_start_frame.is_finite()
+        || !range_end_frame.is_finite()
+        || range_end_frame <= range_start_frame
+    {
+        return Vec::new();
+    }
+    let mut visited = HashSet::new();
+    visited.insert(project.sequence.id);
+    let mut out = Vec::new();
+    collect_sequence_audio_clips(
+        project,
+        &project.sequence,
+        range_start_frame,
+        range_end_frame,
+        &[],
+        &mut visited,
+        0,
+        &mut out,
+    );
+    out
+}
+
+/// Mixes pre-collected [`FlattenedAudioClip`] items against a decoded buffer map into a
+/// deterministic 48 kHz (or custom `sample_rate`) stereo buffer.
+///
+/// Uses a 32-sample control-rate block cache for expression-driven clips while falling back
+/// to exact per-sample evaluation across clip/precomp boundaries.
+pub fn mix_flattened_audio_clips<B: Borrow<AudioBuffer>>(
+    clips: &[FlattenedAudioClip],
+    range_start_frame: f64,
+    total_frames: f64,
+    root_fps: f64,
+    sample_rate: u32,
+    buffers: &HashMap<String, B>,
+) -> Result<Vec<[f32; 2]>, AudioError> {
+    let scheduled: Vec<AudioClipScheduleItem> = clips
+        .iter()
+        .map(|clip| clip.to_schedule_item(range_start_frame, root_fps))
+        .collect();
+
+    let block_frames = (32.0 / f64::from(sample_rate.max(1))) * root_fps.max(1.0);
+    let caches: Vec<RefCell<ExprSampleCache>> = clips
+        .iter()
+        .map(|_| RefCell::new(ExprSampleCache::new(block_frames)))
+        .collect();
+
+    try_mix_offline_stereo_animated(
+        total_frames,
+        root_fps,
+        sample_rate,
+        &scheduled,
+        buffers,
+        |idx, _item, local_frame| {
+            let clip = &clips[idx];
+            if !clip.has_expressions() {
+                return clip.evaluate_params(local_frame);
+            }
+            let mut cache = caches[idx].borrow_mut();
+            if !cache.valid
+                || local_frame < cache.block_origin_frame
+                || local_frame > cache.block_end_frame
+            {
+                let b0 = local_frame;
+                let b1 = (local_frame + cache.block_step_frames).min(clip.root_length_frames);
+                cache.block_origin_frame = b0;
+                cache.block_end_frame = b1;
+                cache.p0 = clip.evaluate_params(b0);
+                cache.p1 = clip.evaluate_params(b1);
+                cache.valid = true;
+            }
+            if cache.p0.media_time_sec < 0.0 || cache.p1.media_time_sec < 0.0 {
+                return clip.evaluate_params(local_frame);
+            }
+            let span = (cache.block_end_frame - cache.block_origin_frame).max(1e-9);
+            let frac = ((local_frame - cache.block_origin_frame) / span).clamp(0.0, 1.0);
+            let frac32 = frac as f32;
+            ClipAudioSampleParams {
+                media_time_sec: cache.p0.media_time_sec
+                    + (cache.p1.media_time_sec - cache.p0.media_time_sec) * frac,
+                volume: cache.p0.volume + (cache.p1.volume - cache.p0.volume) * frac32,
+                pan: cache.p0.pan + (cache.p1.pan - cache.p0.pan) * frac32,
+            }
+        },
+    )
+}
+
+/// Returns `true` if `project` has at least one decodable active audio clip (including inside
+/// nested `PrecompRef` compositions) overlapping `[range_start_frame, range_end_frame)`.
+///
+/// Video-only containers returning [`AudioError::NoAudioTrack`] are treated gracefully as silent.
+#[must_use]
+pub fn project_has_active_audio_in_range(
+    project: &Project,
+    range_start_frame: f64,
+    range_end_frame: f64,
+) -> bool {
+    let clips = collect_flattened_audio_clips(project, range_start_frame, range_end_frame);
+    let mut checked_silent: HashSet<&str> = HashSet::new();
+    for clip in &clips {
+        if checked_silent.contains(clip.asset_id.as_str()) {
+            continue;
+        }
+        let Some(record) = project.assets.get(&clip.asset_id) else {
+            continue;
+        };
+        let Some(bytes) = record.bytes.as_deref() else {
+            continue;
+        };
+        let ext_hint = Path::new(&record.filename)
+            .extension()
+            .and_then(|e| e.to_str());
+        match decode_audio_bytes(bytes, ext_hint) {
+            Ok(buf) if !buf.is_empty() => return true,
+            Ok(_) | Err(AudioError::NoAudioTrack) => {
+                checked_silent.insert(clip.asset_id.as_str());
+            }
+            Err(_) => {
+                // Keep audio active on unexpected decode errors so mix reports them.
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Flattens and mixes all active audio clips (including nested `PrecompRef` compositions) in
+/// `project` over `[start_seq_frame, start_seq_frame + total_seq_frames)` at `sample_rate`.
+///
+/// - Returns `Ok(None)` if `total_seq_frames <= 0.0` or no active decodable audio clips exist.
+/// - Treats video-only containers (`AudioError::NoAudioTrack`), empty decoded audio streams, and
+///   missing asset bytes gracefully as silence.
+pub fn mix_project_audio_with_precomps(
+    project: &Project,
+    start_seq_frame: f64,
+    total_seq_frames: f64,
+    sample_rate: u32,
+) -> Result<Option<Vec<[f32; 2]>>, AudioError> {
+    if !start_seq_frame.is_finite() || !total_seq_frames.is_finite() || total_seq_frames <= 0.0 {
+        return Ok(None);
+    }
+    let root_fps = sequence_effective_fps(&project.sequence);
+    let range_end = start_seq_frame + total_seq_frames;
+    let flattened = collect_flattened_audio_clips(project, start_seq_frame, range_end);
+
+    let mut buffers: HashMap<String, AudioBuffer> = HashMap::new();
+    let mut silent_assets: HashSet<String> = HashSet::new();
+    let mut active_clips: Vec<FlattenedAudioClip> = Vec::new();
+
+    for clip in flattened {
+        if silent_assets.contains(&clip.asset_id) {
+            continue;
+        }
+        if !buffers.contains_key(&clip.asset_id) {
+            let Some(record) = project.assets.get(&clip.asset_id) else {
+                continue;
+            };
+            let Some(bytes) = record.bytes.as_deref() else {
+                continue;
+            };
+            let ext_hint = Path::new(&record.filename)
+                .extension()
+                .and_then(|e| e.to_str());
+            match decode_audio_bytes(bytes, ext_hint) {
+                Ok(decoded) => {
+                    if decoded.is_empty() {
+                        silent_assets.insert(clip.asset_id.clone());
+                        continue;
+                    }
+                    buffers.insert(clip.asset_id.clone(), decoded);
+                }
+                Err(AudioError::NoAudioTrack) => {
+                    tracing::debug!(
+                        "audio asset `{}` has no audio track; treating as silent",
+                        clip.asset_id
+                    );
+                    silent_assets.insert(clip.asset_id.clone());
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        active_clips.push(clip);
+    }
+
+    if active_clips.is_empty() {
+        return Ok(None);
+    }
+
+    let mixed = mix_flattened_audio_clips(
+        &active_clips,
+        start_seq_frame,
+        total_seq_frames,
+        root_fps,
+        sample_rate,
+        &buffers,
+    )?;
+    Ok(Some(mixed))
+}
+
+#[derive(Debug, Clone)]
+struct ParentCompMap {
+    clip_start: f64,
+    clip_length: f64,
+    parent_fps: f64,
+    child_fps: f64,
+    precomp_offset_frames: f64,
+    has_time_keyframes: bool,
+    time_prop: ScalarTrack,
+    time_expr: Option<String>,
+    volume_prop: ScalarTrack,
+    volume_expr: Option<String>,
+    pan_prop: ScalarTrack,
+    pan_expr: Option<String>,
+    controls: Arc<CompiledControls>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledAudioClipProps {
+    has_time_keyframes: bool,
+    time: ScalarTrack,
+    time_expr: Option<String>,
+    volume: ScalarTrack,
+    volume_expr: Option<String>,
+    pan: ScalarTrack,
+    pan_expr: Option<String>,
+    controls: Arc<CompiledControls>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledControls {
+    static_by_name: HashMap<String, f64>,
+    static_by_id: HashMap<String, f64>,
+    animated: Vec<(String, String, ScalarTrack)>,
+}
+
+impl CompiledControls {
+    fn from_sequence(seq: &Sequence) -> Arc<Self> {
+        let mut static_by_name = HashMap::new();
+        let mut static_by_id = HashMap::new();
+        let mut animated = Vec::new();
+        for ctl in &seq.controls {
+            let (val, anim_track) = match &ctl.track.value {
+                PropertyValue::Number(_) => {
+                    let track = ScalarTrack::from_property_track(&ctl.track, 0.0);
+                    let v0 = track.evaluate(0.0);
+                    if track.is_keyframed && track.keyframes.len() > 1 {
+                        (v0, Some(track))
+                    } else {
+                        (v0, None)
+                    }
+                }
+                PropertyValue::Option(idx) => (f64::from(*idx), None),
+                PropertyValue::Bool(b) => (if *b { 1.0 } else { 0.0 }, None),
+                PropertyValue::Text(s) => (s.trim().parse::<f64>().unwrap_or(0.0), None),
+                _ => (0.0, None),
+            };
+            static_by_name.insert(ctl.name.clone(), val);
+            static_by_id.insert(ctl.id.clone(), val);
+            if let Some(track) = anim_track {
+                animated.push((ctl.name.clone(), ctl.id.clone(), track));
+            }
+        }
+        Arc::new(Self {
+            static_by_name,
+            static_by_id,
+            animated,
+        })
+    }
+
+    fn with_resolved<R>(
+        &self,
+        seq_frame: f64,
+        f: impl FnOnce(&HashMap<String, f64>, &HashMap<String, f64>) -> R,
+    ) -> R {
+        if self.animated.is_empty() {
+            return f(&self.static_by_name, &self.static_by_id);
+        }
+        let mut by_name = self.static_by_name.clone();
+        let mut by_id = self.static_by_id.clone();
+        for (name, id, track) in &self.animated {
+            let val = track.evaluate(seq_frame);
+            by_name.insert(name.clone(), val);
+            by_id.insert(id.clone(), val);
+        }
+        f(&by_name, &by_id)
+    }
+}
+
+struct ExprSampleCache {
+    block_origin_frame: f64,
+    block_end_frame: f64,
+    block_step_frames: f64,
+    p0: ClipAudioSampleParams,
+    p1: ClipAudioSampleParams,
+    valid: bool,
+}
+
+impl ExprSampleCache {
+    fn new(block_step_frames: f64) -> Self {
+        Self {
+            block_origin_frame: 0.0,
+            block_end_frame: 0.0,
+            block_step_frames: block_step_frames.max(1e-6),
+            p0: ClipAudioSampleParams {
+                media_time_sec: 0.0,
+                volume: 1.0,
+                pan: 0.0,
+            },
+            p1: ClipAudioSampleParams {
+                media_time_sec: 0.0,
+                volume: 1.0,
+                pan: 0.0,
+            },
+            valid: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ScalarKeyframe {
+    frame: f64,
+    value: f64,
+    ease_index: u8,
+    is_bezier: bool,
+    in_tangent: [f64; 2],
+    out_tangent: [f64; 2],
+}
+
+/// Self-contained CM3 scalar `PropertyTrack` evaluator (Hold, all 33 CM3 easings, and
+/// handle-driven cubic Bezier segments with Easing+ crossing-handle preservation).
+#[derive(Debug, Clone)]
+struct ScalarTrack {
+    base_value: f64,
+    is_keyframed: bool,
+    keyframes: Vec<ScalarKeyframe>,
+}
+
+impl ScalarTrack {
+    fn constant(value: f64) -> Self {
+        Self {
+            base_value: if value.is_finite() { value } else { 0.0 },
+            is_keyframed: false,
+            keyframes: Vec::new(),
+        }
+    }
+
+    fn from_property_track(track: &PropertyTrack, default: f64) -> Self {
+        let base = track
+            .value
+            .as_f64()
+            .filter(|v| v.is_finite())
+            .unwrap_or(default);
+        let use_keyframes = !track.keyframes.is_empty()
+            && (track.animated
+                || track.static_behavior == StaticBehavior::Linear
+                || track.keyframes.len() > 1);
+        if !use_keyframes {
+            return Self::constant(base);
+        }
+        let mut keyframes: Vec<ScalarKeyframe> = track
+            .keyframes
+            .iter()
+            .filter_map(|kf| {
+                let value = kf.value.as_f64().filter(|v| v.is_finite())?;
+                let frame = if kf.frame.is_finite() { kf.frame } else { 0.0 };
+                let ease_index = (kf.tween & 0xFF) as u8;
+                let is_bezier = ease_index != 0 && (kf.tween >> 8) == 1;
+                Some(ScalarKeyframe {
+                    frame,
+                    value,
+                    ease_index,
+                    is_bezier,
+                    in_tangent: kf.control_points[0],
+                    out_tangent: kf.control_points[1],
+                })
+            })
+            .collect();
+        if keyframes.is_empty() {
+            return Self::constant(base);
+        }
+        keyframes.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+        Self {
+            base_value: base,
+            is_keyframed: true,
+            keyframes,
+        }
+    }
+
+    fn evaluate(&self, frame: f64) -> f64 {
+        if !self.is_keyframed || self.keyframes.is_empty() {
+            return self.base_value;
+        }
+        if !frame.is_finite() || self.keyframes.len() == 1 || frame <= self.keyframes[0].frame {
+            return self.keyframes[0].value;
+        }
+        let last = &self.keyframes[self.keyframes.len() - 1];
+        if frame >= last.frame {
+            return last.value;
+        }
+        let idx = self.keyframes.partition_point(|kf| kf.frame <= frame);
+        if idx == 0 {
+            return self.keyframes[0].value;
+        }
+        if idx >= self.keyframes.len() {
+            return last.value;
+        }
+        let k0 = &self.keyframes[idx - 1];
+        let k1 = &self.keyframes[idx];
+        if (frame - k0.frame).abs() == 0.0 || k1.ease_index == 0 {
+            return k0.value;
+        }
+        let span = k1.frame - k0.frame;
+        if !span.is_finite() || span <= 0.0 {
+            return k0.value;
+        }
+        if k1.is_bezier {
+            return eval_segment_bezier(
+                k0.frame,
+                k0.value,
+                k0.out_tangent,
+                k1.frame,
+                k1.value,
+                k1.in_tangent,
+                frame,
+            );
+        }
+        let u = ((frame - k0.frame) / span).clamp(0.0, 1.0);
+        let e = eval_cm3_easing(k1.ease_index, u);
+        k0.value + (k1.value - k0.value) * e
+    }
+}
+
+fn eval_cm3_easing(index: u8, u: f64) -> f64 {
+    let u = u.clamp(0.0, 1.0);
+    match index {
+        0 => {
+            if u < 1.0 {
+                0.0
+            } else {
+                1.0
+            }
+        }
+        2 => u * u,
+        3 => u * (2.0 - u),
+        4 => {
+            let w = 2.0 * u;
+            if w < 1.0 {
+                0.5 * w * w
+            } else {
+                -0.5 * ((w - 1.0) * (w - 3.0) - 1.0)
+            }
+        }
+        5 => u * u * u,
+        6 => {
+            let d = u - 1.0;
+            d * d * d + 1.0
+        }
+        7 => {
+            let w = 2.0 * u;
+            if w < 1.0 {
+                0.5 * w * w * w
+            } else {
+                let d = w - 2.0;
+                0.5 * (d * d * d + 2.0)
+            }
+        }
+        8 => {
+            let u2 = u * u;
+            u2 * u2
+        }
+        9 => {
+            let d = u - 1.0;
+            let d2 = d * d;
+            1.0 - d2 * d2
+        }
+        10 => {
+            let w = 2.0 * u;
+            if w < 1.0 {
+                let w2 = w * w;
+                0.5 * w2 * w2
+            } else {
+                let d = w - 2.0;
+                let d2 = d * d;
+                -0.5 * (d2 * d2 - 2.0)
+            }
+        }
+        11 => u.powi(5),
+        12 => (u - 1.0).powi(5) + 1.0,
+        13 => {
+            let w = 2.0 * u;
+            if w < 1.0 {
+                0.5 * w.powi(5)
+            } else {
+                0.5 * ((w - 2.0).powi(5) + 2.0)
+            }
+        }
+        14 => 1.0 - (u * FRAC_PI_2_F64).cos(),
+        15 => (u * FRAC_PI_2_F64).sin(),
+        16 => 0.5 * (1.0 - (PI_F64 * u).cos()),
+        17 => {
+            if u <= 0.0 {
+                0.0
+            } else {
+                1024.0_f64.powf(u - 1.0)
+            }
+        }
+        18 => {
+            if u >= 1.0 {
+                1.0
+            } else {
+                1.0 - 2.0_f64.powf(-10.0 * u)
+            }
+        }
+        19 => {
+            if u <= 0.0 {
+                0.0
+            } else if u >= 1.0 {
+                1.0
+            } else {
+                let w = 2.0 * u;
+                if w < 1.0 {
+                    0.5 * 1024.0_f64.powf(w - 1.0)
+                } else {
+                    0.5 * (2.0 - 2.0_f64.powf(-10.0 * (w - 1.0)))
+                }
+            }
+        }
+        20 => 1.0 - (1.0 - u * u).max(0.0).sqrt(),
+        21 => {
+            let d = u - 1.0;
+            (1.0 - d * d).max(0.0).sqrt()
+        }
+        22 => {
+            let w = 2.0 * u;
+            if w < 1.0 {
+                -0.5 * ((1.0 - w * w).max(0.0).sqrt() - 1.0)
+            } else {
+                let d = w - 2.0;
+                0.5 * ((1.0 - d * d).max(0.0).sqrt() + 1.0)
+            }
+        }
+        23 => {
+            if u <= 0.0 {
+                0.0
+            } else if u >= 1.0 {
+                1.0
+            } else {
+                -2.0_f64.powf(10.0 * (u - 1.0)) * ((u - 1.1) * TAU_F64 / 0.4).sin()
+            }
+        }
+        24 => {
+            if u <= 0.0 {
+                0.0
+            } else if u >= 1.0 {
+                1.0
+            } else {
+                2.0_f64.powf(-10.0 * u) * ((u - 0.1) * TAU_F64 / 0.4).sin() + 1.0
+            }
+        }
+        25 => {
+            if u <= 0.0 {
+                0.0
+            } else if u >= 1.0 {
+                1.0
+            } else {
+                let w = 2.0 * u;
+                if w < 1.0 {
+                    -0.5 * 2.0_f64.powf(10.0 * (w - 1.0)) * ((w - 1.1) * TAU_F64 / 0.4).sin()
+                } else {
+                    0.5 * 2.0_f64.powf(-10.0 * (w - 1.0)) * ((w - 1.1) * TAU_F64 / 0.4).sin() + 1.0
+                }
+            }
+        }
+        26 => {
+            const C: f64 = 1.70158;
+            u * u * ((C + 1.0) * u - C)
+        }
+        27 => {
+            const C: f64 = 1.70158;
+            let d = u - 1.0;
+            d * d * ((C + 1.0) * d + C) + 1.0
+        }
+        28 => {
+            const C: f64 = 1.70158 * 1.525;
+            let w = 2.0 * u;
+            if w < 1.0 {
+                0.5 * w * w * ((C + 1.0) * w - C)
+            } else {
+                let d = w - 2.0;
+                0.5 * (d * d * ((C + 1.0) * d + C) + 2.0)
+            }
+        }
+        29 => 1.0 - bounce_out(1.0 - u),
+        30 => bounce_out(u),
+        31 => {
+            if u < 0.5 {
+                0.5 * (1.0 - bounce_out(1.0 - 2.0 * u))
+            } else {
+                0.5 * bounce_out(2.0 * u - 1.0) + 0.5
+            }
+        }
+        32 => {
+            let d = u - 0.5;
+            4.0 * d * d * d + 0.5
+        }
+        _ => u,
+    }
+}
+
+fn bounce_out(u: f64) -> f64 {
+    const N1: f64 = 7.5625;
+    const D1: f64 = 2.75;
+    if u < 1.0 / D1 {
+        N1 * u * u
+    } else if u < 2.0 / D1 {
+        let d = u - 1.5 / D1;
+        N1 * d * d + 0.75
+    } else if u < 2.5 / D1 {
+        let d = u - 2.25 / D1;
+        N1 * d * d + 0.9375
+    } else {
+        let d = u - 2.625 / D1;
+        N1 * d * d + 0.984375
+    }
+}
+
+fn eval_segment_bezier(
+    start_frame: f64,
+    start_value: f64,
+    out_tangent: [f64; 2],
+    end_frame: f64,
+    end_value: f64,
+    in_tangent: [f64; 2],
+    frame: f64,
+) -> f64 {
+    let duration = end_frame - start_frame;
+    if !frame.is_finite() || !duration.is_finite() || duration <= 0.0 || frame <= start_frame {
+        return start_value;
+    }
+    if frame >= end_frame {
+        return end_value;
+    }
+    let out_x = if out_tangent[0].is_finite() {
+        out_tangent[0].max(0.0)
+    } else {
+        0.0
+    };
+    let out_y = if out_tangent[1].is_finite() {
+        out_tangent[1]
+    } else {
+        0.0
+    };
+    let in_x = if in_tangent[0].is_finite() {
+        in_tangent[0].min(0.0)
+    } else {
+        0.0
+    };
+    let in_y = if in_tangent[1].is_finite() {
+        in_tangent[1]
+    } else {
+        0.0
+    };
+
+    let x1_raw = out_x / duration;
+    let x2_raw = 1.0 + in_x / duration;
+    let s =
+        if (0.0..=1.0).contains(&x1_raw) && (0.0..=1.0).contains(&x2_raw) && x1_raw > x2_raw + 1e-8
+        {
+            1.0
+        } else {
+            let sum_x = out_x.abs() + in_x.abs();
+            if !sum_x.is_finite() {
+                0.0
+            } else if sum_x > duration {
+                duration / sum_x
+            } else {
+                1.0
+            }
+        };
+
+    let nx1 = (s * out_x / duration).clamp(0.0, 1.0);
+    let nx2 = (1.0 + s * in_x / duration).clamp(0.0, 1.0);
+    let norm_t = ((frame - start_frame) / duration).clamp(0.0, 1.0);
+    let u = solve_bezier_param(nx1, nx2, norm_t);
+
+    let y0 = start_value;
+    let y1 = start_value + s * out_y;
+    let y2 = end_value + s * in_y;
+    let y3 = end_value;
+
+    let mu = 1.0 - u;
+    mu * mu * mu * y0 + 3.0 * mu * mu * u * y1 + 3.0 * mu * u * u * y2 + u * u * u * y3
+}
+
+fn solve_bezier_param(x1: f64, x2: f64, t: f64) -> f64 {
+    if !t.is_finite() || t <= 0.0 {
+        return 0.0;
+    }
+    if t >= 1.0 {
+        return 1.0;
+    }
+    let cx = 3.0 * x1;
+    let bx = 3.0 * (x2 - x1) - cx;
+    let ax = 1.0 - cx - bx;
+
+    let sample_x = |u: f64| ((ax * u + bx) * u + cx) * u;
+    let sample_dx = |u: f64| (3.0 * ax * u + 2.0 * bx) * u + cx;
+
+    const EPS: f64 = 1e-12;
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+    let mut u = t;
+
+    for _ in 0..10 {
+        let err = sample_x(u) - t;
+        if err.abs() <= EPS {
+            return u;
+        }
+        if err < 0.0 {
+            lo = u;
+        } else {
+            hi = u;
+        }
+        let slope = sample_dx(u);
+        if slope.abs() > 1e-9 {
+            let next = u - err / slope;
+            if next > lo && next < hi {
+                u = next;
+            } else {
+                u = 0.5 * (lo + hi);
+            }
+        } else {
+            u = 0.5 * (lo + hi);
+        }
+    }
+
+    for _ in 0..64 {
+        let err = sample_x(u) - t;
+        if err.abs() <= EPS || (hi - lo) <= EPS {
+            break;
+        }
+        if err < 0.0 {
+            lo = u;
+        } else {
+            hi = u;
+        }
+        u = 0.5 * (lo + hi);
+    }
+
+    u
+}
+
+fn sequence_effective_fps(seq: &Sequence) -> f64 {
+    seq.exact_fps
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or_else(|| f64::from(seq.fps.max(1)))
+}
+
+fn non_empty_expr(expr: &Option<String>) -> Option<String> {
+    expr.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+#[inline]
+fn sanitize_gain_f64(v: f64) -> f64 {
+    if v.is_finite() { v.max(0.0) } else { 0.0 }
+}
+
+#[inline]
+fn sanitize_pan_f64(v: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn eval_time_track(
+    has_keyframes: bool,
+    prop: &ScalarTrack,
+    expr: Option<&str>,
+    local_frame: f64,
+    seq_frame: f64,
+    fps: f64,
+    controls: &CompiledControls,
+) -> f64 {
+    let raw_time = if has_keyframes {
+        prop.evaluate(local_frame)
+    } else {
+        prop.evaluate(0.0) + local_frame / fps
+    };
+    match expr {
+        Some(src) => controls.with_resolved(seq_frame, |by_name, by_id| {
+            let ctx = AudioExprContext {
+                frame: local_frame,
+                time: raw_time,
+                fps,
+                value: raw_time,
+                controls_by_name: by_name,
+                controls_by_id: by_id,
+            };
+            eval_audio_expression_or_fallback(src, &ctx)
+        }),
+        None => raw_time,
+    }
+}
+
+fn eval_scalar_expr_track(
+    prop: &ScalarTrack,
+    expr: Option<&str>,
+    local_frame: f64,
+    media_time_sec: f64,
+    seq_frame: f64,
+    fps: f64,
+    controls: &CompiledControls,
+) -> f64 {
+    let base = prop.evaluate(local_frame);
+    match expr {
+        Some(src) => controls.with_resolved(seq_frame, |by_name, by_id| {
+            let ctx = AudioExprContext {
+                frame: local_frame,
+                time: media_time_sec,
+                fps,
+                value: base,
+                controls_by_name: by_name,
+                controls_by_id: by_id,
+            };
+            eval_audio_expression_or_fallback(src, &ctx)
+        }),
+        None => base,
+    }
+}
+
+enum LinkedPrecompAudio<'a> {
+    None,
+    Muted,
+    Active(&'a AudioClip),
+}
+
+fn find_linked_precomp_audio<'a>(
+    seq: &'a Sequence,
+    vclip: &VideoClip,
+    any_audio_solo: bool,
+) -> LinkedPrecompAudio<'a> {
+    let Some(link_id) = vclip.link else {
+        return LinkedPrecompAudio::None;
+    };
+    for track in &seq.audio_tracks {
+        for clip in &track.clips {
+            if clip.link == Some(link_id) && clip.media.is_none() {
+                if !track.enabled || track.muted || (any_audio_solo && !track.solo) {
+                    return LinkedPrecompAudio::Muted;
+                }
+                return LinkedPrecompAudio::Active(clip);
+            }
+        }
+    }
+    LinkedPrecompAudio::None
+}
+
+fn resolve_precomp_offset(seq: &Sequence, layer: &Layer) -> f64 {
+    seq.precomp_offsets
+        .get(&layer.id)
+        .copied()
+        .or_else(|| {
+            layer.preserved.get("offset").and_then(|v| {
+                v.as_f64()
+                    .or_else(|| v.get("value").and_then(|inner| inner.as_f64()))
+            })
+        })
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0)
+}
+
+fn layer_or_clip_muted(vclip: &VideoClip, layer: &Layer) -> bool {
+    let check_bool = |v: Option<bool>| v.unwrap_or(false);
+    check_bool(
+        vclip
+            .preserved
+            .get("muted")
+            .or_else(|| vclip.preserved.get("mute"))
+            .and_then(|v| v.as_bool()),
+    ) || check_bool(
+        layer
+            .preserved
+            .get("muted")
+            .or_else(|| layer.preserved.get("mute"))
+            .and_then(|v| v.as_bool()),
+    )
+}
+
+fn preserved_number_or(vclip: &VideoClip, layer: &Layer, key: &str, default: f64) -> f64 {
+    vclip
+        .preserved
+        .get(key)
+        .or_else(|| layer.preserved.get(key))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.get("value").and_then(|inner| inner.as_f64()))
+        })
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+
+fn clip_media_offset_sec(clip: &AudioClip) -> f64 {
+    clip.preserved
+        .get("media_offset")
+        .or_else(|| clip.preserved.get("mediaOffset"))
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0)
+}
+
+fn collect_precomp_layers<'a>(layer: &'a Layer, out: &mut Vec<(&'a Layer, Uuid)>) {
+    match &layer.kind {
+        LayerKind::PrecompRef { composition_id } => {
+            out.push((layer, *composition_id));
+        }
+        LayerKind::Composite { layers } => {
+            for child in layers {
+                collect_precomp_layers(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_sequence_audio_clips(
+    project: &Project,
+    seq: &Sequence,
+    root_window_start: f64,
+    root_window_end: f64,
+    parent_chain: &[ParentCompMap],
+    visited_comps: &mut HashSet<Uuid>,
+    depth: usize,
+    out: &mut Vec<FlattenedAudioClip>,
+) {
+    let seq_fps = sequence_effective_fps(seq);
+    // Zoidium solo semantics: `hasSolo = tracks.some(t => t.solo)` per composition.
+    let any_audio_solo = seq.audio_tracks.iter().any(|t| t.solo);
+    let controls = CompiledControls::from_sequence(seq);
+
+    for track in &seq.audio_tracks {
+        if !track.enabled || track.muted || (any_audio_solo && !track.solo) {
+            continue;
+        }
+        for clip in &track.clips {
+            if !clip.start.is_finite() || !clip.length.is_finite() || clip.length <= 0.0 {
+                continue;
+            }
+            let Some(asset_id) = clip.media.as_deref().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            let (clip_root_start, clip_root_length) = if parent_chain.is_empty() {
+                if clip.start + clip.length <= root_window_start || clip.start >= root_window_end {
+                    continue;
+                }
+                (clip.start, clip.length)
+            } else {
+                (
+                    root_window_start,
+                    (root_window_end - root_window_start).max(0.0),
+                )
+            };
+
+            let time = ScalarTrack::from_property_track(&clip.time_curve, 0.0);
+            let volume = ScalarTrack::from_property_track(&clip.audio.volume, 1.0);
+            let pan = ScalarTrack::from_property_track(&clip.audio.pan, 0.0);
+
+            out.push(FlattenedAudioClip {
+                root_start_frame: clip_root_start,
+                root_length_frames: clip_root_length,
+                asset_id: asset_id.to_owned(),
+                own_start_frame: clip.start,
+                own_length_frames: clip.length,
+                own_fps: seq_fps,
+                media_offset_sec: clip_media_offset_sec(clip),
+                depth,
+                parent_chain: parent_chain.to_vec(),
+                props: CompiledAudioClipProps {
+                    has_time_keyframes: time.is_keyframed,
+                    time,
+                    time_expr: non_empty_expr(&clip.time_curve.expression),
+                    volume,
+                    volume_expr: non_empty_expr(&clip.audio.volume.expression),
+                    pan,
+                    pan_expr: non_empty_expr(&clip.audio.pan.expression),
+                    controls: Arc::clone(&controls),
+                },
+            });
+        }
+    }
+
+    if depth >= MAX_PRECOMP_AUDIO_DEPTH {
+        return;
+    }
+
+    let any_video_solo = seq.video_tracks.iter().any(|t| t.solo);
+    for vtrack in &seq.video_tracks {
+        let vtrack_muted = vtrack
+            .preserved
+            .get("muted")
+            .or_else(|| vtrack.preserved.get("mute"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !vtrack.enabled || vtrack_muted || (any_video_solo && !vtrack.solo) {
+            continue;
+        }
+        for vclip in &vtrack.clips {
+            if !vclip.start.is_finite() || !vclip.length.is_finite() || vclip.length <= 0.0 {
+                continue;
+            }
+            let mut precomp_refs = Vec::new();
+            collect_precomp_layers(&vclip.layer, &mut precomp_refs);
+            if precomp_refs.is_empty() {
+                continue;
+            }
+
+            let linked_audio = find_linked_precomp_audio(seq, vclip, any_audio_solo);
+            if matches!(linked_audio, LinkedPrecompAudio::Muted) {
+                continue;
+            }
+
+            let (child_root_start, child_root_end) = if parent_chain.is_empty() {
+                let s = vclip.start.max(root_window_start);
+                let e = (vclip.start + vclip.length).min(root_window_end);
+                if e <= s {
+                    continue;
+                }
+                (s, e)
+            } else {
+                (root_window_start, root_window_end)
+            };
+
+            for (layer, composition_id) in precomp_refs {
+                if layer_or_clip_muted(vclip, layer) {
+                    continue;
+                }
+                if !visited_comps.insert(composition_id) {
+                    continue;
+                }
+                if let Some(child_seq) = project.compositions.get(&composition_id) {
+                    let time_prop = ScalarTrack::from_property_track(&vclip.time_curve, 0.0);
+                    let (volume_prop, volume_expr, pan_prop, pan_expr) = match linked_audio {
+                        LinkedPrecompAudio::Active(aclip) => (
+                            ScalarTrack::from_property_track(&aclip.audio.volume, 1.0),
+                            non_empty_expr(&aclip.audio.volume.expression),
+                            ScalarTrack::from_property_track(&aclip.audio.pan, 0.0),
+                            non_empty_expr(&aclip.audio.pan.expression),
+                        ),
+                        LinkedPrecompAudio::None | LinkedPrecompAudio::Muted => (
+                            ScalarTrack::constant(preserved_number_or(vclip, layer, "volume", 1.0)),
+                            None,
+                            ScalarTrack::constant(preserved_number_or(vclip, layer, "pan", 0.0)),
+                            None,
+                        ),
+                    };
+
+                    let mut next_chain = Vec::with_capacity(parent_chain.len() + 1);
+                    next_chain.extend_from_slice(parent_chain);
+                    next_chain.push(ParentCompMap {
+                        clip_start: vclip.start,
+                        clip_length: vclip.length,
+                        parent_fps: seq_fps,
+                        child_fps: sequence_effective_fps(child_seq),
+                        precomp_offset_frames: resolve_precomp_offset(seq, layer),
+                        has_time_keyframes: time_prop.is_keyframed,
+                        time_prop,
+                        time_expr: non_empty_expr(&vclip.time_curve.expression),
+                        volume_prop,
+                        volume_expr,
+                        pan_prop,
+                        pan_expr,
+                        controls: Arc::clone(&controls),
+                    });
+
+                    collect_sequence_audio_clips(
+                        project,
+                        child_seq,
+                        child_root_start,
+                        child_root_end,
+                        &next_chain,
+                        visited_comps,
+                        depth + 1,
+                        out,
+                    );
+                }
+                visited_comps.remove(&composition_id);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::f32::consts::FRAC_1_SQRT_2;
@@ -542,5 +1840,661 @@ mod tests {
             peak < 0.05,
             "expected anti-aliased 2x mix to attenuate 18kHz->36kHz tone, got peak {peak}"
         );
+    }
+
+    fn make_constant_wav(sr: u32, frames: usize, value: [f32; 2]) -> Vec<u8> {
+        let samples = vec![value; frames];
+        crate::decode::encode_wav_f32_stereo(&samples, sr)
+    }
+
+    fn make_ramp_wav(sr: u32, frames: usize) -> Vec<u8> {
+        let samples: Vec<[f32; 2]> = (0..frames)
+            .map(|i| {
+                let v = (i as f32 / frames.max(1) as f32).clamp(0.0, 1.0);
+                [v, v]
+            })
+            .collect();
+        crate::decode::encode_wav_f32_stereo(&samples, sr)
+    }
+
+    fn make_asset(filename: &str, bytes: Vec<u8>) -> zc_project::AssetRecord {
+        let size = bytes.len() as u64;
+        zc_project::AssetRecord {
+            id: filename.to_owned(),
+            kind: zc_project::AssetKind::default(),
+            source: zc_project::AssetSource::default(),
+            filename: filename.to_owned(),
+            url: None,
+            external: false,
+            bytes: Some(bytes),
+            missing: false,
+            sha256: String::new(),
+            size,
+            preserved: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn make_audio_track(
+        name: &str,
+        enabled: bool,
+        muted: bool,
+        solo: bool,
+        clips: Vec<AudioClip>,
+    ) -> zc_project::AudioTrack {
+        zc_project::AudioTrack {
+            id: Uuid::new_v4(),
+            name: name.to_owned(),
+            enabled,
+            muted,
+            solo,
+            locked: false,
+            clips,
+            preserved: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn make_audio_clip(
+        start: f64,
+        length: f64,
+        media: Option<&str>,
+        time_curve: PropertyTrack,
+        volume: PropertyTrack,
+        pan: PropertyTrack,
+        link: Option<u32>,
+    ) -> AudioClip {
+        AudioClip {
+            id: Uuid::new_v4(),
+            name: "Audio".to_owned(),
+            start,
+            length,
+            link,
+            media: media.map(str::to_owned),
+            time_curve,
+            audio: zc_project::AudioClipData {
+                name: "Audio".to_owned(),
+                volume,
+                pan,
+                preserved: std::collections::BTreeMap::new(),
+            },
+            preserved: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_precomp_video_track(
+        name: &str,
+        enabled: bool,
+        solo: bool,
+        start: f64,
+        length: f64,
+        comp_id: Uuid,
+        time_curve: PropertyTrack,
+        link: Option<u32>,
+    ) -> (zc_project::VideoTrack, Uuid) {
+        let layer = Layer::new(
+            "Precomp",
+            LayerKind::PrecompRef {
+                composition_id: comp_id,
+            },
+            [640, 360],
+        );
+        let layer_id = layer.id;
+        let track = zc_project::VideoTrack {
+            id: Uuid::new_v4(),
+            name: name.to_owned(),
+            enabled,
+            solo,
+            locked: false,
+            is_3d: false,
+            clips: vec![VideoClip {
+                id: Uuid::new_v4(),
+                name: "Precomp Clip".to_owned(),
+                start,
+                length,
+                link,
+                media: None,
+                time_curve,
+                layer,
+                preserved: std::collections::BTreeMap::new(),
+            }],
+            preserved: std::collections::BTreeMap::new(),
+        };
+        (track, layer_id)
+    }
+
+    /// Minimal valid ISO-BMFF / MP4 container containing an `ftyp` + `moov`/`mvhd` with
+    /// zero audio tracks, causing `symphonia` to probe successfully and yield `NoAudioTrack`.
+    fn make_video_only_mp4_bytes() -> Vec<u8> {
+        fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let size = (8 + payload.len()) as u32;
+            let mut out = Vec::with_capacity(size as usize);
+            out.extend_from_slice(&size.to_be_bytes());
+            out.extend_from_slice(fourcc);
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut ftyp_payload = Vec::new();
+        ftyp_payload.extend_from_slice(b"isom");
+        ftyp_payload.extend_from_slice(&0u32.to_be_bytes());
+        ftyp_payload.extend_from_slice(b"isommp41");
+
+        // Version-0 mvhd box (100 bytes payload).
+        let mut mvhd_payload = vec![0u8; 100];
+        // timescale = 1000 at offset 12..16
+        mvhd_payload[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        // duration = 1000 at offset 16..20
+        mvhd_payload[16..20].copy_from_slice(&1000u32.to_be_bytes());
+        // rate = 1.0 (0x00010000) at offset 20..24
+        mvhd_payload[20..24].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        // volume = 1.0 (0x0100) at offset 24..26
+        mvhd_payload[24..26].copy_from_slice(&0x0100u16.to_be_bytes());
+        // unity matrix at offset 36..72
+        mvhd_payload[36..40].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        mvhd_payload[52..56].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        mvhd_payload[68..72].copy_from_slice(&0x4000_0000u32.to_be_bytes());
+        // next_track_id = 1 at offset 96..100
+        mvhd_payload[96..100].copy_from_slice(&1u32.to_be_bytes());
+
+        let mvhd = mp4_box(b"mvhd", &mvhd_payload);
+        let moov = mp4_box(b"moov", &mvhd);
+        let ftyp = mp4_box(b"ftyp", &ftyp_payload);
+        let mut out = Vec::with_capacity(ftyp.len() + moov.len());
+        out.extend_from_slice(&ftyp);
+        out.extend_from_slice(&moov);
+        out
+    }
+
+    #[test]
+    fn nested_two_level_precomp_mixes_with_combined_volume_pan_and_time_offset() {
+        let sr = STANDARD_SAMPLE_RATE;
+        let mut project = Project::new_cm3_default();
+        project.sequence.fps = 30;
+        project.sequence.length_frames = 60.0;
+
+        // 2-second linear ramp audio: sample value equals `t / 2.0` for easy time-offset verification.
+        let ramp_wav = make_ramp_wav(sr, (sr * 2) as usize);
+        project
+            .assets
+            .insert("ramp.wav".to_owned(), make_asset("ramp.wav", ramp_wav));
+
+        // Innermost Comp B (30 fps):
+        // Audio clip spans Comp B frames [15..45) (1.0s), volume = 0.8 (via SequenceControl expr!),
+        // pan = 0.25, starting at media_time = 0.2s.
+        let comp_b_id = Uuid::new_v4();
+        let mut comp_b = Sequence {
+            id: comp_b_id,
+            name: "Comp B".to_owned(),
+            fps: 30,
+            length_frames: 60.0,
+            ..Sequence::default()
+        };
+        comp_b.controls.push(zc_project::SequenceControl {
+            id: "ctl_gain".to_owned(),
+            name: "ChildGain".to_owned(),
+            kind: zc_project::SequenceControlKind::Slider,
+            track: PropertyTrack::number(0.8),
+            preserved: std::collections::BTreeMap::new(),
+        });
+        let child_clip = make_audio_clip(
+            15.0,
+            30.0,
+            Some("ramp.wav"),
+            PropertyTrack::number(0.2), // 0.2s media start offset
+            PropertyTrack::number_with_expr(1.0, "control('ChildGain') + (time * 0.0)"),
+            PropertyTrack::number(0.25),
+            None,
+        );
+        comp_b.audio_tracks.push(make_audio_track(
+            "A_B",
+            true,
+            false,
+            false,
+            vec![child_clip],
+        ));
+
+        // Middle Comp A (30 fps):
+        // References Comp B at frames [10..40) with precomp_offset = +15 frames (so Comp A frame 10
+        // maps to Comp B frame 15 where child_clip starts!), linked companion audio clip sets
+        // parent volume = 0.5 and parent pan = 0.75 -> combined pan = min(1.0, 0.75 + 0.25) = +1.0!
+        let comp_a_id = Uuid::new_v4();
+        let mut comp_a = Sequence {
+            id: comp_a_id,
+            name: "Comp A".to_owned(),
+            fps: 30,
+            length_frames: 60.0,
+            ..Sequence::default()
+        };
+        let (vtrack_a, layer_a_id) = make_precomp_video_track(
+            "V_A",
+            true,
+            false,
+            10.0,
+            30.0,
+            comp_b_id,
+            PropertyTrack::linear_time_curve(30.0, 30),
+            Some(77),
+        );
+        comp_a.precomp_offsets.insert(layer_a_id, 15.0);
+        comp_a.video_tracks.push(vtrack_a);
+        comp_a.audio_tracks.push(make_audio_track(
+            "A_Link_A",
+            true,
+            false,
+            false,
+            vec![make_audio_clip(
+                10.0,
+                30.0,
+                None,
+                PropertyTrack::linear_time_curve(30.0, 30),
+                PropertyTrack::number(0.5),
+                PropertyTrack::number(0.75),
+                Some(77),
+            )],
+        ));
+
+        // Root sequence (30 fps):
+        // References Comp A at root frames [5..35) with precomp_offset = +10 frames (so root frame 5
+        // maps to Comp A frame 10 -> Comp B frame 15 -> ramp media_time = 0.2s!).
+        // Also stretches time_curve to 2x speed: 30 root frames traverse 2.0s (60 frames) of Comp A!
+        let mut stretched_time = PropertyTrack::number(0.0);
+        stretched_time.animated = true;
+        stretched_time.keyframes = vec![
+            zc_project::PropertyKeyframe::linear(0.0, PropertyValue::Number(0.0)),
+            zc_project::PropertyKeyframe::linear(30.0, PropertyValue::Number(2.0)),
+        ];
+        let (vtrack_root, layer_root_id) = make_precomp_video_track(
+            "V_Root",
+            true,
+            false,
+            5.0,
+            30.0,
+            comp_a_id,
+            stretched_time,
+            None,
+        );
+        project.sequence.precomp_offsets.insert(layer_root_id, 10.0);
+        project.sequence.audio_tracks.clear();
+        project.sequence.video_tracks = vec![vtrack_root];
+
+        project.compositions.insert(comp_a_id, comp_a);
+        project.compositions.insert(comp_b_id, comp_b);
+
+        let flattened = collect_flattened_audio_clips(&project, 0.0, 60.0);
+        assert_eq!(flattened.len(), 1);
+        assert_eq!(flattened[0].depth, 2);
+
+        // At root frame 5 + 7.5 = 12.5 (root_local = 7.5):
+        // Root -> Comp A: stretched 2x => 7.5/30 * 2.0 = 0.5s = 15 frames + offset 10 = Comp A frame 25.
+        // Comp A -> Comp B: p_local = 25 - 10 = 15 frames + offset 15 = Comp B frame 30.
+        // Comp B -> AudioClip: own_local = 30 - 15 = 15 frames (0.5s) + 0.2s media start = 0.7s!
+        let params_mid = flattened[0].evaluate_params(7.5);
+        assert!(
+            (params_mid.media_time_sec - 0.7).abs() < 1e-6,
+            "expected media_time_sec=0.7, got {}",
+            params_mid.media_time_sec
+        );
+        assert!(
+            (params_mid.volume - 0.4).abs() < 1e-6,
+            "expected combined volume 0.5*0.8=0.4, got {}",
+            params_mid.volume
+        );
+        assert!(
+            (params_mid.pan - 1.0).abs() < 1e-6,
+            "expected combined pan clamp(0.75+0.25)=1.0, got {}",
+            params_mid.pan
+        );
+
+        let mixed = mix_project_audio_with_precomps(&project, 0.0, 60.0, sr)
+            .expect("nested mix must succeed")
+            .expect("nested mix must produce samples");
+        assert_eq!(mixed.len(), (sr * 2) as usize);
+
+        // Before root frame 5 (sample index 1000 < 8000): strictly silent.
+        assert_eq!(mixed[1_000], [0.0, 0.0]);
+
+        // At root frame 12.5 => sample_idx = (12.5 / 30.0) * 48000 = 20000:
+        // Ramp at media_time = 0.7s has value 0.7 / 2.0 = 0.35 on [L, R].
+        // With volume = 0.4, pan = +1.0 (hard right):
+        // L1 = R1 = 0.35 * 0.4 = 0.14; hard right => L_out = 0.0, R_out = L1 + R1 = 0.28.
+        let sample = mixed[20_000];
+        assert!(
+            sample[0].abs() < 1e-3,
+            "hard-right combined pan L must be ~0, got {}",
+            sample[0]
+        );
+        assert!(
+            (sample[1] - 0.28).abs() < 1e-2,
+            "hard-right combined pan R must be ~0.28, got {}",
+            sample[1]
+        );
+
+        // Past Comp B clip end (at root frame 25 => root_local 20 => 2x => 40 frames in Comp A,
+        // outside Comp A's [10..40) PrecompRef B clip): strictly silent.
+        let late_idx = ((25.0 / 30.0) * f64::from(sr)) as usize;
+        assert_eq!(mixed[late_idx], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn cyclic_precomp_ref_terminates_safely_without_infinite_recursion() {
+        let sr = STANDARD_SAMPLE_RATE;
+        let mut project = Project::new_cm3_default();
+        project.sequence.fps = 30;
+        project.sequence.length_frames = 30.0;
+
+        let wav = make_constant_wav(sr, sr as usize, [0.25, 0.25]);
+        project
+            .assets
+            .insert("tone.wav".to_owned(), make_asset("tone.wav", wav));
+
+        let comp_a_id = Uuid::new_v4();
+        let comp_b_id = Uuid::new_v4();
+
+        // Comp A references Comp B AND has a direct audio clip.
+        let mut comp_a = Sequence {
+            id: comp_a_id,
+            name: "Comp A".to_owned(),
+            fps: 30,
+            length_frames: 30.0,
+            ..Sequence::default()
+        };
+        let (va_to_b, _) = make_precomp_video_track(
+            "A->B",
+            true,
+            false,
+            0.0,
+            30.0,
+            comp_b_id,
+            PropertyTrack::linear_time_curve(30.0, 30),
+            None,
+        );
+        // Also add a self-loop A -> A to exercise direct self-recursion guard.
+        let (va_to_a, _) = make_precomp_video_track(
+            "A->A",
+            true,
+            false,
+            0.0,
+            30.0,
+            comp_a_id,
+            PropertyTrack::linear_time_curve(30.0, 30),
+            None,
+        );
+        comp_a.video_tracks.push(va_to_b);
+        comp_a.video_tracks.push(va_to_a);
+        comp_a.audio_tracks.push(make_audio_track(
+            "A_Audio",
+            true,
+            false,
+            false,
+            vec![make_audio_clip(
+                0.0,
+                30.0,
+                Some("tone.wav"),
+                PropertyTrack::linear_time_curve(30.0, 30),
+                PropertyTrack::number(1.0),
+                PropertyTrack::number(0.0),
+                None,
+            )],
+        ));
+
+        // Comp B references Comp A (forming cycle A -> B -> A) AND has a direct audio clip.
+        let mut comp_b = Sequence {
+            id: comp_b_id,
+            name: "Comp B".to_owned(),
+            fps: 30,
+            length_frames: 30.0,
+            ..Sequence::default()
+        };
+        let (vb_to_a, _) = make_precomp_video_track(
+            "B->A",
+            true,
+            false,
+            0.0,
+            30.0,
+            comp_a_id,
+            PropertyTrack::linear_time_curve(30.0, 30),
+            None,
+        );
+        comp_b.video_tracks.push(vb_to_a);
+        comp_b.audio_tracks.push(make_audio_track(
+            "B_Audio",
+            true,
+            false,
+            false,
+            vec![make_audio_clip(
+                0.0,
+                30.0,
+                Some("tone.wav"),
+                PropertyTrack::linear_time_curve(30.0, 30),
+                PropertyTrack::number(1.0),
+                PropertyTrack::number(0.0),
+                None,
+            )],
+        ));
+
+        let (vroot, _) = make_precomp_video_track(
+            "Root->A",
+            true,
+            false,
+            0.0,
+            30.0,
+            comp_a_id,
+            PropertyTrack::linear_time_curve(30.0, 30),
+            None,
+        );
+        project.sequence.audio_tracks.clear();
+        project.sequence.video_tracks = vec![vroot];
+        project.compositions.insert(comp_a_id, comp_a);
+        project.compositions.insert(comp_b_id, comp_b);
+
+        // Must terminate safely and collect exactly 2 clips (one from Comp A, one from Comp B).
+        let clips = collect_flattened_audio_clips(&project, 0.0, 30.0);
+        assert_eq!(clips.len(), 2);
+
+        let mixed = mix_project_audio_with_precomps(&project, 0.0, 30.0, sr)
+            .expect("cyclic precomp mix must not error")
+            .expect("valid clips in A and B must still mix");
+        let mid = mixed[mixed.len() / 2];
+        assert!(
+            (mid[0] - 0.5).abs() < 1e-3 && (mid[1] - 0.5).abs() < 1e-3,
+            "expected summed 0.25 + 0.25 = 0.5, got {mid:?}"
+        );
+    }
+
+    #[test]
+    fn muted_and_non_soloed_nested_precomp_clips_stay_silent() {
+        let sr = STANDARD_SAMPLE_RATE;
+        let mut project = Project::new_cm3_default();
+        project.sequence.fps = 30;
+        project.sequence.length_frames = 30.0;
+
+        let wav = make_constant_wav(sr, sr as usize, [0.5, 0.5]);
+        project
+            .assets
+            .insert("tone.wav".to_owned(), make_asset("tone.wav", wav));
+
+        // 1) Child composition with a muted clip, a non-soloed clip, and a muted solo track.
+        // Because `any_solo` is true in `comp_child`, the non-soloed enabled track must stay silent;
+        // the soloed track is ALSO muted so nothing in `comp_child` should be audible.
+        let comp_child_id = Uuid::new_v4();
+        let mut comp_child = Sequence {
+            id: comp_child_id,
+            name: "Muted/Non-Solo Comp".to_owned(),
+            fps: 30,
+            length_frames: 30.0,
+            ..Sequence::default()
+        };
+        comp_child.audio_tracks.push(make_audio_track(
+            "MutedTrack",
+            true,
+            true, // muted
+            false,
+            vec![make_audio_clip(
+                0.0,
+                30.0,
+                Some("tone.wav"),
+                PropertyTrack::linear_time_curve(30.0, 30),
+                PropertyTrack::number(1.0),
+                PropertyTrack::number(0.0),
+                None,
+            )],
+        ));
+        comp_child.audio_tracks.push(make_audio_track(
+            "NonSoloTrack",
+            true,
+            false,
+            false, // non-soloed while SoloMutedTrack has solo=true
+            vec![make_audio_clip(
+                0.0,
+                30.0,
+                Some("tone.wav"),
+                PropertyTrack::linear_time_curve(30.0, 30),
+                PropertyTrack::number(1.0),
+                PropertyTrack::number(0.0),
+                None,
+            )],
+        ));
+        comp_child.audio_tracks.push(make_audio_track(
+            "SoloMutedTrack",
+            true,
+            true, // muted + solo -> triggers any_solo=true while itself remaining silent
+            true,
+            vec![make_audio_clip(
+                0.0,
+                30.0,
+                Some("tone.wav"),
+                PropertyTrack::linear_time_curve(30.0, 30),
+                PropertyTrack::number(1.0),
+                PropertyTrack::number(0.0),
+                None,
+            )],
+        ));
+
+        // 2) An audible child composition referenced from a non-soloed root video track while
+        // another root video track is soloed (testing parent video track `any_solo` gating).
+        let comp_audible_id = Uuid::new_v4();
+        let mut comp_audible = Sequence {
+            id: comp_audible_id,
+            name: "Audible Child".to_owned(),
+            fps: 30,
+            length_frames: 30.0,
+            ..Sequence::default()
+        };
+        comp_audible.audio_tracks.push(make_audio_track(
+            "AudibleTrack",
+            true,
+            false,
+            false,
+            vec![make_audio_clip(
+                0.0,
+                30.0,
+                Some("tone.wav"),
+                PropertyTrack::linear_time_curve(30.0, 30),
+                PropertyTrack::number(1.0),
+                PropertyTrack::number(0.0),
+                None,
+            )],
+        ));
+
+        // 3) Root video track hosting `comp_audible` via a muted linked audio track.
+        let (v_solo_muted_child, _) = make_precomp_video_track(
+            "SoloParentOfMutedChild",
+            true,
+            true, // soloed video track -> silences non-soloed video tracks in root
+            0.0,
+            30.0,
+            comp_child_id,
+            PropertyTrack::linear_time_curve(30.0, 30),
+            None,
+        );
+        let (v_non_solo_audible, _) = make_precomp_video_track(
+            "NonSoloParentOfAudibleChild",
+            true,
+            false, // not soloed -> silenced by root video any_solo
+            0.0,
+            30.0,
+            comp_audible_id,
+            PropertyTrack::linear_time_curve(30.0, 30),
+            None,
+        );
+        let (v_solo_linked_muted, _) = make_precomp_video_track(
+            "SoloParentMutedByLink",
+            true,
+            true,
+            0.0,
+            30.0,
+            comp_audible_id,
+            PropertyTrack::linear_time_curve(30.0, 30),
+            Some(99),
+        );
+
+        project.sequence.audio_tracks = vec![make_audio_track(
+            "MutedLinkAudio",
+            true,
+            true, // mutes linked PrecompRef (link=99)
+            false,
+            vec![make_audio_clip(
+                0.0,
+                30.0,
+                None,
+                PropertyTrack::linear_time_curve(30.0, 30),
+                PropertyTrack::number(1.0),
+                PropertyTrack::number(0.0),
+                Some(99),
+            )],
+        )];
+        project.sequence.video_tracks =
+            vec![v_solo_muted_child, v_non_solo_audible, v_solo_linked_muted];
+        project.compositions.insert(comp_child_id, comp_child);
+        project.compositions.insert(comp_audible_id, comp_audible);
+
+        let clips = collect_flattened_audio_clips(&project, 0.0, 30.0);
+        assert!(
+            clips.is_empty(),
+            "expected all muted/non-soloed nested precomp clips to be excluded, got {}",
+            clips.len()
+        );
+        assert!(!project_has_active_audio_in_range(&project, 0.0, 30.0));
+        let mixed = mix_project_audio_with_precomps(&project, 0.0, 30.0, sr)
+            .expect("muted mix must succeed");
+        assert!(mixed.is_none(), "muted/non-soloed project must stay silent");
+    }
+
+    #[test]
+    fn video_only_no_audio_track_handled_as_silence() {
+        let sr = STANDARD_SAMPLE_RATE;
+        let mut project = Project::new_cm3_default();
+        project.sequence.fps = 30;
+        project.sequence.length_frames = 15.0;
+
+        let mp4_bytes = make_video_only_mp4_bytes();
+        // Verify our fixture genuinely triggers `AudioError::NoAudioTrack`.
+        assert!(matches!(
+            decode_audio_bytes(&mp4_bytes, Some("mp4")),
+            Err(AudioError::NoAudioTrack)
+        ));
+
+        project
+            .assets
+            .insert("silent.mp4".to_owned(), make_asset("silent.mp4", mp4_bytes));
+        project.sequence.audio_tracks = vec![make_audio_track(
+            "VideoOnlyAudio",
+            true,
+            false,
+            false,
+            vec![make_audio_clip(
+                0.0,
+                15.0,
+                Some("silent.mp4"),
+                PropertyTrack::linear_time_curve(15.0, 30),
+                PropertyTrack::number(1.0),
+                PropertyTrack::number(0.0),
+                None,
+            )],
+        )];
+
+        assert!(!project_has_active_audio_in_range(&project, 0.0, 15.0));
+        let mixed = mix_project_audio_with_precomps(&project, 0.0, 15.0, sr)
+            .expect("NoAudioTrack must be treated as silence, not an error");
+        assert!(mixed.is_none());
     }
 }

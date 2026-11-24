@@ -9,13 +9,16 @@ use std::f32::consts::{PI, TAU};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use image::AnimationDecoder;
 use tracing::{debug, warn};
-use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
+use zc_anim::{BezierSegment, EasingKind, InterpolationMode, eval_easing, eval_segment_bezier};
 use zc_expr::expresstext::{
     EffectorKind as ExpressTextEffectorKind, EffectorLayer as ExpressTextLayer, EtPropReader,
     EtValue, EvalAux as ExpressTextEvalAux, LetterList as ExpressTextLetterList,
-    TextTransform as ExpressTextTransform, evaluate_stack as evaluate_expresstext_stack,
-    world_base_of as expresstext_world_base_of,
+    LettersMode as ExpressTextLettersMode, TextTransform as ExpressTextTransform,
+    apply_chunk_pose_to_positions, evaluate_expresstext_repeater_instances,
+    evaluate_expresstext_voronoi_params, evaluate_stack as evaluate_expresstext_stack,
+    parse_express_text_config, shatter_glyph_triangles, world_base_of as expresstext_world_base_of,
 };
 use zc_expr::{
     EvalConfig, ExprContext, ExprError, HandleId, HandleRef, KeyframeRecord, NameOrIndex,
@@ -41,17 +44,23 @@ use zc_scene::{
     ParticleBlending, ParticleSystemParams, PlainParams, PositionDistribution, RepeaterMode,
     RepeaterParams, SPRING_CYCLES, SPRING_DAMPING, Text3DExtendedOptions, Text3DParams,
     TextAlignMode, TextScaleMode, TwistParams, UvMode, VelocityDistribution, Vertex3D,
-    VoronoiFractureParams, WarpAxis, WarpParams, apply_delay, apply_plain,
-    apply_repeater_with_params, apply_twist_with_params, apply_voronoi_fracture_with_params,
-    apply_warp_with_params, build_box, build_capsule, build_circle, build_cylinder,
-    build_dodecahedron, build_donut, build_fallback_text_mesh,
-    build_fallback_text_mesh_with_options, build_icosahedron, build_octahedron, build_rectangle,
-    build_rounded_box, build_sphere, build_tetrahedron, build_text3d_character_meshes,
+    VoronoiFractureParams, WarpAxis, WarpParams, apply_delay, apply_normalized_uv_layout,
+    apply_plain, apply_repeater_with_params, apply_twist_with_params,
+    apply_voronoi_fracture_with_params, apply_warp_with_params, build_box, build_capsule,
+    build_circle, build_cylinder, build_dodecahedron, build_donut, build_fallback_text_mesh,
+    build_fallback_text_mesh_with_options, build_icosahedron, build_octahedron, build_preset_model,
+    build_rectangle, build_sphere, build_tetrahedron, build_text3d_character_meshes,
     build_text3d_mesh, build_text3d_mesh_with_options, build_wire, compute_deformer_frame,
-    compute_shared_deformer_bounds, evaluate_camera_shake, evaluate_particles, parse_obj,
+    compute_shared_deformer_bounds, evaluate_camera_shake, evaluate_particles_cm3_lut,
+    generate_particle_sprite_by_name, parse_character_ranges, parse_gltf_or_glb, parse_obj,
     repeater_echo_frames, repeater_instance_transform,
 };
-use zc_shader::{CompileOptions, CompiledCustomShader, UniformType, UniformValue, pack_uniforms};
+use zc_shader::{
+    CompileOptions, CompiledCustomShader, GradientColorSpace, GradientInterpolation, GradientSpec,
+    GradientStop as ShaderGradientStop, OpacityStop as ShaderOpacityStop, UniformType,
+    UniformValue, bake_gradient_rgba8, bake_gradient_rgba8_with_opacity, bake_node_material_maps,
+    compile_node_effect_to_glsl, pack_uniforms,
+};
 
 use crate::cache::{FrameCache, FrameCacheKey};
 use crate::compositor::{BlendMode, Compositor2D, LayerTransform2D};
@@ -64,12 +73,20 @@ use crate::effects::{
     fnv1a_hash64, lookup_effect_shader,
 };
 use crate::scene3d::{
-    CameraParams, CompatMode as RenderCompatMode, CullSide, DofPassParams, GpuMesh,
-    LightKind as RenderLightKind, LineVertex, MAX_SCENE_LIGHTS, MaterialBlend, MaterialParams,
-    MeshDrawCall, MeshExtraMaps, MeshVertex, ParticleBlend, ParticleDrawCall,
-    ParticleInstance as RenderParticleInstance, Scene3DPassInput, Scene3DRenderOptions,
-    Scene3DRenderer, SceneLight, ShadingModel, TextureWrap, build_camera_helper_lines,
-    build_light_helper_lines, mat4_identity, mat4_mul, mat4_orthographic_rh, mat4_perspective_rh,
+    CameraParams, CompatMode as RenderCompatMode, CullSide, CustomMaterial3DDrawCall,
+    DofPassParams, GpuMesh, LightKind as RenderLightKind, LineVertex, MAX_SCENE_LIGHTS,
+    MaterialBlend, MaterialParams, MeshDrawCall, MeshExtraMaps, MeshVertex, OpticalFlareDrawCall,
+    ParticleBlend, ParticleDrawCall, ParticleInstance as RenderParticleInstance,
+    Scene3DExtendedOptions, Scene3DPassInput, Scene3DRenderOptions, Scene3DRenderer, SceneLight,
+    ShadingModel, TextureWrap, build_camera_helper_lines, build_light_helper_lines, mat4_identity,
+    mat4_mul, mat4_orthographic_rh, mat4_perspective_rh,
+};
+use crate::shape_plus::{
+    EvaluatedMask as ShapePlusMask, eval_prop_f64 as shape_plus_eval_prop_f64, rasterize_masks_aa,
+    rasterize_shape_plus,
+};
+use crate::text_plus_2d::{
+    evaluate_text_plus_2d_chars, parse_character_selection, shake_angle, text_seeded_random,
 };
 
 /// Built-in OFL TrueType fallback font (`Geist-Regular.ttf`) used for 3D Text and 2D Text
@@ -91,6 +108,10 @@ pub const MAX_CACHED_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum nested Precomp+ / Composite recursion depth.
 const MAX_COMPOSITION_DEPTH: usize = 16;
 const MAX_EFFECT_GROUP_DEPTH: usize = 16;
+/// Maximum nested temporal sampling recursion depth (Adjustment + stacked temporal effects).
+const MAX_TEMPORAL_DEPTH: usize = 4;
+const MAX_CACHED_GIFS: usize = 32;
+const MAX_CACHED_NODE_MATERIALS: usize = 64;
 const MAX_CUBE_LUT_3D_SIZE: u32 = 128;
 const MAX_CUBE_LUT_1D_SIZE: usize = 65_536;
 
@@ -229,6 +250,8 @@ struct MeshCacheKey {
 struct CachedGpuMesh {
     mesh: Arc<GpuMesh>,
     bounds: Aabb3,
+    has_vertex_colors: bool,
+    material_slots: Vec<u32>,
     last_used: u64,
 }
 
@@ -242,6 +265,25 @@ struct TextureCacheKey {
 struct CachedGpuTexture {
     target: Arc<RenderTarget>,
     bytes: usize,
+    last_used: u64,
+}
+
+struct CachedGifFrame {
+    width: u32,
+    height: u32,
+    rgba_straight: Vec<u8>,
+    end_time_sec: f64,
+}
+
+struct CachedGifAnimation {
+    content_hash: u64,
+    total_duration_sec: f64,
+    frames: Vec<CachedGifFrame>,
+    last_used: u64,
+}
+
+struct CachedNodeMaterial {
+    eval: EvaluatedMaterial,
     last_used: u64,
 }
 
@@ -330,16 +372,22 @@ impl<'a> EvalEnv<'a> {
 }
 
 /// Context allowing temporal layer effects (`echo`, `smartmotionblur`, `timeoffset`,
-/// `posterizetime`, `timeremap`, and Shader+ `timeSample`) to sample neighbor frames
+/// `posterizetime`, `timeremap`, `timedisplacement`, `ccwidetime`, `timedifference`,
+/// `vhs`, `datamosh`, and Shader+ `timeSample`) to sample neighbor frames
 /// of the active layer without infinite recursion.
 struct TemporalEffectContext<'a> {
     backdrop: &'a RenderTarget,
     layer: &'a Layer,
+    track_idx: Option<usize>,
+    track_is_3d: bool,
+    transparent_background: bool,
+    shared_camera: Option<CameraParams>,
     time_curve: Option<&'a PropertyTrack>,
     prefix_effects: &'a [EffectInstance],
     visited_comps: &'a mut Vec<Uuid>,
     visited_tracks: &'a mut Vec<Uuid>,
     comp_depth: usize,
+    depth: usize,
     scene_override: Option<&'a Scene3DOverride<'a>>,
 }
 
@@ -356,6 +404,9 @@ pub struct ProjectRenderEngine {
     mesh_cache: HashMap<MeshCacheKey, CachedGpuMesh>,
     texture_cache: HashMap<TextureCacheKey, CachedGpuTexture>,
     texture_cache_bytes: usize,
+    gif_cache: HashMap<String, CachedGifAnimation>,
+    node_material_cache: HashMap<u64, CachedNodeMaterial>,
+    registered_custom_3d_materials: HashSet<String>,
     custom_pipelines: HashMap<u64, CachedCustomPipeline>,
     custom_vs_module: wgpu::ShaderModule,
     custom_sampler: wgpu::Sampler,
@@ -426,6 +477,9 @@ impl ProjectRenderEngine {
             mesh_cache: HashMap::new(),
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
+            gif_cache: HashMap::new(),
+            node_material_cache: HashMap::new(),
+            registered_custom_3d_materials: HashSet::new(),
             custom_pipelines: HashMap::new(),
             custom_vs_module,
             custom_sampler,
@@ -493,6 +547,9 @@ impl ProjectRenderEngine {
         self.mesh_cache.clear();
         self.texture_cache.clear();
         self.texture_cache_bytes = 0;
+        self.gif_cache.clear();
+        self.node_material_cache.clear();
+        self.registered_custom_3d_materials.clear();
         self.custom_pipelines.clear();
         self.effects.evict_custom_shaders();
     }
@@ -1022,11 +1079,25 @@ impl ProjectRenderEngine {
             );
         }
 
+        // Evaluate active Camera+ `LayerKind::CameraLayer` (type 9) for 3D-tracked scenes/layers.
+        let shared_camera = evaluate_active_camera_layer(
+            project,
+            sequence,
+            plugins,
+            base_frame,
+            eval_frame,
+            fps,
+            width,
+            height,
+            &controls,
+            &expr_stack,
+        );
+
         // P9 P1-9: Solo state checks `t.solo` regardless of `enabled` (matching Zoidium).
         let any_solo = sequence.video_tracks.iter().any(|t| t.solo);
 
         // Spec 03 §7.3: render video tracks strictly bottom-to-top (0 -> N - 1).
-        for track in &sequence.video_tracks {
+        for (track_idx, track) in sequence.video_tracks.iter().enumerate() {
             if !track.enabled || (any_solo && !track.solo) {
                 continue;
             }
@@ -1103,11 +1174,163 @@ impl ProjectRenderEngine {
                     visited_comps,
                     visited_tracks,
                     comp_depth,
+                    Some(track_idx),
+                    track.is_3d,
+                    transparent_background,
+                    shared_camera,
+                    0,
                     scene_override.as_ref(),
                 )?;
             }
         }
 
+        Ok(canvas)
+    }
+
+    /// Re-renders only lower video tracks (`tracks[0..track_limit]`) at `eval_frame` into a fresh
+    /// target so temporal effects on an Adjustment layer sample real animated lower tracks at
+    /// neighbor frames instead of reusing the frozen current-frame backdrop.
+    #[allow(clippy::too_many_arguments)]
+    fn render_sequence_prefix_tracks(
+        &mut self,
+        project: &Project,
+        sequence: &Sequence,
+        plugins: &PluginRegistry,
+        eval_frame: f64,
+        track_limit: usize,
+        width: u32,
+        height: u32,
+        visited_comps: &mut Vec<Uuid>,
+        visited_tracks: &mut Vec<Uuid>,
+        comp_depth: usize,
+        temporal_depth: usize,
+        transparent_background: bool,
+    ) -> Result<RenderTarget, RenderError> {
+        let fps = sequence
+            .exact_fps
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .unwrap_or_else(|| f64::from(sequence.fps.max(1)));
+        let controls = RefCell::new(BTreeMap::new());
+        let expr_stack = RefCell::new(HashSet::new());
+        evaluate_sequence_controls_into(
+            sequence,
+            eval_frame,
+            fps,
+            project,
+            plugins,
+            &controls,
+            &expr_stack,
+        );
+
+        let mut canvas =
+            self.targets
+                .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+        if comp_depth > 0 || transparent_background {
+            self.compositor
+                .clear_target(&self.ctx, &canvas, wgpu::Color::TRANSPARENT);
+        } else {
+            let bg = sequence.background_color;
+            let bg_a = f64::from(bg[3].clamp(0.0, 1.0));
+            self.compositor.clear_target(
+                &self.ctx,
+                &canvas,
+                wgpu::Color {
+                    r: f64::from(bg[0].clamp(0.0, 1.0)) * bg_a,
+                    g: f64::from(bg[1].clamp(0.0, 1.0)) * bg_a,
+                    b: f64::from(bg[2].clamp(0.0, 1.0)) * bg_a,
+                    a: bg_a,
+                },
+            );
+        }
+
+        let shared_camera = evaluate_active_camera_layer(
+            project,
+            sequence,
+            plugins,
+            eval_frame,
+            eval_frame,
+            fps,
+            width,
+            height,
+            &controls,
+            &expr_stack,
+        );
+        let any_solo = sequence.video_tracks.iter().any(|t| t.solo);
+        let limit = track_limit.min(sequence.video_tracks.len());
+
+        for (track_idx, track) in sequence.video_tracks[..limit].iter().enumerate() {
+            if !track.enabled || (any_solo && !track.solo) {
+                continue;
+            }
+            for clip in &track.clips {
+                if clip.length <= 0.0
+                    || eval_frame < clip.start
+                    || eval_frame >= clip.start + clip.length
+                {
+                    continue;
+                }
+                let local_frame = eval_frame - clip.start;
+                let empty_props = BTreeMap::new();
+                let raw_time = eval_track_keyframes_only(&clip.time_curve, local_frame)
+                    .as_f64()
+                    .unwrap_or(local_frame / fps);
+                let time_env = EvalEnv {
+                    frame: local_frame,
+                    abs_frame: eval_frame,
+                    time: raw_time,
+                    fps,
+                    sequence_resolution: sequence.resolution,
+                    project,
+                    sequence,
+                    plugins,
+                    controls: &controls,
+                    parent_props: &empty_props,
+                    active_clip_id: Some(clip.id),
+                    active_layer_id: Some(clip.layer.id),
+                    active_object_id: None,
+                    active_effect_id: None,
+                    active_property_id: Some(format!("prop:clip:{}:time", clip.id)),
+                    expr_stack: &expr_stack,
+                };
+                let clip_time = eval_f64(&clip.time_curve, &time_env);
+                let clip_env = EvalEnv {
+                    frame: local_frame,
+                    abs_frame: eval_frame,
+                    time: clip_time,
+                    fps,
+                    sequence_resolution: sequence.resolution,
+                    project,
+                    sequence,
+                    plugins,
+                    controls: &controls,
+                    parent_props: &empty_props,
+                    active_clip_id: Some(clip.id),
+                    active_layer_id: Some(clip.layer.id),
+                    active_object_id: None,
+                    active_effect_id: None,
+                    active_property_id: None,
+                    expr_stack: &expr_stack,
+                };
+
+                canvas = self.render_and_composite_layer(
+                    canvas,
+                    &clip.layer,
+                    Some(&clip.time_curve),
+                    &clip_env,
+                    width,
+                    height,
+                    visited_comps,
+                    visited_tracks,
+                    comp_depth,
+                    Some(track_idx),
+                    track.is_3d,
+                    transparent_background,
+                    shared_camera,
+                    temporal_depth,
+                    None,
+                )?;
+            }
+        }
         Ok(canvas)
     }
 
@@ -1123,6 +1346,11 @@ impl ProjectRenderEngine {
         visited_comps: &mut Vec<Uuid>,
         visited_tracks: &mut Vec<Uuid>,
         comp_depth: usize,
+        track_idx: Option<usize>,
+        track_is_3d: bool,
+        transparent_background: bool,
+        shared_camera: Option<CameraParams>,
+        temporal_depth: usize,
         scene_override: Option<&Scene3DOverride<'_>>,
     ) -> Result<RenderTarget, RenderError> {
         let layer_env = env.with_layer(layer.id);
@@ -1145,6 +1373,7 @@ impl ProjectRenderEngine {
             visited_comps,
             visited_tracks,
             comp_depth,
+            if track_is_3d { shared_camera } else { None },
             scene_override,
         )?
         else {
@@ -1155,11 +1384,16 @@ impl ProjectRenderEngine {
             let mut temporal_ctx = TemporalEffectContext {
                 backdrop: &backdrop,
                 layer,
+                track_idx,
+                track_is_3d,
+                transparent_background,
+                shared_camera,
                 time_curve,
                 prefix_effects: &[],
                 visited_comps,
                 visited_tracks,
                 comp_depth,
+                depth: temporal_depth,
                 scene_override,
             };
             layer_target = self.apply_project_effect_stack_depth(
@@ -1167,7 +1401,11 @@ impl ProjectRenderEngine {
                 &layer.effects,
                 &layer_env,
                 0,
-                Some(&mut temporal_ctx),
+                if temporal_depth < MAX_TEMPORAL_DEPTH {
+                    Some(&mut temporal_ctx)
+                } else {
+                    None
+                },
             )?;
         }
 
@@ -1207,31 +1445,187 @@ impl ProjectRenderEngine {
         );
         let anchor = [raw_anchor[0] * scale_x, raw_anchor[1] * scale_y];
 
+        // Camera+ 3D-tracked 2D layer perspective projection (`VideoTrack.is_3d` + `layer_3d_props`).
+        let props_3d = layer_env.sequence.layer_3d_props.get(&layer.id);
+        let is_2d_layer = !matches!(
+            layer.kind,
+            LayerKind::Scene3D { .. } | LayerKind::CameraLayer { .. }
+        );
+        let (final_layer_target, transform) = if is_2d_layer && (track_is_3d || props_3d.is_some())
+        {
+            let depth_val = props_3d.map_or(0.0, |p| eval_f32(&p.depth, &layer_env));
+            let rot_x = props_3d.map_or(0.0, |p| eval_f32(&p.rotation_x, &layer_env));
+            let rot_y = props_3d.map_or(0.0, |p| eval_f32(&p.rotation_y, &layer_env));
+            let needs_3d = (track_is_3d && shared_camera.is_some())
+                || depth_val.abs() > 1e-4
+                || rot_x.abs() > 1e-4
+                || rot_y.abs() > 1e-4;
+            if needs_3d {
+                let projected = self.render_3d_projected_2d_layer(
+                    &layer_target,
+                    width,
+                    height,
+                    seq_w,
+                    seq_h,
+                    raw_pos,
+                    raw_anchor,
+                    scale,
+                    [rot_x, rot_y, rotation],
+                    depth_val,
+                    shared_camera,
+                )?;
+                self.targets.release(layer_target);
+                (projected, LayerTransform2D::default())
+            } else {
+                (
+                    layer_target,
+                    LayerTransform2D {
+                        position: pos,
+                        scale,
+                        rotation,
+                        anchor,
+                    },
+                )
+            }
+        } else {
+            (
+                layer_target,
+                LayerTransform2D {
+                    position: pos,
+                    scale,
+                    rotation,
+                    anchor,
+                },
+            )
+        };
+
         // P6 P0: Adjustment layers MUST always composite through `compositor.composite_layer`
         // (never bypassing `SrcOver`), so masked/keyed adjustment pixels with alpha < 1 reveal
         // the unmodified `backdrop` underneath.
-        let transform = LayerTransform2D {
-            position: pos,
-            scale,
-            rotation,
-            anchor,
-        };
-
         let composited =
             self.targets
                 .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
         self.compositor.composite_layer(
             &self.ctx,
             &backdrop,
-            &layer_target,
+            &final_layer_target,
             &composited,
             transform,
             opacity,
             blend_mode,
         );
         self.targets.release(backdrop);
-        self.targets.release(layer_target);
+        self.targets.release(final_layer_target);
         Ok(composited)
+    }
+
+    /// Projects a 2D layer target through a 3D perspective camera using Camera+ `layer_3d_props`
+    /// (`depth`, `rotation_x`, `rotation_y`) and optional shared `CameraLayer` camera.
+    #[allow(clippy::too_many_arguments)]
+    fn render_3d_projected_2d_layer(
+        &mut self,
+        src: &RenderTarget,
+        width: u32,
+        height: u32,
+        seq_w: f32,
+        seq_h: f32,
+        raw_pos: [f32; 2],
+        raw_anchor: [f32; 2],
+        scale: [f32; 2],
+        rot_xyz: [f32; 3],
+        depth_val: f32,
+        shared_camera: Option<CameraParams>,
+    ) -> Result<RenderTarget, RenderError> {
+        // Map sequence pixels to world units matching default camera (z=80, fov=60deg -> visible height ~92.38).
+        let aspect = (width.max(1) as f32) / (height.max(1) as f32);
+        let default_fov_deg = 60.0_f32;
+        let default_cam_z = 80.0_f32;
+        let visible_h = 2.0 * default_cam_z * (default_fov_deg.to_radians() * 0.5).tan();
+        let unit_per_px = visible_h / seq_h.max(1.0);
+        let quad_w = (src.width as f32 / width.max(1) as f32) * seq_w * unit_per_px;
+        let quad_h = (src.height as f32 / height.max(1) as f32) * seq_h * unit_per_px;
+
+        let quad_mesh_cpu = build_rectangle(quad_w.max(1e-3), quad_h.max(1e-3));
+        let gpu_mesh = GpuMesh::from_mesh_data(&self.ctx, &quad_mesh_cpu, Some("zc-layer-3d-quad"));
+
+        let anchor_offset = Vec3::new(
+            -raw_anchor[0] * unit_per_px,
+            -raw_anchor[1] * unit_per_px,
+            0.0,
+        );
+        let world_pos = Vec3::new(
+            raw_pos[0] * unit_per_px,
+            raw_pos[1] * unit_per_px,
+            -depth_val,
+        );
+        let rot_q = euler_to_quat(Vec3::from_array(rot_xyz), GeomEulerOrder::XYZ);
+        let model = Mat4::from_translation(world_pos)
+            * Mat4::from_quat(rot_q)
+            * Mat4::from_scale(Vec3::new(scale[0], scale[1], 1.0))
+            * Mat4::from_translation(anchor_offset);
+
+        let camera = shared_camera.unwrap_or_else(|| {
+            CameraParams::perspective_look_at(
+                [0.0, 0.0, default_cam_z],
+                [0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                default_fov_deg,
+                aspect,
+                0.1,
+                5000.0,
+            )
+        });
+
+        let color =
+            self.targets
+                .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+        let depth =
+            self.targets
+                .acquire(&self.ctx, width, height, wgpu::TextureFormat::Depth32Float)?;
+
+        let draw = [MeshDrawCall {
+            mesh: &gpu_mesh,
+            model: model.to_cols_array_2d(),
+            normal_matrix: compute_normal_matrix(model),
+            material: MaterialParams {
+                shading: ShadingModel::Basic,
+                base_color: [1.0, 1.0, 1.0],
+                opacity: 1.0,
+                side: CullSide::Both,
+                blend: MaterialBlend::Normal,
+                albedo_premultiplied: true,
+                receive_shadow: false,
+                ..Default::default()
+            },
+            albedo_view: Some(&src.view),
+            normal_view: None,
+            matcap_view: None,
+            cast_shadow: false,
+            receive_shadow: false,
+        }];
+
+        let res = self.scene3d.render(
+            &self.ctx,
+            &color,
+            &depth,
+            &Scene3DPassInput {
+                camera,
+                lights: &[],
+                meshes: &draw,
+                particles: &[],
+                compat_mode: RenderCompatMode::Current,
+                editing_camera: false,
+                selection_aabb: None,
+            },
+        );
+        self.targets.release(depth);
+        match res {
+            Ok(()) => Ok(color),
+            Err(err) => {
+                self.targets.release(color);
+                Err(err)
+            }
+        }
     }
 
     /// Captures a single video track's active clip for `LayerInput` (`"source"`, `"masks"`,
@@ -1344,6 +1738,7 @@ impl ProjectRenderEngine {
             visited_tracks,
             comp_depth + 1,
             None,
+            None,
         );
         self.targets.release(clear_bg);
 
@@ -1359,43 +1754,67 @@ impl ProjectRenderEngine {
             }
         };
 
-        let run_effects = matches!(stage, "effects-masks" | "effects" | "");
-        let run_masks = matches!(stage, "masks" | "effects-masks" | "");
+        // Zoidium `layer-input/README.md` stage policy:
+        // - `"source"`: raw layer content only.
+        // - `"masks"`: run ONLY native CM3 `mask` effects and SKIP `zoidiumMasks`.
+        // - `"effects"`: run all effects, skip `zoidiumMasks`.
+        // - `"effects-masks"` (default / `""`): run all effects AND `zoidiumMasks`.
+        let stage_norm = stage.trim().to_ascii_lowercase();
+        let run_all_effects = matches!(stage_norm.as_str(), "effects-masks" | "effects" | "");
+        let run_native_masks_only = stage_norm == "masks";
+        let run_zoidium_masks = matches!(stage_norm.as_str(), "effects-masks" | "");
 
-        if run_effects && !clip.layer.effects.is_empty() {
-            let empty_bg =
-                self.targets
-                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
-            self.compositor
-                .clear_target(&self.ctx, &empty_bg, wgpu::Color::TRANSPARENT);
-            let mut tctx = TemporalEffectContext {
-                backdrop: &empty_bg,
-                layer: &clip.layer,
-                time_curve: Some(&clip.time_curve),
-                prefix_effects: &[],
-                visited_comps,
-                visited_tracks,
-                comp_depth: comp_depth + 1,
-                scene_override: None,
+        if (run_all_effects || run_native_masks_only) && !clip.layer.effects.is_empty() {
+            let filtered_masks: Vec<EffectInstance>;
+            let effects_slice: &[EffectInstance] = if run_native_masks_only {
+                filtered_masks = filter_native_cm3_mask_effects(&clip.layer.effects);
+                &filtered_masks
+            } else {
+                &clip.layer.effects
             };
-            let fx_res = self.apply_project_effect_stack_depth(
-                target,
-                &clip.layer.effects,
-                &clip_env,
-                0,
-                Some(&mut tctx),
-            );
-            self.targets.release(empty_bg);
-            target = match fx_res {
-                Ok(t) => t,
-                Err(err) => {
-                    visited_tracks.pop();
-                    return Err(err);
-                }
-            };
+            if !effects_slice.is_empty() {
+                let empty_bg = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                )?;
+                self.compositor
+                    .clear_target(&self.ctx, &empty_bg, wgpu::Color::TRANSPARENT);
+                let mut tctx = TemporalEffectContext {
+                    backdrop: &empty_bg,
+                    layer: &clip.layer,
+                    track_idx: None,
+                    track_is_3d: track.is_3d,
+                    transparent_background: true,
+                    shared_camera: None,
+                    time_curve: Some(&clip.time_curve),
+                    prefix_effects: &[],
+                    visited_comps,
+                    visited_tracks,
+                    comp_depth: comp_depth + 1,
+                    depth: 0,
+                    scene_override: None,
+                };
+                let fx_res = self.apply_project_effect_stack_depth(
+                    target,
+                    effects_slice,
+                    &clip_env,
+                    0,
+                    Some(&mut tctx),
+                );
+                self.targets.release(empty_bg);
+                target = match fx_res {
+                    Ok(t) => t,
+                    Err(err) => {
+                        visited_tracks.pop();
+                        return Err(err);
+                    }
+                };
+            }
         }
 
-        if run_masks {
+        if run_zoidium_masks {
             let mask_res = if let Some(typed_masks) =
                 clip_env.sequence.layer_masks.get(&clip.layer.id)
                 && !typed_masks.is_empty()
@@ -1430,6 +1849,7 @@ impl ProjectRenderEngine {
         visited_comps: &mut Vec<Uuid>,
         visited_tracks: &mut Vec<Uuid>,
         comp_depth: usize,
+        shared_camera: Option<CameraParams>,
         scene_override: Option<&Scene3DOverride<'_>>,
     ) -> Result<Option<RenderTarget>, RenderError> {
         let seq_w = env.sequence_resolution[0].max(1) as f32;
@@ -1476,6 +1896,7 @@ impl ProjectRenderEngine {
                     env,
                     width,
                     height,
+                    shared_camera,
                     scene_override,
                 )?;
                 Ok(Some(target))
@@ -1502,11 +1923,23 @@ impl ProjectRenderEngine {
                 Ok(Some(dst))
             }
             LayerKind::Image { image } => {
-                // P6 P0: Honor `layer.resolution` scaled by preview ratio instead of
-                // magnifying/stretching small images to full composition size.
-                if let Some(asset_id) = image.as_deref()
-                    && let Some(tex) = self.ensure_image_asset_texture(env.project, asset_id, true)
-                {
+                // P6 P0 + Animated GIF support (`gif-support`): honor `layer.resolution` and
+                // decode animated GIF frame matching `env.time % total_duration` when enabled.
+                let gif_enabled = env.plugins.is_enabled("gif-support");
+                let tex_opt = image.as_deref().and_then(|asset_id| {
+                    if gif_enabled
+                        && let Some(gif_tex) = self.ensure_gif_frame_texture(
+                            env.project,
+                            asset_id,
+                            env.time.max(0.0),
+                            true,
+                        )
+                    {
+                        return Some(gif_tex);
+                    }
+                    self.ensure_image_asset_texture(env.project, asset_id, true)
+                });
+                if let Some(tex) = tex_opt {
                     let natural_w = if layer.resolution[0] > 0 {
                         layer.resolution[0]
                     } else {
@@ -1550,8 +1983,15 @@ impl ProjectRenderEngine {
             LayerKind::Video { media } => {
                 // P6 P0 + P7 P0: Honor `layer.resolution` AND sample video at `env.time`!
                 let sample_time = env.time.max(0.0);
+                let gif_enabled = env.plugins.is_enabled("gif-support");
                 let tex_opt = media.as_deref().and_then(|asset_id| {
-                    self.ensure_video_frame_texture(env.project, asset_id, sample_time)
+                    if gif_enabled
+                        && let Some(gif_tex) =
+                            self.ensure_gif_frame_texture(env.project, asset_id, sample_time, true)
+                    {
+                        return Some(gif_tex);
+                    }
+                    self.ensure_video_frame_texture(env.project, asset_id, sample_time, true)
                         .or_else(|| self.ensure_image_asset_texture(env.project, asset_id, true))
                 });
                 if let Some(tex) = tex_opt {
@@ -1623,6 +2063,11 @@ impl ProjectRenderEngine {
                         visited_comps,
                         visited_tracks,
                         comp_depth + 1,
+                        None,
+                        false,
+                        true,
+                        shared_camera,
+                        0,
                         scene_override,
                     )?;
                 }
@@ -1703,12 +2148,18 @@ impl ProjectRenderEngine {
                 size,
                 shapes,
             } => {
+                let text_plus_2d = env
+                    .plugins
+                    .is_enabled("text-plus")
+                    .then(|| layer.preserved.get("zoidiumTextPlus2D"))
+                    .flatten();
                 let target = self.render_text_2d(
                     layer.id,
                     text,
                     font.as_deref(),
                     *size,
                     shapes,
+                    text_plus_2d,
                     env,
                     width,
                     height,
@@ -1745,6 +2196,136 @@ impl ProjectRenderEngine {
         env: &EvalEnv<'_>,
         width: u32,
         height: u32,
+        shared_camera: Option<CameraParams>,
+        scene_override: Option<&Scene3DOverride<'_>>,
+    ) -> Result<RenderTarget, RenderError> {
+        // Check Camera+ per-camera `motion_blur` (`enabled`, `samples`, `shutter`) when not
+        // in editing camera mode and sequence-level motion blur is not already supersampling.
+        if scene_override.is_none()
+            && !env.sequence.motion_blur.enabled
+            && env.plugins.is_enabled("camera-plus")
+            && let Some(mb) = find_active_camera_motion_blur(objects, env)
+            && mb.enabled
+        {
+            let samples = mb.samples.clamp(1, 32);
+            let shutter = eval_f64(&mb.shutter, env).clamp(0.0, 2.0);
+            if samples > 1 && shutter > 1e-4 {
+                let res_f = [width as f32, height as f32];
+                let inv_total = 1.0 / (samples as f32);
+                let mut acc_in = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba16Float,
+                )?;
+                let mut acc_out = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba16Float,
+                )?;
+                let final_dst = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                )?;
+                for i in 0..samples {
+                    let frac = ((f64::from(i) + 0.5) / f64::from(samples)) - 0.5;
+                    let sub_env = env_at_frame(env, env.frame + frac * shutter);
+                    let sample_target = match self.render_scene_3d_single(
+                        objects,
+                        shadow_mode,
+                        shadows_enabled,
+                        scene_bg,
+                        &sub_env,
+                        width,
+                        height,
+                        shared_camera,
+                        None,
+                    ) {
+                        Ok(t) => t,
+                        Err(err) => {
+                            self.targets.release(acc_in);
+                            self.targets.release(acc_out);
+                            self.targets.release(final_dst);
+                            return Err(err);
+                        }
+                    };
+                    let is_first = i == 0;
+                    let is_last = i + 1 == samples;
+                    let target_fmt = if is_last {
+                        wgpu::TextureFormat::Rgba8Unorm
+                    } else {
+                        wgpu::TextureFormat::Rgba16Float
+                    };
+                    let out_view = if is_last {
+                        &final_dst.view
+                    } else {
+                        &acc_out.view
+                    };
+                    let mut encoder =
+                        self.ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-camera-mb-shutter-accum"),
+                            });
+                    let res = self.effects.run_shutter_accumulate(
+                        &self.ctx.device,
+                        &mut encoder,
+                        &acc_in.view,
+                        &sample_target.view,
+                        out_view,
+                        res_f,
+                        1.0,
+                        inv_total,
+                        is_first,
+                        is_last,
+                        target_fmt,
+                    );
+                    if let Err(err) = res {
+                        self.targets.release(sample_target);
+                        self.targets.release(acc_in);
+                        self.targets.release(acc_out);
+                        self.targets.release(final_dst);
+                        return Err(RenderError::Effect(err.to_string()));
+                    }
+                    self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                    self.targets.release(sample_target);
+                    if !is_last {
+                        std::mem::swap(&mut acc_in, &mut acc_out);
+                    }
+                }
+                self.targets.release(acc_in);
+                self.targets.release(acc_out);
+                return Ok(final_dst);
+            }
+        }
+
+        self.render_scene_3d_single(
+            objects,
+            shadow_mode,
+            shadows_enabled,
+            scene_bg,
+            env,
+            width,
+            height,
+            shared_camera,
+            scene_override,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_scene_3d_single(
+        &mut self,
+        objects: &[Object3D],
+        shadow_mode: ProjectCompatMode,
+        shadows_enabled: bool,
+        scene_bg: Option<[f32; 4]>,
+        env: &EvalEnv<'_>,
+        width: u32,
+        height: u32,
+        shared_camera: Option<CameraParams>,
         scene_override: Option<&Scene3DOverride<'_>>,
     ) -> Result<RenderTarget, RenderError> {
         let mut collected = CollectedScene3D {
@@ -1760,14 +2341,18 @@ impl ProjectRenderEngine {
             for spec in &mut collected.meshes {
                 spec.cast_shadow = false;
                 spec.receive_shadow = false;
+                spec.material.receive_shadow = false;
             }
         }
 
         let camera = match scene_override {
             Some(ov) => ov.editing_camera,
-            None => match collected.camera {
+            None => match shared_camera {
                 Some(cam) => cam,
-                None => default_scene_camera(width, height),
+                None => match collected.camera {
+                    Some(cam) => cam,
+                    None => default_scene_camera(width, height),
+                },
             },
         };
 
@@ -1847,6 +2432,12 @@ impl ProjectRenderEngine {
             })
             .collect();
 
+        let mesh_ao_views: Vec<Option<&wgpu::TextureView>> = collected
+            .meshes
+            .iter()
+            .map(|spec| spec.ao_map.as_deref().map(|t| &t.view))
+            .collect();
+
         let particle_draws: Vec<ParticleDrawCall<'_>> = collected
             .particles
             .iter()
@@ -1856,6 +2447,37 @@ impl ProjectRenderEngine {
                 blend: p.blend,
             })
             .collect();
+
+        // Project 3D Optical Flares into screen NDC + depth `[0, 1]` for depth-occluded compositing.
+        let vp_mat = Mat4::from_cols_array_2d(&camera.view_proj);
+        let mut optical_flares_draw: Vec<OpticalFlareDrawCall> =
+            Vec::with_capacity(collected.optical_flares.len());
+        for flare in &collected.optical_flares {
+            let clip =
+                vp_mat * Vec4::new(flare.world_pos.x, flare.world_pos.y, flare.world_pos.z, 1.0);
+            if clip.w <= 1e-5 || !clip.w.is_finite() {
+                continue;
+            }
+            let ndc_x = clip.x / clip.w;
+            let ndc_y = clip.y / clip.w;
+            let ndc_z = (clip.z / clip.w).clamp(0.0, 1.0);
+            if !ndc_x.is_finite() || !ndc_y.is_finite() {
+                continue;
+            }
+            optical_flares_draw.push(OpticalFlareDrawCall {
+                screen_pos_ndc: [ndc_x, ndc_y],
+                depth_ndc: ndc_z,
+                color: flare.color,
+                brightness: flare.brightness,
+                scale: flare.scale,
+                anamorphic: flare.anamorphic,
+                ghosts: flare.ghosts,
+                starburst_rays: flare.starburst_rays,
+                ring_intensity: flare.ring_intensity,
+                occlusion_enabled: flare.occlusion_enabled,
+                rotation_rad: flare.rotation_rad,
+            });
+        }
 
         let color =
             self.targets
@@ -1869,7 +2491,7 @@ impl ProjectRenderEngine {
             ProjectCompatMode::Legacy => RenderCompatMode::Legacy,
         };
 
-        let render_res = self.scene3d.render_with_options(
+        let mut render_res = self.scene3d.render_with_extended_options(
             &self.ctx,
             &color,
             &depth,
@@ -1882,18 +2504,57 @@ impl ProjectRenderEngine {
                 editing_camera: scene_override.is_some(),
                 selection_aabb,
             },
-            &Scene3DRenderOptions {
-                extra_lines: &extra_wireframe_lines,
-                mesh_extra_maps: &mesh_extra_maps,
-                dof: if scene_override.is_some() {
-                    None
-                } else {
-                    collected.dof
+            &Scene3DExtendedOptions {
+                base: Scene3DRenderOptions {
+                    extra_lines: &extra_wireframe_lines,
+                    mesh_extra_maps: &mesh_extra_maps,
+                    dof: if scene_override.is_some() {
+                        None
+                    } else {
+                        collected.dof
+                    },
+                    linear_lighting: false,
+                    particle_sprites_straight_alpha: true,
                 },
-                linear_lighting: false,
-                particle_sprites_straight_alpha: true,
+                mesh_ao_views: &mesh_ao_views,
+                shadow_map_size: collected.max_shadow_map_size,
+                optical_flares: &[],
             },
         );
+
+        // Render 3D CustomShader material meshes into `(color, depth)` while depth buffer is live.
+        if render_res.is_ok() {
+            for cm in &collected.custom_material_meshes {
+                let draw = CustomMaterial3DDrawCall {
+                    mesh: cm.mesh.as_ref(),
+                    model: cm.model,
+                    normal_matrix: cm.normal_matrix,
+                    side: cm.side,
+                    blend: cm.blend,
+                    time: env.time as f32,
+                    params_a: cm.params_a,
+                    params_b: cm.params_b,
+                };
+                if let Err(err) = self.scene3d.render_custom_material_mesh(
+                    &self.ctx,
+                    &color,
+                    &depth,
+                    &camera,
+                    &cm.shader_key,
+                    &draw,
+                ) {
+                    warn!(shader_key = %cm.shader_key, error = %err, "custom 3D material draw failed");
+                }
+            }
+        }
+
+        // Composite depth-occluded Optical Flares additively over the completed 3D scene + depth.
+        if render_res.is_ok() && !optical_flares_draw.is_empty() {
+            render_res =
+                self.scene3d
+                    .render_optical_flares(&self.ctx, &color, &depth, &optical_flares_draw);
+        }
+
         self.targets.release(depth);
 
         match render_res {
@@ -1989,7 +2650,19 @@ impl ProjectRenderEngine {
             let node_env = obj_env.with_parent_props(&node.parent_props);
 
             match &obj.kind {
-                Object3DKind::Group { .. } | Object3DKind::Dummy { .. } => {}
+                Object3DKind::Group { .. } | Object3DKind::Dummy { .. } => {
+                    // Check Optical Flares (`zoidium:optical-flares/flare` / `type: 13`).
+                    if env.plugins.is_enabled("optical-flares") && is_optical_flare_object(obj) {
+                        out.optical_flares
+                            .push(collect_optical_flare(obj, world, &node_env));
+                    }
+                    // Check Trapcode Suite (`Particular`, `Form`, `Plexus`).
+                    if env.plugins.is_enabled("trapcode-suite")
+                        && let Some(tc_kind) = detect_trapcode_kind(obj)
+                    {
+                        self.collect_trapcode_object(obj, tc_kind, world, &node_env, out);
+                    }
+                }
                 Object3DKind::Camera(cam) => {
                     let parent_mat = node
                         .parent
@@ -2055,6 +2728,10 @@ impl ProjectRenderEngine {
                     let kind = map_light_kind(light.kind);
                     let position = world.w_axis.truncate().to_array();
                     let target = target_world.to_array();
+                    if light.cast_shadow && light.shadow_map_size > 0 {
+                        out.max_shadow_map_size =
+                            out.max_shadow_map_size.max(light.shadow_map_size);
+                    }
                     if out.lights.len() < MAX_SCENE_LIGHTS {
                         out.lights.push(SceneLight {
                             kind,
@@ -2089,17 +2766,27 @@ impl ProjectRenderEngine {
                         &has_mesh_descendant,
                     );
                     let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
+                    let slot_mats = self.evaluate_object_slot_materials(obj, &node_env);
+                    let (cast_sh, recv_sh) = object_shadow_flags(obj);
+                    let has_voronoi = effector_chain
+                        .iter()
+                        .any(|&i| effector_kinds[i] == Some(SceneEffectorKind::VoronoiFracture));
                     if effector_chain.is_empty() {
-                        if let Some((mesh, bounds)) = self.ensure_shape_mesh(obj, shape, &node_env)
-                        {
-                            push_prepared_mesh(out, obj.id, mesh, bounds, world, &mat_eval);
+                        if let Some(cached) = self.ensure_shape_mesh(obj, shape, &node_env) {
+                            push_prepared_mesh_ex(
+                                out, obj.id, &cached, world, &mat_eval, &slot_mats, cast_sh,
+                                recv_sh, false,
+                            );
                         }
                     } else {
-                        let base_mesh = apply_object_effectors(
+                        let mut base_mesh = apply_object_effectors(
                             build_shape_mesh_cpu(shape, &node_env),
                             obj,
                             &node_env,
                         );
+                        if object_uses_normalized_uv(obj) {
+                            apply_normalized_uv_layout(&mut base_mesh);
+                        }
                         self.emit_effected_mesh(
                             objects,
                             parent_world,
@@ -2111,6 +2798,10 @@ impl ProjectRenderEngine {
                             &effector_chain,
                             &effector_kinds,
                             &mat_eval,
+                            &slot_mats,
+                            cast_sh,
+                            recv_sh,
+                            has_voronoi,
                             env,
                             0,
                             out,
@@ -2125,14 +2816,53 @@ impl ProjectRenderEngine {
                         &has_mesh_descendant,
                     );
                     let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
+                    let slot_mats = self.evaluate_object_slot_materials(obj, &node_env);
+                    let (cast_sh, recv_sh) = object_shadow_flags(obj);
+                    let has_voronoi = effector_chain
+                        .iter()
+                        .any(|&i| effector_kinds[i] == Some(SceneEffectorKind::VoronoiFracture));
 
-                    let et_layers_owned = if expresstext_active {
+                    let (et_layers_owned, et_letters_mode, et_container_idx) = if expresstext_active
+                    {
                         collect_expresstext_layers_for_node(&eval_graph, node_idx)
+                    } else {
+                        (Vec::new(), ExpressTextLettersMode::PerText, None)
+                    };
+                    let text_plus_groups = if env.plugins.is_enabled("text-plus") {
+                        collect_text_plus_3d_groups(&eval_graph, node_idx)
                     } else {
                         Vec::new()
                     };
+                    // Check if a Voronoi Fracture effector specifies character ranges on this Text3D.
+                    let voronoi_char_filter: Option<(usize, String, bool)> = effector_chain
+                        .iter()
+                        .copied()
+                        .find(|&e_idx| {
+                            effector_kinds[e_idx] == Some(SceneEffectorKind::VoronoiFracture)
+                        })
+                        .and_then(|e_idx| {
+                            let e_obj = eval_graph.nodes[e_idx].obj;
+                            let e_env = env.with_object(e_obj.id);
+                            let chars_spec =
+                                eval_obj_str(e_obj, &["characters", "characterRanges"], &e_env)
+                                    .unwrap_or_default();
+                            let inv = eval_obj_bool(
+                                e_obj,
+                                &["invertCharacters", "invert_characters"],
+                                false,
+                                &e_env,
+                            );
+                            if !chars_spec.trim().is_empty() || inv {
+                                Some((e_idx, chars_spec, inv))
+                            } else {
+                                None
+                            }
+                        });
 
-                    if !et_layers_owned.is_empty() {
+                    if !et_layers_owned.is_empty()
+                        || !text_plus_groups.is_empty()
+                        || voronoi_char_filter.is_some()
+                    {
                         let (text_params, ext_opts) =
                             build_text3d_params_and_options(text_data, obj);
                         let char_meshes = build_text3d_character_meshes_with_fallback(
@@ -2158,9 +2888,25 @@ impl ProjectRenderEngine {
                                 TextScaleMode::Legacy => world,
                             };
 
+                            // AcrossTexts indexing across sibling Text3D children under an ExpressText+ container.
+                            let (across_offset, across_total) = if !et_layers_owned.is_empty()
+                                && et_letters_mode == ExpressTextLettersMode::AcrossTexts
+                                && let Some(c_idx) = et_container_idx
+                            {
+                                compute_across_texts_range(
+                                    &eval_graph,
+                                    c_idx,
+                                    node_idx,
+                                    char_meshes.len(),
+                                )
+                            } else {
+                                (0usize, char_meshes.len())
+                            };
+
                             let index_offset =
                                 eval_f64(&text_data.character_index_offset, &node_env).round()
-                                    as isize;
+                                    as isize
+                                    + across_offset as isize;
                             let count_override =
                                 eval_f64(&text_data.character_count_override, &node_env)
                                     .round()
@@ -2168,7 +2914,7 @@ impl ProjectRenderEngine {
                             let total = if count_override > 0 {
                                 count_override
                             } else {
-                                char_meshes.len()
+                                across_total
                             };
                             let list = ExpressTextLetterList {
                                 total,
@@ -2227,6 +2973,37 @@ impl ProjectRenderEngine {
                                 })
                                 .collect();
 
+                            let voronoi_mask: Option<Vec<bool>> =
+                                voronoi_char_filter.as_ref().map(|(_, spec, inv)| {
+                                    parse_character_ranges(spec, char_meshes.len(), *inv)
+                                });
+
+                            // Pre-evaluate Character Material overrides from `zoidium:text-plus/character-material` groups.
+                            let mut tp_char_mats: Vec<(
+                                Vec<usize>,
+                                EvaluatedMaterial,
+                                HashMap<u32, EvaluatedMaterial>,
+                            )> = Vec::new();
+                            for &(g_idx, g_kind) in &text_plus_groups {
+                                if g_kind == TextPlus3DGroupKind::CharacterMaterial {
+                                    let g_obj = eval_graph.nodes[g_idx].obj;
+                                    let g_env = env.with_object(g_obj.id);
+                                    let sel_raw = eval_obj_str(
+                                        g_obj,
+                                        &["characterNumbers", "characters"],
+                                        &g_env,
+                                    )
+                                    .unwrap_or_else(|| "1".to_owned());
+                                    let sel =
+                                        parse_character_selection(&sel_raw, char_meshes.len());
+                                    let gm =
+                                        self.evaluate_material(g_obj.material.as_ref(), &g_env);
+                                    let gsm = self.evaluate_object_slot_materials(g_obj, &g_env);
+                                    tp_char_mats.push((sel, gm, gsm));
+                                }
+                            }
+
+                            let char_count_local = char_meshes.len();
                             for ch in char_meshes {
                                 if ch.mesh.indices.is_empty() {
                                     continue;
@@ -2239,47 +3016,131 @@ impl ProjectRenderEngine {
                                     f64::from(ch.anchor_pos.y),
                                     f64::from(ch.anchor_pos.z),
                                 ];
-                                let ctrl = evaluate_expresstext_stack(
-                                    &et_layers, env.frame, eff_idx, &list, base_local, &aux,
-                                );
-                                let char_pos = ch.anchor_pos
-                                    + Vec3::new(
+
+                                // 1. Evaluate ExpressText+ transform stack (if active)
+                                let mut acc_pos = Vec3::ZERO;
+                                let mut acc_rot_euler = Vec3::ZERO;
+                                let mut acc_scale = Vec3::ONE;
+                                if !et_layers.is_empty() {
+                                    let ctrl = evaluate_expresstext_stack(
+                                        &et_layers, env.frame, eff_idx, &list, base_local, &aux,
+                                    );
+                                    acc_pos += Vec3::new(
                                         ctrl.position[0] as f32,
                                         ctrl.position[1] as f32,
                                         ctrl.position[2] as f32,
                                     );
-                                let char_rot = euler_to_quat(
-                                    Vec3::new(
+                                    acc_rot_euler += Vec3::new(
                                         ctrl.rotation[0] as f32,
                                         ctrl.rotation[1] as f32,
                                         ctrl.rotation[2] as f32,
-                                    ),
-                                    GeomEulerOrder::XYZ,
-                                );
-                                let char_scale = Vec3::new(
-                                    ctrl.scale[0] as f32,
-                                    ctrl.scale[1] as f32,
-                                    ctrl.scale[2] as f32,
-                                );
+                                    );
+                                    acc_scale *= Vec3::new(
+                                        ctrl.scale[0] as f32,
+                                        ctrl.scale[1] as f32,
+                                        ctrl.scale[2] as f32,
+                                    );
+                                }
+
+                                // 2. Evaluate all 7 `zoidium:text-plus/*` 3D modifier groups
+                                if !text_plus_groups.is_empty() {
+                                    let (tp_pos, tp_rot, tp_scale) = evaluate_text_plus_3d_for_char(
+                                        &eval_graph,
+                                        &text_plus_groups,
+                                        ch.index,
+                                        char_count_local,
+                                        env,
+                                    );
+                                    acc_pos += tp_pos;
+                                    acc_rot_euler += tp_rot;
+                                    acc_scale *= tp_scale;
+                                }
+
+                                // Resolve per-character material override (`character-material` group).
+                                let mut ch_mat = mat_eval.clone();
+                                let mut ch_slot_mats = slot_mats.clone();
+                                for (sel, gm, gsm) in &tp_char_mats {
+                                    if sel.contains(&ch.index) {
+                                        if gm.albedo.is_some()
+                                            || gm.matcap.is_some()
+                                            || gm.custom_shader_key.is_some()
+                                            || gm.params.base_color != [1.0, 1.0, 1.0]
+                                            || gm.params.shading != ShadingModel::StandardPbr
+                                        {
+                                            ch_mat = gm.clone();
+                                        }
+                                        for (slot_k, slot_m) in gsm {
+                                            ch_slot_mats.insert(*slot_k, slot_m.clone());
+                                        }
+                                    }
+                                }
+
+                                // 3. ExpressText+ Voronoi shatter effector (`shatter_glyph_triangles` + `apply_chunk_pose_to_positions`).
+                                let mut ch_mesh = apply_object_effectors(ch.mesh, obj, &node_env);
+                                let mut et_voronoi_applied = false;
+                                if !et_layers.is_empty()
+                                    && let Some(vparams) = evaluate_expresstext_voronoi_params(
+                                        &et_layers, env.frame, eff_idx, &list, base_local,
+                                    )
+                                {
+                                    let shattered =
+                                        shatter_mesh_data_expresstext(&ch_mesh, &vparams);
+                                    if !shattered.indices.is_empty() {
+                                        ch_mesh = shattered;
+                                        et_voronoi_applied = true;
+                                    }
+                                }
+                                if object_uses_normalized_uv(obj) {
+                                    apply_normalized_uv_layout(&mut ch_mesh);
+                                }
+
+                                let char_pos = ch.anchor_pos + acc_pos;
+                                let char_rot = euler_to_quat(acc_rot_euler, GeomEulerOrder::XYZ);
                                 let anchor_mat = Mat4::from_scale_rotation_translation(
-                                    char_scale, char_rot, char_pos,
+                                    acc_scale, char_rot, char_pos,
                                 );
                                 let glyph_mat = Mat4::from_translation(ch.mesh_offset)
                                     * Mat4::from_scale(ch.mesh_scale);
                                 let char_world = container_world * anchor_mat * glyph_mat;
-                                let ch_mesh = apply_object_effectors(ch.mesh, obj, &node_env);
                                 let char_salt = (ch.index as u64).wrapping_add(1);
-                                if effector_chain.is_empty() {
+
+                                // Filter out VoronoiFracture effector from chain if character is excluded by `characters`/`invertCharacters`.
+                                let filtered_chain: Vec<usize> =
+                                    if let (Some((v_idx, _, _)), Some(mask)) =
+                                        (voronoi_char_filter.as_ref(), voronoi_mask.as_ref())
+                                    {
+                                        if mask.get(ch.index).copied().unwrap_or(true) {
+                                            effector_chain.clone()
+                                        } else {
+                                            effector_chain
+                                                .iter()
+                                                .copied()
+                                                .filter(|&idx| idx != *v_idx)
+                                                .collect()
+                                        }
+                                    } else {
+                                        effector_chain.clone()
+                                    };
+                                let ch_has_voronoi = et_voronoi_applied
+                                    || filtered_chain.iter().any(|&i| {
+                                        effector_kinds[i]
+                                            == Some(SceneEffectorKind::VoronoiFracture)
+                                    });
+
+                                if filtered_chain.is_empty() {
                                     if !ch_mesh.indices.is_empty() {
                                         let mut h =
                                             hash_text3d_and_effectors(text_data, obj, &node_env);
                                         h = hash_u64(h, 0xE7_0001);
                                         h = hash_u64(h, char_salt);
+                                        if et_voronoi_applied {
+                                            h = hash_f64(h, env.frame);
+                                        }
                                         let key = MeshCacheKey {
                                             object_id: obj.id,
                                             content_hash: h,
                                         };
-                                        let (gpu_mesh, bounds) =
+                                        let cached =
                                             self.touch_cached_mesh(key).unwrap_or_else(|| {
                                                 self.insert_cached_mesh(
                                                     key,
@@ -2287,9 +3148,71 @@ impl ProjectRenderEngine {
                                                     "zc-expresstext-char-mesh",
                                                 )
                                             });
-                                        push_prepared_mesh(
-                                            out, obj.id, gpu_mesh, bounds, char_world, &mat_eval,
+                                        push_prepared_mesh_ex(
+                                            out,
+                                            obj.id,
+                                            &cached,
+                                            char_world,
+                                            &ch_mat,
+                                            &ch_slot_mats,
+                                            cast_sh,
+                                            recv_sh,
+                                            ch_has_voronoi,
                                         );
+
+                                        // 4. ExpressText+ Repeater effector (`evaluate_expresstext_repeater_instances`).
+                                        if !et_layers.is_empty() {
+                                            let rep_insts = evaluate_expresstext_repeater_instances(
+                                                &et_layers, env.frame, eff_idx, &list, base_local,
+                                                &aux,
+                                            );
+                                            for r_inst in rep_insts {
+                                                let r_pos = ch.anchor_pos
+                                                    + Vec3::new(
+                                                        r_inst.controls.position[0] as f32,
+                                                        r_inst.controls.position[1] as f32,
+                                                        r_inst.controls.position[2] as f32,
+                                                    );
+                                                let r_rot = euler_to_quat(
+                                                    Vec3::new(
+                                                        r_inst.controls.rotation[0] as f32,
+                                                        r_inst.controls.rotation[1] as f32,
+                                                        r_inst.controls.rotation[2] as f32,
+                                                    ),
+                                                    GeomEulerOrder::XYZ,
+                                                );
+                                                let r_scale = Vec3::new(
+                                                    r_inst.controls.scale[0] as f32,
+                                                    r_inst.controls.scale[1] as f32,
+                                                    r_inst.controls.scale[2] as f32,
+                                                );
+                                                let r_world = container_world
+                                                    * Mat4::from_scale_rotation_translation(
+                                                        r_scale, r_rot, r_pos,
+                                                    )
+                                                    * glyph_mat;
+                                                let mut r_mat = ch_mat.clone();
+                                                r_mat.params.opacity = (r_mat.params.opacity
+                                                    * r_inst.opacity as f32)
+                                                    .clamp(0.0, 1.0);
+                                                if r_mat.params.opacity < 0.999
+                                                    && r_mat.params.blend == MaterialBlend::Opaque
+                                                {
+                                                    r_mat.params.blend = MaterialBlend::Normal;
+                                                }
+                                                push_prepared_mesh_ex(
+                                                    out,
+                                                    obj.id,
+                                                    &cached,
+                                                    r_world,
+                                                    &r_mat,
+                                                    &ch_slot_mats,
+                                                    cast_sh,
+                                                    recv_sh,
+                                                    ch_has_voronoi,
+                                                );
+                                            }
+                                        }
                                     }
                                 } else {
                                     self.emit_effected_mesh(
@@ -2300,9 +3223,13 @@ impl ProjectRenderEngine {
                                         obj.id,
                                         ch_mesh,
                                         char_world,
-                                        &effector_chain,
+                                        &filtered_chain,
                                         &effector_kinds,
-                                        &mat_eval,
+                                        &ch_mat,
+                                        &ch_slot_mats,
+                                        cast_sh,
+                                        recv_sh,
+                                        ch_has_voronoi,
                                         env,
                                         char_salt,
                                         out,
@@ -2314,17 +3241,21 @@ impl ProjectRenderEngine {
                     }
 
                     if effector_chain.is_empty() {
-                        if let Some((mesh, bounds)) =
-                            self.ensure_text3d_mesh(obj, text_data, &node_env)
-                        {
-                            push_prepared_mesh(out, obj.id, mesh, bounds, world, &mat_eval);
+                        if let Some(cached) = self.ensure_text3d_mesh(obj, text_data, &node_env) {
+                            push_prepared_mesh_ex(
+                                out, obj.id, &cached, world, &mat_eval, &slot_mats, cast_sh,
+                                recv_sh, false,
+                            );
                         }
                     } else {
-                        let base_mesh = apply_object_effectors(
+                        let mut base_mesh = apply_object_effectors(
                             build_text3d_mesh_cpu(obj, text_data, &node_env),
                             obj,
                             &node_env,
                         );
+                        if object_uses_normalized_uv(obj) {
+                            apply_normalized_uv_layout(&mut base_mesh);
+                        }
                         self.emit_effected_mesh(
                             objects,
                             parent_world,
@@ -2336,6 +3267,10 @@ impl ProjectRenderEngine {
                             &effector_chain,
                             &effector_kinds,
                             &mat_eval,
+                            &slot_mats,
+                            cast_sh,
+                            recv_sh,
+                            has_voronoi,
                             env,
                             0,
                             out,
@@ -2350,18 +3285,27 @@ impl ProjectRenderEngine {
                         &has_mesh_descendant,
                     );
                     let mat_eval = self.evaluate_material(obj.material.as_ref(), &node_env);
+                    let slot_mats = self.evaluate_object_slot_materials(obj, &node_env);
+                    let (cast_sh, recv_sh) = object_shadow_flags(obj);
+                    let has_voronoi = effector_chain
+                        .iter()
+                        .any(|&i| effector_kinds[i] == Some(SceneEffectorKind::VoronoiFracture));
                     if effector_chain.is_empty() {
-                        if let Some((mesh, bounds)) =
-                            self.ensure_model_mesh(obj, model_data, &node_env)
-                        {
-                            push_prepared_mesh(out, obj.id, mesh, bounds, world, &mat_eval);
+                        if let Some(cached) = self.ensure_model_mesh(obj, model_data, &node_env) {
+                            push_prepared_mesh_ex(
+                                out, obj.id, &cached, world, &mat_eval, &slot_mats, cast_sh,
+                                recv_sh, false,
+                            );
                         }
                     } else {
-                        let base_mesh = apply_object_effectors(
+                        let mut base_mesh = apply_object_effectors(
                             build_model_mesh_cpu(model_data, &node_env),
                             obj,
                             &node_env,
                         );
+                        if object_uses_normalized_uv(obj) {
+                            apply_normalized_uv_layout(&mut base_mesh);
+                        }
                         self.emit_effected_mesh(
                             objects,
                             parent_world,
@@ -2373,6 +3317,10 @@ impl ProjectRenderEngine {
                             &effector_chain,
                             &effector_kinds,
                             &mat_eval,
+                            &slot_mats,
+                            cast_sh,
+                            recv_sh,
+                            has_voronoi,
                             env,
                             0,
                             out,
@@ -2455,7 +3403,8 @@ impl ProjectRenderEngine {
                     if world_scale <= 1e-6 {
                         continue;
                     }
-                    let eval_list = evaluate_particles(sim_time, &params);
+                    // Use CM3 32-texel LUT evaluator for exact ClipMaker 3 / Particles+ parity.
+                    let eval_list = evaluate_particles_cm3_lut(sim_time, &params, false);
                     let mut instances = Vec::with_capacity(eval_list.len());
                     for p in eval_list {
                         if !p.alive || p.size <= 0.0 {
@@ -2471,12 +3420,22 @@ impl ProjectRenderEngine {
                         });
                     }
                     if !instances.is_empty() {
-                        // P5 P0: Particle sprite textures are straight-alpha (not premultiplied)
-                        // so `PARTICLE_WGSL` doesn't double-premultiply `tex.rgb * tex.a^2`.
+                        // P5 P0: Particle sprite textures are straight-alpha (not premultiplied).
+                        // Fall back to Particles+ 54/54 procedural sprite preset when no image asset is bound.
+                        let sprite_preset_name = pdata.sprite_preset.as_deref().or_else(|| {
+                            obj.preserved
+                                .get("_zoidiumParticlesPlusSprite")
+                                .and_then(serde_json::Value::as_str)
+                        });
                         let sprite = pdata
                             .texture
                             .as_deref()
-                            .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                            .and_then(|id| self.ensure_image_asset_texture(env.project, id, false))
+                            .or_else(|| {
+                                sprite_preset_name.and_then(|name| {
+                                    self.ensure_particle_sprite_preset_texture(name)
+                                })
+                            });
                         out.particles.push(PreparedParticlesSpec {
                             instances,
                             sprite,
@@ -2487,6 +3446,266 @@ impl ProjectRenderEngine {
                             },
                         });
                     }
+                }
+            }
+        }
+    }
+
+    fn ensure_particle_sprite_preset_texture(&mut self, name: &str) -> Option<Arc<RenderTarget>> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let key = TextureCacheKey {
+            asset_key: format!("particle_sprite:{trimmed}"),
+            content_hash: fnv1a_hash64(trimmed.as_bytes()),
+            premultiply: false,
+        };
+        if let Some(cached) = self.touch_cached_texture(&key) {
+            return Some(cached);
+        }
+        let (w, h, rgba) = generate_particle_sprite_by_name(trimmed, 128)?;
+        let tex = self
+            .ctx
+            .create_rgba8_texture("zc-particle-sprite-preset", w, h, &rgba)
+            .ok()?;
+        Some(self.insert_cached_texture(key, tex))
+    }
+
+    fn evaluate_object_slot_materials(
+        &mut self,
+        obj: &Object3D,
+        env: &EvalEnv<'_>,
+    ) -> HashMap<u32, EvaluatedMaterial> {
+        let mut out = HashMap::new();
+        for (k, spec) in &obj.material_slots {
+            let slot_idx = match k.trim().to_ascii_lowercase().as_str() {
+                "front" | "0" | "outer" | "face" => 0u32,
+                "side" | "1" | "bevel" | "cap" | "inner" => 1u32,
+                other => other.parse::<u32>().unwrap_or(1),
+            };
+            let evaluated = self.evaluate_material(Some(spec), env);
+            out.insert(slot_idx, evaluated);
+        }
+        out
+    }
+
+    fn collect_trapcode_object(
+        &mut self,
+        obj: &Object3D,
+        tc_kind: TrapcodeKind,
+        world: Mat4,
+        env: &EvalEnv<'_>,
+        out: &mut CollectedScene3D,
+    ) {
+        let world_scale = (world.x_axis.truncate().length()
+            + world.y_axis.truncate().length()
+            + world.z_axis.truncate().length())
+            / 3.0;
+        if world_scale <= 1e-6 {
+            return;
+        }
+        let (cast_sh, recv_sh) = object_shadow_flags(obj);
+        let color = eval_obj_color_rgb(
+            obj,
+            &["color", "particleColor", "lineColor"],
+            [0.85, 0.92, 1.0],
+            env,
+        );
+        let opacity = eval_obj_f32(obj, &["opacity"], 1.0, env).clamp(0.0, 1.0);
+        let seed = eval_obj_i32(obj, &["seed", "randomSeed"], 1, env);
+        let t = env.time as f32;
+
+        match tc_kind {
+            TrapcodeKind::Particular => {
+                let count = eval_obj_u32(obj, &["count", "particlesPerSec", "number"], 64, env)
+                    .clamp(1, 2048);
+                let rate = eval_obj_f32(obj, &["rate", "particlesPerSec"], 30.0, env).max(1.0);
+                let lifetime = eval_obj_f32(obj, &["lifetime", "life"], 3.0, env).max(0.1);
+                let size = eval_obj_f32(obj, &["size", "particleSize"], 3.0, env).max(0.1);
+                let velocity = eval_obj_f32(obj, &["velocity"], 12.0, env);
+                let gravity = eval_obj_f32(obj, &["gravity"], -4.0, env);
+                let spread = eval_obj_vec3(obj, &["emitterSize", "spread"], Vec3::splat(6.0), env);
+                let params = ParticleSystemParams {
+                    count,
+                    rate,
+                    lifetime,
+                    position_dist: PositionDistribution::Sphere,
+                    origin: Vec3::ZERO,
+                    position_spread: spread,
+                    radius: spread.length() * 0.25,
+                    radius_spread: spread.length() * 0.25,
+                    velocity_dist: VelocityDistribution::Sphere,
+                    velocity: Vec3::new(0.0, velocity * 0.25, 0.0),
+                    velocity_spread: Vec3::splat(velocity * 0.5),
+                    radial_velocity: velocity,
+                    radial_velocity_spread: velocity * 0.35,
+                    gravity: Vec3::new(0.0, gravity, 0.0),
+                    blending: ParticleBlending::Add,
+                    color_gradient: vec![
+                        ParticleGradientStop {
+                            position: 0.0,
+                            color: [color[0], color[1], color[2], opacity],
+                        },
+                        ParticleGradientStop {
+                            position: 1.0,
+                            color: [color[0], color[1], color[2], 0.0],
+                        },
+                    ],
+                    size_gradient: vec![
+                        ParticleGradientStop {
+                            position: 0.0,
+                            color: [size, size, size, 1.0],
+                        },
+                        ParticleGradientStop {
+                            position: 1.0,
+                            color: [size * 0.3, size * 0.3, size * 0.3, 1.0],
+                        },
+                    ],
+                    ..ParticleSystemParams::default()
+                };
+                let sim_t = t + (seed.unsigned_abs() % 17) as f32 * 0.07;
+                let eval_list = evaluate_particles_cm3_lut(sim_t, &params, false);
+                let mut instances = Vec::with_capacity(eval_list.len());
+                for p in eval_list {
+                    if !p.alive || p.size <= 0.0 {
+                        continue;
+                    }
+                    let wp = world.transform_point3(Vec3::from_array(p.position));
+                    let a = p.color[3].clamp(0.0, 1.0);
+                    instances.push(RenderParticleInstance {
+                        position: wp.to_array(),
+                        size: (p.size * world_scale).max(1e-4),
+                        rotation: p.angle,
+                        color: [p.color[0] * a, p.color[1] * a, p.color[2] * a, a],
+                    });
+                }
+                if !instances.is_empty() {
+                    let sprite = self.ensure_particle_sprite_preset_texture("circle_soft");
+                    out.particles.push(PreparedParticlesSpec {
+                        instances,
+                        sprite,
+                        blend: ParticleBlend::Additive,
+                    });
+                }
+            }
+            TrapcodeKind::Form => {
+                let nx = eval_obj_u32(obj, &["particlesX", "countX"], 6, env).clamp(2, 16);
+                let ny = eval_obj_u32(obj, &["particlesY", "countY"], 6, env).clamp(2, 16);
+                let nz = eval_obj_u32(obj, &["particlesZ", "countZ"], 4, env).clamp(1, 12);
+                let sz_x = eval_obj_f32(obj, &["sizeX"], 24.0, env).max(1.0);
+                let sz_y = eval_obj_f32(obj, &["sizeY"], 24.0, env).max(1.0);
+                let sz_z = eval_obj_f32(obj, &["sizeZ"], 16.0, env).max(1.0);
+                let displace = eval_obj_f32(obj, &["displace", "disperse"], 2.5, env);
+                let node_size =
+                    eval_obj_f32(obj, &["particleSize", "size"], 0.85, env).clamp(0.1, 8.0);
+                let mesh = build_trapcode_form_mesh(
+                    nx,
+                    ny,
+                    nz,
+                    [sz_x, sz_y, sz_z],
+                    displace,
+                    node_size,
+                    t,
+                    seed,
+                );
+                if !mesh.indices.is_empty() {
+                    let mut h = fnv1a_hash64(b"trapcode_form_v1");
+                    h = hash_u64(
+                        h,
+                        u64::from(nx) ^ (u64::from(ny) << 16) ^ (u64::from(nz) << 32),
+                    );
+                    h = hash_f64(h, f64::from(t));
+                    h = hash_u64(h, seed as u64);
+                    let key = MeshCacheKey {
+                        object_id: obj.id,
+                        content_hash: h,
+                    };
+                    let cached = self
+                        .touch_cached_mesh(key)
+                        .unwrap_or_else(|| self.insert_cached_mesh(key, &mesh, "zc-trapcode-form"));
+                    let mat_eval = obj
+                        .material
+                        .as_ref()
+                        .map(|m| self.evaluate_material(Some(m), env))
+                        .unwrap_or_else(|| EvaluatedMaterial {
+                            params: MaterialParams {
+                                shading: ShadingModel::Basic,
+                                base_color: color,
+                                opacity,
+                                blend: if opacity < 0.999 {
+                                    MaterialBlend::Normal
+                                } else {
+                                    MaterialBlend::Opaque
+                                },
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        });
+                    push_prepared_mesh_ex(
+                        out,
+                        obj.id,
+                        &cached,
+                        world,
+                        &mat_eval,
+                        &HashMap::new(),
+                        cast_sh,
+                        recv_sh,
+                        false,
+                    );
+                }
+            }
+            TrapcodeKind::Plexus => {
+                let count =
+                    eval_obj_u32(obj, &["count", "points", "vertices"], 24, env).clamp(3, 96);
+                let radius = eval_obj_f32(obj, &["radius", "size"], 18.0, env).max(1.0);
+                let max_dist =
+                    eval_obj_f32(obj, &["maxDistance", "distance"], radius * 0.85, env).max(0.5);
+                let beam_r =
+                    eval_obj_f32(obj, &["beamThickness", "lineWidth", "thickness"], 0.25, env)
+                        .clamp(0.05, 4.0);
+                let mesh = build_trapcode_plexus_mesh(count, radius, max_dist, beam_r, t, seed);
+                if !mesh.indices.is_empty() {
+                    let mut h = fnv1a_hash64(b"trapcode_plexus_v1");
+                    h = hash_u64(h, u64::from(count));
+                    h = hash_f64(h, f64::from(t));
+                    h = hash_u64(h, seed as u64);
+                    let key = MeshCacheKey {
+                        object_id: obj.id,
+                        content_hash: h,
+                    };
+                    let cached = self.touch_cached_mesh(key).unwrap_or_else(|| {
+                        self.insert_cached_mesh(key, &mesh, "zc-trapcode-plexus")
+                    });
+                    let mat_eval = obj
+                        .material
+                        .as_ref()
+                        .map(|m| self.evaluate_material(Some(m), env))
+                        .unwrap_or_else(|| EvaluatedMaterial {
+                            params: MaterialParams {
+                                shading: ShadingModel::Basic,
+                                base_color: color,
+                                opacity,
+                                blend: if opacity < 0.999 {
+                                    MaterialBlend::Normal
+                                } else {
+                                    MaterialBlend::Opaque
+                                },
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        });
+                    push_prepared_mesh_ex(
+                        out,
+                        obj.id,
+                        &cached,
+                        world,
+                        &mat_eval,
+                        &HashMap::new(),
+                        cast_sh,
+                        recv_sh,
+                        false,
+                    );
                 }
             }
         }
@@ -2505,6 +3724,10 @@ impl ProjectRenderEngine {
         effector_chain: &[usize],
         effector_kinds: &[Option<SceneEffectorKind>],
         mat_eval: &EvaluatedMaterial,
+        slot_mats: &HashMap<u32, EvaluatedMaterial>,
+        cast_shadow: bool,
+        receive_shadow: bool,
+        is_voronoi: bool,
         env: &EvalEnv<'_>,
         salt: u64,
         out: &mut CollectedScene3D,
@@ -2528,20 +3751,21 @@ impl ProjectRenderEngine {
             return;
         }
 
-        let mut uploaded: HashMap<usize, (Arc<GpuMesh>, Aabb3)> = HashMap::new();
+        let mut uploaded: HashMap<usize, CachedMeshHandle> = HashMap::new();
         for (inst_idx, inst) in instances.into_iter().enumerate() {
             if inst.mesh.indices.is_empty() {
                 continue;
             }
             let ptr_key = Arc::as_ptr(&inst.mesh) as usize;
-            let (gpu_mesh, bounds) = if let Some(cached) = uploaded.get(&ptr_key) {
-                (Arc::clone(&cached.0), cached.1)
+            let cached = if let Some(hit) = uploaded.get(&ptr_key) {
+                hit.clone()
             } else {
-                let mut h = fnv1a_hash64(b"effected_mesh_v1");
+                let mut h = fnv1a_hash64(b"effected_mesh_v2");
                 h = hash_u64(h, salt);
                 h = hash_u64(h, inst_idx as u64);
                 h = hash_u64(h, inst.mesh.vertices.len() as u64);
                 h = hash_u64(h, inst.mesh.indices.len() as u64);
+                h = hash_u64(h, inst.mesh.colors.len() as u64);
                 for v in inst
                     .mesh
                     .vertices
@@ -2562,13 +3786,23 @@ impl ProjectRenderEngine {
                     object_id,
                     content_hash: h,
                 };
-                let pair = self.touch_cached_mesh(key).unwrap_or_else(|| {
+                let handle = self.touch_cached_mesh(key).unwrap_or_else(|| {
                     self.insert_cached_mesh(key, &inst.mesh, "zc-effected-mesh")
                 });
-                uploaded.insert(ptr_key, (Arc::clone(&pair.0), pair.1));
-                pair
+                uploaded.insert(ptr_key, handle.clone());
+                handle
             };
-            push_prepared_mesh(out, object_id, gpu_mesh, bounds, inst.world, mat_eval);
+            push_prepared_mesh_ex(
+                out,
+                object_id,
+                &cached,
+                inst.world,
+                mat_eval,
+                slot_mats,
+                cast_shadow,
+                receive_shadow,
+                is_voronoi,
+            );
         }
     }
 
@@ -2577,8 +3811,12 @@ impl ProjectRenderEngine {
         obj: &Object3D,
         shape: &Shape3DKind,
         env: &EvalEnv<'_>,
-    ) -> Option<(Arc<GpuMesh>, Aabb3)> {
-        let content_hash = hash_shape_and_effectors(shape, obj, env);
+    ) -> Option<CachedMeshHandle> {
+        let uv_norm = object_uses_normalized_uv(obj);
+        let content_hash = hash_u64(
+            hash_shape_and_effectors(shape, obj, env),
+            u64::from(uv_norm),
+        );
         let key = MeshCacheKey {
             object_id: obj.id,
             content_hash,
@@ -2589,6 +3827,9 @@ impl ProjectRenderEngine {
 
         let mut mesh = build_shape_mesh_cpu(shape, env);
         mesh = apply_object_effectors(mesh, obj, env);
+        if uv_norm {
+            apply_normalized_uv_layout(&mut mesh);
+        }
         if mesh.indices.is_empty() {
             return None;
         }
@@ -2600,8 +3841,12 @@ impl ProjectRenderEngine {
         obj: &Object3D,
         data: &zc_project::Text3DData,
         env: &EvalEnv<'_>,
-    ) -> Option<(Arc<GpuMesh>, Aabb3)> {
-        let content_hash = hash_text3d_and_effectors(data, obj, env);
+    ) -> Option<CachedMeshHandle> {
+        let uv_norm = object_uses_normalized_uv(obj);
+        let content_hash = hash_u64(
+            hash_text3d_and_effectors(data, obj, env),
+            u64::from(uv_norm),
+        );
         let key = MeshCacheKey {
             object_id: obj.id,
             content_hash,
@@ -2612,6 +3857,9 @@ impl ProjectRenderEngine {
 
         let mut mesh = build_text3d_mesh_cpu(obj, data, env);
         mesh = apply_object_effectors(mesh, obj, env);
+        if uv_norm {
+            apply_normalized_uv_layout(&mut mesh);
+        }
         if mesh.indices.is_empty() {
             return None;
         }
@@ -2623,17 +3871,21 @@ impl ProjectRenderEngine {
         obj: &Object3D,
         data: &zc_project::ModelData,
         env: &EvalEnv<'_>,
-    ) -> Option<(Arc<GpuMesh>, Aabb3)> {
+    ) -> Option<CachedMeshHandle> {
+        let uv_norm = object_uses_normalized_uv(obj);
         let asset_bytes_hash = data
             .asset_id
             .as_deref()
             .and_then(|id| env.project.assets.get(id))
             .map_or(0u64, hash_asset_record);
-        let mut h = fnv1a_hash64(b"model3d");
+        let mut h = fnv1a_hash64(b"model3d_v2");
         h = hash_u64(h, asset_bytes_hash);
         if let Some(p) = data.preset_type {
             h = hash_u64(h, u64::from(p));
         }
+        let lid_rot = eval_model_lid_rotation(data, env);
+        h = hash_u64(h, u64::from(lid_rot.to_bits()));
+        h = hash_u64(h, u64::from(uv_norm));
         h = hash_effectors(h, obj, env);
 
         let key = MeshCacheKey {
@@ -2646,17 +3898,25 @@ impl ProjectRenderEngine {
 
         let mut mesh = build_model_mesh_cpu(data, env);
         mesh = apply_object_effectors(mesh, obj, env);
+        if uv_norm {
+            apply_normalized_uv_layout(&mut mesh);
+        }
         if mesh.indices.is_empty() {
             return None;
         }
         Some(self.insert_cached_mesh(key, &mesh, "zc-model3d-mesh"))
     }
 
-    fn touch_cached_mesh(&mut self, key: MeshCacheKey) -> Option<(Arc<GpuMesh>, Aabb3)> {
+    fn touch_cached_mesh(&mut self, key: MeshCacheKey) -> Option<CachedMeshHandle> {
         if let Some(entry) = self.mesh_cache.get_mut(&key) {
             self.cache_tick = self.cache_tick.wrapping_add(1);
             entry.last_used = self.cache_tick;
-            Some((Arc::clone(&entry.mesh), entry.bounds))
+            Some(CachedMeshHandle {
+                mesh: Arc::clone(&entry.mesh),
+                bounds: entry.bounds,
+                has_vertex_colors: entry.has_vertex_colors,
+                material_slots: entry.material_slots.clone(),
+            })
         } else {
             None
         }
@@ -2667,7 +3927,7 @@ impl ProjectRenderEngine {
         key: MeshCacheKey,
         mesh: &MeshData,
         label: &str,
-    ) -> (Arc<GpuMesh>, Aabb3) {
+    ) -> CachedMeshHandle {
         self.cache_tick = self.cache_tick.wrapping_add(1);
         let tick = self.cache_tick;
         while self.mesh_cache.len() >= MAX_CACHED_MESHES {
@@ -2682,31 +3942,34 @@ impl ProjectRenderEngine {
             self.mesh_cache.remove(&oldest);
         }
 
-        let gpu_verts: Vec<MeshVertex> = mesh
-            .vertices
-            .iter()
-            .map(|v| MeshVertex {
-                position: v.position,
-                normal: v.normal,
-                uv: v.uv,
-                material_slot: v.material_slot,
-            })
-            .collect();
-        let gpu_mesh = Arc::new(GpuMesh::from_slices(
-            &self.ctx,
-            &gpu_verts,
-            &mesh.indices,
-            Some(label),
-        ));
+        let has_vertex_colors = !mesh.colors.is_empty();
+        let mut slots: Vec<u32> = Vec::new();
+        for v in &mesh.vertices {
+            if !slots.contains(&v.material_slot) {
+                slots.push(v.material_slot);
+            }
+        }
+        slots.sort_unstable();
+        if slots.is_empty() {
+            slots.push(0);
+        }
+        let gpu_mesh = Arc::new(GpuMesh::from_mesh_data(&self.ctx, mesh, Some(label)));
         self.mesh_cache.insert(
             key,
             CachedGpuMesh {
                 mesh: Arc::clone(&gpu_mesh),
                 bounds: mesh.bounds,
+                has_vertex_colors,
+                material_slots: slots.clone(),
                 last_used: tick,
             },
         );
-        (gpu_mesh, mesh.bounds)
+        CachedMeshHandle {
+            mesh: gpu_mesh,
+            bounds: mesh.bounds,
+            has_vertex_colors,
+            material_slots: slots,
+        }
     }
 
     fn evaluate_material(
@@ -2755,10 +4018,21 @@ impl ProjectRenderEngine {
             }
             MaterialSpec::Video(m) => {
                 let opacity = eval_f32(&m.opacity, env).clamp(0.0, 1.0);
-                let albedo = m
-                    .video
-                    .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                let video_time = ((env.frame - f64::from(m.start_offset)
+                    + f64::from(m.media_offset))
+                    / env.fps.max(1.0))
+                .max(0.0);
+                let gif_enabled = env.plugins.is_enabled("gif-support");
+                let albedo = m.video.as_deref().and_then(|id| {
+                    if gif_enabled
+                        && let Some(gif_tex) =
+                            self.ensure_gif_frame_texture(env.project, id, video_time, false)
+                    {
+                        return Some(gif_tex);
+                    }
+                    self.ensure_video_frame_texture(env.project, id, video_time, false)
+                        .or_else(|| self.ensure_image_asset_texture(env.project, id, false))
+                });
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::Basic,
@@ -2798,6 +4072,7 @@ impl ProjectRenderEngine {
                         uv_center: eval_vec2(&m.center, env),
                         uv_rotation: eval_f32(&m.rotation, env),
                         wrap: TextureWrap::from_cm3(m.wrap),
+                        reflection_enabled: m.reflection,
                         albedo_premultiplied: false,
                         ..Default::default()
                     },
@@ -2844,6 +4119,16 @@ impl ProjectRenderEngine {
                     .alpha_map
                     .as_deref()
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                let ao_map = m
+                    .ao_texture
+                    .as_deref()
+                    .or_else(|| {
+                        m.preserved
+                            .get("aoTexture")
+                            .or_else(|| m.preserved.get("aoMap"))
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
                 let env_map = m
                     .preserved
                     .get("envMap")
@@ -2852,28 +4137,32 @@ impl ProjectRenderEngine {
                     .and_then(serde_json::Value::as_str)
                     .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
 
+                let mut params = MaterialParams {
+                    shading: ShadingModel::StandardPbr,
+                    base_color: eval_color_rgb(&m.base_color, env, [1.0, 1.0, 1.0]),
+                    emissive: eval_color_rgb(&m.emissive, env, [0.0, 0.0, 0.0]),
+                    opacity,
+                    roughness: eval_f32(&m.roughness, env).clamp(0.04, 1.0),
+                    metalness: eval_f32(&m.metalness, env).clamp(0.0, 1.0),
+                    normal_scale,
+                    side: map_cull_side(m.side),
+                    blend: map_material_blend(m.blending, m.transparent, opacity),
+                    uv_repeat: eval_vec2(&m.repeat, env),
+                    uv_offset: eval_vec2(&m.offset, env),
+                    uv_center: eval_vec2(&m.center, env),
+                    uv_rotation: eval_f32(&m.rotation, env),
+                    wrap: TextureWrap::from_cm3(m.wrap),
+                    emissive_intensity,
+                    alpha_test,
+                    reflection_intensity,
+                    reflection_enabled: m.reflection,
+                    albedo_premultiplied: false,
+                    ..Default::default()
+                };
+                apply_pbr_plus_surface_props(&mut params, &m.preserved, ao_map.is_some(), env);
+
                 EvaluatedMaterial {
-                    params: MaterialParams {
-                        shading: ShadingModel::StandardPbr,
-                        base_color: eval_color_rgb(&m.base_color, env, [1.0, 1.0, 1.0]),
-                        emissive: eval_color_rgb(&m.emissive, env, [0.0, 0.0, 0.0]),
-                        opacity,
-                        roughness: eval_f32(&m.roughness, env).clamp(0.04, 1.0),
-                        metalness: eval_f32(&m.metalness, env).clamp(0.0, 1.0),
-                        normal_scale,
-                        side: map_cull_side(m.side),
-                        blend: map_material_blend(m.blending, m.transparent, opacity),
-                        uv_repeat: eval_vec2(&m.repeat, env),
-                        uv_offset: eval_vec2(&m.offset, env),
-                        uv_center: eval_vec2(&m.center, env),
-                        uv_rotation: eval_f32(&m.rotation, env),
-                        wrap: TextureWrap::from_cm3(m.wrap),
-                        emissive_intensity,
-                        alpha_test,
-                        reflection_intensity,
-                        albedo_premultiplied: false,
-                        ..Default::default()
-                    },
+                    params,
                     albedo,
                     normal,
                     matcap: None,
@@ -2881,7 +4170,11 @@ impl ProjectRenderEngine {
                     roughness_map,
                     metalness_map,
                     alpha_map,
+                    ao_map,
                     env_map,
+                    custom_shader_key: None,
+                    custom_params_a: [0.0; 4],
+                    custom_params_b: [0.0; 4],
                 }
             }
             MaterialSpec::Matcap(m) => {
@@ -2935,9 +4228,205 @@ impl ProjectRenderEngine {
                     ..Default::default()
                 }
             }
-            MaterialSpec::CustomShader { .. }
-            | MaterialSpec::NodeMaterial { .. }
-            | MaterialSpec::Unknown { .. } => EvaluatedMaterial::default(),
+            MaterialSpec::NodeMaterial {
+                resolution, graph, ..
+            } => {
+                let bake_res = (*resolution).clamp(32, 1024);
+                let mut h = fnv1a_hash64(b"node_material_v1");
+                h = hash_u64(h, u64::from(bake_res));
+                if let Ok(bytes) = serde_json::to_vec(graph) {
+                    h = hash_u64(h, fnv1a_hash64(&bytes));
+                }
+                if let Some(entry) = self.node_material_cache.get_mut(&h) {
+                    self.cache_tick = self.cache_tick.wrapping_add(1);
+                    entry.last_used = self.cache_tick;
+                    return entry.eval.clone();
+                }
+
+                let eval = match bake_node_material_maps(graph, bake_res) {
+                    Ok(baked) => {
+                        let upload_baked = |engine: &mut Self,
+                                            chan: &str,
+                                            map_opt: Option<&zc_shader::BakedMap>|
+                         -> Option<Arc<RenderTarget>> {
+                            let bm = map_opt?;
+                            let key = TextureCacheKey {
+                                asset_key: format!("nodemat:{h:016x}:{chan}"),
+                                content_hash: h,
+                                premultiply: false,
+                            };
+                            if let Some(hit) = engine.touch_cached_texture(&key) {
+                                return Some(hit);
+                            }
+                            let tex = engine
+                                .ctx
+                                .create_rgba8_texture(
+                                    "zc-node-mat-map",
+                                    bm.width,
+                                    bm.height,
+                                    &bm.rgba8,
+                                )
+                                .ok()?;
+                            Some(engine.insert_cached_texture(key, tex))
+                        };
+                        let albedo = upload_baked(self, "color", baked.color.as_ref());
+                        let emissive_map = upload_baked(self, "emissive", baked.emissive.as_ref());
+                        let roughness_map =
+                            upload_baked(self, "roughness", baked.roughness.as_ref());
+                        let metalness_map =
+                            upload_baked(self, "metalness", baked.metalness.as_ref());
+                        let normal = upload_baked(self, "normal", baked.normal.as_ref());
+                        let alpha_map = upload_baked(self, "opacity", baked.opacity.as_ref());
+
+                        let has_alpha_map = alpha_map.is_some();
+                        let opacity = baked.opacity_factor.clamp(0.0, 1.0);
+                        let blend = if has_alpha_map || opacity < 0.999 {
+                            MaterialBlend::Normal
+                        } else {
+                            MaterialBlend::Opaque
+                        };
+                        EvaluatedMaterial {
+                            params: MaterialParams {
+                                shading: ShadingModel::StandardPbr,
+                                base_color: if albedo.is_some() {
+                                    [1.0, 1.0, 1.0]
+                                } else {
+                                    [
+                                        baked.base_color_factor[0],
+                                        baked.base_color_factor[1],
+                                        baked.base_color_factor[2],
+                                    ]
+                                },
+                                emissive: if emissive_map.is_some() {
+                                    [1.0, 1.0, 1.0]
+                                } else {
+                                    baked.emissive_factor
+                                },
+                                opacity,
+                                roughness: if roughness_map.is_some() {
+                                    1.0
+                                } else {
+                                    baked.roughness_factor.clamp(0.04, 1.0)
+                                },
+                                metalness: if metalness_map.is_some() {
+                                    1.0
+                                } else {
+                                    baked.metalness_factor.clamp(0.0, 1.0)
+                                },
+                                normal_scale: baked.normal_strength,
+                                blend,
+                                albedo_premultiplied: false,
+                                ..Default::default()
+                            },
+                            albedo,
+                            normal,
+                            matcap: None,
+                            emissive_map,
+                            roughness_map,
+                            metalness_map,
+                            alpha_map,
+                            ao_map: None,
+                            env_map: None,
+                            custom_shader_key: None,
+                            custom_params_a: [0.0; 4],
+                            custom_params_b: [0.0; 4],
+                        }
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "failed to bake NodeMaterial procedural maps");
+                        EvaluatedMaterial::default()
+                    }
+                };
+
+                while self.node_material_cache.len() >= MAX_CACHED_NODE_MATERIALS {
+                    let Some(&oldest) = self
+                        .node_material_cache
+                        .iter()
+                        .min_by_key(|(_, e)| e.last_used)
+                        .map(|(k, _)| k)
+                    else {
+                        break;
+                    };
+                    self.node_material_cache.remove(&oldest);
+                }
+                self.cache_tick = self.cache_tick.wrapping_add(1);
+                let tick = self.cache_tick;
+                self.node_material_cache.insert(
+                    h,
+                    CachedNodeMaterial {
+                        eval: eval.clone(),
+                        last_used: tick,
+                    },
+                );
+                eval
+            }
+            MaterialSpec::CustomShader {
+                frag_shader,
+                custom_properties,
+            } => {
+                let mut params_a = [1.0_f32, 1.0, 1.0, 1.0];
+                let mut params_b = [0.0_f32; 4];
+                let mut slot = 0usize;
+                for cp in custom_properties {
+                    let val = eval_property_track(&cp.track, env);
+                    let vals: Vec<f32> = match val {
+                        PropertyValue::Number(v) => vec![v as f32],
+                        PropertyValue::Vec2(v) => vec![v[0] as f32, v[1] as f32],
+                        PropertyValue::Vec3(v) | PropertyValue::Color(v) => {
+                            vec![v[0] as f32, v[1] as f32, v[2] as f32]
+                        }
+                        PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) => {
+                            vec![v[0] as f32, v[1] as f32, v[2] as f32, v[3] as f32]
+                        }
+                        PropertyValue::Bool(b) => vec![if b { 1.0 } else { 0.0 }],
+                        PropertyValue::Option(o) => vec![o as f32],
+                        _ => Vec::new(),
+                    };
+                    for v in vals {
+                        if slot < 4 {
+                            params_a[slot] = v;
+                        } else if slot < 8 {
+                            params_b[slot - 4] = v;
+                        }
+                        slot += 1;
+                    }
+                }
+                let wgsl_body: Cow<'_, str> = if frag_shader.contains("fn custom_material_fs") {
+                    Cow::Borrowed(frag_shader.as_str())
+                } else {
+                    // Fallback WGSL body for non-WGSL 3D CustomShader materials so they still render distinctly.
+                    Cow::Borrowed(
+                        "fn custom_material_fs(world_pos: vec3<f32>, world_normal: vec3<f32>, uv: vec2<f32>, vertex_color: vec4<f32>, camera_pos: vec3<f32>, time: f32, params_a: vec4<f32>, params_b: vec4<f32>) -> vec4<f32> {\n    let n = normalize(world_normal);\n    let v = normalize(camera_pos - world_pos);\n    let ndotv = max(dot(n, v), 0.15);\n    let col = clamp(params_a.rgb * ndotv * vertex_color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return vec4<f32>(col, clamp(params_a.a * vertex_color.a, 0.0, 1.0));\n}",
+                    )
+                };
+                let key = format!("custom3d:{:016x}", fnv1a_hash64(wgsl_body.as_bytes()));
+                if !self.registered_custom_3d_materials.contains(&key) {
+                    match self
+                        .scene3d
+                        .register_custom_material_shader(&self.ctx, &key, &wgsl_body)
+                    {
+                        Ok(()) => {
+                            self.registered_custom_3d_materials.insert(key.clone());
+                        }
+                        Err(err) => {
+                            warn!(shader_key = %key, error = %err, "failed to register 3D CustomShader material");
+                            return EvaluatedMaterial::default();
+                        }
+                    }
+                }
+                EvaluatedMaterial {
+                    params: MaterialParams {
+                        side: CullSide::Front,
+                        blend: MaterialBlend::Opaque,
+                        ..Default::default()
+                    },
+                    custom_shader_key: Some(key),
+                    custom_params_a: params_a,
+                    custom_params_b: params_b,
+                    ..Default::default()
+                }
+            }
+            MaterialSpec::Unknown { .. } => EvaluatedMaterial::default(),
         }
     }
 
@@ -3035,7 +4524,7 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<RenderTarget, RenderError> {
-        let mut h = fnv1a_hash64(b"shape_plus_2d");
+        let mut h = fnv1a_hash64(b"shape_plus_2d_v2");
         h = hash_u64(h, u64::from(width));
         h = hash_u64(h, u64::from(height));
         h = hash_u64(h, u64::from(env.sequence_resolution[0]));
@@ -3052,7 +4541,18 @@ impl ProjectRenderEngine {
         let tex = if let Some(cached) = self.touch_cached_texture(&key) {
             cached
         } else {
-            let rgba = rasterize_shape_plus_payload(payload, env, width, height);
+            let expr_cb = |expr_src: &str, f: f64| -> Option<f64> {
+                eval_scalar_expr_at_frame(expr_src, env, f)
+            };
+            let rgba = rasterize_shape_plus(
+                payload,
+                width,
+                height,
+                env.sequence_resolution,
+                env.frame,
+                env.fps,
+                Some(&expr_cb),
+            );
             let created =
                 self.ctx
                     .create_rgba8_texture("zc-shape-plus-2d", width, height, &rgba)?;
@@ -3079,9 +4579,11 @@ impl ProjectRenderEngine {
             }
             let flat: Vec<f32> = if !m.path.channels.is_empty() {
                 m.path.channels.iter().map(|ch| eval_f32(ch, env)).collect()
+            } else if !m.path.keyframes.is_empty() {
+                eval_property_track_f32_array(&m.path, env)
             } else {
                 match eval_property_track(&m.path, env) {
-                    PropertyValue::Json(v) => eval_json_anim_f32_array(Some(&v), env.frame),
+                    PropertyValue::Json(v) => eval_json_anim_f32_array_aa(Some(&v), env),
                     _ => Vec::new(),
                 }
             };
@@ -3150,7 +4652,7 @@ impl ProjectRenderEngine {
         }
         let w = layer_target.width;
         let h = layer_target.height;
-        let mut hash = fnv1a_hash64(b"zoidium_masks_v1");
+        let mut hash = fnv1a_hash64(b"zoidium_masks_aa_v2");
         hash = hash_u64(hash, u64::from(w));
         hash = hash_u64(hash, u64::from(h));
         hash = hash_u64(hash, u64::from(env.sequence_resolution[0]));
@@ -3179,7 +4681,40 @@ impl ProjectRenderEngine {
         let mask_tex = if let Some(cached) = self.touch_cached_texture(&key) {
             cached
         } else {
-            let cov_rgba = rasterize_zoidium_masks_rgba8(masks, env.sequence_resolution, w, h);
+            let sx = (w as f32) / (env.sequence_resolution[0].max(1) as f32);
+            let sy = (h as f32) / (env.sequence_resolution[1].max(1) as f32);
+            let scale = (sx + sy) * 0.5;
+            let aa_masks: Vec<ShapePlusMask> = masks
+                .iter()
+                .map(|m| ShapePlusMask {
+                    vertices: m
+                        .vertices
+                        .iter()
+                        .map(|v| {
+                            [
+                                v.point[0] * sx,
+                                v.point[1] * sy,
+                                v.in_h[0] * sx,
+                                v.in_h[1] * sy,
+                                v.out_h[0] * sx,
+                                v.out_h[1] * sy,
+                            ]
+                        })
+                        .collect(),
+                    closed: m.closed,
+                    mode: m.mode.clone(),
+                    feather: (m.feather * scale).clamp(0.0, 500.0),
+                    expansion: (m.expansion * scale).clamp(-128.0, 128.0),
+                    opacity: m.opacity.clamp(0.0, 1.0),
+                    invert: m.invert,
+                    enabled: true,
+                })
+                .collect();
+            let cov_u8 = rasterize_masks_aa(&aa_masks, w, h);
+            let mut cov_rgba = Vec::with_capacity(cov_u8.len() * 4);
+            for b in cov_u8 {
+                cov_rgba.extend_from_slice(&[b, b, b, b]);
+            }
             let created = self
                 .ctx
                 .create_rgba8_texture("zc-zoidium-mask", w, h, &cov_rgba)?;
@@ -3210,6 +4745,7 @@ impl ProjectRenderEngine {
         font: Option<&str>,
         size: u32,
         shapes: &[Shape2DNode],
+        text_plus_2d: Option<&serde_json::Value>,
         env: &EvalEnv<'_>,
         width: u32,
         height: u32,
@@ -3233,8 +4769,181 @@ impl ProjectRenderEngine {
             .iter()
             .any(|op| matches!(op, EvalPaintOp::Stroke(_, w) if *w > 0.0));
         let text_transform = extract_primary_shape_transform(shapes, env);
-
         let font_bytes = resolve_font_bytes(env.project, font);
+
+        // Text+ 2D (`zoidiumTextPlus2D`) per-character transform path!
+        if let Some(tp_json) = text_plus_2d {
+            let params = Text3DParams {
+                text: text.to_owned(),
+                height: px_size,
+                thickness: 0.0,
+                curve_segments,
+                bevel_enabled: false,
+                bevel_thickness: 0.0,
+                bevel_size: 0.0,
+                bevel_segments: 1,
+                align: TextAlignMode::Center,
+                uv_mode: UvMode::Current,
+                letter_spacing: 0.0,
+                line_height: 1.2,
+            };
+            let ext_opts = Text3DExtendedOptions::default();
+            let char_meshes = font_bytes
+                .and_then(|b| build_text3d_character_meshes(b, &params, &ext_opts, Vec3::ONE).ok())
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    build_text3d_character_meshes(
+                        DEFAULT_TTF_FONT_BYTES,
+                        &params,
+                        &ext_opts,
+                        Vec3::ONE,
+                    )
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                })
+                .unwrap_or_default();
+            if !char_meshes.is_empty() {
+                let expr_cb = |expr_src: &str, f: f64| -> Option<f64> {
+                    eval_scalar_expr_at_frame(expr_src, env, f)
+                };
+                let char_tfs = evaluate_text_plus_2d_chars(
+                    tp_json,
+                    char_meshes.len(),
+                    env.frame,
+                    env.fps,
+                    Some(&expr_cb),
+                );
+                let any_active = char_tfs.iter().any(|ct| !ct.is_neutral());
+                if any_active {
+                    let base_model = Mat4::from_translation(Vec3::new(
+                        text_transform.position[0] * scale_x,
+                        text_transform.position[1] * scale_y,
+                        0.0,
+                    )) * Mat4::from_rotation_z(text_transform.rotation)
+                        * Mat4::from_scale(Vec3::new(
+                            text_transform.scale[0],
+                            text_transform.scale[1],
+                            1.0,
+                        ));
+                    let fill = paint_ops
+                        .iter()
+                        .rev()
+                        .find_map(|op| match op {
+                            EvalPaintOp::Fill(c) => Some(*c),
+                            EvalPaintOp::Stroke(_, _) => None,
+                        })
+                        .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+                    let mut gpu_chars: Vec<(Arc<GpuMesh>, Mat4, f32)> =
+                        Vec::with_capacity(char_meshes.len());
+                    for (ci, ch) in char_meshes.into_iter().enumerate() {
+                        if ch.mesh.indices.is_empty() {
+                            continue;
+                        }
+                        let ct = char_tfs.get(ci).copied().unwrap_or_default();
+                        let eff_op = (fill[3] * ct.opacity).clamp(0.0, 1.0);
+                        if eff_op <= 1e-4 {
+                            continue;
+                        }
+                        let ch_pos = ch.anchor_pos
+                            + Vec3::new(ct.offset[0] * scale_x, ct.offset[1] * scale_y, 0.0);
+                        let ch_mat = base_model
+                            * Mat4::from_translation(ch_pos)
+                            * Mat4::from_rotation_z(ct.rotation_rad)
+                            * Mat4::from_scale(Vec3::new(ct.scale[0], ct.scale[1], 1.0))
+                            * Mat4::from_translation(ch.mesh_offset)
+                            * Mat4::from_scale(ch.mesh_scale);
+                        let mut mh = fnv1a_hash64(b"text2d_tp_char_v1");
+                        mh = hash_u64(mh, fnv1a_hash64(text.as_bytes()));
+                        mh = hash_u64(mh, u64::from(px_size.to_bits()));
+                        mh = hash_u64(mh, ci as u64);
+                        let key = MeshCacheKey {
+                            object_id: layer_id,
+                            content_hash: mh,
+                        };
+                        let handle = self.touch_cached_mesh(key).unwrap_or_else(|| {
+                            self.insert_cached_mesh(key, &ch.mesh, "zc-text2d-tp-char")
+                        });
+                        gpu_chars.push((handle.mesh, ch_mat, eff_op));
+                    }
+
+                    let color = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
+                    if gpu_chars.is_empty() {
+                        self.compositor
+                            .clear_target(&self.ctx, &color, wgpu::Color::TRANSPARENT);
+                        return Ok(color);
+                    }
+                    let half_w = (width as f32) * 0.5;
+                    let half_h = (height as f32) * 0.5;
+                    let view =
+                        Mat4::from_translation(Vec3::new(0.0, 0.0, -10.0)).to_cols_array_2d();
+                    let proj = mat4_orthographic_rh(-half_w, half_w, -half_h, half_h, 0.1, 100.0);
+                    let camera = CameraParams {
+                        view,
+                        proj,
+                        view_proj: mat4_mul(proj, view),
+                        eye_position: [0.0, 0.0, 10.0],
+                    };
+                    let depth = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Depth32Float,
+                    )?;
+                    let draws: Vec<MeshDrawCall<'_>> = gpu_chars
+                        .iter()
+                        .map(|(mesh, mat, op)| MeshDrawCall {
+                            mesh: mesh.as_ref(),
+                            model: mat.to_cols_array_2d(),
+                            normal_matrix: compute_normal_matrix(*mat),
+                            material: MaterialParams {
+                                shading: ShadingModel::Basic,
+                                base_color: [fill[0], fill[1], fill[2]],
+                                opacity: *op,
+                                side: CullSide::Both,
+                                blend: if *op < 0.999 {
+                                    MaterialBlend::Normal
+                                } else {
+                                    MaterialBlend::Opaque
+                                },
+                                ..Default::default()
+                            },
+                            albedo_view: None,
+                            normal_view: None,
+                            matcap_view: None,
+                            cast_shadow: false,
+                            receive_shadow: false,
+                        })
+                        .collect();
+                    let res = self.scene3d.render(
+                        &self.ctx,
+                        &color,
+                        &depth,
+                        &Scene3DPassInput {
+                            camera,
+                            lights: &[],
+                            meshes: &draws,
+                            particles: &[],
+                            compat_mode: RenderCompatMode::Current,
+                            editing_camera: false,
+                            selection_aabb: None,
+                        },
+                    );
+                    self.targets.release(depth);
+                    return match res {
+                        Ok(()) => Ok(color),
+                        Err(err) => {
+                            self.targets.release(color);
+                            Err(err)
+                        }
+                    };
+                }
+            }
+        }
 
         let mut h = fnv1a_hash64(b"text_2d_v2");
         h = hash_u64(h, fnv1a_hash64(text.as_bytes()));
@@ -3344,7 +5053,7 @@ impl ProjectRenderEngine {
                 self.targets
                     .acquire(&self.ctx, rw, rh, wgpu::TextureFormat::Depth32Float)?;
             let draw = [MeshDrawCall {
-                mesh: cached_mesh.0.as_ref(),
+                mesh: cached_mesh.mesh.as_ref(),
                 model: model_mat.to_cols_array_2d(),
                 normal_matrix: compute_normal_matrix(model_mat),
                 material: MaterialParams {
@@ -3440,7 +5149,7 @@ impl ProjectRenderEngine {
             self.targets
                 .acquire(&self.ctx, width, height, wgpu::TextureFormat::Depth32Float)?;
         let draw = [MeshDrawCall {
-            mesh: cached_mesh.0.as_ref(),
+            mesh: cached_mesh.mesh.as_ref(),
             model: model_mat.to_cols_array_2d(),
             normal_matrix: compute_normal_matrix(model_mat),
             material: MaterialParams {
@@ -3500,6 +5209,127 @@ impl ProjectRenderEngine {
         Ok(color)
     }
 
+    /// Decodes an animated GIF asset (`GIF87a` / `GIF89a`) once per asset ID and returns the
+    /// frame matching `time_secs % total_duration_sec` as a cached GPU texture.
+    fn ensure_gif_frame_texture(
+        &mut self,
+        project: &Project,
+        asset_id: &str,
+        time_secs: f64,
+        premultiply: bool,
+    ) -> Option<Arc<RenderTarget>> {
+        let record = project.assets.get(asset_id)?;
+        let bytes = record.bytes.as_deref()?;
+        if bytes.len() < 6 || (&bytes[..6] != b"GIF87a" && &bytes[..6] != b"GIF89a") {
+            return None;
+        }
+        let content_hash = hash_asset_record(record);
+        let needs_decode = self
+            .gif_cache
+            .get(asset_id)
+            .is_none_or(|c| c.content_hash != content_hash);
+        if needs_decode {
+            let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+            let mut decoded_frames = Vec::new();
+            let mut acc_sec = 0.0_f64;
+            for frame_res in decoder.into_frames() {
+                let Ok(frame) = frame_res else {
+                    break;
+                };
+                let (num, den) = frame.delay().numer_denom_ms();
+                let dur = if num == 0 {
+                    0.1
+                } else {
+                    (f64::from(num) / (f64::from(den.max(1)) * 1000.0)).max(0.01)
+                };
+                acc_sec += dur;
+                let buf = frame.into_buffer();
+                let (w, h) = buf.dimensions();
+                if self
+                    .ctx
+                    .validate_dimensions(w, h, wgpu::TextureFormat::Rgba8Unorm)
+                    .is_err()
+                {
+                    return None;
+                }
+                decoded_frames.push(CachedGifFrame {
+                    width: w,
+                    height: h,
+                    rgba_straight: buf.into_raw(),
+                    end_time_sec: acc_sec,
+                });
+                if decoded_frames.len() >= 1024 {
+                    break;
+                }
+            }
+            if decoded_frames.is_empty() {
+                return None;
+            }
+            while self.gif_cache.len() >= MAX_CACHED_GIFS {
+                let Some(oldest) = self
+                    .gif_cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                self.gif_cache.remove(&oldest);
+            }
+            self.cache_tick = self.cache_tick.wrapping_add(1);
+            let tick = self.cache_tick;
+            self.gif_cache.insert(
+                asset_id.to_owned(),
+                CachedGifAnimation {
+                    content_hash,
+                    total_duration_sec: acc_sec.max(1e-4),
+                    frames: decoded_frames,
+                    last_used: tick,
+                },
+            );
+        }
+
+        let (frame_idx, w, h, mut pixels) = {
+            let entry = self.gif_cache.get_mut(asset_id)?;
+            self.cache_tick = self.cache_tick.wrapping_add(1);
+            entry.last_used = self.cache_tick;
+            let t_mod = if entry.frames.len() <= 1 {
+                0.0
+            } else {
+                time_secs.max(0.0) % entry.total_duration_sec
+            };
+            let idx = entry
+                .frames
+                .iter()
+                .position(|f| t_mod < f.end_time_sec)
+                .unwrap_or(entry.frames.len() - 1);
+            let f = &entry.frames[idx];
+            (idx, f.width, f.height, f.rgba_straight.clone())
+        };
+
+        let key = TextureCacheKey {
+            asset_key: format!("gif:{asset_id}#{frame_idx}"),
+            content_hash: hash_u64(content_hash, frame_idx as u64),
+            premultiply,
+        };
+        if let Some(cached) = self.touch_cached_texture(&key) {
+            return Some(cached);
+        }
+        if premultiply {
+            for px in pixels.as_chunks_mut::<4>().0 {
+                let a = f32::from(px[3]) / 255.0;
+                px[0] = (f32::from(px[0]) * a).round() as u8;
+                px[1] = (f32::from(px[1]) * a).round() as u8;
+                px[2] = (f32::from(px[2]) * a).round() as u8;
+            }
+        }
+        let target = self
+            .ctx
+            .create_rgba8_texture("zc-asset-gif-frame", w, h, &pixels)
+            .ok()?;
+        Some(self.insert_cached_texture(key, target))
+    }
+
     /// Samples a video asset at `time_secs` if it is a video container; returns `None` for
     /// static images or when video decode is unavailable (caller falls back to image decode).
     fn ensure_video_frame_texture(
@@ -3507,6 +5337,7 @@ impl ProjectRenderEngine {
         project: &Project,
         asset_id: &str,
         time_secs: f64,
+        premultiply: bool,
     ) -> Option<Arc<RenderTarget>> {
         let record = project.assets.get(asset_id)?;
         if record.kind != zc_project::AssetKind::Av {
@@ -3518,7 +5349,7 @@ impl ProjectRenderEngine {
         let key = TextureCacheKey {
             asset_key: format!("vid:{asset_id}@{ms_bucket}"),
             content_hash: hash_u64(base_hash, ms_bucket),
-            premultiply: true,
+            premultiply,
         };
         if let Some(cached) = self.touch_cached_texture(&key) {
             return Some(cached);
@@ -3578,11 +5409,13 @@ impl ProjectRenderEngine {
             return None;
         }
         let mut pixels = img.into_raw();
-        for px in pixels.as_chunks_mut::<4>().0 {
-            let a = f32::from(px[3]) / 255.0;
-            px[0] = (f32::from(px[0]) * a).round() as u8;
-            px[1] = (f32::from(px[1]) * a).round() as u8;
-            px[2] = (f32::from(px[2]) * a).round() as u8;
+        if premultiply {
+            for px in pixels.as_chunks_mut::<4>().0 {
+                let a = f32::from(px[3]) / 255.0;
+                px[0] = (f32::from(px[0]) * a).round() as u8;
+                px[1] = (f32::from(px[1]) * a).round() as u8;
+                px[2] = (f32::from(px[2]) * a).round() as u8;
+            }
         }
         let target = self
             .ctx
@@ -3777,6 +5610,10 @@ impl ProjectRenderEngine {
                 let mut step_ctx = TemporalEffectContext {
                     backdrop: tctx.backdrop,
                     layer: tctx.layer,
+                    track_idx: tctx.track_idx,
+                    track_is_3d: tctx.track_is_3d,
+                    transparent_background: tctx.transparent_background,
+                    shared_camera: tctx.shared_camera,
                     time_curve: tctx.time_curve,
                     prefix_effects: if group_depth == 0 {
                         &effects[..idx]
@@ -3786,6 +5623,7 @@ impl ProjectRenderEngine {
                     visited_comps: tctx.visited_comps,
                     visited_tracks: tctx.visited_tracks,
                     comp_depth: tctx.comp_depth,
+                    depth: tctx.depth,
                     scene_override: tctx.scene_override,
                 };
                 source = self.apply_single_effect(
@@ -3836,9 +5674,14 @@ impl ProjectRenderEngine {
                     temporal_ctx,
                 )
             }
-            EffectKind::Standard(effect_id) => {
-                self.apply_builtin_effect(source, effect_id, &fx.params, env, temporal_ctx)
-            }
+            EffectKind::Standard(effect_id) => self.apply_builtin_effect(
+                source,
+                effect_id,
+                &fx.params,
+                &fx.preserved,
+                env,
+                temporal_ctx,
+            ),
             EffectKind::Plugin {
                 plugin_id,
                 effect_id,
@@ -3846,19 +5689,30 @@ impl ProjectRenderEngine {
                 if !env.plugins.is_enabled(plugin_id) {
                     return Ok(source);
                 }
-                // Handle temporal & layer-input plugin effects directly in the engine even if
-                // they have no standalone fragment shader in `PLUGIN_EFFECT_SHADERS`.
+                // Handle temporal, node-effect, layer-input, and all native/plugin GPU effects.
                 if matches!(
                     effect_id.as_str(),
                     "timeoffset"
                         | "posterizetime"
                         | "posterizetime-legacy"
                         | "timeremap"
+                        | "time-remap"
                         | "layer-input"
                         | "layerinput"
+                        | "layer-input-displacement"
+                        | "layerinputdisplacement"
+                        | "nodeeffect"
+                        | "node-effect"
                 ) || lookup_effect_shader(effect_id).is_some()
                 {
-                    self.apply_builtin_effect(source, effect_id, &fx.params, env, temporal_ctx)
+                    self.apply_builtin_effect(
+                        source,
+                        effect_id,
+                        &fx.params,
+                        &fx.preserved,
+                        env,
+                        temporal_ctx,
+                    )
                 } else {
                     debug!(
                         plugin_id,
@@ -3888,6 +5742,9 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<Option<RenderTarget>, RenderError> {
+        if tctx.depth >= MAX_TEMPORAL_DEPTH {
+            return Ok(None);
+        }
         let fps = env.fps.max(1.0);
         let sample_frame = env.frame + frame_offset;
         let sample_abs_frame = env.abs_frame + frame_offset;
@@ -3915,8 +5772,33 @@ impl ProjectRenderEngine {
             fps,
             ..env.clone()
         };
-        let Some(mut target) = self.render_layer_content(
-            tctx.backdrop,
+
+        // Wave 2D A1: For Adjustment layers, re-render lower visible tracks (`tracks[0..track_idx]`)
+        // at `sample_abs_frame` into a fresh temporary `RenderTarget` instead of reusing frozen `tctx.backdrop`!
+        let fresh_adj_backdrop = if matches!(tctx.layer.kind, LayerKind::Adjustment)
+            && let Some(track_idx) = tctx.track_idx
+        {
+            Some(self.render_sequence_prefix_tracks(
+                env.project,
+                env.sequence,
+                env.plugins,
+                sample_abs_frame,
+                track_idx,
+                width,
+                height,
+                tctx.visited_comps,
+                tctx.visited_tracks,
+                tctx.comp_depth,
+                tctx.depth + 1,
+                tctx.transparent_background,
+            )?)
+        } else {
+            None
+        };
+
+        let effective_backdrop = fresh_adj_backdrop.as_ref().unwrap_or(tctx.backdrop);
+        let rendered = self.render_layer_content(
+            effective_backdrop,
             tctx.layer,
             &sample_env,
             width,
@@ -3924,31 +5806,82 @@ impl ProjectRenderEngine {
             tctx.visited_comps,
             tctx.visited_tracks,
             tctx.comp_depth,
+            if tctx.track_is_3d {
+                tctx.shared_camera
+            } else {
+                None
+            },
             tctx.scene_override,
-        )?
-        else {
+        );
+        let Some(mut target) = (match rendered {
+            Ok(opt) => opt,
+            Err(err) => {
+                if let Some(bd) = fresh_adj_backdrop {
+                    self.targets.release(bd);
+                }
+                return Err(err);
+            }
+        }) else {
+            if let Some(bd) = fresh_adj_backdrop {
+                self.targets.release(bd);
+            }
             return Ok(None);
         };
+
+        // Wave 2D A1: Pass a child `TemporalEffectContext` with `depth + 1` into prefix effects
+        // so stacked temporal effects (e.g. `echo` after `timeoffset` or `timeremap`) work!
         if !tctx.prefix_effects.is_empty() {
-            // Pass `None` for temporal_ctx as a recursion guard against nested temporal effects.
-            target = self.apply_project_effect_stack_depth(
-                target,
-                tctx.prefix_effects,
-                &sample_env,
-                0,
-                None,
-            )?;
+            let fx_res = if tctx.depth + 1 < MAX_TEMPORAL_DEPTH {
+                let mut child_tctx = TemporalEffectContext {
+                    backdrop: effective_backdrop,
+                    layer: tctx.layer,
+                    track_idx: tctx.track_idx,
+                    track_is_3d: tctx.track_is_3d,
+                    transparent_background: tctx.transparent_background,
+                    shared_camera: tctx.shared_camera,
+                    time_curve: tctx.time_curve,
+                    prefix_effects: &[],
+                    visited_comps: tctx.visited_comps,
+                    visited_tracks: tctx.visited_tracks,
+                    comp_depth: tctx.comp_depth,
+                    depth: tctx.depth + 1,
+                    scene_override: tctx.scene_override,
+                };
+                self.apply_project_effect_stack_depth(
+                    target,
+                    tctx.prefix_effects,
+                    &sample_env,
+                    0,
+                    Some(&mut child_tctx),
+                )
+            } else {
+                self.apply_project_effect_stack_depth(
+                    target,
+                    tctx.prefix_effects,
+                    &sample_env,
+                    0,
+                    None,
+                )
+            };
+            if let Some(bd) = fresh_adj_backdrop {
+                self.targets.release(bd);
+            }
+            target = fx_res?;
+        } else if let Some(bd) = fresh_adj_backdrop {
+            self.targets.release(bd);
         }
         Ok(Some(target))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_builtin_effect(
         &mut self,
         source: RenderTarget,
         effect_id: &str,
         param_tracks: &BTreeMap<String, PropertyTrack>,
+        preserved: &BTreeMap<String, serde_json::Value>,
         env: &EvalEnv<'_>,
-        temporal_ctx: Option<&mut TemporalEffectContext<'_>>,
+        mut temporal_ctx: Option<&mut TemporalEffectContext<'_>>,
     ) -> Result<RenderTarget, RenderError> {
         let canonical_id = crate::effects::canonical_effect_id(effect_id);
         let width = source.width;
@@ -3959,6 +5892,7 @@ impl ProjectRenderEngine {
             env.frame as f32,
         );
         let mut aux_tex: Option<Arc<RenderTarget>> = None;
+        let mut source_image_asset: Option<String> = None;
 
         for (name, track) in param_tracks {
             let val = eval_property_track(track, env);
@@ -3996,10 +5930,27 @@ impl ProjectRenderEngine {
                             bake_color_curves_lut_rgba8(&serde_json::Value::String(s.clone()));
                         reg_params.set("lut", RegParamValue::Lut1D(lut));
                     }
+                    if name == "sourceImage" && !s.is_empty() {
+                        source_image_asset = Some(s.clone());
+                    }
                     reg_params.set(name.clone(), RegParamValue::String(s));
                 }
                 PropertyValue::Gradient(stops) => {
-                    let lut = bake_project_gradient_lut_rgba8(&stops);
+                    let shader_stops: Vec<ShaderGradientStop> = if stops.is_empty() {
+                        vec![ShaderGradientStop::new(0.0, [1.0, 1.0, 1.0, 1.0])]
+                    } else {
+                        stops
+                            .iter()
+                            .map(|s| {
+                                ShaderGradientStop::new(s.position as f32, parse_css_rgba(&s.color))
+                            })
+                            .collect()
+                    };
+                    let raw = bake_gradient_rgba8(&GradientSpec {
+                        stops: shader_stops,
+                        ..GradientSpec::default()
+                    });
+                    let lut: Vec<[u8; 4]> = raw.as_chunks::<4>().0.to_vec();
                     reg_params.set(name.clone(), RegParamValue::Lut1D(lut));
                 }
                 PropertyValue::Curve(curve_json) => {
@@ -4007,7 +5958,10 @@ impl ProjectRenderEngine {
                     reg_params.set("lut", RegParamValue::Lut1D(lut));
                 }
                 PropertyValue::Asset(Some(asset_id)) => {
-                    if effect_id == "cubelut" {
+                    if name == "sourceImage" {
+                        source_image_asset = Some(asset_id.clone());
+                    }
+                    if effect_id == "cubelut" || canonical_id == "magiclooks" {
                         let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
                         if let Some(record) = env.project.assets.get(&asset_id)
                             && let Some(bytes) = record.bytes.as_deref()
@@ -4019,14 +5973,204 @@ impl ProjectRenderEngine {
                             reg_params.set("domainMax", RegParamValue::Vec3(domain_max));
                         }
                     } else if aux_tex.is_none() {
-                        // P4 P0-9: `displacementmap` expects straight (unpremultiplied) RGB
-                        // vectors so semi-transparent map texels are not corrupted.
-                        let premultiply = effect_id != "displacementmap";
+                        // P4 P0-9: `displacementmap` and `layerinputdisplacement` expect straight
+                        // (unpremultiplied) RGB vectors so semi-transparent map texels are not corrupted.
+                        let premultiply = !matches!(
+                            canonical_id,
+                            "displacementmap" | "layerinputdisplacement" | "timedisplacement"
+                        );
                         aux_tex =
                             self.ensure_image_asset_texture(env.project, &asset_id, premultiply);
                     }
                 }
-                PropertyValue::Asset(None) | PropertyValue::Json(_) => {}
+                PropertyValue::Json(v) => {
+                    // Preserve JSON params (`looksInstances`, `chainOrder`, `curves`, `graph`) as String.
+                    if effect_id == "colorcurves" && name == "curves" {
+                        let lut = bake_color_curves_lut_rgba8(&v);
+                        reg_params.set("lut", RegParamValue::Lut1D(lut));
+                    }
+                    let encoded = match v {
+                        serde_json::Value::String(s) => s,
+                        other => serde_json::to_string(&other).unwrap_or_default(),
+                    };
+                    reg_params.set(name.clone(), RegParamValue::String(encoded));
+                }
+                PropertyValue::Asset(None) => {}
+            }
+        }
+
+        // Also surface JSON/String metadata stored in `fx.preserved` (`looksInstances`, `chainOrder`, `graph`, `curves`, `sourceImage`).
+        for key in [
+            "looksInstances",
+            "chainOrder",
+            "graph",
+            "curves",
+            "sourceImage",
+        ] {
+            if !reg_params.values.contains_key(key)
+                && let Some(v) = preserved.get(key)
+            {
+                let encoded = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                };
+                if key == "sourceImage" && source_image_asset.is_none() && !encoded.is_empty() {
+                    source_image_asset = Some(encoded.clone());
+                }
+                reg_params.set(key.to_owned(), RegParamValue::String(encoded));
+            }
+        }
+
+        // Wave 2D B4: `nodeeffect` (`node-effect`) -> compile graph via `compile_node_effect_to_glsl`
+        // and execute via the cached CustomShader pipeline!
+        if matches!(effect_id, "nodeeffect" | "node-effect") {
+            let graph_json: Option<serde_json::Value> = param_tracks
+                .get("graph")
+                .map(|t| eval_property_track(t, env))
+                .and_then(|pv| match pv {
+                    PropertyValue::Json(v) => Some(v),
+                    PropertyValue::Text(s) | PropertyValue::Shader(s) | PropertyValue::List(s) => {
+                        serde_json::from_str(&s).ok()
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    preserved.get("graph").and_then(|v| match v {
+                        serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+                        other => Some(other.clone()),
+                    })
+                });
+            let Some(graph) = graph_json else {
+                return Ok(source);
+            };
+            let compiled = match compile_node_effect_to_glsl(&graph) {
+                Ok(c) => c,
+                Err(err) => {
+                    warn!(error = %err, "failed to compile nodeeffect graph");
+                    return Ok(source);
+                }
+            };
+            let mut node_props: Vec<CustomProperty> =
+                Vec::with_capacity(compiled.parameters.len() + 1);
+            if compiled.uses_time {
+                node_props.push(CustomProperty {
+                    name: "ne_time".to_owned(),
+                    prop_type: None,
+                    track: PropertyTrack::number(env.time),
+                    metadata: BTreeMap::new(),
+                });
+            }
+            for param in &compiled.parameters {
+                let default_track = match param.kind {
+                    1 => PropertyTrack::vec3([
+                        f64::from(*param.default_value.first().unwrap_or(&0.0)),
+                        f64::from(*param.default_value.get(1).unwrap_or(&0.0)),
+                        f64::from(*param.default_value.get(2).unwrap_or(&0.0)),
+                    ]),
+                    2 => PropertyTrack::vec2([
+                        f64::from(*param.default_value.first().unwrap_or(&0.0)),
+                        f64::from(*param.default_value.get(1).unwrap_or(&0.0)),
+                    ]),
+                    _ => PropertyTrack::number(f64::from(
+                        *param.default_value.first().unwrap_or(&0.0),
+                    )),
+                };
+                let track = param_tracks
+                    .get(&param.uniform_name)
+                    .or_else(|| param_tracks.get(&param.id))
+                    .or_else(|| param_tracks.get(&param.label))
+                    .cloned()
+                    .unwrap_or(default_track);
+                node_props.push(CustomProperty {
+                    name: param.uniform_name.clone(),
+                    prop_type: None,
+                    track,
+                    metadata: BTreeMap::new(),
+                });
+            }
+            return self.apply_custom_glsl_shader(
+                source,
+                &compiled.glsl_source,
+                &node_props,
+                env,
+                temporal_ctx,
+            );
+        }
+
+        // Wave 2D B4: Magic Looks (`looks` / `magiclooks` / `magic-looks`) with `.cube` LUT resolution
+        // and explicit `apply_magic_looks_chain` dispatch when `looksInstances` is non-empty.
+        if canonical_id == "magiclooks" {
+            if !reg_params.values.contains_key("lut")
+                && let Some(json_str) = reg_params.string("looksInstances")
+                && let Ok(serde_json::Value::Array(items)) =
+                    serde_json::from_str::<serde_json::Value>(json_str)
+            {
+                let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
+                'lut_search: for item in &items {
+                    for candidate in [
+                        item.get("lutAsset"),
+                        item.get("lut"),
+                        item.get("cubeLut"),
+                        item.get("params").and_then(|p| p.get("lutAsset")),
+                        item.get("params").and_then(|p| p.get("lut")),
+                    ] {
+                        if let Some(asset_id) = candidate.and_then(serde_json::Value::as_str)
+                            && let Some(record) = env.project.assets.get(asset_id)
+                            && let Some(bytes) = record.bytes.as_deref()
+                            && let Some((lut_val, domain_min, domain_max)) =
+                                parse_cube_lut_bytes(bytes, max_dim)
+                        {
+                            reg_params.set("lut", lut_val);
+                            reg_params.set("domainMin", RegParamValue::Vec3(domain_min));
+                            reg_params.set("domainMax", RegParamValue::Vec3(domain_max));
+                            break 'lut_search;
+                        }
+                    }
+                }
+            }
+            let has_instances = reg_params.string("looksInstances").is_some_and(|s| {
+                let t = s.trim();
+                !t.is_empty() && t != "[]" && t != "null"
+            });
+            if has_instances {
+                let dst = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                )?;
+                let mut encoder =
+                    self.ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("zc-magic-looks-chain-encoder"),
+                        });
+                let targets = EffectTargets {
+                    input: &source.view,
+                    output: &dst.view,
+                    aux: aux_tex.as_deref().map(|t| &t.view),
+                    aux2: None,
+                };
+                match self.effects.apply_magic_looks_chain(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    &mut encoder,
+                    &reg_params,
+                    &targets,
+                    width,
+                    height,
+                ) {
+                    Ok(()) => {
+                        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                        self.targets.release(source);
+                        return Ok(dst);
+                    }
+                    Err(err) => {
+                        self.targets.release(dst);
+                        self.targets.release(source);
+                        return Err(RenderError::Effect(err.to_string()));
+                    }
+                }
             }
         }
 
@@ -4043,10 +6187,8 @@ impl ProjectRenderEngine {
             reg_params.set("size", RegParamValue::Vec2([sz[0] * sx, sz[1] * sy]));
         }
 
-        // P6 P0: `layer-input` plugin effect composites another track's capture onto `source`.
-        if matches!(effect_id, "layer-input" | "layerinput")
-            && let Some(tctx) = temporal_ctx
-        {
+        // Wave 2D B2: `layer-input` plugin effect composites another track's capture OR `sourceImage` asset onto `source`.
+        if matches!(effect_id, "layer-input" | "layerinput") {
             let track_ref = match reg_params
                 .values
                 .get("source")
@@ -4059,23 +6201,54 @@ impl ProjectRenderEngine {
                 Some(RegParamValue::String(s)) => s.as_str(),
                 _ => "effects-masks",
             };
-            if let Some(captured) = self.render_track_source(
-                &track_ref,
-                stage,
-                env,
-                width,
-                height,
-                tctx.visited_comps,
-                tctx.visited_tracks,
-                tctx.comp_depth,
-            )? {
-                let opacity = reg_params.float_or("opacity", 1.0).clamp(0.0, 1.0);
-                let blend = match reg_params.values.get("blending") {
-                    Some(RegParamValue::String(tok)) => {
-                        BlendMode::from_token(tok).unwrap_or(BlendMode::SrcOver)
-                    }
-                    _ => BlendMode::SrcOver,
-                };
+            let opacity = reg_params.float_or("opacity", 1.0).clamp(0.0, 1.0);
+            let blend = match reg_params.values.get("blending") {
+                Some(RegParamValue::String(tok)) => {
+                    BlendMode::from_token(tok).unwrap_or(BlendMode::SrcOver)
+                }
+                _ => BlendMode::SrcOver,
+            };
+
+            if track_ref.eq_ignore_ascii_case("image")
+                || (track_ref.is_empty() && source_image_asset.is_some())
+            {
+                let img_tex = source_image_asset
+                    .as_deref()
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, true))
+                    .or_else(|| aux_tex.clone());
+                if let Some(img) = img_tex {
+                    let dst = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
+                    self.compositor.composite_layer(
+                        &self.ctx,
+                        &source,
+                        &img,
+                        &dst,
+                        LayerTransform2D::default(),
+                        opacity,
+                        blend,
+                    );
+                    self.targets.release(source);
+                    return Ok(dst);
+                }
+                return Ok(source);
+            }
+            if let Some(tctx) = temporal_ctx.as_deref_mut()
+                && let Some(captured) = self.render_track_source(
+                    &track_ref,
+                    stage,
+                    env,
+                    width,
+                    height,
+                    tctx.visited_comps,
+                    tctx.visited_tracks,
+                    tctx.comp_depth,
+                )?
+            {
                 let dst = self.targets.acquire(
                     &self.ctx,
                     width,
@@ -4098,11 +6271,478 @@ impl ProjectRenderEngine {
             return Ok(source);
         }
 
-        // P4 P0-2: Temporal `timeoffset` effect.
-        if effect_id == "timeoffset"
-            && let Some(tctx) = temporal_ctx
+        // Wave 2D B2: `layerinputdisplacement` (`layer-input-displacement`) renders track/image source as `aux`.
+        if canonical_id == "layerinputdisplacement" {
+            let track_ref = match reg_params
+                .values
+                .get("source")
+                .or_else(|| reg_params.values.get("layer"))
+            {
+                Some(RegParamValue::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let stage = match reg_params.values.get("stage") {
+                Some(RegParamValue::String(s)) => s.as_str(),
+                _ => "effects-masks",
+            };
+            let mut owned_disp_target: Option<RenderTarget> = None;
+            let mut shared_disp_tex: Option<Arc<RenderTarget>> = None;
+            if track_ref.eq_ignore_ascii_case("image")
+                || (track_ref.is_empty() && source_image_asset.is_some())
+            {
+                shared_disp_tex = source_image_asset
+                    .as_deref()
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false))
+                    .or_else(|| aux_tex.clone());
+            } else if !track_ref.is_empty()
+                && let Some(tctx) = temporal_ctx.as_deref_mut()
+            {
+                owned_disp_target = self.render_track_source(
+                    &track_ref,
+                    stage,
+                    env,
+                    width,
+                    height,
+                    tctx.visited_comps,
+                    tctx.visited_tracks,
+                    tctx.comp_depth,
+                )?;
+            } else {
+                shared_disp_tex = aux_tex.clone();
+            }
+            let dst =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+            let mut encoder =
+                self.ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("zc-layerinputdisplacement-encoder"),
+                    });
+            let aux_view = owned_disp_target
+                .as_ref()
+                .map(|t| &t.view)
+                .or_else(|| shared_disp_tex.as_deref().map(|t| &t.view));
+            let targets = EffectTargets {
+                input: &source.view,
+                output: &dst.view,
+                aux: aux_view,
+                aux2: None,
+            };
+            let run_res = self.effects.run_effect(
+                &self.ctx.device,
+                &self.ctx.queue,
+                &mut encoder,
+                "layerinputdisplacement",
+                &reg_params,
+                &targets,
+            );
+            if let Some(ot) = owned_disp_target {
+                self.targets.release(ot);
+            }
+            return match run_res {
+                Ok(true) => {
+                    self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                    self.targets.release(source);
+                    Ok(dst)
+                }
+                Ok(false) => {
+                    self.targets.release(dst);
+                    Ok(source)
+                }
+                Err(err) => {
+                    self.targets.release(dst);
+                    self.targets.release(source);
+                    Err(RenderError::Effect(err.to_string()))
+                }
+            };
+        }
+
+        // Wave 2D B3: `timedisplacement` multi-slice temporal sampler guided by track/image map!
+        if canonical_id == "timedisplacement"
+            && let Some(tctx) = temporal_ctx.as_deref_mut()
         {
-            let offset_frames = f64::from(reg_params.float_or("offset", 0.0));
+            let max_disp = f64::from(reg_params.float_or("maxDisplacement", 1.0));
+            let num_slices = reg_params.int_or("timeResolution", 30).clamp(2, 64) as u32;
+            if !max_disp.is_finite() || max_disp.abs() < 1e-6 {
+                return Ok(source);
+            }
+            let track_ref = match reg_params
+                .values
+                .get("source")
+                .or_else(|| reg_params.values.get("layer"))
+                .or_else(|| reg_params.values.get("timeDisplacementLayer"))
+            {
+                Some(RegParamValue::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let stage = match reg_params.values.get("stage") {
+                Some(RegParamValue::String(s)) => s.as_str(),
+                _ => "effects-masks",
+            };
+            let mut owned_map_target: Option<RenderTarget> = None;
+            let mut shared_map_tex: Option<Arc<RenderTarget>> = None;
+            if track_ref.eq_ignore_ascii_case("image")
+                || (track_ref.is_empty() && source_image_asset.is_some())
+            {
+                shared_map_tex = source_image_asset
+                    .as_deref()
+                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false))
+                    .or_else(|| aux_tex.clone());
+            } else if !track_ref.is_empty() {
+                owned_map_target = self.render_track_source(
+                    &track_ref,
+                    stage,
+                    env,
+                    width,
+                    height,
+                    tctx.visited_comps,
+                    tctx.visited_tracks,
+                    tctx.comp_depth,
+                )?;
+            } else {
+                shared_map_tex = aux_tex.clone();
+            }
+
+            let mut acc_in =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+            self.compositor.blit(&self.ctx, &source.view, &acc_in);
+            let mut acc_out =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+
+            let fps = env.fps.max(1.0);
+            for slice_idx in 0..num_slices {
+                let t = f64::from(slice_idx) / f64::from((num_slices - 1).max(1));
+                let frame_off = (t - 0.5) * 2.0 * max_disp * fps;
+                let sampled_opt = if frame_off.abs() < 1e-4 {
+                    None
+                } else {
+                    match self.render_temporal_layer_sample(tctx, env, frame_off, width, height) {
+                        Ok(opt) => opt,
+                        Err(err) => {
+                            if let Some(mt) = owned_map_target {
+                                self.targets.release(mt);
+                            }
+                            self.targets.release(acc_in);
+                            self.targets.release(acc_out);
+                            self.targets.release(source);
+                            return Err(err);
+                        }
+                    }
+                };
+                let slice_view = sampled_opt.as_ref().map_or(&source.view, |t| &t.view);
+                let map_view = owned_map_target
+                    .as_ref()
+                    .map(|t| &t.view)
+                    .or_else(|| shared_map_tex.as_deref().map(|t| &t.view));
+                let mut encoder =
+                    self.ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("zc-timedisplacement-slice-encoder"),
+                        });
+                let res = self.effects.run_time_displacement_slice(
+                    &self.ctx.device,
+                    &mut encoder,
+                    &acc_in.view,
+                    slice_view,
+                    map_view,
+                    &acc_out.view,
+                    &reg_params,
+                    slice_idx,
+                    num_slices,
+                );
+                if let Err(err) = res {
+                    if let Some(st) = sampled_opt {
+                        self.targets.release(st);
+                    }
+                    if let Some(mt) = owned_map_target {
+                        self.targets.release(mt);
+                    }
+                    self.targets.release(acc_in);
+                    self.targets.release(acc_out);
+                    self.targets.release(source);
+                    return Err(RenderError::Effect(err.to_string()));
+                }
+                self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                if let Some(st) = sampled_opt {
+                    self.targets.release(st);
+                }
+                std::mem::swap(&mut acc_in, &mut acc_out);
+            }
+            if let Some(mt) = owned_map_target {
+                self.targets.release(mt);
+            }
+            self.targets.release(acc_out);
+            self.targets.release(source);
+            return Ok(acc_in);
+        }
+
+        // Wave 2D B3: `ccwidetime` multi-frame forward/backward weighted tap accumulator!
+        if canonical_id == "ccwidetime"
+            && let Some(tctx) = temporal_ctx.as_deref_mut()
+        {
+            let fwd = reg_params.int_or("forwardSteps", 2).clamp(0, 16);
+            let bwd = reg_params.int_or("backwardSteps", 2).clamp(0, 16);
+            let native_mb = reg_params.bool_or("nativeMotionBlur", false);
+            let total = 1 + fwd + bwd;
+            if total <= 1 {
+                return Ok(source);
+            }
+            let weight = 1.0 / (total as f32);
+            let mut acc_in =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+            let mut acc_out =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+            let mut is_first = true;
+            for step in -bwd..=fwd {
+                let sampled_opt = if step == 0 {
+                    None
+                } else {
+                    match self.render_temporal_layer_sample(
+                        tctx,
+                        env,
+                        f64::from(step),
+                        width,
+                        height,
+                    ) {
+                        Ok(opt) => opt,
+                        Err(err) => {
+                            self.targets.release(acc_in);
+                            self.targets.release(acc_out);
+                            self.targets.release(source);
+                            return Err(err);
+                        }
+                    }
+                };
+                let tap_view = sampled_opt.as_ref().map_or(&source.view, |t| &t.view);
+                let mut encoder =
+                    self.ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("zc-ccwidetime-tap-encoder"),
+                        });
+                let res = self.effects.run_wide_time_tap(
+                    &self.ctx.device,
+                    &mut encoder,
+                    &acc_in.view,
+                    tap_view,
+                    &acc_out.view,
+                    &reg_params,
+                    weight,
+                    is_first,
+                    native_mb,
+                );
+                if let Err(err) = res {
+                    if let Some(st) = sampled_opt {
+                        self.targets.release(st);
+                    }
+                    self.targets.release(acc_in);
+                    self.targets.release(acc_out);
+                    self.targets.release(source);
+                    return Err(RenderError::Effect(err.to_string()));
+                }
+                self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                if let Some(st) = sampled_opt {
+                    self.targets.release(st);
+                }
+                is_first = false;
+                std::mem::swap(&mut acc_in, &mut acc_out);
+            }
+            self.targets.release(acc_out);
+            self.targets.release(source);
+            return Ok(acc_in);
+        }
+
+        // Wave 2D B3: `timedifference` renders offset frame as `aux` into `timedifference` shader!
+        if canonical_id == "timedifference"
+            && let Some(tctx) = temporal_ctx.as_deref_mut()
+        {
+            let offset_sec = f64::from(reg_params.float_or("offset", 0.04));
+            let offset_frames = offset_sec * env.fps.max(1.0);
+            let offset_target = if offset_frames.is_finite() && offset_frames.abs() > 1e-6 {
+                self.render_temporal_layer_sample(tctx, env, offset_frames, width, height)?
+            } else {
+                None
+            };
+            let dst =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+            let mut encoder =
+                self.ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("zc-timedifference-encoder"),
+                    });
+            let targets = EffectTargets {
+                input: &source.view,
+                output: &dst.view,
+                aux: offset_target.as_ref().map(|t| &t.view),
+                aux2: None,
+            };
+            let run_res = self.effects.run_effect(
+                &self.ctx.device,
+                &self.ctx.queue,
+                &mut encoder,
+                "timedifference",
+                &reg_params,
+                &targets,
+            );
+            if let Some(ot) = offset_target {
+                self.targets.release(ot);
+            }
+            return match run_res {
+                Ok(true) => {
+                    self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                    self.targets.release(source);
+                    Ok(dst)
+                }
+                Ok(false) => {
+                    self.targets.release(dst);
+                    Ok(source)
+                }
+                Err(err) => {
+                    self.targets.release(dst);
+                    self.targets.release(source);
+                    Err(RenderError::Effect(err.to_string()))
+                }
+            };
+        }
+
+        // Wave 2D B4: `vhs` temporal persistence tap (`-1.0` frame offset) when `persistence > 0.0`.
+        if canonical_id == "vhs"
+            && let Some(tctx) = temporal_ctx.as_deref_mut()
+            && reg_params.float_or("persistence", 0.35) > 0.0
+            && env.frame >= 1.0
+        {
+            let prev_target = self.render_temporal_layer_sample(tctx, env, -1.0, width, height)?;
+            let dst =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+            let mut encoder =
+                self.ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("zc-vhs-persistence-encoder"),
+                    });
+            let targets = EffectTargets {
+                input: &source.view,
+                output: &dst.view,
+                aux: prev_target.as_ref().map(|t| &t.view),
+                aux2: None,
+            };
+            let run_res = self.effects.run_effect(
+                &self.ctx.device,
+                &self.ctx.queue,
+                &mut encoder,
+                effect_id,
+                &reg_params,
+                &targets,
+            );
+            if let Some(pt) = prev_target {
+                self.targets.release(pt);
+            }
+            return match run_res {
+                Ok(true) => {
+                    self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                    self.targets.release(source);
+                    Ok(dst)
+                }
+                Ok(false) => {
+                    self.targets.release(dst);
+                    Ok(source)
+                }
+                Err(err) => {
+                    self.targets.release(dst);
+                    self.targets.release(source);
+                    Err(RenderError::Effect(err.to_string()))
+                }
+            };
+        }
+
+        // Wave 2D B4: `datamosh` temporal segment I-frame anchor tap (`floor(frame / interval) * interval` or `-interval`).
+        if canonical_id == "datamosh"
+            && let Some(tctx) = temporal_ctx.as_deref_mut()
+        {
+            let interval_sec = f64::from(reg_params.float_or("interval", 1.0).max(0.05));
+            let interval_frames = (interval_sec * env.fps.max(1.0)).max(1.0);
+            let anchor_frame = (env.frame / interval_frames).floor() * interval_frames;
+            let raw_delta = if (anchor_frame - env.frame).abs() < 1e-4 {
+                -interval_frames
+            } else {
+                anchor_frame - env.frame
+            };
+            let delta = (env.frame + raw_delta).max(0.0) - env.frame;
+            let anchor_target = if delta.abs() > 1e-4 {
+                self.render_temporal_layer_sample(tctx, env, delta, width, height)?
+            } else {
+                None
+            };
+            let dst =
+                self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+            let mut encoder =
+                self.ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("zc-datamosh-anchor-encoder"),
+                    });
+            let targets = EffectTargets {
+                input: &source.view,
+                output: &dst.view,
+                aux: anchor_target
+                    .as_ref()
+                    .map(|t| &t.view)
+                    .or_else(|| aux_tex.as_deref().map(|t| &t.view)),
+                aux2: None,
+            };
+            let run_res = self.effects.run_effect(
+                &self.ctx.device,
+                &self.ctx.queue,
+                &mut encoder,
+                effect_id,
+                &reg_params,
+                &targets,
+            );
+            if let Some(at) = anchor_target {
+                self.targets.release(at);
+            }
+            return match run_res {
+                Ok(true) => {
+                    self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                    self.targets.release(source);
+                    Ok(dst)
+                }
+                Ok(false) => {
+                    self.targets.release(dst);
+                    Ok(source)
+                }
+                Err(err) => {
+                    self.targets.release(dst);
+                    self.targets.release(source);
+                    Err(RenderError::Effect(err.to_string()))
+                }
+            };
+        }
+
+        // P4 P0-2 + Wave 2D B4: Temporal `timeoffset` effect honoring `units` (`0 = frames`, `1 = seconds`).
+        if effect_id == "timeoffset"
+            && let Some(tctx) = temporal_ctx.as_deref_mut()
+        {
+            let raw_offset = f64::from(reg_params.float_or("offset", 0.0));
+            let is_seconds = reg_params.int_or("units", 0) == 1
+                || reg_params.string("units").is_some_and(|s| {
+                    s.eq_ignore_ascii_case("seconds") || s.eq_ignore_ascii_case("sec")
+                });
+            let offset_frames = if is_seconds {
+                raw_offset * env.fps.max(1.0)
+            } else {
+                raw_offset
+            };
             if offset_frames.abs() < 1e-6 || !offset_frames.is_finite() {
                 return Ok(source);
             }
@@ -4122,7 +6762,7 @@ impl ProjectRenderEngine {
 
         // P4 P0-2 + P7 P0: Temporal `posterizetime` / `posterizetime-legacy` effect.
         if matches!(effect_id, "posterizetime" | "posterizetime-legacy")
-            && let Some(tctx) = temporal_ctx
+            && let Some(tctx) = temporal_ctx.as_deref_mut()
         {
             let target_fps = f64::from(if reg_params.values.contains_key("fps") {
                 reg_params.float_or("fps", 12.0)
@@ -4151,14 +6791,48 @@ impl ProjectRenderEngine {
             };
         }
 
-        // P4 P0-2 + P7 P0: Temporal `timeremap` effect.
-        if effect_id == "timeremap"
-            && let Some(tctx) = temporal_ctx
+        // Wave 2D B4: Temporal `timeremap` honoring both Zoidium (`remap`, `mode`, `sourceTime`, `speed`, `blend`)
+        // and legacy (`time`, `frameBlending`), integrating animated `speed` curves across `[0..frame]`,
+        // and blending fractional frames via `effects.run_frame_mix` (NOT `SrcOver`!).
+        if matches!(effect_id, "timeremap" | "time-remap")
+            && let Some(tctx) = temporal_ctx.as_deref_mut()
         {
+            let fps = env.fps.max(1.0);
             let mode = reg_params.int_or("mode", 0);
-            let target_frame = if mode == 1 || reg_params.values.contains_key("sourceTime") {
-                let src_time = f64::from(reg_params.float_or("sourceTime", env.time as f32));
-                src_time * env.fps.max(1.0)
+            let has_direct_time = mode == 1
+                || reg_params.values.contains_key("sourceTime")
+                || reg_params.values.contains_key("remap")
+                || reg_params.values.contains_key("time");
+            let target_frame = if has_direct_time {
+                let src_time = if reg_params.values.contains_key("remap") {
+                    f64::from(reg_params.float_or("remap", env.time as f32))
+                } else if reg_params.values.contains_key("sourceTime") {
+                    f64::from(reg_params.float_or("sourceTime", env.time as f32))
+                } else {
+                    f64::from(reg_params.float_or("time", env.time as f32))
+                };
+                src_time * fps
+            } else if let Some(speed_track) = param_tracks.get("speed")
+                && (speed_track.animated
+                    || speed_track.expression.is_some()
+                    || !speed_track.keyframes.is_empty())
+            {
+                // Trapezoidal integration of animated `speed(f) / 100.0` across `[0..env.frame]`.
+                let end_f = env.frame.max(0.0);
+                let steps = (end_f.ceil() as usize).clamp(1, 2000);
+                let df = end_f / (steps as f64);
+                let mut acc = 0.0_f64;
+                let eval_sp = |f: f64| -> f64 {
+                    let e = env_at_frame(env, f);
+                    eval_f64(speed_track, &e) / 100.0
+                };
+                let mut prev_s = eval_sp(0.0);
+                for i in 1..=steps {
+                    let cur_s = eval_sp(df * (i as f64));
+                    acc += 0.5 * (prev_s + cur_s) * df;
+                    prev_s = cur_s;
+                }
+                acc
             } else {
                 let speed = f64::from(reg_params.float_or("speed", 100.0)) / 100.0;
                 env.frame * speed
@@ -4170,8 +6844,14 @@ impl ProjectRenderEngine {
             if delta.abs() < 1e-6 {
                 return Ok(source);
             }
-            let blend_frames = reg_params.int_or("blend", 0) != 0;
-            if blend_frames && (target_frame.fract().abs() > 1e-4) {
+            let blend_mode_i = if reg_params.values.contains_key("blend") {
+                reg_params.int_or("blend", 0)
+            } else if reg_params.bool_or("frameBlending", false) {
+                1
+            } else {
+                0
+            };
+            if blend_mode_i > 0 && (target_frame.fract().abs() > 1e-4) {
                 let f0 = target_frame.floor();
                 let frac = (target_frame - f0).clamp(0.0, 1.0) as f32;
                 let t0 =
@@ -4191,19 +6871,39 @@ impl ProjectRenderEngine {
                             height,
                             wgpu::TextureFormat::Rgba8Unorm,
                         )?;
-                        self.compositor.composite_layer(
-                            &self.ctx,
-                            &a,
-                            &b,
-                            &dst,
-                            LayerTransform2D::default(),
+                        let mix_mode = match blend_mode_i {
+                            2 => 2u32, // optical-flow warp
+                            _ => 0u32, // linear premul mix
+                        };
+                        let mut encoder = self.ctx.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-timeremap-framemix-encoder"),
+                            },
+                        );
+                        let mix_res = self.effects.run_frame_mix(
+                            &self.ctx.device,
+                            &mut encoder,
+                            &a.view,
+                            &b.view,
+                            &dst.view,
+                            [width as f32, height as f32],
                             frac,
-                            BlendMode::SrcOver,
+                            mix_mode,
                         );
                         self.targets.release(a);
                         self.targets.release(b);
-                        self.targets.release(source);
-                        return Ok(dst);
+                        return match mix_res {
+                            Ok(()) => {
+                                self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                                self.targets.release(source);
+                                Ok(dst)
+                            }
+                            Err(err) => {
+                                self.targets.release(dst);
+                                self.targets.release(source);
+                                Err(RenderError::Effect(err.to_string()))
+                            }
+                        };
                     }
                     (opt_a, opt_b) => {
                         if let Some(a) = opt_a {
@@ -4229,10 +6929,17 @@ impl ProjectRenderEngine {
             };
         }
 
+        // Wave 2D B4: `echo` & `echo-legacy` (newest-on-top oldest->newest loop for CompositeInFront/over,
+        // and `mode`/`strength`/`threshold`/`wsum`/`finalize` for `echo-legacy`!).
         if canonical_id == "echo"
-            && let Some(tctx) = temporal_ctx
+            && let Some(tctx) = temporal_ctx.as_deref_mut()
         {
             const MAX_ECHO_TAPS: u32 = 32;
+            let is_legacy = effect_id == "echo-legacy"
+                || reg_params.bool_or("legacyMode", false)
+                || (reg_params.values.contains_key("strength")
+                    && !reg_params.values.contains_key("composite")
+                    && !reg_params.values.contains_key("operator"));
             let is_zoidium_schema =
                 reg_params.values.contains_key("echoes") || reg_params.values.contains_key("delay");
             let raw_echoes = if is_zoidium_schema {
@@ -4268,7 +6975,167 @@ impl ProjectRenderEngine {
                 reg_params.float_or("weight", 1.0)
             };
             let decay = reg_params.float_or("decay", if is_zoidium_schema { 0.75 } else { 0.5 });
+
+            let op_code = if is_legacy {
+                -1
+            } else if reg_params.values.contains_key("composite") {
+                match reg_params.int_or("composite", 0) {
+                    0 => 4, // CompositeInFront / over
+                    1 => 5, // CompositeInBack / behind
+                    2 => 0, // Add
+                    3 => 3, // Screen
+                    4 => 1, // Maximum
+                    _ => 4,
+                }
+            } else {
+                reg_params.int_or("operator", 0).clamp(0, 6)
+            };
+
+            // For `CompositeInFront` / `over` (`op_code == 4`): loop oldest -> newest (`num_echoes..=1`)
+            // and composite `source` on top with `newestOnTop = true` so newest always sits on top!
+            if !is_legacy && op_code == 4 {
+                let mut accum = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                )?;
+                self.compositor
+                    .clear_target(&self.ctx, &accum, wgpu::Color::TRANSPARENT);
+                for k in (1..=num_echoes).rev() {
+                    let frame_offset = f64::from(k) * frame_step;
+                    let tap_target = match self.render_temporal_layer_sample(
+                        tctx,
+                        env,
+                        frame_offset,
+                        width,
+                        height,
+                    ) {
+                        Ok(Some(t)) => t,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            self.targets.release(accum);
+                            self.targets.release(source);
+                            return Err(err);
+                        }
+                    };
+                    let tap_weight = if starting_intensity.is_finite() && decay.is_finite() {
+                        (starting_intensity * decay.powi((k - 1) as i32)).max(0.0)
+                    } else {
+                        0.0
+                    };
+                    let mut tap_params = reg_params.clone();
+                    tap_params.set("startingIntensity", RegParamValue::Float(tap_weight));
+                    tap_params.set("weight", RegParamValue::Float(tap_weight));
+                    tap_params.set("operator", RegParamValue::Int(4));
+                    tap_params.set("newestOnTop", RegParamValue::Bool(false));
+                    let dst = match self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    ) {
+                        Ok(t) => t,
+                        Err(err) => {
+                            self.targets.release(tap_target);
+                            self.targets.release(accum);
+                            self.targets.release(source);
+                            return Err(err);
+                        }
+                    };
+                    let mut encoder =
+                        self.ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-project-echo-over-encoder"),
+                            });
+                    let targets = EffectTargets {
+                        input: &accum.view,
+                        output: &dst.view,
+                        aux: Some(&tap_target.view),
+                        aux2: None,
+                    };
+                    let run_res = self.effects.run_effect(
+                        &self.ctx.device,
+                        &self.ctx.queue,
+                        &mut encoder,
+                        effect_id,
+                        &tap_params,
+                        &targets,
+                    );
+                    match run_res {
+                        Ok(true) => {
+                            self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                            self.targets.release(tap_target);
+                            self.targets.release(accum);
+                            accum = dst;
+                        }
+                        Ok(false) => {
+                            self.targets.release(tap_target);
+                            self.targets.release(dst);
+                        }
+                        Err(err) => {
+                            self.targets.release(tap_target);
+                            self.targets.release(dst);
+                            self.targets.release(accum);
+                            self.targets.release(source);
+                            return Err(RenderError::Effect(err.to_string()));
+                        }
+                    }
+                }
+                // Place newest current `source` on top of accumulated echoes (`newestOnTop = true`).
+                let mut final_params = reg_params.clone();
+                final_params.set("startingIntensity", RegParamValue::Float(1.0));
+                final_params.set("weight", RegParamValue::Float(1.0));
+                final_params.set("operator", RegParamValue::Int(4));
+                final_params.set("newestOnTop", RegParamValue::Bool(true));
+                let dst = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                )?;
+                let mut encoder =
+                    self.ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("zc-project-echo-over-final"),
+                        });
+                let targets = EffectTargets {
+                    input: &source.view,
+                    output: &dst.view,
+                    aux: Some(&accum.view),
+                    aux2: None,
+                };
+                let run_res = self.effects.run_effect(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    &mut encoder,
+                    effect_id,
+                    &final_params,
+                    &targets,
+                );
+                self.targets.release(accum);
+                return match run_res {
+                    Ok(true) => {
+                        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                        self.targets.release(source);
+                        Ok(dst)
+                    }
+                    Ok(false) => {
+                        self.targets.release(dst);
+                        Ok(source)
+                    }
+                    Err(err) => {
+                        self.targets.release(dst);
+                        self.targets.release(source);
+                        Err(RenderError::Effect(err.to_string()))
+                    }
+                };
+            }
+
             let mut accum = source;
+            let mut total_wsum = 1.0_f32;
             for k in 1..=num_echoes {
                 let frame_offset = f64::from(k) * frame_step;
                 let tap_target =
@@ -4286,21 +7153,25 @@ impl ProjectRenderEngine {
                 } else {
                     0.0
                 };
+                total_wsum += tap_weight;
                 let mut tap_params = reg_params.clone();
                 tap_params.set("startingIntensity", RegParamValue::Float(tap_weight));
                 tap_params.set("weight", RegParamValue::Float(tap_weight));
-                if is_zoidium_schema && !tap_params.values.contains_key("operator") {
-                    // Map Zoidium `composite` (0=over, 1=behind, 2=add, 3=screen, 4=maximum)
-                    // onto EffectRegistry's `operator` enum.
-                    let op = match reg_params.int_or("composite", 0) {
-                        0 => 4, // CompositeInFront
-                        1 => 5, // CompositeInBack
-                        2 => 0, // Add
-                        3 => 3, // Screen
-                        4 => 1, // Maximum
-                        _ => 4,
-                    };
-                    tap_params.set("operator", RegParamValue::Int(op));
+                if is_legacy {
+                    tap_params.set("legacyMode", RegParamValue::Bool(true));
+                    tap_params.set("mode", RegParamValue::Int(reg_params.int_or("mode", 0)));
+                    tap_params.set(
+                        "strength",
+                        RegParamValue::Float(reg_params.float_or("strength", 1.0)),
+                    );
+                    tap_params.set(
+                        "threshold",
+                        RegParamValue::Float(reg_params.float_or("threshold", 0.0)),
+                    );
+                    tap_params.set("wsum", RegParamValue::Float(total_wsum));
+                    tap_params.set("finalize", RegParamValue::Bool(k == num_echoes));
+                } else if !tap_params.values.contains_key("operator") {
+                    tap_params.set("operator", RegParamValue::Int(op_code));
                 }
                 let dst = match self.targets.acquire(
                     &self.ctx,
@@ -4357,18 +7228,133 @@ impl ProjectRenderEngine {
             return Ok(accum);
         }
 
+        // Wave 2D B4: `smartmotionblur` & `smart-motion-blur-lite` honoring `reconstruction`
+        // (Shutter Samples via `run_shutter_accumulate` OR Optical Flow passing `prev`/`next` + `quality` + `analysis`/`analysisFrames`).
         if canonical_id == "smartmotionblur"
             && let Some(tctx) = temporal_ctx
         {
             if crate::effects::should_bypass(canonical_id, &reg_params) {
                 return Ok(source);
             }
-            // Honor `analysis` mode: 0 = Both, 1 = Previous only, 2 = Next only.
+            let use_shutter_samples = reg_params.int_or("reconstruction", 0) == 1
+                || reg_params.string("reconstruction").is_some_and(|s| {
+                    let low = s.to_ascii_lowercase();
+                    low.contains("shutter") || low.contains("sample")
+                });
+            if use_shutter_samples {
+                let samples = reg_params.int_or("samples", 8).clamp(2, 32) as u32;
+                let shutter_angle =
+                    f64::from(reg_params.float_or("shutterAngle", 180.0).clamp(0.0, 720.0));
+                let shutter_phase = f64::from(
+                    reg_params
+                        .float_or("shutterPhase", -90.0)
+                        .clamp(-360.0, 360.0),
+                );
+                let span = (shutter_angle / 360.0).max(0.0);
+                let start = shutter_phase / 360.0;
+                if span > 1e-4 {
+                    let res_f = [width as f32, height as f32];
+                    let inv_total = 1.0 / (samples as f32);
+                    let mut acc_in = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba16Float,
+                    )?;
+                    let mut acc_out = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba16Float,
+                    )?;
+                    let final_dst = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
+                    for i in 0..samples {
+                        let frac = (f64::from(i) + 0.5) / f64::from(samples);
+                        let frame_off = start + frac * span;
+                        let sampled_opt = if frame_off.abs() < 1e-4 {
+                            None
+                        } else {
+                            match self
+                                .render_temporal_layer_sample(tctx, env, frame_off, width, height)
+                            {
+                                Ok(opt) => opt,
+                                Err(err) => {
+                                    self.targets.release(acc_in);
+                                    self.targets.release(acc_out);
+                                    self.targets.release(final_dst);
+                                    self.targets.release(source);
+                                    return Err(err);
+                                }
+                            }
+                        };
+                        let sample_view = sampled_opt.as_ref().map_or(&source.view, |t| &t.view);
+                        let is_first = i == 0;
+                        let is_last = i + 1 == samples;
+                        let target_fmt = if is_last {
+                            wgpu::TextureFormat::Rgba8Unorm
+                        } else {
+                            wgpu::TextureFormat::Rgba16Float
+                        };
+                        let out_view = if is_last {
+                            &final_dst.view
+                        } else {
+                            &acc_out.view
+                        };
+                        let mut encoder = self.ctx.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-smb-shutter-accum-encoder"),
+                            },
+                        );
+                        let res = self.effects.run_shutter_accumulate(
+                            &self.ctx.device,
+                            &mut encoder,
+                            &acc_in.view,
+                            sample_view,
+                            out_view,
+                            res_f,
+                            1.0,
+                            inv_total,
+                            is_first,
+                            is_last,
+                            target_fmt,
+                        );
+                        if let Err(err) = res {
+                            if let Some(st) = sampled_opt {
+                                self.targets.release(st);
+                            }
+                            self.targets.release(acc_in);
+                            self.targets.release(acc_out);
+                            self.targets.release(final_dst);
+                            self.targets.release(source);
+                            return Err(RenderError::Effect(err.to_string()));
+                        }
+                        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                        if let Some(st) = sampled_opt {
+                            self.targets.release(st);
+                        }
+                        if !is_last {
+                            std::mem::swap(&mut acc_in, &mut acc_out);
+                        }
+                    }
+                    self.targets.release(acc_in);
+                    self.targets.release(acc_out);
+                    self.targets.release(source);
+                    return Ok(final_dst);
+                }
+            }
+
+            // Optical Flow mode: honor `analysis` (0=Both, 1=Prev, 2=Next) and `analysisFrames` (step 1..=4).
             let analysis = reg_params.int_or("analysis", 0);
+            let step = f64::from(reg_params.float_or("analysisFrames", 1.0).clamp(1.0, 4.0));
             let want_prev = analysis != 2;
             let want_next = analysis != 1;
-            let prev_target = if want_prev && env.frame >= 1.0 {
-                match self.render_temporal_layer_sample(tctx, env, -1.0, width, height) {
+            let prev_target = if want_prev && env.frame >= step {
+                match self.render_temporal_layer_sample(tctx, env, -step, width, height) {
                     Ok(t) => t,
                     Err(err) => {
                         self.targets.release(source);
@@ -4379,7 +7365,7 @@ impl ProjectRenderEngine {
                 None
             };
             let next_target = if want_next {
-                match self.render_temporal_layer_sample(tctx, env, 1.0, width, height) {
+                match self.render_temporal_layer_sample(tctx, env, step, width, height) {
                     Ok(t) => t,
                     Err(err) => {
                         if let Some(prev) = prev_target {
@@ -4756,6 +7742,7 @@ impl ProjectRenderEngine {
         // P8 P0-1: ZoidCraft allocates exact-sized render targets so `uvScale` is `[1.0, 1.0]`.
         uniform_values.insert("uvScale".to_owned(), UniformValue::Vec2([1.0, 1.0]));
         uniform_values.insert("time".to_owned(), UniformValue::Float(env.time as f32));
+        uniform_values.insert("ne_time".to_owned(), UniformValue::Float(env.time as f32));
         uniform_values.insert("frame".to_owned(), UniformValue::Float(env.frame as f32));
         uniform_values.insert("fps".to_owned(), UniformValue::Float(env.fps as f32));
 
@@ -4866,6 +7853,41 @@ impl ProjectRenderEngine {
                 continue;
             }
 
+            // Handle Shader+ `path` property baking (`<Name>` 256x1 RGBA16F `(px, py, tx, ty)`,
+            // `<Name>_length`, `<Name>_closed`, `<Name>_count`).
+            if shader_kind == Some("path") {
+                let (f16_bits, total_len, is_closed, vert_count) =
+                    bake_shader_plus_path_rgba16f(&val, env);
+                if let Ok(tex) =
+                    self.ctx
+                        .create_rgba16f_texture("zc-custom-path-lut-f16", 256, 1, &f16_bits)
+                {
+                    let idx = owned_temp_targets.len();
+                    owned_temp_targets.push(tex);
+                    temp_texture_indices.insert(norm_name.clone(), idx);
+                }
+                uniform_values.insert(
+                    format!("{norm_name}_length"),
+                    UniformValue::Float(total_len),
+                );
+                let closed_name = format!("{norm_name}_closed");
+                if uniform_field_types.get(&closed_name).copied() == Some(UniformType::Bool) {
+                    uniform_values.insert(closed_name, UniformValue::Bool(is_closed));
+                } else {
+                    uniform_values.insert(
+                        closed_name,
+                        UniformValue::Float(if is_closed { 1.0 } else { 0.0 }),
+                    );
+                }
+                let count_name = format!("{norm_name}_count");
+                if uniform_field_types.get(&count_name).copied() == Some(UniformType::Int) {
+                    uniform_values.insert(count_name, UniformValue::Int(vert_count as i32));
+                } else {
+                    uniform_values.insert(count_name, UniformValue::Float(vert_count as f32));
+                }
+                continue;
+            }
+
             // Handle Layer Input track source (`track:id:<id>` or `_zoidiumShaderLayerSource`).
             if let Some(s) = val.as_str()
                 && (is_layer_source || s.starts_with("track:id:"))
@@ -4938,35 +7960,18 @@ impl ProjectRenderEngine {
                     }
                 }
                 PropertyValue::Gradient(stops) => {
-                    let lut = bake_project_gradient_lut_rgba8(&stops);
-                    let raw: Vec<u8> = lut.iter().flat_map(|px| *px).collect();
-                    if let Ok(tex) = self.ctx.create_rgba8_texture(
-                        "zc-custom-gradient-lut",
-                        lut.len() as u32,
-                        1,
-                        &raw,
-                    ) {
+                    let (raw, cyclic, reps) = bake_project_gradient_spec_rgba8(&stops, cp);
+                    if let Ok(tex) =
+                        self.ctx
+                            .create_rgba8_texture("zc-custom-gradient-lut", 256, 1, &raw)
+                    {
                         let idx = owned_temp_targets.len();
                         owned_temp_targets.push(tex);
                         temp_texture_indices.insert(norm_name.clone(), idx);
                     }
-                    let cyclic = cp
-                        .metadata
-                        .get("type")
-                        .and_then(|t| t.get("zoidiumShader"))
-                        .and_then(|s| s.get("cyclic"))
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
                     if cyclic {
                         repeat_textures.insert(norm_name.clone());
                     }
-                    let reps = cp
-                        .metadata
-                        .get("type")
-                        .and_then(|t| t.get("zoidiumShader"))
-                        .and_then(|s| s.get("repetitions"))
-                        .and_then(serde_json::Value::as_f64)
-                        .unwrap_or(1.0) as f32;
                     uniform_values.insert(
                         format!("{norm_name}_repetitions"),
                         UniformValue::Float(reps),
@@ -5321,6 +8326,7 @@ impl ProjectRenderEngine {
             let combined = MeshData {
                 vertices,
                 indices,
+                colors: Vec::new(),
                 bounds: Aabb3::new(
                     Vec3::new(-(width as f32) * 0.5, -(height as f32) * 0.5, -1.0),
                     Vec3::new((width as f32) * 0.5, (height as f32) * 0.5, 1.0),
@@ -5512,6 +8518,14 @@ impl ProjectRenderEngine {
 // Internal 3D Scene Collection & Camera Helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct CachedMeshHandle {
+    mesh: Arc<GpuMesh>,
+    bounds: Aabb3,
+    has_vertex_colors: bool,
+    material_slots: Vec<u32>,
+}
+
 struct PreparedMeshSpec {
     object_id: Uuid,
     world_aabb: ([f32; 3], [f32; 3]),
@@ -5526,9 +8540,34 @@ struct PreparedMeshSpec {
     roughness_map: Option<Arc<RenderTarget>>,
     metalness_map: Option<Arc<RenderTarget>>,
     alpha_map: Option<Arc<RenderTarget>>,
+    ao_map: Option<Arc<RenderTarget>>,
     env_map: Option<Arc<RenderTarget>>,
     cast_shadow: bool,
     receive_shadow: bool,
+}
+
+struct PreparedCustomMaterialMesh {
+    mesh: Arc<GpuMesh>,
+    model: [[f32; 4]; 4],
+    normal_matrix: [[f32; 4]; 4],
+    side: CullSide,
+    blend: MaterialBlend,
+    shader_key: String,
+    params_a: [f32; 4],
+    params_b: [f32; 4],
+}
+
+struct CollectedOpticalFlare {
+    world_pos: Vec3,
+    color: [f32; 3],
+    brightness: f32,
+    scale: f32,
+    anamorphic: f32,
+    ghosts: u32,
+    starburst_rays: u32,
+    ring_intensity: f32,
+    occlusion_enabled: bool,
+    rotation_rad: f32,
 }
 
 fn transform_aabb_world(bounds: Aabb3, world: Mat4) -> ([f32; 3], [f32; 3]) {
@@ -5569,7 +8608,11 @@ struct EvaluatedMaterial {
     roughness_map: Option<Arc<RenderTarget>>,
     metalness_map: Option<Arc<RenderTarget>>,
     alpha_map: Option<Arc<RenderTarget>>,
+    ao_map: Option<Arc<RenderTarget>>,
     env_map: Option<Arc<RenderTarget>>,
+    custom_shader_key: Option<String>,
+    custom_params_a: [f32; 4],
+    custom_params_b: [f32; 4],
 }
 
 struct CollectedCameraHelper {
@@ -5596,8 +8639,11 @@ struct CollectedScene3D {
     camera_is_active: bool,
     camera_is_camera_plus: bool,
     dof: Option<DofPassParams>,
+    max_shadow_map_size: u32,
     lights: Vec<SceneLight>,
     meshes: Vec<PreparedMeshSpec>,
+    custom_material_meshes: Vec<PreparedCustomMaterialMesh>,
+    optical_flares: Vec<CollectedOpticalFlare>,
     particles: Vec<PreparedParticlesSpec>,
     camera_helpers: Vec<CollectedCameraHelper>,
     light_helpers: Vec<CollectedLightHelper>,
@@ -5611,8 +8657,11 @@ impl Default for CollectedScene3D {
             camera_is_active: false,
             camera_is_camera_plus: false,
             dof: None,
+            max_shadow_map_size: 0,
             lights: Vec::new(),
             meshes: Vec::new(),
+            custom_material_meshes: Vec::new(),
+            optical_flares: Vec::new(),
             particles: Vec::new(),
             camera_helpers: Vec::new(),
             light_helpers: Vec::new(),
@@ -5673,6 +8722,15 @@ fn evaluate_scene_graph_3d<'a>(
     objects: &'a [Object3D],
     root_world: Mat4,
     env: &EvalEnv<'_>,
+) -> EvaluatedSceneGraph3D<'a> {
+    evaluate_scene_graph_3d_depth(objects, root_world, env, 0)
+}
+
+fn evaluate_scene_graph_3d_depth<'a>(
+    objects: &'a [Object3D],
+    root_world: Mat4,
+    env: &EvalEnv<'_>,
+    cross_scene_depth: usize,
 ) -> EvaluatedSceneGraph3D<'a> {
     let mut nodes: Vec<EvalNode3D<'a>> = Vec::new();
     let mut by_uuid: HashMap<Uuid, usize> = HashMap::new();
@@ -5814,7 +8872,7 @@ fn evaluate_scene_graph_3d<'a>(
     // (matching Zoidium `constraint-graph.js`, `follow-evaluate.js`, `track-to-evaluate.js`).
     if env.plugins.is_enabled("constraints") {
         let mut active_targets: HashMap<usize, (Option<usize>, Option<usize>)> = HashMap::new();
-        let mut fallback_only: Vec<usize> = Vec::new();
+        let mut unresolved_follows: Vec<usize> = Vec::new();
         for (idx, node) in nodes.iter().enumerate() {
             let follow_target = node.obj.constraints.follow.as_ref().and_then(|f| {
                 by_zoidium_id
@@ -5823,7 +8881,7 @@ fn evaluate_scene_graph_3d<'a>(
                     .filter(|&t| t != idx)
             });
             if node.obj.constraints.follow.is_some() && follow_target.is_none() {
-                fallback_only.push(idx);
+                unresolved_follows.push(idx);
             }
             let track_target = node.obj.constraints.track_to.as_ref().and_then(|tr| {
                 let raw_inf = eval_f64(&tr.influence, &env.with_object(node.obj.id));
@@ -5841,11 +8899,82 @@ fn evaluate_scene_graph_3d<'a>(
             }
         }
 
-        // Apply Follow fallback poses for unresolved saved targets.
-        for idx in fallback_only {
-            if let Some(follow) = nodes[idx].obj.constraints.follow.as_ref()
-                && let Some(fb) = follow.fallback_pose.as_ref()
-            {
+        // Resolve cross-scene Follow targets from sibling `Scene3D` clips active at `env.abs_frame`
+        // (guarded by `cross_scene_depth < 2`), falling back to `fallback_pose` if still unresolved.
+        for idx in unresolved_follows {
+            let Some(follow) = nodes[idx].obj.constraints.follow.as_ref() else {
+                continue;
+            };
+            let mut resolved_ext: Option<(Mat4, Mat4)> = None;
+            if cross_scene_depth < 2 {
+                let empty_parent_props = BTreeMap::new();
+                'search_sibling: for track in &env.sequence.video_tracks {
+                    if !track.enabled {
+                        continue;
+                    }
+                    for clip in &track.clips {
+                        if env.abs_frame < clip.start || env.abs_frame >= clip.start + clip.length {
+                            continue;
+                        }
+                        if Some(clip.layer.id) == env.active_layer_id {
+                            continue;
+                        }
+                        if let LayerKind::Scene3D {
+                            objects: sib_objs, ..
+                        } = &clip.layer.kind
+                        {
+                            let sib_local_f = (env.abs_frame - clip.start).max(0.0);
+                            let sib_time_sec =
+                                eval_track_keyframes_only(&clip.time_curve, sib_local_f)
+                                    .as_f64()
+                                    .unwrap_or(sib_local_f / env.fps.max(1.0));
+                            let sib_eval_f = sib_time_sec * env.fps.max(1.0);
+                            let sib_env = EvalEnv {
+                                project: env.project,
+                                sequence: env.sequence,
+                                plugins: env.plugins,
+                                frame: sib_eval_f,
+                                abs_frame: env.abs_frame,
+                                time: sib_time_sec,
+                                fps: env.fps,
+                                sequence_resolution: env.sequence_resolution,
+                                active_clip_id: Some(clip.id),
+                                active_layer_id: Some(clip.layer.id),
+                                active_object_id: None,
+                                active_effect_id: None,
+                                active_property_id: None,
+                                controls: env.controls,
+                                expr_stack: env.expr_stack,
+                                parent_props: &empty_parent_props,
+                            };
+                            let sib_graph = evaluate_scene_graph_3d_depth(
+                                sib_objs,
+                                Mat4::IDENTITY,
+                                &sib_env,
+                                cross_scene_depth + 1,
+                            );
+                            for sn in &sib_graph.nodes {
+                                let matches_zid = sn
+                                    .obj
+                                    .constraints
+                                    .zoidium_id
+                                    .as_deref()
+                                    .is_some_and(|z| z == follow.target_id);
+                                if matches_zid || sn.obj.id.to_string() == follow.target_id {
+                                    resolved_ext = Some((sn.local_mat, sn.world_mat));
+                                    break 'search_sibling;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((ext_local, ext_world)) = resolved_ext {
+                let node_env = env.with_object(nodes[idx].obj.id);
+                apply_follow_matrix_constraint(
+                    &mut nodes, idx, ext_local, ext_world, root_world, follow, &node_env,
+                );
+            } else if let Some(fb) = follow.fallback_pose.as_ref() {
                 apply_follow_fallback(&mut nodes, idx, root_world, follow, fb);
             }
         }
@@ -5923,6 +9052,236 @@ fn evaluate_scene_graph_3d<'a>(
     }
 
     EvaluatedSceneGraph3D { nodes, by_uuid }
+}
+
+fn apply_follow_matrix_constraint(
+    nodes: &mut [EvalNode3D<'_>],
+    idx: usize,
+    target_local: Mat4,
+    target_world: Mat4,
+    root_world: Mat4,
+    follow: &zc_project::FollowConstraint,
+    env: &EvalEnv<'_>,
+) {
+    let local_space = follow.space == 1;
+    let mut matrix = if local_space {
+        target_local
+    } else {
+        target_world
+    };
+    let p_off = Vec3::from_array(eval_vec3(&follow.position_offset, env));
+    let r_off = Vec3::from_array(eval_vec3(&follow.rotation_offset, env));
+    let s_off = Vec3::from_array(eval_vec3(&follow.scale_offset, env));
+    if r_off.length_squared() > 0.0
+        && let Some((pos, rot, scale)) = decompose_mat4_trs(matrix)
+    {
+        let off_q = euler_to_quat(r_off, nodes[idx].euler_order);
+        matrix = Mat4::from_scale_rotation_translation(scale, (rot * off_q).normalize(), pos);
+    }
+    matrix.w_axis.x += p_off.x;
+    matrix.w_axis.y += p_off.y;
+    matrix.w_axis.z += p_off.z;
+    matrix *= Mat4::from_scale(s_off);
+
+    if !local_space && let Some(parent_idx) = nodes[idx].parent {
+        let parent_world = nodes[parent_idx].world_mat;
+        if parent_world.determinant().abs() < 1e-12 {
+            return;
+        }
+        matrix = parent_world.inverse() * matrix;
+    }
+    let Some((pos, rot, scale)) = decompose_mat4_trs(matrix) else {
+        return;
+    };
+    if follow.follow_position {
+        nodes[idx].local_pos = pos;
+    }
+    if follow.follow_rotation {
+        nodes[idx].local_rot = rot;
+    }
+    if follow.follow_scale {
+        nodes[idx].local_scale = scale;
+    }
+    propagate_world_matrices(nodes, idx, root_world);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_active_camera_layer(
+    project: &Project,
+    sequence: &Sequence,
+    plugins: &PluginRegistry,
+    base_frame: f64,
+    eval_frame: f64,
+    fps: f64,
+    width: u32,
+    height: u32,
+    controls: &RefCell<BTreeMap<String, ExprValue>>,
+    expr_stack: &RefCell<HashSet<String>>,
+) -> Option<CameraParams> {
+    if !plugins.is_enabled("camera-plus") {
+        return None;
+    }
+    let viewport_dims = [width as f32, height as f32];
+    let empty_parent_props = BTreeMap::new();
+    // Scan video tracks top-to-bottom so the highest active CameraLayer clip takes precedence.
+    for track in sequence.video_tracks.iter().rev() {
+        if !track.enabled {
+            continue;
+        }
+        for clip in &track.clips {
+            if base_frame < clip.start || base_frame >= clip.start + clip.length {
+                continue;
+            }
+            let LayerKind::CameraLayer { camera } = &clip.layer.kind else {
+                continue;
+            };
+            let local_frame = (eval_frame - clip.start).max(0.0);
+            let clip_time = eval_track_keyframes_only(&clip.time_curve, local_frame)
+                .as_f64()
+                .unwrap_or(local_frame / fps.max(1.0));
+            let mapped_frame = clip_time * fps.max(1.0);
+            let layer_env = EvalEnv {
+                project,
+                sequence,
+                plugins,
+                frame: mapped_frame,
+                abs_frame: base_frame,
+                time: clip_time,
+                fps,
+                sequence_resolution: sequence.resolution,
+                active_clip_id: Some(clip.id),
+                active_layer_id: Some(clip.layer.id),
+                active_object_id: None,
+                active_effect_id: None,
+                active_property_id: None,
+                controls,
+                expr_stack,
+                parent_props: &empty_parent_props,
+            };
+            // Prefer the full CameraLayer 3D object tree if persisted in `sequence.camera_layer_objects`.
+            if let Some(cam_objects) = sequence.camera_layer_objects.get(&clip.layer.id)
+                && !cam_objects.is_empty()
+            {
+                let graph = evaluate_scene_graph_3d(cam_objects, Mat4::IDENTITY, &layer_env);
+                for node in &graph.nodes {
+                    if !node.render_enabled {
+                        continue;
+                    }
+                    if let Object3DKind::Camera(cam) = &node.obj.kind {
+                        if !cam.active {
+                            continue;
+                        }
+                        let obj_env = layer_env.with_object(node.obj.id);
+                        return Some(build_camera_params_without_vibrate(
+                            cam,
+                            node.world_mat,
+                            &obj_env,
+                            viewport_dims,
+                            true,
+                        ));
+                    }
+                }
+            }
+            if !camera.active {
+                continue;
+            }
+            // Fallback: build camera from layer transform + `CameraData`.
+            let pos2d = eval_vec2(&clip.layer.position, &layer_env);
+            let rot_z = eval_f32(&clip.layer.rotation, &layer_env);
+            let (depth, rot_x, rot_y) = sequence
+                .layer_3d_props
+                .get(&clip.layer.id)
+                .map(|p| {
+                    (
+                        eval_f32(&p.depth, &layer_env),
+                        eval_f32(&p.rotation_x, &layer_env),
+                        eval_f32(&p.rotation_y, &layer_env),
+                    )
+                })
+                .unwrap_or((100.0, 0.0, 0.0));
+            let world = Mat4::from_scale_rotation_translation(
+                Vec3::ONE,
+                euler_to_quat(Vec3::new(rot_x, rot_y, rot_z), GeomEulerOrder::XYZ),
+                Vec3::new(pos2d[0], pos2d[1], depth),
+            );
+            return Some(build_camera_params_without_vibrate(
+                camera,
+                world,
+                &layer_env,
+                viewport_dims,
+                true,
+            ));
+        }
+    }
+    None
+}
+
+/// Filters an effect stack to keep ONLY native CM3 `mask` effects (recursing into `EffectGroup`).
+/// Used by Layer Input `"masks"` stage policy (`stage == "masks"`).
+fn filter_native_cm3_mask_effects(effects: &[EffectInstance]) -> Vec<EffectInstance> {
+    let mut out = Vec::new();
+    for fx in effects {
+        match &fx.kind {
+            EffectKind::Standard(id) if id.eq_ignore_ascii_case("mask") => {
+                out.push(fx.clone());
+            }
+            EffectKind::EffectGroup {
+                children,
+                custom_properties,
+            } => {
+                let filtered = filter_native_cm3_mask_effects(children);
+                if !filtered.is_empty() {
+                    let mut group = fx.clone();
+                    group.kind = EffectKind::EffectGroup {
+                        children: filtered,
+                        custom_properties: custom_properties.clone(),
+                    };
+                    out.push(group);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn find_active_camera_motion_blur(
+    objects: &[Object3D],
+    env: &EvalEnv<'_>,
+) -> Option<zc_project::CameraMotionBlurParams> {
+    fn walk(
+        objects: &[Object3D],
+        env: &EvalEnv<'_>,
+        best: &mut Option<(i32, zc_project::CameraMotionBlurParams)>,
+    ) {
+        for obj in objects {
+            let obj_env = env.with_object(obj.id);
+            let enabled = eval_bool(&obj.enabled, &obj_env, true);
+            match &obj.kind {
+                Object3DKind::Camera(cam) if enabled && cam.active => {
+                    if let Some(mb) = cam.motion_blur.as_ref()
+                        && mb.enabled
+                    {
+                        let prio = obj
+                            .preserved
+                            .get("priority")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0) as i32;
+                        if best.as_ref().is_none_or(|(bp, _)| prio >= *bp) {
+                            *best = Some((prio, mb.clone()));
+                        }
+                    }
+                }
+                Object3DKind::Group { children, .. } => {
+                    walk(children, &obj_env, best);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut best = None;
+    walk(objects, env, &mut best);
+    best.map(|(_, mb)| mb)
 }
 
 fn propagate_world_matrices(nodes: &mut [EvalNode3D<'_>], idx: usize, root_world: Mat4) {
@@ -8710,32 +12069,550 @@ fn build_torus_knot(
     MeshData::new(vertices, indices)
 }
 
-fn push_prepared_mesh(
+#[allow(clippy::too_many_arguments)]
+fn push_prepared_mesh_ex(
     out: &mut CollectedScene3D,
     object_id: Uuid,
-    mesh: Arc<GpuMesh>,
-    bounds: Aabb3,
+    cached: &CachedMeshHandle,
     world: Mat4,
     mat_eval: &EvaluatedMaterial,
+    slot_mats: &HashMap<u32, EvaluatedMaterial>,
+    cast_shadow: bool,
+    receive_shadow: bool,
+    is_voronoi: bool,
 ) {
-    out.meshes.push(PreparedMeshSpec {
-        object_id,
-        world_aabb: transform_aabb_world(bounds, world),
-        mesh,
-        model: world.to_cols_array_2d(),
-        normal_matrix: compute_normal_matrix(world),
-        material: mat_eval.params,
-        albedo: mat_eval.albedo.clone(),
-        normal: mat_eval.normal.clone(),
-        matcap: mat_eval.matcap.clone(),
-        emissive_map: mat_eval.emissive_map.clone(),
-        roughness_map: mat_eval.roughness_map.clone(),
-        metalness_map: mat_eval.metalness_map.clone(),
-        alpha_map: mat_eval.alpha_map.clone(),
-        env_map: mat_eval.env_map.clone(),
-        cast_shadow: true,
-        receive_shadow: true,
-    });
+    let model = world.to_cols_array_2d();
+    let normal_matrix = compute_normal_matrix(world);
+
+    // Custom 3D shader material route (`MaterialSpec::CustomShader`).
+    if let Some(shader_key) = mat_eval.custom_shader_key.as_ref() {
+        out.custom_material_meshes.push(PreparedCustomMaterialMesh {
+            mesh: Arc::clone(&cached.mesh),
+            model,
+            normal_matrix,
+            side: mat_eval.params.side,
+            blend: mat_eval.params.blend,
+            shader_key: shader_key.clone(),
+            params_a: mat_eval.custom_params_a,
+            params_b: mat_eval.custom_params_b,
+        });
+        return;
+    }
+
+    let world_aabb = transform_aabb_world(cached.bounds, world);
+    let slots = &cached.material_slots;
+    if slots.len() > 1 {
+        for &slot in slots {
+            let effective = slot_mats.get(&slot).unwrap_or(mat_eval);
+            if let Some(shader_key) = effective.custom_shader_key.as_ref() {
+                out.custom_material_meshes.push(PreparedCustomMaterialMesh {
+                    mesh: Arc::clone(&cached.mesh),
+                    model,
+                    normal_matrix,
+                    side: effective.params.side,
+                    blend: effective.params.blend,
+                    shader_key: shader_key.clone(),
+                    params_a: effective.custom_params_a,
+                    params_b: effective.custom_params_b,
+                });
+                continue;
+            }
+            let mut mat = effective.params;
+            mat.use_vertex_color = cached.has_vertex_colors;
+            mat.material_slot_filter = Some(slot);
+            mat.polygon_offset_cap = is_voronoi && slot == 1;
+            mat.receive_shadow = mat.receive_shadow && receive_shadow;
+            out.meshes.push(PreparedMeshSpec {
+                object_id,
+                world_aabb,
+                mesh: Arc::clone(&cached.mesh),
+                model,
+                normal_matrix,
+                material: mat,
+                albedo: effective.albedo.clone(),
+                normal: effective.normal.clone(),
+                matcap: effective.matcap.clone(),
+                emissive_map: effective.emissive_map.clone(),
+                roughness_map: effective.roughness_map.clone(),
+                metalness_map: effective.metalness_map.clone(),
+                alpha_map: effective.alpha_map.clone(),
+                ao_map: effective.ao_map.clone(),
+                env_map: effective.env_map.clone(),
+                cast_shadow,
+                receive_shadow: mat.receive_shadow,
+            });
+        }
+    } else {
+        let slot0 = slots.first().copied().unwrap_or(0);
+        let effective = slot_mats.get(&slot0).unwrap_or(mat_eval);
+        let mut mat = effective.params;
+        mat.use_vertex_color = cached.has_vertex_colors;
+        mat.material_slot_filter = None;
+        mat.polygon_offset_cap = is_voronoi && slot0 == 1;
+        mat.receive_shadow = mat.receive_shadow && receive_shadow;
+        out.meshes.push(PreparedMeshSpec {
+            object_id,
+            world_aabb,
+            mesh: Arc::clone(&cached.mesh),
+            model,
+            normal_matrix,
+            material: mat,
+            albedo: effective.albedo.clone(),
+            normal: effective.normal.clone(),
+            matcap: effective.matcap.clone(),
+            emissive_map: effective.emissive_map.clone(),
+            roughness_map: effective.roughness_map.clone(),
+            metalness_map: effective.metalness_map.clone(),
+            alpha_map: effective.alpha_map.clone(),
+            ao_map: effective.ao_map.clone(),
+            env_map: effective.env_map.clone(),
+            cast_shadow,
+            receive_shadow: mat.receive_shadow,
+        });
+    }
+}
+
+fn object_shadow_flags(obj: &Object3D) -> (bool, bool) {
+    let cast = parse_preserved_bool_flag(
+        obj.preserved
+            .get("castShadow")
+            .or_else(|| obj.preserved.get("cast_shadow")),
+        true,
+    );
+    let recv = parse_preserved_bool_flag(
+        obj.preserved
+            .get("receiveShadow")
+            .or_else(|| obj.preserved.get("receive_shadow")),
+        true,
+    );
+    (cast, recv)
+}
+
+fn object_uses_normalized_uv(obj: &Object3D) -> bool {
+    if let Some(MaterialSpec::CustomPbr(m)) = obj.material.as_ref()
+        && m.uv_normalized
+    {
+        return true;
+    }
+    parse_preserved_bool_flag(
+        obj.preserved
+            .get("uvNormalized")
+            .or_else(|| obj.preserved.get("uv_normalized")),
+        false,
+    )
+}
+
+fn eval_obj_color_rgb(
+    obj: &Object3D,
+    keys: &[&str],
+    default: [f32; 3],
+    env: &EvalEnv<'_>,
+) -> [f32; 3] {
+    if let Some(track) = lookup_obj_prop_value(obj, keys) {
+        return eval_color_rgb(&track, env, default);
+    }
+    for &k in keys {
+        if let Some(v) = obj.preserved.get(k)
+            && let Some(rgba) = parse_json_rgba(v)
+        {
+            return [rgba[0], rgba[1], rgba[2]];
+        }
+    }
+    default
+}
+
+fn eval_model_lid_rotation(data: &zc_project::ModelData, env: &EvalEnv<'_>) -> f32 {
+    for k in ["lidRotation", "lid_rotation", "lidAngle", "lid"] {
+        if let Some(tr) = data.model_properties.get(k) {
+            return eval_f32(tr, env);
+        }
+    }
+    0.0
+}
+
+fn is_optical_flare_object(obj: &Object3D) -> bool {
+    let raw = obj
+        .preserved
+        .get("zoidiumPluginObjectType")
+        .and_then(serde_json::Value::as_str)
+        .or(match &obj.kind {
+            Object3DKind::Dummy { original_type, .. } => original_type.as_deref(),
+            _ => None,
+        });
+    raw.is_some_and(|s| {
+        let low = s.trim().to_ascii_lowercase().replace('_', "-");
+        low.contains("optical-flare") || low.contains("opticalflare") || low == "flare"
+    })
+}
+
+fn collect_optical_flare(obj: &Object3D, world: Mat4, env: &EvalEnv<'_>) -> CollectedOpticalFlare {
+    let world_pos = world.w_axis.truncate();
+    let color = eval_obj_color_rgb(obj, &["color", "flareColor", "tint"], [1.0, 0.92, 0.8], env);
+    let brightness = eval_obj_f32(obj, &["brightness", "intensity"], 1.0, env).clamp(0.0, 10.0);
+    let scale = eval_obj_f32(obj, &["scale", "size"], 1.0, env).clamp(0.05, 8.0);
+    let anamorphic =
+        eval_obj_f32(obj, &["anamorphic", "streak", "streakIntensity"], 0.5, env).clamp(0.0, 4.0);
+    let ghosts = eval_obj_u32(obj, &["ghosts", "ghostCount"], 4, env).min(8);
+    let starburst_rays = eval_obj_u32(obj, &["starburstRays", "rays", "starburst"], 8, env).min(24);
+    let ring_intensity =
+        eval_obj_f32(obj, &["ringIntensity", "ring", "halo"], 0.4, env).clamp(0.0, 2.0);
+    let occlusion_enabled = eval_obj_bool(obj, &["occlusion", "occlusionEnabled"], true, env);
+    let rotation_rad = eval_obj_f32(obj, &["rotation", "angle"], 0.0, env);
+    CollectedOpticalFlare {
+        world_pos,
+        color,
+        brightness,
+        scale,
+        anamorphic,
+        ghosts,
+        starburst_rays,
+        ring_intensity,
+        occlusion_enabled,
+        rotation_rad,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrapcodeKind {
+    Particular,
+    Form,
+    Plexus,
+}
+
+fn detect_trapcode_kind(obj: &Object3D) -> Option<TrapcodeKind> {
+    let raw = obj
+        .preserved
+        .get("zoidiumPluginObjectType")
+        .and_then(serde_json::Value::as_str)
+        .or(match &obj.kind {
+            Object3DKind::Dummy { original_type, .. } => original_type.as_deref(),
+            _ => None,
+        })?;
+    let low = raw.trim().to_ascii_lowercase().replace('_', "-");
+    if low.contains("particular") {
+        Some(TrapcodeKind::Particular)
+    } else if low.contains("trapcode") && low.contains("form") || low == "form" {
+        Some(TrapcodeKind::Form)
+    } else if low.contains("plexus") {
+        Some(TrapcodeKind::Plexus)
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_trapcode_form_mesh(
+    nx: u32,
+    ny: u32,
+    nz: u32,
+    size: [f32; 3],
+    displace: f32,
+    node_size: f32,
+    time: f32,
+    seed: i32,
+) -> MeshData {
+    let unit_cube = build_box(node_size, node_size, node_size);
+    let total_nodes = (nx as usize) * (ny as usize) * (nz as usize);
+    let mut vertices = Vec::with_capacity(total_nodes * unit_cube.vertices.len());
+    let mut indices = Vec::with_capacity(total_nodes * unit_cube.indices.len());
+    let seed_f = seed as f32 * 0.713;
+    for iz in 0..nz {
+        let fz = if nz <= 1 {
+            0.0
+        } else {
+            (iz as f32 / (nz - 1) as f32) - 0.5
+        };
+        for iy in 0..ny {
+            let fy = if ny <= 1 {
+                0.0
+            } else {
+                (iy as f32 / (ny - 1) as f32) - 0.5
+            };
+            for ix in 0..nx {
+                let fx = if nx <= 1 {
+                    0.0
+                } else {
+                    (ix as f32 / (nx - 1) as f32) - 0.5
+                };
+                let bx = fx * size[0];
+                let by = fy * size[1];
+                let bz = fz * size[2];
+                let dx = (by * 0.17 + bz * 0.13 + time * 1.1 + seed_f).sin() * displace;
+                let dy = (bx * 0.19 + bz * 0.11 + time * 1.3 + seed_f * 1.3).cos() * displace;
+                let dz = (bx * 0.15 + by * 0.21 + time * 0.9 + seed_f * 0.7).sin() * displace;
+                let base_v = vertices.len() as u32;
+                for v in &unit_cube.vertices {
+                    let mut nv = *v;
+                    nv.position[0] += bx + dx;
+                    nv.position[1] += by + dy;
+                    nv.position[2] += bz + dz;
+                    vertices.push(nv);
+                }
+                for &idx in &unit_cube.indices {
+                    indices.push(base_v + idx);
+                }
+            }
+        }
+    }
+    MeshData::new(vertices, indices)
+}
+
+fn build_trapcode_plexus_mesh(
+    count: u32,
+    radius: f32,
+    max_dist: f32,
+    beam_r: f32,
+    time: f32,
+    seed: i32,
+) -> MeshData {
+    let n = count as usize;
+    let mut pts = Vec::with_capacity(n);
+    for i in 0..n {
+        let s = f64::from(seed) + 1.0;
+        let rx = text_seeded_random(s, i as i32, 0) as f32 * 2.0 - 1.0;
+        let ry = text_seeded_random(s, i as i32, 1) as f32 * 2.0 - 1.0;
+        let rz = text_seeded_random(s, i as i32, 2) as f32 * 2.0 - 1.0;
+        let ph = text_seeded_random(s, i as i32, 3) as f32 * TAU;
+        let p = Vec3::new(
+            rx * radius + (time * 0.8 + ph).sin() * radius * 0.08,
+            ry * radius + (time * 0.7 + ph * 1.3).cos() * radius * 0.08,
+            rz * radius + (time * 0.9 + ph * 0.7).sin() * radius * 0.08,
+        );
+        pts.push(p);
+    }
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let max_d2 = max_dist * max_dist;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let a = pts[i];
+            let b = pts[j];
+            let diff = b - a;
+            let d2 = diff.length_squared();
+            if d2 <= 1e-6 || d2 > max_d2 {
+                continue;
+            }
+            let dir = diff / d2.sqrt();
+            let up = if dir.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+            let right = dir.cross(up).normalize() * beam_r;
+            let ortho = dir.cross(right).normalize() * beam_r;
+            // Two crossed quads forming a visible 3D beam from any view angle.
+            for side_vec in [right, ortho] {
+                let normal = dir.cross(side_vec).normalize().to_array();
+                let base_v = vertices.len() as u32;
+                let corners = [a - side_vec, a + side_vec, b + side_vec, b - side_vec];
+                let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                for (c, uv) in corners.into_iter().zip(uvs) {
+                    vertices.push(Vertex3D::new(c.to_array(), normal, uv, 0));
+                }
+                indices.extend_from_slice(&[
+                    base_v,
+                    base_v + 1,
+                    base_v + 2,
+                    base_v,
+                    base_v + 2,
+                    base_v + 3,
+                ]);
+            }
+        }
+    }
+    MeshData::new(vertices, indices)
+}
+
+fn apply_pbr_plus_surface_props(
+    params: &mut MaterialParams,
+    preserved: &BTreeMap<String, serde_json::Value>,
+    has_ao_map: bool,
+    env: &EvalEnv<'_>,
+) {
+    let eval_num = |keys: &[&str], default: f32| -> f32 {
+        for &k in keys {
+            if let Some(v) = preserved.get(k) {
+                let tr = json_to_property_track(v, PropertyValue::Number(f64::from(default)));
+                return eval_f32(&tr, env);
+            }
+        }
+        default
+    };
+    let eval_flag = |keys: &[&str], default: bool| -> bool {
+        for &k in keys {
+            if let Some(v) = preserved.get(k) {
+                let tr = json_to_property_track(v, PropertyValue::Bool(default));
+                return eval_bool(&tr, env, default);
+            }
+        }
+        default
+    };
+    let eval_rgb = |keys: &[&str], default: [f32; 3]| -> [f32; 3] {
+        for &k in keys {
+            if let Some(v) = preserved.get(k) {
+                if let Some(rgba) = parse_json_rgba(v) {
+                    return [rgba[0], rgba[1], rgba[2]];
+                }
+                let tr = json_to_property_track(
+                    v,
+                    PropertyValue::Color([
+                        f64::from(default[0]),
+                        f64::from(default[1]),
+                        f64::from(default[2]),
+                    ]),
+                );
+                return eval_color_rgb(&tr, env, default);
+            }
+        }
+        default
+    };
+
+    // Ambient Occlusion
+    let ao_enabled = eval_flag(&["aoEnabled", "ao_enabled"], has_ao_map);
+    if ao_enabled || has_ao_map {
+        params.ao_enabled = true;
+        params.ao_intensity = eval_num(&["aoIntensity", "ao_intensity"], 0.75).clamp(0.0, 2.0);
+        params.ao_color = eval_rgb(&["aoColor", "ao_color"], [0.0, 0.0, 0.0]);
+        params.ao_distance = eval_num(&["aoDistance", "ao_distance"], 1.0).max(0.05);
+    }
+
+    // Cel / Toon Shading
+    if eval_flag(&["celEnabled", "cel_enabled", "celShading", "toon"], false) {
+        params.cel_enabled = true;
+        params.cel_steps = eval_num(&["celSteps", "cel_steps"], 4.0).clamp(1.0, 32.0);
+        params.cel_smoothness = eval_num(&["celSmoothness", "cel_smoothness"], 0.1).clamp(0.0, 1.0);
+        params.cel_specular_steps =
+            eval_num(&["celSpecularSteps", "cel_specular_steps"], 6.0).clamp(1.0, 32.0);
+    }
+
+    // Fresnel Rim
+    if eval_flag(&["fresnelEnabled", "fresnel_enabled", "fresnel"], false) {
+        params.fresnel_enabled = true;
+        params.fresnel_color = eval_rgb(&["fresnelColor", "fresnel_color"], [1.0, 1.0, 1.0]);
+        params.fresnel_power = eval_num(&["fresnelPower", "fresnel_power"], 4.0).clamp(0.1, 32.0);
+        params.fresnel_mix_strength = eval_num(
+            &[
+                "fresnelMixStrength",
+                "fresnelStrength",
+                "fresnel_mix_strength",
+            ],
+            0.7,
+        )
+        .clamp(0.0, 1.0);
+    }
+
+    // 4-stop Inline Color Ramp
+    if eval_flag(&["rampEnabled", "ramp_enabled", "colorRampEnabled"], false) {
+        params.ramp_enabled = true;
+        params.ramp_factor =
+            eval_num(&["rampFactor", "ramp_factor", "rampStrength"], 1.0).clamp(0.0, 1.0);
+        params.ramp_source = match preserved
+            .get("rampSource")
+            .or_else(|| preserved.get("ramp_source"))
+        {
+            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0) as u32,
+            Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "normaly" | "normal_y" | "1" => 1,
+                "fresnel" | "2" => 2,
+                "uvx" | "uv_x" | "u" | "3" => 3,
+                "uvy" | "uv_y" | "v" | "4" => 4,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        if let Some(stops) = preserved
+            .get("ramp")
+            .or_else(|| preserved.get("rampColors"))
+            .and_then(|v| {
+                v.as_array()
+                    .or_else(|| v.get("stops").and_then(serde_json::Value::as_array))
+            })
+            && !stops.is_empty()
+        {
+            let mut parsed: Vec<[f32; 4]> = Vec::new();
+            for (i, st) in stops.iter().take(4).enumerate() {
+                let default_pos = if stops.len() <= 1 {
+                    0.0
+                } else {
+                    i as f32 / (stops.len().min(4) - 1) as f32
+                };
+                let pos = st
+                    .get("position")
+                    .or_else(|| st.get("pos"))
+                    .and_then(serde_json::Value::as_f64)
+                    .map_or(default_pos, |p| (p as f32).clamp(0.0, 1.0));
+                let rgba = st
+                    .get("color")
+                    .and_then(parse_json_rgba)
+                    .or_else(|| parse_json_rgba(st))
+                    .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+                parsed.push([rgba[0], rgba[1], rgba[2], pos]);
+            }
+            while parsed.len() < 4 {
+                let last = *parsed.last().unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
+                parsed.push([last[0], last[1], last[2], 1.0]);
+            }
+            params.ramp_colors = [parsed[0], parsed[1], parsed[2], parsed[3]];
+        }
+    }
+
+    // Procedural Bump Noise
+    let bump_strength = eval_num(&["bumpStrength", "bump_strength"], 0.0);
+    if eval_flag(&["bumpNoise", "bump_noise", "bumpNoiseEnabled"], false)
+        || bump_strength.abs() > 1e-4
+    {
+        params.bump_noise_enabled = true;
+        params.bump_strength = if bump_strength.abs() > 1e-4 {
+            bump_strength
+        } else {
+            0.35
+        };
+        params.bump_noise_scale = eval_num(&["bumpNoiseScale", "bump_noise_scale"], 4.0).max(0.05);
+    }
+
+    // UV Projection (0 = UV, 1 = Spherical, 2 = Cylindrical, 3 = Cubic/Triplanar)
+    if let Some(proj_v) = preserved
+        .get("projection")
+        .or_else(|| preserved.get("uvProjection"))
+        .or_else(|| preserved.get("uv_projection"))
+    {
+        params.uv_projection = match proj_v {
+            serde_json::Value::Number(n) => (n.as_u64().unwrap_or(0) as u32).min(3),
+            serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "spherical" | "sphere" | "1" => 1,
+                "cylindrical" | "cylinder" | "2" => 2,
+                "cubic" | "triplanar" | "box" | "3" => 3,
+                _ => 0,
+            },
+            _ => 0,
+        };
+    }
+    if let Some(ps) = preserved
+        .get("projScale")
+        .or_else(|| preserved.get("proj_scale"))
+    {
+        params.proj_scale = eval_json_anim_vec2(Some(ps), env.frame, [1.0, 1.0]);
+    }
+    if let Some(pt) = preserved
+        .get("projTranslate")
+        .or_else(|| preserved.get("proj_translate"))
+    {
+        params.proj_translate = eval_json_anim_vec2(Some(pt), env.frame, [0.0, 0.0]);
+    }
+    params.proj_rotation = eval_num(&["projRotation", "proj_rotation"], params.proj_rotation);
+
+    // Procedural Hemisphere Reflection & Env Rotation
+    if eval_flag(
+        &["reflection", "reflectionEnabled", "reflection_enabled"],
+        false,
+    ) {
+        params.reflection_enabled = true;
+    }
+    params.reflection_env_color_top = eval_rgb(
+        &["reflectionEnvColorTop", "reflection_env_color_top"],
+        params.reflection_env_color_top,
+    );
+    params.reflection_env_color_bottom = eval_rgb(
+        &["reflectionEnvColorBottom", "reflection_env_color_bottom"],
+        params.reflection_env_color_bottom,
+    );
+    params.env_rotation = eval_num(&["envRotation", "env_rotation"], params.env_rotation);
 }
 
 fn build_shape_mesh_cpu(shape: &Shape3DKind, env: &EvalEnv<'_>) -> MeshData {
@@ -8787,36 +12664,205 @@ fn build_shape_mesh_cpu(shape: &Shape3DKind, env: &EvalEnv<'_>) -> MeshData {
         ),
         Shape3DKind::Cone {
             radius,
+            top_radius,
             height,
             detail,
             open_ended,
-        } => build_cylinder(0.0, *radius as f32, *height as f32, *detail, *open_ended),
+            shading,
+        } => {
+            let mut m = build_cylinder(
+                *top_radius as f32,
+                *radius as f32,
+                *height as f32,
+                *detail,
+                *open_ended,
+            );
+            if *shading == 1 {
+                zc_scene::apply_flat_normals(&mut m);
+            }
+            m
+        }
         Shape3DKind::RoundedBox {
             size,
             radius,
             segments,
-        } => build_rounded_box(
+            corner_radius,
+            corner_segments,
+            bevel_size,
+            bevel_segments,
+            shading,
+        } => zc_scene::build_rounded_box_ext(
             size[0] as f32,
             size[1] as f32,
             size[2] as f32,
-            *radius as f32,
-            *segments,
+            corner_radius.unwrap_or(*radius) as f32,
+            corner_segments.unwrap_or(*segments),
+            bevel_size.unwrap_or(*radius) as f32,
+            bevel_segments.unwrap_or(*segments),
+            *shading == 0,
         ),
-        Shape3DKind::Tetrahedron { radius, detail } => build_tetrahedron(*radius as f32, *detail),
-        Shape3DKind::Octahedron { radius, detail } => build_octahedron(*radius as f32, *detail),
-        Shape3DKind::Dodecahedron { radius, detail } => build_dodecahedron(*radius as f32, *detail),
-        Shape3DKind::Icosahedron { radius, detail } => build_icosahedron(*radius as f32, *detail),
+        Shape3DKind::Tetrahedron {
+            radius,
+            detail,
+            shading,
+        } => {
+            let mut m = build_tetrahedron(*radius as f32, *detail);
+            if *shading == 1 {
+                zc_scene::apply_flat_normals(&mut m);
+            }
+            m
+        }
+        Shape3DKind::Octahedron {
+            radius,
+            detail,
+            shading,
+        } => {
+            let mut m = build_octahedron(*radius as f32, *detail);
+            if *shading == 1 {
+                zc_scene::apply_flat_normals(&mut m);
+            }
+            m
+        }
+        Shape3DKind::Dodecahedron {
+            radius,
+            detail,
+            shading,
+        } => {
+            let mut m = build_dodecahedron(*radius as f32, *detail);
+            if *shading == 1 {
+                zc_scene::apply_flat_normals(&mut m);
+            }
+            m
+        }
+        Shape3DKind::Icosahedron {
+            radius,
+            detail,
+            shading,
+        } => {
+            let mut m = build_icosahedron(*radius as f32, *detail);
+            if *shading == 1 {
+                zc_scene::apply_flat_normals(&mut m);
+            }
+            m
+        }
         Shape3DKind::Capsule {
             radius,
             length,
             cap_segments,
             radial_segments,
-        } => build_capsule(
-            *radius as f32,
-            *length as f32,
-            *cap_segments,
+            shading,
+        } => {
+            let mut m = build_capsule(
+                *radius as f32,
+                *length as f32,
+                *cap_segments,
+                *radial_segments,
+            );
+            if *shading == 1 {
+                zc_scene::apply_flat_normals(&mut m);
+            }
+            m
+        }
+        Shape3DKind::Tube {
+            outer_radius,
+            inner_radius,
+            height,
+            radial_segments,
+            open_ended,
+            shading,
+        } => zc_scene::build_tube(
+            *outer_radius as f32,
+            *inner_radius as f32,
+            *height as f32,
             *radial_segments,
+            !*open_ended,
+            *shading == 0,
         ),
+        Shape3DKind::Gear {
+            teeth,
+            inner_radius,
+            outer_radius,
+            thickness,
+            tooth_width,
+            bevel_size,
+            bevel_segments,
+            shading,
+        } => zc_scene::build_gear(
+            *teeth,
+            *inner_radius as f32,
+            *outer_radius as f32,
+            *thickness as f32,
+            *tooth_width as f32,
+            *bevel_size as f32,
+            *bevel_segments,
+            *shading == 0,
+        ),
+        Shape3DKind::Helix {
+            radius,
+            height,
+            turns,
+            tube_radius,
+            path_segments,
+            radial_segments,
+            shading,
+        } => zc_scene::build_helix(
+            *radius as f32,
+            *height as f32,
+            *turns as f32,
+            *tube_radius as f32,
+            *path_segments,
+            *radial_segments,
+            *shading == 0,
+        ),
+        Shape3DKind::Spline {
+            points,
+            interpolation,
+            closed,
+            start,
+            end,
+            thickness,
+            tension,
+            path_segments,
+            radial_segments,
+            caps,
+            cap_style,
+            shading,
+            ..
+        } => {
+            let pts: Vec<[f32; 3]> = points
+                .iter()
+                .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+                .collect();
+            let interp_code = match interpolation.to_ascii_lowercase().as_str() {
+                "linear" | "0" => 0,
+                "akima" | "2" => 2,
+                "bspline" | "b-spline" | "3" => 3,
+                _ => 1,
+            };
+            let has_caps = !matches!(
+                caps.to_ascii_lowercase().as_str(),
+                "none" | "off" | "0" | "false"
+            );
+            let cap_style_code = match cap_style.to_ascii_lowercase().as_str() {
+                "hemisphere" | "round" | "sphere" | "1" => 1,
+                _ => 0,
+            };
+            zc_scene::build_spline(
+                &pts,
+                interp_code,
+                *closed,
+                *start as f32,
+                *end as f32,
+                *thickness as f32,
+                &[],
+                *tension as f32,
+                *path_segments,
+                *radial_segments,
+                has_caps,
+                cap_style_code,
+                *shading == 0,
+            )
+        }
         Shape3DKind::TorusKnot {
             radius,
             tube,
@@ -8939,10 +12985,31 @@ fn build_text3d_character_meshes_with_fallback(
 }
 
 fn build_model_mesh_cpu(data: &zc_project::ModelData, env: &EvalEnv<'_>) -> MeshData {
-    data.asset_id
-        .as_deref()
-        .and_then(|id| load_obj_from_project(env.project, id))
-        .unwrap_or_else(|| build_box(12.0, 12.0, 12.0))
+    // CM3 built-in procedural preset models (`1` = AK-47, `2` = Mystery Box with animated lid).
+    if let Some(preset) = data.preset_type
+        && matches!(preset, 1 | 2)
+    {
+        let lid_rot = eval_model_lid_rotation(data, env);
+        return build_preset_model(preset, lid_rot);
+    }
+    if let Some(id) = data.asset_id.as_deref()
+        && let Some(rec) = env.project.assets.get(id)
+        && let Some(bytes) = rec.bytes.as_deref()
+    {
+        let is_glb_or_gltf = bytes.starts_with(b"glTF")
+            || rec.filename.to_ascii_lowercase().ends_with(".glb")
+            || rec.filename.to_ascii_lowercase().ends_with(".gltf")
+            || bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{');
+        if is_glb_or_gltf && let Ok(mesh) = parse_gltf_or_glb(bytes) {
+            return mesh;
+        }
+        if let Ok(text) = std::str::from_utf8(bytes)
+            && let Ok(mesh) = parse_obj(text)
+        {
+            return mesh;
+        }
+    }
+    build_box(12.0, 12.0, 12.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -8973,32 +13040,27 @@ fn detect_scene_effector_kind(obj: &Object3D) -> Option<SceneEffectorKind> {
             Object3DKind::Dummy { original_type, .. } => original_type.as_deref(),
             _ => None,
         })?;
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "zoidium:repeater/repeater" | "repeater" | "step-repeater" | "step_repeater" => {
+    let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "zoidium:repeater/repeater" | "repeater" | "step-repeater" => {
             Some(SceneEffectorKind::Repeater(RepeaterMode::Step))
         }
-        "zoidium:repeater/linear-repeater" | "linear-repeater" | "linear_repeater" => {
+        "zoidium:repeater/linear-repeater" | "linear-repeater" => {
             Some(SceneEffectorKind::Repeater(RepeaterMode::Linear))
         }
-        "zoidium:repeater/random-repeater" | "random-repeater" | "random_repeater" => {
+        "zoidium:repeater/random-repeater" | "random-repeater" => {
             Some(SceneEffectorKind::Repeater(RepeaterMode::Random))
         }
-        "zoidium:repeater/echo-repeater" | "echo-repeater" | "echo_repeater" => {
+        "zoidium:repeater/echo-repeater" | "echo-repeater" => {
             Some(SceneEffectorKind::Repeater(RepeaterMode::Echo))
         }
         "zoidium:repeater/twist" | "twist" | "7" => Some(SceneEffectorKind::Twist),
         "zoidium:repeater/warp" | "warp" | "8" => Some(SceneEffectorKind::Warp),
-        "zoidium:repeater/voronoi-fracture"
-        | "voronoi-fracture"
-        | "voronoi_fracture"
-        | "fracture"
-        | "9" => Some(SceneEffectorKind::VoronoiFracture),
-        "zoidium:repeater/plain" | "plain" | "plain-effector" | "plain_effector" => {
-            Some(SceneEffectorKind::Plain)
+        "zoidium:repeater/voronoi-fracture" | "voronoi-fracture" | "fracture" | "9" => {
+            Some(SceneEffectorKind::VoronoiFracture)
         }
-        "zoidium:repeater/delay" | "delay" | "delay-effector" | "delay_effector" => {
-            Some(SceneEffectorKind::Delay)
-        }
+        "zoidium:repeater/plain" | "plain" | "plain-effector" => Some(SceneEffectorKind::Plain),
+        "zoidium:repeater/delay" | "delay" | "delay-effector" => Some(SceneEffectorKind::Delay),
         _ => None,
     }
 }
@@ -9766,6 +13828,7 @@ fn parse_voronoi_params(obj: &Object3D, env: &EvalEnv<'_>) -> VoronoiFracturePar
         fragment_scale: eval_obj_f32(obj, &["fragmentScale", "fragment_scale"], 100.0, env),
         gravity: eval_obj_f32(obj, &["gravity"], 0.0, env),
         randomness: eval_obj_f32(obj, &["randomness"], 0.0, env),
+        random_colors: eval_obj_u32(obj, &["colors", "randomColors"], 0, env) != 0,
         field: parse_effector_field_from_obj(obj, env),
     }
 }
@@ -9885,22 +13948,68 @@ impl EtPropReader for SceneEtPropReader<'_> {
 }
 
 fn parse_expresstext_kind(token: &str) -> Option<ExpressTextEffectorKind> {
-    match token.trim().to_ascii_lowercase().as_str() {
-        "shake" => Some(ExpressTextEffectorKind::Shake),
-        "plain" => Some(ExpressTextEffectorKind::Plain),
-        "random" => Some(ExpressTextEffectorKind::Random),
-        "formula" => Some(ExpressTextEffectorKind::Formula),
-        "twist" => Some(ExpressTextEffectorKind::Twist),
-        "wrap" => Some(ExpressTextEffectorKind::Wrap),
-        "orbit" => Some(ExpressTextEffectorKind::Orbit),
-        "spline" => Some(ExpressTextEffectorKind::Spline),
-        "delay" => Some(ExpressTextEffectorKind::Delay),
-        _ => None,
-    }
+    ExpressTextEffectorKind::from_name(token).or_else(|| {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "shake" => Some(ExpressTextEffectorKind::Shake),
+            "plain" => Some(ExpressTextEffectorKind::Plain),
+            "random" => Some(ExpressTextEffectorKind::Random),
+            "formula" => Some(ExpressTextEffectorKind::Formula),
+            "twist" => Some(ExpressTextEffectorKind::Twist),
+            "wrap" => Some(ExpressTextEffectorKind::Wrap),
+            "orbit" => Some(ExpressTextEffectorKind::Orbit),
+            "spline" => Some(ExpressTextEffectorKind::Spline),
+            "delay" => Some(ExpressTextEffectorKind::Delay),
+            "repeater" => Some(ExpressTextEffectorKind::Repeater),
+            "voronoi" | "shatter" => Some(ExpressTextEffectorKind::Voronoi),
+            _ => None,
+        }
+    })
 }
 
-fn extract_expresstext_layers_from_obj(obj: &Object3D) -> Vec<OwnedExpressTextLayer> {
+fn extract_expresstext_layers_from_obj(
+    obj: &Object3D,
+) -> (Vec<OwnedExpressTextLayer>, Option<ExpressTextLettersMode>) {
     let mut out = Vec::new();
+    let mut letters_mode: Option<ExpressTextLettersMode> = None;
+
+    // 0. Canonical Zoidium `preserved["expressProperties"]` via `parse_express_text_config`.
+    if let Some(ep_val) = obj.preserved.get("expressProperties")
+        && let Ok(cfg) = parse_express_text_config(ep_val)
+    {
+        letters_mode = Some(cfg.letters_mode);
+        for eff in cfg.effectors {
+            let mut props = BTreeMap::new();
+            for (k, v) in &eff.properties {
+                let pv = match v {
+                    EtValue::Number(n) => PropertyValue::Number(*n),
+                    EtValue::Vec3(a) => PropertyValue::Vec3(*a),
+                    EtValue::Text(s) => PropertyValue::Text(s.clone()),
+                };
+                props.insert(k.clone(), PropertyTrack::constant(pv));
+            }
+            out.push(OwnedExpressTextLayer {
+                kind: eff.kind,
+                props,
+            });
+        }
+    }
+
+    // Check explicit `lettersMode` / `letters` in preserved or custom properties.
+    if letters_mode.is_none()
+        && let Some(lm_val) = obj
+            .preserved
+            .get("lettersMode")
+            .or_else(|| obj.preserved.get("letters"))
+    {
+        if let Some(n) = lm_val.as_f64() {
+            letters_mode = Some(ExpressTextLettersMode::from_raw(n));
+        } else if let Some(s) = lm_val.as_str() {
+            let low = s.trim().to_ascii_lowercase();
+            if low.contains("across") || low == "1" {
+                letters_mode = Some(ExpressTextLettersMode::AcrossTexts);
+            }
+        }
+    }
 
     // 1. Explicit array in preserved["expressTextEffectors" | "expresstextEffectors" | "expressText" | "expresstext"]
     for key in [
@@ -9984,7 +14093,7 @@ fn extract_expresstext_layers_from_obj(obj: &Object3D) -> Vec<OwnedExpressTextLa
         extract_flat_expresstext_tracks(&flat, &mut out);
     }
 
-    out
+    (out, letters_mode)
 }
 
 fn extract_flat_expresstext_props_from_map(
@@ -10005,7 +14114,7 @@ fn extract_flat_expresstext_tracks(
     flat: &BTreeMap<String, PropertyTrack>,
     out: &mut Vec<OwnedExpressTextLayer>,
 ) {
-    const KINDS: [ExpressTextEffectorKind; 9] = [
+    const KINDS: [ExpressTextEffectorKind; 11] = [
         ExpressTextEffectorKind::Shake,
         ExpressTextEffectorKind::Plain,
         ExpressTextEffectorKind::Random,
@@ -10015,6 +14124,8 @@ fn extract_flat_expresstext_tracks(
         ExpressTextEffectorKind::Orbit,
         ExpressTextEffectorKind::Spline,
         ExpressTextEffectorKind::Delay,
+        ExpressTextEffectorKind::Repeater,
+        ExpressTextEffectorKind::Voronoi,
     ];
     for kind in KINDS {
         let prefix = kind.as_str();
@@ -10033,8 +14144,14 @@ fn extract_flat_expresstext_tracks(
 fn collect_expresstext_layers_for_node(
     eval_graph: &EvaluatedSceneGraph3D<'_>,
     node_idx: usize,
-) -> Vec<OwnedExpressTextLayer> {
-    let mut layers = extract_expresstext_layers_from_obj(eval_graph.nodes[node_idx].obj);
+) -> (
+    Vec<OwnedExpressTextLayer>,
+    ExpressTextLettersMode,
+    Option<usize>,
+) {
+    let (mut layers, mut mode) =
+        extract_expresstext_layers_from_obj(eval_graph.nodes[node_idx].obj);
+    let mut container_idx: Option<usize> = None;
     let mut cur = eval_graph.nodes[node_idx].parent;
     let mut guard = 0usize;
     while let Some(anc) = cur {
@@ -10042,14 +14159,322 @@ fn collect_expresstext_layers_for_node(
             break;
         }
         if eval_graph.nodes[anc].render_enabled {
-            layers.extend(extract_expresstext_layers_from_obj(
-                eval_graph.nodes[anc].obj,
-            ));
+            let (anc_layers, anc_mode) =
+                extract_expresstext_layers_from_obj(eval_graph.nodes[anc].obj);
+            if !anc_layers.is_empty() {
+                if container_idx.is_none() {
+                    container_idx = Some(anc);
+                }
+                layers.extend(anc_layers);
+            }
+            if mode.is_none() && anc_mode.is_some() {
+                mode = anc_mode;
+                if container_idx.is_none() {
+                    container_idx = Some(anc);
+                }
+            }
         }
         cur = eval_graph.nodes[anc].parent;
         guard += 1;
     }
-    layers
+    (
+        layers,
+        mode.unwrap_or(ExpressTextLettersMode::PerText),
+        container_idx,
+    )
+}
+
+fn compute_across_texts_range(
+    eval_graph: &EvaluatedSceneGraph3D<'_>,
+    container_idx: usize,
+    target_node_idx: usize,
+    target_glyph_count: usize,
+) -> (usize, usize) {
+    let mut offset = 0usize;
+    let mut total = 0usize;
+    let mut found = false;
+    let mut stack: Vec<usize> = eval_graph.nodes[container_idx]
+        .children
+        .iter()
+        .rev()
+        .copied()
+        .collect();
+    let mut guard = 0usize;
+    while let Some(idx) = stack.pop() {
+        if guard >= 4096 {
+            break;
+        }
+        guard += 1;
+        let node = &eval_graph.nodes[idx];
+        if !node.render_enabled {
+            continue;
+        }
+        if let Object3DKind::Text3D(td) = &node.obj.kind {
+            let count = if idx == target_node_idx {
+                target_glyph_count
+            } else {
+                td.text.chars().filter(|c| !c.is_whitespace()).count()
+            };
+            if idx == target_node_idx {
+                offset = total;
+                found = true;
+            }
+            total += count;
+        }
+        for &c in node.children.iter().rev() {
+            stack.push(c);
+        }
+    }
+    if !found {
+        (0, target_glyph_count)
+    } else {
+        (offset, total.max(target_glyph_count))
+    }
+}
+
+fn shatter_mesh_data_expresstext(
+    mesh: &MeshData,
+    params: &zc_expr::expresstext::VoronoiGlyphParams,
+) -> MeshData {
+    let mut flat_pos = Vec::with_capacity(mesh.indices.len() * 3);
+    let mut flat_norm = Vec::with_capacity(mesh.indices.len() * 3);
+    let mut flat_uv = Vec::with_capacity(mesh.indices.len() * 2);
+    for &idx in &mesh.indices {
+        let v = mesh.vertices[idx as usize];
+        flat_pos.extend_from_slice(&v.position);
+        flat_norm.extend_from_slice(&v.normal);
+        flat_uv.extend_from_slice(&v.uv);
+    }
+    let chunks = shatter_glyph_triangles(&flat_pos, &flat_norm, &flat_uv, None, params);
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for chunk in &chunks {
+        let posed = apply_chunk_pose_to_positions(chunk);
+        let tri_count = posed.len() / 9;
+        for t in 0..tri_count {
+            let b = t * 9;
+            let p0 = Vec3::new(posed[b], posed[b + 1], posed[b + 2]);
+            let p1 = Vec3::new(posed[b + 3], posed[b + 4], posed[b + 5]);
+            let p2 = Vec3::new(posed[b + 6], posed[b + 7], posed[b + 8]);
+            let n = (p1 - p0).cross(p2 - p0).normalize_or_zero().to_array();
+            let base = vertices.len() as u32;
+            vertices.push(Vertex3D::new(p0.to_array(), n, [0.0, 0.0], 0));
+            vertices.push(Vertex3D::new(p1.to_array(), n, [1.0, 0.0], 0));
+            vertices.push(Vertex3D::new(p2.to_array(), n, [0.5, 1.0], 0));
+            indices.extend_from_slice(&[base, base + 1, base + 2]);
+        }
+    }
+    MeshData::new(vertices, indices)
+}
+
+// ---------------------------------------------------------------------------
+// Text+ 3D Modifier Groups (all 7 `zoidium:text-plus/*` groups)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextPlus3DGroupKind {
+    TextPlus,
+    GradientTransform,
+    CharacterShake,
+    SelectedTransform,
+    SelectedShake,
+    RandomScatter,
+    CharacterMaterial,
+}
+
+fn detect_text_plus_3d_group_kind(obj: &Object3D) -> Option<TextPlus3DGroupKind> {
+    let raw = obj
+        .preserved
+        .get("zoidiumPluginObjectType")
+        .and_then(serde_json::Value::as_str)?;
+    let low = raw.trim().to_ascii_lowercase().replace('_', "-");
+    match low.as_str() {
+        "zoidium:text-plus/text-plus" | "zoidium:text-plus/container" => {
+            Some(TextPlus3DGroupKind::TextPlus)
+        }
+        "zoidium:text-plus/gradient-transform" => Some(TextPlus3DGroupKind::GradientTransform),
+        "zoidium:text-plus/character-shake" => Some(TextPlus3DGroupKind::CharacterShake),
+        "zoidium:text-plus/selected-transform" => Some(TextPlus3DGroupKind::SelectedTransform),
+        "zoidium:text-plus/selected-shake" => Some(TextPlus3DGroupKind::SelectedShake),
+        "zoidium:text-plus/random-scatter" => Some(TextPlus3DGroupKind::RandomScatter),
+        "zoidium:text-plus/character-material" => Some(TextPlus3DGroupKind::CharacterMaterial),
+        _ => None,
+    }
+}
+
+fn collect_text_plus_3d_groups(
+    eval_graph: &EvaluatedSceneGraph3D<'_>,
+    node_idx: usize,
+) -> Vec<(usize, TextPlus3DGroupKind)> {
+    let mut out = Vec::new();
+    let mut cur = eval_graph.nodes[node_idx].parent;
+    let mut guard = 0usize;
+    while let Some(anc) = cur {
+        if guard >= 256 {
+            break;
+        }
+        if eval_graph.nodes[anc].render_enabled
+            && let Some(kind) = detect_text_plus_3d_group_kind(eval_graph.nodes[anc].obj)
+        {
+            out.push((anc, kind));
+        }
+        cur = eval_graph.nodes[anc].parent;
+        guard += 1;
+    }
+    out.reverse();
+    out
+}
+
+fn evaluate_text_plus_3d_for_char(
+    eval_graph: &EvaluatedSceneGraph3D<'_>,
+    groups: &[(usize, TextPlus3DGroupKind)],
+    char_idx: usize,
+    total_chars: usize,
+    env: &EvalEnv<'_>,
+) -> (Vec3, Vec3, Vec3) {
+    let mut pos = Vec3::ZERO;
+    let mut rot = Vec3::ZERO;
+    let mut scale = Vec3::ONE;
+    let t_norm = if total_chars <= 1 {
+        0.0
+    } else {
+        char_idx as f32 / (total_chars - 1) as f32
+    };
+
+    for &(g_idx, kind) in groups {
+        let g_obj = eval_graph.nodes[g_idx].obj;
+        let g_env = env.with_object(g_obj.id);
+        let strength = eval_obj_f32(g_obj, &["strength", "amount"], 1.0, &g_env);
+        match kind {
+            TextPlus3DGroupKind::TextPlus => {
+                let p_off = eval_obj_vec3(
+                    g_obj,
+                    &["positionOffset", "charPosition"],
+                    Vec3::ZERO,
+                    &g_env,
+                );
+                let r_off = eval_obj_vec3(
+                    g_obj,
+                    &["rotationOffset", "charRotation"],
+                    Vec3::ZERO,
+                    &g_env,
+                );
+                let s_off = eval_obj_vec3(g_obj, &["scaleOffset", "charScale"], Vec3::ONE, &g_env);
+                pos += p_off * strength;
+                rot += r_off * strength;
+                scale *= Vec3::ONE.lerp(s_off, strength.clamp(0.0, 1.0));
+            }
+            TextPlus3DGroupKind::GradientTransform => {
+                let reverse = eval_obj_bool(g_obj, &["reverse"], false, &g_env);
+                let u = if reverse { 1.0 - t_norm } else { t_norm } * strength;
+                let p_start =
+                    eval_obj_vec3(g_obj, &["startPosition", "posStart"], Vec3::ZERO, &g_env);
+                let p_end = eval_obj_vec3(
+                    g_obj,
+                    &["endPosition", "posEnd", "position"],
+                    Vec3::ZERO,
+                    &g_env,
+                );
+                let r_start =
+                    eval_obj_vec3(g_obj, &["startRotation", "rotStart"], Vec3::ZERO, &g_env);
+                let r_end = eval_obj_vec3(
+                    g_obj,
+                    &["endRotation", "rotEnd", "rotation"],
+                    Vec3::ZERO,
+                    &g_env,
+                );
+                let s_start =
+                    eval_obj_vec3(g_obj, &["startScale", "scaleStart"], Vec3::ONE, &g_env);
+                let s_end =
+                    eval_obj_vec3(g_obj, &["endScale", "scaleEnd", "scale"], Vec3::ONE, &g_env);
+                pos += p_start.lerp(p_end, u);
+                rot += r_start.lerp(r_end, u);
+                scale *= s_start.lerp(s_end, u);
+            }
+            TextPlus3DGroupKind::CharacterShake | TextPlus3DGroupKind::SelectedShake => {
+                if kind == TextPlus3DGroupKind::SelectedShake {
+                    let sel_raw = eval_obj_str(g_obj, &["characterNumbers", "characters"], &g_env)
+                        .unwrap_or_else(|| "1".to_owned());
+                    let sel = parse_character_selection(&sel_raw, total_chars);
+                    if !sel.contains(&char_idx) {
+                        continue;
+                    }
+                }
+                let freq = eval_obj_f64(g_obj, &["frequency", "speed"], 4.0, &g_env);
+                let stagger = eval_obj_f64(g_obj, &["stagger", "phaseOffset"], 0.35, &g_env);
+                let p_amp = eval_obj_vec3(
+                    g_obj,
+                    &["positionAmplitude", "position", "amplitude"],
+                    Vec3::ZERO,
+                    &g_env,
+                );
+                let r_amp = eval_obj_vec3(
+                    g_obj,
+                    &["rotationAmplitude", "rotation"],
+                    Vec3::ZERO,
+                    &g_env,
+                );
+                let s_amp = eval_obj_vec3(g_obj, &["scaleAmplitude", "scale"], Vec3::ZERO, &g_env);
+                let period = (env.fps / freq.max(0.01)).max(1.0);
+                let ph = env.frame + char_idx as f64 * stagger * period;
+                let ax = shake_angle(1.0, period, ph);
+                let ay = shake_angle(1.0, period, ph + period * 0.27);
+                let az = shake_angle(1.0, period, ph + period * 0.53);
+                pos += Vec3::new(
+                    p_amp.x * ax as f32,
+                    p_amp.y * ay as f32,
+                    p_amp.z * az as f32,
+                ) * strength;
+                rot += Vec3::new(
+                    r_amp.x * ax as f32,
+                    r_amp.y * ay as f32,
+                    r_amp.z * az as f32,
+                ) * strength;
+                scale *= Vec3::ONE
+                    + Vec3::new(
+                        s_amp.x * ax as f32,
+                        s_amp.y * ay as f32,
+                        s_amp.z * az as f32,
+                    ) * strength;
+            }
+            TextPlus3DGroupKind::SelectedTransform => {
+                let sel_raw = eval_obj_str(g_obj, &["characterNumbers", "characters"], &g_env)
+                    .unwrap_or_else(|| "1".to_owned());
+                let sel = parse_character_selection(&sel_raw, total_chars);
+                if !sel.contains(&char_idx) {
+                    continue;
+                }
+                let p_off =
+                    eval_obj_vec3(g_obj, &["positionOffset", "position"], Vec3::ZERO, &g_env);
+                let r_off =
+                    eval_obj_vec3(g_obj, &["rotationOffset", "rotation"], Vec3::ZERO, &g_env);
+                let s_off = eval_obj_vec3(g_obj, &["scaleOffset", "scale"], Vec3::ONE, &g_env);
+                pos += p_off * strength;
+                rot += r_off * strength;
+                scale *= Vec3::ONE.lerp(s_off, strength.clamp(0.0, 1.0));
+            }
+            TextPlus3DGroupKind::RandomScatter => {
+                let seed = eval_obj_f64(g_obj, &["seed", "randomSeed"], 1.0, &g_env);
+                let p_amp = eval_obj_vec3(
+                    g_obj,
+                    &["positionRange", "position", "scatter"],
+                    Vec3::ZERO,
+                    &g_env,
+                );
+                let r_amp =
+                    eval_obj_vec3(g_obj, &["rotationRange", "rotation"], Vec3::ZERO, &g_env);
+                let s_amp = eval_obj_vec3(g_obj, &["scaleRange", "scale"], Vec3::ZERO, &g_env);
+                let r =
+                    |ch: i32| (text_seeded_random(seed, char_idx as i32, ch) as f32) * 2.0 - 1.0;
+                pos += Vec3::new(p_amp.x * r(0), p_amp.y * r(1), p_amp.z * r(2)) * strength;
+                rot += Vec3::new(r_amp.x * r(3), r_amp.y * r(4), r_amp.z * r(5)) * strength;
+                scale *= Vec3::ONE
+                    + Vec3::new(s_amp.x * r(6), s_amp.y * r(7), s_amp.z * r(8)) * strength;
+            }
+            TextPlus3DGroupKind::CharacterMaterial => {}
+        }
+    }
+    (pos, rot, scale)
 }
 
 fn parse_inline_field(item: &serde_json::Value) -> Option<EffectorField> {
@@ -10313,6 +14738,7 @@ fn apply_object_effectors(mut mesh: MeshData, obj: &Object3D, env: &EvalEnv<'_>)
                         .get("gravity")
                         .and_then(serde_json::Value::as_f64)
                         .unwrap_or(0.0) as f32,
+                    random_colors: parse_preserved_bool_flag(item.get("colors"), false),
                     randomness: item
                         .get("randomness")
                         .and_then(serde_json::Value::as_f64)
@@ -10560,20 +14986,66 @@ fn convert_size_gradient_stops(stops: &[ProjectGradientStop]) -> Vec<ParticleGra
     out
 }
 
-fn bake_project_gradient_lut_rgba8(stops: &[ProjectGradientStop]) -> Vec<[u8; 4]> {
-    let converted = convert_gradient_stops(stops);
-    let baked = zc_scene::bake_gradient_lut(&converted, 256);
-    baked
-        .into_iter()
-        .map(|c| {
-            [
-                (c[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-                (c[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-                (c[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-                (c[3].clamp(0.0, 1.0) * 255.0).round() as u8,
-            ]
-        })
-        .collect()
+fn parse_gradient_interpolation(val: Option<&serde_json::Value>) -> GradientInterpolation {
+    match val
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("constant" | "step" | "hold") => GradientInterpolation::Constant,
+        Some("ease" | "smooth" | "smoothstep") => GradientInterpolation::Ease,
+        Some("cardinal" | "catmull" | "spline" | "cubic") => GradientInterpolation::Cardinal,
+        _ => GradientInterpolation::Linear,
+    }
+}
+
+fn parse_gradient_color_space(val: Option<&serde_json::Value>) -> GradientColorSpace {
+    match val
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("linear" | "linear-rgb" | "linearrgb" | "linear_rgb") => GradientColorSpace::LinearRgb,
+        Some("oklab" | "ok-lab" | "ok_lab") => GradientColorSpace::OkLab,
+        _ => GradientColorSpace::Srgb,
+    }
+}
+
+fn bake_project_gradient_spec_rgba8(
+    stops: &[ProjectGradientStop],
+    cp: &CustomProperty,
+) -> (Vec<u8>, bool, f32) {
+    let shader_meta = cp.metadata.get("type").and_then(|t| t.get("zoidiumShader"));
+    let cyclic = shader_meta
+        .and_then(|s| s.get("cyclic"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let reps = shader_meta
+        .and_then(|s| s.get("repetitions"))
+        .and_then(serde_json::Value::as_f64)
+        .filter(|v| v.is_finite())
+        .map_or(1.0, |v| (v as f32).max(1.0));
+    let interpolation =
+        parse_gradient_interpolation(shader_meta.and_then(|s| s.get("interpolation")));
+    let color_space = parse_gradient_color_space(shader_meta.and_then(|s| s.get("colorSpace")));
+    let shader_stops: Vec<ShaderGradientStop> = if stops.is_empty() {
+        vec![ShaderGradientStop::new(0.0, [1.0, 1.0, 1.0, 1.0])]
+    } else {
+        stops
+            .iter()
+            .map(|s| ShaderGradientStop::new(s.position as f32, parse_css_rgba(&s.color)))
+            .collect()
+    };
+    let spec = GradientSpec {
+        stops: shader_stops,
+        interpolation,
+        color_space,
+        cyclic,
+        repetitions: reps,
+    };
+    (bake_gradient_rgba8(&spec), cyclic, reps)
 }
 
 /// Normalizes whitespace in custom property names to underscores matching CM3 `fixPropertyName`.
@@ -10810,46 +15282,75 @@ fn bake_shader_plus_gradient_json(
     val: &serde_json::Value,
     cp: &CustomProperty,
 ) -> (Vec<u8>, bool, f32) {
+    let shader_meta = cp.metadata.get("type").and_then(|t| t.get("zoidiumShader"));
     let stops_arr = val
         .get("stops")
         .and_then(serde_json::Value::as_array)
         .or_else(|| val.as_array());
-    let mut stops: Vec<ProjectGradientStop> = Vec::new();
+    let mut stops: Vec<ShaderGradientStop> = Vec::new();
     if let Some(arr) = stops_arr {
         for item in arr {
             let pos = item
                 .get("position")
+                .or_else(|| item.get("pos"))
                 .and_then(serde_json::Value::as_f64)
                 .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
+                .clamp(0.0, 1.0) as f32;
             let rgba = item
                 .get("color")
                 .and_then(parse_json_rgba)
                 .unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            stops.push(ProjectGradientStop {
+            let midpoint = item
+                .get("midpoint")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|v| v.is_finite())
+                .map_or(0.5, |v| (v as f32).clamp(0.0, 1.0));
+            stops.push(ShaderGradientStop {
                 position: pos,
-                color: format!(
-                    "rgba({},{},{},{})",
-                    (rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    (rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    (rgba[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    rgba[3].clamp(0.0, 1.0)
-                ),
+                color: rgba,
+                midpoint,
             });
         }
     }
     if stops.is_empty() {
-        stops = ProjectGradientStop::white_default();
+        stops.push(ShaderGradientStop::new(0.0, [1.0, 1.0, 1.0, 1.0]));
     }
-    let lut = bake_project_gradient_lut_rgba8(&stops);
-    let raw: Vec<u8> = lut.iter().flat_map(|px| *px).collect();
+    let mut opacity_stops: Vec<ShaderOpacityStop> = Vec::new();
+    if let Some(arr) = val
+        .get("opacityStops")
+        .or_else(|| val.get("opacity_stops"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in arr {
+            let pos = item
+                .get("position")
+                .or_else(|| item.get("pos"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0) as f32;
+            let alpha = item
+                .get("opacity")
+                .or_else(|| item.get("alpha"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0) as f32;
+            let midpoint = item
+                .get("midpoint")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|v| v.is_finite())
+                .map_or(0.5, |v| (v as f32).clamp(0.0, 1.0));
+            opacity_stops.push(ShaderOpacityStop {
+                position: pos,
+                alpha,
+                midpoint,
+            });
+        }
+    }
     let cyclic = val
         .get("cyclic")
         .and_then(serde_json::Value::as_bool)
         .or_else(|| {
-            cp.metadata
-                .get("type")
-                .and_then(|t| t.get("zoidiumShader"))
+            shader_meta
                 .and_then(|s| s.get("cyclic"))
                 .and_then(serde_json::Value::as_bool)
         })
@@ -10858,15 +15359,251 @@ fn bake_shader_plus_gradient_json(
         .get("repetitions")
         .and_then(serde_json::Value::as_f64)
         .or_else(|| {
-            cp.metadata
-                .get("type")
-                .and_then(|t| t.get("zoidiumShader"))
+            shader_meta
                 .and_then(|s| s.get("repetitions"))
                 .and_then(serde_json::Value::as_f64)
         })
         .filter(|v| v.is_finite())
         .map_or(1.0, |v| (v as f32).max(1.0));
+    let interpolation = parse_gradient_interpolation(
+        val.get("interpolation")
+            .or_else(|| shader_meta.and_then(|s| s.get("interpolation"))),
+    );
+    let color_space = parse_gradient_color_space(
+        val.get("colorSpace")
+            .or_else(|| val.get("color_space"))
+            .or_else(|| shader_meta.and_then(|s| s.get("colorSpace"))),
+    );
+    let spec = GradientSpec {
+        stops,
+        interpolation,
+        color_space,
+        cyclic,
+        repetitions: reps,
+    };
+    let raw = if opacity_stops.is_empty() {
+        bake_gradient_rgba8(&spec)
+    } else {
+        bake_gradient_rgba8_with_opacity(&spec, &opacity_stops)
+    };
     (raw, cyclic, reps)
+}
+
+/// Bakes a Shader+ `Path` property into a `256 x 1` `Rgba16Float` LUT storing
+/// `(px, py, tx, ty)` in normalized UV `[0, 1]` coordinates with unit tangent `(tx, ty)`,
+/// returning `(f16_bits, total_length_uv, closed, vertex_count)`.
+fn bake_shader_plus_path_rgba16f(
+    val: &PropertyValue,
+    env: &EvalEnv<'_>,
+) -> (Vec<u16>, f32, bool, usize) {
+    let parsed_owned;
+    let json_val: Option<&serde_json::Value> = match val {
+        PropertyValue::Json(v) => Some(v),
+        PropertyValue::Text(s) => {
+            parsed_owned = serde_json::from_str::<serde_json::Value>(s).ok();
+            parsed_owned.as_ref()
+        }
+        _ => None,
+    };
+
+    let seq_w = (env.sequence_resolution[0].max(1)) as f32;
+    let seq_h = (env.sequence_resolution[1].max(1)) as f32;
+    let mut subpaths: Vec<PolySubPath> = Vec::new();
+    let mut closed = false;
+    let mut raw_vert_count = 0usize;
+
+    if let Some(j) = json_val {
+        closed = j
+            .get("closed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        // 1. Referenced mask or Shape+ path on a sequence layer (`layerId` / `maskId` / `pathId`).
+        if let Some(layer_ref) = j.get("layerId").and_then(serde_json::Value::as_str) {
+            let mask_ref = j
+                .get("maskId")
+                .or_else(|| j.get("pathId"))
+                .and_then(serde_json::Value::as_str);
+            'search_layer: for track in &env.sequence.video_tracks {
+                for clip in &track.clips {
+                    let clip_id = clip.layer.id.to_string();
+                    let name_match = clip.layer.name == layer_ref || clip_id == layer_ref;
+                    if !name_match {
+                        continue;
+                    }
+                    // Check typed sequence layer_masks first.
+                    if let Some(typed_masks) = env.sequence.layer_masks.get(&clip.layer.id) {
+                        for (mi, m) in typed_masks.iter().enumerate() {
+                            if mask_ref.is_none()
+                                || mask_ref == Some(m.id.as_str())
+                                || mask_ref == Some(m.name.as_str())
+                                || mask_ref == Some(&mi.to_string())
+                            {
+                                let flat = if !m.path.channels.is_empty() {
+                                    m.path.channels.iter().map(|ch| eval_f32(ch, env)).collect()
+                                } else {
+                                    eval_property_track_f32_array(&m.path, env)
+                                };
+                                let vc = flat.len() / 6;
+                                let mut verts = Vec::with_capacity(vc);
+                                for i in 0..vc {
+                                    let b = i * 6;
+                                    verts.push(BezierVertex2D {
+                                        point: [flat[b] / seq_w, 1.0 - flat[b + 1] / seq_h],
+                                        in_h: [flat[b + 2] / seq_w, -flat[b + 3] / seq_h],
+                                        out_h: [flat[b + 4] / seq_w, -flat[b + 5] / seq_h],
+                                    });
+                                }
+                                if verts.len() >= 2 {
+                                    raw_vert_count = verts.len();
+                                    closed = m.closed;
+                                    subpaths.push(flatten_bezier_vertices(&verts, closed, 1e-6));
+                                    break 'search_layer;
+                                }
+                            }
+                        }
+                    }
+                    // Check preserved `zoidiumMasks`.
+                    if let Some(arr) = clip
+                        .layer
+                        .preserved
+                        .get("zoidiumMasks")
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        let evaled = evaluate_zoidium_masks(arr, env);
+                        if let Some(m) = evaled.first()
+                            && m.vertices.len() >= 2
+                        {
+                            let verts: Vec<BezierVertex2D> = m
+                                .vertices
+                                .iter()
+                                .map(|v| BezierVertex2D {
+                                    point: [v.point[0] / seq_w, 1.0 - v.point[1] / seq_h],
+                                    in_h: [v.in_h[0] / seq_w, -v.in_h[1] / seq_h],
+                                    out_h: [v.out_h[0] / seq_w, -v.out_h[1] / seq_h],
+                                })
+                                .collect();
+                            raw_vert_count = verts.len();
+                            closed = m.closed;
+                            subpaths.push(flatten_bezier_vertices(&verts, closed, 1e-6));
+                            break 'search_layer;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Inline Bezier vertices `{ vertices: [{ point, in, out }] }` or flat `path` array.
+        if subpaths.is_empty()
+            && let Some(verts_arr) = j.get("vertices").and_then(serde_json::Value::as_array)
+        {
+            let mut verts = Vec::with_capacity(verts_arr.len());
+            for v in verts_arr {
+                let p = eval_json_anim_vec2(v.get("point").or(Some(v)), env.frame, [0.0, 0.0]);
+                let inh = eval_json_anim_vec2(v.get("in"), env.frame, [0.0, 0.0]);
+                let outh = eval_json_anim_vec2(v.get("out"), env.frame, [0.0, 0.0]);
+                verts.push(BezierVertex2D {
+                    point: p,
+                    in_h: inh,
+                    out_h: outh,
+                });
+            }
+            if verts.len() >= 2 {
+                raw_vert_count = verts.len();
+                let needs_norm = verts
+                    .iter()
+                    .any(|v| v.point[0].abs() > 2.0 || v.point[1].abs() > 2.0);
+                if needs_norm {
+                    for v in &mut verts {
+                        v.point = [v.point[0] / seq_w, v.point[1] / seq_h];
+                        v.in_h = [v.in_h[0] / seq_w, v.in_h[1] / seq_h];
+                        v.out_h = [v.out_h[0] / seq_w, v.out_h[1] / seq_h];
+                    }
+                }
+                subpaths.push(flatten_bezier_vertices(&verts, closed, 1e-6));
+            }
+        }
+
+        // 3. Inline `points` / `commands` / SVG string via `parse_shape2d_path_json`.
+        if subpaths.is_empty() {
+            let candidate = j
+                .get("points")
+                .or_else(|| j.get("path"))
+                .or_else(|| j.get("d"))
+                .unwrap_or(j);
+            let mut parsed = parse_shape2d_path_json(candidate);
+            if !parsed.is_empty() {
+                raw_vert_count = parsed[0].points.len();
+                closed = closed || parsed[0].closed;
+                let needs_norm = parsed[0]
+                    .points
+                    .iter()
+                    .any(|p| p.x.abs() > 2.0 || p.y.abs() > 2.0);
+                if needs_norm {
+                    for p in &mut parsed[0].points {
+                        p.x = (p.x + seq_w * 0.5) / seq_w;
+                        p.y = (p.y + seq_h * 0.5) / seq_h;
+                    }
+                }
+                subpaths = parsed;
+            }
+        }
+    } else if let PropertyValue::Text(svg) = val
+        && !svg.trim().is_empty()
+    {
+        let parsed = parse_svg_path_string(svg);
+        if !parsed.is_empty() {
+            raw_vert_count = parsed[0].points.len();
+            closed = parsed[0].closed;
+            subpaths = parsed;
+        }
+    }
+
+    // Arc-length resample into 256 (px, py, tx, ty) RGBA16F texels.
+    let mut ring: Vec<Vec2> = subpaths
+        .into_iter()
+        .next()
+        .map(|sp| sp.points)
+        .unwrap_or_else(|| vec![Vec2::new(0.0, 0.5), Vec2::new(1.0, 0.5)]);
+    if ring.len() < 2 {
+        ring = vec![Vec2::new(0.0, 0.5), Vec2::new(1.0, 0.5)];
+    }
+    if closed && ring.last() != ring.first() {
+        ring.push(ring[0]);
+    }
+    let mut cum = vec![0.0_f32; ring.len()];
+    for i in 1..ring.len() {
+        cum[i] = cum[i - 1] + ring[i].distance(ring[i - 1]);
+    }
+    let total_len = *cum.last().unwrap_or(&0.0);
+    let mut out = Vec::with_capacity(256 * 4);
+    for s in 0..256 {
+        let frac = (s as f32) / 255.0;
+        let target = frac * total_len;
+        let mut pos = ring[0];
+        let mut tan = Vec2::X;
+        if total_len > 1e-6 {
+            for i in 1..cum.len() {
+                if target <= cum[i] || i + 1 == cum.len() {
+                    let seg = (cum[i] - cum[i - 1]).max(1e-6);
+                    let u = ((target - cum[i - 1]) / seg).clamp(0.0, 1.0);
+                    pos = ring[i - 1].lerp(ring[i], u);
+                    let d = ring[i] - ring[i - 1];
+                    tan = if d.length_squared() > 1e-10 {
+                        d.normalize()
+                    } else {
+                        Vec2::X
+                    };
+                    break;
+                }
+            }
+        }
+        out.push(f32_to_f16_bits(pos.x));
+        out.push(f32_to_f16_bits(pos.y));
+        out.push(f32_to_f16_bits(tan.x));
+        out.push(f32_to_f16_bits(tan.y));
+    }
+    (out, total_len, closed, raw_vert_count.max(ring.len()))
 }
 
 /// Evaluates Fritsch-Butland monotone cubic Hermite spline (matching Zoidium `graph-curves.js:102-148`).
@@ -11446,9 +16183,22 @@ fn point_to_segment_dist_sq(p: Vec2, a: Vec2, b: Vec2) -> f32 {
     p.distance_squared(a + ab * t)
 }
 
-/// Parses CM3 `Shape2DKind::Path { path }` (OpenType/Canvas `commands` array, raw array of
-/// `[x, y]` points, or SVG path string) into Y-up sequence-pixel polylines.
+/// Parses CM3 `Shape2DKind::Path { path }` (preset objects, OpenType/Canvas `commands` array,
+/// raw array of `[x, y]` points, or SVG path string) into Y-up sequence-pixel polylines.
 fn parse_shape2d_path_json(path_json: &serde_json::Value) -> Vec<PolySubPath> {
+    // 0. CM3 preset shorthand `{"preset": "rectangle"|"ellipse"|"circle"}`
+    if let Some(preset_str) = path_json.get("preset").and_then(serde_json::Value::as_str) {
+        let low = preset_str.trim().to_ascii_lowercase();
+        let kind = match low.as_str() {
+            "rectangle" | "rect" | "square" => Some(PresetShapeKind::Rectangle),
+            "ellipse" | "circle" | "oval" => Some(PresetShapeKind::Ellipse),
+            _ => None,
+        };
+        if let Some(p) = kind {
+            return vec![canonical_preset_subpath(p)];
+        }
+    }
+
     // 1. OpenType / CM3 `{ commands: [{ type: "M"|"L"|"Q"|"C"|"Z", x, y, x1, y1, x2, y2 }] }`
     if let Some(cmds) = path_json
         .get("commands")
@@ -12154,22 +16904,110 @@ fn rasterize_preset_shape_nodes(
         return fb_to_rgba8(&fb);
     }
 
-    for node in shapes {
+    #[allow(clippy::too_many_arguments)]
+    fn render_preset_node(
+        node: &Shape2DNode,
+        parent_mat: Mat3,
+        inherited_ops: &[EvalPaintOp],
+        canonical: &[PolySubPath],
+        env: &EvalEnv<'_>,
+        preview_scale: f32,
+        width: u32,
+        height: u32,
+        fb: &mut [[f32; 4]],
+    ) {
         let pos = eval_vec2(&node.position, env);
         let rot = eval_f32(&node.rotation, env);
         let sc = eval_vec2(&node.scale, env);
-        let mat = cm3_shape_node_mat3(pos, rot, sc);
-        let mut ops: Vec<EvalPaintOp> = node
+        let world_mat = parent_mat * cm3_shape_node_mat3(pos, rot, sc);
+        let mut combined_ops: Vec<EvalPaintOp> = node
             .operations
             .iter()
             .map(|op| eval_draw_op(op, env))
             .collect();
-        if ops.is_empty() {
-            ops.push(EvalPaintOp::Fill([1.0, 1.0, 1.0, 1.0]));
+        combined_ops.extend_from_slice(inherited_ops);
+
+        match &node.kind {
+            Shape2DKind::Group { children } if !children.is_empty() => {
+                for child in children {
+                    render_preset_node(
+                        child,
+                        world_mat,
+                        &combined_ops,
+                        canonical,
+                        env,
+                        preview_scale,
+                        width,
+                        height,
+                        fb,
+                    );
+                }
+            }
+            Shape2DKind::Path { path } => {
+                let parsed = parse_shape2d_path_json(path);
+                let src_paths = if parsed.is_empty() {
+                    canonical
+                } else {
+                    &parsed
+                };
+                let ops_slice: &[EvalPaintOp] = if combined_ops.is_empty() {
+                    &[EvalPaintOp::Fill([1.0, 1.0, 1.0, 1.0])]
+                } else {
+                    &combined_ops
+                };
+                let px_paths = map_seq_subpaths_to_pixels(
+                    src_paths,
+                    world_mat,
+                    env.sequence_resolution,
+                    width,
+                    height,
+                );
+                apply_paint_ops_to_subpaths(
+                    &px_paths,
+                    ops_slice,
+                    preview_scale,
+                    width as usize,
+                    height as usize,
+                    fb,
+                );
+            }
+            Shape2DKind::Group { .. } => {
+                let ops_slice: &[EvalPaintOp] = if combined_ops.is_empty() {
+                    &[EvalPaintOp::Fill([1.0, 1.0, 1.0, 1.0])]
+                } else {
+                    &combined_ops
+                };
+                let px_paths = map_seq_subpaths_to_pixels(
+                    canonical,
+                    world_mat,
+                    env.sequence_resolution,
+                    width,
+                    height,
+                );
+                apply_paint_ops_to_subpaths(
+                    &px_paths,
+                    ops_slice,
+                    preview_scale,
+                    width as usize,
+                    height as usize,
+                    fb,
+                );
+            }
         }
-        let px_paths =
-            map_seq_subpaths_to_pixels(&canonical, mat, env.sequence_resolution, width, height);
-        apply_paint_ops_to_subpaths(&px_paths, &ops, preview_scale, w, h, &mut fb);
+    }
+
+    for node in shapes {
+        render_preset_node(
+            node,
+            Mat3::IDENTITY,
+            &[],
+            &canonical,
+            env,
+            preview_scale,
+            width,
+            height,
+            &mut fb,
+        );
     }
     fb_to_rgba8(&fb)
 }
@@ -12269,56 +17107,231 @@ fn rasterize_shape_nodes(
 }
 
 // ---------------------------------------------------------------------------
-// Shape+ (`zoidium:shape-plus/shape-layer`) Vector Contents Evaluator
+// Shape+ & Layer Mask Keyframe/Expression Helpers (upgraded to zc-anim + zc-expr)
 // ---------------------------------------------------------------------------
 
-fn eval_json_anim_number(val: Option<&serde_json::Value>, frame: f64, default: f32) -> f32 {
-    let Some(v) = val else {
-        return default;
-    };
-    if let Some(n) = v.as_f64() {
-        return n as f32;
+fn eval_scalar_expr_at_frame(expr_src: &str, env: &EvalEnv<'_>, frame: f64) -> Option<f64> {
+    if expr_src.trim().is_empty() {
+        return None;
     }
-    if let Some(b) = v.as_bool() {
-        return if b { 1.0 } else { 0.0 };
+    let env_f = env_at_frame(env, frame);
+    let mut track = PropertyTrack::number(0.0);
+    track.expression = Some(expr_src.to_owned());
+    let val = eval_property_track(&track, &env_f);
+    val.as_f64().filter(|v| v.is_finite())
+}
+
+fn eval_property_track_f32_array(track: &PropertyTrack, env: &EvalEnv<'_>) -> Vec<f32> {
+    if !track.channels.is_empty() {
+        return track.channels.iter().map(|c| eval_f32(c, env)).collect();
     }
-    if let Some(s) = v.as_str()
-        && let Ok(n) = s.trim().parse::<f64>()
-    {
-        return n as f32;
-    }
-    if let Some(kfs) = v.get("keyframes").and_then(serde_json::Value::as_array)
-        && !kfs.is_empty()
-    {
-        let mut pts: Vec<(f64, f64)> = kfs
+    if !track.keyframes.is_empty() {
+        let mut pts: Vec<(f64, Vec<f32>, &PropertyKeyframe)> = track
+            .keyframes
             .iter()
-            .filter_map(|k| {
-                let f = k.get("frame").and_then(serde_json::Value::as_f64)?;
-                let val = k.get("value").and_then(serde_json::Value::as_f64)?;
-                Some((f, val))
+            .filter_map(|kf| match &kf.value {
+                PropertyValue::Json(serde_json::Value::Array(arr)) => Some((
+                    kf.frame,
+                    arr.iter()
+                        .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                        .collect(),
+                    kf,
+                )),
+                _ => None,
             })
             .collect();
         if !pts.is_empty() {
             pts.sort_by(|a, b| a.0.total_cmp(&b.0));
-            if frame <= pts[0].0 {
-                return pts[0].1 as f32;
+            if env.frame <= pts[0].0 {
+                return pts[0].1.clone();
             }
-            if frame >= pts[pts.len() - 1].0 {
-                return pts[pts.len() - 1].1 as f32;
+            if env.frame >= pts[pts.len() - 1].0 {
+                return pts[pts.len() - 1].1.clone();
             }
             for w in pts.windows(2) {
-                if frame <= w[1].0 {
+                if env.frame <= w[1].0 {
+                    let k0 = w[0].2;
+                    let k1 = w[1].2;
+                    let ease_idx = (k1.tween & 0xFF) as u8;
+                    if ease_idx == 0 {
+                        return w[0].1.clone();
+                    }
+                    let is_bezier = (k1.tween >> 8) == 1;
+                    let (mode, easing) = if is_bezier {
+                        (InterpolationMode::Bezier, EasingKind::Linear)
+                    } else {
+                        InterpolationMode::from_cm3_tween_code(u16::from(ease_idx))
+                    };
+                    if mode == InterpolationMode::Discrete {
+                        return w[0].1.clone();
+                    }
                     let span = (w[1].0 - w[0].0).max(1e-9);
-                    let u = ((frame - w[0].0) / span).clamp(0.0, 1.0);
-                    return (w[0].1 + (w[1].1 - w[0].1) * u) as f32;
+                    let raw_t = ((env.frame - w[0].0) / span).clamp(0.0, 1.0);
+                    let len = w[0].1.len().min(w[1].1.len());
+                    if mode == InterpolationMode::Bezier {
+                        return (0..len)
+                            .map(|i| {
+                                eval_segment_bezier(
+                                    BezierSegment {
+                                        start_frame: k0.frame,
+                                        start_value: f64::from(w[0].1[i]),
+                                        out_tangent: k0.control_points[1],
+                                        end_frame: k1.frame,
+                                        end_value: f64::from(w[1].1[i]),
+                                        in_tangent: k1.control_points[0],
+                                    },
+                                    env.frame,
+                                ) as f32
+                            })
+                            .collect();
+                    }
+                    let u = if mode == InterpolationMode::Interpolated {
+                        eval_easing(easing, raw_t)
+                    } else {
+                        raw_t
+                    } as f32;
+                    return (0..len)
+                        .map(|i| w[0].1[i] + (w[1].1[i] - w[0].1[i]) * u)
+                        .collect();
+                }
+            }
+        }
+    }
+    match eval_property_track(track, env) {
+        PropertyValue::Json(v) => eval_json_anim_f32_array_aa(Some(&v), env),
+        _ => Vec::new(),
+    }
+}
+
+fn eval_json_anim_f32_array_aa(val: Option<&serde_json::Value>, env: &EvalEnv<'_>) -> Vec<f32> {
+    let Some(v) = val else {
+        return Vec::new();
+    };
+    if let Some(arr) = v.as_array() {
+        return arr
+            .iter()
+            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+            .collect();
+    }
+    if let Some(objs) = v.get("objects").and_then(serde_json::Value::as_array) {
+        let expr_cb = |src: &str, f: f64| eval_scalar_expr_at_frame(src, env, f);
+        return objs
+            .iter()
+            .map(|o| shape_plus_eval_prop_f64(Some(o), env.frame, 0.0, Some(&expr_cb)) as f32)
+            .collect();
+    }
+    if let Some(kfs) = v.get("keyframes").and_then(serde_json::Value::as_array)
+        && !kfs.is_empty()
+    {
+        let mut pts: Vec<(f64, Vec<f32>, &serde_json::Value)> = kfs
+            .iter()
+            .filter_map(|k| {
+                let f = k.get("frame").and_then(serde_json::Value::as_f64)?;
+                let arr = k.get("value").and_then(serde_json::Value::as_array)?;
+                Some((
+                    f,
+                    arr.iter()
+                        .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                        .collect(),
+                    k,
+                ))
+            })
+            .collect();
+        if !pts.is_empty() {
+            pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if env.frame <= pts[0].0 {
+                return pts[0].1.clone();
+            }
+            if env.frame >= pts[pts.len() - 1].0 {
+                return pts[pts.len() - 1].1.clone();
+            }
+            for w in pts.windows(2) {
+                if env.frame <= w[1].0 {
+                    let k0 = w[0].2;
+                    let k1 = w[1].2;
+                    let tween_u16 = k1
+                        .get("tween")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|n| n as u16);
+                    let tween_str = k0
+                        .get("tween")
+                        .or_else(|| k0.get("interpolation"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if tween_u16.is_some_and(|t| (t & 0xFF) == 0)
+                        || matches!(tween_str.as_str(), "hold" | "step" | "constant")
+                    {
+                        return w[0].1.clone();
+                    }
+                    let span = (w[1].0 - w[0].0).max(1e-9);
+                    let raw_t = ((env.frame - w[0].0) / span).clamp(0.0, 1.0);
+                    let len = w[0].1.len().min(w[1].1.len());
+                    if tween_u16.is_some_and(|t| (t >> 8) == 1)
+                        || tween_str == "bezier"
+                        || k0
+                            .get("useBezier")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    {
+                        let out_h = k0
+                            .get("outHandle")
+                            .and_then(serde_json::Value::as_array)
+                            .filter(|a| a.len() >= 2)
+                            .map(|a| [a[0].as_f64().unwrap_or(0.33), a[1].as_f64().unwrap_or(0.33)])
+                            .unwrap_or([0.33, 0.33]);
+                        let in_h = k1
+                            .get("inHandle")
+                            .and_then(serde_json::Value::as_array)
+                            .filter(|a| a.len() >= 2)
+                            .map(|a| [a[0].as_f64().unwrap_or(0.67), a[1].as_f64().unwrap_or(0.67)])
+                            .unwrap_or([0.67, 0.67]);
+                        let u = eval_segment_bezier(
+                            BezierSegment {
+                                start_frame: 0.0,
+                                start_value: 0.0,
+                                out_tangent: out_h,
+                                end_frame: 1.0,
+                                end_value: 1.0,
+                                in_tangent: in_h,
+                            },
+                            raw_t,
+                        ) as f32;
+                        return (0..len)
+                            .map(|i| w[0].1[i] + (w[1].1[i] - w[0].1[i]) * u)
+                            .collect();
+                    }
+                    let u = if let Some(tc) = tween_u16 {
+                        let (mode, easing) = InterpolationMode::from_cm3_tween_code(tc);
+                        if mode == InterpolationMode::Interpolated {
+                            eval_easing(easing, raw_t)
+                        } else {
+                            raw_t
+                        }
+                    } else if let Some(idx) = k0
+                        .get("easing")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|n| EasingKind::from_cm3_index(n as u8))
+                    {
+                        eval_easing(idx, raw_t)
+                    } else {
+                        raw_t
+                    } as f32;
+                    return (0..len)
+                        .map(|i| w[0].1[i] + (w[1].1[i] - w[0].1[i]) * u)
+                        .collect();
                 }
             }
         }
     }
     if let Some(inner) = v.get("value") {
-        return eval_json_anim_number(Some(inner), frame, default);
+        return eval_json_anim_f32_array_aa(Some(inner), env);
     }
-    default
+    Vec::new()
+}
+
+fn eval_json_anim_number(val: Option<&serde_json::Value>, frame: f64, default: f32) -> f32 {
+    shape_plus_eval_prop_f64(val, frame, f64::from(default), None) as f32
 }
 
 fn eval_json_anim_vec2(val: Option<&serde_json::Value>, frame: f64, default: [f32; 2]) -> [f32; 2] {
@@ -12347,454 +17360,9 @@ fn eval_json_anim_vec2(val: Option<&serde_json::Value>, frame: f64, default: [f3
     default
 }
 
-fn eval_json_anim_color(
-    val: Option<&serde_json::Value>,
-    frame: f64,
-    default: [f32; 4],
-) -> [f32; 4] {
-    let Some(v) = val else {
-        return default;
-    };
-    if let Some(rgba) = parse_json_rgba(v) {
-        return rgba;
-    }
-    if let Some(objs) = v.get("objects").and_then(serde_json::Value::as_array)
-        && objs.len() >= 3
-    {
-        let r = eval_json_anim_number(Some(&objs[0]), frame, default[0]);
-        let g = eval_json_anim_number(Some(&objs[1]), frame, default[1]);
-        let b = eval_json_anim_number(Some(&objs[2]), frame, default[2]);
-        let a = objs.get(3).map_or(default[3], |o| {
-            eval_json_anim_number(Some(o), frame, default[3])
-        });
-        let scale = if r > 1.0 || g > 1.0 || b > 1.0 {
-            1.0 / 255.0
-        } else {
-            1.0
-        };
-        return [
-            (r * scale).clamp(0.0, 1.0),
-            (g * scale).clamp(0.0, 1.0),
-            (b * scale).clamp(0.0, 1.0),
-            a.clamp(0.0, 1.0),
-        ];
-    }
-    if let Some(inner) = v.get("value") {
-        return eval_json_anim_color(Some(inner), frame, default);
-    }
-    default
-}
-
-fn eval_json_anim_f32_array(val: Option<&serde_json::Value>, frame: f64) -> Vec<f32> {
-    let Some(v) = val else {
-        return Vec::new();
-    };
-    if let Some(arr) = v.as_array() {
-        return arr
-            .iter()
-            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-            .collect();
-    }
-    if let Some(objs) = v.get("objects").and_then(serde_json::Value::as_array) {
-        return objs
-            .iter()
-            .map(|o| eval_json_anim_number(Some(o), frame, 0.0))
-            .collect();
-    }
-    if let Some(kfs) = v.get("keyframes").and_then(serde_json::Value::as_array)
-        && !kfs.is_empty()
-    {
-        let mut pts: Vec<(f64, Vec<f32>)> = kfs
-            .iter()
-            .filter_map(|k| {
-                let f = k.get("frame").and_then(serde_json::Value::as_f64)?;
-                let arr = k.get("value").and_then(serde_json::Value::as_array)?;
-                Some((
-                    f,
-                    arr.iter()
-                        .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-                        .collect(),
-                ))
-            })
-            .collect();
-        if !pts.is_empty() {
-            pts.sort_by(|a, b| a.0.total_cmp(&b.0));
-            if frame <= pts[0].0 {
-                return pts[0].1.clone();
-            }
-            if frame >= pts[pts.len() - 1].0 {
-                return pts[pts.len() - 1].1.clone();
-            }
-            for w in pts.windows(2) {
-                if frame <= w[1].0 {
-                    let span = (w[1].0 - w[0].0).max(1e-9);
-                    let u = ((frame - w[0].0) / span).clamp(0.0, 1.0) as f32;
-                    let len = w[0].1.len().min(w[1].1.len());
-                    return (0..len)
-                        .map(|i| w[0].1[i] + (w[1].1[i] - w[0].1[i]) * u)
-                        .collect();
-                }
-            }
-        }
-    }
-    if let Some(inner) = v.get("value") {
-        return eval_json_anim_f32_array(Some(inner), frame);
-    }
-    Vec::new()
-}
-
-fn shape_plus_group_mat3(props: Option<&serde_json::Value>, frame: f64) -> Mat3 {
-    let pos = eval_json_anim_vec2(props.and_then(|p| p.get("position")), frame, [0.0, 0.0]);
-    let anchor = eval_json_anim_vec2(props.and_then(|p| p.get("anchor")), frame, [0.0, 0.0]);
-    let scale = eval_json_anim_vec2(props.and_then(|p| p.get("scale")), frame, [1.0, 1.0]);
-    let rot = eval_json_anim_number(props.and_then(|p| p.get("rotation")), frame, 0.0);
-    zc_geom::Transform2D {
-        position: Vec2::from_array(pos),
-        rotation: rot,
-        scale: Vec2::from_array(scale),
-        anchor: Vec2::from_array(anchor),
-    }
-    .to_mat3()
-}
-
-fn shape_plus_primitive_subpath(item: &serde_json::Value, frame: f64) -> Option<PolySubPath> {
-    let kind = item.get("kind").and_then(serde_json::Value::as_str)?;
-    let props = item.get("properties");
-    let center = eval_json_anim_vec2(props.and_then(|p| p.get("position")), frame, [0.0, 0.0]);
-    let tol_sq = 0.04_f32;
-
-    let mut verts: Vec<BezierVertex2D> = Vec::new();
-    let mut closed = true;
-    match kind {
-        "rectangle" => {
-            let sz = eval_json_anim_vec2(props.and_then(|p| p.get("size")), frame, [200.0, 200.0]);
-            let hw = sz[0].abs() * 0.5;
-            let hh = sz[1].abs() * 0.5;
-            let r = eval_json_anim_number(props.and_then(|p| p.get("roundness")), frame, 0.0)
-                .clamp(0.0, hw.min(hh));
-            let k = 0.552_284_8_f32 * r;
-            if r <= 1e-4 {
-                for pt in [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]] {
-                    verts.push(BezierVertex2D {
-                        point: [pt[0] + center[0], pt[1] + center[1]],
-                        in_h: [0.0, 0.0],
-                        out_h: [0.0, 0.0],
-                    });
-                }
-            } else {
-                let raw = [
-                    ([-hw + r, -hh], [-k, 0.0], [0.0, 0.0]),
-                    ([hw - r, -hh], [0.0, 0.0], [k, 0.0]),
-                    ([hw, -hh + r], [0.0, -k], [0.0, 0.0]),
-                    ([hw, hh - r], [0.0, 0.0], [0.0, k]),
-                    ([hw - r, hh], [k, 0.0], [0.0, 0.0]),
-                    ([-hw + r, hh], [0.0, 0.0], [-k, 0.0]),
-                    ([-hw, hh - r], [0.0, k], [0.0, 0.0]),
-                    ([-hw, -hh + r], [0.0, 0.0], [0.0, -k]),
-                ];
-                for (pt, inh, outh) in raw {
-                    verts.push(BezierVertex2D {
-                        point: [pt[0] + center[0], pt[1] + center[1]],
-                        in_h: inh,
-                        out_h: outh,
-                    });
-                }
-            }
-        }
-        "ellipse" => {
-            let sz = eval_json_anim_vec2(props.and_then(|p| p.get("size")), frame, [200.0, 200.0]);
-            let rx = sz[0].abs() * 0.5;
-            let ry = sz[1].abs() * 0.5;
-            let k = 0.552_284_8_f32;
-            let raw = [
-                ([rx, 0.0], [0.0, -ry * k], [0.0, ry * k]),
-                ([0.0, ry], [rx * k, 0.0], [-rx * k, 0.0]),
-                ([-rx, 0.0], [0.0, ry * k], [0.0, -ry * k]),
-                ([0.0, -ry], [-rx * k, 0.0], [rx * k, 0.0]),
-            ];
-            for (pt, inh, outh) in raw {
-                verts.push(BezierVertex2D {
-                    point: [pt[0] + center[0], pt[1] + center[1]],
-                    in_h: inh,
-                    out_h: outh,
-                });
-            }
-        }
-        "polystar" => {
-            let count = eval_json_anim_number(props.and_then(|p| p.get("points")), frame, 5.0)
-                .round()
-                .clamp(3.0, 128.0) as usize;
-            let is_star = props
-                .and_then(|p| p.get("mode"))
-                .and_then(serde_json::Value::as_str)
-                != Some("polygon");
-            let outer_r =
-                eval_json_anim_number(props.and_then(|p| p.get("outerRadius")), frame, 100.0);
-            let inner_r =
-                eval_json_anim_number(props.and_then(|p| p.get("innerRadius")), frame, 50.0);
-            let rot = eval_json_anim_number(props.and_then(|p| p.get("rotation")), frame, 0.0);
-            let n = count * if is_star { 2 } else { 1 };
-            for i in 0..n {
-                let theta = rot + std::f32::consts::FRAC_PI_2 + (i as f32 / n as f32) * TAU;
-                let r = if is_star && i % 2 == 1 {
-                    inner_r
-                } else {
-                    outer_r
-                };
-                verts.push(BezierVertex2D {
-                    point: [center[0] + r * theta.cos(), center[1] + r * theta.sin()],
-                    in_h: [0.0, 0.0],
-                    out_h: [0.0, 0.0],
-                });
-            }
-        }
-        "path" => {
-            let values = eval_json_anim_f32_array(props.and_then(|p| p.get("path")), frame);
-            let num_verts = item
-                .get("vertexIds")
-                .and_then(serde_json::Value::as_array)
-                .map_or(values.len() / 6, |a| a.len());
-            for i in 0..num_verts {
-                let base = i * 6;
-                if base + 5 < values.len() {
-                    verts.push(BezierVertex2D {
-                        point: [values[base], values[base + 1]],
-                        in_h: [values[base + 2], values[base + 3]],
-                        out_h: [values[base + 4], values[base + 5]],
-                    });
-                }
-            }
-            closed = eval_json_anim_number(props.and_then(|p| p.get("closed")), frame, 1.0) >= 0.5;
-        }
-        _ => return None,
-    }
-    Some(flatten_bezier_vertices(&verts, closed, tol_sq))
-}
-
-fn trim_subpath(
-    sp: &PolySubPath,
-    start_pct: f32,
-    end_pct: f32,
-    offset_rad: f32,
-) -> Option<PolySubPath> {
-    if sp.points.len() < 2 {
-        return None;
-    }
-    let s = (start_pct / 100.0).clamp(0.0, 1.0);
-    let e = (end_pct / 100.0).clamp(0.0, 1.0);
-    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-    if (hi - lo) <= 1e-5 {
-        return None;
-    }
-    if (lo <= 1e-5) && (hi >= 1.0 - 1e-5) && offset_rad.abs() <= 1e-5 {
-        return Some(sp.clone());
-    }
-    let mut ring = sp.points.clone();
-    if sp.closed && ring.last() != ring.first() {
-        ring.push(ring[0]);
-    }
-    let mut lengths = vec![0.0_f32; ring.len()];
-    for i in 1..ring.len() {
-        lengths[i] = lengths[i - 1] + ring[i].distance(ring[i - 1]);
-    }
-    let total = *lengths.last().unwrap_or(&0.0);
-    if total <= 1e-6 {
-        return None;
-    }
-    let off = (offset_rad / TAU).rem_euclid(1.0);
-    let d0 = ((lo + off).rem_euclid(1.0)) * total;
-    let d1 = ((hi + off).rem_euclid(1.0)) * total;
-    let sample = |dist: f32| -> Vec2 {
-        let clamped = dist.clamp(0.0, total);
-        for i in 1..lengths.len() {
-            if clamped <= lengths[i] {
-                let seg = (lengths[i] - lengths[i - 1]).max(1e-6);
-                let t = ((clamped - lengths[i - 1]) / seg).clamp(0.0, 1.0);
-                return ring[i - 1].lerp(ring[i], t);
-            }
-        }
-        *ring.last().unwrap()
-    };
-    let mut out = Vec::new();
-    let emit_span = |a: f32, b: f32, dst: &mut Vec<Vec2>| {
-        dst.push(sample(a));
-        for (idx, &len) in lengths.iter().enumerate() {
-            if len > a && len < b {
-                dst.push(ring[idx]);
-            }
-        }
-        dst.push(sample(b));
-    };
-    if d0 <= d1 {
-        emit_span(d0, d1, &mut out);
-    } else {
-        emit_span(d0, total, &mut out);
-        emit_span(0.0, d1, &mut out);
-    }
-    Some(PolySubPath {
-        points: out,
-        closed: false,
-    })
-}
-
-fn rasterize_shape_plus_payload(
-    payload: &serde_json::Value,
-    env: &EvalEnv<'_>,
-    width: u32,
-    height: u32,
-) -> Vec<u8> {
-    let w = width as usize;
-    let h = height as usize;
-    let mut fb = vec![[0.0_f32; 4]; w * h];
-    let Some(contents) = payload
-        .get("contents")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return fb_to_rgba8(&fb);
-    };
-    let preview_scale = ((width as f32) / (env.sequence_resolution[0].max(1) as f32)
-        + (height as f32) / (env.sequence_resolution[1].max(1) as f32))
-        * 0.5;
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_contents(
-        items: &[serde_json::Value],
-        mat: Mat3,
-        opacity_mult: f32,
-        env: &EvalEnv<'_>,
-        preview_scale: f32,
-        width: u32,
-        height: u32,
-        fb: &mut [[f32; 4]],
-    ) {
-        let mut paths: Vec<PolySubPath> = Vec::new();
-        for item in items {
-            let Some(kind) = item.get("kind").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let props = item.get("properties");
-            match kind {
-                "rectangle" | "ellipse" | "polystar" | "path" => {
-                    if let Some(sp) = shape_plus_primitive_subpath(item, env.frame) {
-                        paths.push(sp);
-                    }
-                }
-                "trim" => {
-                    let s =
-                        eval_json_anim_number(props.and_then(|p| p.get("start")), env.frame, 0.0);
-                    let e =
-                        eval_json_anim_number(props.and_then(|p| p.get("end")), env.frame, 100.0);
-                    let off =
-                        eval_json_anim_number(props.and_then(|p| p.get("offset")), env.frame, 0.0);
-                    paths = paths
-                        .iter()
-                        .filter_map(|sp| trim_subpath(sp, s, e, off))
-                        .collect();
-                }
-                "group" => {
-                    let gmat = mat * shape_plus_group_mat3(props, env.frame);
-                    let gop =
-                        eval_json_anim_number(props.and_then(|p| p.get("opacity")), env.frame, 1.0)
-                            .clamp(0.0, 1.0);
-                    if let Some(sub) = item.get("contents").and_then(serde_json::Value::as_array) {
-                        render_contents(
-                            sub,
-                            gmat,
-                            opacity_mult * gop,
-                            env,
-                            preview_scale,
-                            width,
-                            height,
-                            fb,
-                        );
-                    }
-                }
-                "fill" | "gradientFill" => {
-                    if paths.is_empty() {
-                        continue;
-                    }
-                    let mut col = eval_json_anim_color(
-                        props.and_then(|p| p.get("color")),
-                        env.frame,
-                        [1.0, 1.0, 1.0, 1.0],
-                    );
-                    let op =
-                        eval_json_anim_number(props.and_then(|p| p.get("opacity")), env.frame, 1.0)
-                            .clamp(0.0, 1.0);
-                    col[3] = (col[3] * op * opacity_mult).clamp(0.0, 1.0);
-                    let even_odd = props
-                        .and_then(|p| p.get("fillRule"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("even-odd");
-                    let px_paths = map_seq_subpaths_to_pixels(
-                        &paths,
-                        mat,
-                        env.sequence_resolution,
-                        width,
-                        height,
-                    );
-                    rasterize_fill_subpaths(
-                        &px_paths,
-                        col,
-                        even_odd,
-                        width as usize,
-                        height as usize,
-                        fb,
-                    );
-                }
-                "stroke" | "gradientStroke" => {
-                    if paths.is_empty() {
-                        continue;
-                    }
-                    let mut col = eval_json_anim_color(
-                        props.and_then(|p| p.get("color")),
-                        env.frame,
-                        [1.0, 1.0, 1.0, 1.0],
-                    );
-                    let op =
-                        eval_json_anim_number(props.and_then(|p| p.get("opacity")), env.frame, 1.0)
-                            .clamp(0.0, 1.0);
-                    let sw =
-                        eval_json_anim_number(props.and_then(|p| p.get("width")), env.frame, 2.0)
-                            .max(0.0);
-                    col[3] = (col[3] * op * opacity_mult).clamp(0.0, 1.0);
-                    let px_paths = map_seq_subpaths_to_pixels(
-                        &paths,
-                        mat,
-                        env.sequence_resolution,
-                        width,
-                        height,
-                    );
-                    rasterize_stroke_subpaths(
-                        &px_paths,
-                        col,
-                        sw * preview_scale,
-                        width as usize,
-                        height as usize,
-                        fb,
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
-    render_contents(
-        contents,
-        Mat3::IDENTITY,
-        1.0,
-        env,
-        preview_scale,
-        width,
-        height,
-        &mut fb,
-    );
-    fb_to_rgba8(&fb)
-}
-
 // ---------------------------------------------------------------------------
 // Exact 2D Euclidean Distance Transform (Felzenszwalb-Huttenlocher O(W*H))
-// Used for Text2D DrawOp::Stroke and zoidiumMasks SDF expansion.
+// Used for Text2D DrawOp::Stroke and Shader+ SDF text.
 // ---------------------------------------------------------------------------
 
 fn edt_1d(f: &[f32], d: &mut [f32], v: &mut [usize], z: &mut [f32]) {
@@ -12954,29 +17522,25 @@ fn shade_silhouette_with_paint_ops(
 }
 
 // ---------------------------------------------------------------------------
-// Zoidium Layer Masks (`zoidiumMasks`) Evaluator & Rasterizer (P6 P0)
+// Zoidium Layer Masks (`zoidiumMasks`) Evaluator (full zc-anim + zc-expr)
 // ---------------------------------------------------------------------------
 
 fn evaluate_zoidium_masks(
     arr: &[serde_json::Value],
     env: &EvalEnv<'_>,
 ) -> Vec<EvaluatedZoidiumMask> {
+    let expr_cb = |src: &str, f: f64| eval_scalar_expr_at_frame(src, env, f);
+    let eval_num = |val: Option<&serde_json::Value>, default: f64| -> f32 {
+        shape_plus_eval_prop_f64(val, env.frame, default, Some(&expr_cb)) as f32
+    };
     let mut out = Vec::new();
     for item in arr.iter().take(32) {
         let props = item.get("properties").unwrap_or(item);
-        let enabled = eval_json_anim_number(
-            props.get("enabled").or_else(|| item.get("enabled")),
-            env.frame,
-            1.0,
-        );
+        let enabled = eval_num(props.get("enabled").or_else(|| item.get("enabled")), 1.0);
         if enabled < 0.5 {
             continue;
         }
-        let closed = eval_json_anim_number(
-            props.get("closed").or_else(|| item.get("closed")),
-            env.frame,
-            1.0,
-        ) >= 0.5;
+        let closed = eval_num(props.get("closed").or_else(|| item.get("closed")), 1.0) >= 0.5;
         let mode = props
             .get("mode")
             .or_else(|| item.get("mode"))
@@ -12986,29 +17550,16 @@ fn evaluate_zoidium_masks(
             })
             .unwrap_or("add")
             .to_ascii_lowercase();
-        let feather = eval_json_anim_number(
-            props.get("feather").or_else(|| item.get("feather")),
-            env.frame,
-            0.0,
-        )
-        .clamp(0.0, 500.0);
-        let expansion = eval_json_anim_number(
+        let feather =
+            eval_num(props.get("feather").or_else(|| item.get("feather")), 0.0).clamp(0.0, 500.0);
+        let expansion = eval_num(
             props.get("expansion").or_else(|| item.get("expansion")),
-            env.frame,
             0.0,
         )
         .clamp(-128.0, 128.0);
-        let opacity = eval_json_anim_number(
-            props.get("opacity").or_else(|| item.get("opacity")),
-            env.frame,
-            1.0,
-        )
-        .clamp(0.0, 1.0);
-        let invert = eval_json_anim_number(
-            props.get("invert").or_else(|| item.get("invert")),
-            env.frame,
-            0.0,
-        ) >= 0.5;
+        let opacity =
+            eval_num(props.get("opacity").or_else(|| item.get("opacity")), 1.0).clamp(0.0, 1.0);
+        let invert = eval_num(props.get("invert").or_else(|| item.get("invert")), 0.0) >= 0.5;
 
         let mut vertices = Vec::new();
         if let Some(verts_arr) = item.get("vertices").and_then(serde_json::Value::as_array) {
@@ -13024,7 +17575,7 @@ fn evaluate_zoidium_masks(
             }
         } else {
             let flat =
-                eval_json_anim_f32_array(props.get("path").or_else(|| item.get("path")), env.frame);
+                eval_json_anim_f32_array_aa(props.get("path").or_else(|| item.get("path")), env);
             let vcount = item
                 .get("vertexIds")
                 .and_then(serde_json::Value::as_array)
@@ -13051,182 +17602,6 @@ fn evaluate_zoidium_masks(
             opacity,
             invert,
         });
-    }
-    out
-}
-
-fn fill_polygon_even_odd_plane(points: &[Vec2], width: usize, height: usize, alpha: &mut [f32]) {
-    if points.len() < 3 {
-        return;
-    }
-    let mut edges: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(points.len());
-    for i in 0..points.len() {
-        let a = points[i];
-        let b = points[(i + 1) % points.len()];
-        if (a.y - b.y).abs() < 1e-7 {
-            continue;
-        }
-        let (top, bot) = if a.y < b.y { (a, b) } else { (b, a) };
-        edges.push((top.y, bot.y, top.x, (bot.x - top.x) / (bot.y - top.y)));
-    }
-    let mut crossings = Vec::with_capacity(16);
-    for y in 0..height {
-        let sy = y as f32 + 0.5;
-        crossings.clear();
-        for &(y0, y1, x0, slope) in &edges {
-            if sy >= y0 && sy < y1 {
-                crossings.push(x0 + (sy - y0) * slope);
-            }
-        }
-        if crossings.is_empty() {
-            continue;
-        }
-        crossings.sort_by(f32::total_cmp);
-        let row = y * width;
-        let mut idx = 0;
-        while idx + 1 < crossings.len() {
-            let x0 = ((crossings[idx] - 0.5).ceil() as isize).max(0) as usize;
-            let x1 = ((crossings[idx + 1] - 0.5).floor() as isize).min(width as isize - 1);
-            if x1 >= x0 as isize {
-                for x in x0..=(x1 as usize) {
-                    alpha[row + x] = 1.0;
-                }
-            }
-            idx += 2;
-        }
-    }
-}
-
-/// Sliding-window clamped box blur matching Zoidium `mask-raster.js:76-111`.
-fn mask_box_blur_1d(
-    src: &[f32],
-    width: usize,
-    height: usize,
-    radius: usize,
-    transpose: bool,
-) -> Vec<f32> {
-    if radius == 0 || width == 0 || height == 0 {
-        return src.to_vec();
-    }
-    let major = if transpose { height } else { width };
-    let minor = if transpose { width } else { height };
-    let window = (2 * radius + 1) as f32;
-    let r = radius as isize;
-    let mut out = vec![0.0_f32; src.len()];
-    let get = |m: usize, i: isize| -> f32 {
-        let clamped = i.clamp(0, major as isize - 1) as usize;
-        if transpose {
-            src[clamped * width + m]
-        } else {
-            src[m * width + clamped]
-        }
-    };
-    for m in 0..minor {
-        let mut sum = 0.0_f32;
-        for k in -r..=r {
-            sum += get(m, k);
-        }
-        for i in 0..major {
-            let val = sum / window;
-            if transpose {
-                out[i * width + m] = val;
-            } else {
-                out[m * width + i] = val;
-            }
-            sum += get(m, i as isize + r + 1) - get(m, i as isize - r);
-        }
-    }
-    out
-}
-
-fn mask_feather_3pass(mut channel: Vec<f32>, width: usize, height: usize, radius: f32) -> Vec<f32> {
-    let clamped = (radius.round() as isize).clamp(0, width.max(height) as isize) as usize;
-    if clamped == 0 {
-        return channel;
-    }
-    for _ in 0..3 {
-        channel = mask_box_blur_1d(&channel, width, height, clamped, false);
-        channel = mask_box_blur_1d(&channel, width, height, clamped, true);
-    }
-    channel
-}
-
-fn combine_mask_value(base: f32, alpha: f32, mode: &str, is_first: bool) -> f32 {
-    if is_first {
-        return if mode == "subtract" { 0.0 } else { alpha };
-    }
-    match mode {
-        "add" => base + alpha * (1.0 - base),
-        "subtract" => base * (1.0 - alpha),
-        _ => base.min(alpha),
-    }
-}
-
-/// Rasterizes evaluated `zoidiumMasks` into RGBA8 `[cov, cov, cov, cov]` following Zoidium's
-/// exact pipeline: fill/expand -> 3-pass box feather -> opacity -> invert -> ordered combine.
-fn rasterize_zoidium_masks_rgba8(
-    masks: &[EvaluatedZoidiumMask],
-    seq_res: [u32; 2],
-    width: u32,
-    height: u32,
-) -> Vec<u8> {
-    let w = width as usize;
-    let h = height as usize;
-    let sx = (width as f32) / (seq_res[0].max(1) as f32);
-    let sy = (height as f32) / (seq_res[1].max(1) as f32);
-    let scale = (sx + sy) * 0.5;
-    let mut coverage = vec![0.0_f32; w * h];
-    let mut first = true;
-
-    for mask in masks {
-        let mut scratch = vec![0.0_f32; w * h];
-        if mask.vertices.len() >= 2 {
-            // Scale mask vertices from top-left Y-down sequence pixels to target pixels.
-            let scaled_verts: Vec<BezierVertex2D> = mask
-                .vertices
-                .iter()
-                .map(|v| BezierVertex2D {
-                    point: [v.point[0] * sx, v.point[1] * sy],
-                    in_h: [v.in_h[0] * sx, v.in_h[1] * sy],
-                    out_h: [v.out_h[0] * sx, v.out_h[1] * sy],
-                })
-                .collect();
-            // Auto-close open paths for fill coverage (`mask-raster.js:30-35`).
-            let flat = flatten_bezier_vertices(&scaled_verts, true, 0.0625);
-            fill_polygon_even_odd_plane(&flat.points, w, h, &mut scratch);
-
-            if mask.expansion.abs() > 1e-4 {
-                let inside: Vec<bool> = scratch.iter().map(|&v| v >= 0.5).collect();
-                let sdf = compute_signed_distance_2d(&inside, w, h);
-                let exp_px = mask.expansion * scale;
-                for (slot, &sd) in scratch.iter_mut().zip(sdf.iter()) {
-                    *slot = (0.5 + sd + exp_px).clamp(0.0, 1.0);
-                }
-            }
-        }
-
-        let channel = if mask.feather > 0.0 {
-            mask_feather_3pass(scratch, w, h, mask.feather * scale)
-        } else {
-            scratch
-        };
-
-        for (cov_slot, &ch) in coverage.iter_mut().zip(channel.iter()) {
-            let mut alpha = ch * mask.opacity;
-            // P6 P0: `invert` happens AFTER `opacity` (matching `mask-raster.js:146-147`).
-            if mask.invert {
-                alpha = 1.0 - alpha;
-            }
-            alpha = alpha.clamp(0.0, 1.0);
-            *cov_slot = combine_mask_value(*cov_slot, alpha, &mask.mode, first);
-        }
-        first = false;
-    }
-
-    let mut out = Vec::with_capacity(w * h * 4);
-    for c in coverage {
-        let b = (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-        out.extend_from_slice(&[b, b, b, b]);
     }
     out
 }
@@ -15495,6 +19870,8 @@ DOMAIN_MAX 0.9 0.8 0.7
                 expansion: 0.0,
                 opacity: 1.0,
                 closed: true,
+                locked: false,
+                outline_color: String::new(),
                 vertex_ids: vec![
                     "v0".to_owned(),
                     "v1".to_owned(),
@@ -15552,18 +19929,30 @@ DOMAIN_MAX 0.9 0.8 0.7
             p
         };
 
-        for stage in ["masks", "effects-masks"] {
-            let proj_stage = make_consumer(stage);
-            let px = engine
-                .render_frame_rgba8(&proj_stage, &plugins, 0.0, 64, 64)
-                .expect("render layer-input masked");
-            let left_r = px[(32 * 64 + 12) * 4];
-            let right_r = px[(32 * 64 + 52) * 4];
-            assert!(
-                left_r > 200 && right_r < 20,
-                "LayerInput stage `{stage}` must honor typed sequence.layer_masks (left_r={left_r}, right_r={right_r})"
-            );
-        }
+        // Per Zoidium `layer-input/README.md` (Wave 2D B2):
+        // - `"effects-masks"` runs all effects AND `zoidiumMasks` / typed `sequence.layer_masks`.
+        // - `"masks"` runs ONLY native CM3 `mask` effects and skips `zoidiumMasks`.
+        let proj_effects_masks = make_consumer("effects-masks");
+        let px_em = engine
+            .render_frame_rgba8(&proj_effects_masks, &plugins, 0.0, 64, 64)
+            .expect("render layer-input effects-masks");
+        let left_r = px_em[(32 * 64 + 12) * 4];
+        let right_r = px_em[(32 * 64 + 52) * 4];
+        assert!(
+            left_r > 200 && right_r < 20,
+            "LayerInput stage `effects-masks` must honor typed sequence.layer_masks (left_r={left_r}, right_r={right_r})"
+        );
+
+        let proj_masks_only = make_consumer("masks");
+        let px_mo = engine
+            .render_frame_rgba8(&proj_masks_only, &plugins, 0.0, 64, 64)
+            .expect("render layer-input masks-only");
+        let mo_left_r = px_mo[(32 * 64 + 12) * 4];
+        let mo_right_r = px_mo[(32 * 64 + 52) * 4];
+        assert!(
+            mo_left_r > 200 && mo_right_r > 200,
+            "LayerInput stage `masks` must run only native CM3 mask effects and skip zoidiumMasks (left_r={mo_left_r}, right_r={mo_right_r})"
+        );
     }
 
     #[test]
@@ -16005,6 +20394,515 @@ DOMAIN_MAX 0.9 0.8 0.7
         assert_eq!(
             px_opaque_again[3], 255,
             "toggling set_transparent_background(false) must NOT return stale cached transparent pixels"
+        );
+    }
+
+    #[test]
+    fn gpu_wave2d_echo_on_adjustment_layer_renders_temporal_trail() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        plugins.enable("native-fx").expect("enable native-fx");
+
+        let make_proj = |with_adj_echo: bool| {
+            let mut project = Project::new_cm3_default();
+            project.sequence.resolution = [64, 64];
+            project.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+            let mut pos_track = PropertyTrack::vec2([-22.0, 0.0]);
+            pos_track.animated = true;
+            pos_track.keyframes = vec![
+                PropertyKeyframe::linear(0.0, PropertyValue::Vec2([-22.0, 0.0])),
+                PropertyKeyframe::linear(10.0, PropertyValue::Vec2([22.0, 0.0])),
+            ];
+            let moving_layer = Layer::new(
+                "MovingSquare",
+                LayerKind::PresetShape2D {
+                    preset: PresetShapeKind::Rectangle,
+                    shapes: vec![Shape2DNode {
+                        id: Uuid::new_v4(),
+                        name: "Sq".to_owned(),
+                        kind: Shape2DKind::Group {
+                            children: Vec::new(),
+                        },
+                        position: pos_track,
+                        rotation: PropertyTrack::number(0.0),
+                        scale: PropertyTrack::vec2([0.06, 0.06]),
+                        operations: vec![DrawOp::Fill {
+                            color: PropertyTrack::constant(PropertyValue::ColorRgba([
+                                1.0, 1.0, 1.0, 1.0,
+                            ])),
+                        }],
+                        preserved: BTreeMap::new(),
+                    }],
+                },
+                [64, 64],
+            );
+            let mut tracks = vec![zc_project::VideoTrack {
+                id: Uuid::new_v4(),
+                name: "BaseTrack".to_owned(),
+                enabled: true,
+                solo: false,
+                locked: false,
+                is_3d: false,
+                clips: vec![VideoClip {
+                    id: Uuid::new_v4(),
+                    name: "MoveClip".to_owned(),
+                    start: 0.0,
+                    length: 60.0,
+                    link: None,
+                    media: None,
+                    time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                    layer: moving_layer,
+                    preserved: BTreeMap::new(),
+                }],
+                preserved: BTreeMap::new(),
+            }];
+            if with_adj_echo {
+                let mut adj = Layer::new("AdjEcho", LayerKind::Adjustment, [64, 64]);
+                let mut echo_params = BTreeMap::new();
+                echo_params.insert("echoes".to_owned(), PropertyTrack::number(3.0));
+                echo_params.insert("delay".to_owned(), PropertyTrack::number(1.0));
+                echo_params.insert("decay".to_owned(), PropertyTrack::number(0.85));
+                echo_params.insert("opacity".to_owned(), PropertyTrack::number(0.95));
+                adj.effects.push(EffectInstance {
+                    id: Uuid::new_v4(),
+                    name: "Echo".to_owned(),
+                    kind: EffectKind::Plugin {
+                        plugin_id: "native-fx".to_owned(),
+                        effect_id: "echo".to_owned(),
+                    },
+                    enabled: PropertyTrack::option(1),
+                    params: echo_params,
+                    preserved: BTreeMap::new(),
+                });
+                tracks.push(zc_project::VideoTrack {
+                    id: Uuid::new_v4(),
+                    name: "AdjTrack".to_owned(),
+                    enabled: true,
+                    solo: false,
+                    locked: false,
+                    is_3d: false,
+                    clips: vec![VideoClip {
+                        id: Uuid::new_v4(),
+                        name: "AdjClip".to_owned(),
+                        start: 0.0,
+                        length: 60.0,
+                        link: None,
+                        media: None,
+                        time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                        layer: adj,
+                        preserved: BTreeMap::new(),
+                    }],
+                    preserved: BTreeMap::new(),
+                });
+            }
+            project.sequence.video_tracks = tracks;
+            project
+        };
+
+        let px_base = engine
+            .render_frame_rgba8(&make_proj(false), &plugins, 5.0, 64, 64)
+            .expect("render baseline moving square");
+        let px_adj_echo = engine
+            .render_frame_rgba8(&make_proj(true), &plugins, 5.0, 64, 64)
+            .expect("render adjustment echo");
+        let count_lit =
+            |px: &[u8]| -> usize { px.as_chunks::<4>().0.iter().filter(|p| p[0] > 20).count() };
+        let base_lit = count_lit(&px_base);
+        let adj_lit = count_lit(&px_adj_echo);
+        assert!(
+            adj_lit > base_lit + 40,
+            "echo on Adjustment layer must re-render lower tracks at historical frames and leave a visible trail (base_lit={base_lit}, adj_lit={adj_lit})"
+        );
+    }
+
+    #[test]
+    fn gpu_wave2d_shape_plus_gradient_fill_and_repeater() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        plugins.enable("shape-plus").expect("enable shape-plus");
+
+        let mut project = Project::new_cm3_default();
+        project.sequence.resolution = [128, 64];
+        project.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        let payload = serde_json::json!({
+            "version": 1,
+            "contents": [{
+                "id": "g1",
+                "kind": "group",
+                "properties": {},
+                "contents": [
+                    { "id": "r1", "kind": "rectangle", "properties": { "size": [28.0, 36.0], "position": [-36.0, 0.0] } },
+                    {
+                        "id": "gf1",
+                        "kind": "gradientFill",
+                        "properties": {
+                            "gradientType": "linear",
+                            "startPoint": [-50.0, 0.0],
+                            "endPoint": [-22.0, 0.0],
+                            "stops": [
+                                { "position": 0.0, "color": [1.0, 0.0, 0.0, 1.0] },
+                                { "position": 1.0, "color": [0.0, 0.0, 1.0, 1.0] }
+                            ]
+                        }
+                    },
+                    {
+                        "id": "rep1",
+                        "kind": "repeater",
+                        "properties": {
+                            "copies": 3.0,
+                            "offset": 0.0,
+                            "position": [36.0, 0.0],
+                            "scale": [1.0, 1.0],
+                            "rotation": 0.0,
+                            "startOpacity": 1.0,
+                            "endOpacity": 1.0
+                        }
+                    }
+                ]
+            }]
+        });
+        let layer = Layer::new(
+            "ShapePlusLayer",
+            LayerKind::Plugin {
+                plugin_type: "zoidium:shape-plus/shape-layer".to_owned(),
+                payload,
+            },
+            [128, 64],
+        );
+        project.sequence.video_tracks = vec![zc_project::VideoTrack {
+            id: Uuid::new_v4(),
+            name: "ShapePlusTrack".to_owned(),
+            enabled: true,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![VideoClip {
+                id: Uuid::new_v4(),
+                name: "SPClip".to_owned(),
+                start: 0.0,
+                length: 60.0,
+                link: None,
+                media: None,
+                time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                layer,
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        }];
+
+        let px = engine
+            .render_frame_rgba8(&project, &plugins, 0.0, 128, 64)
+            .expect("render shape+ gradient+repeater");
+        let mut red_dominant = 0usize;
+        let mut blue_dominant = 0usize;
+        let mut distinct_colors = HashSet::new();
+        for p in px.as_chunks::<4>().0 {
+            if p[0] > 40 || p[2] > 40 {
+                distinct_colors.insert((p[0] / 16, p[1] / 16, p[2] / 16));
+            }
+            if p[0] > p[2].saturating_add(40) {
+                red_dominant += 1;
+            }
+            if p[2] > p[0].saturating_add(40) {
+                blue_dominant += 1;
+            }
+        }
+        assert!(
+            red_dominant > 100 && blue_dominant > 100 && distinct_colors.len() >= 4,
+            "Shape+ gradientFill + repeater must render distinct non-flat gradient copies (red={red_dominant}, blue={blue_dominant}, distinct={})",
+            distinct_colors.len()
+        );
+    }
+
+    #[test]
+    fn gpu_wave2d_node_effect_compiles_and_filters_gpu() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        plugins.enable("node-effect").expect("enable node-effect");
+
+        let make_proj = |with_node_fx: bool| {
+            let mut project = Project::new_cm3_default();
+            project.sequence.resolution = [64, 64];
+            project.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+            let mut layer = Layer::new(
+                "Solid",
+                LayerKind::PresetShape2D {
+                    preset: PresetShapeKind::Rectangle,
+                    shapes: vec![Shape2DNode {
+                        id: Uuid::new_v4(),
+                        name: "Rect".to_owned(),
+                        kind: Shape2DKind::Group {
+                            children: Vec::new(),
+                        },
+                        position: PropertyTrack::vec2([0.0, 0.0]),
+                        rotation: PropertyTrack::number(0.0),
+                        scale: PropertyTrack::vec2([0.5, 0.5]),
+                        operations: vec![DrawOp::Fill {
+                            color: PropertyTrack::constant(PropertyValue::ColorRgba([
+                                0.8, 0.8, 0.8, 1.0,
+                            ])),
+                        }],
+                        preserved: BTreeMap::new(),
+                    }],
+                },
+                [64, 64],
+            );
+            if with_node_fx {
+                let graph = serde_json::json!({
+                    "version": 1,
+                    "nodes": [
+                        { "id": "uv", "type": "uv" },
+                        { "id": "samp", "type": "sample" },
+                        { "id": "vor", "type": "voronoi", "params": { "mode": 2, "scale": 5.0 } },
+                        { "id": "ramp", "type": "colorRamp", "params": {
+                            "interpolation": 1,
+                            "stops": [[0.0, 0.1, 0.0, 0.8, 1.0], [1.0, 1.0, 0.5, 0.0, 1.0]]
+                        }},
+                        { "id": "mix", "type": "mix", "params": { "mode": 0, "factor": 0.85 } },
+                        { "id": "out", "type": "output" }
+                    ],
+                    "links": [
+                        { "from": { "node": "uv", "port": "out" }, "to": { "node": "samp", "port": "uv" } },
+                        { "from": { "node": "vor", "port": "out" }, "to": { "node": "ramp", "port": "factor" } },
+                        { "from": { "node": "samp", "port": "color" }, "to": { "node": "mix", "port": "a" } },
+                        { "from": { "node": "ramp", "port": "color" }, "to": { "node": "mix", "port": "b" } },
+                        { "from": { "node": "mix", "port": "color" }, "to": { "node": "out", "port": "color" } },
+                        { "from": { "node": "samp", "port": "alpha" }, "to": { "node": "out", "port": "alpha" } }
+                    ]
+                });
+                let mut params = BTreeMap::new();
+                params.insert(
+                    "graph".to_owned(),
+                    PropertyTrack::constant(PropertyValue::Json(graph)),
+                );
+                layer.effects.push(EffectInstance {
+                    id: Uuid::new_v4(),
+                    name: "NodeFX".to_owned(),
+                    kind: EffectKind::Plugin {
+                        plugin_id: "node-effect".to_owned(),
+                        effect_id: "nodeeffect".to_owned(),
+                    },
+                    enabled: PropertyTrack::option(1),
+                    params,
+                    preserved: BTreeMap::new(),
+                });
+            }
+            project.sequence.video_tracks = vec![zc_project::VideoTrack {
+                id: Uuid::new_v4(),
+                name: "NodeTrack".to_owned(),
+                enabled: true,
+                solo: false,
+                locked: false,
+                is_3d: false,
+                clips: vec![VideoClip {
+                    id: Uuid::new_v4(),
+                    name: "NodeClip".to_owned(),
+                    start: 0.0,
+                    length: 60.0,
+                    link: None,
+                    media: None,
+                    time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                    layer,
+                    preserved: BTreeMap::new(),
+                }],
+                preserved: BTreeMap::new(),
+            }];
+            project
+        };
+
+        let px_base = engine
+            .render_frame_rgba8(&make_proj(false), &plugins, 0.0, 64, 64)
+            .expect("render baseline for nodeeffect");
+        let px_fx = engine
+            .render_frame_rgba8(&make_proj(true), &plugins, 0.0, 64, 64)
+            .expect("render nodeeffect");
+        let diff_px = px_base
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(px_fx.as_chunks::<4>().0.iter())
+            .filter(|(a, b)| {
+                a[0].abs_diff(b[0]) > 20 || a[1].abs_diff(b[1]) > 20 || a[2].abs_diff(b[2]) > 20
+            })
+            .count();
+        assert!(
+            diff_px > 100,
+            "nodeeffect graph must compile to WGSL and produce non-identity filtered GPU output (diff_px={diff_px})"
+        );
+    }
+
+    #[test]
+    fn gpu_wave2d_node_material_procedural_3d_render() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let plugins = PluginRegistry::new();
+
+        let mat_graph = serde_json::json!({
+            "nodes": [
+                { "id": "n", "type": "noise", "params": { "scale": 6, "octaves": 4, "seed": 11, "contrast": 2.0 } },
+                { "id": "ramp", "type": "colorRamp", "params": {
+                    "interpolation": 1,
+                    "stops": [[0.0, 0.05, 0.1, 0.95, 1.0], [1.0, 0.98, 0.45, 0.05, 1.0]]
+                }},
+                { "id": "out", "type": "pbrOutput" }
+            ],
+            "links": [
+                { "from": "n", "fromPort": "out", "to": "ramp", "toPort": "factor" },
+                { "from": "ramp", "fromPort": "out", "to": "out", "toPort": "color" }
+            ]
+        });
+        let mut cube = Object3D::new_shape_3d(
+            "NodeMatBox",
+            Shape3DKind::Box {
+                size: [48.0, 48.0, 48.0],
+            },
+        );
+        cube.material = Some(MaterialSpec::NodeMaterial {
+            schema_version: 1,
+            resolution: 64,
+            graph: mat_graph,
+        });
+        let mut amb_data = zc_project::LightData::for_kind(zc_project::LightKind::Ambient);
+        amb_data.intensity = PropertyTrack::number(1.2);
+        let amb = Object3D::new("Ambient", Object3DKind::Light(Box::new(amb_data)));
+        let mut cam = Object3D::new_perspective_camera();
+        cam.position = PropertyTrack::vec3([0.0, 0.0, 72.0]);
+        let project = make_test_scene_project(vec![cam, amb, cube], [64, 64]);
+
+        let px = engine
+            .render_frame_rgba8(&project, &plugins, 0.0, 64, 64)
+            .expect("render NodeMaterial 3D scene");
+        let mut colored_non_white = 0usize;
+        let mut distinct_buckets = HashSet::new();
+        for p in px.as_chunks::<4>().0 {
+            if p[0] > 15 || p[1] > 15 || p[2] > 15 {
+                let chroma = p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]);
+                if chroma > 30 {
+                    colored_non_white += 1;
+                }
+                distinct_buckets.insert((p[0] / 24, p[1] / 24, p[2] / 24));
+            }
+        }
+        assert!(
+            colored_non_white > 150 && distinct_buckets.len() >= 3,
+            "NodeMaterial must bake procedural maps and render non-white textured 3D pixels (colored={colored_non_white}, distinct={})",
+            distinct_buckets.len()
+        );
+    }
+
+    #[test]
+    fn gpu_wave2d_optical_flare_renders_additive_3d_flare() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        plugins
+            .enable("optical-flares")
+            .expect("enable optical-flares");
+
+        let mut cam = Object3D::new_perspective_camera();
+        cam.position = PropertyTrack::vec3([0.0, 0.0, 80.0]);
+
+        let mut flare_obj = Object3D::new(
+            "SunFlare",
+            Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: Vec::new(),
+            },
+        );
+        flare_obj.position = PropertyTrack::vec3([0.0, 0.0, 0.0]);
+        flare_obj.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:optical-flares/optical-flare"),
+        );
+        flare_obj
+            .preserved
+            .insert("brightness".to_owned(), serde_json::json!(2.0));
+        flare_obj
+            .preserved
+            .insert("scale".to_owned(), serde_json::json!(1.5));
+        flare_obj
+            .preserved
+            .insert("anamorphic".to_owned(), serde_json::json!(0.9));
+        flare_obj
+            .preserved
+            .insert("color".to_owned(), serde_json::json!([1.0, 0.75, 0.35]));
+
+        let mut proj_dark = make_test_scene_project(vec![cam.clone()], [64, 64]);
+        proj_dark.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        let mut proj_flare = make_test_scene_project(vec![cam, flare_obj], [64, 64]);
+        proj_flare.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+
+        let px_dark = engine
+            .render_frame_rgba8(&proj_dark, &plugins, 0.0, 64, 64)
+            .expect("render dark scene");
+        let px_flare = engine
+            .render_frame_rgba8(&proj_flare, &plugins, 0.0, 64, 64)
+            .expect("render optical flare scene");
+        let dark_lit = count_non_black_rgb_pixels(&px_dark);
+        let flare_lit = count_non_black_rgb_pixels(&px_flare);
+        let center_idx = (32 * 64 + 32) * 4;
+        assert!(
+            flare_lit > dark_lit + 100 && px_flare[center_idx] > 180,
+            "OpticalFlare must render bright additive flare over 3D scene (dark_lit={dark_lit}, flare_lit={flare_lit}, center_rgb={:?})",
+            &px_flare[center_idx..center_idx + 3]
+        );
+    }
+
+    #[test]
+    fn gpu_wave2d_particles_plus_sprite_preset_renders_without_image_asset() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        plugins
+            .enable("particles-plus")
+            .expect("enable particles-plus");
+
+        let mut cam = Object3D::new_perspective_camera();
+        cam.position = PropertyTrack::vec3([0.0, 0.0, 80.0]);
+
+        let pdata = zc_project::ParticlesData {
+            texture: None,
+            sprite_preset: Some("star_5".to_owned()),
+            number: 64,
+            rate: 60.0,
+            lifetime: 4.0,
+            iradius: 18.0,
+            ..zc_project::ParticlesData::default()
+        };
+        let particles_obj =
+            Object3D::new("StarParticles", Object3DKind::Particles(Box::new(pdata)));
+
+        let mut project = make_test_scene_project(vec![cam, particles_obj], [64, 64]);
+        project.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        let px = engine
+            .render_frame_rgba8(&project, &plugins, 15.0, 64, 64)
+            .expect("render Particles+ sprite preset");
+        let lit = count_non_black_rgb_pixels(&px);
+        assert!(
+            lit > 50,
+            "Particles+ sprite preset (`star_5`) must render non-blank particles without an external image asset (lit={lit})"
         );
     }
 }

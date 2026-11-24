@@ -648,9 +648,9 @@ pub fn builtin_plugins() -> Vec<PluginDescriptor> {
         },
         PluginDescriptor {
             id: s("sglow-hq-v2-preview"),
-            name: s("HQ Multi-Scale Glow (beta 1.0)"),
+            name: s("HQ Multi-Scale Glow (beta 1.1)"),
             author: s("ZoidCraft"),
-            version: s("1.0.0-beta.1"),
+            version: s("beta 1.1"),
             category: PluginCategory::Adjustment,
             kind: PluginKind::NativeFx,
             tagline: s("High-precision multi-scale glow with per-channel spread and atmosphere."),
@@ -664,6 +664,65 @@ pub fn builtin_plugins() -> Vec<PluginDescriptor> {
             warning: None,
             accent_color: [255, 224, 130],
             features: features(&["hq-multiscale-glow", "rgb-spread", "atmosphere"]),
+        },
+        PluginDescriptor {
+            id: s("afterclip"),
+            name: s("AfterClip FX Pack"),
+            author: s("ZoidCraft"),
+            version: s("1.0.0"),
+            category: PluginCategory::Adjustment,
+            kind: PluginKind::ShaderPack,
+            tagline: s("Declarative custom shader effects and multi-effect preset groups."),
+            description: s(
+                "Declarative GLSL shader pack slot for compositing, glow, distortion, blur, and \
+                 stylized adjustment presets executed via the native Custom Shader pipeline.",
+            ),
+            default_enabled: false,
+            always_enabled: false,
+            visible: true,
+            warning: None,
+            accent_color: [126, 200, 227],
+            features: features(&["shader-pack", "custom-shaders", "preset-groups"]),
+        },
+        PluginDescriptor {
+            id: s("alipfx-shader-pack-4"),
+            name: s("Shader FX Pack 4"),
+            author: s("ZoidCraft"),
+            version: s("1.0.0"),
+            category: PluginCategory::Adjustment,
+            kind: PluginKind::ShaderPack,
+            tagline: s(
+                "Declarative shader pack with stylized blur, distortion, and color presets.",
+            ),
+            description: s(
+                "Declarative GLSL shader pack slot for mosaic, warp, blur, keyer, and stylistic \
+                 adjustment presets executed via the native Custom Shader pipeline.",
+            ),
+            default_enabled: false,
+            always_enabled: false,
+            visible: true,
+            warning: None,
+            accent_color: [174, 148, 240],
+            features: features(&["shader-pack", "custom-shaders", "preset-groups"]),
+        },
+        PluginDescriptor {
+            id: s("ccfx-shader-pack"),
+            name: s("CCFX Pack"),
+            author: s("ZoidCraft"),
+            version: s("1.0.0"),
+            category: PluginCategory::Adjustment,
+            kind: PluginKind::ShaderPack,
+            tagline: s("Declarative color-correction and stylized visual FX shader pack."),
+            description: s(
+                "Declarative GLSL shader pack slot for color grading, edge stylization, chromatic \
+                 separation, and look presets executed via the native Custom Shader pipeline.",
+            ),
+            default_enabled: false,
+            always_enabled: false,
+            visible: true,
+            warning: None,
+            accent_color: [244, 158, 122],
+            features: features(&["shader-pack", "custom-shaders", "preset-groups"]),
         },
         // Category 4: Experimental
         PluginDescriptor {
@@ -694,4 +753,70 @@ pub fn builtin_plugins() -> Vec<PluginDescriptor> {
             ]),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn sglow_version_and_shader_pack_catalog_entries() {
+        let plugins = builtin_plugins();
+        let ids: BTreeSet<&str> = plugins.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids.len(), plugins.len(), "plugin IDs must be unique");
+
+        let sglow = plugins
+            .iter()
+            .find(|p| p.id == "sglow-hq-v2-preview")
+            .expect("sglow-hq-v2-preview must exist");
+        assert_eq!(sglow.version, "beta 1.1");
+        assert!(sglow.name.contains("beta 1.1"));
+
+        for (id, expected_name) in [
+            ("afterclip", "AfterClip FX Pack"),
+            ("alipfx-shader-pack-4", "Shader FX Pack 4"),
+            ("ccfx-shader-pack", "CCFX Pack"),
+        ] {
+            let pack = plugins
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("missing shader pack '{id}'"));
+            assert_eq!(pack.name, expected_name);
+            assert_eq!(pack.category, PluginCategory::Adjustment);
+            assert_eq!(pack.kind, PluginKind::ShaderPack);
+            assert!(!pack.default_enabled);
+            assert!(pack.visible);
+        }
+
+        // Ensure no third-party brand names appear in display strings or descriptions.
+        let forbidden_brands = [
+            "adobe",
+            "after effects",
+            "sapphire",
+            "boris",
+            "trapcode",
+            "red giant",
+            "magic bullet",
+            "alight motion",
+            "afterzoid",
+            "panzoid",
+            "zoidium",
+        ];
+        for plugin in &plugins {
+            for field in [&plugin.name, &plugin.tagline, &plugin.description] {
+                let lower = field.to_ascii_lowercase();
+                for brand in forbidden_brands {
+                    assert!(
+                        !lower.contains(brand),
+                        "plugin '{}' text {:?} must not contain third-party brand '{}'",
+                        plugin.id,
+                        field,
+                        brand
+                    );
+                }
+            }
+        }
+    }
 }

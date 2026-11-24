@@ -777,6 +777,12 @@ pub struct LayerMask {
     pub opacity: f64,
     #[serde(default)]
     pub closed: bool,
+    /// Shape+ edit lock (`locked`, default `false`).
+    #[serde(default)]
+    pub locked: bool,
+    /// Shape+ overlay outline hex color (`outlineColor`, e.g. `"#58a6ff"`; empty falls back to UI palette).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outline_color: String,
     #[serde(default)]
     pub vertex_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1443,9 +1449,7 @@ impl Default for Text3DData {
 #[serde(tag = "shape", rename_all = "snake_case")]
 pub enum Shape3DKind {
     /// CM3 `objectType: 1`.
-    Box {
-        size: [f64; 3],
-    },
+    Box { size: [f64; 3] },
     /// CM3 `objectType: 2`. Note CM3 inversion: `cylinder_openEnded == 0` => `open_ended = true`.
     Cylinder {
         top_radius: f64,
@@ -1455,14 +1459,9 @@ pub enum Shape3DKind {
         open_ended: bool,
     },
     /// CM3 `objectType: 3`.
-    Rectangle {
-        size: [f64; 2],
-    },
+    Rectangle { size: [f64; 2] },
     /// CM3 `objectType: 4`.
-    Circle {
-        radius: f64,
-        detail: u32,
-    },
+    Circle { radius: f64, detail: u32 },
     /// CM3 `objectType: 5`.
     Sphere {
         radius: f64,
@@ -1495,33 +1494,57 @@ pub enum Shape3DKind {
         height: f64,
         detail: u32,
         open_ended: bool,
+        #[serde(default)]
+        top_radius: f64,
+        #[serde(default)]
+        shading: u32,
     },
     RoundedBox {
         size: [f64; 3],
         radius: f64,
         segments: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        corner_radius: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        corner_segments: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bevel_size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bevel_segments: Option<u32>,
+        #[serde(default)]
+        shading: u32,
     },
     Tetrahedron {
         radius: f64,
         detail: u32,
+        #[serde(default)]
+        shading: u32,
     },
     Octahedron {
         radius: f64,
         detail: u32,
+        #[serde(default)]
+        shading: u32,
     },
     Dodecahedron {
         radius: f64,
         detail: u32,
+        #[serde(default)]
+        shading: u32,
     },
     Icosahedron {
         radius: f64,
         detail: u32,
+        #[serde(default)]
+        shading: u32,
     },
     Capsule {
         radius: f64,
         length: f64,
         cap_segments: u32,
         radial_segments: u32,
+        #[serde(default)]
+        shading: u32,
     },
     TorusKnot {
         radius: f64,
@@ -1530,6 +1553,88 @@ pub enum Shape3DKind {
         radial_segments: u32,
         p: u32,
         q: u32,
+    },
+    /// Geometry+ hollow cylinder (`zoidium:geometry-plus/tube`).
+    Tube {
+        #[serde(default = "default_tube_outer_radius")]
+        outer_radius: f64,
+        #[serde(default = "default_tube_inner_radius")]
+        inner_radius: f64,
+        #[serde(default = "default_tube_height")]
+        height: f64,
+        #[serde(default = "default_tube_radial_segments")]
+        radial_segments: u32,
+        #[serde(default)]
+        open_ended: bool,
+        #[serde(default)]
+        shading: u32,
+    },
+    /// Geometry+ procedural gear (`zoidium:geometry-plus/gear`).
+    Gear {
+        #[serde(default = "default_gear_teeth")]
+        teeth: u32,
+        #[serde(default = "default_gear_inner_radius")]
+        inner_radius: f64,
+        #[serde(default = "default_gear_outer_radius")]
+        outer_radius: f64,
+        #[serde(default = "default_gear_thickness")]
+        thickness: f64,
+        #[serde(default = "default_gear_tooth_width")]
+        tooth_width: f64,
+        #[serde(default = "default_gear_bevel_size")]
+        bevel_size: f64,
+        #[serde(default = "default_gear_bevel_segments")]
+        bevel_segments: u32,
+        #[serde(default)]
+        shading: u32,
+    },
+    /// Geometry+ helical tube (`zoidium:geometry-plus/helix`).
+    Helix {
+        #[serde(default = "default_helix_radius")]
+        radius: f64,
+        #[serde(default = "default_helix_height")]
+        height: f64,
+        #[serde(default = "default_helix_turns")]
+        turns: f64,
+        #[serde(default = "default_helix_tube_radius")]
+        tube_radius: f64,
+        #[serde(default = "default_helix_path_segments")]
+        path_segments: u32,
+        #[serde(default = "default_helix_radial_segments")]
+        radial_segments: u32,
+        #[serde(default)]
+        shading: u32,
+    },
+    /// Geometry+ swept 3D spline tube (`zoidium:geometry-plus/spline`).
+    Spline {
+        #[serde(default = "default_spline_points")]
+        points: Vec<[f64; 3]>,
+        #[serde(default = "default_spline_interpolation")]
+        interpolation: String,
+        #[serde(default)]
+        closed: bool,
+        #[serde(default)]
+        start: f64,
+        #[serde(default = "default_one_f64")]
+        end: f64,
+        #[serde(default = "default_spline_thickness")]
+        thickness: f64,
+        #[serde(default = "default_gradient_white")]
+        thickness_map: Vec<GradientStop>,
+        #[serde(default = "default_spline_gradient_space")]
+        gradient_space: String,
+        #[serde(default = "default_one_f64")]
+        tension: f64,
+        #[serde(default = "default_spline_path_segments")]
+        path_segments: u32,
+        #[serde(default = "default_spline_radial_segments")]
+        radial_segments: u32,
+        #[serde(default = "default_spline_caps")]
+        caps: String,
+        #[serde(default = "default_spline_cap_style")]
+        cap_style: String,
+        #[serde(default)]
+        shading: u32,
     },
 }
 
@@ -1793,6 +1898,9 @@ pub struct ParticlesData {
     pub blending: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub texture: Option<String>,
+    /// Particles+ monochrome sprite preset ID (`_zoidiumParticlesPlusSprite`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprite_preset: Option<String>,
 }
 
 impl Default for ParticlesData {
@@ -1821,6 +1929,7 @@ impl Default for ParticlesData {
             avspread: 0.0,
             blending: 0,
             texture: None,
+            sprite_preset: None,
         }
     }
 }
@@ -2398,6 +2507,110 @@ const fn default_bevel_profile() -> u32 {
 
 const fn default_bevel_tension() -> f64 {
     0.5
+}
+
+const fn default_tube_outer_radius() -> f64 {
+    12.0
+}
+
+const fn default_tube_inner_radius() -> f64 {
+    8.0
+}
+
+const fn default_tube_height() -> f64 {
+    24.0
+}
+
+const fn default_tube_radial_segments() -> u32 {
+    24
+}
+
+const fn default_gear_teeth() -> u32 {
+    12
+}
+
+const fn default_gear_inner_radius() -> f64 {
+    10.0
+}
+
+const fn default_gear_outer_radius() -> f64 {
+    16.0
+}
+
+const fn default_gear_thickness() -> f64 {
+    6.0
+}
+
+const fn default_gear_tooth_width() -> f64 {
+    0.55
+}
+
+const fn default_gear_bevel_size() -> f64 {
+    0.3
+}
+
+const fn default_gear_bevel_segments() -> u32 {
+    2
+}
+
+const fn default_helix_radius() -> f64 {
+    14.0
+}
+
+const fn default_helix_height() -> f64 {
+    32.0
+}
+
+const fn default_helix_turns() -> f64 {
+    3.0
+}
+
+const fn default_helix_tube_radius() -> f64 {
+    2.0
+}
+
+const fn default_helix_path_segments() -> u32 {
+    64
+}
+
+const fn default_helix_radial_segments() -> u32 {
+    8
+}
+
+fn default_spline_points() -> Vec<[f64; 3]> {
+    vec![[-20.0, 0.0, 0.0], [0.0, 20.0, 0.0], [20.0, 0.0, 0.0]]
+}
+
+fn default_spline_interpolation() -> String {
+    "Cubic".to_owned()
+}
+
+const fn default_spline_thickness() -> f64 {
+    2.0
+}
+
+fn default_gradient_white() -> Vec<GradientStop> {
+    GradientStop::white_default()
+}
+
+fn default_spline_gradient_space() -> String {
+    "Curve".to_owned()
+}
+
+const fn default_spline_path_segments() -> u32 {
+    16
+}
+
+const fn default_spline_radial_segments() -> u32 {
+    8
+}
+
+fn default_spline_caps() -> String {
+    "Both".to_owned()
+}
+
+fn default_spline_cap_style() -> String {
+    "Flat".to_owned()
 }
 
 fn default_vibrate_frequency() -> PropertyTrack {

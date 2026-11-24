@@ -1,0 +1,1275 @@
+//! Self-contained, pure safe Rust GLB / glTF 2.0 mesh loader (zero external JSON/base64 crates).
+//!
+//! Supports:
+//! - Binary `.glb` 2.0 containers (JSON + BIN chunks) and text `.gltf` 2.0 JSON + `data:` base64
+//!   buffer URIs (plus optional external buffer slices).
+//! - `POSITION` (`VEC3` `f32`), `NORMAL` (`VEC3` `f32`, auto-generated if absent),
+//!   `TEXCOORD_0` (`VEC2` `f32` / normalized `u8` / `u16`), `INDICES` (`u8` / `u16` / `u32`).
+//! - Primitive topologies: `TRIANGLES` (`4`), `TRIANGLE_STRIP` (`5`), `TRIANGLE_FAN` (`6`).
+//! - Node hierarchy traversal (`matrix` and `translation` / `rotation` / `scale` TRS composition).
+//! - Multi-primitive `material_slot` preservation.
+
+use std::collections::{HashMap, HashSet};
+
+use thiserror::Error;
+use zc_geom::{Mat4, Quat, Vec3};
+
+use crate::mesh::{MeshData, Vertex3D};
+
+const GLB_MAGIC: u32 = 0x4654_6C67; // "glTF"
+const GLB_VERSION_2: u32 = 2;
+const CHUNK_TYPE_JSON: u32 = 0x4E4F_534A; // "JSON"
+const CHUNK_TYPE_BIN: u32 = 0x004E_4942; // "BIN\0"
+
+const COMP_UNSIGNED_BYTE: u32 = 5121;
+const COMP_UNSIGNED_SHORT: u32 = 5123;
+const COMP_UNSIGNED_INT: u32 = 5125;
+const COMP_FLOAT: u32 = 5126;
+
+const MODE_TRIANGLES: u32 = 4;
+const MODE_TRIANGLE_STRIP: u32 = 5;
+const MODE_TRIANGLE_FAN: u32 = 6;
+
+const MAX_JSON_DEPTH: usize = 128;
+
+/// Errors returned while parsing a `.glb` or `.gltf` 2.0 mesh.
+#[derive(Debug, Error)]
+pub enum GltfLoadError {
+    #[error("invalid GLB header: {0}")]
+    InvalidHeader(String),
+    #[error("invalid glTF JSON: {0}")]
+    InvalidJson(String),
+    #[error("invalid glTF data URI: {0}")]
+    InvalidDataUri(String),
+    #[error("invalid glTF buffer or accessor: {0}")]
+    InvalidBuffer(String),
+    #[error("unsupported glTF feature: {0}")]
+    UnsupportedFeature(String),
+    #[error("glTF contains no valid geometry")]
+    EmptyMesh,
+}
+
+/* ----------------------------------------------------- Minimal JSON parser */
+
+#[derive(Debug, Clone)]
+enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<JsonValue>),
+    Object(HashMap<String, JsonValue>),
+}
+
+impl JsonValue {
+    fn as_object(&self) -> Option<&HashMap<String, JsonValue>> {
+        match self {
+            Self::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&[JsonValue]> {
+        match self {
+            Self::Array(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Number(n) if n.is_finite() => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn as_usize(&self) -> Option<usize> {
+        let n = self.as_f64()?;
+        if n < 0.0 || n.fract() != 0.0 || n > usize::MAX as f64 {
+            return None;
+        }
+        Some(n as usize)
+    }
+
+    fn as_u32(&self) -> Option<u32> {
+        let n = self.as_f64()?;
+        if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
+            return None;
+        }
+        Some(n as u32)
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&JsonValue> {
+        self.as_object()?.get(key)
+    }
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    depth: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        let trimmed = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+        Self {
+            bytes: trimmed.as_bytes(),
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn parse_root(&mut self) -> Result<JsonValue, GltfLoadError> {
+        self.skip_ws();
+        let val = self.parse_value()?;
+        self.skip_ws();
+        if self.pos < self.bytes.len() {
+            return Err(GltfLoadError::InvalidJson(format!(
+                "trailing bytes at offset {}",
+                self.pos
+            )));
+        }
+        Ok(val)
+    }
+
+    fn parse_value(&mut self) -> Result<JsonValue, GltfLoadError> {
+        self.skip_ws();
+        let Some(b) = self.peek() else {
+            return Err(GltfLoadError::InvalidJson(String::from("unexpected EOF")));
+        };
+        match b {
+            b'{' => self.parse_object(),
+            b'[' => self.parse_array(),
+            b'"' => self.parse_string().map(JsonValue::String),
+            b't' => self.expect_literal(b"true", JsonValue::Bool(true)),
+            b'f' => self.expect_literal(b"false", JsonValue::Bool(false)),
+            b'n' => self.expect_literal(b"null", JsonValue::Null),
+            b'-' | b'0'..=b'9' => self.parse_number(),
+            other => Err(GltfLoadError::InvalidJson(format!(
+                "unexpected byte 0x{other:02X} at offset {}",
+                self.pos
+            ))),
+        }
+    }
+
+    fn expect_literal(&mut self, lit: &[u8], val: JsonValue) -> Result<JsonValue, GltfLoadError> {
+        if self.bytes.get(self.pos..self.pos + lit.len()) == Some(lit) {
+            self.pos += lit.len();
+            Ok(val)
+        } else {
+            Err(GltfLoadError::InvalidJson(format!(
+                "invalid literal at offset {}",
+                self.pos
+            )))
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<JsonValue, GltfLoadError> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(GltfLoadError::InvalidJson(String::from(
+                "nesting depth exceeded",
+            )));
+        }
+        self.depth += 1;
+        self.pos += 1; // '{'
+        let mut map = HashMap::new();
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            self.depth -= 1;
+            return Ok(JsonValue::Object(map));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return Err(GltfLoadError::InvalidJson(format!(
+                    "expected object key at offset {}",
+                    self.pos
+                )));
+            }
+            let key = self.parse_string()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err(GltfLoadError::InvalidJson(format!(
+                    "expected ':' at offset {}",
+                    self.pos
+                )));
+            }
+            self.pos += 1;
+            let val = self.parse_value()?;
+            map.insert(key, val);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Ok(JsonValue::Object(map));
+                }
+                _ => {
+                    return Err(GltfLoadError::InvalidJson(format!(
+                        "expected ',' or '}}' at offset {}",
+                        self.pos
+                    )));
+                }
+            }
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<JsonValue, GltfLoadError> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(GltfLoadError::InvalidJson(String::from(
+                "nesting depth exceeded",
+            )));
+        }
+        self.depth += 1;
+        self.pos += 1; // '['
+        let mut arr = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            self.depth -= 1;
+            return Ok(JsonValue::Array(arr));
+        }
+        loop {
+            let val = self.parse_value()?;
+            arr.push(val);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Ok(JsonValue::Array(arr));
+                }
+                _ => {
+                    return Err(GltfLoadError::InvalidJson(format!(
+                        "expected ',' or ']' at offset {}",
+                        self.pos
+                    )));
+                }
+            }
+        }
+    }
+
+    fn parse_hex4(&mut self) -> Result<u16, GltfLoadError> {
+        let Some(slice) = self.bytes.get(self.pos..self.pos + 4) else {
+            return Err(GltfLoadError::InvalidJson(String::from(
+                "truncated \\u escape",
+            )));
+        };
+        let mut val = 0_u16;
+        for &b in slice {
+            let digit = match b {
+                b'0'..=b'9' => u16::from(b - b'0'),
+                b'a'..=b'f' => u16::from(b - b'a' + 10),
+                b'A'..=b'F' => u16::from(b - b'A' + 10),
+                _ => {
+                    return Err(GltfLoadError::InvalidJson(String::from(
+                        "invalid hex digit in \\u escape",
+                    )));
+                }
+            };
+            val = (val << 4) | digit;
+        }
+        self.pos += 4;
+        Ok(val)
+    }
+
+    fn parse_string(&mut self) -> Result<String, GltfLoadError> {
+        self.pos += 1; // opening '"'
+        let mut out = String::new();
+        while let Some(&b) = self.bytes.get(self.pos) {
+            match b {
+                b'"' => {
+                    self.pos += 1;
+                    return Ok(out);
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    let Some(&esc) = self.bytes.get(self.pos) else {
+                        return Err(GltfLoadError::InvalidJson(String::from(
+                            "unterminated escape",
+                        )));
+                    };
+                    self.pos += 1;
+                    match esc {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{0008}'),
+                        b'f' => out.push('\u{000C}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let code = self.parse_hex4()?;
+                            if (0xD800..=0xDBFF).contains(&code) {
+                                if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                    return Err(GltfLoadError::InvalidJson(String::from(
+                                        "missing low surrogate",
+                                    )));
+                                }
+                                self.pos += 2;
+                                let low = self.parse_hex4()?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(GltfLoadError::InvalidJson(String::from(
+                                        "invalid low surrogate",
+                                    )));
+                                }
+                                let cp = 0x10000
+                                    + ((u32::from(code) - 0xD800) << 10)
+                                    + (u32::from(low) - 0xDC00);
+                                let ch = char::from_u32(cp).ok_or_else(|| {
+                                    GltfLoadError::InvalidJson(String::from(
+                                        "invalid unicode scalar",
+                                    ))
+                                })?;
+                                out.push(ch);
+                            } else {
+                                let ch = char::from_u32(u32::from(code)).ok_or_else(|| {
+                                    GltfLoadError::InvalidJson(String::from(
+                                        "invalid unicode scalar",
+                                    ))
+                                })?;
+                                out.push(ch);
+                            }
+                        }
+                        _ => {
+                            return Err(GltfLoadError::InvalidJson(format!(
+                                "invalid escape byte 0x{esc:02X}"
+                            )));
+                        }
+                    }
+                }
+                0x00..=0x1F => {
+                    return Err(GltfLoadError::InvalidJson(String::from(
+                        "unescaped control character in string",
+                    )));
+                }
+                _ => {
+                    let start = self.pos;
+                    while let Some(&c) = self.bytes.get(self.pos) {
+                        if c == b'"' || c == b'\\' || c < 0x20 {
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                    let chunk =
+                        std::str::from_utf8(&self.bytes[start..self.pos]).map_err(|_| {
+                            GltfLoadError::InvalidJson(String::from("invalid UTF-8 in string"))
+                        })?;
+                    out.push_str(chunk);
+                }
+            }
+        }
+        Err(GltfLoadError::InvalidJson(String::from(
+            "unterminated string",
+        )))
+    }
+
+    fn parse_number(&mut self) -> Result<JsonValue, GltfLoadError> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        let mut has_digits = false;
+        while let Some(b'0'..=b'9') = self.peek() {
+            has_digits = true;
+            self.pos += 1;
+        }
+        if !has_digits {
+            return Err(GltfLoadError::InvalidJson(format!(
+                "invalid number at offset {start}"
+            )));
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            let mut frac_digits = false;
+            while let Some(b'0'..=b'9') = self.peek() {
+                frac_digits = true;
+                self.pos += 1;
+            }
+            if !frac_digits {
+                return Err(GltfLoadError::InvalidJson(format!(
+                    "invalid fractional number at offset {start}"
+                )));
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            let mut exp_digits = false;
+            while let Some(b'0'..=b'9') = self.peek() {
+                exp_digits = true;
+                self.pos += 1;
+            }
+            if !exp_digits {
+                return Err(GltfLoadError::InvalidJson(format!(
+                    "invalid exponent at offset {start}"
+                )));
+            }
+        }
+        let slice = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| GltfLoadError::InvalidJson(String::from("invalid UTF-8 in number")))?;
+        let val: f64 = slice
+            .parse()
+            .map_err(|_| GltfLoadError::InvalidJson(format!("failed to parse number '{slice}'")))?;
+        if !val.is_finite() {
+            return Err(GltfLoadError::InvalidJson(format!(
+                "non-finite number '{slice}'"
+            )));
+        }
+        Ok(JsonValue::Number(val))
+    }
+}
+
+/* ----------------------------------------------------- Base64 URI decoder */
+
+fn decode_base64(input: &str) -> Result<Vec<u8>, GltfLoadError> {
+    let mut out = Vec::with_capacity((input.len() / 4) * 3);
+    let mut buf = [0_u8; 4];
+    let mut count = 0_usize;
+    let mut pad = 0_usize;
+
+    for b in input.bytes() {
+        if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+            continue;
+        }
+        if b == b'=' {
+            buf[count] = 0;
+            count += 1;
+            pad += 1;
+        } else {
+            if pad > 0 {
+                return Err(GltfLoadError::InvalidDataUri(String::from(
+                    "unexpected byte after base64 padding",
+                )));
+            }
+            let val = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' | b'-' => 62,
+                b'/' | b'_' => 63,
+                _ => {
+                    return Err(GltfLoadError::InvalidDataUri(format!(
+                        "invalid base64 byte 0x{b:02X}"
+                    )));
+                }
+            };
+            buf[count] = val;
+            count += 1;
+        }
+        if count == 4 {
+            let n = (u32::from(buf[0]) << 18)
+                | (u32::from(buf[1]) << 12)
+                | (u32::from(buf[2]) << 6)
+                | u32::from(buf[3]);
+            out.push(((n >> 16) & 0xFF) as u8);
+            if pad < 2 {
+                out.push(((n >> 8) & 0xFF) as u8);
+            }
+            if pad == 0 {
+                out.push((n & 0xFF) as u8);
+            }
+            count = 0;
+            pad = 0;
+        }
+    }
+    if count != 0 {
+        return Err(GltfLoadError::InvalidDataUri(String::from(
+            "unaligned base64 length",
+        )));
+    }
+    Ok(out)
+}
+
+fn decode_data_uri(uri: &str) -> Result<Vec<u8>, GltfLoadError> {
+    let rest = uri.strip_prefix("data:").ok_or_else(|| {
+        GltfLoadError::InvalidDataUri(String::from("URI does not start with data:"))
+    })?;
+    let (meta, payload) = rest.split_once(',').ok_or_else(|| {
+        GltfLoadError::InvalidDataUri(String::from("missing comma separator in data URI"))
+    })?;
+    if !meta.to_ascii_lowercase().contains(";base64") {
+        return Err(GltfLoadError::UnsupportedFeature(String::from(
+            "only base64 data URIs are supported",
+        )));
+    }
+    decode_base64(payload)
+}
+
+/* ----------------------------------------------------- Buffer / Accessors */
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, GltfLoadError> {
+    let slice = bytes.get(offset..offset + 4).ok_or_else(|| {
+        GltfLoadError::InvalidBuffer(format!("read u32 out of bounds at {offset}"))
+    })?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16, GltfLoadError> {
+    let slice = bytes.get(offset..offset + 2).ok_or_else(|| {
+        GltfLoadError::InvalidBuffer(format!("read u16 out of bounds at {offset}"))
+    })?;
+    Ok(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_f32_le(bytes: &[u8], offset: usize) -> Result<f32, GltfLoadError> {
+    let slice = bytes.get(offset..offset + 4).ok_or_else(|| {
+        GltfLoadError::InvalidBuffer(format!("read f32 out of bounds at {offset}"))
+    })?;
+    let v = f32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+    if !v.is_finite() {
+        return Err(GltfLoadError::InvalidBuffer(format!(
+            "non-finite f32 at offset {offset}"
+        )));
+    }
+    Ok(v)
+}
+
+struct BufferViewInfo {
+    buffer: usize,
+    byte_offset: usize,
+    byte_length: usize,
+    byte_stride: Option<usize>,
+}
+
+struct AccessorInfo {
+    buffer_view: usize,
+    byte_offset: usize,
+    component_type: u32,
+    count: usize,
+    accessor_type: String,
+    normalized: bool,
+}
+
+fn component_size(comp_type: u32) -> Result<usize, GltfLoadError> {
+    match comp_type {
+        5120 | COMP_UNSIGNED_BYTE => Ok(1),
+        5122 | COMP_UNSIGNED_SHORT => Ok(2),
+        COMP_UNSIGNED_INT | COMP_FLOAT => Ok(4),
+        other => Err(GltfLoadError::InvalidBuffer(format!(
+            "unknown componentType {other}"
+        ))),
+    }
+}
+
+fn type_components(accessor_type: &str) -> Result<usize, GltfLoadError> {
+    match accessor_type {
+        "SCALAR" => Ok(1),
+        "VEC2" => Ok(2),
+        "VEC3" => Ok(3),
+        "VEC4" => Ok(4),
+        "MAT2" => Ok(4),
+        "MAT3" => Ok(9),
+        "MAT4" => Ok(16),
+        other => Err(GltfLoadError::InvalidBuffer(format!(
+            "unknown accessor type '{other}'"
+        ))),
+    }
+}
+
+struct AccessorSlice<'a> {
+    bytes: &'a [u8],
+    base: usize,
+    stride: usize,
+    count: usize,
+    component_type: u32,
+    normalized: bool,
+}
+
+struct GltfDocument<'a> {
+    root: JsonValue,
+    buffers: Vec<Vec<u8>>,
+    external_buffers: &'a [&'a [u8]],
+    buffer_views: Vec<BufferViewInfo>,
+    accessors: Vec<AccessorInfo>,
+}
+
+impl<'a> GltfDocument<'a> {
+    fn buffer_bytes(&self, index: usize) -> Result<&[u8], GltfLoadError> {
+        if let Some(buf) = self.buffers.get(index)
+            && !buf.is_empty()
+        {
+            return Ok(buf.as_slice());
+        }
+        if let Some(ext) = self.external_buffers.get(index) {
+            return Ok(ext);
+        }
+        Err(GltfLoadError::InvalidBuffer(format!(
+            "missing buffer {index}"
+        )))
+    }
+
+    fn accessor_slice_params(
+        &self,
+        accessor_idx: usize,
+        expected_type: &str,
+    ) -> Result<AccessorSlice<'_>, GltfLoadError> {
+        let acc = self.accessors.get(accessor_idx).ok_or_else(|| {
+            GltfLoadError::InvalidBuffer(format!("accessor {accessor_idx} out of bounds"))
+        })?;
+        if acc.accessor_type != expected_type {
+            return Err(GltfLoadError::InvalidBuffer(format!(
+                "accessor {accessor_idx}: expected {expected_type}, got {}",
+                acc.accessor_type
+            )));
+        }
+        let bv = self.buffer_views.get(acc.buffer_view).ok_or_else(|| {
+            GltfLoadError::InvalidBuffer(format!("bufferView {} out of bounds", acc.buffer_view))
+        })?;
+        let raw = self.buffer_bytes(bv.buffer)?;
+        let elem_size = component_size(acc.component_type)? * type_components(&acc.accessor_type)?;
+        let stride = bv.byte_stride.unwrap_or(elem_size);
+        if stride < elem_size {
+            return Err(GltfLoadError::InvalidBuffer(format!(
+                "bufferView {} byteStride {stride} < element size {elem_size}",
+                acc.buffer_view
+            )));
+        }
+        let bv_end = bv
+            .byte_offset
+            .checked_add(bv.byte_length)
+            .ok_or_else(|| GltfLoadError::InvalidBuffer(String::from("bufferView overflow")))?;
+        if bv_end > raw.len() {
+            return Err(GltfLoadError::InvalidBuffer(format!(
+                "bufferView {} exceeds buffer length",
+                acc.buffer_view
+            )));
+        }
+        let view_slice = &raw[bv.byte_offset..bv_end];
+        if acc.count > 0 {
+            let last_end = acc
+                .byte_offset
+                .checked_add(
+                    (acc.count - 1)
+                        .checked_mul(stride)
+                        .and_then(|v| v.checked_add(elem_size))
+                        .ok_or_else(|| {
+                            GltfLoadError::InvalidBuffer(String::from("accessor span overflow"))
+                        })?,
+                )
+                .ok_or_else(|| GltfLoadError::InvalidBuffer(String::from("accessor overflow")))?;
+            if last_end > view_slice.len() {
+                return Err(GltfLoadError::InvalidBuffer(format!(
+                    "accessor {accessor_idx} exceeds bufferView bounds"
+                )));
+            }
+        }
+        Ok(AccessorSlice {
+            bytes: view_slice,
+            base: acc.byte_offset,
+            stride,
+            count: acc.count,
+            component_type: acc.component_type,
+            normalized: acc.normalized,
+        })
+    }
+
+    fn read_vec3_f32(&self, accessor_idx: usize) -> Result<Vec<[f32; 3]>, GltfLoadError> {
+        let s = self.accessor_slice_params(accessor_idx, "VEC3")?;
+        if s.component_type != COMP_FLOAT {
+            return Err(GltfLoadError::UnsupportedFeature(format!(
+                "VEC3 accessor {accessor_idx} requires f32 (5126), got {}",
+                s.component_type
+            )));
+        }
+        let mut out = Vec::with_capacity(s.count);
+        for i in 0..s.count {
+            let off = s.base + i * s.stride;
+            out.push([
+                read_f32_le(s.bytes, off)?,
+                read_f32_le(s.bytes, off + 4)?,
+                read_f32_le(s.bytes, off + 8)?,
+            ]);
+        }
+        Ok(out)
+    }
+
+    fn read_vec2_f32(&self, accessor_idx: usize) -> Result<Vec<[f32; 2]>, GltfLoadError> {
+        let s = self.accessor_slice_params(accessor_idx, "VEC2")?;
+        let mut out = Vec::with_capacity(s.count);
+        for i in 0..s.count {
+            let off = s.base + i * s.stride;
+            let uv = match s.component_type {
+                COMP_FLOAT => [read_f32_le(s.bytes, off)?, read_f32_le(s.bytes, off + 4)?],
+                COMP_UNSIGNED_BYTE if s.normalized => [
+                    f32::from(s.bytes[off]) / 255.0,
+                    f32::from(s.bytes[off + 1]) / 255.0,
+                ],
+                COMP_UNSIGNED_SHORT if s.normalized => [
+                    f32::from(read_u16_le(s.bytes, off)?) / 65535.0,
+                    f32::from(read_u16_le(s.bytes, off + 2)?) / 65535.0,
+                ],
+                other => {
+                    return Err(GltfLoadError::UnsupportedFeature(format!(
+                        "unsupported TEXCOORD_0 componentType {other} (normalized={})",
+                        s.normalized
+                    )));
+                }
+            };
+            out.push(uv);
+        }
+        Ok(out)
+    }
+
+    fn read_indices(&self, accessor_idx: usize) -> Result<Vec<u32>, GltfLoadError> {
+        let s = self.accessor_slice_params(accessor_idx, "SCALAR")?;
+        let mut out = Vec::with_capacity(s.count);
+        for i in 0..s.count {
+            let off = s.base + i * s.stride;
+            let idx = match s.component_type {
+                COMP_UNSIGNED_BYTE => u32::from(s.bytes[off]),
+                COMP_UNSIGNED_SHORT => u32::from(read_u16_le(s.bytes, off)?),
+                COMP_UNSIGNED_INT => read_u32_le(s.bytes, off)?,
+                other => {
+                    return Err(GltfLoadError::InvalidBuffer(format!(
+                        "invalid index componentType {other}"
+                    )));
+                }
+            };
+            out.push(idx);
+        }
+        Ok(out)
+    }
+
+    fn build_mesh(&self, mesh_idx: usize) -> Result<MeshData, GltfLoadError> {
+        let meshes = self
+            .root
+            .get("meshes")
+            .and_then(JsonValue::as_array)
+            .ok_or(GltfLoadError::EmptyMesh)?;
+        let mesh_obj = meshes.get(mesh_idx).ok_or_else(|| {
+            GltfLoadError::InvalidJson(format!("mesh index {mesh_idx} out of bounds"))
+        })?;
+        let primitives = mesh_obj
+            .get("primitives")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                GltfLoadError::InvalidJson(format!("mesh {mesh_idx} missing primitives"))
+            })?;
+
+        let mut combined = MeshData::empty();
+
+        for prim in primitives {
+            let mode = prim
+                .get("mode")
+                .and_then(JsonValue::as_u32)
+                .unwrap_or(MODE_TRIANGLES);
+            if !matches!(
+                mode,
+                MODE_TRIANGLES | MODE_TRIANGLE_STRIP | MODE_TRIANGLE_FAN
+            ) {
+                continue;
+            }
+            let attrs = prim.get("attributes").ok_or_else(|| {
+                GltfLoadError::InvalidJson(String::from("primitive missing attributes"))
+            })?;
+            let Some(pos_acc) = attrs.get("POSITION").and_then(JsonValue::as_usize) else {
+                continue;
+            };
+            let positions = self.read_vec3_f32(pos_acc)?;
+            if positions.is_empty() {
+                continue;
+            }
+
+            let normals = if let Some(n_acc) = attrs.get("NORMAL").and_then(JsonValue::as_usize) {
+                let ns = self.read_vec3_f32(n_acc)?;
+                if ns.len() != positions.len() {
+                    return Err(GltfLoadError::InvalidBuffer(String::from(
+                        "NORMAL count does not match POSITION count",
+                    )));
+                }
+                Some(ns)
+            } else {
+                None
+            };
+
+            let uvs = if let Some(uv_acc) = attrs.get("TEXCOORD_0").and_then(JsonValue::as_usize) {
+                let ts = self.read_vec2_f32(uv_acc)?;
+                if ts.len() != positions.len() {
+                    return Err(GltfLoadError::InvalidBuffer(String::from(
+                        "TEXCOORD_0 count does not match POSITION count",
+                    )));
+                }
+                Some(ts)
+            } else {
+                None
+            };
+
+            let raw_indices: Vec<u32> =
+                if let Some(i_acc) = prim.get("indices").and_then(JsonValue::as_usize) {
+                    self.read_indices(i_acc)?
+                } else {
+                    (0..positions.len() as u32).collect()
+                };
+
+            let vcount = positions.len() as u32;
+            for &idx in &raw_indices {
+                if idx >= vcount {
+                    return Err(GltfLoadError::InvalidBuffer(format!(
+                        "index {idx} exceeds vertex count {vcount}"
+                    )));
+                }
+            }
+
+            let mut tri_indices = Vec::new();
+            match mode {
+                MODE_TRIANGLES => {
+                    let usable = (raw_indices.len() / 3) * 3;
+                    tri_indices.extend_from_slice(&raw_indices[..usable]);
+                }
+                MODE_TRIANGLE_STRIP => {
+                    for k in 0..raw_indices.len().saturating_sub(2) {
+                        if k % 2 == 0 {
+                            tri_indices.extend_from_slice(&[
+                                raw_indices[k],
+                                raw_indices[k + 1],
+                                raw_indices[k + 2],
+                            ]);
+                        } else {
+                            tri_indices.extend_from_slice(&[
+                                raw_indices[k],
+                                raw_indices[k + 2],
+                                raw_indices[k + 1],
+                            ]);
+                        }
+                    }
+                }
+                MODE_TRIANGLE_FAN if raw_indices.len() >= 3 => {
+                    let root_i = raw_indices[0];
+                    for k in 1..(raw_indices.len() - 1) {
+                        tri_indices.extend_from_slice(&[
+                            root_i,
+                            raw_indices[k],
+                            raw_indices[k + 1],
+                        ]);
+                    }
+                }
+                _ => {}
+            }
+
+            if tri_indices.len() < 3 {
+                continue;
+            }
+
+            let material_slot = prim
+                .get("material")
+                .and_then(JsonValue::as_u32)
+                .unwrap_or(0);
+
+            let mut vertices = Vec::with_capacity(positions.len());
+            for (vi, &pos) in positions.iter().enumerate() {
+                let n = if let Some(ref ns) = normals {
+                    let nv = Vec3::from_array(ns[vi]);
+                    if nv.length_squared() > 1e-12 {
+                        nv.normalize().to_array()
+                    } else {
+                        [0.0, 0.0, 1.0]
+                    }
+                } else {
+                    [0.0, 0.0, 1.0]
+                };
+                let uv = uvs.as_ref().map_or([0.0, 0.0], |ts| ts[vi]);
+                vertices.push(Vertex3D::new(pos, n, uv, material_slot));
+            }
+
+            let mut prim_mesh = MeshData::new(vertices, tri_indices);
+            if normals.is_none() {
+                prim_mesh.compute_smooth_normals();
+            }
+            combined.merge(&prim_mesh);
+        }
+
+        Ok(combined)
+    }
+
+    fn node_local_matrix(node: &JsonValue) -> Result<Mat4, GltfLoadError> {
+        if let Some(mat_arr) = node.get("matrix").and_then(JsonValue::as_array) {
+            if mat_arr.len() != 16 {
+                return Err(GltfLoadError::InvalidJson(String::from(
+                    "node matrix must have 16 elements",
+                )));
+            }
+            let mut cols = [0.0_f32; 16];
+            for (i, item) in mat_arr.iter().enumerate() {
+                cols[i] = item.as_f64().ok_or_else(|| {
+                    GltfLoadError::InvalidJson(String::from("non-numeric matrix element"))
+                })? as f32;
+            }
+            return Ok(Mat4::from_cols_array(&cols));
+        }
+
+        let translation = if let Some(arr) = node.get("translation").and_then(JsonValue::as_array) {
+            if arr.len() != 3 {
+                return Err(GltfLoadError::InvalidJson(String::from(
+                    "node translation must have 3 elements",
+                )));
+            }
+            Vec3::new(
+                arr[0].as_f64().unwrap_or(0.0) as f32,
+                arr[1].as_f64().unwrap_or(0.0) as f32,
+                arr[2].as_f64().unwrap_or(0.0) as f32,
+            )
+        } else {
+            Vec3::ZERO
+        };
+
+        let rotation = if let Some(arr) = node.get("rotation").and_then(JsonValue::as_array) {
+            if arr.len() != 4 {
+                return Err(GltfLoadError::InvalidJson(String::from(
+                    "node rotation must have 4 elements",
+                )));
+            }
+            let q = Quat::from_xyzw(
+                arr[0].as_f64().unwrap_or(0.0) as f32,
+                arr[1].as_f64().unwrap_or(0.0) as f32,
+                arr[2].as_f64().unwrap_or(0.0) as f32,
+                arr[3].as_f64().unwrap_or(1.0) as f32,
+            );
+            if q.length_squared() > 1e-12 {
+                q.normalize()
+            } else {
+                Quat::IDENTITY
+            }
+        } else {
+            Quat::IDENTITY
+        };
+
+        let scale = if let Some(arr) = node.get("scale").and_then(JsonValue::as_array) {
+            if arr.len() != 3 {
+                return Err(GltfLoadError::InvalidJson(String::from(
+                    "node scale must have 3 elements",
+                )));
+            }
+            Vec3::new(
+                arr[0].as_f64().unwrap_or(1.0) as f32,
+                arr[1].as_f64().unwrap_or(1.0) as f32,
+                arr[2].as_f64().unwrap_or(1.0) as f32,
+            )
+        } else {
+            Vec3::ONE
+        };
+
+        Ok(Mat4::from_scale_rotation_translation(
+            scale,
+            rotation,
+            translation,
+        ))
+    }
+
+    fn traverse_node(
+        &self,
+        nodes: &[JsonValue],
+        node_idx: usize,
+        parent_world: Mat4,
+        visited: &mut HashSet<usize>,
+        out: &mut MeshData,
+    ) -> Result<(), GltfLoadError> {
+        if !visited.insert(node_idx) {
+            return Ok(()); // Guard against malformed cycles
+        }
+        let node = nodes.get(node_idx).ok_or_else(|| {
+            GltfLoadError::InvalidJson(format!("node index {node_idx} out of bounds"))
+        })?;
+        let local = Self::node_local_matrix(node)?;
+        let world = parent_world * local;
+
+        if let Some(mesh_idx) = node.get("mesh").and_then(JsonValue::as_usize) {
+            let mut m = self.build_mesh(mesh_idx)?;
+            if !m.vertices.is_empty() {
+                if world != Mat4::IDENTITY {
+                    m.apply_matrix(world);
+                }
+                out.merge(&m);
+            }
+        }
+
+        if let Some(children) = node.get("children").and_then(JsonValue::as_array) {
+            for child in children {
+                if let Some(child_idx) = child.as_usize() {
+                    self.traverse_node(nodes, child_idx, world, visited, out)?;
+                }
+            }
+        }
+
+        visited.remove(&node_idx);
+        Ok(())
+    }
+
+    fn assemble_scene(&self) -> Result<MeshData, GltfLoadError> {
+        let mut out = MeshData::empty();
+
+        if let Some(nodes) = self.root.get("nodes").and_then(JsonValue::as_array)
+            && !nodes.is_empty()
+        {
+            let root_indices: Vec<usize> = if let Some(scenes) =
+                self.root.get("scenes").and_then(JsonValue::as_array)
+                && !scenes.is_empty()
+            {
+                let scene_idx = self
+                    .root
+                    .get("scene")
+                    .and_then(JsonValue::as_usize)
+                    .unwrap_or(0)
+                    .min(scenes.len() - 1);
+                scenes[scene_idx]
+                    .get("nodes")
+                    .and_then(JsonValue::as_array)
+                    .map(|arr| arr.iter().filter_map(JsonValue::as_usize).collect())
+                    .unwrap_or_default()
+            } else {
+                let mut child_set = HashSet::new();
+                for node in nodes {
+                    if let Some(children) = node.get("children").and_then(JsonValue::as_array) {
+                        for c in children {
+                            if let Some(ci) = c.as_usize() {
+                                child_set.insert(ci);
+                            }
+                        }
+                    }
+                }
+                (0..nodes.len())
+                    .filter(|i| !child_set.contains(i))
+                    .collect()
+            };
+
+            let mut visited = HashSet::new();
+            for root_idx in root_indices {
+                self.traverse_node(nodes, root_idx, Mat4::IDENTITY, &mut visited, &mut out)?;
+            }
+        } else if let Some(meshes) = self.root.get("meshes").and_then(JsonValue::as_array) {
+            for mesh_idx in 0..meshes.len() {
+                let m = self.build_mesh(mesh_idx)?;
+                out.merge(&m);
+            }
+        }
+
+        if out.vertices.is_empty() || out.indices.is_empty() {
+            return Err(GltfLoadError::EmptyMesh);
+        }
+        Ok(out)
+    }
+}
+
+fn parse_document(
+    json_str: &str,
+    glb_bin_chunk: Option<&[u8]>,
+    external_buffers: &[&[u8]],
+) -> Result<MeshData, GltfLoadError> {
+    let root = JsonParser::new(json_str).parse_root()?;
+
+    let mut buffers = Vec::new();
+    if let Some(buf_arr) = root.get("buffers").and_then(JsonValue::as_array) {
+        for (i, buf_val) in buf_arr.iter().enumerate() {
+            if let Some(uri) = buf_val.get("uri").and_then(JsonValue::as_str) {
+                if uri.starts_with("data:") {
+                    buffers.push(decode_data_uri(uri)?);
+                } else {
+                    buffers.push(Vec::new()); // Resolved via external_buffers[i]
+                }
+            } else if i == 0
+                && let Some(bin) = glb_bin_chunk
+            {
+                buffers.push(bin.to_vec());
+            } else {
+                buffers.push(Vec::new());
+            }
+        }
+    }
+
+    let mut buffer_views = Vec::new();
+    if let Some(bv_arr) = root.get("bufferViews").and_then(JsonValue::as_array) {
+        for bv in bv_arr {
+            let buffer = bv
+                .get("buffer")
+                .and_then(JsonValue::as_usize)
+                .ok_or_else(|| {
+                    GltfLoadError::InvalidJson(String::from("bufferView missing buffer"))
+                })?;
+            let byte_length = bv
+                .get("byteLength")
+                .and_then(JsonValue::as_usize)
+                .ok_or_else(|| {
+                    GltfLoadError::InvalidJson(String::from("bufferView missing byteLength"))
+                })?;
+            let byte_offset = bv
+                .get("byteOffset")
+                .and_then(JsonValue::as_usize)
+                .unwrap_or(0);
+            let byte_stride = bv.get("byteStride").and_then(JsonValue::as_usize);
+            buffer_views.push(BufferViewInfo {
+                buffer,
+                byte_offset,
+                byte_length,
+                byte_stride,
+            });
+        }
+    }
+
+    let mut accessors = Vec::new();
+    if let Some(acc_arr) = root.get("accessors").and_then(JsonValue::as_array) {
+        for acc in acc_arr {
+            let buffer_view = acc
+                .get("bufferView")
+                .and_then(JsonValue::as_usize)
+                .ok_or_else(|| {
+                    GltfLoadError::UnsupportedFeature(String::from(
+                        "sparse/zero-initialized accessor without bufferView",
+                    ))
+                })?;
+            let byte_offset = acc
+                .get("byteOffset")
+                .and_then(JsonValue::as_usize)
+                .unwrap_or(0);
+            let component_type = acc
+                .get("componentType")
+                .and_then(JsonValue::as_u32)
+                .ok_or_else(|| {
+                    GltfLoadError::InvalidJson(String::from("accessor missing componentType"))
+                })?;
+            let count = acc
+                .get("count")
+                .and_then(JsonValue::as_usize)
+                .ok_or_else(|| {
+                    GltfLoadError::InvalidJson(String::from("accessor missing count"))
+                })?;
+            let accessor_type = acc
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| GltfLoadError::InvalidJson(String::from("accessor missing type")))?
+                .to_owned();
+            let normalized = acc
+                .get("normalized")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            accessors.push(AccessorInfo {
+                buffer_view,
+                byte_offset,
+                component_type,
+                count,
+                accessor_type,
+                normalized,
+            });
+        }
+    }
+
+    let doc = GltfDocument {
+        root,
+        buffers,
+        external_buffers,
+        buffer_views,
+        accessors,
+    };
+    doc.assemble_scene()
+}
+
+/// Parses a binary glTF 2.0 (`.glb`) container into a [`MeshData`].
+pub fn parse_glb(bytes: &[u8]) -> Result<MeshData, GltfLoadError> {
+    if bytes.len() < 12 {
+        return Err(GltfLoadError::InvalidHeader(String::from(
+            "buffer shorter than 12-byte GLB header",
+        )));
+    }
+    let magic = read_u32_le(bytes, 0)?;
+    if magic != GLB_MAGIC {
+        return Err(GltfLoadError::InvalidHeader(format!(
+            "bad magic 0x{magic:08X} (expected 0x{GLB_MAGIC:08X})"
+        )));
+    }
+    let version = read_u32_le(bytes, 4)?;
+    if version != GLB_VERSION_2 {
+        return Err(GltfLoadError::InvalidHeader(format!(
+            "unsupported GLB version {version} (expected 2)"
+        )));
+    }
+    let declared_len = read_u32_le(bytes, 8)? as usize;
+    if declared_len < 12 || declared_len > bytes.len() {
+        return Err(GltfLoadError::InvalidHeader(format!(
+            "declared length {declared_len} invalid for {} input bytes",
+            bytes.len()
+        )));
+    }
+
+    let mut offset = 12_usize;
+    let mut json_chunk: Option<&[u8]> = None;
+    let mut bin_chunk: Option<&[u8]> = None;
+
+    while offset + 8 <= declared_len {
+        let chunk_len = read_u32_le(bytes, offset)? as usize;
+        let chunk_type = read_u32_le(bytes, offset + 4)?;
+        let data_start = offset + 8;
+        let data_end = data_start.checked_add(chunk_len).ok_or_else(|| {
+            GltfLoadError::InvalidHeader(String::from("GLB chunk length overflow"))
+        })?;
+        if data_end > declared_len {
+            return Err(GltfLoadError::InvalidHeader(format!(
+                "GLB chunk at {offset} exceeds declared length {declared_len}"
+            )));
+        }
+        let payload = &bytes[data_start..data_end];
+        match chunk_type {
+            CHUNK_TYPE_JSON if json_chunk.is_none() => json_chunk = Some(payload),
+            CHUNK_TYPE_BIN if bin_chunk.is_none() => bin_chunk = Some(payload),
+            _ => {}
+        }
+        offset = data_end;
+    }
+
+    let json_bytes = json_chunk
+        .ok_or_else(|| GltfLoadError::InvalidHeader(String::from("GLB missing JSON chunk")))?;
+    let json_str = std::str::from_utf8(json_bytes)
+        .map_err(|_| GltfLoadError::InvalidJson(String::from("JSON chunk is not valid UTF-8")))?;
+
+    parse_document(json_str, bin_chunk, &[])
+}
+
+/// Parses a text glTF 2.0 (`.gltf`) JSON document with optional external buffer slices.
+pub fn parse_gltf(json_str: &str, external_buffers: &[&[u8]]) -> Result<MeshData, GltfLoadError> {
+    parse_document(json_str, None, external_buffers)
+}
+
+/// Auto-detects binary `.glb` (`b"glTF"` magic) or UTF-8 `.gltf` JSON and parses it into a
+/// [`MeshData`].
+pub fn parse_gltf_or_glb(bytes: &[u8]) -> Result<MeshData, GltfLoadError> {
+    if bytes.len() >= 4 && &bytes[..4] == b"glTF" {
+        parse_glb(bytes)
+    } else {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| GltfLoadError::InvalidJson(String::from("input is not valid UTF-8")))?;
+        parse_gltf(text, &[])
+    }
+}

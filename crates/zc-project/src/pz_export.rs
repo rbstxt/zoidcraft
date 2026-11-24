@@ -1476,6 +1476,15 @@ fn serialize_layer_mask(mask: &LayerMask, remap: &BTreeMap<String, String>) -> V
     );
     obj.insert("invert".to_owned(), json!(u32::from(mask.invert)));
     obj.insert("enabled".to_owned(), json!(u32::from(mask.enabled)));
+    obj.insert("locked".to_owned(), Value::Bool(mask.locked));
+    if !mask.outline_color.is_empty() {
+        obj.insert(
+            "outlineColor".to_owned(),
+            Value::String(mask.outline_color.clone()),
+        );
+    } else {
+        obj.remove("outlineColor");
+    }
     if !mask.vertex_ids.is_empty() {
         obj.insert(
             "vertexIds".to_owned(),
@@ -1796,6 +1805,16 @@ fn serialize_object3d(obj: &Object3D, remap: &BTreeMap<String, String>) -> Value
         }
         Object3DKind::Particles(particles) => {
             out.insert("type".to_owned(), json!(4));
+            if let Some(ref sprite) = particles.sprite_preset
+                && !sprite.is_empty()
+            {
+                out.insert(
+                    "_zoidiumParticlesPlusSprite".to_owned(),
+                    Value::String(sprite.clone()),
+                );
+            } else {
+                out.remove("_zoidiumParticlesPlusSprite");
+            }
             serialize_particles_props(particles, &mut props, remap);
         }
         Object3DKind::Model(model) => {
@@ -1822,6 +1841,12 @@ fn serialize_object3d(obj: &Object3D, remap: &BTreeMap<String, String>) -> Value
                         out.insert("type".to_owned(), json!(num));
                     } else {
                         out.insert("type".to_owned(), Value::String(orig.clone()));
+                    }
+                } else if let Some(pt) = plugin_obj_type {
+                    if pt == "zoidium:optical-flares/flare" {
+                        out.insert("type".to_owned(), json!(13));
+                    } else {
+                        out.insert("type".to_owned(), Value::String(pt.to_owned()));
                     }
                 } else {
                     out.insert("type".to_owned(), json!(99));
@@ -2034,11 +2059,16 @@ fn serialize_shape3d(
                 }),
             );
         }
-        // Geometry+ primitives
+        // Geometry+ primitives (8/8)
         Shape3DKind::RoundedBox {
             size,
             radius,
             segments,
+            corner_radius,
+            corner_segments,
+            bevel_size,
+            bevel_segments,
+            shading,
         } => {
             out.insert(
                 "type".to_owned(),
@@ -2048,22 +2078,44 @@ fn serialize_shape3d(
                         .to_owned(),
                 ),
             );
-            props.insert(
-                "size".to_owned(),
+            insert_shape_prop_preserving_animated(
+                props,
+                "size",
                 json!([
                     finite_f64(size[0]),
                     finite_f64(size[1]),
                     finite_f64(size[2])
                 ]),
             );
-            props.insert("cornerRadius".to_owned(), json!(finite_f64(*radius)));
-            props.insert("cornerSegments".to_owned(), json!(*segments));
+            insert_shape_prop_preserving_animated(
+                props,
+                "cornerRadius",
+                json!(finite_f64(corner_radius.unwrap_or(*radius))),
+            );
+            insert_shape_prop_preserving_animated(
+                props,
+                "cornerSegments",
+                json!(corner_segments.unwrap_or(*segments)),
+            );
+            insert_shape_prop_preserving_animated(
+                props,
+                "bevelSize",
+                json!(finite_f64(bevel_size.unwrap_or(0.6))),
+            );
+            insert_shape_prop_preserving_animated(
+                props,
+                "bevelSegments",
+                json!(bevel_segments.unwrap_or(2)),
+            );
+            insert_shape_prop_preserving_animated(props, "shading", json!(*shading));
         }
         Shape3DKind::Cone {
             radius,
             height,
             detail,
             open_ended,
+            top_radius,
+            shading,
         } => {
             out.insert(
                 "type".to_owned(),
@@ -2073,16 +2125,42 @@ fn serialize_shape3d(
                         .to_owned(),
                 ),
             );
-            props.insert("bottomRadius".to_owned(), json!(finite_f64(*radius)));
-            props.insert("height".to_owned(), json!(finite_f64(*height)));
-            props.insert("segments".to_owned(), json!(*detail));
+            insert_shape_prop_preserving_animated(
+                props,
+                "topRadius",
+                json!(finite_f64(*top_radius)),
+            );
+            insert_shape_prop_preserving_animated(
+                props,
+                "bottomRadius",
+                json!(finite_f64(*radius)),
+            );
+            insert_shape_prop_preserving_animated(props, "height", json!(finite_f64(*height)));
+            insert_shape_prop_preserving_animated(props, "segments", json!(*detail));
             // Zoidium Cone endCaps: 0 = closed, 1 = open.
-            props.insert("endCaps".to_owned(), json!(u32::from(*open_ended)));
+            insert_shape_prop_preserving_animated(props, "endCaps", json!(u32::from(*open_ended)));
+            insert_shape_prop_preserving_animated(props, "shading", json!(*shading));
         }
-        Shape3DKind::Tetrahedron { radius, detail }
-        | Shape3DKind::Octahedron { radius, detail }
-        | Shape3DKind::Icosahedron { radius, detail }
-        | Shape3DKind::Dodecahedron { radius, detail } => {
+        Shape3DKind::Tetrahedron {
+            radius,
+            detail,
+            shading,
+        }
+        | Shape3DKind::Octahedron {
+            radius,
+            detail,
+            shading,
+        }
+        | Shape3DKind::Icosahedron {
+            radius,
+            detail,
+            shading,
+        }
+        | Shape3DKind::Dodecahedron {
+            radius,
+            detail,
+            shading,
+        } => {
             out.insert(
                 "type".to_owned(),
                 Value::String(
@@ -2098,15 +2176,17 @@ fn serialize_shape3d(
                 Shape3DKind::Dodecahedron { .. } => 3,
                 _ => 0,
             };
-            props.insert("shape".to_owned(), json!(shape_idx));
-            props.insert("radius".to_owned(), json!(finite_f64(*radius)));
-            props.insert("detail".to_owned(), json!(*detail));
+            insert_shape_prop_preserving_animated(props, "shape", json!(shape_idx));
+            insert_shape_prop_preserving_animated(props, "radius", json!(finite_f64(*radius)));
+            insert_shape_prop_preserving_animated(props, "detail", json!(*detail));
+            insert_shape_prop_preserving_animated(props, "shading", json!(*shading));
         }
         Shape3DKind::Capsule {
             radius,
             length,
             cap_segments,
             radial_segments,
+            shading,
         } => {
             out.insert(
                 "type".to_owned(),
@@ -2116,13 +2196,15 @@ fn serialize_shape3d(
                         .to_owned(),
                 ),
             );
-            props.insert("radius".to_owned(), json!(finite_f64(*radius)));
-            props.insert(
-                "height".to_owned(),
+            insert_shape_prop_preserving_animated(props, "radius", json!(finite_f64(*radius)));
+            insert_shape_prop_preserving_animated(
+                props,
+                "height",
                 json!(finite_f64(*length + 2.0 * *radius)),
             );
-            props.insert("segments".to_owned(), json!(*cap_segments));
-            props.insert("radialSegments".to_owned(), json!(*radial_segments));
+            insert_shape_prop_preserving_animated(props, "segments", json!(*cap_segments));
+            insert_shape_prop_preserving_animated(props, "radialSegments", json!(*radial_segments));
+            insert_shape_prop_preserving_animated(props, "shading", json!(*shading));
         }
         Shape3DKind::TorusKnot {
             radius,
@@ -2140,14 +2222,220 @@ fn serialize_shape3d(
                         .to_owned(),
                 ),
             );
-            props.insert("radius".to_owned(), json!(finite_f64(*radius)));
-            props.insert("tube".to_owned(), json!(finite_f64(*tube)));
-            props.insert("tubularSegments".to_owned(), json!(*tubular_segments));
-            props.insert("radialSegments".to_owned(), json!(*radial_segments));
-            props.insert("p".to_owned(), json!(*p));
-            props.insert("q".to_owned(), json!(*q));
+            insert_shape_prop_preserving_animated(props, "radius", json!(finite_f64(*radius)));
+            insert_shape_prop_preserving_animated(props, "tube", json!(finite_f64(*tube)));
+            insert_shape_prop_preserving_animated(
+                props,
+                "tubularSegments",
+                json!(*tubular_segments),
+            );
+            insert_shape_prop_preserving_animated(props, "radialSegments", json!(*radial_segments));
+            insert_shape_prop_preserving_animated(props, "p", json!(*p));
+            insert_shape_prop_preserving_animated(props, "q", json!(*q));
+        }
+        Shape3DKind::Tube {
+            outer_radius,
+            inner_radius,
+            height,
+            radial_segments,
+            open_ended,
+            shading,
+        } => {
+            out.insert(
+                "type".to_owned(),
+                Value::String(
+                    plugin_obj_type
+                        .unwrap_or("zoidium:geometry-plus/tube")
+                        .to_owned(),
+                ),
+            );
+            insert_shape_prop_preserving_animated(
+                props,
+                "outerRadius",
+                json!(finite_f64(*outer_radius)),
+            );
+            insert_shape_prop_preserving_animated(
+                props,
+                "innerRadius",
+                json!(finite_f64(*inner_radius)),
+            );
+            insert_shape_prop_preserving_animated(props, "height", json!(finite_f64(*height)));
+            insert_shape_prop_preserving_animated(props, "radialSegments", json!(*radial_segments));
+            insert_shape_prop_preserving_animated(props, "endCaps", json!(u32::from(*open_ended)));
+            insert_shape_prop_preserving_animated(props, "shading", json!(*shading));
+        }
+        Shape3DKind::Gear {
+            teeth,
+            inner_radius,
+            outer_radius,
+            thickness,
+            tooth_width,
+            bevel_size,
+            bevel_segments,
+            shading,
+        } => {
+            out.insert(
+                "type".to_owned(),
+                Value::String(
+                    plugin_obj_type
+                        .unwrap_or("zoidium:geometry-plus/gear")
+                        .to_owned(),
+                ),
+            );
+            insert_shape_prop_preserving_animated(props, "teeth", json!(*teeth));
+            insert_shape_prop_preserving_animated(
+                props,
+                "innerRadius",
+                json!(finite_f64(*inner_radius)),
+            );
+            insert_shape_prop_preserving_animated(
+                props,
+                "outerRadius",
+                json!(finite_f64(*outer_radius)),
+            );
+            insert_shape_prop_preserving_animated(
+                props,
+                "thickness",
+                json!(finite_f64(*thickness)),
+            );
+            insert_shape_prop_preserving_animated(
+                props,
+                "toothWidth",
+                json!(finite_f64(*tooth_width)),
+            );
+            insert_shape_prop_preserving_animated(
+                props,
+                "bevelSize",
+                json!(finite_f64(*bevel_size)),
+            );
+            insert_shape_prop_preserving_animated(props, "bevelSegments", json!(*bevel_segments));
+            insert_shape_prop_preserving_animated(props, "shading", json!(*shading));
+        }
+        Shape3DKind::Helix {
+            radius,
+            height,
+            turns,
+            tube_radius,
+            path_segments,
+            radial_segments,
+            shading,
+        } => {
+            out.insert(
+                "type".to_owned(),
+                Value::String(
+                    plugin_obj_type
+                        .unwrap_or("zoidium:geometry-plus/helix")
+                        .to_owned(),
+                ),
+            );
+            insert_shape_prop_preserving_animated(props, "radius", json!(finite_f64(*radius)));
+            insert_shape_prop_preserving_animated(props, "height", json!(finite_f64(*height)));
+            insert_shape_prop_preserving_animated(props, "turns", json!(finite_f64(*turns)));
+            insert_shape_prop_preserving_animated(
+                props,
+                "tubeRadius",
+                json!(finite_f64(*tube_radius)),
+            );
+            insert_shape_prop_preserving_animated(props, "pathSegments", json!(*path_segments));
+            insert_shape_prop_preserving_animated(props, "radialSegments", json!(*radial_segments));
+            insert_shape_prop_preserving_animated(props, "shading", json!(*shading));
+        }
+        Shape3DKind::Spline {
+            points,
+            interpolation,
+            closed,
+            start,
+            end,
+            thickness,
+            thickness_map,
+            gradient_space,
+            tension,
+            path_segments,
+            radial_segments,
+            caps,
+            cap_style,
+            shading,
+        } => {
+            out.insert(
+                "type".to_owned(),
+                Value::String(
+                    plugin_obj_type
+                        .unwrap_or("zoidium:geometry-plus/spline")
+                        .to_owned(),
+                ),
+            );
+            let point_count = points.len().clamp(2, 32);
+            props.insert("points".to_owned(), json!(point_count));
+            for (idx, pt) in points.iter().take(32).enumerate() {
+                let key = format!("point{}", idx + 1);
+                insert_shape_prop_preserving_animated(
+                    props,
+                    &key,
+                    json!([finite_f64(pt[0]), finite_f64(pt[1]), finite_f64(pt[2])]),
+                );
+            }
+            props.insert(
+                "interpolation".to_owned(),
+                Value::String(interpolation.clone()),
+            );
+            insert_shape_prop_preserving_animated(props, "closed", json!(u32::from(*closed)));
+            insert_shape_prop_preserving_animated(props, "start", json!(finite_f64(*start)));
+            insert_shape_prop_preserving_animated(props, "end", json!(finite_f64(*end)));
+            insert_shape_prop_preserving_animated(
+                props,
+                "thickness",
+                json!(finite_f64(*thickness)),
+            );
+            props.insert(
+                "thicknessMap".to_owned(),
+                serialize_gradient_stops(thickness_map),
+            );
+            props.insert(
+                "gradientSpace".to_owned(),
+                Value::String(gradient_space.clone()),
+            );
+            insert_shape_prop_preserving_animated(props, "tension", json!(finite_f64(*tension)));
+            insert_shape_prop_preserving_animated(props, "pathSegments", json!(*path_segments));
+            insert_shape_prop_preserving_animated(props, "radialSegments", json!(*radial_segments));
+            props.insert("caps".to_owned(), Value::String(caps.clone()));
+            props.insert("capStyle".to_owned(), Value::String(cap_style.clone()));
+            insert_shape_prop_preserving_animated(props, "shading", json!(*shading));
         }
     }
+}
+
+fn is_preserved_animated_track(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    if obj.get("animated").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if obj
+        .get("expression")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return true;
+    }
+    if obj
+        .get("keyframes")
+        .and_then(Value::as_array)
+        .is_some_and(|kfs| kfs.len() > 1)
+    {
+        return true;
+    }
+    if let Some(channels) = obj.get("objects").and_then(Value::as_array) {
+        return channels.iter().any(is_preserved_animated_track);
+    }
+    false
+}
+
+fn insert_shape_prop_preserving_animated(props: &mut Map<String, Value>, key: &str, value: Value) {
+    if props.get(key).is_some_and(is_preserved_animated_track) {
+        return;
+    }
+    props.insert(key.to_owned(), value);
 }
 
 fn serialize_light(
@@ -3698,6 +3986,11 @@ mod tests {
                 size: [30.0, 20.0, 8.0],
                 radius: 2.5,
                 segments: 5,
+                corner_radius: Some(2.5),
+                corner_segments: Some(5),
+                bevel_size: Some(0.6),
+                bevel_segments: Some(2),
+                shading: 0,
             }),
         );
         rbox_obj.material = Some(MaterialSpec::Matcap(Box::new(MatcapMaterial {
@@ -3843,6 +4136,8 @@ mod tests {
                 expansion: -3.5,
                 opacity: 0.9,
                 closed: true,
+                locked: false,
+                outline_color: String::new(),
                 vertex_ids: vec!["v1".to_owned(), "v2".to_owned()],
                 vertex_modes: BTreeMap::from([("v1".to_owned(), "smooth".to_owned())]),
                 path: PropertyTrack::constant(PropertyValue::Json(json!([
@@ -4541,6 +4836,8 @@ mod tests {
                     height: 24.0,
                     detail: 20,
                     open_ended: true,
+                    top_radius: 0.0,
+                    shading: 0,
                 },
             ));
             objects.push(Object3D::new_shape_3d(
@@ -4550,6 +4847,7 @@ mod tests {
                     length: 14.0,
                     cap_segments: 6,
                     radial_segments: 12,
+                    shading: 0,
                 },
             ));
             objects.push(Object3D::new_shape_3d(
@@ -4557,6 +4855,7 @@ mod tests {
                 Shape3DKind::Icosahedron {
                     radius: 9.0,
                     detail: 2,
+                    shading: 0,
                 },
             ));
             let mut vec_expr_box = Object3D::new_shape_3d(
@@ -4805,7 +5104,7 @@ mod tests {
             });
         }
 
-        // 5. All 16 native Zoidium plugin effects + a standard effect with static fields (`coloroverlay`).
+        // 5. All 36 Zoidium plugin effects (35 nativeEffects + nodeeffect) + a standard effect with static fields (`coloroverlay`).
         let mut effects = vec![custom_fx];
         for &id in &ZOIDIUM_PLUGIN_EFFECT_IDS {
             effects.push(create_zoidium_effect(id).expect("zoidium effect"));
@@ -4827,6 +5126,8 @@ mod tests {
                     expansion: 0.0,
                     opacity: 1.0,
                     closed: true,
+                    locked: false,
+                    outline_color: String::new(),
                     vertex_ids: vec!["v1".to_owned()],
                     vertex_modes: BTreeMap::new(),
                     path: PropertyTrack::constant(PropertyValue::Json(json!([
@@ -4844,6 +5145,8 @@ mod tests {
                     expansion: 0.0,
                     opacity: 0.5,
                     closed: false,
+                    locked: true,
+                    outline_color: "#f0883e".to_owned(),
                     vertex_ids: vec!["v1".to_owned()],
                     vertex_modes: BTreeMap::new(),
                     path: PropertyTrack::constant(PropertyValue::Json(json!([
@@ -5123,21 +5426,13 @@ mod tests {
         );
 
         // --- Full round-trip via `import_pz_from_bytes` ---
-        // Note: `pz_import.rs` / `effects.rs` currently preserves manifest IDs `"looks"` and
-        // `"sglow-hq-v2-preview"` as `EffectKind::Plugin { plugin_id: "unknown", .. }` with a
-        // `"preserved unknown effect ..."` warning; no other warnings may appear.
+        // All 36 Zoidium plugin effects (including manifest IDs `"looks"` and `"sglow-hq-v2-preview"`)
+        // must re-import with ZERO warnings.
         let reimported = import_pz_from_bytes(&pz_bytes).expect("reimport invariants pz");
-        let unexpected_warnings: Vec<&String> = reimported
-            .warnings
-            .iter()
-            .filter(|w| {
-                !w.contains("preserved unknown effect \"looks\"")
-                    && !w.contains("preserved unknown effect \"sglow-hq-v2-preview\"")
-            })
-            .collect();
         assert!(
-            unexpected_warnings.is_empty(),
-            "unexpected warnings on round-trip: {unexpected_warnings:?}"
+            reimported.warnings.is_empty(),
+            "unexpected warnings on round-trip: {:?}",
+            reimported.warnings
         );
         let rp = reimported.project;
 
@@ -5593,7 +5888,7 @@ mod tests {
         assert_eq!(fx_arr[6]["properties"]["setup"], json!("preset-a"));
         assert_eq!(fx_arr[6]["properties"]["timeMode"], json!(1.0));
         assert_eq!(fx_arr[6]["properties"]["glitchSeed"], json!(42.0));
-        assert!(fx_arr[6]["properties"]["noise"]["keyframes"].is_array());
+        assert!(fx_arr[6]["properties"]["noiseOpacity"]["keyframes"].is_array());
         assert_eq!(fx_arr[7]["properties"]["timeMode"], json!(1.0));
         assert_eq!(fx_arr[7]["properties"]["motion"], json!(2));
         assert_eq!(fx_arr[7]["properties"]["interval"], json!(30.0));
@@ -5788,6 +6083,587 @@ mod tests {
                 .any(|w| w.contains("\"looks\"") || w.contains("\"sglow-hq-v2-preview\"")),
             "looks / sglow-hq-v2-preview should not emit unknown-effect warnings: {:?}",
             reimported.warnings
+        );
+    }
+
+    #[test]
+    fn round_trips_all_8_geometry_plus_primitives_layer_mask_metadata_and_particles_sprite() {
+        let mut project = Project::new_cm3_default();
+        let clip = &mut project.sequence.video_tracks[0].clips[0];
+        let scene_id = clip.layer.id;
+
+        if let LayerKind::Scene3D {
+            ref mut objects, ..
+        } = clip.layer.kind
+        {
+            // 1. RoundedBox (with corner/bevel/shading + animated bevelSize track preserved)
+            let mut rbox = Object3D::new_shape_3d(
+                "RBox",
+                Shape3DKind::RoundedBox {
+                    size: [44.0, 26.0, 8.0],
+                    radius: 4.0,
+                    segments: 8,
+                    corner_radius: Some(4.0),
+                    corner_segments: Some(8),
+                    bevel_size: Some(0.9),
+                    bevel_segments: Some(3),
+                    shading: 1,
+                },
+            );
+            rbox.preserved.insert(
+                "property.bevelSize".to_owned(),
+                json!({
+                    "animated": true,
+                    "keyframes": [
+                        { "frame": 0, "value": 0.9, "tween": 1 },
+                        { "frame": 30, "value": 2.4, "tween": 1 }
+                    ]
+                }),
+            );
+            objects.push(rbox);
+
+            // 2. Polyhedron (Dodecahedron with shading=1)
+            objects.push(Object3D::new_shape_3d(
+                "Poly",
+                Shape3DKind::Dodecahedron {
+                    radius: 15.0,
+                    detail: 2,
+                    shading: 1,
+                },
+            ));
+
+            // 3. Cone (frustum with top_radius + shading=1)
+            objects.push(Object3D::new_shape_3d(
+                "FrustumCone",
+                Shape3DKind::Cone {
+                    radius: 18.0,
+                    height: 36.0,
+                    detail: 28,
+                    open_ended: true,
+                    top_radius: 5.0,
+                    shading: 1,
+                },
+            ));
+
+            // 4. Capsule (with shading=1)
+            objects.push(Object3D::new_shape_3d(
+                "SmoothCapsule",
+                Shape3DKind::Capsule {
+                    radius: 7.0,
+                    length: 20.0,
+                    cap_segments: 10,
+                    radial_segments: 24,
+                    shading: 1,
+                },
+            ));
+
+            // 5. Tube
+            objects.push(Object3D::new_shape_3d(
+                "HollowTube",
+                Shape3DKind::Tube {
+                    outer_radius: 14.0,
+                    inner_radius: 9.5,
+                    height: 28.0,
+                    radial_segments: 32,
+                    open_ended: true,
+                    shading: 1,
+                },
+            ));
+
+            // 6. Gear
+            objects.push(Object3D::new_shape_3d(
+                "CogGear",
+                Shape3DKind::Gear {
+                    teeth: 16,
+                    inner_radius: 11.0,
+                    outer_radius: 19.0,
+                    thickness: 7.5,
+                    tooth_width: 0.6,
+                    bevel_size: 0.4,
+                    bevel_segments: 3,
+                    shading: 1,
+                },
+            ));
+
+            // 7. Helix
+            objects.push(Object3D::new_shape_3d(
+                "SpringHelix",
+                Shape3DKind::Helix {
+                    radius: 16.0,
+                    height: 40.0,
+                    turns: 4.5,
+                    tube_radius: 2.5,
+                    path_segments: 96,
+                    radial_segments: 12,
+                    shading: 1,
+                },
+            ));
+
+            // 8. Spline
+            objects.push(Object3D::new_shape_3d(
+                "ArchSpline",
+                Shape3DKind::Spline {
+                    points: vec![
+                        [-25.0, 0.0, 0.0],
+                        [-8.0, 18.0, 5.0],
+                        [8.0, -12.0, -5.0],
+                        [25.0, 4.0, 0.0],
+                    ],
+                    interpolation: "Akima".to_owned(),
+                    closed: true,
+                    start: 0.1,
+                    end: 0.9,
+                    thickness: 3.5,
+                    thickness_map: vec![
+                        GradientStop {
+                            position: 0.0,
+                            color: "rgba(255,255,255,1.0)".to_owned(),
+                        },
+                        GradientStop {
+                            position: 1.0,
+                            color: "rgba(128,128,128,1.0)".to_owned(),
+                        },
+                    ],
+                    gradient_space: "Trimmed".to_owned(),
+                    tension: 1.25,
+                    path_segments: 24,
+                    radial_segments: 10,
+                    caps: "Start".to_owned(),
+                    cap_style: "Round".to_owned(),
+                    shading: 1,
+                },
+            ));
+
+            // 9. Particles with Particles+ sprite_preset
+            objects.push(Object3D::new(
+                "Sparkles",
+                Object3DKind::Particles(Box::new(ParticlesData {
+                    number: 100,
+                    rate: 20.0,
+                    lifetime: 1.5,
+                    sprite_preset: Some("star-4pt".to_owned()),
+                    ..ParticlesData::default()
+                })),
+            ));
+        }
+
+        // LayerMask with locked + outline_color, and one with default empty outline_color
+        project.sequence.layer_masks.insert(
+            scene_id,
+            vec![
+                LayerMask {
+                    id: "m-locked".to_owned(),
+                    name: "Locked Mask".to_owned(),
+                    enabled: true,
+                    mode: MaskMode::Add,
+                    invert: false,
+                    feather: 2.0,
+                    expansion: 1.5,
+                    opacity: 0.85,
+                    closed: true,
+                    locked: true,
+                    outline_color: "#ff7b72".to_owned(),
+                    vertex_ids: vec!["v1".to_owned()],
+                    vertex_modes: BTreeMap::new(),
+                    path: PropertyTrack::constant(PropertyValue::Json(json!([
+                        0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                    ]))),
+                    preserved: BTreeMap::new(),
+                },
+                LayerMask {
+                    id: "m-default-outline".to_owned(),
+                    name: "Default Outline".to_owned(),
+                    enabled: true,
+                    mode: MaskMode::Subtract,
+                    invert: false,
+                    feather: 0.0,
+                    expansion: 0.0,
+                    opacity: 1.0,
+                    closed: false,
+                    locked: false,
+                    outline_color: String::new(),
+                    vertex_ids: Vec::new(),
+                    vertex_modes: BTreeMap::new(),
+                    path: PropertyTrack::constant(PropertyValue::Json(json!([
+                        1.0, 2.0, 0.0, 0.0, 0.0, 0.0
+                    ]))),
+                    preserved: BTreeMap::new(),
+                },
+            ],
+        );
+
+        let pz_bytes = export_pz_to_bytes(&project).expect("export wave 1a pz");
+        let entries = inspect_tar_entries(&pz_bytes);
+        let doc: Value = serde_json::from_slice(&entries["project"]).expect("parse project JSON");
+        let scene_json = &doc["sequence"]["videoTracks"][0]["clips"][0]["object"];
+
+        // Empty outline_color must NOT emit invalid empty string to Zoidium
+        let masks_json = scene_json["zoidiumMasks"].as_array().expect("zoidiumMasks");
+        assert_eq!(masks_json[0]["locked"], json!(true));
+        assert_eq!(masks_json[0]["outlineColor"], json!("#ff7b72"));
+        assert_eq!(masks_json[1]["locked"], json!(false));
+        assert!(masks_json[1].get("outlineColor").is_none());
+
+        // Animated bevelSize track on RoundedBox must not be clobbered on export
+        assert_eq!(
+            scene_json["objects"][1]["properties"]["bevelSize"]["animated"],
+            json!(true)
+        );
+        // Particles+ sprite_preset synced to `_zoidiumParticlesPlusSprite`
+        assert_eq!(
+            scene_json["objects"][9]["_zoidiumParticlesPlusSprite"],
+            json!("star-4pt")
+        );
+
+        let reimported = import_pz_from_bytes(&pz_bytes).expect("reimport wave 1a pz");
+        assert!(
+            reimported.warnings.is_empty(),
+            "expected zero warnings, got {:?}",
+            reimported.warnings
+        );
+        let rp = reimported.project;
+        assert!(rp.plugin_requirements.contains("geometry-plus"));
+        assert!(rp.plugin_requirements.contains("particles-plus"));
+
+        let rscene = &rp.sequence.video_tracks[0].clips[0].layer;
+        let rmasks = &rp.sequence.layer_masks[&rscene.id];
+        assert_eq!(rmasks.len(), 2);
+        assert!(rmasks[0].locked);
+        assert_eq!(rmasks[0].outline_color, "#ff7b72");
+        assert!(!rmasks[1].locked);
+        assert!(rmasks[1].outline_color.is_empty());
+
+        let LayerKind::Scene3D { ref objects, .. } = rscene.kind else {
+            panic!("expected Scene3D");
+        };
+        assert!(matches!(
+            objects[1].kind,
+            Object3DKind::Shape3D(Shape3DKind::RoundedBox {
+                size: [44.0, 26.0, 8.0],
+                radius: 4.0,
+                segments: 8,
+                corner_radius: Some(4.0),
+                corner_segments: Some(8),
+                bevel_size: Some(0.9),
+                bevel_segments: Some(3),
+                shading: 1,
+            })
+        ));
+        assert_eq!(
+            objects[1]
+                .preserved
+                .get("property.bevelSize")
+                .and_then(|v| v.get("animated")),
+            Some(&json!(true))
+        );
+        assert!(matches!(
+            objects[2].kind,
+            Object3DKind::Shape3D(Shape3DKind::Dodecahedron {
+                radius: 15.0,
+                detail: 2,
+                shading: 1,
+            })
+        ));
+        assert!(matches!(
+            objects[3].kind,
+            Object3DKind::Shape3D(Shape3DKind::Cone {
+                radius: 18.0,
+                height: 36.0,
+                detail: 28,
+                open_ended: true,
+                top_radius: 5.0,
+                shading: 1,
+            })
+        ));
+        assert!(matches!(
+            objects[4].kind,
+            Object3DKind::Shape3D(Shape3DKind::Capsule {
+                radius: 7.0,
+                length: 20.0,
+                cap_segments: 10,
+                radial_segments: 24,
+                shading: 1,
+            })
+        ));
+        assert!(matches!(
+            objects[5].kind,
+            Object3DKind::Shape3D(Shape3DKind::Tube {
+                outer_radius: 14.0,
+                inner_radius: 9.5,
+                height: 28.0,
+                radial_segments: 32,
+                open_ended: true,
+                shading: 1,
+            })
+        ));
+        assert!(matches!(
+            objects[6].kind,
+            Object3DKind::Shape3D(Shape3DKind::Gear {
+                teeth: 16,
+                inner_radius: 11.0,
+                outer_radius: 19.0,
+                thickness: 7.5,
+                tooth_width: 0.6,
+                bevel_size: 0.4,
+                bevel_segments: 3,
+                shading: 1,
+            })
+        ));
+        assert!(matches!(
+            objects[7].kind,
+            Object3DKind::Shape3D(Shape3DKind::Helix {
+                radius: 16.0,
+                height: 40.0,
+                turns: 4.5,
+                tube_radius: 2.5,
+                path_segments: 96,
+                radial_segments: 12,
+                shading: 1,
+            })
+        ));
+        let Object3DKind::Shape3D(Shape3DKind::Spline {
+            ref points,
+            ref interpolation,
+            closed,
+            start,
+            end,
+            thickness,
+            ref thickness_map,
+            ref gradient_space,
+            tension,
+            path_segments,
+            radial_segments,
+            ref caps,
+            ref cap_style,
+            shading,
+        }) = objects[8].kind
+        else {
+            panic!("expected Spline, got {:?}", objects[8].kind);
+        };
+        assert_eq!(points.len(), 4);
+        assert_eq!(points[1], [-8.0, 18.0, 5.0]);
+        assert_eq!(interpolation, "Akima");
+        assert!(closed);
+        assert!((start - 0.1).abs() < 1e-9);
+        assert!((end - 0.9).abs() < 1e-9);
+        assert!((thickness - 3.5).abs() < 1e-9);
+        assert_eq!(thickness_map.len(), 2);
+        assert_eq!(gradient_space, "Trimmed");
+        assert!((tension - 1.25).abs() < 1e-9);
+        assert_eq!(path_segments, 24);
+        assert_eq!(radial_segments, 10);
+        assert_eq!(caps, "Start");
+        assert_eq!(cap_style, "Round");
+        assert_eq!(shading, 1);
+
+        let Object3DKind::Particles(ref rpart) = objects[9].kind else {
+            panic!("expected Particles");
+        };
+        assert_eq!(rpart.sprite_preset.as_deref(), Some("star-4pt"));
+    }
+
+    #[test]
+    fn expresstext_plus_optical_flares_and_trapcode_round_trip_with_zero_warnings() {
+        let expresstext_types = [
+            "zoidium:expresstext-plus/expresstext",
+            "zoidium:expresstext-plus/shake",
+            "zoidium:expresstext-plus/plain",
+            "zoidium:expresstext-plus/random",
+            "zoidium:expresstext-plus/formula",
+            "zoidium:expresstext-plus/delay",
+            "zoidium:expresstext-plus/spline",
+            "zoidium:expresstext-plus/orbit",
+            "zoidium:expresstext-plus/repeater",
+            "zoidium:expresstext-plus/twist",
+            "zoidium:expresstext-plus/wrap",
+            "zoidium:expresstext-plus/voronoi",
+        ];
+
+        let mut scene_objects: Vec<Value> = expresstext_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                json!({
+                    "type": ty,
+                    "schemaVersion": 1,
+                    "properties": { "name": format!("ET_{i}") },
+                    "expressProperties": {
+                        "lettersMode": 1,
+                        "lettersVersion": 2,
+                        "strength": { "animated": false, "keyframes": [{ "frame": 0, "value": 1.0, "tween": 1 }] }
+                    },
+                    "objects": [
+                        { "type": 1, "properties": { "name": "ChildText", "text": "HI" } }
+                    ]
+                })
+            })
+            .collect();
+
+        // Optical Flares (numeric type 13 and string type)
+        scene_objects.push(json!({
+            "type": 13,
+            "objectType": 2,
+            "properties": { "name": "NumericFlare" },
+            "stack": [{ "kind": "glow", "brightness": 1.2 }]
+        }));
+        scene_objects.push(json!({
+            "type": "zoidium:optical-flares/flare",
+            "properties": { "name": "StringFlare" }
+        }));
+
+        // Trapcode (both `zoidium:trapcode/*` and `zoidium:trapcode-suite/*`)
+        for ty in [
+            "zoidium:trapcode/particular",
+            "zoidium:trapcode/form",
+            "zoidium:trapcode/plexus",
+            "zoidium:trapcode-suite/particular",
+            "zoidium:trapcode-suite/form",
+            "zoidium:trapcode-suite/plexus",
+        ] {
+            scene_objects.push(json!({
+                "type": ty,
+                "properties": { "name": ty }
+            }));
+        }
+
+        let project_json = json!({
+            "sequence": {
+                "properties": { "name": "Seq", "rate": 30 },
+                "videoTracks": [{
+                    "clips": [{
+                        "start": 0,
+                        "length": 60,
+                        "name": "Clip",
+                        "object": {
+                            "type": 4,
+                            "properties": { "name": "Scene" },
+                            "objects": scene_objects
+                        }
+                    }]
+                }],
+                "audioTracks": []
+            }
+        });
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let meta = br#"{"version":"1.0.101"}"#;
+            let proj = serde_json::to_vec(&project_json).unwrap();
+            append_ustar_file(&mut builder, "meta", meta).unwrap();
+            append_ustar_file(&mut builder, "project", &proj).unwrap();
+            builder.finish().unwrap();
+        }
+        let pz_bytes = encoder.finish().unwrap();
+
+        let imported = import_pz_from_bytes(&pz_bytes).expect("import plugin objects");
+        assert!(
+            imported.warnings.is_empty(),
+            "expected ZERO warnings for ExpressText+/OpticalFlares/Trapcode, got: {:?}",
+            imported.warnings
+        );
+        assert!(
+            imported
+                .project
+                .plugin_requirements
+                .contains("expresstext-plus")
+        );
+        assert!(
+            imported
+                .project
+                .plugin_requirements
+                .contains("optical-flares")
+        );
+        assert!(
+            imported
+                .project
+                .plugin_requirements
+                .contains("trapcode-suite")
+        );
+
+        let LayerKind::Scene3D { ref objects, .. } = imported.project.sequence.video_tracks[0]
+            .clips[0]
+            .layer
+            .kind
+        else {
+            panic!("expected Scene3D");
+        };
+        assert_eq!(objects.len(), 12 + 2 + 6);
+
+        // Verify all 12 ExpressText+ classes imported as Group with expressProperties & lettersMode preserved
+        for (i, &ty) in expresstext_types.iter().enumerate() {
+            assert!(
+                matches!(objects[i].kind, Object3DKind::Group { ref children, .. } if children.len() == 1),
+                "expected Group with 1 child for {ty}"
+            );
+            assert_eq!(
+                objects[i].preserved.get("zoidiumPluginObjectType"),
+                Some(&json!(ty))
+            );
+            assert_eq!(
+                objects[i]
+                    .preserved
+                    .get("expressProperties")
+                    .and_then(|v| v.get("lettersMode")),
+                Some(&json!(1))
+            );
+        }
+
+        // Verify Optical Flares
+        assert_eq!(
+            objects[12].preserved.get("zoidiumPluginObjectType"),
+            Some(&json!("zoidium:optical-flares/flare"))
+        );
+        assert_eq!(
+            objects[13].preserved.get("zoidiumPluginObjectType"),
+            Some(&json!("zoidium:optical-flares/flare"))
+        );
+
+        // Verify Trapcode
+        for (offset, ty) in [
+            "zoidium:trapcode/particular",
+            "zoidium:trapcode/form",
+            "zoidium:trapcode/plexus",
+            "zoidium:trapcode-suite/particular",
+            "zoidium:trapcode-suite/form",
+            "zoidium:trapcode-suite/plexus",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(
+                objects[14 + offset]
+                    .preserved
+                    .get("zoidiumPluginObjectType"),
+                Some(&json!(ty))
+            );
+        }
+
+        // Re-export and re-import to verify lossless round-trip with 0 warnings
+        let reexported = export_pz_to_bytes(&imported.project).expect("reexport");
+        let roundtripped = import_pz_from_bytes(&reexported).expect("roundtrip");
+        assert!(
+            roundtripped.warnings.is_empty(),
+            "expected ZERO warnings after re-export, got: {:?}",
+            roundtripped.warnings
+        );
+        let LayerKind::Scene3D { ref objects, .. } = roundtripped.project.sequence.video_tracks[0]
+            .clips[0]
+            .layer
+            .kind
+        else {
+            panic!("expected Scene3D");
+        };
+        assert_eq!(
+            objects[0]
+                .preserved
+                .get("expressProperties")
+                .and_then(|v| v.get("lettersMode")),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            objects[12].preserved.get("zoidiumPluginObjectType"),
+            Some(&json!("zoidium:optical-flares/flare"))
         );
     }
 }

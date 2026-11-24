@@ -93,10 +93,11 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     }
     let src = sample_diffuse(in_v.v_uv);
     let flare = sample_aux(in_v.v_uv);
-    let lum_src = luma601(src.rgb);
+    let bright_tex = select(src, sample_aux2(in_v.v_uv), (u.flags & 1u) != 0u);
+    let lum_bright = luma601(bright_tex.rgb);
     let lo = u.p0.y - u.p0.z;
     let hi = max(u.p0.y + u.p0.z, lo + 1e-4);
-    let atten = (1.0 - smoothstep(lo, hi, lum_src)) * u.p0.x;
+    let atten = (1.0 - smoothstep(lo, hi, lum_bright)) * u.p0.x;
     return vec4<f32>(
         min(src.rgb + flare.rgb * atten, vec3<f32>(1.0)),
         clamp(src.a + flare.a * atten, 0.0, 1.0),

@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod glsl_shim;
+pub mod node_graph;
 pub mod shader_plus;
 
 pub use glsl_shim::{
@@ -11,6 +12,10 @@ pub use glsl_shim::{
     UniformBlockLayout, UniformField, UniformType, UniformValue, align_up, bind_curve_ranges,
     bind_gradient_cycles, fix_property_name, pack_uniforms, translate_glsl_es100,
     translate_glsl_es100_with_options,
+};
+pub use node_graph::{
+    BakedMap, BakedNodeMaterialMaps, CompiledNodeEffect, NodeEffectParameter,
+    bake_node_material_maps, compile_node_effect_to_glsl,
 };
 pub use shader_plus::{
     CURVE_LUT_WIDTH, ConditionClause, CurveChannel, CurveMode, CurvePoint, CurveSpec,

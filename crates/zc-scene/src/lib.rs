@@ -1,12 +1,16 @@
 //! Clean-room 3D scene geometry, extruded 3D text, stateless GPU particles,
-//! procedural camera shake/DOF, Wavefront OBJ loader, and Effector deformers
+//! procedural camera shake/DOF, Wavefront OBJ & glTF/GLB loaders, and Effector deformers
 //! for ZoidCraft.
+
+#![forbid(unsafe_code)]
 
 pub mod camera;
 pub mod effector;
+pub mod gltf_loader;
 pub mod mesh;
 pub mod obj_loader;
 pub mod particles;
+pub mod primitives;
 pub mod text3d;
 
 pub use camera::{
@@ -25,9 +29,10 @@ pub use effector::{
     apply_voronoi_fracture, apply_voronoi_fracture_with_params, apply_warp, apply_warp_with_params,
     compute_deformer_frame, compute_shared_deformer_bounds, connected_pieces, delay_weight,
     effector_hash_unit_vector, effector_hash01, evaluate_field, generate_voronoi_sites,
-    prepare_field_for_bounds, prepare_field_from_positions, repeater_echo_frames,
-    repeater_instance_transform, rotate_xyz_deg, voronoi_piece_color,
+    parse_character_ranges, prepare_field_for_bounds, prepare_field_from_positions,
+    repeater_echo_frames, repeater_instance_transform, rotate_xyz_deg, voronoi_piece_color,
 };
+pub use gltf_loader::{GltfLoadError, parse_glb, parse_gltf, parse_gltf_or_glb};
 pub use mesh::{
     MAX_SMOOTH_TRIANGLES, MeshData, Vertex3D, budget_subdivision, build_box, build_capsule,
     build_circle, build_cylinder, build_dodecahedron, build_donut, build_icosahedron,
@@ -36,12 +41,18 @@ pub use mesh::{
 };
 pub use obj_loader::{ObjLoadError, parse_obj};
 pub use particles::{
-    CM3_GRADIENT_LUT_SIZE, GradientStop, ParticleBlending, ParticleInstance, ParticleSpriteKind,
-    ParticleSystemParams, PositionDistribution, VelocityDistribution, bake_cm3_gradient_lut_rgba8,
+    ALL_PARTICLE_SPRITE_NAMES, CM3_GRADIENT_LUT_SIZE, GradientStop, ParticleBlending,
+    ParticleInstance, ParticleSpriteKind, ParticleSystemParams, PositionDistribution,
+    VelocityDistribution, all_particle_sprite_names, bake_cm3_gradient_lut_rgba8,
     bake_gradient_lut, cm3_quad_rotation_rad, cm3_rotate_point_sprite_uv,
     compose_particle_fragment_premul, evaluate_particle, evaluate_particle_cm3_lut,
-    evaluate_particles, evaluate_particles_cm3_lut, generate_particle_sprite, particle_hash,
-    perspective_point_size, sample_cm3_gradient_lut, sample_gradient,
+    evaluate_particles, evaluate_particles_cm3_lut, generate_particle_sprite,
+    generate_particle_sprite_by_name, particle_hash, perspective_point_size,
+    sample_cm3_gradient_lut, sample_gradient,
+};
+pub use primitives::{
+    apply_flat_normals, apply_normalized_uv_layout, build_gear, build_helix, build_preset_model,
+    build_rounded_box_ext, build_spline, build_tube,
 };
 pub use text3d::{
     BevelProfile, BevelSide, Text3DCharacterMesh, Text3DError, Text3DExtendedOptions, Text3DParams,
@@ -1431,5 +1442,452 @@ mod tests {
         assert!(frac_open.vertices.iter().all(|v| v.material_slot == 0));
         let col = voronoi_piece_color(7, 0);
         assert!(col.iter().all(|&c| (0.0..=1.0).contains(&c)));
+    }
+
+    #[test]
+    fn particles_plus_all_54_sprites_distinct_and_valid() {
+        let names = all_particle_sprite_names();
+        assert_eq!(names.len(), 54);
+
+        let mut unique_names = std::collections::HashSet::new();
+        let mut rendered: Vec<(&str, Vec<u8>)> = Vec::with_capacity(54);
+        for &name in names {
+            assert!(unique_names.insert(name), "duplicate sprite name {name}");
+            let (w, h, rgba) =
+                generate_particle_sprite_by_name(name, 32).expect("known sprite should generate");
+            assert_eq!((w, h), (32, 32));
+            assert_eq!(rgba.len(), 32 * 32 * 4);
+
+            let mut non_zero_alpha = 0_usize;
+            for y in 0..32_usize {
+                for x in 0..32_usize {
+                    let off = (y * 32 + x) * 4;
+                    assert_eq!(
+                        &rgba[off..off + 3],
+                        &[255, 255, 255],
+                        "{name}: RGB must be pure white"
+                    );
+                    if x == 0 || y == 0 || x == 31 || y == 31 {
+                        assert_eq!(rgba[off + 3], 0, "{name}: 1px border must be transparent");
+                    } else if rgba[off + 3] > 0 {
+                        non_zero_alpha += 1;
+                    }
+                }
+            }
+            assert!(non_zero_alpha > 10, "{name}: sprite alpha is empty");
+            rendered.push((name, rgba));
+        }
+
+        // Verify all 54 sprites produce distinct alpha silhouettes
+        for i in 0..rendered.len() {
+            for j in (i + 1)..rendered.len() {
+                assert_ne!(
+                    rendered[i].1, rendered[j].1,
+                    "sprites '{}' and '{}' produced identical pixels",
+                    rendered[i].0, rendered[j].0
+                );
+            }
+        }
+
+        // Name normalization: .png suffix, uppercase, sprite- prefix, path + query string
+        let base = generate_particle_sprite_by_name("star_5", 24).unwrap();
+        assert_eq!(
+            generate_particle_sprite_by_name("STAR_5.PNG", 24).unwrap(),
+            base
+        );
+        assert_eq!(
+            generate_particle_sprite_by_name("sprite-star_5", 24).unwrap(),
+            base
+        );
+        assert_eq!(
+            generate_particle_sprite_by_name(
+                "./plugins/particles-plus/sprites/star_5.png?v=10",
+                24
+            )
+            .unwrap(),
+            base
+        );
+        assert!(generate_particle_sprite_by_name("does_not_exist_xyz", 24).is_none());
+    }
+
+    #[test]
+    fn geometry_plus_tube_gear_helix_spline_and_rounded_box_ext() {
+        let tube_capped_smooth = build_tube(12.0, 8.0, 24.0, 24, true, true);
+        let tube_open_flat = build_tube(12.0, 8.0, 24.0, 16, false, false);
+        assert_valid_mesh(&tube_capped_smooth, "tube_capped_smooth");
+        assert_valid_mesh(&tube_open_flat, "tube_open_flat");
+        assert!(tube_capped_smooth.triangle_count() > tube_open_flat.triangle_count());
+
+        let gear_flat = build_gear(12, 10.0, 16.0, 6.0, 0.55, 0.3, 2, false);
+        let gear_smooth = build_gear(8, 6.0, 10.0, 4.0, 0.5, 0.0, 0, true);
+        assert_valid_mesh(&gear_flat, "gear_flat");
+        assert_valid_mesh(&gear_smooth, "gear_smooth");
+        assert!(gear_flat.bounds.max.x > 14.0);
+
+        let helix_smooth = build_helix(14.0, 32.0, 3.0, 2.0, 64, 8, true);
+        let helix_flat = build_helix(14.0, 32.0, 2.0, 1.5, 32, 6, false);
+        assert_valid_mesh(&helix_smooth, "helix_smooth");
+        assert_valid_mesh(&helix_flat, "helix_flat");
+        assert!((helix_smooth.bounds.size().y - 32.0).abs() < 5.0);
+
+        // Spline across all 4 interpolation modes + closed loop + round & flat caps + thickness stops
+        let pts = [
+            [-20.0, 0.0, 0.0],
+            [-6.0, 14.0, 4.0],
+            [8.0, 8.0, -4.0],
+            [20.0, 0.0, 2.0],
+        ];
+        let stops = [(0.0, 0.4), (0.5, 1.5), (1.0, 0.6)];
+        for interp in 0..=3 {
+            let open_flat = build_spline(
+                &pts, interp, false, 0.0, 1.0, 2.0, &stops, 1.0, 8, 8, true, 0, true,
+            );
+            assert_valid_mesh(&open_flat, &format!("spline_interp_{interp}_flat_cap"));
+
+            let open_round = build_spline(
+                &pts, interp, false, 0.1, 0.9, 2.0, &stops, 1.0, 6, 8, true, 1, true,
+            );
+            assert_valid_mesh(&open_round, &format!("spline_interp_{interp}_round_cap"));
+            assert!(open_round.triangle_count() > open_flat.triangle_count() / 2);
+
+            let closed_loop = build_spline(
+                &pts,
+                interp,
+                true,
+                0.0,
+                1.0,
+                2.0,
+                &[],
+                1.0,
+                6,
+                8,
+                false,
+                0,
+                false,
+            );
+            assert_valid_mesh(&closed_loop, &format!("spline_interp_{interp}_closed"));
+        }
+
+        let rbox_smooth = build_rounded_box_ext(40.0, 24.0, 6.0, 3.0, 6, 0.6, 2, true);
+        let rbox_flat = build_rounded_box_ext(40.0, 24.0, 6.0, 3.0, 4, 0.6, 2, false);
+        assert_valid_mesh(&rbox_smooth, "rounded_box_ext_smooth");
+        assert_valid_mesh(&rbox_flat, "rounded_box_ext_flat");
+        assert_eq!(rbox_flat.vertices.len(), rbox_flat.indices.len());
+        assert!((rbox_smooth.bounds.size().x - 40.0).abs() < 1e-3);
+        assert!((rbox_smooth.bounds.size().y - 24.0).abs() < 1e-3);
+        assert!((rbox_smooth.bounds.size().z - 6.0).abs() < 1e-3);
+
+        // apply_flat_normals splits shared vertices and preserves colors
+        let mut sphere = build_sphere(5.0, 12, 8);
+        sphere.colors = vec![[0.2, 0.5, 0.8, 1.0]; sphere.vertices.len()];
+        let orig_verts = sphere.vertices.len();
+        apply_flat_normals(&mut sphere);
+        assert_valid_mesh(&sphere, "sphere_after_flat_normals");
+        assert_eq!(sphere.vertices.len(), sphere.indices.len());
+        assert_eq!(sphere.colors.len(), sphere.vertices.len());
+        assert!(sphere.vertices.len() > orig_verts);
+    }
+
+    #[test]
+    fn normalized_uv_layout_extruded_and_general_meshes() {
+        // Extruded mesh (reconstructable XY contour walls + Z caps)
+        let mut rbox = build_rounded_box_ext(20.0, 10.0, 4.0, 2.0, 4, 0.0, 0, true);
+        apply_normalized_uv_layout(&mut rbox);
+        assert_valid_mesh(&rbox, "rbox_normalized_uv");
+        let mut max_u = 0.0_f32;
+        let mut max_v = 0.0_f32;
+        for v in &rbox.vertices {
+            assert!(v.uv[0].is_finite() && v.uv[1].is_finite());
+            max_u = max_u.max(v.uv[0]);
+            max_v = max_v.max(v.uv[1]);
+        }
+        // Perimeter of 20x10 rounded box (~56.6) divided by height scale (10.0) > 4.0
+        assert!(
+            max_u > 4.0,
+            "expected arc-length U unwrap, got max_u={max_u}"
+        );
+        assert!(
+            (max_v - 1.0).abs() < 1e-3,
+            "expected cap V max 1.0, got {max_v}"
+        );
+
+        // General 3D mesh (sphere -> triplanar box fallback)
+        let mut sphere = build_sphere(6.0, 12, 8);
+        apply_normalized_uv_layout(&mut sphere);
+        assert_valid_mesh(&sphere, "sphere_normalized_uv");
+        for v in &sphere.vertices {
+            assert!(v.uv[0] >= -1e-4 && v.uv[0] <= 1.0001);
+            assert!(v.uv[1] >= -1e-4 && v.uv[1] <= 1.0001);
+        }
+    }
+
+    #[test]
+    fn cm3_preset_models_rifle_and_articulated_mystery_box() {
+        let rifle = build_preset_model(1, 0.0);
+        assert_valid_mesh(&rifle, "preset_rifle");
+        assert!(
+            rifle.triangle_count() >= 150,
+            "rifle should be detailed multi-part mesh, got {} tris",
+            rifle.triangle_count()
+        );
+        // Rifle is elongated along X
+        let r_size = rifle.bounds.size();
+        assert!(r_size.x > r_size.y * 2.0 && r_size.x > r_size.z * 4.0);
+
+        let chest_closed = build_preset_model(2, 0.0);
+        let chest_open = build_preset_model(2, std::f32::consts::FRAC_PI_2);
+        assert_valid_mesh(&chest_closed, "preset_mystery_box_closed");
+        assert_valid_mesh(&chest_open, "preset_mystery_box_open");
+        assert_eq!(chest_closed.vertices.len(), chest_open.vertices.len());
+        // Opening the lid around the back hinge must raise the maximum Y bound significantly
+        // while keeping the base bottom Y unchanged!
+        assert!(
+            (chest_closed.bounds.min.y - chest_open.bounds.min.y).abs() < 1e-4,
+            "base bottom must stay anchored"
+        );
+        assert!(
+            chest_open.bounds.max.y > chest_closed.bounds.max.y + 4.0,
+            "opening lid should lift lid vertices upward (closed={}, open={})",
+            chest_closed.bounds.max.y,
+            chest_open.bounds.max.y
+        );
+    }
+
+    #[test]
+    fn glb_and_gltf_loader_roundtrip_hierarchy_and_materials() {
+        // Build a minimal valid binary GLB with 2 primitives (materials 0 & 1), u16 indices,
+        // POSITION + TEXCOORD_0 (no NORMAL -> auto-generated), and a parent->child TRS hierarchy.
+        let positions: [[f32; 3]; 6] = [
+            // Primitive 0 triangle
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            // Primitive 1 triangle
+            [0.0, 0.0, 1.0],
+            [2.0, 0.0, 1.0],
+            [0.0, 2.0, 1.0],
+        ];
+        let uvs: [[f32; 2]; 6] = [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ];
+        let indices0: [u16; 3] = [0, 1, 2];
+        let indices1: [u16; 3] = [0, 1, 2];
+
+        let mut bin = Vec::new();
+        let pos_off = bin.len();
+        for p in positions {
+            for c in p {
+                bin.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let uv_off = bin.len();
+        for uv in uvs {
+            for c in uv {
+                bin.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let idx0_off = bin.len();
+        for i in indices0 {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        // Align to 4 bytes
+        while !bin.len().is_multiple_of(4) {
+            bin.push(0);
+        }
+        let idx1_off = bin.len();
+        for i in indices1 {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        while !bin.len().is_multiple_of(4) {
+            bin.push(0);
+        }
+
+        let json = format!(
+            r#"{{
+              "asset": {{"version": "2.0"}},
+              "scene": 0,
+              "scenes": [{{"nodes": [0]}}],
+              "nodes": [
+                {{"translation": [10.0, 0.0, 0.0], "children": [1]}},
+                {{"scale": [2.0, 2.0, 2.0], "mesh": 0}}
+              ],
+              "meshes": [{{
+                "primitives": [
+                  {{"attributes": {{"POSITION": 0, "TEXCOORD_0": 2}}, "indices": 4, "material": 0}},
+                  {{"attributes": {{"POSITION": 1, "TEXCOORD_0": 3}}, "indices": 5, "material": 1}}
+                ]
+              }}],
+              "buffers": [{{"byteLength": {}}}],
+              "bufferViews": [
+                {{"buffer": 0, "byteOffset": {pos_off}, "byteLength": 72}},
+                {{"buffer": 0, "byteOffset": {uv_off}, "byteLength": 48}},
+                {{"buffer": 0, "byteOffset": {idx0_off}, "byteLength": 6}},
+                {{"buffer": 0, "byteOffset": {idx1_off}, "byteLength": 6}}
+              ],
+              "accessors": [
+                {{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3"}},
+                {{"bufferView": 0, "byteOffset": 36, "componentType": 5126, "count": 3, "type": "VEC3"}},
+                {{"bufferView": 1, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC2"}},
+                {{"bufferView": 1, "byteOffset": 24, "componentType": 5126, "count": 3, "type": "VEC2"}},
+                {{"bufferView": 2, "byteOffset": 0, "componentType": 5123, "count": 3, "type": "SCALAR"}},
+                {{"bufferView": 3, "byteOffset": 0, "componentType": 5123, "count": 3, "type": "SCALAR"}}
+              ]
+            }}"#,
+            bin.len()
+        );
+
+        let mut json_bytes = json.as_bytes().to_vec();
+        while !json_bytes.len().is_multiple_of(4) {
+            json_bytes.push(b' ');
+        }
+
+        let total_len = 12 + 8 + json_bytes.len() + 8 + bin.len();
+        let mut glb = Vec::with_capacity(total_len);
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2_u32.to_le_bytes());
+        glb.extend_from_slice(&(total_len as u32).to_le_bytes());
+        glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json_bytes);
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"BIN\0");
+        glb.extend_from_slice(&bin);
+
+        let parsed = parse_gltf_or_glb(&glb).expect("synthetic GLB should parse");
+        assert_valid_mesh(&parsed, "synthetic_glb");
+        assert_eq!(parsed.triangle_count(), 2);
+        // Hierarchy transform: scale 2 then translate +10 on X => x in [10, 14], y in [0, 4], z in [0, 2]
+        assert!((parsed.bounds.min.x - 10.0).abs() < 1e-4);
+        assert!((parsed.bounds.max.x - 14.0).abs() < 1e-4);
+        assert!((parsed.bounds.max.y - 4.0).abs() < 1e-4);
+        assert!((parsed.bounds.max.z - 2.0).abs() < 1e-4);
+        // Material slots preserved per primitive
+        assert!(parsed.vertices.iter().any(|v| v.material_slot == 0));
+        assert!(parsed.vertices.iter().any(|v| v.material_slot == 1));
+
+        // Also test text .gltf with external buffer slice
+        let parsed_gltf = parse_gltf(&json, &[&bin]).expect("text glTF should parse");
+        assert_eq!(parsed_gltf, parsed);
+    }
+
+    #[test]
+    fn obj_smoothing_groups_split_hard_normals() {
+        // Two faces meeting at 90 degrees along shared edge v1-v2
+        let obj_flat = r#"
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+v 1 0 -1
+v 1 1 -1
+s off
+f 1 2 3 4
+f 2 5 6 3
+"#;
+        let flat_mesh = parse_obj(obj_flat).expect("flat OBJ parses");
+        assert_valid_mesh(&flat_mesh, "obj_s_off");
+        // With `s off`, shared vertices on edge (1,0,0)-(1,1,0) must NOT be merged across faces
+        assert_eq!(flat_mesh.vertices.len(), 8);
+
+        let obj_two_groups = r#"
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+v 1 0 -1
+v 1 1 -1
+s 1
+f 1 2 3 4
+s 2
+f 2 5 6 3
+"#;
+        let split_mesh = parse_obj(obj_two_groups).expect("two-group OBJ parses");
+        assert_valid_mesh(&split_mesh, "obj_s_1_2");
+        assert_eq!(split_mesh.vertices.len(), 8);
+
+        let obj_same_group = r#"
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+v 1 0 -1
+v 1 1 -1
+s 1
+f 1 2 3 4
+f 2 5 6 3
+"#;
+        let smooth_mesh = parse_obj(obj_same_group).expect("same-group OBJ parses");
+        assert_valid_mesh(&smooth_mesh, "obj_s_1_same");
+        assert_eq!(smooth_mesh.vertices.len(), 6);
+    }
+
+    #[test]
+    fn voronoi_vertex_colors_and_character_ranges() {
+        let box_mesh = build_box(10.0, 10.0, 10.0);
+        let colored = apply_voronoi_fracture_with_params(
+            &box_mesh,
+            &VoronoiFractureParams {
+                cells: 6,
+                seed: 42,
+                random_colors: true,
+                distance: 1.5,
+                ..VoronoiFractureParams::default()
+            },
+            None,
+            None,
+        );
+        assert_valid_mesh(&colored, "voronoi_random_colors");
+        assert_eq!(colored.colors.len(), colored.vertices.len());
+        let first_c = colored.colors[0];
+        assert!(
+            colored.colors.iter().any(|&c| c != first_c),
+            "distinct Voronoi pieces should receive distinct vertex colors"
+        );
+        assert!(
+            colored
+                .colors
+                .iter()
+                .all(|c| c.iter().all(|&x| (0.0..=1.0).contains(&x)) && (c[3] - 1.0).abs() < 1e-6)
+        );
+
+        let uncolored = apply_voronoi_fracture_with_params(
+            &box_mesh,
+            &VoronoiFractureParams {
+                cells: 6,
+                seed: 42,
+                random_colors: false,
+                ..VoronoiFractureParams::default()
+            },
+            None,
+            None,
+        );
+        assert!(uncolored.colors.is_empty());
+
+        // Character range parsing matching Zoidium `effector-fracture-characters.js`
+        assert_eq!(
+            parse_character_ranges("1-3, 5, 8-10", 10, false),
+            vec![
+                true, true, true, false, true, false, false, true, true, true
+            ]
+        );
+        assert_eq!(
+            parse_character_ranges("1-3, 5, 8-10", 10, true),
+            vec![
+                false, false, false, true, false, true, true, false, false, false
+            ]
+        );
+        // Empty spec matches all even with invert = true
+        assert_eq!(parse_character_ranges("", 4, false), vec![true; 4]);
+        assert_eq!(parse_character_ranges("   ", 4, true), vec![true; 4]);
+        // Invalid syntax returns all false
+        assert_eq!(parse_character_ranges("0-2", 4, false), vec![false; 4]);
+        assert_eq!(parse_character_ranges("3-1", 4, false), vec![false; 4]);
+        assert_eq!(parse_character_ranges("1,,2", 4, false), vec![false; 4]);
+        assert_eq!(parse_character_ranges("abc", 4, true), vec![false; 4]);
     }
 }

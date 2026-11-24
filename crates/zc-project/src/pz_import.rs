@@ -2958,6 +2958,14 @@ fn parse_layer_masks(val: &Value) -> Vec<LayerMask> {
             .and_then(|p| p.get("closed"))
             .and_then(value_as_bool)
             .unwrap_or(false);
+        let locked = obj.get("locked").and_then(value_as_bool).unwrap_or(false);
+        let outline_color = obj
+            .get("outlineColor")
+            .or_else(|| obj.get("outline_color"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned();
         let vertex_ids: Vec<String> = obj
             .get("vertexIds")
             .and_then(Value::as_array)
@@ -2994,6 +3002,9 @@ fn parse_layer_masks(val: &Value) -> Vec<LayerMask> {
                     | "invert"
                     | "inverted"
                     | "enabled"
+                    | "locked"
+                    | "outlineColor"
+                    | "outline_color"
                     | "vertexIds"
                     | "vertexModes"
                     | "properties"
@@ -3018,6 +3029,8 @@ fn parse_layer_masks(val: &Value) -> Vec<LayerMask> {
             expansion,
             opacity,
             closed,
+            locked,
+            outline_color,
             vertex_ids,
             vertex_modes,
             path,
@@ -3622,17 +3635,21 @@ fn parse_object3d(
                     (name, [0.0, 10.0, 0.0], Object3DKind::Light(Box::new(light)))
                 }
                 Some(4) => {
-                    if obj
+                    let sprite_preset = obj
                         .get("_zoidiumParticlesPlusSprite")
                         .and_then(Value::as_str)
-                        .is_some_and(|s| !s.is_empty())
-                    {
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned);
+                    if sprite_preset.is_some() {
                         plugins.insert("particles-plus".to_owned());
                     }
+                    let mut particles = parse_particles_data(props);
+                    particles.sprite_preset = sprite_preset;
                     (
                         "Particles",
                         [0.0, 0.0, 0.0],
-                        Object3DKind::Particles(Box::new(parse_particles_data(props))),
+                        Object3DKind::Particles(Box::new(particles)),
                     )
                 }
                 Some(5) => {
@@ -3699,6 +3716,18 @@ fn parse_object3d(
                     plugins,
                     warnings,
                 ),
+                Some(13) => {
+                    plugins.insert("optical-flares".to_owned());
+                    plugin_object_type = Some("zoidium:optical-flares/flare".to_owned());
+                    (
+                        "Optical Flares",
+                        [0.0, 0.0, 0.0],
+                        Object3DKind::Dummy {
+                            original_type: Some("13".to_owned()),
+                            payload: val.clone(),
+                        },
+                    )
+                }
                 Some(99) => (
                     "3D Object",
                     [0.0, 0.0, 0.0],
@@ -3810,6 +3839,7 @@ fn parse_object3d(
                 | "zoidiumShadowMode"
                 | "frontMaterial"
                 | "sideMaterial"
+                | "_zoidiumParticlesPlusSprite"
         ) {
             out.preserved.insert(k.clone(), v.clone());
         }
@@ -3845,6 +3875,7 @@ fn parse_string_typed_object3d(
         "zoidium:geometry-plus/rounded-box" | "zoidium:geometry-plus/rounded_box" => {
             plugins.insert("geometry-plus".to_owned());
             *plugin_object_type = Some("zoidium:geometry-plus/rounded-box".to_owned());
+            preserve_animated_geometry_props(props, extra_preserved);
             let size = props
                 .and_then(|p| prop_track_vec3(p, "size"))
                 .unwrap_or([40.0, 24.0, 6.0]);
@@ -3854,6 +3885,17 @@ fn parse_string_typed_object3d(
             let segments = props
                 .and_then(|p| prop_track_f64(p, "cornerSegments"))
                 .map_or(6, |v| v.round().max(1.0) as u32);
+            let bevel_size = props
+                .and_then(|p| prop_track_f64(p, "bevelSize"))
+                .or(Some(0.6));
+            let bevel_segments = props
+                .and_then(|p| prop_track_f64(p, "bevelSegments"))
+                .map(|v| v.round().max(0.0) as u32)
+                .or(Some(2));
+            let shading = props
+                .and_then(|p| p.get("shading"))
+                .and_then(prop_track_u32_val)
+                .unwrap_or(0);
             (
                 "Rounded Box",
                 [0.0, 0.0, 0.0],
@@ -3861,12 +3903,18 @@ fn parse_string_typed_object3d(
                     size,
                     radius,
                     segments,
+                    corner_radius: Some(radius),
+                    corner_segments: Some(segments),
+                    bevel_size,
+                    bevel_segments,
+                    shading,
                 }),
             )
         }
         "zoidium:geometry-plus/polyhedron" => {
             plugins.insert("geometry-plus".to_owned());
             *plugin_object_type = Some(type_str.to_owned());
+            preserve_animated_geometry_props(props, extra_preserved);
             let shape_idx = props
                 .and_then(|p| p.get("shape"))
                 .and_then(prop_track_u32_val)
@@ -3877,18 +3925,42 @@ fn parse_string_typed_object3d(
             let detail = props
                 .and_then(|p| prop_track_f64(p, "detail"))
                 .map_or(0, |v| v.round().max(0.0) as u32);
+            let shading = props
+                .and_then(|p| p.get("shading"))
+                .and_then(prop_track_u32_val)
+                .unwrap_or(0);
             // Zoidium order: 0=tetrahedron, 1=octahedron, 2=icosahedron, 3=dodecahedron.
             let shape = match shape_idx {
-                1 => Shape3DKind::Octahedron { radius, detail },
-                2 => Shape3DKind::Icosahedron { radius, detail },
-                3 => Shape3DKind::Dodecahedron { radius, detail },
-                _ => Shape3DKind::Tetrahedron { radius, detail },
+                1 => Shape3DKind::Octahedron {
+                    radius,
+                    detail,
+                    shading,
+                },
+                2 => Shape3DKind::Icosahedron {
+                    radius,
+                    detail,
+                    shading,
+                },
+                3 => Shape3DKind::Dodecahedron {
+                    radius,
+                    detail,
+                    shading,
+                },
+                _ => Shape3DKind::Tetrahedron {
+                    radius,
+                    detail,
+                    shading,
+                },
             };
             ("Polyhedron", [0.0, 0.0, 0.0], Object3DKind::Shape3D(shape))
         }
         "zoidium:geometry-plus/cone" => {
             plugins.insert("geometry-plus".to_owned());
             *plugin_object_type = Some(type_str.to_owned());
+            preserve_animated_geometry_props(props, extra_preserved);
+            let top_radius = props
+                .and_then(|p| prop_track_f64(p, "topRadius"))
+                .unwrap_or(0.0);
             let radius = props
                 .and_then(|p| prop_track_f64(p, "bottomRadius"))
                 .unwrap_or(16.0);
@@ -3903,6 +3975,10 @@ fn parse_string_typed_object3d(
                 .and_then(|p| p.get("endCaps"))
                 .and_then(prop_track_u32_val)
                 .unwrap_or(0);
+            let shading = props
+                .and_then(|p| p.get("shading"))
+                .and_then(prop_track_u32_val)
+                .unwrap_or(0);
             (
                 "Cone",
                 [0.0, 0.0, 0.0],
@@ -3911,12 +3987,15 @@ fn parse_string_typed_object3d(
                     height,
                     detail,
                     open_ended: end_caps != 0,
+                    top_radius,
+                    shading,
                 }),
             )
         }
         "zoidium:geometry-plus/capsule" => {
             plugins.insert("geometry-plus".to_owned());
             *plugin_object_type = Some(type_str.to_owned());
+            preserve_animated_geometry_props(props, extra_preserved);
             let radius = props
                 .and_then(|p| prop_track_f64(p, "radius"))
                 .unwrap_or(8.0);
@@ -3930,6 +4009,10 @@ fn parse_string_typed_object3d(
             let radial_segments = props
                 .and_then(|p| prop_track_f64(p, "radialSegments"))
                 .map_or(16, |v| v.round().max(3.0) as u32);
+            let shading = props
+                .and_then(|p| p.get("shading"))
+                .and_then(prop_track_u32_val)
+                .unwrap_or(0);
             (
                 "Capsule",
                 [0.0, 0.0, 0.0],
@@ -3938,23 +4021,270 @@ fn parse_string_typed_object3d(
                     length,
                     cap_segments,
                     radial_segments,
+                    shading,
                 }),
             )
         }
-        "zoidium:geometry-plus/tube"
-        | "zoidium:geometry-plus/gear"
-        | "zoidium:geometry-plus/helix"
-        | "zoidium:geometry-plus/spline" => {
+        "zoidium:geometry-plus/tube" => {
             plugins.insert("geometry-plus".to_owned());
             *plugin_object_type = Some(type_str.to_owned());
+            preserve_animated_geometry_props(props, extra_preserved);
+            let outer_radius = props
+                .and_then(|p| prop_track_f64(p, "outerRadius"))
+                .unwrap_or(12.0);
+            let inner_radius = props
+                .and_then(|p| prop_track_f64(p, "innerRadius"))
+                .unwrap_or(8.0);
+            let height = props
+                .and_then(|p| prop_track_f64(p, "height"))
+                .unwrap_or(24.0);
+            let radial_segments = props
+                .and_then(|p| prop_track_f64(p, "radialSegments"))
+                .map_or(24, |v| v.round().max(3.0) as u32);
+            let end_caps = props
+                .and_then(|p| p.get("endCaps"))
+                .and_then(prop_track_u32_val)
+                .unwrap_or(0);
+            let shading = props
+                .and_then(|p| p.get("shading"))
+                .and_then(prop_track_u32_val)
+                .unwrap_or(0);
+            (
+                "Tube",
+                [0.0, 0.0, 0.0],
+                Object3DKind::Shape3D(Shape3DKind::Tube {
+                    outer_radius,
+                    inner_radius,
+                    height,
+                    radial_segments,
+                    open_ended: end_caps != 0,
+                    shading,
+                }),
+            )
+        }
+        "zoidium:geometry-plus/gear" => {
+            plugins.insert("geometry-plus".to_owned());
+            *plugin_object_type = Some(type_str.to_owned());
+            preserve_animated_geometry_props(props, extra_preserved);
+            let teeth = props
+                .and_then(|p| prop_track_f64(p, "teeth"))
+                .map_or(12, |v| v.round().clamp(3.0, 64.0) as u32);
+            let inner_radius = props
+                .and_then(|p| prop_track_f64(p, "innerRadius"))
+                .unwrap_or(10.0);
+            let outer_radius = props
+                .and_then(|p| prop_track_f64(p, "outerRadius"))
+                .unwrap_or(16.0);
+            let thickness = props
+                .and_then(|p| prop_track_f64(p, "thickness"))
+                .unwrap_or(6.0);
+            let tooth_width = props
+                .and_then(|p| prop_track_f64(p, "toothWidth"))
+                .unwrap_or(0.55);
+            let bevel_size = props
+                .and_then(|p| prop_track_f64(p, "bevelSize"))
+                .unwrap_or(0.3);
+            let bevel_segments = props
+                .and_then(|p| prop_track_f64(p, "bevelSegments"))
+                .map_or(2, |v| v.round().max(0.0) as u32);
+            let shading = props
+                .and_then(|p| p.get("shading"))
+                .and_then(prop_track_u32_val)
+                .unwrap_or(0);
+            (
+                "Gear",
+                [0.0, 0.0, 0.0],
+                Object3DKind::Shape3D(Shape3DKind::Gear {
+                    teeth,
+                    inner_radius,
+                    outer_radius,
+                    thickness,
+                    tooth_width,
+                    bevel_size,
+                    bevel_segments,
+                    shading,
+                }),
+            )
+        }
+        "zoidium:geometry-plus/helix" => {
+            plugins.insert("geometry-plus".to_owned());
+            *plugin_object_type = Some(type_str.to_owned());
+            preserve_animated_geometry_props(props, extra_preserved);
+            let radius = props
+                .and_then(|p| prop_track_f64(p, "radius"))
+                .unwrap_or(14.0);
+            let height = props
+                .and_then(|p| prop_track_f64(p, "height"))
+                .unwrap_or(32.0);
+            let turns = props
+                .and_then(|p| prop_track_f64(p, "turns"))
+                .unwrap_or(3.0);
+            let tube_radius = props
+                .and_then(|p| prop_track_f64(p, "tubeRadius"))
+                .unwrap_or(2.0);
+            let path_segments = props
+                .and_then(|p| prop_track_f64(p, "pathSegments"))
+                .map_or(64, |v| v.round().max(8.0) as u32);
+            let radial_segments = props
+                .and_then(|p| prop_track_f64(p, "radialSegments"))
+                .map_or(8, |v| v.round().max(3.0) as u32);
+            let shading = props
+                .and_then(|p| p.get("shading"))
+                .and_then(prop_track_u32_val)
+                .unwrap_or(0);
+            (
+                "Helix",
+                [0.0, 0.0, 0.0],
+                Object3DKind::Shape3D(Shape3DKind::Helix {
+                    radius,
+                    height,
+                    turns,
+                    tube_radius,
+                    path_segments,
+                    radial_segments,
+                    shading,
+                }),
+            )
+        }
+        "zoidium:geometry-plus/spline" => {
+            plugins.insert("geometry-plus".to_owned());
+            *plugin_object_type = Some(type_str.to_owned());
+            preserve_animated_geometry_props(props, extra_preserved);
+            let default_pts: [[f64; 3]; 3] =
+                [[-20.0, 0.0, 0.0], [0.0, 20.0, 0.0], [20.0, 0.0, 0.0]];
+            let point_count = props
+                .and_then(|p| prop_track_f64(p, "points"))
+                .map_or(3, |v| v.round().clamp(2.0, 32.0) as usize);
+            let mut points = Vec::with_capacity(point_count);
+            for idx in 1..=point_count {
+                let fallback = default_pts.get(idx - 1).copied().unwrap_or([0.0, 0.0, 0.0]);
+                let pt = props
+                    .and_then(|p| prop_track_vec3(p, &format!("point{idx}")))
+                    .unwrap_or(fallback);
+                points.push(pt);
+            }
+            let interpolation = props
+                .and_then(|p| prop_str(p, "interpolation"))
+                .unwrap_or_else(|| "Cubic".to_owned());
+            let closed = props
+                .and_then(|p| p.get("closed"))
+                .and_then(prop_track_u32_val)
+                .unwrap_or(0)
+                != 0;
+            let start = props
+                .and_then(|p| prop_track_f64(p, "start"))
+                .unwrap_or(0.0);
+            let end = props.and_then(|p| prop_track_f64(p, "end")).unwrap_or(1.0);
+            let thickness = props
+                .and_then(|p| prop_track_f64(p, "thickness"))
+                .unwrap_or(2.0);
+            let thickness_map = props
+                .and_then(|p| p.get("thicknessMap"))
+                .map(parse_gradient_stops)
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(GradientStop::white_default);
+            let gradient_space = props
+                .and_then(|p| prop_str(p, "gradientSpace"))
+                .unwrap_or_else(|| "Curve".to_owned());
+            let tension = props
+                .and_then(|p| prop_track_f64(p, "tension"))
+                .unwrap_or(1.0);
+            let path_segments = props
+                .and_then(|p| prop_track_f64(p, "pathSegments"))
+                .map_or(16, |v| v.round().max(1.0) as u32);
+            let radial_segments = props
+                .and_then(|p| prop_track_f64(p, "radialSegments"))
+                .map_or(8, |v| v.round().max(3.0) as u32);
+            let caps = props
+                .and_then(|p| prop_str(p, "caps"))
+                .unwrap_or_else(|| "Both".to_owned());
+            let cap_style = props
+                .and_then(|p| prop_str(p, "capStyle"))
+                .unwrap_or_else(|| "Flat".to_owned());
+            let shading = props
+                .and_then(|p| p.get("shading"))
+                .and_then(prop_track_u32_val)
+                .unwrap_or(0);
+            (
+                "Spline",
+                [0.0, 0.0, 0.0],
+                Object3DKind::Shape3D(Shape3DKind::Spline {
+                    points,
+                    interpolation,
+                    closed,
+                    start,
+                    end,
+                    thickness,
+                    thickness_map,
+                    gradient_space,
+                    tension,
+                    path_segments,
+                    radial_segments,
+                    caps,
+                    cap_style,
+                    shading,
+                }),
+            )
+        }
+        // --- ExpressText+ (12 container/effector classes) ---
+        "zoidium:expresstext-plus/expresstext"
+        | "zoidium:expresstext-plus/shake"
+        | "zoidium:expresstext-plus/plain"
+        | "zoidium:expresstext-plus/random"
+        | "zoidium:expresstext-plus/formula"
+        | "zoidium:expresstext-plus/delay"
+        | "zoidium:expresstext-plus/spline"
+        | "zoidium:expresstext-plus/orbit"
+        | "zoidium:expresstext-plus/repeater"
+        | "zoidium:expresstext-plus/twist"
+        | "zoidium:expresstext-plus/wrap"
+        | "zoidium:expresstext-plus/voronoi" => {
+            plugins.insert("expresstext-plus".to_owned());
+            *plugin_object_type = Some(type_str.to_owned());
+            let custom_properties = parse_custom_properties(obj.get("customProperties"));
+            let mut children = Vec::new();
+            if let Some(arr) = obj.get("objects").and_then(Value::as_array) {
+                for child in arr {
+                    children.push(parse_object3d(child, plugins, warnings));
+                }
+            }
+            if let Some(ep) = obj.get("expressProperties") {
+                extra_preserved.insert("expressProperties".to_owned(), ep.clone());
+            }
+            if let Some(lm) = obj.get("lettersMode") {
+                extra_preserved.insert("lettersMode".to_owned(), lm.clone());
+            }
             let label = match type_str {
-                "zoidium:geometry-plus/tube" => "Tube",
-                "zoidium:geometry-plus/gear" => "Gear",
-                "zoidium:geometry-plus/helix" => "Helix",
-                _ => "Spline",
+                "zoidium:expresstext-plus/expresstext" => "ExpressText+",
+                "zoidium:expresstext-plus/shake" => "Shake",
+                "zoidium:expresstext-plus/plain" => "Plain",
+                "zoidium:expresstext-plus/random" => "Random",
+                "zoidium:expresstext-plus/formula" => "Formula",
+                "zoidium:expresstext-plus/delay" => "Delay",
+                "zoidium:expresstext-plus/spline" => "Spline",
+                "zoidium:expresstext-plus/orbit" => "Orbit",
+                "zoidium:expresstext-plus/repeater" => "Repeater",
+                "zoidium:expresstext-plus/twist" => "Twist",
+                "zoidium:expresstext-plus/wrap" => "Wrap",
+                "zoidium:expresstext-plus/voronoi" => "Voronoi",
+                _ => "ExpressText+",
             };
             (
                 label,
+                [0.0, 0.0, 0.0],
+                Object3DKind::Group {
+                    reflection_visibility: 0,
+                    custom_properties,
+                    children,
+                },
+            )
+        }
+        // --- Optical Flares ---
+        "zoidium:optical-flares/flare" | "zoidium:optical-flares/optflares" => {
+            plugins.insert("optical-flares".to_owned());
+            *plugin_object_type = Some("zoidium:optical-flares/flare".to_owned());
+            (
+                "Optical Flares",
                 [0.0, 0.0, 0.0],
                 Object3DKind::Dummy {
                     original_type: Some(type_str.to_owned()),
@@ -4043,11 +4373,14 @@ fn parse_string_typed_object3d(
                 },
             )
         }
-        // --- Trapcode Suite (8 lights + 3 other 3D objects) ---
-        s if s.starts_with("zoidium:trapcode-suite/") => {
+        // --- Trapcode Suite (8 lights + 3 other 3D objects, accepting both `trapcode-suite/` and `trapcode/`) ---
+        s if s.starts_with("zoidium:trapcode-suite/") || s.starts_with("zoidium:trapcode/") => {
             plugins.insert("trapcode-suite".to_owned());
             *plugin_object_type = Some(s.to_owned());
-            let sub = s.trim_start_matches("zoidium:trapcode-suite/");
+            let sub = s
+                .strip_prefix("zoidium:trapcode-suite/")
+                .or_else(|| s.strip_prefix("zoidium:trapcode/"))
+                .unwrap_or(s);
             let light_sub_type = match sub {
                 "spot-light" => Some((1u32, "Spot Light")),
                 "point-light" => Some((2, "Point Light")),
@@ -4085,8 +4418,14 @@ fn parse_string_typed_object3d(
                         children.push(parse_object3d(child, plugins, warnings));
                     }
                 }
+                let label = match sub {
+                    "particular" => "Particular",
+                    "form" => "Form",
+                    "plexus" => "Plexus",
+                    _ => "Plugin Group",
+                };
                 (
-                    "Plugin Group",
+                    label,
                     [0.0, 0.0, 0.0],
                     Object3DKind::Group {
                         reflection_visibility: 0,
@@ -4095,8 +4434,14 @@ fn parse_string_typed_object3d(
                     },
                 )
             } else {
+                let label = match sub {
+                    "particular" => "Particular",
+                    "form" => "Form",
+                    "plexus" => "Plexus",
+                    _ => "3D Object",
+                };
                 (
-                    "3D Object",
+                    label,
                     [0.0, 0.0, 0.0],
                     Object3DKind::Dummy {
                         original_type: Some(s.to_owned()),
@@ -4145,6 +4490,53 @@ fn parse_string_typed_object3d(
                     },
                 )
             }
+        }
+    }
+}
+
+fn is_animated_pz_track_value(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    if obj.get("animated").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if obj
+        .get("expression")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return true;
+    }
+    if obj
+        .get("keyframes")
+        .and_then(Value::as_array)
+        .is_some_and(|kfs| kfs.len() > 1)
+    {
+        return true;
+    }
+    if let Some(channels) = obj.get("objects").and_then(Value::as_array) {
+        return channels.iter().any(is_animated_pz_track_value);
+    }
+    false
+}
+
+fn preserve_animated_geometry_props(
+    props: Option<&Map<String, Value>>,
+    extra_preserved: &mut BTreeMap<String, Value>,
+) {
+    let Some(p) = props else {
+        return;
+    };
+    for (k, v) in p {
+        if matches!(
+            k.as_str(),
+            "name" | "enabled" | "position" | "rotation" | "scale" | "eulerOrder"
+        ) {
+            continue;
+        }
+        if is_animated_pz_track_value(v) {
+            extra_preserved.insert(format!("property.{k}"), v.clone());
         }
     }
 }
@@ -7893,7 +8285,8 @@ mod tests {
             objects[3].kind,
             Object3DKind::Shape3D(Shape3DKind::Icosahedron {
                 radius: 15.0,
-                detail: 1
+                detail: 1,
+                ..
             })
         ));
         let Some(MaterialSpec::CustomPbr(ref uvc)) = objects[3].material else {
@@ -8072,13 +8465,34 @@ mod tests {
                 radius: 6.0,
                 length: 18.0,
                 cap_segments: 10,
-                radial_segments: 20
+                radial_segments: 20,
+                ..
             })
         ));
-        // Tube preserves its material cleanly without dropping it.
+        // Tube, Gear, Helix, Spline all import natively as Shape3D (never Dummy!) and preserve material.
+        assert!(matches!(
+            objects[2].kind,
+            Object3DKind::Shape3D(Shape3DKind::Tube {
+                outer_radius: 12.0,
+                inner_radius: 8.0,
+                ..
+            })
+        ));
         assert!(matches!(
             objects[2].material,
             Some(MaterialSpec::SingleColor { .. })
+        ));
+        assert!(matches!(
+            objects[3].kind,
+            Object3DKind::Shape3D(Shape3DKind::Gear { teeth: 12, .. })
+        ));
+        assert!(matches!(
+            objects[4].kind,
+            Object3DKind::Shape3D(Shape3DKind::Helix { .. })
+        ));
+        assert!(matches!(
+            objects[5].kind,
+            Object3DKind::Shape3D(Shape3DKind::Spline { ref points, .. }) if points.len() == 3
         ));
 
         // Verify rebase_time_curve_for_clipped_prefix respects Hold (tween=0) & EaseIn (tween=2).
