@@ -61,6 +61,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run workspace tests
+        env:
+          ZOIDCRAFT_REQUIRE_GPU: "1"
         run: cargo test --locked --workspace
       - name: Build binaries
         run: cargo build --locked --bin zoidcraft --bin zoidcraft-cli
