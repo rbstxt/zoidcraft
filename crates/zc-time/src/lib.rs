@@ -1,6 +1,8 @@
 //! Temporal primitives for ZoidCraft: frame rates, sub-frame timestamps,
 //! high-precision integer ticks, CM3 timecode formatting/parsing, and audio sample timing.
 
+#![forbid(unsafe_code)]
+
 use std::fmt;
 use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 

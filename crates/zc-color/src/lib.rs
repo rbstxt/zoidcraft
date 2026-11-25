@@ -1,6 +1,8 @@
 //! Color primitives, color-space conversions (sRGB, linear RGB, HSL, HSV, OKLab),
 //! WCAG 2.x contrast calculations, CM3 theme derivation, and all 43 CM3 premultiplied blend modes.
 
+#![forbid(unsafe_code)]
+
 use std::fmt;
 
 use bytemuck::{Pod, Zeroable};

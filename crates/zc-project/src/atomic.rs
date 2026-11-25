@@ -70,7 +70,10 @@ fn create_unique_sibling(target: &Path) -> Result<(File, PathBuf), ProjectError>
     } else {
         truncated
     };
+    #[cfg(not(target_arch = "wasm32"))]
     let pid = std::process::id();
+    #[cfg(target_arch = "wasm32")]
+    let pid = 0_u32;
 
     for _ in 0..16 {
         let candidate = parent.join(format!(".{base_name}.{pid}.{}.tmp", Uuid::new_v4()));

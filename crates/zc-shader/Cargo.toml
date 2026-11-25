@@ -9,7 +9,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-zc-project = { workspace = true }
 naga = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

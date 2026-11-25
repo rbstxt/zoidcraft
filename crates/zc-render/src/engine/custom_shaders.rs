@@ -205,7 +205,7 @@ impl ProjectRenderEngine {
                         multiview_mask: None,
                         cache: None,
                     });
-            if let Some(err) = pollster::block_on(scope.pop()) {
+            if let Some(err) = crate::context::pop_validation_error(scope) {
                 self.targets.release(source);
                 return Err(RenderError::Shader(format!(
                     "GPU validation error compiling custom shader: {err}"

@@ -3916,9 +3916,6 @@ name = "zc-anim"
 version = "0.2.5"
 dependencies = [
  "serde",
- "zc-color",
- "zc-geom",
- "zc-time",
 ]
 
 [[package]]
@@ -3926,11 +3923,13 @@ name = "zc-audio"
 version = "0.2.5"
 dependencies = [
  "cpal",
+ "js-sys",
  "symphonia",
  "thiserror 2.0.21",
  "tracing",
+ "wasm-bindgen",
+ "web-time",
  "zc-project",
- "zc-time",
 ]
 
 [[package]]
@@ -3949,9 +3948,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "zc-audio",
- "zc-project",
  "zc-render",
- "zc-time",
 ]
 
 [[package]]
@@ -3961,15 +3958,12 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "zc-geom",
- "zc-time",
 ]
 
 [[package]]
 name = "zc-geom"
 version = "0.2.5"
 dependencies = [
- "bytemuck",
  "glam",
  "serde",
 ]
@@ -3993,9 +3987,7 @@ dependencies = [
  "tar",
  "thiserror 2.0.21",
  "uuid",
- "zc-color",
- "zc-geom",
- "zc-time",
+ "web-time",
 ]
 
 [[package]]
@@ -4004,20 +3996,23 @@ version = "0.2.5"
 dependencies = [
  "bytemuck",
  "image",
+ "js-sys",
  "pollster",
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
  "wgpu",
  "zc-anim",
- "zc-color",
  "zc-expr",
  "zc-geom",
  "zc-plugin",
  "zc-project",
  "zc-scene",
  "zc-shader",
- "zc-time",
 ]
 
 [[package]]
@@ -4028,11 +4023,7 @@ dependencies = [
  "lyon_tessellation",
  "thiserror 2.0.21",
  "ttf-parser",
- "zc-anim",
- "zc-color",
  "zc-geom",
- "zc-project",
- "zc-time",
 ]
 
 [[package]]
@@ -4043,14 +4034,10 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "zc-anim",
- "zc-audio",
- "zc-export",
  "zc-expr",
  "zc-plugin",
  "zc-project",
  "zc-render",
- "zc-scene",
- "zc-time",
 ]
 
 [[package]]
@@ -4061,7 +4048,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "zc-project",
 ]
 
 [[package]]
@@ -4128,7 +4114,6 @@ dependencies = [
  "zc-scene",
  "zc-session",
  "zc-shader",
- "zc-time",
 ]
 
 [[package]]
@@ -4147,7 +4132,6 @@ dependencies = [
  "zc-project",
  "zc-render",
  "zc-session",
- "zc-time",
 ]
 
 [[package]]

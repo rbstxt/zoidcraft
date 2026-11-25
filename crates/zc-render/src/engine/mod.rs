@@ -7,8 +7,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f32::consts::{PI, TAU};
 use std::num::NonZeroU64;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Mutex, OnceLock};
 
 use image::AnimationDecoder;
 use tracing::{debug, warn};
@@ -116,6 +119,13 @@ use mesh_builders::*;
 use raster_2d::*;
 use scene3d_graph::*;
 use scene3d_pass::*;
+
+/// Computes the key passed to the WebCodecs bridge for a project video asset.
+#[cfg(target_arch = "wasm32")]
+#[must_use]
+pub fn web_video_asset_hash(record: &zc_project::AssetRecord) -> u64 {
+    hash_asset_record(record)
+}
 
 /// Built-in OFL TrueType fallback font (`Geist-Regular.ttf`) used for 3D Text and 2D Text
 /// when the referenced font preset/asset key is not embedded in `project.assets`.
@@ -774,6 +784,32 @@ impl ProjectRenderEngine {
     ) -> Result<Vec<u8>, RenderError> {
         let transparent = self.transparent_background;
         self.render_frame_rgba8_transparent(project, plugins, frame, width, height, transparent)
+    }
+
+    /// Renders `project` at `frame` and reads back tightly packed RGBA8 pixels.
+    pub async fn render_frame_rgba8_async(
+        &mut self,
+        project: &Project,
+        plugins: &PluginRegistry,
+        frame: f64,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, RenderError> {
+        self.ctx.validate_rgba8_readback_dimensions(width, height)?;
+        self.render_frame_to_texture_internal(
+            project,
+            plugins,
+            frame,
+            width,
+            height,
+            None,
+            self.transparent_background,
+        )?;
+        let target = self
+            .output_target
+            .as_ref()
+            .ok_or_else(|| RenderError::Effect("output target missing after render".into()))?;
+        crate::readback_rgba8_async(&self.ctx, target).await
     }
 
     /// Renders `project` at `frame` with explicit `transparent_background` override and

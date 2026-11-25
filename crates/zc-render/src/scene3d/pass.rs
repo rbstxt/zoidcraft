@@ -555,6 +555,9 @@ impl Scene3DRenderer {
             && dof_active.is_none()
             && ext.optical_flares.is_empty()
             && color_target.format == wgpu::TextureFormat::Rgba8Unorm;
+        // WebGL2 can restrict the sample counts supported by Depth32Float.
+        #[cfg(target_arch = "wasm32")]
+        let use_msaa = use_msaa && ctx.device.adapter_info().backend != wgpu::Backend::Gl;
         let sample_count = if use_msaa { SCENE_MSAA_SAMPLE_COUNT } else { 1 };
         if use_msaa {
             self.ensure_msaa_attachments(ctx, color_target.width, color_target.height);
@@ -1339,8 +1342,9 @@ impl Scene3DRenderer {
                 label: Some("zc-render custom 3d material wgsl"),
                 source: wgpu::ShaderSource::Wgsl(Cow::Owned(full_src)),
             });
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        if let Some(err) = pollster::block_on(scope.pop()) {
+        if let Some(err) = crate::context::pop_validation_error(scope) {
             return Err(RenderError::Shader(format!(
                 "custom 3D material '{key}' compilation failed: {err}"
             )));
@@ -1478,8 +1482,9 @@ impl Scene3DRenderer {
                 label: Some("zc-render glsl custom 3d frag wgsl"),
                 source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(&compiled.wgsl)),
             });
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        if let Some(err) = pollster::block_on(scope.pop()) {
+        if let Some(err) = crate::context::pop_validation_error(scope) {
             return Err(RenderError::Shader(format!(
                 "GLSL custom 3D material '{key}' compilation failed: {err}"
             )));
@@ -1751,8 +1756,9 @@ impl Scene3DRenderer {
                 multiview_mask: None,
                 cache: None,
             });
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        if let Some(err) = pollster::block_on(scope.pop()) {
+        if let Some(err) = crate::context::pop_validation_error(scope) {
             return Err(RenderError::Shader(format!(
                 "GLSL custom 3D material '{}' pipeline failed: {err}",
                 key.shader_key
@@ -2020,8 +2026,9 @@ impl Scene3DRenderer {
                 multiview_mask: None,
                 cache: None,
             });
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        if let Some(err) = pollster::block_on(scope.pop()) {
+        if let Some(err) = crate::context::pop_validation_error(scope) {
             return Err(RenderError::Shader(format!(
                 "custom 3D material '{}' pipeline error: {err}",
                 key.shader_key

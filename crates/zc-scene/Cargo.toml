@@ -9,11 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-zc-time = { workspace = true }
 zc-geom = { workspace = true }
-zc-color = { workspace = true }
-zc-anim = { workspace = true }
-zc-project = { workspace = true }
 ttf-parser = { workspace = true }
 lyon_tessellation = { workspace = true }
 bytemuck = { workspace = true }

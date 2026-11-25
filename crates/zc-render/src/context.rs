@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use thiserror::Error;
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::{debug, warn};
 
 /// Default pooled GPU render-target memory budget (256 MiB per Spec 04 §5.1).
@@ -32,6 +33,35 @@ pub enum RenderError {
     Effect(String),
 }
 
+/// Returns validation errors when the backend can deliver them synchronously.
+pub(crate) fn pop_validation_error(scope: wgpu::ErrorScopeGuard) -> Option<wgpu::Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        pollster::block_on(scope.pop())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let mut validation = Box::pin(scope.pop());
+        match validation
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(error) => error,
+            Poll::Pending => {
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Some(error) = validation.await {
+                        tracing::warn!("GPU shader validation failed: {error}");
+                    }
+                });
+                None
+            }
+        }
+    }
+}
+
 /// Shared handle to a `wgpu` device and command queue.
 ///
 /// Supports both standalone headless execution (CLI / tests / offline export)
@@ -46,9 +76,17 @@ impl GpuContext {
     /// Creates a headless GPU context, falling back to a software adapter when
     /// no hardware GPU is available (e.g. headless CI runners).
     pub fn new_headless() -> Result<Self, RenderError> {
-        pollster::block_on(Self::new_headless_async())
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pollster::block_on(Self::new_headless_async())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(RenderError::NoAdapter("use from_shared on wasm32".into()))
+        }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn new_headless_async() -> Result<Self, RenderError> {
         let instance = wgpu::Instance::default();
 
@@ -593,122 +631,248 @@ pub fn readback_rgba8(
 /// Reads back an 8-bit 4-channel render target into tightly packed RGBA8 bytes,
 /// reusing a caller-owned `MAP_READ` staging buffer across frames when its capacity
 /// is sufficient.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn readback_rgba8_with_staging(
     ctx: &GpuContext,
     target: &RenderTarget,
     staging_slot: &mut Option<(wgpu::Buffer, u64)>,
     out: &mut Vec<u8>,
 ) -> Result<(), RenderError> {
-    let (padded_bytes_per_row, staging_size, _) =
-        ctx.validate_rgba8_readback_dimensions(target.width, target.height)?;
-
-    let swap_rb = match target.format {
-        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => false,
-        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => true,
-        other => return Err(RenderError::UnsupportedFormat(other)),
-    };
-
+    let layout = Rgba8Readback::new(ctx, target)?;
     let needs_alloc = staging_slot
         .as_ref()
-        .is_none_or(|(_, cap)| *cap < staging_size);
+        .is_none_or(|(_, cap)| *cap < layout.size);
     if needs_alloc {
-        let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("zc-render rgba8 readback staging"),
-            size: staging_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        *staging_slot = Some((buf, staging_size));
+        *staging_slot = Some((layout.create_staging(ctx), layout.size));
     }
-
     let staging = &staging_slot.as_ref().expect("staging buffer allocated").0;
+    layout.submit_copy(ctx, target, staging);
 
-    let mut encoder = ctx
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("zc-render rgba8 readback encoder"),
-        });
-
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture: &target.texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: staging,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(padded_bytes_per_row),
-                rows_per_image: Some(target.height),
-            },
-        },
-        wgpu::Extent3d {
-            width: target.width,
-            height: target.height,
-            depth_or_array_layers: 1,
-        },
-    );
-
-    ctx.queue.submit(std::iter::once(encoder.finish()));
-
-    let slice = staging.slice(0..staging_size);
     let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = tx.send(res);
-    });
+    staging
+        .slice(0..layout.size)
+        .map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
 
     if let Err(e) = ctx.device.poll(wgpu::PollType::wait_indefinitely()) {
         *staging_slot = None;
         return Err(RenderError::DevicePoll(e.to_string()));
     }
 
-    match rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            *staging_slot = None;
-            return Err(RenderError::BufferMap(e.to_string()));
-        }
-        Err(e) => {
-            *staging_slot = None;
-            return Err(RenderError::BufferMap(e.to_string()));
+    let mapped = rx
+        .recv()
+        .map_err(|e| RenderError::BufferMap(e.to_string()))
+        .and_then(|res| res.map_err(|e| RenderError::BufferMap(e.to_string())));
+    if let Err(err) = mapped {
+        *staging_slot = None;
+        return Err(err);
+    }
+
+    layout.copy_mapped(staging, out)
+}
+
+/// Synchronous GPU readback is unavailable in the browser. Use [`readback_rgba8_async`].
+#[cfg(target_arch = "wasm32")]
+pub fn readback_rgba8_with_staging(
+    _ctx: &GpuContext,
+    _target: &RenderTarget,
+    _staging_slot: &mut Option<(wgpu::Buffer, u64)>,
+    _out: &mut Vec<u8>,
+) -> Result<(), RenderError> {
+    Err(RenderError::BufferMap(
+        "use readback_rgba8_async on wasm32".into(),
+    ))
+}
+
+/// Reads a render target as tightly packed RGBA8 bytes in top-down row order.
+/// Browser implementations yield while the device maps the staging buffer.
+pub async fn readback_rgba8_async(
+    ctx: &GpuContext,
+    target: &RenderTarget,
+) -> Result<Vec<u8>, RenderError> {
+    use std::future::poll_fn;
+    use std::sync::Mutex;
+    use std::task::{Poll, Waker};
+
+    #[derive(Default)]
+    struct Mapping {
+        result: Option<Result<(), wgpu::BufferAsyncError>>,
+        waker: Option<Waker>,
+    }
+
+    let layout = Rgba8Readback::new(ctx, target)?;
+    let staging = layout.create_staging(ctx);
+    layout.submit_copy(ctx, target, &staging);
+    let mapping = Arc::new(Mutex::new(Mapping::default()));
+    let callback_mapping = Arc::clone(&mapping);
+    staging
+        .slice(0..layout.size)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let waker = {
+                let mut state = callback_mapping.lock().expect("readback mapping lock");
+                state.result = Some(result);
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+
+    #[cfg(not(target_arch = "wasm32"))]
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| RenderError::DevicePoll(e.to_string()))?;
+
+    // wgpu's WebGL2 backend needs explicit device polling. Yield a browser task
+    // between polls so the GPU can advance. Browser WebGPU delivers the callback itself.
+    #[cfg(target_arch = "wasm32")]
+    if ctx.device.adapter_info().backend == wgpu::Backend::Gl {
+        let pending = || {
+            mapping
+                .lock()
+                .expect("readback mapping lock")
+                .result
+                .is_none()
+        };
+        while pending() {
+            ctx.device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|e| RenderError::DevicePoll(e.to_string()))?;
+            if pending() {
+                yield_to_browser().await?;
+            }
         }
     }
 
-    let row_len = (target.width as usize) * 4;
-    let padded_stride = padded_bytes_per_row as usize;
-    let total_len = row_len * (target.height as usize);
-    out.clear();
-    out.reserve(total_len);
+    poll_fn(|cx| {
+        let mut state = mapping.lock().expect("readback mapping lock");
+        if let Some(result) = state.result.take() {
+            Poll::Ready(result.map_err(|e| RenderError::BufferMap(e.to_string())))
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    })
+    .await?;
 
-    let copy_res = {
-        let mapped = slice
+    let mut pixels = Vec::new();
+    layout.copy_mapped(&staging, &mut pixels)?;
+    Ok(pixels)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn yield_to_browser() -> Result<(), RenderError> {
+    use wasm_bindgen::JsCast;
+
+    let global = js_sys::global();
+    let timer = js_sys::Promise::new(&mut |resolve, reject| {
+        let result = if let Some(window) = global.dyn_ref::<web_sys::Window>() {
+            window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+        } else if let Some(worker) = global.dyn_ref::<web_sys::WorkerGlobalScope>() {
+            worker.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+        } else {
+            Err("no browser timer available".into())
+        };
+        if let Err(err) = result {
+            let _ = reject.call1(&wasm_bindgen::JsValue::UNDEFINED, &err);
+        }
+    });
+    wasm_bindgen_futures::JsFuture::from(timer)
+        .await
+        .map(|_| ())
+        .map_err(|e| RenderError::DevicePoll(format!("could not schedule GPU poll: {e:?}")))
+}
+
+struct Rgba8Readback {
+    stride: u32,
+    size: u64,
+    row_len: usize,
+    packed_len: usize,
+    swap_rb: bool,
+}
+
+impl Rgba8Readback {
+    fn new(ctx: &GpuContext, target: &RenderTarget) -> Result<Self, RenderError> {
+        let (stride, size, packed_len) =
+            ctx.validate_rgba8_readback_dimensions(target.width, target.height)?;
+        let swap_rb = match target.format {
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => false,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => true,
+            other => return Err(RenderError::UnsupportedFormat(other)),
+        };
+        Ok(Self {
+            stride,
+            size,
+            row_len: target.width as usize * 4,
+            packed_len,
+            swap_rb,
+        })
+    }
+
+    fn create_staging(&self, ctx: &GpuContext) -> wgpu::Buffer {
+        ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("zc-render rgba8 readback staging"),
+            size: self.size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn submit_copy(&self, ctx: &GpuContext, target: &RenderTarget, staging: &wgpu::Buffer) {
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zc-render rgba8 readback encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.stride),
+                    rows_per_image: Some(target.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: target.width,
+                height: target.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    fn copy_mapped(&self, staging: &wgpu::Buffer, out: &mut Vec<u8>) -> Result<(), RenderError> {
+        out.clear();
+        out.reserve(self.packed_len);
+        let padded_stride = self.stride as usize;
+        let result = staging
+            .slice(0..self.size)
             .get_mapped_range()
-            .map_err(|e| RenderError::BufferMap(e.to_string()));
-        match mapped {
-            Ok(mapped) => {
-                if !swap_rb && padded_stride == row_len {
-                    out.extend_from_slice(&mapped[..total_len]);
-                } else {
-                    for row in 0..(target.height as usize) {
-                        let start = row * padded_stride;
-                        let src_row = &mapped[start..(start + row_len)];
-                        if swap_rb {
-                            for px in src_row.as_chunks::<4>().0 {
-                                out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-                            }
-                        } else {
-                            out.extend_from_slice(src_row);
+            .map(|mapped| {
+                if !self.swap_rb && padded_stride == self.row_len {
+                    out.extend_from_slice(&mapped[..self.packed_len]);
+                    return;
+                }
+                for row in mapped.chunks_exact(padded_stride) {
+                    let src_row = &row[..self.row_len];
+                    if self.swap_rb {
+                        for px in src_row.as_chunks::<4>().0 {
+                            out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
                         }
+                    } else {
+                        out.extend_from_slice(src_row);
                     }
                 }
-                Ok(())
-            }
-            Err(err) => Err(err),
-        }
-    };
-
-    staging.unmap();
-    copy_res
+            });
+        staging.unmap();
+        result.map_err(|e| RenderError::BufferMap(e.to_string()))
+    }
 }

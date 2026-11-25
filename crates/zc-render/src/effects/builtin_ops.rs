@@ -572,7 +572,7 @@ impl EffectRegistry {
                 wgsl_source,
                 None,
             );
-            if let Some(err) = pollster::block_on(error_scope.pop()) {
+            if let Some(err) = crate::context::pop_validation_error(error_scope) {
                 return Err(EffectError::CustomShaderInvalid(err.to_string()));
             }
             self.custom_pipelines.insert(

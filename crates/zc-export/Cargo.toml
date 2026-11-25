@@ -9,10 +9,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-zc-time = { workspace = true }
-zc-project = { workspace = true }
 zc-render = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zc-audio = { workspace = true }
 image = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }

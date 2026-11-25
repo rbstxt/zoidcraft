@@ -915,6 +915,7 @@ pub(super) fn hash_text3d_and_effectors(
 
 pub(super) enum ResolvedFont<'a> {
     Borrowed(&'a [u8]),
+    #[cfg(not(target_arch = "wasm32"))]
     Owned(Arc<[u8]>),
 }
 
@@ -922,15 +923,19 @@ impl ResolvedFont<'_> {
     pub(super) fn as_slice(&self) -> &[u8] {
         match self {
             Self::Borrowed(b) => b,
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Owned(b) => b,
         }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) const MAX_SYSTEM_FONT_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) type DiskFontCache = Mutex<HashMap<PathBuf, Option<Arc<[u8]>>>>;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn load_font_file_cached(path: &Path) -> Option<Arc<[u8]>> {
     static DISK_FONT_CACHE: OnceLock<DiskFontCache> = OnceLock::new();
     let cache = DISK_FONT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -953,6 +958,7 @@ pub(super) fn load_font_file_cached(path: &Path) -> Option<Arc<[u8]>> {
     loaded
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn normalize_font_token(raw: &str) -> String {
     raw.trim()
         .to_ascii_lowercase()
@@ -961,6 +967,7 @@ pub(super) fn normalize_font_token(raw: &str) -> String {
         .collect()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn system_font_index() -> &'static [(String, PathBuf)] {
     static INDEX: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
     INDEX.get_or_init(|| {
@@ -1021,6 +1028,7 @@ pub(super) fn system_font_index() -> &'static [(String, PathBuf)] {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn resolve_system_font_by_name(font_key: &str) -> Option<Arc<[u8]>> {
     let trimmed = font_key.trim();
     if trimmed.is_empty() {
@@ -1074,6 +1082,7 @@ pub(super) fn resolve_system_font_by_name(font_key: &str) -> Option<Arc<[u8]>> {
     None
 }
 
+#[cfg(any(test, not(target_arch = "wasm32")))]
 pub(super) fn font_supports_cjk(bytes: &[u8]) -> bool {
     if font_has_missing_glyphs(bytes, "あテ中") {
         return false;
@@ -1089,6 +1098,7 @@ pub(super) fn font_supports_cjk(bytes: &[u8]) -> bool {
         .is_ok_and(|mesh| !mesh.vertices.is_empty() && !mesh.indices.is_empty())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn resolve_system_cjk_fallback_font() -> Option<Arc<[u8]>> {
     static CJK_FALLBACK: OnceLock<Option<Arc<[u8]>>> = OnceLock::new();
     CJK_FALLBACK
@@ -1136,6 +1146,11 @@ pub(super) fn resolve_system_cjk_fallback_font() -> Option<Arc<[u8]>> {
         .clone()
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(super) fn resolve_system_cjk_fallback_font() -> Option<Arc<[u8]>> {
+    None
+}
+
 pub(super) fn resolve_font_bytes<'a>(
     project: &'a Project,
     font: Option<&str>,
@@ -1176,5 +1191,12 @@ pub(super) fn resolve_font_bytes<'a>(
         _ => {}
     }
     // System font path (`.ttf`/`.otf`/`.ttc`) or installed OS font family name (cached).
-    resolve_system_font_by_name(font_key).map(ResolvedFont::Owned)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        resolve_system_font_by_name(font_key).map(ResolvedFont::Owned)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
 }

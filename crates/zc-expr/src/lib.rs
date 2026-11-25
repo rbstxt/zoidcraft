@@ -2,6 +2,8 @@
 //! ZoidCraft, supporting both Vanilla ClipMaker 3 (`ExprMode::VanillaCm3`)
 //! and Zoidium Expressions+ (`ExprMode::ExpressionsPlus`).
 
+#![forbid(unsafe_code)]
+
 pub mod ast;
 pub mod builtins;
 pub mod eval;

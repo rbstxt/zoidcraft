@@ -32,7 +32,6 @@ repository = "https://github.com/rbstxt/zoidcraft"
 
 [workspace.dependencies]
 # Workspace crates
-zc-time = { path = "crates/zc-time" }
 zc-geom = { path = "crates/zc-geom" }
 zc-color = { path = "crates/zc-color" }
 zc-anim = { path = "crates/zc-anim" }
@@ -58,6 +57,13 @@ tar = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.6", features = ["derive"] }
+
+# Browser APIs
+web-time = "1.1"
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "Storage", "Navigator", "Clipboard", "Performance", "Url", "Blob", "BlobPropertyBag", "HtmlAnchorElement", "HtmlInputElement", "FileList", "File", "console"] }
 
 # Graphics / shaders / fonts / images
 wgpu = "30.0"

@@ -8,13 +8,23 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
+#[cfg(not(target_arch = "wasm32"))]
 use cpal::SampleFormat;
+#[cfg(not(target_arch = "wasm32"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::AudioError;
-use crate::decode::{STANDARD_SAMPLE_RATE, f32_to_pcm16};
+use crate::decode::STANDARD_SAMPLE_RATE;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::decode::f32_to_pcm16;
+
+#[cfg(target_arch = "wasm32")]
+mod web;
 
 /// Maximum time (500 ms) a live CPAL stream callback may go silent before `exact_frame()`
 /// falls back to monotonic wall-clock advancement so playback never freezes on device sleep.
@@ -353,6 +363,34 @@ impl ClockShared {
         .unwrap_or_else(|| self.epoch_id.load(Ordering::Acquire))
     }
 
+    fn attach_hardware_clock(&self, sample_rate: u32) -> u64 {
+        // Anchor clock to hardware sample counter, bump epoch, and claim a unique stream ID
+        // before starting playback so re-attaching never double-counts prior samples.
+        let mut stream_id = 0_u64;
+        self.commit_update(true, |snap, wall_anchor_nanos, ctx| {
+            let mut next_id = self
+                .active_stream_id
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            if next_id == 0 {
+                next_id = self
+                    .active_stream_id
+                    .fetch_add(1, Ordering::AcqRel)
+                    .wrapping_add(1);
+            }
+            stream_id = next_id;
+            snap.anchor_exact_frame = ctx.current_frame;
+            snap.anchor_sample_count = ctx.hw_now;
+            snap.sample_rate = sample_rate;
+            snap.hardware_clock_active = true;
+            *wall_anchor_nanos = ctx.now_nanos;
+            self.last_callback_nanos
+                .store(ctx.now_nanos, Ordering::Release);
+        });
+
+        stream_id
+    }
+
     fn detach_hardware_clock(&self, expected_stream_id: u64) {
         self.try_commit_update(false, |snap, wall_anchor_nanos, ctx| {
             if self.active_stream_id.load(Ordering::Acquire) != expected_stream_id {
@@ -644,7 +682,7 @@ impl MasterPlaybackClock {
             .saturating_add(sample_frames)
     }
 
-    /// Attempts to open a live `cpal` audio output stream synchronized to this clock.
+    /// Attempts to open a live audio output stream synchronized to this clock.
     ///
     /// Gracefully returns `None` (keeping silent wall-clock fallback active) if no audio output
     /// device is available (e.g., headless servers or CI environments).
@@ -659,7 +697,7 @@ impl MasterPlaybackClock {
         }))
     }
 
-    /// Attempts to open a live `cpal` audio output stream backed by a bounded timeline window.
+    /// Attempts to open a live audio output stream backed by a bounded timeline window.
     #[must_use]
     pub fn try_start_audio_output_windowed(
         &self,
@@ -676,7 +714,7 @@ impl MasterPlaybackClock {
         }
     }
 
-    /// Opens a live `cpal` audio output stream synchronized to this clock.
+    /// Opens a live audio output stream synchronized to this clock.
     ///
     /// Dropping the returned [`AudioOutputHandle`] stops the stream, releases OS audio resources,
     /// and seamlessly transitions the clock back to wall-clock mode.
@@ -690,9 +728,10 @@ impl MasterPlaybackClock {
         }))
     }
 
-    /// Opens a live `cpal` audio output stream backed by a bounded [`AudioMixWindow`] anchored
+    /// Opens a live audio output stream backed by a bounded [`AudioMixWindow`] anchored
     /// at `window.origin_frame`, allowing arbitrarily long timelines to stream audio without
     /// exceeding the mixer sample cap.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn start_audio_output_windowed(
         &self,
         window: Option<AudioMixWindow>,
@@ -716,33 +755,7 @@ impl MasterPlaybackClock {
             ));
         }
 
-        // Anchor clock to hardware sample counter, bump epoch, and claim a unique stream ID
-        // before starting playback so re-attaching never double-counts prior samples.
-        let mut stream_id = 0_u64;
-        self.shared
-            .commit_update(true, |snap, wall_anchor_nanos, ctx| {
-                let mut next_id = self
-                    .shared
-                    .active_stream_id
-                    .fetch_add(1, Ordering::AcqRel)
-                    .wrapping_add(1);
-                if next_id == 0 {
-                    next_id = self
-                        .shared
-                        .active_stream_id
-                        .fetch_add(1, Ordering::AcqRel)
-                        .wrapping_add(1);
-                }
-                stream_id = next_id;
-                snap.anchor_exact_frame = ctx.current_frame;
-                snap.anchor_sample_count = ctx.hw_now;
-                snap.sample_rate = device_sr;
-                snap.hardware_clock_active = true;
-                *wall_anchor_nanos = ctx.now_nanos;
-                self.shared
-                    .last_callback_nanos
-                    .store(ctx.now_nanos, Ordering::Release);
-            });
+        let stream_id = self.shared.attach_hardware_clock(device_sr);
 
         let shared_cb = Arc::clone(&self.shared);
         let err_fn = |err: cpal::Error| {
@@ -781,7 +794,7 @@ impl MasterPlaybackClock {
                         cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
-                        Some(info),
+                        output_delay_secs(info),
                         data,
                         |s| s,
                     );
@@ -801,7 +814,7 @@ impl MasterPlaybackClock {
                         cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
-                        Some(info),
+                        output_delay_secs(info),
                         data,
                         f32_to_f64_sample,
                     );
@@ -821,7 +834,7 @@ impl MasterPlaybackClock {
                         cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
-                        Some(info),
+                        output_delay_secs(info),
                         data,
                         f32_to_pcm16,
                     );
@@ -841,7 +854,7 @@ impl MasterPlaybackClock {
                         cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
-                        Some(info),
+                        output_delay_secs(info),
                         data,
                         |s| ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * f32::from(u16::MAX)).round() as u16,
                     );
@@ -861,7 +874,7 @@ impl MasterPlaybackClock {
                         cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
-                        Some(info),
+                        output_delay_secs(info),
                         data,
                         f32_to_i32_sample,
                     );
@@ -881,7 +894,7 @@ impl MasterPlaybackClock {
                         cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
-                        Some(info),
+                        output_delay_secs(info),
                         data,
                         f32_to_u32_sample,
                     );
@@ -901,7 +914,7 @@ impl MasterPlaybackClock {
                         cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
-                        Some(info),
+                        output_delay_secs(info),
                         data,
                         f32_to_i8_sample,
                     );
@@ -921,7 +934,7 @@ impl MasterPlaybackClock {
                         cb_state.active_loop_head.as_deref(),
                         mix_sr,
                         ch_usize,
-                        Some(info),
+                        output_delay_secs(info),
                         data,
                         f32_to_u8_sample,
                     );
@@ -966,6 +979,7 @@ impl MasterPlaybackClock {
 }
 
 #[inline]
+#[cfg(not(target_arch = "wasm32"))]
 fn is_transient_cpal_xrun(err: &cpal::Error) -> bool {
     if err.kind() == cpal::ErrorKind::Xrun {
         return true;
@@ -974,6 +988,7 @@ fn is_transient_cpal_xrun(err: &cpal::Error) -> bool {
     msg.contains("underrun") || msg.contains("overrun")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn log_cpal_stream_error(err: &cpal::Error) {
     if is_transient_cpal_xrun(err) {
         tracing::debug!("cpal output stream transient xrun: {err}");
@@ -983,6 +998,7 @@ fn log_cpal_stream_error(err: &cpal::Error) {
 }
 
 #[inline]
+#[cfg(not(target_arch = "wasm32"))]
 fn f32_to_f64_sample(s: f32) -> f64 {
     if s.is_finite() {
         f64::from(s.clamp(-1.0, 1.0))
@@ -992,6 +1008,7 @@ fn f32_to_f64_sample(s: f32) -> f64 {
 }
 
 #[inline]
+#[cfg(not(target_arch = "wasm32"))]
 fn f32_to_i32_sample(s: f32) -> i32 {
     if !s.is_finite() {
         return 0;
@@ -1008,6 +1025,7 @@ fn f32_to_i32_sample(s: f32) -> i32 {
 }
 
 #[inline]
+#[cfg(not(target_arch = "wasm32"))]
 fn f32_to_u32_sample(s: f32) -> u32 {
     if !s.is_finite() {
         return u32::MAX / 2;
@@ -1019,6 +1037,7 @@ fn f32_to_u32_sample(s: f32) -> u32 {
 }
 
 #[inline]
+#[cfg(not(target_arch = "wasm32"))]
 fn f32_to_i8_sample(s: f32) -> i8 {
     if !s.is_finite() {
         return 0;
@@ -1033,6 +1052,7 @@ fn f32_to_i8_sample(s: f32) -> i8 {
 }
 
 #[inline]
+#[cfg(not(target_arch = "wasm32"))]
 fn f32_to_u8_sample(s: f32) -> u8 {
     if !s.is_finite() {
         return 128;
@@ -1082,13 +1102,22 @@ impl CallbackMixState {
     }
 }
 
-#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+fn output_delay_secs(info: &cpal::OutputCallbackInfo) -> f64 {
+    let timestamp = info.timestamp();
+    timestamp
+        .playback
+        .saturating_duration_since(timestamp.callback)
+        .as_secs_f64()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn render_callback_frames<T, F>(
     shared: &ClockShared,
     mix: Option<&Vec<[f32; 2]>>,
     mix_sample_rate: f64,
     channels: usize,
-    info: Option<&cpal::OutputCallbackInfo>,
+    delay_secs: f64,
     output: &mut [T],
     convert: F,
 ) where
@@ -1100,7 +1129,7 @@ fn render_callback_frames<T, F>(
         0.0,
         mix_sample_rate,
         channels,
-        info,
+        delay_secs,
         output,
         convert,
     );
@@ -1114,7 +1143,7 @@ fn render_callback_frames_windowed_with_loop_head<T, F>(
     loop_head: Option<&Vec<[f32; 2]>>,
     mix_sample_rate: f64,
     channels: usize,
-    info: Option<&cpal::OutputCallbackInfo>,
+    delay_secs: f64,
     output: &mut [T],
     convert: F,
 ) where
@@ -1207,18 +1236,8 @@ fn render_callback_frames_windowed_with_loop_head<T, F>(
         }
     }
 
-    // Derive queued hardware output latency from CPAL's playback timestamp relative to the
-    // callback time; clamp to at least one buffer period (and <= 2s) so video tracks audible
-    // output rather than leading by the queued ring buffer.
-    let reported_delay_samples = info.map_or(0, |cb| {
-        let d = cb
-            .timestamp()
-            .playback
-            .saturating_duration_since(cb.timestamp().callback);
-        (d.as_secs_f64() * f64::from(snap.sample_rate))
-            .round()
-            .max(0.0) as u64
-    });
+    // Account for samples queued for playback and bound the estimate to two seconds.
+    let reported_delay_samples = (delay_secs * f64::from(snap.sample_rate)).round().max(0.0) as u64;
     let max_reasonable_latency = u64::from(snap.sample_rate).saturating_mul(2);
     let min_latency = frame_count.min(max_reasonable_latency);
     let latency_samples = reported_delay_samples.clamp(min_latency, max_reasonable_latency);
@@ -1230,7 +1249,7 @@ fn render_callback_frames_windowed_with_loop_head<T, F>(
         .fetch_add(frame_count, Ordering::Release);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::too_many_arguments)]
 fn render_callback_frames_windowed<T, F>(
     shared: &ClockShared,
@@ -1238,7 +1257,7 @@ fn render_callback_frames_windowed<T, F>(
     mix_origin_frame: f64,
     mix_sample_rate: f64,
     channels: usize,
-    info: Option<&cpal::OutputCallbackInfo>,
+    delay_secs: f64,
     output: &mut [T],
     convert: F,
 ) where
@@ -1251,18 +1270,21 @@ fn render_callback_frames_windowed<T, F>(
         None,
         mix_sample_rate,
         channels,
-        info,
+        delay_secs,
         output,
         convert,
     );
 }
 
-/// RAII handle owning a live `cpal` output stream attached to a [`MasterPlaybackClock`].
+/// RAII handle owning a live audio output stream attached to a [`MasterPlaybackClock`].
 ///
 /// Dropping this handle cleanly detaches the clock back to wall-clock fallback mode and
 /// stops/releases the underlying OS audio stream with zero leaked resources.
 pub struct AudioOutputHandle {
+    #[cfg(not(target_arch = "wasm32"))]
     stream: Option<cpal::Stream>,
+    #[cfg(target_arch = "wasm32")]
+    stream: Option<web::WebAudioStream>,
     stream_id: u64,
     shared: Arc<ClockShared>,
     sample_rate: u32,
@@ -1274,6 +1296,28 @@ pub struct AudioOutputHandle {
 }
 
 impl AudioOutputHandle {
+    /// Opens a live output stream synchronized to `clock`.
+    pub fn start_with_window(
+        clock: &MasterPlaybackClock,
+        window: Option<AudioMixWindow>,
+    ) -> Result<Self, AudioError> {
+        clock.start_audio_output_windowed(window)
+    }
+
+    /// Returns whether this handle still owns an output stream.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// Stops the stream and returns its clock to wall-clock playback.
+    pub fn stop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            drop(stream);
+            self.shared.detach_hardware_clock(self.stream_id);
+        }
+    }
+
     /// Device output sample rate in Hz.
     #[must_use]
     pub const fn sample_rate(&self) -> u32 {
@@ -1313,15 +1357,11 @@ impl AudioOutputHandle {
 
 impl Drop for AudioOutputHandle {
     fn drop(&mut self) {
-        // Drop the CPAL stream FIRST so the audio callback thread stops before we detach.
-        drop(self.stream.take());
-        if self.shared.active_stream_id.load(Ordering::Acquire) == self.stream_id {
-            self.shared.detach_hardware_clock(self.stream_id);
-        }
+        self.stop();
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 
@@ -1418,7 +1458,7 @@ mod tests {
             Some(&mix),
             f64::from(STANDARD_SAMPLE_RATE),
             2,
-            None,
+            0.0,
             &mut out,
             |s| s,
         );
@@ -1453,7 +1493,7 @@ mod tests {
             Some(&mix),
             f64::from(STANDARD_SAMPLE_RATE),
             2,
-            None,
+            0.0,
             &mut out,
             |s| s,
         );
@@ -1475,7 +1515,7 @@ mod tests {
             Some(&mix),
             f64::from(STANDARD_SAMPLE_RATE),
             2,
-            None,
+            0.0,
             &mut fallback_out,
             |s| s,
         );
@@ -1499,7 +1539,7 @@ mod tests {
             Some(&mix),
             f64::from(STANDARD_SAMPLE_RATE),
             2,
-            None,
+            0.0,
             &mut active_out,
             |s| s,
         );
@@ -1633,7 +1673,7 @@ mod tests {
             Some(&loop_head),
             f64::from(STANDARD_SAMPLE_RATE),
             2,
-            None,
+            0.0,
             &mut out,
             |s| s,
         );

@@ -314,7 +314,7 @@ fn all_wgsl_shaders_validate_and_compile_cleanly() {
     renderer.ensure_dof_composite_pipeline(&ctx, fmt);
     renderer.ensure_optical_flare_pipeline(&ctx, fmt);
     let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-    let err = pollster::block_on(scope.pop());
+    let err = crate::context::pop_validation_error(scope);
     assert!(err.is_none(), "WGSL / pipeline validation error: {err:?}");
 }
 
@@ -381,7 +381,7 @@ fn all_scene3d_wgsl_shaders_compile_and_never_texture_load_depth_textures() {
             });
     }
     let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-    let err = pollster::block_on(scope.pop());
+    let err = crate::context::pop_validation_error(scope);
     assert!(err.is_none(), "WGSL module compilation error: {err:?}");
 }
 
@@ -762,7 +762,7 @@ fn multi_light_point_shadows_pbr_maps_and_dof_render_cleanly() {
         )
         .expect("render with multi-shadow + pbr maps + dof");
     let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-    let err = pollster::block_on(scope.pop());
+    let err = crate::context::pop_validation_error(scope);
     assert!(err.is_none(), "GPU validation error: {err:?}");
     let px = readback_rgba8(&ctx, &color);
     assert!(
@@ -1712,7 +1712,7 @@ fn dynamic_shadow_map_2048_and_shadow_modes_render_cleanly() {
     assert_eq!(renderer.shadow_map_size(), expected_size);
 
     let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-    let err = pollster::block_on(scope.pop());
+    let err = crate::context::pop_validation_error(scope);
     assert!(
         err.is_none(),
         "GPU validation error with 2048 shadow map: {err:?}"
@@ -1963,7 +1963,7 @@ fn optical_flares_render_bright_unoccluded_and_dimmed_when_depth_occluded() {
     );
 
     let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-    let err = pollster::block_on(scope.pop());
+    let err = crate::context::pop_validation_error(scope);
     assert!(err.is_none(), "Optical flare GPU validation error: {err:?}");
 }
 

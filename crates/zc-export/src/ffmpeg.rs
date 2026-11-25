@@ -4,11 +4,16 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::{Child, Command, Stdio};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 use crate::ExportError;
 use crate::settings::{AudioCodec, ExportContainer, ExportSettings, QualityMode, VideoCodec};
@@ -21,6 +26,7 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Configures `cmd` so its spawned child leads its own process group on Unix, allowing
 /// safe, complete process-tree termination on cancel or timeout.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn configure_process_group(cmd: &mut Command) {
     #[cfg(unix)]
     {
@@ -37,6 +43,7 @@ pub(crate) fn configure_process_group(cmd: &mut Command) {
 ///
 /// SAFETY INVARIANT: This MUST ONLY be called while the parent still holds an open, unreaped
 /// `Child` handle to `pid` (never after reaping), preventing PID/PGID-reuse kills on any OS.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn kill_process_tree_by_pid(pid: u32) {
     #[cfg(unix)]
     {
@@ -63,6 +70,7 @@ pub(crate) fn kill_process_tree_by_pid(pid: u32) {
 }
 
 /// Terminates the entire process tree rooted at `child` (wrapper + descendants) and reaps `child`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn kill_process_tree_and_reap(child: &mut Child) {
     kill_process_tree_by_pid(child.id());
     let _ = child.kill();
@@ -75,6 +83,7 @@ pub(crate) fn kill_process_tree_and_reap(child: &mut Child) {
 /// `ReadFileEx`, which require `CancelIoEx(pipe_handle, NULL)` on the pipe handle rather than
 /// `CancelSynchronousIo`. `live` is locked around both `CancelIoEx` and `GuardedPipe`'s drop
 /// transition before closing the OS handle, making handle-reuse races impossible.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub(crate) struct PipeCancelToken {
     #[cfg(windows)]
@@ -83,6 +92,7 @@ pub(crate) struct PipeCancelToken {
     live: Arc<std::sync::Mutex<bool>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PipeCancelToken {
     #[cfg(not(windows))]
     pub(crate) fn noop() -> Self {
@@ -185,6 +195,7 @@ impl<P: std::io::Write> std::io::Write for GuardedPipe<P> {
 /// Cooperatively aborts a worker thread and waits up to `timeout` for its completion channel,
 /// retrying Windows `CancelIoEx` on the worker's pipe handle every 10 ms so the worker always
 /// releases its descriptor/buffers and joins cleanly without signaling any reaped child PID.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn abort_and_join_worker<T, R>(
     abort: &AtomicBool,
     cancel_token: &PipeCancelToken,
@@ -235,10 +246,18 @@ pub fn resolve_ffmpeg_binary(binary: Option<&Path>) -> std::borrow::Cow<'_, Path
 
 /// Probes whether `ffmpeg` is available and returns its version banner line, enforcing
 /// bounded stdout/stderr buffering and a hard timeout so a stalled executable can never hang.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn probe_ffmpeg(binary: Option<&Path>) -> Result<String, ExportError> {
     probe_ffmpeg_with_timeout(binary, PROBE_TIMEOUT)
 }
 
+/// Reports that the FFmpeg executable cannot run in the browser.
+#[cfg(target_arch = "wasm32")]
+pub fn probe_ffmpeg(_binary: Option<&Path>) -> Result<String, ExportError> {
+    Err(crate::browser_ffmpeg_unavailable())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn probe_ffmpeg_with_timeout(
     binary: Option<&Path>,
     timeout: Duration,
@@ -914,7 +933,7 @@ impl BoundedStderrBuffer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::path::PathBuf;
 

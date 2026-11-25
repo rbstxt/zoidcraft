@@ -1,14 +1,19 @@
 //! Temporary stereo WAV staging with guaranteed RAII file cleanup on drop,
 //! cancellation, error, or panic.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::{self, File};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ExportError;
 
+#[cfg(not(target_arch = "wasm32"))]
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// RAII guard that deletes its backing file on [`Drop`], even across errors or panics,
@@ -16,6 +21,7 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub struct TempFileGuard {
     path: PathBuf,
+    #[cfg(not(target_arch = "wasm32"))]
     armed: bool,
 }
 
@@ -23,7 +29,11 @@ impl TempFileGuard {
     /// Creates a guard tracking `path` for automatic deletion on drop.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+        Self {
+            path,
+            #[cfg(not(target_arch = "wasm32"))]
+            armed: true,
+        }
     }
 
     /// Returns the path of the managed temporary file.
@@ -34,10 +44,14 @@ impl TempFileGuard {
 
     /// Disarms automatic deletion (used after atomically publishing the file to its final path).
     pub fn disarm(&mut self) {
-        self.armed = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.armed = false;
+        }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -54,6 +68,7 @@ impl Drop for TempFileGuard {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -67,6 +82,7 @@ fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
 
 /// Allocates a unique sibling temporary path in the same directory as `dest` so
 /// FFmpeg never clobbers an existing destination file prior to successful muxing.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn unique_sibling_temp_path(dest: &Path) -> PathBuf {
     let pid = std::process::id();
     let seq = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -89,6 +105,7 @@ pub(crate) fn unique_sibling_temp_path(dest: &Path) -> PathBuf {
 
 /// Writes interleaved stereo `f32` samples to a unique temporary 32-bit IEEE float WAV file
 /// and returns an RAII [`TempFileGuard`] that removes the file when dropped.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn write_temp_stereo_wav_f32(
     samples: &[[f32; 2]],
     sample_rate: u32,
@@ -177,6 +194,7 @@ pub fn write_temp_stereo_wav_f32(
     Ok(guard)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn unique_temp_wav_path() -> PathBuf {
     let pid = std::process::id();
     let seq = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -187,7 +205,16 @@ fn unique_temp_wav_path() -> PathBuf {
     std::env::temp_dir().join(format!("zoidcraft_audio_{pid}_{seq}_{nanos}.wav"))
 }
 
-#[cfg(test)]
+/// Reports that WAV staging is unavailable in the browser.
+#[cfg(target_arch = "wasm32")]
+pub fn write_temp_stereo_wav_f32(
+    _samples: &[[f32; 2]],
+    _sample_rate: u32,
+) -> Result<TempFileGuard, ExportError> {
+    Err(crate::browser_ffmpeg_unavailable())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

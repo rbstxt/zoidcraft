@@ -9,7 +9,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-zc-time = { workspace = true }
 zc-anim = { workspace = true }
 zc-plugin = { workspace = true }
 zc-project = { workspace = true }

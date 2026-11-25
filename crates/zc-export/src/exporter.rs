@@ -1,43 +1,61 @@
 //! Deadlock-free, zero-leak FFmpeg video exporter and direct PNG sequence exporter.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::{self, File};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufWriter, ErrorKind, Read, Write};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::Ordering;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
-use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 use image::codecs::png::PngEncoder;
+#[cfg(not(target_arch = "wasm32"))]
 use image::{ExtendedColorType, ImageEncoder};
 
 use crate::ExportError;
 #[cfg(windows)]
 use crate::ffmpeg::GuardedPipe;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::ffmpeg::{
     BoundedStderrBuffer, MAX_STDERR_BYTES, PipeCancelToken, abort_and_join_worker,
     build_ffmpeg_os_args_with_output, configure_process_group, kill_process_tree_and_reap,
     resolve_ffmpeg_binary,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use crate::padding::pad_rgba_frame_into;
-use crate::settings::{
-    AudioCodec, ExportContainer, ExportProgress, ExportReport, ExportSettings, FrameProvider,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::settings::{AudioCodec, ExportContainer};
+use crate::settings::{ExportProgress, ExportReport, ExportSettings, FrameProvider};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::temp_audio::{TempFileGuard, unique_sibling_temp_path, write_temp_stereo_wav_f32};
 
 /// Shared handle to a spawned FFmpeg child process that allows cooperative exit polling
 /// and cancellation killing while guaranteeing the child is always reaped (`wait()`) on
 /// drop/error/cancel/panic (zero zombies, zero leaked descriptors, zero signals after reaping).
+#[cfg(not(target_arch = "wasm32"))]
 struct ChildState {
     child: Option<Child>,
     exited: Option<ExitStatus>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct SharedChildGuard {
     state: Arc<Mutex<ChildState>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SharedChildGuard {
     fn new(child: Child) -> Self {
         Self {
@@ -104,6 +122,7 @@ impl SharedChildGuard {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for SharedChildGuard {
     fn drop(&mut self) {
         self.kill_and_reap();
@@ -125,6 +144,7 @@ where
 }
 
 /// Same as [`export_video`], invoking `on_progress` after each completed frame.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn export_video_with_progress<F, P>(
     settings: &ExportSettings,
     audio_stereo: Option<&[[f32; 2]]>,
@@ -156,6 +176,23 @@ where
     }
 }
 
+/// Reports that file-based export is unavailable in the browser.
+#[cfg(target_arch = "wasm32")]
+pub fn export_video_with_progress<F, P>(
+    _settings: &ExportSettings,
+    _audio_stereo: Option<&[[f32; 2]]>,
+    _cancel: &Arc<AtomicBool>,
+    _frame_provider: F,
+    _on_progress: P,
+) -> Result<ExportReport, ExportError>
+where
+    F: FrameProvider,
+    P: FnMut(ExportProgress),
+{
+    Err(crate::browser_ffmpeg_unavailable())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn export_wav_audio_only(
     settings: &ExportSettings,
     audio_stereo: Option<&[[f32; 2]]>,
@@ -216,6 +253,7 @@ fn export_wav_audio_only(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn export_m4a_audio_only(
     settings: &ExportSettings,
     audio_stereo: Option<&[[f32; 2]]>,
@@ -443,11 +481,13 @@ fn export_m4a_audio_only(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct TempDirGuard {
     path: std::path::PathBuf,
     armed: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl TempDirGuard {
     fn new(path: std::path::PathBuf) -> Self {
         Self { path, armed: true }
@@ -463,6 +503,7 @@ impl TempDirGuard {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -471,6 +512,7 @@ impl Drop for TempDirGuard {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn export_png_sequence<F, P>(
     settings: &ExportSettings,
     cancel: &Arc<AtomicBool>,
@@ -823,6 +865,7 @@ where
 
 /// Publishes every staged PNG frame into `dst_dir` with full rollback if any move fails,
 /// preserving pre-existing frames in `dst_dir` intact on failure.
+#[cfg(not(target_arch = "wasm32"))]
 fn publish_staged_png_directory(
     staging_dir: &Path,
     dst_dir: &Path,
@@ -890,6 +933,7 @@ fn publish_staged_png_directory(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn export_ffmpeg<F, P>(
     settings: &ExportSettings,
     audio_stereo: Option<&[[f32; 2]]>,
@@ -1541,6 +1585,7 @@ where
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn publish_temp_output(src: &Path, dst: &Path) -> Result<(), ExportError> {
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
@@ -1580,12 +1625,14 @@ fn publish_temp_output(src: &Path, dst: &Path) -> Result<(), ExportError> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn mul_div_255_round(c: u8, a: u16) -> u8 {
     let t = u16::from(c) * a + 128;
     ((t + (t >> 8)) >> 8) as u8
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn flatten_rgba_over_black_in_place(buf: &mut [u8]) {
     for px in buf.as_chunks_mut::<4>().0 {
         let a = px[3];
@@ -1604,6 +1651,7 @@ fn flatten_rgba_over_black_in_place(buf: &mut [u8]) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn checked_rgba_len(width: u32, height: u32) -> Result<usize, ExportError> {
     (width as usize)
         .checked_mul(height as usize)
@@ -1611,7 +1659,7 @@ fn checked_rgba_len(width: u32, height: u32) -> Result<usize, ExportError> {
         .ok_or_else(|| ExportError::InvalidSettings("frame dimensions overflow RGBA size".into()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::f64::consts::TAU;
     use std::path::PathBuf;

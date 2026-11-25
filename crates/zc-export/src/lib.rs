@@ -27,6 +27,11 @@ pub use temp_audio::{TempFileGuard, write_temp_stereo_wav_f32};
 
 use thiserror::Error;
 
+#[cfg(target_arch = "wasm32")]
+fn browser_ffmpeg_unavailable() -> ExportError {
+    ExportError::FfmpegNotFound("FFmpeg CLI is unavailable in browser; use WebCodecs export".into())
+}
+
 /// Errors returned by the export pipeline.
 #[derive(Debug, Error)]
 pub enum ExportError {

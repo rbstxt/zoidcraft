@@ -9,9 +9,15 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-zc-time = { workspace = true }
 zc-project = { workspace = true }
 symphonia = { workspace = true }
-cpal = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = { workspace = true }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }

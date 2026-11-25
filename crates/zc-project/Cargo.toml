@@ -9,12 +9,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-zc-time = { workspace = true }
-zc-geom = { workspace = true }
-zc-color = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { workspace = true, features = ["js"] }
+web-time = { workspace = true }

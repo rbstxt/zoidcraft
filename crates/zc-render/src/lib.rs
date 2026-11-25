@@ -17,7 +17,7 @@ pub use cache::{CachedFrame, FrameCache, FrameCacheKey};
 pub use compositor::{BlendMode, Compositor2D, LayerTransform2D, encode_png};
 pub use context::{
     DEFAULT_TARGET_POOL_MAX_BYTES, GpuContext, RenderError, RenderTarget, TargetPool,
-    f32_to_f16_bits, readback_rgba8, readback_rgba8_with_staging,
+    f32_to_f16_bits, readback_rgba8, readback_rgba8_async, readback_rgba8_with_staging,
 };
 pub use engine::*;
 pub use scene3d::{
@@ -508,6 +508,22 @@ mod tests {
 
         let err = encode_png(&[0; 3], 2, 2);
         assert!(matches!(err, Err(RenderError::InvalidBufferSize { .. })));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn async_readback_removes_row_padding() {
+        let ctx = match GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize headless GpuContext: {err}"),
+        };
+        let pixels: Vec<u8> = (0..24).collect();
+        let target = ctx
+            .create_rgba8_texture("async readback test", 3, 2, &pixels)
+            .unwrap();
+        let readback = pollster::block_on(readback_rgba8_async(&ctx, &target)).unwrap();
+        assert_eq!(readback, pixels);
     }
 
     #[test]

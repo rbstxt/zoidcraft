@@ -1,6 +1,8 @@
 //! Coordinate-system, transform, Euler rotation, camera projection, and bounding-box math
 //! for ZoidCraft (right-handed Y-up convention matching Panzoid CM3 / Three.js and wgpu `[0, 1]` Z).
 
+#![forbid(unsafe_code)]
+
 use serde::{Deserialize, Serialize};
 
 pub use glam::{Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
