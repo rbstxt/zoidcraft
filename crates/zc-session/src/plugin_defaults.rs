@@ -124,6 +124,8 @@ pub(crate) fn canonicalize_object_3d_kind(raw: &str) -> (String, Option<u32>) {
                     "linear-repeater" | "linear" => "linear-repeater",
                     "random-repeater" | "random" => "random-repeater",
                     "echo-repeater" | "echo" => "echo-repeater",
+                    "radial" | "radial-repeater" => "radial",
+                    "grid" | "grid-repeater" => "grid",
                     "twist" => "twist",
                     "warp" => "warp",
                     "voronoi-fracture" | "fracture" => "voronoi-fracture",
@@ -208,6 +210,28 @@ pub(crate) fn canonicalize_object_3d_kind(raw: &str) -> (String, Option<u32>) {
         return ("text_3d".to_owned(), None);
     }
 
+    match lower.as_str() {
+        "radial-repeater" | "radial_repeater" => {
+            return ("zoidium:repeater/radial".to_owned(), None);
+        }
+        "grid-repeater" | "grid_repeater" => {
+            return ("zoidium:repeater/grid".to_owned(), None);
+        }
+        "light" => return ("light".to_owned(), None),
+        "spotlight" | "spot-light" | "spot_light" => return ("spot_light".to_owned(), None),
+        "pointlight" | "point-light" | "point_light" => return ("point_light".to_owned(), None),
+        "directionallight" | "directional-light" | "directional_light" => {
+            return ("directional_light".to_owned(), None);
+        }
+        "hemispherelight" | "hemisphere-light" | "hemisphere_light" => {
+            return ("hemisphere_light".to_owned(), None);
+        }
+        "ambientlight" | "ambient-light" | "ambient_light" => {
+            return ("ambient_light".to_owned(), None);
+        }
+        _ => {}
+    }
+
     (trimmed.to_owned(), None)
 }
 
@@ -248,13 +272,31 @@ pub(crate) fn plugin_light_kind(kind: &str) -> Option<zc_project::LightKind> {
     None
 }
 
-/// Default Zoidium `particle-defaults.js` `ParticlesData`.
+/// Default starter `ParticlesData` with crisp, non-whiteout particle sizing and emission.
 #[must_use]
 pub(crate) fn default_particles_data() -> zc_project::ParticlesData {
     zc_project::ParticlesData {
         time: zc_project::PropertyTrack::number_with_expr(0.0, "time"),
-        color: zc_project::GradientStop::white_default(),
-        size: zc_project::GradientStop::white_default(),
+        color: vec![
+            zc_project::GradientStop {
+                position: 0.0,
+                color: "rgba(255,255,255,1.0)".to_owned(),
+            },
+            zc_project::GradientStop {
+                position: 1.0,
+                color: "rgba(255,255,255,0.0)".to_owned(),
+            },
+        ],
+        size: vec![
+            zc_project::GradientStop {
+                position: 0.0,
+                color: "rgba(14,14,14,1.0)".to_owned(),
+            },
+            zc_project::GradientStop {
+                position: 1.0,
+                color: "rgba(4,4,4,1.0)".to_owned(),
+            },
+        ],
         number: 400,
         rate: 200.0,
         lifetime: 3.0,
@@ -431,6 +473,41 @@ pub(crate) fn insert_default_repeater_properties(
             props.insert(
                 "delay".to_owned(),
                 SessionProperty::static_value(json!(5.0)),
+            );
+        }
+        "zoidium:repeater/radial" => {
+            props.insert("count".to_owned(), SessionProperty::static_value(json!(8)));
+            props.insert(
+                "radius".to_owned(),
+                SessionProperty::static_value(json!(28.0)),
+            );
+            props.insert(
+                "startAngle".to_owned(),
+                SessionProperty::static_value(json!(0.0)),
+            );
+            props.insert(
+                "endAngle".to_owned(),
+                SessionProperty::static_value(json!(360.0)),
+            );
+            props.insert(
+                "alignToCircle".to_owned(),
+                SessionProperty::static_value_with_kind(json!(1), SessionValueKind::Option),
+            );
+            props.insert(
+                "axis".to_owned(),
+                SessionProperty::static_value_with_kind(json!(2), SessionValueKind::Option),
+            );
+        }
+        "zoidium:repeater/grid" => {
+            props.insert("countX".to_owned(), SessionProperty::static_value(json!(3)));
+            props.insert("countY".to_owned(), SessionProperty::static_value(json!(3)));
+            props.insert("countZ".to_owned(), SessionProperty::static_value(json!(1)));
+            props.insert(
+                "spacing".to_owned(),
+                SessionProperty::static_value_with_kind(
+                    json!([16.0, 16.0, 16.0]),
+                    SessionValueKind::Vec3,
+                ),
             );
         }
         "zoidium:repeater/twist" => {
@@ -894,7 +971,7 @@ pub(crate) fn insert_default_trapcode_properties(
             props.insert(
                 "particleColor".to_owned(),
                 SessionProperty::static_value_with_kind(
-                    json!([0.85, 0.92, 1.0]),
+                    json!([0.40, 0.85, 1.0]),
                     SessionValueKind::Color,
                 ),
             );
@@ -988,20 +1065,249 @@ pub(crate) fn insert_default_expresstext_properties(
 ) {
     props.insert(
         "lettersMode".to_owned(),
-        SessionProperty::static_value_with_kind(json!("per_text"), SessionValueKind::Text),
+        SessionProperty::static_value_with_kind(json!("per_letter"), SessionValueKind::Text),
     );
     let sub = canonical_kind
         .strip_prefix("zoidium:expresstext-plus/")
         .unwrap_or("");
     if sub != "expresstext" && !sub.is_empty() {
         props.insert(
-            format!("{sub}Enabled"),
+            format!("{sub}Enable"),
             SessionProperty::static_value_with_kind(json!(1), SessionValueKind::Option),
         );
         props.insert(
             format!("{sub}Strength"),
-            SessionProperty::static_value(json!(1.0)),
+            SessionProperty::static_value(json!(100.0)),
         );
+        match sub {
+            "shake" => {
+                props.insert(
+                    "shakePosition".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([2.0, 4.0, 0.0]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "shakeRotation".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([0.0, 0.0, 0.15]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "shakeFrequency".to_owned(),
+                    SessionProperty::static_value(json!(2.0)),
+                );
+            }
+            "plain" => {
+                props.insert(
+                    "plainPosition".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([0.0, 6.0, 0.0]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "plainRotation".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([0.0, 0.25, 0.0]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "plainScale".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([1.15, 1.15, 1.15]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+            }
+            "random" => {
+                props.insert(
+                    "randomMode".to_owned(),
+                    SessionProperty::static_value_with_kind(json!(2), SessionValueKind::Option),
+                );
+                props.insert(
+                    "randomPosition".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([6.0, 6.0, 3.0]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "randomPositionMin".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([-6.0, -6.0, -3.0]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "randomPositionMax".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([6.0, 6.0, 3.0]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "randomRotation".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([0.25, 0.25, 0.25]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "randomRotationMin".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([-0.25, -0.25, -0.25]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "randomRotationMax".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([0.25, 0.25, 0.25]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "randomAnimationSpeed".to_owned(),
+                    SessionProperty::static_value(json!(100.0)),
+                );
+            }
+            "formula" => {
+                props.insert(
+                    "formulaPosition".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([0.0, 10.0, 0.0]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "formulaExpression".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!("sin(u*360*f+t*90)"),
+                        SessionValueKind::Text,
+                    ),
+                );
+                props.insert(
+                    "formulaFrequency".to_owned(),
+                    SessionProperty::static_value(json!(1.0)),
+                );
+            }
+            "delay" => {
+                props.insert(
+                    "delayMode".to_owned(),
+                    SessionProperty::static_value_with_kind(json!(2), SessionValueKind::Option),
+                );
+                props.insert(
+                    "delayFrames".to_owned(),
+                    SessionProperty::static_value(json!(6.0)),
+                );
+            }
+            "spline" => {
+                props.insert(
+                    "splinePath".to_owned(),
+                    SessionProperty::static_value_with_kind(json!(1), SessionValueKind::Option),
+                );
+                props.insert(
+                    "splineRadius".to_owned(),
+                    SessionProperty::static_value(json!(50.0)),
+                );
+                props.insert(
+                    "splineAmplitude".to_owned(),
+                    SessionProperty::static_value(json!(25.0)),
+                );
+                props.insert(
+                    "splineStart".to_owned(),
+                    SessionProperty::static_value(json!(0.0)),
+                );
+                props.insert(
+                    "splineEnd".to_owned(),
+                    SessionProperty::static_value(json!(100.0)),
+                );
+            }
+            "orbit" => {
+                props.insert(
+                    "orbitAngle".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([0.0, std::f64::consts::FRAC_PI_4, 0.0]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "orbitRadius".to_owned(),
+                    SessionProperty::static_value(json!(120.0)),
+                );
+            }
+            "repeater" => {
+                props.insert(
+                    "repeaterCopies".to_owned(),
+                    SessionProperty::static_value(json!(3)),
+                );
+                props.insert(
+                    "repeaterCount".to_owned(),
+                    SessionProperty::static_value(json!(3)),
+                );
+                props.insert(
+                    "repeaterOffset".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([10.0, 0.0, -5.0]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+                props.insert(
+                    "repeaterFade".to_owned(),
+                    SessionProperty::static_value(json!(50.0)),
+                );
+            }
+            "twist" => {
+                props.insert(
+                    "twistAngle".to_owned(),
+                    SessionProperty::static_value(json!(std::f64::consts::FRAC_PI_3)),
+                );
+                props.insert(
+                    "twistAxis".to_owned(),
+                    SessionProperty::static_value_with_kind(json!(2), SessionValueKind::Option),
+                );
+            }
+            "wrap" => {
+                props.insert(
+                    "wrapAmplitude".to_owned(),
+                    SessionProperty::static_value(json!(8.0)),
+                );
+                props.insert(
+                    "wrapFrequency".to_owned(),
+                    SessionProperty::static_value(json!(1.0)),
+                );
+                props.insert(
+                    "wrapDirection".to_owned(),
+                    SessionProperty::static_value_with_kind(json!(1), SessionValueKind::Option),
+                );
+            }
+            "voronoi" => {
+                props.insert(
+                    "voronoiChunks".to_owned(),
+                    SessionProperty::static_value(json!(8)),
+                );
+                props.insert(
+                    "voronoiDistance".to_owned(),
+                    SessionProperty::static_value(json!(6.0)),
+                );
+                props.insert(
+                    "voronoiScatter".to_owned(),
+                    SessionProperty::static_value(json!(2.5)),
+                );
+                props.insert(
+                    "voronoiSpin".to_owned(),
+                    SessionProperty::static_value_with_kind(
+                        json!([0.5, 0.5, 0.5]),
+                        SessionValueKind::Vec3,
+                    ),
+                );
+            }
+            _ => {}
+        }
     }
 }
 

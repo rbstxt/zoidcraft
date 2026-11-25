@@ -698,9 +698,16 @@ pub const fn zoidium_effect_catalog() -> &'static [EffectDescriptor] {
     &ZOIDIUM_EFFECTS
 }
 
+fn canonical_standard_effect_id(lower: &str) -> &str {
+    match lower {
+        "chromaticaberration" | "chromatic_aberration" | "chromatic-aberration" => "rgbshift",
+        _ => lower,
+    }
+}
+
 fn canonical_zoidium_effect_id(lower: &str) -> &str {
     match lower {
-        "looks" => "magiclooks",
+        "looks" | "vignette" => "magiclooks",
         "sglow-hq-v2-preview" => "sglow",
         "zsmb" => "smart-motion-blur-lite",
         "layer_input" => "layerinput",
@@ -713,18 +720,20 @@ fn canonical_zoidium_effect_id(lower: &str) -> &str {
 #[must_use]
 pub fn find_effect_descriptor(id: &str) -> Option<&'static EffectDescriptor> {
     let lower = id.to_ascii_lowercase();
+    let std_canonical = canonical_standard_effect_id(&lower);
     let canonical = canonical_zoidium_effect_id(&lower);
     STANDARD_EFFECTS
         .iter()
         .chain(ZOIDIUM_EFFECTS.iter())
-        .find(|desc| desc.id == lower || desc.id == canonical)
+        .find(|desc| desc.id == lower || desc.id == std_canonical || desc.id == canonical)
 }
 
 /// Instantiates a standard CM3 effect with exact Spec 04 default parameters.
 #[must_use]
 pub fn create_standard_effect(id: &str) -> Option<EffectInstance> {
     let lower = id.to_ascii_lowercase();
-    let desc = STANDARD_EFFECTS.iter().find(|d| d.id == lower)?;
+    let canonical = canonical_standard_effect_id(&lower);
+    let desc = STANDARD_EFFECTS.iter().find(|d| d.id == canonical)?;
     let params = default_standard_params(desc.id)?;
     Some(EffectInstance {
         id: Uuid::new_v4(),
@@ -742,10 +751,16 @@ pub fn create_zoidium_effect(id: &str) -> Option<EffectInstance> {
     let lower = id.to_ascii_lowercase();
     let canonical = canonical_zoidium_effect_id(&lower);
     let desc = ZOIDIUM_EFFECTS.iter().find(|d| d.id == canonical)?;
-    let params = default_zoidium_params(desc.id)?;
+    let mut params = default_zoidium_params(desc.id)?;
+    let name = if lower == "vignette" {
+        params.insert("vignetteStrength".into(), PropertyTrack::number(0.65));
+        "Vignette".to_owned()
+    } else {
+        desc.display_name.to_owned()
+    };
     Some(EffectInstance {
         id: Uuid::new_v4(),
-        name: desc.display_name.to_owned(),
+        name,
         kind: EffectKind::Plugin {
             plugin_id: desc.plugin_id.unwrap_or("zoidium").to_owned(),
             effect_id: desc.id.to_owned(),
@@ -906,7 +921,7 @@ fn default_standard_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> 
         }
         "fxaa" | "negative" | "technicolor" => {}
         "glitch" => {
-            p.insert("time".into(), PropertyTrack::number_with_expr(0.0, "time"));
+            p.insert("time".into(), PropertyTrack::number_with_expr(0.5, "time"));
             p.insert("amount".into(), PropertyTrack::number(0.4));
             p.insert("offset".into(), PropertyTrack::number(0.1));
             p.insert("speed".into(), PropertyTrack::number(4.0));
@@ -914,7 +929,16 @@ fn default_standard_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> 
         "gradientoverlay" => {
             p.insert(
                 "gradient".into(),
-                PropertyTrack::gradient(GradientStop::white_default()),
+                PropertyTrack::gradient(vec![
+                    GradientStop {
+                        position: 0.0,
+                        color: "rgba(60, 180, 255, 1.0)".to_owned(),
+                    },
+                    GradientStop {
+                        position: 1.0,
+                        color: "rgba(255, 90, 200, 1.0)".to_owned(),
+                    },
+                ]),
             );
             p.insert("gradientType".into(), PropertyTrack::option(0));
             p.insert("offset".into(), PropertyTrack::vec2([0.0, 0.0]));
@@ -960,7 +984,7 @@ fn default_standard_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> 
             p.insert("size".into(), PropertyTrack::vec2([16.0, 9.0]));
         }
         "pixelsort" => {
-            p.insert("threshold".into(), PropertyTrack::number(1.0));
+            p.insert("threshold".into(), PropertyTrack::number(0.5));
             p.insert("direction".into(), PropertyTrack::option(0));
             p.insert("reverse".into(), PropertyTrack::option(0));
             p.insert("affect".into(), PropertyTrack::option(0));
@@ -970,7 +994,7 @@ fn default_standard_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> 
             p.insert("regions".into(), PropertyTrack::number(8.0));
         }
         "pulse" => {
-            p.insert("time".into(), PropertyTrack::number(0.0));
+            p.insert("time".into(), PropertyTrack::number_with_expr(0.5, "time"));
             p.insert("amplitude".into(), PropertyTrack::number(300.0));
             p.insert("size".into(), PropertyTrack::number(0.5));
         }
@@ -989,7 +1013,7 @@ fn default_standard_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> 
         "scanlines" => {
             p.insert("color".into(), PropertyTrack::color([0.0, 0.0, 0.0]));
             p.insert("opacity".into(), PropertyTrack::number(1.0));
-            p.insert("thickness".into(), PropertyTrack::number(1.0));
+            p.insert("thickness".into(), PropertyTrack::number(6.0));
             p.insert("offset".into(), PropertyTrack::number(0.0));
             p.insert("feather".into(), PropertyTrack::number(0.25));
             p.insert("angle".into(), PropertyTrack::number(FRAC_PI_2));
@@ -1072,7 +1096,7 @@ fn default_zoidium_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> {
             p.insert("delay".into(), PropertyTrack::number(2.0));
             p.insert("opacity".into(), PropertyTrack::number(0.7));
             p.insert("decay".into(), PropertyTrack::number(0.65));
-            p.insert("composite".into(), PropertyTrack::option(0));
+            p.insert("composite".into(), PropertyTrack::option(2));
         }
         "timeoffset" => {
             p.insert("offset".into(), PropertyTrack::number(0.0));
@@ -1101,7 +1125,7 @@ fn default_zoidium_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> {
             p.insert("nativeMotionBlur".into(), PropertyTrack::option(0));
         }
         "timedifference" => {
-            p.insert("offset".into(), PropertyTrack::number(0.0));
+            p.insert("offset".into(), PropertyTrack::number(1.0));
             p.insert("contrast".into(), PropertyTrack::number(0.0));
             p.insert("absoluteDifference".into(), PropertyTrack::option(1));
             p.insert("alphaChannel".into(), PropertyTrack::option(0));
@@ -1214,7 +1238,7 @@ fn default_zoidium_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> {
             p.insert("startPoint".into(), PropertyTrack::vec2([0.25, 0.5]));
             p.insert("endPoint".into(), PropertyTrack::vec2([0.75, 0.5]));
             p.insert("length".into(), PropertyTrack::number(25.0));
-            p.insert("time".into(), PropertyTrack::number(0.0));
+            p.insert("time".into(), PropertyTrack::number_with_expr(0.5, "time"));
             p.insert("startThickness".into(), PropertyTrack::number(8.0));
             p.insert("endThickness".into(), PropertyTrack::number(8.0));
             p.insert("softness".into(), PropertyTrack::number(20.0));
@@ -1316,8 +1340,38 @@ fn default_zoidium_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> {
                 "graph".into(),
                 PropertyTrack::constant(PropertyValue::Json(serde_json::json!({
                     "schemaVersion": 1,
-                    "nodes": [],
-                    "links": []
+                    "nodes": [
+                        {
+                            "id": "n1",
+                            "type": "layer",
+                            "title": "Source Layer",
+                            "x": 40.0,
+                            "y": 120.0,
+                            "params": {}
+                        },
+                        {
+                            "id": "n2",
+                            "type": "output",
+                            "title": "Effect Output",
+                            "x": 360.0,
+                            "y": 120.0,
+                            "params": {}
+                        }
+                    ],
+                    "links": [
+                        {
+                            "from": "n1",
+                            "fromPort": "color",
+                            "to": "n2",
+                            "toPort": "color"
+                        },
+                        {
+                            "from": "n1",
+                            "fromPort": "alpha",
+                            "to": "n2",
+                            "toPort": "alpha"
+                        }
+                    ]
                 }))),
             );
         }
@@ -1724,7 +1778,22 @@ mod tests {
         assert_eq!(echo.params["delay"].value, PropertyValue::Number(2.0));
         assert_eq!(echo.params["opacity"].value, PropertyValue::Number(0.7));
         assert_eq!(echo.params["decay"].value, PropertyValue::Number(0.65));
-        assert_eq!(echo.params["composite"].value, PropertyValue::Option(0));
+        assert_eq!(echo.params["composite"].value, PropertyValue::Option(2));
+
+        let td = create_zoidium_effect("timedifference").expect("timedifference");
+        assert_eq!(td.params["offset"].value, PropertyValue::Number(1.0));
+
+        assert!(find_effect_descriptor("vignette").is_some());
+        let vig = create_effect_by_id("vignette").expect("vignette");
+        assert_eq!(vig.name, "Vignette");
+        assert_eq!(
+            vig.params["vignetteStrength"].value,
+            PropertyValue::Number(0.65)
+        );
+        assert!(matches!(
+            vig.kind,
+            EffectKind::Plugin { ref effect_id, .. } if effect_id == "magiclooks"
+        ));
 
         let tr = create_zoidium_effect("timeremap").expect("timeremap");
         assert_eq!(tr.params["remap"].value, PropertyValue::Option(1));
@@ -1793,5 +1862,65 @@ mod tests {
         // Namespaced IDs must not fall back to standard effects.
         assert!(create_effect_by_id("zoidium:custom/bloom").is_none());
         assert!(create_effect_by_id("bloom").is_some());
+    }
+
+    #[test]
+    fn qa_effect_defaults_and_wired_node_effect_graph() {
+        let scanlines = create_standard_effect("scanlines").expect("scanlines");
+        assert_eq!(
+            scanlines.params["thickness"].value,
+            PropertyValue::Number(6.0)
+        );
+
+        let pixelsort = create_standard_effect("pixelsort").expect("pixelsort");
+        assert_eq!(
+            pixelsort.params["threshold"].value,
+            PropertyValue::Number(0.5)
+        );
+
+        let grad = create_standard_effect("gradientoverlay").expect("gradientoverlay");
+        match &grad.params["gradient"].value {
+            PropertyValue::Gradient(stops) => {
+                assert_eq!(stops.len(), 2);
+                assert!((stops[0].position - 0.0).abs() < 1e-9);
+                assert!((stops[1].position - 1.0).abs() < 1e-9);
+                assert_ne!(stops[0].color, stops[1].color);
+            }
+            other => panic!("expected 2-stop gradient, got {other:?}"),
+        }
+
+        for id in ["glitch", "pulse", "beam"] {
+            let fx = create_effect_by_id(id).unwrap_or_else(|| panic!("missing {id}"));
+            let time = &fx.params["time"];
+            assert_eq!(time.value, PropertyValue::Number(0.5), "{id}.time fallback");
+            assert_eq!(
+                time.expression.as_deref(),
+                Some("time"),
+                "{id}.time expression"
+            );
+            assert!(time.animated, "{id}.time should be animated");
+        }
+
+        let node_fx = create_effect_by_id("nodeeffect").expect("nodeeffect");
+        let PropertyValue::Json(ref graph) = node_fx.params["graph"].value else {
+            panic!("expected Json graph on nodeeffect");
+        };
+        let nodes = graph["nodes"].as_array().expect("nodes array");
+        let links = graph["links"].as_array().expect("links array");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["type"], "layer");
+        assert_eq!(nodes[1]["type"], "output");
+        assert!(links.iter().any(|l| {
+            l["from"] == "n1"
+                && l["fromPort"] == "color"
+                && l["to"] == "n2"
+                && l["toPort"] == "color"
+        }));
+        assert!(links.iter().any(|l| {
+            l["from"] == "n1"
+                && l["fromPort"] == "alpha"
+                && l["to"] == "n2"
+                && l["toPort"] == "alpha"
+        }));
     }
 }

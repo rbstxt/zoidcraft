@@ -425,7 +425,8 @@ fn eval_character_shake(
     );
     let amplitude = eval_anim_f64(props.get("shakeAmplitude"), frame, 0.0, eval_expr);
     let period = eval_anim_f64(props.get("shakePeriod"), frame, 24.0, eval_expr);
-    let phase = eval_anim_f64(props.get("shakePhase"), frame, 0.0, eval_expr) - phase_offset;
+    let phase =
+        frame + eval_anim_f64(props.get("shakePhase"), frame, 0.0, eval_expr) - phase_offset;
     let angle = shake_angle(amplitude, period, phase);
 
     Char2DTransform {
@@ -1130,11 +1131,12 @@ mod tests {
         assert_ne!(a[0].offset, a[1].offset);
         assert_ne!(a[0].rotation_rad, a[1].rotation_rad);
 
-        // Verify stacked category 3 rotation shifts rotation by +0.25 over 2-category result.
+        // Verify stacked category 3 frame-driven shake rotation composes onto 2-category result.
         let mut two_cats = scatter.clone();
         two_cats["extraCharacterProperties"][1]["mode"] = json!(0);
         let two = evaluate_text_plus_2d_chars(&two_cats, 4, 5.0, 30.0, Some(&eval_cb));
-        assert!((a[0].rotation_rad - (two[0].rotation_rad + 0.25)).abs() < 1e-4);
+        let expected_shake = shake_angle(0.25, 24.0, 5.0 + 6.0) as f32;
+        assert!((a[0].rotation_rad - (two[0].rotation_rad + expected_shake)).abs() < 1e-4);
     }
 
     #[test]
@@ -1170,5 +1172,68 @@ mod tests {
             "expected bezier y > 75, got {}",
             out[0].offset[1]
         );
+    }
+
+    #[test]
+    fn character_shake_and_selected_shake_oscillate_across_frames() {
+        let shake = json!({
+            "schemaVersion": 1,
+            "characterProperties": {
+                "mode": 3,
+                "shakeAmplitude": 0.45,
+                "shakePeriod": 24.0,
+                "shakePhase": 0.0,
+                "shakeDelayPerCharacter": 3.0
+            }
+        });
+        let f0 = evaluate_text_plus_2d_chars(&shake, 4, 0.0, 30.0, None);
+        let f5 = evaluate_text_plus_2d_chars(&shake, 4, 5.0, 30.0, None);
+        let f15 = evaluate_text_plus_2d_chars(&shake, 4, 15.0, 30.0, None);
+        let f30 = evaluate_text_plus_2d_chars(&shake, 4, 30.0, 30.0, None);
+
+        // Character 0 must produce distinct angles at frames 0, 5, 15, 30.
+        let r = [
+            f0[0].rotation_rad,
+            f5[0].rotation_rad,
+            f15[0].rotation_rad,
+            f30[0].rotation_rad,
+        ];
+        assert!(r[0].abs() < 1e-4, "f0 expected ~0, got {}", r[0]);
+        assert!(r[1] > 0.35, "f5 expected positive peak, got {}", r[1]);
+        assert!(r[2] < -0.25, "f15 expected negative swing, got {}", r[2]);
+        assert!(
+            (r[3] - 0.45).abs() < 1e-4,
+            "f30 expected +amplitude (sin(2.5*pi)), got {}",
+            r[3]
+        );
+        for i in 0..r.len() {
+            for j in (i + 1)..r.len() {
+                assert!(
+                    (r[i] - r[j]).abs() > 0.01,
+                    "frames {i} and {j} must be distinct: {r:?}"
+                );
+            }
+        }
+        // Per-character delay must stagger character 1 relative to character 0.
+        assert!((f5[0].rotation_rad - f5[1].rotation_rad).abs() > 0.1);
+
+        // Selected Shake (mode 5) must also oscillate across frames on selected chars only.
+        let sel_shake = json!({
+            "schemaVersion": 1,
+            "characterProperties": {
+                "mode": 5,
+                "characterNumbers": "2",
+                "shakeAmplitude": 0.6,
+                "shakePeriod": 20.0,
+                "shakePhase": 0.0
+            }
+        });
+        let s0 = evaluate_text_plus_2d_chars(&sel_shake, 3, 0.0, 30.0, None);
+        let s5 = evaluate_text_plus_2d_chars(&sel_shake, 3, 5.0, 30.0, None);
+        let s15 = evaluate_text_plus_2d_chars(&sel_shake, 3, 15.0, 30.0, None);
+        assert!(s5[0].is_neutral() && s5[2].is_neutral());
+        assert!(s0[1].rotation_rad.abs() < 1e-4);
+        assert!((s5[1].rotation_rad - 0.6).abs() < 1e-4);
+        assert!((s15[1].rotation_rad + 0.6).abs() < 1e-4);
     }
 }

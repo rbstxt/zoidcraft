@@ -500,7 +500,7 @@ fn find_video_clip_mut_checked(
     for vt in &mut seq.video_tracks {
         if let Some(pos) = vt.clips.iter().position(|c| c.id == clip_id) {
             if vt.locked {
-                return Err(SessionError::TrackLocked(vt.id.to_string()));
+                return Err(crate::track_locked_error(&vt.name, &vt.id.to_string()));
             }
             return Ok(&mut vt.clips[pos]);
         }
@@ -515,12 +515,130 @@ fn find_video_clip_layer_id_checked(
     for vt in &seq.video_tracks {
         if let Some(vc) = vt.clips.iter().find(|c| c.id == clip_id) {
             if vt.locked {
-                return Err(SessionError::TrackLocked(vt.id.to_string()));
+                return Err(crate::track_locked_error(&vt.name, &vt.id.to_string()));
             }
             return Ok(vc.layer.id);
         }
     }
     Err(SessionError::NotFound(format!("video clip '{clip_id}'")))
+}
+
+/// Proportional advance ratio (`advance / height`) matching the bundled default sans-serif font
+/// (`Geist-Regular.ttf`), falling back to `0.60` for monospace fonts and `1.0` for wide CJK glyphs.
+fn proportional_char_advance_ratio(ch: char, is_monospace: bool) -> f64 {
+    if is_monospace {
+        return match ch {
+            '\t' => 2.4,
+            _ if is_wide_cjk(ch) => 1.0,
+            _ => 0.60,
+        };
+    }
+    match ch {
+        ' ' => 0.250,
+        '\t' => 1.000,
+        'A' => 0.668,
+        'B' => 0.680,
+        'C' => 0.703,
+        'D' => 0.694,
+        'E' => 0.603,
+        'F' => 0.590,
+        'G' => 0.700,
+        'H' => 0.713,
+        'I' => 0.270,
+        'J' => 0.597,
+        'K' => 0.640,
+        'L' => 0.580,
+        'M' => 0.877,
+        'N' => 0.743,
+        'O' => 0.739,
+        'P' => 0.650,
+        'Q' => 0.733,
+        'R' => 0.672,
+        'S' => 0.640,
+        'T' => 0.552,
+        'U' => 0.689,
+        'V' => 0.667,
+        'W' => 0.945,
+        'X' => 0.606,
+        'Y' => 0.576,
+        'Z' => 0.544,
+        'a' => 0.551,
+        'b' => 0.595,
+        'c' => 0.546,
+        'd' => 0.595,
+        'e' => 0.561,
+        'f' => 0.395,
+        'g' => 0.594,
+        'h' => 0.581,
+        'i' => 0.244,
+        'j' => 0.260,
+        'k' => 0.590,
+        'l' => 0.267,
+        'm' => 0.877,
+        'n' => 0.581,
+        'o' => 0.573,
+        'p' => 0.595,
+        'q' => 0.595,
+        'r' => 0.379,
+        's' => 0.520,
+        't' => 0.392,
+        'u' => 0.575,
+        'v' => 0.536,
+        'w' => 0.819,
+        'x' => 0.585,
+        'y' => 0.537,
+        'z' => 0.537,
+        '0' => 0.663,
+        '1' => 0.384,
+        '2' => 0.619,
+        '3' => 0.613,
+        '4' => 0.615,
+        '5' => 0.626,
+        '6' => 0.593,
+        '7' => 0.524,
+        '8' => 0.604,
+        '9' => 0.593,
+        '!' => 0.213,
+        '.' | ',' => 0.201,
+        ':' | ';' => 0.297,
+        '-' => 0.419,
+        '"' => 0.346,
+        '\'' => 0.178,
+        '(' | ')' => 0.274,
+        '[' | ']' => 0.347,
+        '{' | '}' => 0.389,
+        '@' => 0.906,
+        '#' => 0.478,
+        '$' => 0.629,
+        '%' => 0.802,
+        '^' => 0.426,
+        '&' => 0.620,
+        '*' => 0.430,
+        '+' => 0.558,
+        '=' => 0.540,
+        '/' => 0.480,
+        '\\' => 0.455,
+        '<' | '>' => 0.544,
+        '?' => 0.559,
+        '_' => 0.557,
+        '|' => 0.264,
+        '~' => 0.523,
+        _ if is_wide_cjk(ch) => 1.000,
+        _ if ch.is_whitespace() => 0.250,
+        _ => 0.600,
+    }
+}
+
+fn is_wide_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3000..=0x30FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0xFF01..=0xFF60
+    )
 }
 
 impl Session {
@@ -824,9 +942,7 @@ impl Session {
             ..zc_project::Sequence::default()
         };
         self.project.compositions.insert(comp_id, comp);
-        self.project
-            .plugin_requirements
-            .insert("precomp-plus".to_owned());
+        self.enable_plugin_requirement("precomp-plus");
         Ok(json!({
             "comp_id": comp_id.to_string(),
             "name": trimmed,
@@ -937,7 +1053,7 @@ impl Session {
                 for vc in &vt.clips {
                     if unique_ids.contains(&vc.id) {
                         if vt.locked {
-                            return Err(SessionError::TrackLocked(vt.id.to_string()));
+                            return Err(crate::track_locked_error(&vt.name, &vt.id.to_string()));
                         }
                         found.insert(vc.id);
                     }
@@ -947,7 +1063,7 @@ impl Session {
                 for ac in &at.clips {
                     if unique_ids.contains(&ac.id) {
                         if at.locked {
-                            return Err(SessionError::TrackLocked(at.id.to_string()));
+                            return Err(crate::track_locked_error(&at.name, &at.id.to_string()));
                         }
                         found.insert(ac.id);
                     }
@@ -1245,9 +1361,7 @@ impl Session {
             ..zc_project::Sequence::default()
         };
         self.project.compositions.insert(comp_id, comp);
-        self.project
-            .plugin_requirements
-            .insert("precomp-plus".to_owned());
+        self.enable_plugin_requirement("precomp-plus");
 
         let active_id = self.document.active_composition_id;
         let active_seq = self.active_sequence().clone();
@@ -1280,6 +1394,9 @@ impl Session {
                 .cloned()
                 .ok_or_else(|| SessionError::NotFound(format!("composition '{id}'")))?,
         };
+        if comp_id.is_some() {
+            self.enable_plugin_requirement("precomp-plus");
+        }
         self.document = SessionDocument::from_sequence(&self.project, &target_seq, comp_id);
         self.selection.clear_all();
         let max_frame = (self.document.sequence_length - 1.0).max(0.0);
@@ -1312,7 +1429,7 @@ impl Session {
             .find_clip_mut(&cid_str)
             .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
         if track.locked {
-            return Err(SessionError::TrackLocked(track.id.clone()));
+            return Err(crate::track_locked_error(&track.name, &track.id));
         }
         if track.kind != TrackKind::Video
             || track.clips[clip_idx].kind != "zoidium:precomp-plus/precomp"
@@ -1402,7 +1519,7 @@ impl Session {
                 .find_clip_mut(&cid_str)
                 .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
             if track.locked {
-                return Err(SessionError::TrackLocked(track.id.clone()));
+                return Err(crate::track_locked_error(&track.name, &track.id));
             }
             let clip = &track.clips[clip_idx];
             if track.kind != TrackKind::Video || clip.kind != "scene" {
@@ -1432,25 +1549,55 @@ impl Session {
             .unwrap_or(20.0)
             .max(0.05);
         let spacing = prop_f64_static(&orig_obj.properties, "spacing").unwrap_or(0.0);
+        let line_height = prop_f64_static(&orig_obj.properties, "lineHeight")
+            .unwrap_or(1.2)
+            .max(0.1);
         let position_mode = prop_f64_static(&orig_obj.properties, "positionMode")
             .map_or(0_i64, |v| v.round() as i64);
+        let font_lower = prop_str_static(&orig_obj.properties, "font")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_monospace = font_lower.contains("mono")
+            || font_lower.contains("source-code-pro")
+            || font_lower.contains("source code pro");
 
-        // Compute per-character advance widths (non-whitespace yields a child Text3D).
-        let glyph_advance = height * 0.6;
-        let space_advance = height * 0.35;
-        let mut placed_chars: Vec<(char, f64)> = Vec::new();
-        let mut cursor = 0.0_f64;
-        let char_count = text.chars().count();
-        for (i, ch) in text.chars().enumerate() {
-            let adv = if ch.is_whitespace() {
-                space_advance
-            } else {
-                placed_chars.push((ch, cursor + glyph_advance * 0.5));
-                glyph_advance
+        // Compute per-line proportional character advance positions, preserving `\n` line breaks.
+        let lines: Vec<&str> = text
+            .split('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            .collect();
+        let line_count = lines.len();
+        let line_step = height * line_height;
+        let vertical_base = match position_mode {
+            3 => 0.0,                                                     // Top
+            4 => (line_count.saturating_sub(1) as f64) * line_step,       // Bottom
+            _ => (line_count.saturating_sub(1) as f64) * 0.5 * line_step, // Center & others
+        };
+
+        let mut placed_chars: Vec<(char, f64, f64)> = Vec::new();
+        for (line_idx, line) in lines.iter().enumerate() {
+            let line_chars: Vec<char> = line.chars().collect();
+            let mut line_placed: Vec<(char, f64)> = Vec::new();
+            let mut cursor = 0.0_f64;
+            for (i, &ch) in line_chars.iter().enumerate() {
+                let adv = proportional_char_advance_ratio(ch, is_monospace) * height;
+                if !ch.is_whitespace() {
+                    line_placed.push((ch, cursor + adv * 0.5));
+                }
+                cursor += adv;
+                if i + 1 < line_chars.len() {
+                    cursor += spacing;
+                }
+            }
+            let line_width = cursor;
+            let align_offset = match position_mode {
+                1 => 0.0,               // Left
+                2 => -line_width,       // Right
+                _ => -line_width * 0.5, // Center (and Top/Bottom/Front/Back)
             };
-            cursor += adv;
-            if i + 1 < char_count {
-                cursor += spacing;
+            let line_y = vertical_base - (line_idx as f64) * line_step;
+            for (ch, center_x) in line_placed {
+                placed_chars.push((ch, center_x + align_offset, line_y));
             }
         }
         if placed_chars.is_empty() {
@@ -1458,13 +1605,6 @@ impl Session {
                 "cannot split Text3D with no non-whitespace characters".to_owned(),
             ));
         }
-
-        let total_width = cursor;
-        let align_offset = match position_mode {
-            1 => 0.0,                // Left
-            2 => -total_width,       // Right
-            _ => -total_width * 0.5, // Center (and Top/Bottom/Front/Back)
-        };
 
         let group_id = self.alloc_uuid_id();
         let mut group_props = BTreeMap::new();
@@ -1497,18 +1637,21 @@ impl Session {
 
         let mut letter_objs = Vec::with_capacity(placed_chars.len());
         let mut letter_ids = Vec::with_capacity(placed_chars.len());
-        for (ch, center_x) in placed_chars {
+        for (ch, pos_x, pos_y) in placed_chars {
             let letter_id = self.alloc_uuid_id();
             letter_ids.push(letter_id.clone());
             let mut lprops = orig_obj.properties.clone();
             lprops.insert(
                 "text".to_owned(),
-                SessionProperty::static_value(json!(ch.to_string())),
+                SessionProperty::static_value_with_kind(
+                    json!(ch.to_string()),
+                    SessionValueKind::Text,
+                ),
             );
             lprops.insert(
                 "position".to_owned(),
                 SessionProperty::static_value_with_kind(
-                    json!([center_x + align_offset, 0.0, 0.0]),
+                    json!([pos_x, pos_y, 0.0]),
                     SessionValueKind::Vec3,
                 ),
             );
@@ -1551,6 +1694,9 @@ impl Session {
             clip.objects_3d.insert(orig_pos_idx + 1 + offset, lo);
         }
         self.selection.prune_object_3d(&oid_str);
+        let _ = self
+            .selection
+            .select_object_3d(group_id.clone(), "group", false);
         self.playback.bump_epoch();
         Ok(json!({
             "clip_id": cid_str,
@@ -1810,6 +1956,8 @@ impl Session {
 
         let mut pasted_ids = Vec::with_capacity(clips.len());
         let mut affected_tracks: BTreeMap<(u8, usize), BTreeSet<String>> = BTreeMap::new();
+        let mut pending_side_tables: Vec<(Uuid, Vec<zc_project::LayerMask>, Option<f64>)> =
+            Vec::new();
 
         for snap in clips {
             let new_start = (target_frame + (snap.clip.start - base_start)).max(0.0);
@@ -1904,6 +2052,12 @@ impl Session {
                         } else if let Some(vt) = seq.video_tracks.first_mut() {
                             vt.clips.push(vc);
                         }
+                    } else if !snap.layer_masks.is_empty() || snap.precomp_offset.is_some() {
+                        pending_side_tables.push((
+                            new_clip_uuid,
+                            snap.layer_masks,
+                            snap.precomp_offset,
+                        ));
                     }
                     self.document.video_tracks[track_idx].clips.push(sclip);
                     affected_tracks
@@ -1941,6 +2095,39 @@ impl Session {
             };
             self.resolve_track_overlaps_for_group(kind, track_idx, &group_ids);
         }
+        if !pending_side_tables.is_empty() {
+            // Materialize newly pasted video clips that lacked a pre-built `snap.video_clip`
+            // so their `layer.id` exists and receives `snap.layer_masks` & `snap.precomp_offset`.
+            self.sync_document_to_project();
+            let mut needs_shape_plus = false;
+            let mut needs_precomp_plus = false;
+            for (clip_uuid, masks, precomp_offset) in pending_side_tables {
+                let layer_id_opt = self
+                    .active_sequence()
+                    .video_tracks
+                    .iter()
+                    .flat_map(|vt| vt.clips.iter())
+                    .find(|c| c.id == clip_uuid)
+                    .map(|c| c.layer.id);
+                if let Some(layer_id) = layer_id_opt {
+                    let seq = self.active_sequence_mut();
+                    if !masks.is_empty() {
+                        seq.layer_masks.insert(layer_id, masks);
+                        needs_shape_plus = true;
+                    }
+                    if let Some(off) = precomp_offset {
+                        seq.precomp_offsets.insert(layer_id, off);
+                        needs_precomp_plus = true;
+                    }
+                }
+            }
+            if needs_shape_plus {
+                let _ = self.enable_plugin_requirement("shape-plus");
+            }
+            if needs_precomp_plus {
+                let _ = self.enable_plugin_requirement("precomp-plus");
+            }
+        }
         self.document.recompute_sequence_length_if_extended();
         self.playback.bump_epoch();
         Ok(json!({ "clip_ids": pasted_ids }))
@@ -1963,7 +2150,7 @@ impl Session {
                 .find_clip_mut(&cid_str)
                 .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
             if track.locked {
-                return Err(SessionError::TrackLocked(track.id.clone()));
+                return Err(crate::track_locked_error(&track.name, &track.id));
             }
             let clip = &track.clips[clip_idx];
             let local_frame = (frame - clip.start).clamp(0.0, clip.length);
@@ -2071,7 +2258,7 @@ impl Session {
             .find_clip_mut(&cid_str)
             .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
         if track.locked {
-            return Err(SessionError::TrackLocked(track.id.clone()));
+            return Err(crate::track_locked_error(&track.name, &track.id));
         }
         let clip = &mut track.clips[clip_idx];
         if !clip.time_animated {

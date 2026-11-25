@@ -573,6 +573,18 @@ fn serialize_composition_media_entry(
         .cloned()
         .unwrap_or_default();
     props.insert("name".to_owned(), Value::String(comp_seq.name.clone()));
+    props.insert(
+        "backgroundColor".to_owned(),
+        json!([
+            finite_f64(f64::from(comp_seq.background_color[0])),
+            finite_f64(f64::from(comp_seq.background_color[1])),
+            finite_f64(f64::from(comp_seq.background_color[2])),
+            finite_f64(f64::from(comp_seq.background_color[3])),
+        ]),
+    );
+    if !comp_seq.markers.is_empty() {
+        props.insert("markers".to_owned(), serialize_markers_track(comp_seq));
+    }
     obj.insert("properties".to_owned(), Value::Object(props));
 
     let clip_links_val = build_clip_links_json(comp_seq);
@@ -586,6 +598,9 @@ fn serialize_composition_media_entry(
         let mut cloned = src.clone();
         remap_json_value(&mut cloned, remap);
         comp_meta.insert("compSource".to_owned(), cloned);
+    }
+    if let Some(mc) = comp_seq.preserved.get("markerColors") {
+        comp_meta.insert("markerColors".to_owned(), mc.clone());
     }
     obj.insert("comp".to_owned(), Value::Object(comp_meta));
 
@@ -603,6 +618,34 @@ fn serialize_composition_media_entry(
     }
 
     Value::Object(obj)
+}
+
+fn serialize_markers_track(seq: &Sequence) -> Value {
+    let marker_colors = seq.preserved.get("markerColors").and_then(Value::as_array);
+    let marker_kfs: Vec<Value> = seq
+        .markers
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| {
+            let mut kf = Map::new();
+            kf.insert("frame".to_owned(), json!(finite_f64(m.frame)));
+            kf.insert("value".to_owned(), Value::String(m.label.clone()));
+            kf.insert("tween".to_owned(), json!(0));
+            if let Some(col) = marker_colors
+                .and_then(|arr| arr.get(idx))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                kf.insert("color".to_owned(), Value::String(col.to_owned()));
+            }
+            Value::Object(kf)
+        })
+        .collect();
+    json!({
+        "animated": true,
+        "keyframes": marker_kfs
+    })
 }
 
 fn serialize_sequence(
@@ -680,24 +723,7 @@ fn serialize_sequence(
     }
 
     if !seq.markers.is_empty() {
-        let marker_kfs: Vec<Value> = seq
-            .markers
-            .iter()
-            .map(|m| {
-                json!({
-                    "frame": finite_f64(m.frame),
-                    "value": m.label,
-                    "tween": 0
-                })
-            })
-            .collect();
-        props.insert(
-            "markers".to_owned(),
-            json!({
-                "animated": true,
-                "keyframes": marker_kfs
-            }),
-        );
+        props.insert("markers".to_owned(), serialize_markers_track(seq));
     }
 
     if !seq.controls.is_empty() {
@@ -813,12 +839,27 @@ fn serialize_sequence_controls(seq: &Sequence, remap: &BTreeMap<String, String>)
         .max(seq.controls.len() as u64 + 1)
         .max(1);
 
+    let mut seen_raw_ids: BTreeSet<String> = BTreeSet::new();
     let controls: Vec<Value> = seq
         .controls
         .iter()
         .enumerate()
         .map(|(idx, ctl)| {
-            serialize_sequence_control(ctl, &final_ids[idx], &final_names[idx], remap)
+            let trimmed_raw = ctl.id.trim();
+            let preserve_raw_id = (!trimmed_raw.is_empty()
+                && trimmed_raw != final_ids[idx]
+                && seen_raw_ids.insert(trimmed_raw.to_owned()))
+            .then_some(trimmed_raw);
+            if trimmed_raw == final_ids[idx] {
+                seen_raw_ids.insert(trimmed_raw.to_owned());
+            }
+            serialize_sequence_control(
+                ctl,
+                &final_ids[idx],
+                preserve_raw_id,
+                &final_names[idx],
+                remap,
+            )
         })
         .collect();
 
@@ -832,6 +873,7 @@ fn serialize_sequence_controls(seq: &Sequence, remap: &BTreeMap<String, String>)
 fn serialize_sequence_control(
     ctl: &SequenceControl,
     normalized_id: &str,
+    preserved_raw_id: Option<&str>,
     normalized_name: &str,
     remap: &BTreeMap<String, String>,
 ) -> Value {
@@ -864,6 +906,14 @@ fn serialize_sequence_control(
         "zoidiumControlId".to_owned(),
         Value::String(normalized_id.to_owned()),
     );
+    if let Some(raw_id) = preserved_raw_id {
+        type_obj.insert(
+            "zoidcraftControlId".to_owned(),
+            Value::String(raw_id.to_owned()),
+        );
+    } else {
+        type_obj.remove("zoidcraftControlId");
+    }
 
     match ctl.kind {
         SequenceControlKind::Slider => {
@@ -1060,7 +1110,7 @@ fn serialize_audio_track(track: &AudioTrack, remap: &BTreeMap<String, String>) -
     Value::Object(obj)
 }
 
-fn serialize_video_clip(
+pub(crate) fn serialize_video_clip(
     clip: &VideoClip,
     seq: &Sequence,
     comp_str_ids: &BTreeMap<Uuid, String>,
@@ -1108,7 +1158,7 @@ fn serialize_video_clip(
     Value::Object(obj)
 }
 
-fn serialize_audio_clip(clip: &AudioClip, remap: &BTreeMap<String, String>) -> Value {
+pub(crate) fn serialize_audio_clip(clip: &AudioClip, remap: &BTreeMap<String, String>) -> Value {
     let mut obj = Map::new();
     for (k, v) in &clip.preserved {
         if k.starts_with("property.") {
@@ -1336,9 +1386,10 @@ fn serialize_layer(
                     serialize_property_value(&bd.opacity.value, remap),
                 );
             }
+            let constraint_ctx = SceneConstraintExportCtx::from_objects(objects);
             let objs: Vec<Value> = objects
                 .iter()
-                .map(|o| serialize_object3d(o, remap))
+                .map(|o| serialize_object3d_with_ctx(o, remap, Some(&constraint_ctx)))
                 .collect();
             obj.insert("objects".to_owned(), Value::Array(objs));
         }
@@ -1391,9 +1442,10 @@ fn serialize_layer(
             let objs: Vec<Value> = if let Some(cam_objs) = seq.camera_layer_objects.get(&layer.id)
                 && !cam_objs.is_empty()
             {
+                let constraint_ctx = SceneConstraintExportCtx::from_objects(cam_objs);
                 cam_objs
                     .iter()
-                    .map(|o| serialize_object3d(o, remap))
+                    .map(|o| serialize_object3d_with_ctx(o, remap, Some(&constraint_ctx)))
                     .collect()
             } else {
                 let mut cam_obj = Object3D::new("Camera", Object3DKind::Camera(camera.clone()));
@@ -1451,7 +1503,7 @@ fn serialize_layer(
     Value::Object(obj)
 }
 
-fn serialize_layer_mask(mask: &LayerMask, remap: &BTreeMap<String, String>) -> Value {
+pub(crate) fn serialize_layer_mask(mask: &LayerMask, remap: &BTreeMap<String, String>) -> Value {
     let mut obj = Map::new();
     for (k, v) in &mask.preserved {
         if k.starts_with("property.") {
@@ -1638,7 +1690,73 @@ fn serialize_draw_op(op: &DrawOp, remap: &BTreeMap<String, String>) -> Value {
     }
 }
 
-fn serialize_object3d(obj: &Object3D, remap: &BTreeMap<String, String>) -> Value {
+#[derive(Default)]
+struct SceneConstraintExportCtx {
+    uuid_to_export_id: BTreeMap<String, String>,
+    referenced_export_ids: BTreeSet<String>,
+}
+
+impl SceneConstraintExportCtx {
+    fn from_objects(objects: &[Object3D]) -> Self {
+        let mut ctx = Self::default();
+        ctx.collect_ids(objects);
+        ctx.collect_targets(objects);
+        ctx
+    }
+
+    fn collect_ids(&mut self, objects: &[Object3D]) {
+        for obj in objects {
+            let export_id = obj
+                .constraints
+                .zoidium_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| obj.id.to_string(), ToOwned::to_owned);
+            self.uuid_to_export_id.insert(obj.id.to_string(), export_id);
+            if let Object3DKind::Group { children, .. } = &obj.kind {
+                self.collect_ids(children);
+            }
+        }
+    }
+
+    fn collect_targets(&mut self, objects: &[Object3D]) {
+        for obj in objects {
+            if let Some(tt) = &obj.constraints.track_to
+                && !tt.target_id.is_empty()
+            {
+                let resolved = self
+                    .uuid_to_export_id
+                    .get(&tt.target_id)
+                    .cloned()
+                    .unwrap_or_else(|| tt.target_id.clone());
+                self.referenced_export_ids.insert(resolved);
+            }
+            if let Some(fl) = &obj.constraints.follow
+                && !fl.target_id.is_empty()
+            {
+                let resolved = self
+                    .uuid_to_export_id
+                    .get(&fl.target_id)
+                    .cloned()
+                    .unwrap_or_else(|| fl.target_id.clone());
+                self.referenced_export_ids.insert(resolved);
+            }
+            if let Object3DKind::Group { children, .. } = &obj.kind {
+                self.collect_targets(children);
+            }
+        }
+    }
+}
+
+pub(crate) fn serialize_object3d(obj: &Object3D, remap: &BTreeMap<String, String>) -> Value {
+    serialize_object3d_with_ctx(obj, remap, None)
+}
+
+fn serialize_object3d_with_ctx(
+    obj: &Object3D,
+    remap: &BTreeMap<String, String>,
+    constraint_ctx: Option<&SceneConstraintExportCtx>,
+) -> Value {
     let plugin_obj_type = obj
         .preserved
         .get("zoidiumPluginObjectType")
@@ -1710,11 +1828,22 @@ fn serialize_object3d(obj: &Object3D, remap: &BTreeMap<String, String>) -> Value
         && !zid.is_empty()
     {
         props.insert("zoidiumId".to_owned(), Value::String(zid.clone()));
+    } else if let Some(ctx) = constraint_ctx {
+        let obj_uuid = obj.id.to_string();
+        if ctx.referenced_export_ids.contains(&obj_uuid)
+            || obj.constraints.track_to.is_some()
+            || obj.constraints.follow.is_some()
+        {
+            props.insert("zoidiumId".to_owned(), Value::String(obj_uuid));
+        }
     }
     if let Some(tt) = &obj.constraints.track_to {
+        let exported_target = constraint_ctx
+            .and_then(|ctx| ctx.uuid_to_export_id.get(&tt.target_id))
+            .map_or(tt.target_id.as_str(), String::as_str);
         props.insert(
             "zoidiumTrackTo".to_owned(),
-            Value::String(tt.target_id.clone()),
+            Value::String(exported_target.to_owned()),
         );
         props.insert("zoidiumTrackAxis".to_owned(), json!(tt.track_axis));
         props.insert("zoidiumUpAxis".to_owned(), json!(tt.up_axis));
@@ -1724,9 +1853,12 @@ fn serialize_object3d(obj: &Object3D, remap: &BTreeMap<String, String>) -> Value
         );
     }
     if let Some(fl) = &obj.constraints.follow {
+        let exported_target = constraint_ctx
+            .and_then(|ctx| ctx.uuid_to_export_id.get(&fl.target_id))
+            .map_or(fl.target_id.as_str(), String::as_str);
         props.insert(
             "zoidiumFollow".to_owned(),
-            Value::String(fl.target_id.clone()),
+            Value::String(exported_target.to_owned()),
         );
         props.insert("zoidiumFollowSpace".to_owned(), json!(fl.space));
         props.insert(
@@ -1792,7 +1924,7 @@ fn serialize_object3d(obj: &Object3D, remap: &BTreeMap<String, String>) -> Value
             }
             let child_arr: Vec<Value> = children
                 .iter()
-                .map(|c| serialize_object3d(c, remap))
+                .map(|c| serialize_object3d_with_ctx(c, remap, constraint_ctx))
                 .collect();
             out.insert("objects".to_owned(), Value::Array(child_arr));
         }
@@ -2463,7 +2595,8 @@ fn serialize_light(
             LightKind::Spot => 1,
             LightKind::Point => 2,
             LightKind::Directional => 3,
-            LightKind::Hemisphere | LightKind::Ambient => 4,
+            LightKind::Hemisphere => 4,
+            LightKind::Ambient => 5,
         };
         out.insert("objectType".to_owned(), json!(sub_type));
     }
@@ -2668,7 +2801,7 @@ fn serialize_particles_props(
     );
 }
 
-fn serialize_material(
+pub(crate) fn serialize_material(
     mat: &MaterialSpec,
     uv_mode: CompatMode,
     remap: &BTreeMap<String, String>,
@@ -2920,29 +3053,6 @@ fn serialize_material(
         } => {
             let mut cloned = graph.clone();
             remap_json_value(&mut cloned, remap);
-            if let Value::Object(mut map) = cloned {
-                map.insert("type".to_owned(), Value::String("nodes".to_owned()));
-                map.insert(
-                    "zoidiumUvMode".to_owned(),
-                    Value::String(uv_mode.as_str().to_owned()),
-                );
-                let bake_idx = match *resolution {
-                    128 => 0,
-                    256 => 1,
-                    512 => 2,
-                    1024 => 3,
-                    2048 => 4,
-                    other => other,
-                };
-                let props = map
-                    .entry("properties".to_owned())
-                    .or_insert_with(|| Value::Object(Map::new()));
-                if let Some(pmap) = props.as_object_mut() {
-                    pmap.insert("bakeResolution".to_owned(), json!(bake_idx));
-                }
-                return Value::Object(map);
-            }
-            obj.insert("type".to_owned(), Value::String("nodes".to_owned()));
             let bake_idx = match *resolution {
                 128 => 0,
                 256 => 1,
@@ -2951,9 +3061,41 @@ fn serialize_material(
                 2048 => 4,
                 other => other,
             };
+            let is_already_zoidium_wrapper = cloned.as_object().is_some_and(|m| {
+                m.get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|p| p.contains_key("graph"))
+            });
+            if is_already_zoidium_wrapper && let Value::Object(mut map) = cloned {
+                map.insert("type".to_owned(), Value::String("nodes".to_owned()));
+                map.insert(
+                    "zoidiumUvMode".to_owned(),
+                    Value::String(uv_mode.as_str().to_owned()),
+                );
+                let props = map
+                    .entry("properties".to_owned())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(pmap) = props.as_object_mut() {
+                    pmap.insert("bakeResolution".to_owned(), json!(bake_idx));
+                }
+                return Value::Object(map);
+            }
+            // Clean native NodeMaterial graph: serialize inside `properties.graph` with
+            // `zoidcraftGraphDirect: true` so `.pz` export stays Zoidium-compatible AND
+            // re-import recovers the exact clean `graph` without injecting wrapper keys.
+            let graph_json_str = serde_json::to_string(&cloned).unwrap_or_else(|_| "{}".to_owned());
+            obj.insert("type".to_owned(), Value::String("nodes".to_owned()));
+            obj.insert(
+                "zoidiumUvMode".to_owned(),
+                Value::String(uv_mode.as_str().to_owned()),
+            );
             obj.insert(
                 "properties".to_owned(),
-                json!({ "bakeResolution": bake_idx }),
+                json!({
+                    "bakeResolution": bake_idx,
+                    "graph": graph_json_str,
+                    "zoidcraftGraphDirect": true,
+                }),
             );
         }
         MaterialSpec::Unknown {
@@ -2978,7 +3120,7 @@ fn serialize_material(
     Value::Object(obj)
 }
 
-fn serialize_effect(
+pub(crate) fn serialize_effect(
     fx: &EffectInstance,
     seq: &Sequence,
     remap: &BTreeMap<String, String>,
@@ -3276,9 +3418,16 @@ fn serialize_custom_property(cp: &CustomProperty, remap: &BTreeMap<String, Strin
         obj.insert(k.clone(), cloned);
     }
 
-    let prop_type = cp
-        .prop_type
-        .unwrap_or_else(|| infer_cm3_prop_type(&cp.track.value));
+    let is_rgb_color = matches!(cp.track.value, PropertyValue::Color(_));
+    let prop_type = if is_rgb_color {
+        match cp.prop_type {
+            Some(3) => 3,
+            _ => 4,
+        }
+    } else {
+        cp.prop_type
+            .unwrap_or_else(|| infer_cm3_prop_type(&cp.track.value))
+    };
 
     let mut type_map = cp
         .metadata
@@ -3309,18 +3458,39 @@ fn serialize_custom_property(cp: &CustomProperty, remap: &BTreeMap<String, Strin
 
     type_map.insert("custom".to_owned(), Value::Bool(true));
     type_map.insert("dynamic".to_owned(), Value::Bool(is_dynamic));
-    type_map
-        .entry("type".to_owned())
-        .or_insert_with(|| json!(prop_type));
+    if is_rgb_color {
+        // Ensure Color uniforms ALWAYS export as color type (`3` or `4`) with 3-channel R/G/B
+        // metadata — never 4-channel X/Y/Z/W or Vec3 (`type: 2`).
+        type_map.insert("type".to_owned(), json!(prop_type));
+    } else {
+        type_map
+            .entry("type".to_owned())
+            .or_insert_with(|| json!(prop_type));
+    }
 
     if is_dynamic {
         if matches!(prop_type, 1..=4) {
             type_map
                 .entry("group".to_owned())
                 .or_insert(Value::Bool(true));
-            type_map
-                .entry("objects".to_owned())
-                .or_insert_with(|| default_custom_group_objects(prop_type));
+            if is_rgb_color {
+                let has_rgb_objects = type_map
+                    .get("objects")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| {
+                        arr.len() == 3
+                            && arr[0].get("name").and_then(Value::as_str) == Some("R")
+                            && arr[1].get("name").and_then(Value::as_str) == Some("G")
+                            && arr[2].get("name").and_then(Value::as_str) == Some("B")
+                    });
+                if !has_rgb_objects {
+                    type_map.insert("objects".to_owned(), default_custom_group_objects(4));
+                }
+            } else {
+                type_map
+                    .entry("objects".to_owned())
+                    .or_insert_with(|| default_custom_group_objects(prop_type));
+            }
         } else if prop_type == 0 {
             type_map
                 .entry("value".to_owned())
@@ -3394,7 +3564,10 @@ const fn infer_cm3_prop_type(val: &PropertyValue) -> u32 {
     }
 }
 
-fn serialize_property_track(track: &PropertyTrack, remap: &BTreeMap<String, String>) -> Value {
+pub(crate) fn serialize_property_track(
+    track: &PropertyTrack,
+    remap: &BTreeMap<String, String>,
+) -> Value {
     if !track.channels.is_empty() {
         return serialize_dynamic_group(track, remap);
     }
@@ -3531,7 +3704,7 @@ fn serialize_keyframe(kf: &PropertyKeyframe, remap: &BTreeMap<String, String>) -
     obj.insert("tween".to_owned(), json!(tween));
 
     let default_cp = [[-10.0, 0.0], [10.0, 0.0]];
-    if kf.is_bezier || kf.control_points != default_cp {
+    if kf.is_bezier || ((tween >> 8) & 1) == 1 || kf.control_points != default_cp {
         obj.insert(
             "controlPoints".to_owned(),
             json!([
@@ -3554,12 +3727,17 @@ fn serialize_keyframe(kf: &PropertyKeyframe, remap: &BTreeMap<String, String>) -
 }
 
 const fn encode_cm3_tween(kf: &PropertyKeyframe) -> u32 {
+    if kf.easing_index == 0 {
+        // Hold (low byte 0) always takes precedence over Bezier bit 8 (Spec 02 §3.1 / zc-anim).
+        // Preserve raw Hold tween codes (e.g. `256` stays `256`, `0` stays `0`) without silently
+        // rewriting `256 -> 257` or `256 -> 0` across `.pz` round-trips.
+        if (kf.tween & 0xFF) == 0 {
+            return kf.tween;
+        }
+        return 0;
+    }
     if kf.is_bezier {
-        let low = if kf.easing_index == 0 {
-            1u32
-        } else {
-            kf.easing_index as u32
-        };
+        let low = kf.easing_index as u32;
         if ((kf.tween >> 8) & 1) == 1 && (kf.tween & 0xFF) == low {
             kf.tween
         } else {
@@ -6796,5 +6974,403 @@ mod tests {
             Some("keep-me"),
             "missing keys in payload should still be filled from layer.preserved"
         );
+    }
+
+    #[test]
+    fn round_trips_track_to_and_follow_uuid_targets_across_export_and_import() {
+        let mut proj = Project::new_cm3_default();
+        let target_cube = Object3D::new(
+            "Hero Cube",
+            Object3DKind::Shape3D(Shape3DKind::Box {
+                size: [10.0, 10.0, 10.0],
+            }),
+        );
+        let nested_target = Object3D::new(
+            "Nested Target",
+            Object3DKind::Shape3D(Shape3DKind::Sphere {
+                radius: 4.0,
+                width_segments: 16,
+                height_segments: 12,
+            }),
+        );
+        let target_cube_uuid = target_cube.id.to_string();
+        let nested_target_uuid = nested_target.id.to_string();
+
+        let mut cam = Object3D::new("Camera", Object3DKind::Camera(Box::default()));
+        cam.constraints.track_to = Some(TrackToConstraint {
+            target_id: target_cube_uuid.clone(),
+            track_axis: 5,
+            up_axis: 0,
+            influence: PropertyTrack::number(100.0),
+        });
+
+        let mut nested_follower = Object3D::new(
+            "Nested Follower",
+            Object3DKind::Shape3D(Shape3DKind::Box {
+                size: [2.0, 2.0, 2.0],
+            }),
+        );
+        nested_follower.constraints.follow = Some(FollowConstraint {
+            target_id: nested_target_uuid.clone(),
+            space: 0,
+            follow_position: true,
+            follow_rotation: true,
+            follow_scale: false,
+            position_offset: PropertyTrack::vec3([0.0, 5.0, 0.0]),
+            rotation_offset: PropertyTrack::vec3([0.0, 0.0, 0.0]),
+            scale_offset: PropertyTrack::vec3([1.0, 1.0, 1.0]),
+            fallback_pose: None,
+        });
+
+        let group = Object3D::new(
+            "Rig Group",
+            Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: vec![nested_target, nested_follower],
+            },
+        );
+
+        let scene_layer = Layer::new(
+            "3D Scene",
+            LayerKind::Scene3D {
+                objects: vec![cam, target_cube, group],
+                shadow_mode: CompatMode::Current,
+            },
+            [1280, 720],
+        );
+        proj.sequence.video_tracks[0].clips[0].layer = scene_layer;
+        proj.plugin_requirements.insert("constraints".to_owned());
+
+        let pz_bytes = export_pz_to_bytes(&proj).expect("export .pz");
+        let reimported = import_pz_from_bytes(&pz_bytes).expect("reimport .pz");
+        assert!(
+            reimported.warnings.is_empty(),
+            "expected zero warnings, got {:?}",
+            reimported.warnings
+        );
+
+        let LayerKind::Scene3D { ref objects, .. } = reimported.project.sequence.video_tracks[0]
+            .clips[0]
+            .layer
+            .kind
+        else {
+            panic!("expected Scene3D");
+        };
+        assert_eq!(objects.len(), 3);
+        let new_cam = &objects[0];
+        let new_cube = &objects[1];
+        let Object3DKind::Group { ref children, .. } = objects[2].kind else {
+            panic!("expected Group");
+        };
+        let new_nested_target = &children[0];
+        let new_nested_follower = &children[1];
+
+        // Fresh UUIDs must have been allocated on import, and constraints must be remapped to them.
+        assert_ne!(new_cube.id.to_string(), target_cube_uuid);
+        assert_ne!(new_nested_target.id.to_string(), nested_target_uuid);
+        assert_eq!(
+            new_cam
+                .constraints
+                .track_to
+                .as_ref()
+                .map(|t| t.target_id.as_str()),
+            Some(new_cube.id.to_string().as_str())
+        );
+        assert_eq!(
+            new_nested_follower
+                .constraints
+                .follow
+                .as_ref()
+                .map(|f| f.target_id.as_str()),
+            Some(new_nested_target.id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn pz_round_trip_preserves_sequence_background_color_and_marker_colors() {
+        let mut proj = Project::new_cm3_default();
+        proj.name = "BG & Markers".to_owned();
+        let bg = [15.0 / 255.0, 20.0 / 255.0, 36.0 / 255.0, 1.0];
+        proj.sequence.background_color = bg;
+        proj.sequence.markers = vec![
+            crate::model::Marker {
+                frame: 12.0,
+                label: "Intro Hit".to_owned(),
+            },
+            crate::model::Marker {
+                frame: 48.0,
+                label: "Drop".to_owned(),
+            },
+        ];
+        proj.sequence
+            .preserved
+            .insert("markerColors".to_owned(), json!(["#ff3366", "#22cc88"]));
+
+        // Also attach a precomposition with its own background_color & marker colors.
+        let sub_bg = [0.25, 0.1, 0.4, 1.0];
+        let mut sub = Sequence {
+            name: "SubComp".to_owned(),
+            background_color: sub_bg,
+            ..Sequence::default()
+        };
+        sub.markers.push(crate::model::Marker {
+            frame: 15.0,
+            label: "Cue".to_owned(),
+        });
+        sub.preserved
+            .insert("markerColors".to_owned(), json!(["#ffaa00"]));
+        let sub_id = sub.id;
+        proj.compositions.insert(sub_id, sub);
+        proj.composition_ids.insert("comp-sub".to_owned(), sub_id);
+
+        let pz_bytes = export_pz_to_bytes(&proj).expect("export .pz");
+        let reimported = import_pz_from_bytes(&pz_bytes).expect("import .pz");
+
+        for i in 0..4 {
+            assert!(
+                (reimported.project.sequence.background_color[i] - bg[i]).abs() < 1e-5,
+                "main sequence background_color[{i}] mismatch: got {:?}, expected {bg:?}",
+                reimported.project.sequence.background_color
+            );
+        }
+        assert_eq!(reimported.project.sequence.markers.len(), 2);
+        assert_eq!(reimported.project.sequence.markers[0].label, "Intro Hit");
+        assert_eq!(reimported.project.sequence.markers[1].label, "Drop");
+        assert_eq!(
+            reimported.project.sequence.preserved.get("markerColors"),
+            Some(&json!(["#ff3366", "#22cc88"]))
+        );
+
+        let sub_rt = reimported
+            .project
+            .compositions
+            .values()
+            .next()
+            .expect("reimported subcomp");
+        for i in 0..4 {
+            assert!(
+                (sub_rt.background_color[i] - sub_bg[i]).abs() < 1e-5,
+                "subcomp background_color[{i}] mismatch: got {:?}, expected {sub_bg:?}",
+                sub_rt.background_color
+            );
+        }
+        assert_eq!(sub_rt.markers.len(), 1);
+        assert_eq!(sub_rt.markers[0].label, "Cue");
+        assert_eq!(
+            sub_rt.preserved.get("markerColors"),
+            Some(&json!(["#ffaa00"]))
+        );
+    }
+
+    #[test]
+    fn qa6_pz_roundtrip_shader_type3_color_ambient_light_precomp_media_control_id_shape_plus_node_graph_and_bit8_256()
+     {
+        let mut proj = Project::new_cm3_default();
+        proj.name = "QA6 Round-Trip".to_owned();
+
+        // 1. CustomShader with Color uniforms (`prop_type: Some(3)` and `Some(4)`)
+        let mut shader_fx = create_custom_shader(
+            "TintShader",
+            "uniform sampler2D tDiffuse; uniform vec3 Tint3; uniform vec3 Tint4; void main() { gl_FragColor = vec4(Tint3 * Tint4, 1.0); }",
+        );
+        if let EffectKind::CustomShader {
+            ref mut custom_properties,
+            ..
+        } = shader_fx.kind
+        {
+            custom_properties.push(CustomProperty {
+                name: "Tint3".to_owned(),
+                prop_type: Some(3),
+                track: PropertyTrack::color([0.2, 0.7, 0.9]),
+                metadata: BTreeMap::new(),
+            });
+            custom_properties.push(CustomProperty {
+                name: "Tint4".to_owned(),
+                prop_type: Some(4),
+                track: PropertyTrack::color([0.9, 0.1, 0.4]),
+                metadata: BTreeMap::new(),
+            });
+        }
+        proj.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .push(shader_fx);
+
+        // 2. LightKind::Ambient + clean NodeMaterial graph + bit-8 Hold keyframe (`tween: 256`)
+        let ambient_light = Object3D::new(
+            "Ambient",
+            Object3DKind::Light(Box::new(LightData::for_kind(LightKind::Ambient))),
+        );
+        let clean_graph = json!({
+            "nodes": [
+                { "id": "n1", "type": "color", "params": { "color": [0.1, 0.5, 0.9] } },
+                { "id": "out", "type": "pbrOutput" }
+            ],
+            "links": [
+                { "from": "n1", "fromPort": "out", "to": "out", "toPort": "baseColor" }
+            ]
+        });
+        let mut node_box = Object3D::new_shape_3d(
+            "NodeBox",
+            Shape3DKind::Box {
+                size: [10.0, 10.0, 10.0],
+            },
+        );
+        node_box.material = Some(MaterialSpec::NodeMaterial {
+            schema_version: 1,
+            resolution: 512,
+            graph: clean_graph.clone(),
+        });
+        // Keyframe with `tween: 256, easing_index: 0, is_bezier: true` + custom control points.
+        proj.sequence.video_tracks[0].clips[0].layer.opacity = PropertyTrack {
+            animated: true,
+            expression: None,
+            static_behavior: crate::StaticBehavior::Constant,
+            value: PropertyValue::Number(1.0),
+            keyframes: vec![
+                PropertyKeyframe {
+                    frame: 0.0,
+                    value: PropertyValue::Number(1.0),
+                    tween: 256,
+                    easing_index: 0,
+                    is_bezier: true,
+                    control_points: [[-4.0, 1.5], [6.0, -2.5]],
+                    continuous_tangent: true,
+                },
+                PropertyKeyframe::linear(30.0, PropertyValue::Number(0.25)),
+            ],
+            channels: Vec::new(),
+        };
+        if let LayerKind::Scene3D {
+            ref mut objects, ..
+        } = proj.sequence.video_tracks[0].clips[0].layer.kind
+        {
+            objects.push(ambient_light);
+            objects.push(node_box);
+        }
+
+        // 3. SequenceControl with custom ID
+        proj.sequence.controls.push(SequenceControl {
+            id: "ctl_custom_hero".to_owned(),
+            name: "Hero Slider".to_owned(),
+            kind: SequenceControlKind::Slider,
+            track: PropertyTrack::number(42.0),
+            preserved: BTreeMap::new(),
+        });
+
+        // 4. Shape+ layer with `payload.version`
+        let shape_plus_clip = VideoClip {
+            id: Uuid::new_v4(),
+            name: "ShapePlus".to_owned(),
+            start: 60.0,
+            length: 60.0,
+            link: None,
+            media: None,
+            time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+            layer: Layer::new(
+                "ShapePlus",
+                LayerKind::Plugin {
+                    plugin_type: "zoidium:shape-plus/shape-layer".to_owned(),
+                    payload: json!({
+                        "version": 2,
+                        "schemaVersion": 1,
+                        "contents": []
+                    }),
+                },
+                [1920, 1080],
+            ),
+            preserved: BTreeMap::new(),
+        };
+        proj.sequence.video_tracks[0].clips.push(shape_plus_clip);
+
+        // 5. Precomp+ composition (must NOT leak spurious `('PrecompName', 'misc', None)` into `media`)
+        let sub = Sequence {
+            name: "PrecompName".to_owned(),
+            ..Sequence::default()
+        };
+        let sub_id = sub.id;
+        proj.compositions.insert(sub_id, sub);
+        proj.composition_ids
+            .insert("comp-precomp-1".to_owned(), sub_id);
+        proj.media.clear();
+
+        let pz_bytes = export_pz_to_bytes(&proj).expect("export qa6 .pz");
+        let reimported = import_pz_from_bytes(&pz_bytes).expect("reimport qa6 .pz");
+        let rp = reimported.project;
+
+        // Shader colors preserved as PropertyValue::Color (NOT Vec3/Vec4)
+        let fx = &rp.sequence.video_tracks[0].clips[0].layer.effects[0];
+        let EffectKind::CustomShader {
+            ref custom_properties,
+            ..
+        } = fx.kind
+        else {
+            panic!("expected CustomShader");
+        };
+        assert_eq!(
+            custom_properties[0].track.value,
+            PropertyValue::Color([0.2, 0.7, 0.9])
+        );
+        assert_eq!(
+            custom_properties[1].track.value,
+            PropertyValue::Color([0.9, 0.1, 0.4])
+        );
+
+        // Ambient light stays Ambient (never Hemisphere) & NodeMaterial graph stays clean
+        let LayerKind::Scene3D { ref objects, .. } =
+            rp.sequence.video_tracks[0].clips[0].layer.kind
+        else {
+            panic!("expected Scene3D");
+        };
+        let amb = objects
+            .iter()
+            .find(|o| o.name == "Ambient")
+            .expect("ambient light");
+        assert!(matches!(
+            amb.kind,
+            Object3DKind::Light(ref l) if l.kind == LightKind::Ambient
+        ));
+        let nb = objects
+            .iter()
+            .find(|o| o.name == "NodeBox")
+            .expect("node box");
+        let Some(MaterialSpec::NodeMaterial {
+            resolution,
+            ref graph,
+            ..
+        }) = nb.material
+        else {
+            panic!("expected NodeMaterial");
+        };
+        assert_eq!(resolution, 512);
+        assert_eq!(graph, &clean_graph);
+        assert!(graph.get("properties").is_none());
+        assert!(graph.get("type").is_none());
+        assert!(graph.get("zoidiumUvMode").is_none());
+
+        // Precomp did not leak into project.media
+        assert!(
+            rp.media.is_empty(),
+            "Precomp+ composition must not leak into project.media: {:?}",
+            rp.media
+        );
+
+        // SequenceControl.id preserved
+        assert_eq!(rp.sequence.controls[0].id, "ctl_custom_hero");
+
+        // Shape+ payload.version preserved
+        let sp_clip = &rp.sequence.video_tracks[0].clips[1];
+        let LayerKind::Plugin { ref payload, .. } = sp_clip.layer.kind else {
+            panic!("expected Shape+ Plugin layer");
+        };
+        assert_eq!(payload.get("version"), Some(&json!(2)));
+
+        // bit-8 Hold keyframe `tween: 256` NOT rewritten to `257`, custom control points preserved
+        let kf0 = &rp.sequence.video_tracks[0].clips[0].layer.opacity.keyframes[0];
+        assert_eq!(kf0.tween, 256);
+        assert_eq!(kf0.easing_index, 0);
+        assert!(!kf0.is_bezier);
+        assert_eq!(kf0.control_points, [[-4.0, 1.5], [6.0, -2.5]]);
     }
 }

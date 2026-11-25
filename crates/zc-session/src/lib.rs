@@ -5,6 +5,7 @@ pub mod control;
 pub mod history;
 mod plugin_defaults;
 mod pro_commands;
+mod pz_clipboard;
 pub mod selection;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -84,6 +85,41 @@ impl From<SessionError> for ControlError {
     fn from(err: SessionError) -> Self {
         Self::new(err.code(), err.to_string())
     }
+}
+
+/// Builds a [`SessionError::TrackLocked`] error displaying the human-readable track name
+/// (falling back to the track ID only when the track has no name).
+#[must_use]
+pub(crate) fn track_locked_error(name: &str, id: &str) -> SessionError {
+    let trimmed = name.trim();
+    let label = if trimmed.is_empty() { id } else { trimmed };
+    SessionError::TrackLocked(label.to_owned())
+}
+
+fn json_value_type_name(val: &Value) -> &'static str {
+    match val {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn is_valid_namespaced_plugin_effect_id(kind: &str) -> bool {
+    let trimmed = kind.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let Some(rest) = lower
+        .strip_prefix("zoidium:")
+        .or_else(|| lower.strip_prefix("zoidcraft:"))
+    else {
+        return false;
+    };
+    let Some((ns, effect_id)) = rest.split_once('/') else {
+        return false;
+    };
+    !ns.trim().is_empty() && !effect_id.trim().is_empty()
 }
 
 // ---------------------------------------------------------------------------
@@ -2547,6 +2583,13 @@ fn default_clip_properties(
                 SessionProperty::static_value_with_kind(json!("text"), SessionValueKind::Text),
             );
             properties.insert(
+                "font".to_string(),
+                SessionProperty::static_value_with_kind(
+                    json!("Geist-Regular.ttf"),
+                    SessionValueKind::Text,
+                ),
+            );
+            properties.insert(
                 "fontSize".to_string(),
                 SessionProperty::static_value_with_kind(json!(72), SessionValueKind::Number),
             );
@@ -3035,19 +3078,19 @@ impl SessionDocument {
             for clip in &mut track.clips {
                 if clip.id == target_id {
                     if track.locked {
-                        return Err(SessionError::TrackLocked(track.id.clone()));
+                        return Err(track_locked_error(&track.name, &track.id));
                     }
                     return Ok(&mut clip.properties);
                 }
                 if let Some(obj) = clip.objects_3d.iter_mut().find(|o| o.id == target_id) {
                     if track.locked {
-                        return Err(SessionError::TrackLocked(track.id.clone()));
+                        return Err(track_locked_error(&track.name, &track.id));
                     }
                     return Ok(&mut obj.properties);
                 }
                 if let Some(fx) = clip.effects.iter_mut().find(|e| e.id == target_id) {
                     if track.locked {
-                        return Err(SessionError::TrackLocked(track.id.clone()));
+                        return Err(track_locked_error(&track.name, &track.id));
                     }
                     return Ok(&mut fx.properties);
                 }
@@ -3149,6 +3192,10 @@ pub struct SessionSnapshot {
     pub project: zc_project::Project,
     pub document: SessionDocument,
     pub selection: SelectionState,
+    /// Enabled plugin IDs captured atomically with this snapshot so Undo/Redo restores
+    /// plugin auto-enablement (e.g. `precomp-plus` on `PrecomposeClips`/`CreateComposition`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled_plugins: Option<BTreeSet<String>>,
     /// Content-addressed SHA-256 blob references (`asset_key -> content_sha256`) for
     /// assets whose binary buffers were deduplicated out of `project.assets` into
     /// `Session.asset_blobs`. Assets absent from this map had `bytes == None` at
@@ -3169,6 +3216,11 @@ impl ByteSized for SessionSnapshot {
             .fold(0usize, usize::saturating_add);
         let doc_bytes = serde_json::to_vec(&self.document).map_or(0, |b| b.len());
         let sel_bytes = serde_json::to_vec(&self.selection).map_or(0, |b| b.len());
+        let plugin_bytes = self.enabled_plugins.as_ref().map_or(0, |set| {
+            set.iter()
+                .map(String::len)
+                .fold(0usize, usize::saturating_add)
+        });
         let ref_bytes = self
             .asset_blob_refs
             .iter()
@@ -3178,6 +3230,7 @@ impl ByteSized for SessionSnapshot {
             .saturating_add(asset_blob_bytes)
             .saturating_add(doc_bytes)
             .saturating_add(sel_bytes)
+            .saturating_add(plugin_bytes)
             .saturating_add(ref_bytes)
     }
 }
@@ -3489,6 +3542,7 @@ impl Session {
             project: self.project.clone(),
             document: self.document.clone(),
             selection: self.selection.clone(),
+            enabled_plugins: Some(self.plugins.enabled_ids().clone()),
             asset_blob_refs: BTreeMap::new(),
         }
     }
@@ -3527,6 +3581,7 @@ impl Session {
             project: lightweight_project,
             document: self.document.clone(),
             selection: self.selection.clone(),
+            enabled_plugins: Some(self.plugins.enabled_ids().clone()),
             asset_blob_refs,
         }
     }
@@ -3593,18 +3648,28 @@ impl Session {
                 .document
                 .find_clip_location(clip_id)
                 .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
-            let (src_locked, src_track_id, clip_len) = match src_kind {
+            let (src_locked, src_track_name, src_track_id, clip_len) = match src_kind {
                 TrackKind::Video => {
                     let t = &self.document.video_tracks[src_track_idx];
-                    (t.locked, t.id.clone(), t.clips[src_clip_idx].length)
+                    (
+                        t.locked,
+                        t.name.clone(),
+                        t.id.clone(),
+                        t.clips[src_clip_idx].length,
+                    )
                 }
                 TrackKind::Audio => {
                     let t = &self.document.audio_tracks[src_track_idx];
-                    (t.locked, t.id.clone(), t.clips[src_clip_idx].length)
+                    (
+                        t.locked,
+                        t.name.clone(),
+                        t.id.clone(),
+                        t.clips[src_clip_idx].length,
+                    )
                 }
             };
             if src_locked {
-                return Err(SessionError::TrackLocked(src_track_id));
+                return Err(track_locked_error(&src_track_name, &src_track_id));
             }
             let (dest_kind, dest_track_idx) = if let Some(idx) = self
                 .document
@@ -3612,8 +3677,9 @@ impl Session {
                 .iter()
                 .position(|t| t.id == *dest_track_id)
             {
-                if self.document.video_tracks[idx].locked {
-                    return Err(SessionError::TrackLocked(dest_track_id.clone()));
+                let t = &self.document.video_tracks[idx];
+                if t.locked {
+                    return Err(track_locked_error(&t.name, &t.id));
                 }
                 (TrackKind::Video, idx)
             } else if let Some(idx) = self
@@ -3622,8 +3688,9 @@ impl Session {
                 .iter()
                 .position(|t| t.id == *dest_track_id)
             {
-                if self.document.audio_tracks[idx].locked {
-                    return Err(SessionError::TrackLocked(dest_track_id.clone()));
+                let t = &self.document.audio_tracks[idx];
+                if t.locked {
+                    return Err(track_locked_error(&t.name, &t.id));
                 }
                 (TrackKind::Audio, idx)
             } else {
@@ -3820,11 +3887,27 @@ impl Session {
     /// Returns a deterministic JSON inspection payload for GUI, CLI, tests, and MCP tools.
     #[must_use]
     pub fn inspect_state(&self) -> Value {
+        let compositions: Vec<Value> = self
+            .project
+            .compositions
+            .iter()
+            .map(|(id, seq)| {
+                json!({
+                    "id": id.to_string(),
+                    "name": seq.name,
+                    "width": seq.resolution[0],
+                    "height": seq.resolution[1],
+                    "fps": seq.fps,
+                })
+            })
+            .collect();
         json!({
             "project_name": self.document.project_name,
             "resolution": self.document.resolution,
             "fps": self.document.fps,
             "sequence_length": self.document.sequence_length,
+            "active_composition_id": self.document.active_composition_id.map(|id| id.to_string()),
+            "compositions": compositions,
             "video_tracks": self.document.video_tracks,
             "audio_tracks": self.document.audio_tracks,
             "sequence_properties": self.document.sequence_properties,
@@ -3854,7 +3937,8 @@ impl Session {
     /// for mutating project commands.
     pub fn execute(&mut self, command: Command) -> Result<Value, SessionError> {
         let label = command.id();
-        if command.is_undoable() {
+        let records_undo = command.is_undoable();
+        if records_undo {
             let before = if self.history.is_in_transaction() {
                 None
             } else {
@@ -3919,6 +4003,7 @@ impl Session {
     }
 
     fn restore_snapshot(&mut self, mut snapshot: SessionSnapshot) {
+        let prev_active_comp = self.document.active_composition_id;
         // Rehydrate ONLY assets explicitly recorded in `asset_blob_refs` (preserving
         // exact content-addressed versions and leaving originally-`None` assets as `None`).
         for (asset_key, blob_digest) in &snapshot.asset_blob_refs {
@@ -3932,6 +4017,35 @@ impl Session {
         self.project = snapshot.project;
         self.document = snapshot.document;
         self.selection = snapshot.selection;
+        if let Some(enabled_plugins) = snapshot.enabled_plugins {
+            let prev_enabled = self.plugins.enabled_ids().clone();
+            let mut settings = self.plugins.export_settings();
+            settings.enabled_plugins = enabled_plugins;
+            self.plugins.apply_settings(&settings);
+            if *self.plugins.enabled_ids() != prev_enabled {
+                self.plugin_revision = self.plugin_revision.saturating_add(1);
+            }
+        }
+        // Preserve pure view navigation (`active_composition_id`) across unrelated Undo/Redo
+        // whenever the currently viewed composition still exists in the restored project.
+        if prev_active_comp != self.document.active_composition_id {
+            let target_comp =
+                prev_active_comp.filter(|id| self.project.compositions.contains_key(id));
+            if target_comp != self.document.active_composition_id {
+                let target_seq = match target_comp {
+                    None => self.project.sequence.clone(),
+                    Some(id) => self
+                        .project
+                        .compositions
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| self.project.sequence.clone()),
+                };
+                self.document =
+                    SessionDocument::from_sequence(&self.project, &target_seq, target_comp);
+                self.selection.clear_all();
+            }
+        }
         self.prev_doc_plugin_deps = self.document.collect_plugin_dependencies();
         self.record_snapshot_ids();
         let max_frame = (self.document.sequence_length - 1.0).max(0.0);
@@ -4623,9 +4737,9 @@ impl Session {
                 Ok(json!({ "fps": self.document.fps }))
             }
             Command::SetSequenceLength { frames } => {
-                if !frames.is_finite() || frames < 0.0 {
+                if !frames.is_finite() || frames <= 0.0 || frames > 1_000_000.0 {
                     return Err(SessionError::InvalidArgument(format!(
-                        "sequence length {frames} must be a non-negative finite number"
+                        "sequence length {frames} must be a finite number in (0, 1000000]"
                     )));
                 }
                 self.document.sequence_length = frames;
@@ -4800,8 +4914,9 @@ impl Session {
                     .iter()
                     .position(|t| t.id == track_id)
                 {
-                    if self.document.video_tracks[idx].locked {
-                        return Err(SessionError::TrackLocked(track_id));
+                    let t = &self.document.video_tracks[idx];
+                    if t.locked {
+                        return Err(track_locked_error(&t.name, &t.id));
                     }
                     self.document.video_tracks.remove(idx)
                 } else if let Some(idx) = self
@@ -4810,8 +4925,9 @@ impl Session {
                     .iter()
                     .position(|t| t.id == track_id)
                 {
-                    if self.document.audio_tracks[idx].locked {
-                        return Err(SessionError::TrackLocked(track_id));
+                    let t = &self.document.audio_tracks[idx];
+                    if t.locked {
+                        return Err(track_locked_error(&t.name, &t.id));
                     }
                     self.document.audio_tracks.remove(idx)
                 } else {
@@ -4870,8 +4986,9 @@ impl Session {
                     .iter()
                     .position(|t| t.id == track_id)
                 {
-                    if self.document.video_tracks[idx].locked {
-                        return Err(SessionError::TrackLocked(track_id));
+                    let t = &self.document.video_tracks[idx];
+                    if t.locked {
+                        return Err(track_locked_error(&t.name, &t.id));
                     }
                     (TrackKind::Video, idx)
                 } else if let Some(idx) = self
@@ -4880,28 +4997,75 @@ impl Session {
                     .iter()
                     .position(|t| t.id == track_id)
                 {
-                    if self.document.audio_tracks[idx].locked {
-                        return Err(SessionError::TrackLocked(track_id));
+                    let t = &self.document.audio_tracks[idx];
+                    if t.locked {
+                        return Err(track_locked_error(&t.name, &t.id));
                     }
                     (TrackKind::Audio, idx)
                 } else {
                     return Err(SessionError::NotFound(format!("track '{track_id}'")));
                 };
 
-                let is_audio_clip = kind == "audio";
+                let raw_kind = kind.trim();
+                let raw_lower = raw_kind.to_ascii_lowercase();
+                let is_audio_clip = raw_lower == "audio";
+                let valid_video_kind = matches!(
+                    raw_lower.as_str(),
+                    "video"
+                        | "image"
+                        | "adjustment"
+                        | "composite"
+                        | "scene"
+                        | "scene_3d"
+                        | "scene3d"
+                        | "generator"
+                        | "color"
+                        | "solid"
+                        | "shape"
+                        | "shape2d"
+                        | "shape_2d"
+                        | "shape_layer"
+                        | "text"
+                        | "text_2d"
+                        | "text2d"
+                        | "preset_shape"
+                        | "presetshape"
+                        | "camera"
+                        | "camera_layer"
+                        | "precomp"
+                        | "shape_plus"
+                ) || is_valid_namespaced_plugin_effect_id(raw_kind);
+                if !is_audio_clip && !valid_video_kind {
+                    return Err(SessionError::InvalidArgument(format!(
+                        "unknown clip kind '{kind}'"
+                    )));
+                }
                 if (track_kind == TrackKind::Audio) != is_audio_clip {
                     return Err(SessionError::InvalidOperation(format!(
                         "clip kind '{kind}' is incompatible with {track_kind:?} track '{track_id}'"
                     )));
                 }
 
-                let kind = match kind.as_str() {
+                let kind = match raw_lower.as_str() {
                     "shape2d" | "shape_2d" => "shape".to_owned(),
                     "text2d" => "text_2d".to_owned(),
                     "precomp" => "zoidium:precomp-plus/precomp".to_owned(),
-                    "shape_plus" => "zoidium:shape-plus/shape-layer".to_owned(),
-                    _ => kind,
+                    "shape_plus" | "zoidium:shape-plus/layer" => {
+                        "zoidium:shape-plus/shape-layer".to_owned()
+                    }
+                    "camera" | "camera_layer" => "zoidium:camera-plus/camera-layer".to_owned(),
+                    "presetshape" => "preset_shape".to_owned(),
+                    _ => raw_kind.to_owned(),
                 };
+                // Auto-enable required built-in plugin atomically inside this undo snapshot.
+                if let Some(plugin_id) = kind
+                    .strip_prefix("zoidium:")
+                    .or_else(|| kind.strip_prefix("zoidcraft:"))
+                    .and_then(|rest| rest.split_once('/').map(|(p, _)| p))
+                    .filter(|p| !p.is_empty())
+                {
+                    let _ = self.enable_plugin_requirement(plugin_id);
+                }
                 let clip_id = self.alloc_uuid_id();
                 let clip_name = name.unwrap_or_else(|| kind.clone());
                 let fps = self.document.fps.max(1.0);
@@ -5003,7 +5167,7 @@ impl Session {
                     TrackKind::Audio => &self.document.audio_tracks[src_track_idx],
                 };
                 if src_track.locked {
-                    return Err(SessionError::TrackLocked(src_track.id.clone()));
+                    return Err(track_locked_error(&src_track.name, &src_track.id));
                 }
 
                 let dest_track_id = target_track_id.unwrap_or_else(|| src_track.id.clone());
@@ -5013,8 +5177,9 @@ impl Session {
                     .iter()
                     .position(|t| t.id == dest_track_id)
                 {
-                    if self.document.video_tracks[idx].locked {
-                        return Err(SessionError::TrackLocked(dest_track_id));
+                    let t = &self.document.video_tracks[idx];
+                    if t.locked {
+                        return Err(track_locked_error(&t.name, &t.id));
                     }
                     (TrackKind::Video, idx)
                 } else if let Some(idx) = self
@@ -5023,8 +5188,9 @@ impl Session {
                     .iter()
                     .position(|t| t.id == dest_track_id)
                 {
-                    if self.document.audio_tracks[idx].locked {
-                        return Err(SessionError::TrackLocked(dest_track_id));
+                    let t = &self.document.audio_tracks[idx];
+                    if t.locked {
+                        return Err(track_locked_error(&t.name, &t.id));
                     }
                     (TrackKind::Audio, idx)
                 } else {
@@ -5079,7 +5245,7 @@ impl Session {
                     TrackKind::Audio => &mut self.document.audio_tracks[track_idx],
                 };
                 if track.locked {
-                    return Err(SessionError::TrackLocked(track.id.clone()));
+                    return Err(track_locked_error(&track.name, &track.id));
                 }
                 let clip = &mut track.clips[clip_idx];
                 let adjust_time = !rate_stretch && !clip.time_animated;
@@ -5210,7 +5376,7 @@ impl Session {
                     TrackKind::Audio => &mut self.document.audio_tracks[track_idx],
                 };
                 if track.locked {
-                    return Err(SessionError::TrackLocked(track.id.clone()));
+                    return Err(track_locked_error(&track.name, &track.id));
                 }
                 let clip = &mut track.clips[clip_idx];
                 let adjust_time = !rate_stretch && !clip.time_animated;
@@ -5318,17 +5484,15 @@ impl Session {
                     TrackKind::Audio => &self.document.audio_tracks[track_idx],
                 };
                 if track.locked {
-                    return Err(SessionError::TrackLocked(track.id.clone()));
+                    return Err(track_locked_error(&track.name, &track.id));
                 }
                 let orig = &track.clips[clip_idx];
                 let local_offset = at_frame - orig.start;
                 // Spec 02 §2.7: strictly require 0 < local_offset < clip.length.
                 if local_offset <= 0.0 || local_offset >= orig.length {
-                    return Err(SessionError::InvalidOperation(format!(
-                        "split frame {at_frame} must lie strictly inside clip range ({}, {})",
-                        orig.start,
-                        orig.start + orig.length
-                    )));
+                    return Err(SessionError::InvalidOperation(
+                        "Move playhead inside the selected clip to split".to_owned(),
+                    ));
                 }
 
                 let t_split = orig.eval_time_at(local_offset);
@@ -5391,11 +5555,12 @@ impl Session {
                     TrackKind::Audio => &self.document.audio_tracks[track_idx],
                 };
                 if track.locked {
-                    return Err(SessionError::TrackLocked(track.id.clone()));
+                    return Err(track_locked_error(&track.name, &track.id));
                 }
 
                 let mut cloned = track.clips[clip_idx].clone();
                 let new_clip_id = self.alloc_uuid_id();
+                let cloned_kind = cloned.kind.clone();
                 cloned.source_clip_id = cloned
                     .source_clip_id
                     .clone()
@@ -5405,16 +5570,98 @@ impl Session {
                 self.remap_cloned_clip_children(&mut cloned);
 
                 let new_start = cloned.start;
-                match kind {
-                    TrackKind::Video => self.document.video_tracks[track_idx].clips.push(cloned),
-                    TrackKind::Audio => self.document.audio_tracks[track_idx].clips.push(cloned),
+                let new_end = new_start + cloned.length;
+                let range_overlaps_track = |t: &SessionTrack| {
+                    t.clips.iter().any(|c| {
+                        let c_end = c.start + c.length;
+                        c_end > new_start + 1e-6 && c.start < new_end - 1e-6
+                    })
+                };
+                let dest_track_idx = {
+                    let tracks = match kind {
+                        TrackKind::Video => &self.document.video_tracks,
+                        TrackKind::Audio => &self.document.audio_tracks,
+                    };
+                    if !range_overlaps_track(&tracks[track_idx]) {
+                        track_idx
+                    } else if let Some(idx) = ((track_idx + 1)..tracks.len())
+                        .chain(0..track_idx)
+                        .find(|&i| !tracks[i].locked && !range_overlaps_track(&tracks[i]))
+                    {
+                        idx
+                    } else {
+                        let new_track_id = self.alloc_uuid_id();
+                        match kind {
+                            TrackKind::Video => {
+                                let name = format!("V{}", self.document.video_tracks.len() + 1);
+                                self.document.video_tracks.push(SessionTrack {
+                                    id: new_track_id,
+                                    kind: TrackKind::Video,
+                                    name,
+                                    enabled: true,
+                                    solo: false,
+                                    locked: false,
+                                    is_3d: false,
+                                    clips: Vec::new(),
+                                });
+                                self.document.video_tracks.len() - 1
+                            }
+                            TrackKind::Audio => {
+                                let name = format!("A{}", self.document.audio_tracks.len() + 1);
+                                self.document.audio_tracks.push(SessionTrack {
+                                    id: new_track_id,
+                                    kind: TrackKind::Audio,
+                                    name,
+                                    enabled: true,
+                                    solo: false,
+                                    locked: false,
+                                    is_3d: false,
+                                    clips: Vec::new(),
+                                });
+                                self.document.audio_tracks.len() - 1
+                            }
+                        }
+                    }
+                };
+                let dest_track_id = match kind {
+                    TrackKind::Video => {
+                        let t = &mut self.document.video_tracks[dest_track_idx];
+                        t.clips.push(cloned);
+                        t.clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+                        t.id.clone()
+                    }
+                    TrackKind::Audio => {
+                        let t = &mut self.document.audio_tracks[dest_track_idx];
+                        t.clips.push(cloned);
+                        t.clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+                        t.id.clone()
+                    }
+                };
+
+                // Select newly created duplicate(s) (preserving multi-duplicate selection inside transactions).
+                if self.history.is_in_transaction()
+                    && self.selection.clip_ids.len() > 1
+                    && let Some(pos) = self.selection.clip_ids.iter().position(|id| id == &clip_id)
+                {
+                    self.selection.clip_ids[pos] = new_clip_id.clone();
+                    self.selection.clear_objects_3d();
+                    self.selection.clear_effects();
+                    self.selection.clear_keyframes();
+                } else {
+                    let base_type = self.selection.clip_base_type.clone().or(Some(cloned_kind));
+                    let _ = self.selection.select_clip(
+                        new_clip_id.clone(),
+                        base_type.as_deref(),
+                        false,
+                    );
                 }
-                self.resolve_track_overlaps(kind, track_idx, &new_clip_id);
+
                 self.document.recompute_sequence_length_if_extended();
                 self.playback.bump_epoch();
                 Ok(json!({
                     "clip_id": new_clip_id,
                     "source_clip_id": clip_id,
+                    "track_id": dest_track_id,
                     "start": new_start,
                 }))
             }
@@ -5428,7 +5675,7 @@ impl Session {
                     TrackKind::Audio => &mut self.document.audio_tracks[track_idx],
                 };
                 if track_mut.locked {
-                    return Err(SessionError::TrackLocked(track_mut.id.clone()));
+                    return Err(track_locked_error(&track_mut.name, &track_mut.id));
                 }
                 let removed = track_mut.clips.remove(clip_idx);
                 self.prune_clip_selection(&removed);
@@ -5449,7 +5696,7 @@ impl Session {
                         .find_clip_mut(&clip_id)
                         .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                     if track.locked {
-                        return Err(SessionError::TrackLocked(track.id.clone()));
+                        return Err(track_locked_error(&track.name, &track.id));
                     }
                     if track.kind != TrackKind::Video || track.clips[clip_idx].kind != "scene" {
                         return Err(SessionError::InvalidOperation(format!(
@@ -5483,7 +5730,8 @@ impl Session {
                     .find_clip_mut(&clip_id)
                     .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                 let clip = &mut track.clips[clip_idx];
-                let obj_name = name.unwrap_or_else(|| canonical_kind.clone());
+                let base_name = name.unwrap_or_else(|| canonical_kind.clone());
+                let obj_name = unique_object_3d_name(&clip.objects_3d, &base_name);
                 let mut properties = BTreeMap::new();
                 properties.insert(
                     "position".to_string(),
@@ -5505,7 +5753,10 @@ impl Session {
                     "text" | "text_3d" => {
                         properties.insert(
                             "text".to_string(),
-                            SessionProperty::static_value(json!("text")),
+                            SessionProperty::static_value_with_kind(
+                                json!("text"),
+                                SessionValueKind::Text,
+                            ),
                         );
                         properties.insert(
                             "height".to_string(),
@@ -5570,6 +5821,24 @@ impl Session {
                                 _ => 0,
                             }
                         };
+                        if matches!(lkind, 0..=2) {
+                            properties.insert(
+                                "position".to_string(),
+                                SessionProperty::static_value_with_kind(
+                                    json!([25.0, 35.0, 55.0]),
+                                    SessionValueKind::Vec3,
+                                ),
+                            );
+                        }
+                        if matches!(lkind, 0 | 2) {
+                            properties.insert(
+                                "target".to_string(),
+                                SessionProperty::static_value_with_kind(
+                                    json!([0.0, 0.0, 0.0]),
+                                    SessionValueKind::Vec3,
+                                ),
+                            );
+                        }
                         properties.insert(
                             "light.kind".to_string(),
                             SessionProperty::static_value(json!(lkind)),
@@ -5596,7 +5865,7 @@ impl Session {
                         );
                         properties.insert(
                             "shadowBias".to_string(),
-                            SessionProperty::static_value(json!(0.0)),
+                            SessionProperty::static_value(json!(0.002)),
                         );
                     }
                     k if is_3d_trapcode_kind(k) => {
@@ -5701,6 +5970,13 @@ impl Session {
                                 SessionValueKind::Vec3,
                             ),
                         );
+                        properties.insert(
+                            "particles.blending".to_string(),
+                            SessionProperty::static_value_with_kind(
+                                json!(p.blending),
+                                SessionValueKind::Option,
+                            ),
+                        );
                         if let Some(preset) = p.sprite_preset {
                             properties.insert(
                                 "particles.spritePreset".to_string(),
@@ -5715,6 +5991,112 @@ impl Session {
                     k if (k.starts_with("zoidium:") || k.starts_with("zoidcraft:"))
                         && !k.starts_with("zoidium:geometry-plus/") => {}
                     _ => {
+                        match canonical_kind.as_str() {
+                            "box" | "shape.box" => {
+                                properties.insert(
+                                    "box_size".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([10.0, 10.0, 10.0]),
+                                        SessionValueKind::Vec3,
+                                    ),
+                                );
+                            }
+                            "sphere" | "shape.sphere" => {
+                                properties.insert(
+                                    "sphere_size".to_string(),
+                                    SessionProperty::static_value(json!(5.0)),
+                                );
+                                properties.insert(
+                                    "sphere_detail".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([24.0, 16.0]),
+                                        SessionValueKind::Vec2,
+                                    ),
+                                );
+                            }
+                            "cylinder" | "shape.cylinder" => {
+                                properties.insert(
+                                    "cylinder_size".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([5.0, 5.0, 10.0]),
+                                        SessionValueKind::Vec3,
+                                    ),
+                                );
+                                properties.insert(
+                                    "cylinder_detail".to_string(),
+                                    SessionProperty::static_value(json!(24)),
+                                );
+                                // CM3 polarity: 0 => open_ended = true, 1 => closed (open_ended = false).
+                                properties.insert(
+                                    "cylinder_openEnded".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!(1),
+                                        SessionValueKind::Option,
+                                    ),
+                                );
+                            }
+                            "rectangle" | "shape.rectangle" => {
+                                properties.insert(
+                                    "rect_size".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([10.0, 10.0]),
+                                        SessionValueKind::Vec2,
+                                    ),
+                                );
+                            }
+                            "circle" | "shape.circle" => {
+                                properties.insert(
+                                    "circle_size".to_string(),
+                                    SessionProperty::static_value(json!(5.0)),
+                                );
+                                properties.insert(
+                                    "circle_detail".to_string(),
+                                    SessionProperty::static_value(json!(32)),
+                                );
+                            }
+                            "donut" | "shape.donut" => {
+                                properties.insert(
+                                    "donut_size".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([5.0, 2.0]),
+                                        SessionValueKind::Vec2,
+                                    ),
+                                );
+                                properties.insert(
+                                    "donut_detail".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([16.0, 32.0]),
+                                        SessionValueKind::Vec2,
+                                    ),
+                                );
+                            }
+                            "wire" | "shape.wire" => {
+                                properties.insert(
+                                    "path_size".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([10.0, 10.0, 10.0]),
+                                        SessionValueKind::Vec3,
+                                    ),
+                                );
+                                properties.insert(
+                                    "path_thickness".to_string(),
+                                    SessionProperty::static_value(json!(0.6)),
+                                );
+                                properties.insert(
+                                    "path_loops".to_string(),
+                                    SessionProperty::static_value(json!(3)),
+                                );
+                                properties.insert(
+                                    "path_detail".to_string(),
+                                    SessionProperty::static_value(json!(24)),
+                                );
+                                properties.insert(
+                                    "path_innerDetail".to_string(),
+                                    SessionProperty::static_value(json!(12)),
+                                );
+                            }
+                            _ => {}
+                        }
                         if let Some(shape_idx) = poly_shape_opt {
                             properties.insert(
                                 "polyhedron.shape".to_string(),
@@ -5769,7 +6151,7 @@ impl Session {
                     .find_clip_mut(&clip_id)
                     .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                 if track.locked {
-                    return Err(SessionError::TrackLocked(track.id.clone()));
+                    return Err(track_locked_error(&track.name, &track.id));
                 }
                 let clip = &mut track.clips[clip_idx];
                 if !clip.objects_3d.iter().any(|o| o.id == object_id) {
@@ -5812,7 +6194,7 @@ impl Session {
                         .find_clip_mut(&clip_id)
                         .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                     if track.locked {
-                        return Err(SessionError::TrackLocked(track.id.clone()));
+                        return Err(track_locked_error(&track.name, &track.id));
                     }
                     let clip = &track.clips[clip_idx];
                     if !clip.objects_3d.iter().any(|o| o.id == object_id) {
@@ -5912,7 +6294,7 @@ impl Session {
                     .find_clip_mut(&clip_id)
                     .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                 if track.locked {
-                    return Err(SessionError::TrackLocked(track.id.clone()));
+                    return Err(track_locked_error(&track.name, &track.id));
                 }
                 let clip = &mut track.clips[clip_idx];
                 let pos = clip
@@ -5992,13 +6374,32 @@ impl Session {
                         .find_clip_mut(&clip_id)
                         .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                     if track.locked {
-                        return Err(SessionError::TrackLocked(track.id.clone()));
+                        return Err(track_locked_error(&track.name, &track.id));
                     }
                     if track.kind != TrackKind::Video {
                         return Err(SessionError::InvalidOperation(format!(
                             "cannot add effect to audio clip '{clip_id}'"
                         )));
                     }
+                }
+                let kind_trimmed = kind.trim();
+                let is_custom_shader = kind_trimmed.eq_ignore_ascii_case("customshader");
+                let is_effect_group = kind_trimmed.eq_ignore_ascii_case("group")
+                    || kind_trimmed.eq_ignore_ascii_case("effectgroup")
+                    || kind_trimmed.eq_ignore_ascii_case("effect_group");
+                let template = if is_custom_shader || is_effect_group {
+                    None
+                } else {
+                    zc_project::create_effect_by_id(kind_trimmed)
+                };
+                if !is_custom_shader
+                    && !is_effect_group
+                    && template.is_none()
+                    && !is_valid_namespaced_plugin_effect_id(kind_trimmed)
+                {
+                    return Err(SessionError::InvalidOperation(format!(
+                        "unknown effect kind '{kind}'"
+                    )));
                 }
                 let new_fx_id = self.alloc_uuid_id();
                 let (track, clip_idx) = self
@@ -6007,27 +6408,43 @@ impl Session {
                     .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                 let clip = &mut track.clips[clip_idx];
                 let fx_name = name.unwrap_or_else(|| {
-                    zc_project::find_effect_descriptor(
-                        kind.strip_prefix("zoidium:")
-                            .or_else(|| kind.strip_prefix("zoidcraft:"))
-                            .and_then(|rest| rest.split_once('/').map(|(_, e)| e))
-                            .unwrap_or(&kind),
-                    )
-                    .map_or_else(|| kind.clone(), |d| d.display_name.to_owned())
+                    if is_custom_shader {
+                        "Custom Shader".to_owned()
+                    } else if is_effect_group {
+                        "Effect Group".to_owned()
+                    } else {
+                        zc_project::find_effect_descriptor(
+                            kind_trimmed
+                                .strip_prefix("zoidium:")
+                                .or_else(|| kind_trimmed.strip_prefix("zoidcraft:"))
+                                .and_then(|rest| rest.split_once('/').map(|(_, e)| e))
+                                .unwrap_or(kind_trimmed),
+                        )
+                        .map_or_else(|| kind_trimmed.to_owned(), |d| d.display_name.to_owned())
+                    }
                 });
-                let mut resolved_kind = kind.clone();
+                let mut resolved_kind = if is_custom_shader {
+                    "customshader".to_owned()
+                } else if is_effect_group {
+                    "effectgroup".to_owned()
+                } else {
+                    kind_trimmed.to_owned()
+                };
                 let mut properties = BTreeMap::new();
                 properties.insert(
                     "enabled".to_string(),
                     SessionProperty::static_value(json!(1)),
                 );
-                if kind == "customshader" {
+                if is_custom_shader {
                     let default_frag = "uniform sampler2D tDiffuse;\nvarying vec2 vUv;\n\nvoid main() {\n    gl_FragColor = texture2D(tDiffuse, vUv);\n}\n";
                     properties.insert(
                         "fragShader".to_string(),
-                        SessionProperty::static_value(json!(default_frag)),
+                        SessionProperty::static_value_with_kind(
+                            json!(default_frag),
+                            SessionValueKind::Text,
+                        ),
                     );
-                } else if let Some(template) = zc_project::create_effect_by_id(&kind) {
+                } else if let Some(template) = template {
                     resolved_kind = effect_kind_to_session_id(&template.kind);
                     for (k, tr) in &template.params {
                         properties.insert(k.clone(), property_track_to_session(tr));
@@ -6040,6 +6457,23 @@ impl Session {
                     source_id: None,
                     properties,
                 });
+                // Auto-enable required built-in plugin atomically inside this undo snapshot
+                // (matching `clipboard.paste_pz_json`).
+                let required_plugin: Option<String> = if let Some(rest) = resolved_kind
+                    .strip_prefix("zoidium:")
+                    .or_else(|| resolved_kind.strip_prefix("zoidcraft:"))
+                {
+                    rest.split_once('/')
+                        .map(|(p, _)| p.to_owned())
+                        .filter(|p| !p.is_empty())
+                } else {
+                    zc_project::find_effect_descriptor(&resolved_kind)
+                        .and_then(|d| d.plugin_id)
+                        .map(str::to_owned)
+                };
+                if let Some(plugin_id) = required_plugin {
+                    let _ = self.enable_plugin_requirement(&plugin_id);
+                }
                 Ok(json!({
                     "clip_id": clip_id,
                     "effect_id": new_fx_id,
@@ -6053,7 +6487,7 @@ impl Session {
                     .find_clip_mut(&clip_id)
                     .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                 if track.locked {
-                    return Err(SessionError::TrackLocked(track.id.clone()));
+                    return Err(track_locked_error(&track.name, &track.id));
                 }
                 let clip = &mut track.clips[clip_idx];
                 let pos = clip
@@ -6077,7 +6511,7 @@ impl Session {
                     .find_clip_mut(&clip_id)
                     .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                 if track.locked {
-                    return Err(SessionError::TrackLocked(track.id.clone()));
+                    return Err(track_locked_error(&track.name, &track.id));
                 }
                 let clip = &mut track.clips[clip_idx];
                 let pos = clip
@@ -6107,7 +6541,7 @@ impl Session {
                     .find_clip_mut(&clip_id)
                     .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
                 if track.locked {
-                    return Err(SessionError::TrackLocked(track.id.clone()));
+                    return Err(track_locked_error(&track.name, &track.id));
                 }
                 let clip = &mut track.clips[clip_idx];
                 let pos = clip
@@ -6132,58 +6566,110 @@ impl Session {
                 value,
             } => {
                 // Keep structural `.name` in sync when inline rename writes `property == "name"`.
-                if property == "name"
-                    && let Some(new_name) = value.as_str().map(str::trim).filter(|s| !s.is_empty())
-                {
-                    let mut renamed = false;
-                    for track in self
-                        .document
-                        .video_tracks
-                        .iter_mut()
-                        .chain(self.document.audio_tracks.iter_mut())
-                    {
-                        for clip in &mut track.clips {
-                            if clip.id == target_id {
-                                if track.locked {
-                                    return Err(SessionError::TrackLocked(track.id.clone()));
+                if property == "name" {
+                    let Some(raw_name) = value.as_str() else {
+                        return Err(SessionError::InvalidArgument(format!(
+                            "property 'name' expects a string value, got {}",
+                            json_value_type_name(&value)
+                        )));
+                    };
+                    let new_name = raw_name.trim();
+                    if !new_name.is_empty() {
+                        let mut renamed = false;
+                        for track in self
+                            .document
+                            .video_tracks
+                            .iter_mut()
+                            .chain(self.document.audio_tracks.iter_mut())
+                        {
+                            for clip in &mut track.clips {
+                                if clip.id == target_id {
+                                    if track.locked {
+                                        return Err(track_locked_error(&track.name, &track.id));
+                                    }
+                                    clip.name = new_name.to_owned();
+                                    renamed = true;
+                                    break;
                                 }
-                                clip.name = new_name.to_owned();
-                                renamed = true;
-                                break;
+                                if let Some(obj) =
+                                    clip.objects_3d.iter_mut().find(|o| o.id == target_id)
+                                {
+                                    if track.locked {
+                                        return Err(track_locked_error(&track.name, &track.id));
+                                    }
+                                    obj.name = new_name.to_owned();
+                                    renamed = true;
+                                    break;
+                                }
+                                if let Some(fx) =
+                                    clip.effects.iter_mut().find(|e| e.id == target_id)
+                                {
+                                    if track.locked {
+                                        return Err(track_locked_error(&track.name, &track.id));
+                                    }
+                                    fx.name = new_name.to_owned();
+                                    renamed = true;
+                                    break;
+                                }
                             }
-                            if let Some(obj) =
-                                clip.objects_3d.iter_mut().find(|o| o.id == target_id)
-                            {
-                                if track.locked {
-                                    return Err(SessionError::TrackLocked(track.id.clone()));
-                                }
-                                obj.name = new_name.to_owned();
-                                renamed = true;
-                                break;
-                            }
-                            if let Some(fx) = clip.effects.iter_mut().find(|e| e.id == target_id) {
-                                if track.locked {
-                                    return Err(SessionError::TrackLocked(track.id.clone()));
-                                }
-                                fx.name = new_name.to_owned();
-                                renamed = true;
+                            if renamed {
                                 break;
                             }
                         }
                         if renamed {
-                            break;
+                            return Ok(json!({
+                                "target_id": target_id,
+                                "property": property,
+                                "value": new_name,
+                            }));
                         }
-                    }
-                    if renamed {
-                        return Ok(json!({
-                            "target_id": target_id,
-                            "property": property,
-                            "value": new_name,
-                        }));
                     }
                 }
 
                 let props = self.document.find_property_map_mut(&target_id)?;
+                let existing_kf = props.get(&property).and_then(|p| p.keyframes.first());
+                let existing_kind = existing_kf.and_then(|kf| kf.value_kind);
+                let existing_is_string = existing_kf.is_some_and(|kf| kf.value.is_string());
+                let is_nullable_asset_prop = existing_kind == Some(SessionValueKind::Asset)
+                    || matches!(
+                        property.as_str(),
+                        "assetId" | "font" | "texture" | "particles.texture"
+                    )
+                    || property.ends_with(".assetId");
+                let is_gradient_text_prop =
+                    matches!(property.as_str(), "particles.color" | "particles.size");
+                let is_string_prop = matches!(property.as_str(), "text" | "fragShader")
+                    || existing_kind == Some(SessionValueKind::Text)
+                    || (existing_is_string
+                        && !matches!(
+                            existing_kind,
+                            Some(
+                                SessionValueKind::Json
+                                    | SessionValueKind::Curve
+                                    | SessionValueKind::Gradient
+                                    | SessionValueKind::Asset
+                            )
+                        ));
+                if is_nullable_asset_prop {
+                    if !value.is_string() && !value.is_null() {
+                        return Err(SessionError::InvalidArgument(format!(
+                            "property '{property}' expects a string or null value, got {}",
+                            json_value_type_name(&value)
+                        )));
+                    }
+                } else if is_gradient_text_prop {
+                    if !value.is_string() && !value.is_array() {
+                        return Err(SessionError::InvalidArgument(format!(
+                            "property '{property}' expects a gradient JSON string or array, got {}",
+                            json_value_type_name(&value)
+                        )));
+                    }
+                } else if is_string_prop && !value.is_string() {
+                    return Err(SessionError::InvalidArgument(format!(
+                        "property '{property}' expects a string value, got {}",
+                        json_value_type_name(&value)
+                    )));
+                }
                 let entry = props
                     .entry(property.clone())
                     .or_insert_with(|| SessionProperty::static_value(value.clone()));
@@ -6515,7 +7001,7 @@ impl Session {
                 Ok(json!({
                     "disabled": disabled,
                     "blocked": blocked,
-                    "vanilla_cm3_mode": self.plugins.is_vanilla_cm3_mode(),
+                    "vanilla_cm3_mode": self.plugins.is_vanilla_cm3_mode() && active_deps.is_empty(),
                 }))
             }
 
@@ -6655,6 +7141,31 @@ impl Session {
                 bytes,
             } => self.exec_relink_asset(asset_id, filename, bytes),
             Command::PurgeUnusedAssets => self.exec_purge_unused_assets(),
+            Command::PastePzJson {
+                json,
+                hint,
+                target_clip_id,
+                parent_object_id,
+                target_object_id,
+                target_property,
+                at_frame,
+            } => self.exec_paste_pz_json(
+                &json,
+                hint.as_deref(),
+                target_clip_id.as_deref(),
+                parent_object_id.as_deref(),
+                target_object_id.as_deref(),
+                target_property.as_deref(),
+                at_frame,
+            ),
+            Command::CopyPzJson {
+                kind,
+                clip_id,
+                target_ids,
+                property,
+            } => {
+                self.exec_copy_pz_json(&kind, clip_id.as_deref(), &target_ids, property.as_deref())
+            }
         }
     }
 
@@ -7339,6 +7850,20 @@ fn parse_gradient_stops_from_session(
         return serde_json::from_str::<Vec<zc_project::GradientStop>>(s).ok();
     }
     serde_json::from_value::<Vec<zc_project::GradientStop>>(val.clone()).ok()
+}
+
+fn unique_object_3d_name(existing: &[SessionObject3D], base: &str) -> String {
+    if !existing.iter().any(|o| o.name == base) {
+        return base.to_owned();
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{base} {suffix}");
+        if !existing.iter().any(|o| o.name == candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
 }
 
 fn clamp_track_f64_range(track: &mut zc_project::PropertyTrack, min: f64, max: f64) {
@@ -9859,7 +10384,7 @@ mod tests {
         assert!((session.playback.current_frame - 42.0).abs() < 1e-9);
         assert_eq!(
             lines[3].result.as_ref().and_then(|v| v.get("count")),
-            Some(&json!(74))
+            Some(&json!(76))
         );
 
         // Malformed JSON and unknown commands return structured errors without panicking.
@@ -13041,5 +13566,974 @@ mod tests {
         assert_eq!(session.project.sequence.exact_fps, None);
         session.execute(Command::Undo).expect("undo snap to 30");
         assert_eq!(session.project.sequence.exact_fps, Some(29.97));
+    }
+
+    #[test]
+    fn qa_lights_particles_repeaters_split_letters_locks_playback_and_validation() {
+        let mut session = Session::new();
+        let vtrack_id = session.document().video_tracks[0].id.clone();
+        let scene_id = session.document().video_tracks[0].clips[0].id.clone();
+
+        // 1. Lights: camelCase normalization + useful default position + shadow_bias 0.002.
+        for (raw_kind, expected_kind, expects_offset, expects_target) in [
+            ("light", zc_project::LightKind::Spot, true, true),
+            ("spotLight", zc_project::LightKind::Spot, true, true),
+            ("SpotLight", zc_project::LightKind::Spot, true, true),
+            (
+                "directionalLight",
+                zc_project::LightKind::Directional,
+                true,
+                true,
+            ),
+            (
+                "DirectionalLight",
+                zc_project::LightKind::Directional,
+                true,
+                true,
+            ),
+            ("pointLight", zc_project::LightKind::Point, true, false),
+            ("PointLight", zc_project::LightKind::Point, true, false),
+            ("ambientLight", zc_project::LightKind::Ambient, false, false),
+            ("AmbientLight", zc_project::LightKind::Ambient, false, false),
+            (
+                "hemisphereLight",
+                zc_project::LightKind::Hemisphere,
+                false,
+                false,
+            ),
+            (
+                "HemisphereLight",
+                zc_project::LightKind::Hemisphere,
+                false,
+                false,
+            ),
+        ] {
+            let oid = session
+                .execute(Command::AddObject3D {
+                    clip_id: scene_id.clone(),
+                    parent_id: None,
+                    kind: raw_kind.to_owned(),
+                    name: None,
+                })
+                .unwrap_or_else(|e| panic!("add {raw_kind}: {e}"))["object_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let proj = session.to_project();
+            let zc_project::LayerKind::Scene3D { ref objects, .. } =
+                proj.sequence.video_tracks[0].clips[0].layer.kind
+            else {
+                panic!("expected Scene3D");
+            };
+            let obj = objects
+                .iter()
+                .find(|o| o.id.to_string() == oid)
+                .expect("light object");
+            let zc_project::Object3DKind::Light(ref light) = obj.kind else {
+                panic!("{raw_kind} must create Light, got {:?}", obj.kind);
+            };
+            assert_eq!(light.kind, expected_kind, "{raw_kind} light kind");
+            assert!(
+                (light.shadow_bias - 0.002).abs() < 1e-9,
+                "{raw_kind} shadow_bias"
+            );
+            if expects_offset {
+                assert_eq!(
+                    obj.position.value,
+                    zc_project::PropertyValue::Vec3([25.0, 35.0, 55.0]),
+                    "{raw_kind} default position"
+                );
+            }
+            if expects_target {
+                assert_eq!(
+                    light.target.value,
+                    zc_project::PropertyValue::Vec3([0.0, 0.0, 0.0]),
+                    "{raw_kind} default target"
+                );
+            }
+        }
+
+        // 2. Particles: crisp non-255 size gradient & normal blending.
+        let pid = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "particles".to_owned(),
+                name: None,
+            })
+            .expect("add particles")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let proj = session.to_project();
+        let zc_project::LayerKind::Scene3D { ref objects, .. } =
+            proj.sequence.video_tracks[0].clips[0].layer.kind
+        else {
+            panic!("expected Scene3D");
+        };
+        let pobj = objects
+            .iter()
+            .find(|o| o.id.to_string() == pid)
+            .expect("particles");
+        let zc_project::Object3DKind::Particles(ref pdata) = pobj.kind else {
+            panic!("expected Particles");
+        };
+        assert_eq!(pdata.size.len(), 2);
+        assert_eq!(pdata.size[0].color, "rgba(14,14,14,1.0)");
+        assert_eq!(pdata.size[1].color, "rgba(4,4,4,1.0)");
+        assert_eq!(pdata.blending, 0);
+
+        // 3. Radial & Grid Repeaters + aliases + zero-warning .pz round-trip.
+        for (raw_kind, canonical_kind, expected_key) in [
+            (
+                "zoidium:repeater/radial",
+                "zoidium:repeater/radial",
+                "radius",
+            ),
+            (
+                "radial-repeater",
+                "zoidium:repeater/radial",
+                "alignToCircle",
+            ),
+            ("zoidium:repeater/grid", "zoidium:repeater/grid", "countX"),
+            ("grid-repeater", "zoidium:repeater/grid", "spacing"),
+        ] {
+            let rid = session
+                .execute(Command::AddObject3D {
+                    clip_id: scene_id.clone(),
+                    parent_id: None,
+                    kind: raw_kind.to_owned(),
+                    name: None,
+                })
+                .expect("add repeater")["object_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let doc_obj = session.document().video_tracks[0].clips[0]
+                .objects_3d
+                .iter()
+                .find(|o| o.id == rid)
+                .expect("doc repeater");
+            assert_eq!(doc_obj.kind, canonical_kind);
+            assert!(
+                doc_obj.properties.contains_key(expected_key),
+                "{raw_kind} missing {expected_key}"
+            );
+            session
+                .execute(Command::AddObject3D {
+                    clip_id: scene_id.clone(),
+                    parent_id: Some(rid),
+                    kind: "box".to_owned(),
+                    name: Some("Child".to_owned()),
+                })
+                .expect("parent child under radial/grid repeater");
+        }
+        let pz_bytes = zc_project::export_pz_to_bytes(&session.to_project()).expect("export pz");
+        let reimported = zc_project::import_pz_from_bytes(&pz_bytes).expect("import pz");
+        assert!(
+            reimported.warnings.is_empty(),
+            "radial/grid repeater .pz round-trip must emit zero warnings, got {:?}",
+            reimported.warnings
+        );
+
+        // 4. Split into Letters: proportional advance ("WILL"), multiline "\n", auto-select group.
+        let txt_id = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "text_3d".to_owned(),
+                name: Some("Multiline".to_owned()),
+            })
+            .expect("add text")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: txt_id.clone(),
+                property: "text".to_owned(),
+                value: json!("WILL\nHI"),
+            })
+            .expect("set multiline text");
+        let split_res = session
+            .execute(Command::SplitText3DIntoLetters {
+                clip_id: zc_project::Uuid::parse_str(&scene_id).unwrap(),
+                object_id: zc_project::Uuid::parse_str(&txt_id).unwrap(),
+            })
+            .expect("split multiline");
+        let group_id = split_res["group_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            session.selection.object_3d_ids,
+            vec![group_id.clone()],
+            "splitting into letters must auto-select the created Text group"
+        );
+        let proj = session.to_project();
+        let zc_project::LayerKind::Scene3D { ref objects, .. } =
+            proj.sequence.video_tracks[0].clips[0].layer.kind
+        else {
+            panic!("expected Scene3D");
+        };
+        let grp = objects
+            .iter()
+            .find(|o| o.id.to_string() == group_id)
+            .expect("split group");
+        let zc_project::Object3DKind::Group { ref children, .. } = grp.kind else {
+            panic!("expected Group");
+        };
+        assert_eq!(children.len(), 6); // W, I, L, L, H, I
+        let pos_of = |idx: usize| match children[idx].position.value {
+            zc_project::PropertyValue::Vec3(v) => v,
+            ref other => panic!("expected Vec3, got {other:?}"),
+        };
+        let [wx, wy, _] = pos_of(0);
+        let [ix, iy, _] = pos_of(1);
+        let [lx1, _, _] = pos_of(2);
+        let [lx2, _, _] = pos_of(3);
+        let [_, hy, _] = pos_of(4);
+        assert!((wy - iy).abs() < 1e-6, "same line Y");
+        assert!(
+            (wy - hy - 24.0).abs() < 1e-6,
+            "second line must drop by height * line_height (20 * 1.2 = 24), got {}",
+            wy - hy
+        );
+        let gap_w_i = ix - wx;
+        let gap_i_l = lx1 - ix;
+        let gap_l_l = lx2 - lx1;
+        assert!(
+            gap_w_i > gap_i_l + 2.0,
+            "W->I center distance ({gap_w_i}) must exceed I->L ({gap_i_l}) under proportional advance"
+        );
+        assert!(
+            (gap_w_i - gap_l_l).abs() > 0.1,
+            "proportional widths must differ from fixed monospace"
+        );
+
+        // 5. Validation: SetPropertyValue rejects wrapped object on string/text properties.
+        let bad_text_err = session
+            .execute(Command::SetPropertyValue {
+                target_id: children[0].id.to_string(),
+                property: "text".to_owned(),
+                value: json!({ "kind": "text", "value": "NOPE" }),
+            })
+            .expect_err("wrapped object on text must be rejected");
+        assert_eq!(bad_text_err.code(), "invalid_argument");
+        let letter_after = session.document().video_tracks[0].clips[0]
+            .objects_3d
+            .iter()
+            .find(|o| o.id == children[0].id.to_string())
+            .expect("letter W");
+        assert_eq!(
+            prop_str_static(&letter_after.properties, "text").as_deref(),
+            Some("W"),
+            "rejected SetPropertyValue must not clear existing text"
+        );
+
+        // 6. Validation: AddEffect rejects unknown bogus effect IDs, permits valid & custom/plugin IDs.
+        let fake_fx_err = session
+            .execute(Command::AddEffect {
+                clip_id: scene_id.clone(),
+                kind: "totally_fake_effect_xyz".to_owned(),
+                name: None,
+            })
+            .expect_err("bogus effect kind must fail");
+        assert_eq!(fake_fx_err.code(), "invalid_operation");
+        session
+            .execute(Command::AddEffect {
+                clip_id: scene_id.clone(),
+                kind: "customShader".to_owned(),
+                name: None,
+            })
+            .expect("customShader allowed");
+        session
+            .execute(Command::AddEffect {
+                clip_id: scene_id.clone(),
+                kind: "zoidium:custom-pack/my-filter".to_owned(),
+                name: None,
+            })
+            .expect("namespaced custom plugin effect allowed");
+
+        // 7. Playback: toggle_play remembers last non-zero speed across pause/resume.
+        session
+            .execute(Command::SetSpeed { speed: 2.0 })
+            .expect("set 2x");
+        assert!((session.playback.speed - 2.0).abs() < 1e-9);
+        session.execute(Command::TogglePlay).expect("pause");
+        assert!((session.playback.speed - 0.0).abs() < 1e-9);
+        session.execute(Command::TogglePlay).expect("resume 2x");
+        assert!((session.playback.speed - 2.0).abs() < 1e-9);
+        session
+            .execute(Command::SetSpeed { speed: -1.5 })
+            .expect("set -1.5x");
+        session.execute(Command::TogglePlay).expect("pause reverse");
+        session.execute(Command::TogglePlay).expect("resume -1.5x");
+        assert!((session.playback.speed - (-1.5)).abs() < 1e-9);
+
+        // 8. Locked-track error displays human-readable track name ('V1'), not raw UUID.
+        session
+            .execute(Command::SetTrackLocked {
+                track_id: vtrack_id.clone(),
+                locked: true,
+            })
+            .expect("lock V1");
+        let lock_err = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id,
+                parent_id: None,
+                kind: "box".to_owned(),
+                name: None,
+            })
+            .expect_err("locked track must reject edit");
+        assert_eq!(lock_err.code(), "track_locked");
+        assert_eq!(lock_err.to_string(), "track 'V1' is locked");
+        assert!(!lock_err.to_string().contains(&vtrack_id));
+    }
+
+    #[test]
+    fn qa_c2_session_defaults_particular_radial_unique_names_and_sphere_radius() {
+        let mut session = Session::new();
+        let vtrack_id = session.document.video_tracks[0].id.clone();
+        let scene_id = session
+            .execute(Command::AddClip {
+                track_id: vtrack_id,
+                kind: "scene".to_owned(),
+                start: 0.0,
+                length: 180.0,
+                name: Some("Defaults Scene".to_owned()),
+            })
+            .expect("add scene clip")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // 1. Particular default particleColor is vivid sky cyan-blue [0.40, 0.85, 1.0].
+        let part_id = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "zoidium:trapcode-suite/particular".to_owned(),
+                name: Some("Particular".to_owned()),
+            })
+            .expect("add particular")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let clip = &session.document.video_tracks[0].clips[0];
+        let part_sobj = clip
+            .objects_3d
+            .iter()
+            .find(|o| o.id == part_id)
+            .expect("particular session obj");
+        assert_eq!(
+            part_sobj.properties["particleColor"].default_value,
+            json!([0.40, 0.85, 1.0])
+        );
+        let zc_project::LayerKind::Scene3D { objects, .. } =
+            &session.project.sequence.video_tracks[0].clips[0].layer.kind
+        else {
+            panic!("expected Scene3D");
+        };
+        let part_proj = objects
+            .iter()
+            .find(|o| o.id.to_string() == part_id)
+            .expect("particular project obj");
+        assert_eq!(
+            part_proj.preserved.get("property.particleColor"),
+            Some(&json!([0.40, 0.85, 1.0]))
+        );
+
+        // 2. Radial Repeater default axis is 2 (Z-axis / XY-plane facing front camera).
+        let radial_id = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "zoidium:repeater/radial".to_owned(),
+                name: Some("Radial Repeater".to_owned()),
+            })
+            .expect("add radial repeater")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let clip = &session.document.video_tracks[0].clips[0];
+        let radial_sobj = clip
+            .objects_3d
+            .iter()
+            .find(|o| o.id == radial_id)
+            .expect("radial session obj");
+        assert_eq!(radial_sobj.properties["axis"].default_value, json!(2));
+        let zc_project::LayerKind::Scene3D { objects, .. } =
+            &session.project.sequence.video_tracks[0].clips[0].layer.kind
+        else {
+            panic!("expected Scene3D");
+        };
+        let radial_proj = objects
+            .iter()
+            .find(|o| o.id.to_string() == radial_id)
+            .expect("radial project obj");
+        assert_eq!(radial_proj.preserved.get("property.axis"), Some(&json!(2)));
+
+        // 3. Unique auto-numbered 3D object names on collision (both explicit and default None).
+        let cam1 = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "camera".to_owned(),
+                name: Some("Camera".to_owned()),
+            })
+            .expect("add Camera 1");
+        let cam2 = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "camera".to_owned(),
+                name: Some("Camera".to_owned()),
+            })
+            .expect("add Camera 2");
+        let cam3 = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "camera".to_owned(),
+                name: Some("Camera".to_owned()),
+            })
+            .expect("add Camera 3");
+        assert_eq!(cam1["name"], json!("Camera"));
+        assert_eq!(cam2["name"], json!("Camera 2"));
+        assert_eq!(cam3["name"], json!("Camera 3"));
+
+        // Deleting "Camera 2" and adding another "Camera" reuses the first free slot ("Camera 2").
+        let cam2_id = cam2["object_id"].as_str().unwrap().to_owned();
+        session
+            .execute(Command::DeleteObject3D {
+                clip_id: scene_id.clone(),
+                object_id: cam2_id,
+            })
+            .expect("delete Camera 2");
+        let cam2_again = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "camera".to_owned(),
+                name: Some("Camera".to_owned()),
+            })
+            .expect("re-add Camera 2");
+        assert_eq!(cam2_again["name"], json!("Camera 2"));
+
+        // Also works when name is None (defaults to canonical kind).
+        let anon1 = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "group".to_owned(),
+                name: None,
+            })
+            .expect("add anon group 1");
+        let anon2 = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id.clone(),
+                parent_id: None,
+                kind: "group".to_owned(),
+                name: None,
+            })
+            .expect("add anon group 2");
+        assert_eq!(anon1["name"], json!("group"));
+        assert_eq!(anon2["name"], json!("group 2"));
+
+        // 4. Sphere default radius & detail in session properties match synced Shape3DKind::Sphere.
+        let sphere_id = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_id,
+                parent_id: None,
+                kind: "sphere".to_owned(),
+                name: Some("Sphere".to_owned()),
+            })
+            .expect("add sphere")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let clip = &session.document.video_tracks[0].clips[0];
+        let sphere_sobj = clip
+            .objects_3d
+            .iter()
+            .find(|o| o.id == sphere_id)
+            .expect("sphere session obj");
+        assert_eq!(
+            prop_f64_static(&sphere_sobj.properties, "sphere_size"),
+            Some(5.0),
+            "sphere session property sphere_size must match rendered radius 5.0"
+        );
+        assert_eq!(
+            prop_vec2_static(&sphere_sobj.properties, "sphere_detail"),
+            Some([24.0, 16.0]),
+            "sphere session property sphere_detail must match rendered [24, 16]"
+        );
+        let zc_project::LayerKind::Scene3D { objects, .. } =
+            &session.project.sequence.video_tracks[0].clips[0].layer.kind
+        else {
+            panic!("expected Scene3D");
+        };
+        let sphere_proj = objects
+            .iter()
+            .find(|o| o.id.to_string() == sphere_id)
+            .expect("sphere project obj");
+        assert!(
+            matches!(
+                sphere_proj.kind,
+                zc_project::Object3DKind::Shape3D(zc_project::Shape3DKind::Sphere {
+                    radius,
+                    width_segments: 24,
+                    height_segments: 16,
+                }) if (radius - 5.0).abs() < 1e-9
+            ),
+            "synced Sphere must match session properties (radius=5.0, 24x16), got {:?}",
+            sphere_proj.kind
+        );
+    }
+
+    #[test]
+    fn precompose_and_create_composition_auto_enable_precomp_plus_and_undo_restores_plugins() {
+        let mut session = Session::new();
+        // Start with precomp-plus explicitly disabled (Vanilla CM3 mode).
+        let _ = session.plugins.disable("precomp-plus", &BTreeSet::new());
+        assert!(!session.plugins.is_enabled("precomp-plus"));
+
+        // 1. PrecomposeClips auto-enables `precomp-plus` and Undo restores disabled state.
+        let orig_clip_uuid = parse_uuid_or_new(&session.document.video_tracks[0].clips[0].id);
+        let precomp_res = session
+            .execute(Command::PrecomposeClips {
+                clip_ids: vec![orig_clip_uuid],
+                name: "Precomp 1".to_owned(),
+            })
+            .expect("precompose clips");
+        let comp_id_str = precomp_res["comp_id"].as_str().unwrap().to_owned();
+        assert!(
+            session.plugins.is_enabled("precomp-plus"),
+            "PrecomposeClips must auto-enable precomp-plus"
+        );
+        assert!(session.project.plugin_requirements.contains("precomp-plus"));
+
+        // inspect_state must expose `compositions` and `active_composition_id`.
+        let state = session.inspect_state();
+        assert!(state["active_composition_id"].is_null());
+        let comps = state["compositions"]
+            .as_array()
+            .expect("compositions array in inspect_state");
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0]["id"], comp_id_str);
+        assert_eq!(comps[0]["name"], "Precomp 1");
+        assert!(comps[0]["width"].as_u64().unwrap() > 0);
+        assert!(comps[0]["height"].as_u64().unwrap() > 0);
+        assert!(comps[0]["fps"].as_u64().unwrap() > 0);
+
+        // Entering the child composition updates `active_composition_id` in inspect_state.
+        let comp_uuid = parse_uuid_or_new(&comp_id_str);
+        session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(comp_uuid),
+            })
+            .expect("enter child comp");
+        assert_eq!(
+            session.inspect_state()["active_composition_id"].as_str(),
+            Some(comp_id_str.as_str())
+        );
+
+        // Pure navigation SetActiveComposition must NOT push an undo snapshot when `precomp-plus` is already enabled.
+        // A single Undo must undo PrecomposeClips directly -> precomp-plus must be disabled again!
+        session.execute(Command::Undo).expect("undo precompose");
+        assert!(
+            !session.plugins.is_enabled("precomp-plus"),
+            "Undo of PrecomposeClips must restore prior disabled state of precomp-plus"
+        );
+
+        // Redo PrecomposeClips -> precomp-plus must be enabled again!
+        session.execute(Command::Redo).expect("redo precompose");
+        assert!(
+            session.plugins.is_enabled("precomp-plus"),
+            "Redo of PrecomposeClips must re-enable precomp-plus"
+        );
+
+        // 2. CreateComposition also auto-enables `precomp-plus` and Undo restores prior state.
+        session.execute(Command::Undo).expect("undo again");
+        assert!(!session.plugins.is_enabled("precomp-plus"));
+        session
+            .execute(Command::CreateComposition {
+                name: "SubComp".to_owned(),
+                resolution: [640, 360],
+                fps: 30,
+                length_frames: 60,
+            })
+            .expect("create composition");
+        assert!(session.plugins.is_enabled("precomp-plus"));
+        session
+            .execute(Command::Undo)
+            .expect("undo create composition");
+        assert!(!session.plugins.is_enabled("precomp-plus"));
+    }
+
+    #[test]
+    fn qa4_set_active_composition_pure_navigation_does_not_dirty_and_friendly_split_error() {
+        let mut session = Session::new();
+        let clip_id = session.document.video_tracks[0].clips[0].id.clone();
+
+        // Friendly SplitClip error when playhead/at_frame is outside clip range
+        let split_err = session
+            .execute(Command::SplitClip {
+                clip_id: clip_id.clone(),
+                at_frame: 9999.0,
+            })
+            .expect_err("split outside clip range must fail");
+        assert_eq!(
+            split_err,
+            SessionError::InvalidOperation(
+                "Move playhead inside the selected clip to split".to_owned()
+            )
+        );
+
+        // Create a composition (enables `precomp-plus`), then mark project clean
+        let created = session
+            .execute(Command::CreateComposition {
+                name: "NavComp".to_owned(),
+                resolution: [1280, 720],
+                fps: 30,
+                length_frames: 60,
+            })
+            .expect("create composition");
+        let comp_uuid = parse_uuid_or_new(created["comp_id"].as_str().unwrap());
+        session.mark_saved();
+        assert!(!session.is_dirty());
+        let undo_before = session.history.undo_len();
+
+        // Pure navigation into child comp and back to main sequence must NOT dirty project or push undo
+        session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(comp_uuid),
+            })
+            .expect("enter child comp");
+        assert!(
+            !session.is_dirty(),
+            "entering composition with precomp-plus already enabled must not dirty project"
+        );
+        assert_eq!(session.history.undo_len(), undo_before);
+
+        session
+            .execute(Command::SetActiveComposition { comp_id: None })
+            .expect("return to main sequence");
+        assert!(
+            !session.is_dirty(),
+            "returning to main sequence must not dirty project"
+        );
+        assert_eq!(session.history.undo_len(), undo_before);
+    }
+
+    #[test]
+    fn duplicate_clip_avoids_overlapping_existing_clips_and_selects_new_duplicate() {
+        let mut session = Session::new();
+        let v1_id = session.document.video_tracks[0].id.clone();
+        // Start with Clip A [0, 60) and Clip B [60, 120) on V1.
+        let clip_a_id = session.document.video_tracks[0].clips[0].id.clone();
+        let orig_len = session.document.video_tracks[0].clips[0].length;
+        session
+            .execute(Command::TrimClipRight {
+                clip_id: clip_a_id.clone(),
+                delta_frames: 60.0 - orig_len,
+                rate_stretch: false,
+            })
+            .expect("trim clip A to 60 frames");
+        let clip_b_id = session
+            .execute(Command::AddClip {
+                track_id: v1_id.clone(),
+                kind: "text".to_owned(),
+                name: Some("Clip B".to_owned()),
+                start: 60.0,
+                length: 60.0,
+            })
+            .expect("add clip B")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Select Clip A and duplicate it: target range [60, 120) overlaps Clip B on V1,
+        // so DuplicateClip must append V2 and place the duplicate there without harming Clip B!
+        session
+            .selection
+            .select_clip(clip_a_id.clone(), Some("scene"), false)
+            .unwrap();
+        let dup_res = session
+            .execute(Command::DuplicateClip {
+                clip_id: clip_a_id.clone(),
+            })
+            .expect("duplicate clip A");
+        let dup_id = dup_res["clip_id"].as_str().unwrap().to_owned();
+
+        // Clip B must remain completely intact on V1 at [60, 120).
+        let v1_clip_b = session.document.video_tracks[0]
+            .clips
+            .iter()
+            .find(|c| c.id == clip_b_id)
+            .expect("Clip B must not be overwritten");
+        assert!((v1_clip_b.start - 60.0).abs() < 1e-6);
+        assert!((v1_clip_b.length - 60.0).abs() < 1e-6);
+
+        // Duplicate must live on newly appended V2 at [60, 120) and be selected.
+        assert_eq!(session.document.video_tracks.len(), 2);
+        let v2_dup = session.document.video_tracks[1]
+            .clips
+            .iter()
+            .find(|c| c.id == dup_id)
+            .expect("duplicate clip must be placed on non-overlapping V2");
+        assert!((v2_dup.start - 60.0).abs() < 1e-6);
+        assert_eq!(session.selection.clip_ids, vec![dup_id]);
+
+        // Undo must restore original selection pointing back at Clip A and remove V2.
+        session.execute(Command::Undo).expect("undo duplicate");
+        assert_eq!(session.selection.clip_ids, vec![clip_a_id]);
+        assert_eq!(session.document.video_tracks.len(), 1);
+    }
+
+    #[test]
+    fn qa6_expresstext_plus_all_11_modifier_defaults() {
+        let mut session = Session::new();
+        let scene_clip_id = session.document.video_tracks[0].clips[0].id.clone();
+
+        let modifiers: &[(&str, &str)] = &[
+            ("shake", "shakePosition"),
+            ("plain", "plainPosition"),
+            ("random", "randomPosition"),
+            ("formula", "formulaPosition"),
+            ("delay", "delayFrames"),
+            ("spline", "splineAmplitude"),
+            ("orbit", "orbitAngle"),
+            ("repeater", "repeaterOffset"),
+            ("twist", "twistAngle"),
+            ("wrap", "wrapAmplitude"),
+            ("voronoi", "voronoiDistance"),
+        ];
+
+        for &(sub, key_param) in modifiers {
+            let kind = format!("zoidium:expresstext-plus/{sub}");
+            let added = session
+                .execute(Command::AddObject3D {
+                    clip_id: scene_clip_id.clone(),
+                    kind,
+                    name: Some(format!("ET-{sub}")),
+                    parent_id: None,
+                })
+                .expect("add ExpressText+ modifier");
+            let obj_id = added["object_id"].as_str().unwrap();
+            let obj = session.document.video_tracks[0].clips[0]
+                .objects_3d
+                .iter()
+                .find(|o| o.id == obj_id)
+                .expect("added modifier object");
+
+            assert_eq!(
+                obj.properties["lettersMode"].default_value,
+                json!("per_letter"),
+                "{sub}: lettersMode must be per_letter"
+            );
+            let enable_key = format!("{sub}Enable");
+            assert!(
+                obj.properties.contains_key(&enable_key),
+                "{sub}: missing {enable_key} (must not be {sub}Enabled)"
+            );
+            assert!(
+                !obj.properties.contains_key(&format!("{sub}Enabled")),
+                "{sub}: stale {sub}Enabled key must not exist"
+            );
+            assert_eq!(obj.properties[&enable_key].default_value, json!(1));
+            assert_eq!(
+                obj.properties[&format!("{sub}Strength")].default_value,
+                json!(100.0),
+                "{sub}: strength must be 100.0 (0..100 scale)"
+            );
+            assert!(
+                obj.properties.contains_key(key_param),
+                "{sub}: missing visible default param {key_param}"
+            );
+        }
+    }
+
+    #[test]
+    fn qa6_session_invariants_plugin_auto_enable_set_active_paste_clips_and_validation() {
+        let mut session = Session::new();
+        let v1_id = session.document.video_tracks[0].id.clone();
+        let clip_id = session.document.video_tracks[0].clips[0].id.clone();
+
+        // 1. `effects.add_effect` auto-enables plugin atomically & Undo reverts `enabled`
+        assert!(!session.plugins.is_enabled("sglow-hq-v2-preview"));
+        session
+            .execute(Command::AddEffect {
+                clip_id: clip_id.clone(),
+                kind: "sglow-hq-v2-preview".to_owned(),
+                name: None,
+            })
+            .expect("add sglow plugin effect");
+        assert!(session.plugins.is_enabled("sglow-hq-v2-preview"));
+
+        // `plugins.disable_all_optional` must NEVER report `vanilla_cm3_mode: true` when deps are active
+        let dis = session
+            .execute(Command::DisableAllOptionalPlugins)
+            .expect("disable optional plugins");
+        assert_eq!(dis["vanilla_cm3_mode"], json!(false));
+
+        // Undo reverts `sglow-hq-v2-preview` enabled back to false
+        session.execute(Command::Undo).expect("undo add sglow");
+        assert!(!session.plugins.is_enabled("sglow-hq-v2-preview"));
+
+        // 2. `timeline.add_clip` auto-enables plugin (`shape_plus`) & Undo reverts `enabled`
+        let dis_clean = session
+            .execute(Command::DisableAllOptionalPlugins)
+            .expect("disable all optional plugins when no deps active");
+        assert_eq!(dis_clean["vanilla_cm3_mode"], json!(true));
+        assert!(!session.plugins.is_enabled("shape-plus"));
+        session
+            .execute(Command::AddClip {
+                track_id: v1_id.clone(),
+                kind: "shape_plus".to_owned(),
+                name: Some("SP".to_owned()),
+                start: 180.0,
+                length: 30.0,
+            })
+            .expect("add shape_plus clip");
+        assert!(session.plugins.is_enabled("shape-plus"));
+        session.execute(Command::Undo).expect("undo add shape_plus");
+        assert!(!session.plugins.is_enabled("shape-plus"));
+
+        // 3. `timeline.add_clip` rejects unknown/bogus kind with InvalidArgument
+        let bad_kind = session
+            .execute(Command::AddClip {
+                track_id: v1_id.clone(),
+                kind: "totally_bogus_xyz".to_owned(),
+                name: None,
+                start: 180.0,
+                length: 30.0,
+            })
+            .expect_err("bogus clip kind must fail");
+        assert!(matches!(bad_kind, SessionError::InvalidArgument(_)));
+
+        // 4. `project.set_sequence_length` rejects <= 0.0, non-finite, and > 1_000_000.0
+        for bad_len in [0.0, -10.0, f64::NAN, f64::INFINITY, 1_000_001.0] {
+            let err = session
+                .execute(Command::SetSequenceLength { frames: bad_len })
+                .expect_err("invalid sequence length must fail");
+            assert!(
+                matches!(err, SessionError::InvalidArgument(_)),
+                "len {bad_len} expected InvalidArgument, got {err:?}"
+            );
+        }
+
+        // 5. `comp.set_active` is non-undoable and unrelated Undo/Redo does NOT warp active_composition_id
+        let cmd = Command::SetActiveComposition { comp_id: None };
+        assert!(!cmd.is_undoable());
+        assert!(!session.registry.get("comp.set_active").unwrap().undoable);
+
+        let created = session
+            .execute(Command::CreateComposition {
+                name: "SubA".to_owned(),
+                resolution: [1280, 720],
+                fps: 30,
+                length_frames: 60,
+            })
+            .expect("create comp");
+        let comp_uuid = parse_uuid_or_new(created["comp_id"].as_str().unwrap());
+        session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(comp_uuid),
+            })
+            .expect("enter SubA");
+        session
+            .execute(Command::SetProjectName {
+                name: "Renamed".to_owned(),
+            })
+            .expect("rename while in SubA");
+        session
+            .execute(Command::SetActiveComposition { comp_id: None })
+            .expect("return to Main");
+        assert_eq!(session.document.active_composition_id, None);
+        session.execute(Command::Undo).expect("undo rename");
+        assert_eq!(
+            session.document.active_composition_id, None,
+            "Undo of unrelated edit must not warp active_composition_id back into SubA"
+        );
+        session.execute(Command::Redo).expect("redo rename");
+        assert_eq!(
+            session.document.active_composition_id, None,
+            "Redo of unrelated edit must keep active_composition_id in Main"
+        );
+
+        // 6. `timeline.paste_clips` attaches `layer_masks` & `precomp_offset` even when `video_clip` is None
+        let dummy_clip = SessionClip {
+            id: "temp-clip".to_owned(),
+            kind: "scene".to_owned(),
+            name: "PastedMasked".to_owned(),
+            start: 0.0,
+            length: 45.0,
+            time_start: 0.0,
+            time_end: 1.5,
+            time_animated: false,
+            media_length: None,
+            source_clip_id: None,
+            properties: default_clip_properties(TrackKind::Video, "scene", [0.0, 0.0, 0.0, 1.0]),
+            objects_3d: Vec::new(),
+            effects: Vec::new(),
+        };
+        let mask = zc_project::LayerMask {
+            id: "mask-qa6".to_owned(),
+            name: "Mask 1".to_owned(),
+            enabled: true,
+            mode: zc_project::MaskMode::Add,
+            invert: false,
+            feather: 0.0,
+            expansion: 0.0,
+            opacity: 1.0,
+            closed: true,
+            locked: false,
+            outline_color: String::new(),
+            vertex_ids: Vec::new(),
+            vertex_modes: BTreeMap::new(),
+            path: zc_project::PropertyTrack::constant(zc_project::PropertyValue::Json(json!([
+                0.0, 0.0, 100.0, 0.0, 100.0, 100.0, 0.0, 100.0
+            ]))),
+            preserved: BTreeMap::new(),
+        };
+        let snap = ClipSnapshot {
+            track_kind: TrackKind::Video,
+            track_id: Some(v1_id),
+            clip: dummy_clip,
+            video_clip: None,
+            audio_clip: None,
+            layer_masks: vec![mask],
+            precomp_offset: Some(12.5),
+        };
+        let pasted = session
+            .execute(Command::PasteClips {
+                clips: vec![snap],
+                target_frame: 200.0,
+            })
+            .expect("paste clip without video_clip");
+        let pasted_id = parse_uuid_or_new(pasted["clip_ids"][0].as_str().unwrap());
+        let pasted_vc = session
+            .project
+            .sequence
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == pasted_id)
+            .expect("pasted video clip");
+        let layer_id = pasted_vc.layer.id;
+        assert_eq!(
+            session
+                .project
+                .sequence
+                .layer_masks
+                .get(&layer_id)
+                .map(Vec::len),
+            Some(1),
+            "layer_masks must attach even when snap.video_clip is None"
+        );
+        assert_eq!(
+            session.project.sequence.precomp_offsets.get(&layer_id),
+            Some(&12.5),
+            "precomp_offset must attach even when snap.video_clip is None"
+        );
     }
 }

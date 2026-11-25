@@ -10,7 +10,8 @@
 
 mod ui;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -55,10 +56,10 @@ use ui::panels::{
     ExportStatus, ExportVideoCodec, PanelsState, ProjectAction, RecoverySnapshotInfo,
 };
 use ui::pro_editors::show_pro_editor_windows;
-use ui::shortcuts::dispatch_shortcuts;
+use ui::shortcuts::{dispatch_shortcuts_with_context, selected_clip_is_scene3d};
 use ui::theme::{
-    BG_PANEL, BG_SUNKEN, BG_TITLE, BORDER_PANEL, Cm3Theme, FONT_COMPACT, FONT_SMALL, TEXT_BRIGHT,
-    TEXT_PRIMARY, apply_cm3_style, install_cm3_fonts,
+    BG_BUTTON, BG_PANEL, BG_SUNKEN, BG_TITLE, BORDER_PANEL, Cm3Theme, FONT_COMPACT, FONT_SMALL,
+    TEXT_BRIGHT, TEXT_PRIMARY, WARNING_BAR, apply_cm3_style, install_cm3_fonts,
 };
 use ui::timeline::{AudioWaveformPeaks, TimelineDragState, TimelineViewState, show_timeline};
 use ui::viewport::{EditorCameraState, ViewportDragState, ViewportState, show_viewport};
@@ -70,9 +71,14 @@ const CLEAR_BG_RGBA: [f32; 4] = [29.0 / 255.0, 29.0 / 255.0, 29.0 / 255.0, 1.0];
 /// Maximum live audio playback mix window duration in seconds (60s = 2.88M stereo frames at 48 kHz,
 /// well inside `zc-audio`'s 32 Mi sample cap even for multi-hour timelines).
 const LIVE_AUDIO_WINDOW_SECS: f64 = 60.0;
+/// Key stored in `Sequence::preserved` inside `.zcraft` saves (stripped on `.pz` export) to
+/// persist enabled safe built-in plugins across GUI save & reload without polluting vanilla CM3 `.pz`.
+const ZOIDCRAFT_ENABLED_PLUGINS_KEY: &str = "zoidcraftEnabledPlugins";
+/// Upper bound on cached GPU preview frame textures in [`PreviewFrameCache`].
+const MAX_PREVIEW_CACHE_ENTRIES: usize = 1024;
 
 // ---------------------------------------------------------------------------
-// Dirty-Tracking Render Key
+// Dirty-Tracking Render Key & Bounded LRU Preview Frame Cache
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,9 +87,202 @@ struct ViewportRenderKey {
     width: u32,
     height: u32,
     scene_hash: u64,
+    active_composition_id: Option<Uuid>,
     editing_camera: bool,
     active_camera_hash: u64,
     camera_bits: [u32; 9],
+}
+
+impl ViewportRenderKey {
+    const fn cache_context(self) -> PreviewCacheContext {
+        PreviewCacheContext {
+            width: self.width,
+            height: self.height,
+            scene_hash: self.scene_hash,
+            active_composition_id: self.active_composition_id,
+            editing_camera: self.editing_camera,
+            active_camera_hash: self.active_camera_hash,
+            camera_bits: self.camera_bits,
+        }
+    }
+}
+
+/// Render state fingerprint (everything except playhead frame) that invalidates cached preview
+/// frames on real edits, resolution changes, composition switches, or camera overrides while
+/// staying stable across scrubbing and playback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreviewCacheContext {
+    width: u32,
+    height: u32,
+    scene_hash: u64,
+    active_composition_id: Option<Uuid>,
+    editing_camera: bool,
+    active_camera_hash: u64,
+    camera_bits: [u32; 9],
+}
+
+struct CachedPreviewEntry<T> {
+    exact_frame_index: i64,
+    bytes: usize,
+    last_used_tick: u64,
+    value: T,
+}
+
+/// Bounded LRU preview frame cache storing rendered viewport frames keyed by integer timeline
+/// frame bucket within the active [`PreviewCacheContext`].
+struct PreviewFrameCache<T> {
+    context: Option<PreviewCacheContext>,
+    entries: HashMap<i64, CachedPreviewEntry<T>>,
+    used_bytes: usize,
+    max_bytes: usize,
+    max_entries: usize,
+    tick: u64,
+}
+
+impl<T> PreviewFrameCache<T> {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            context: None,
+            entries: HashMap::new(),
+            used_bytes: 0,
+            max_bytes,
+            max_entries: MAX_PREVIEW_CACHE_ENTRIES,
+            tick: 0,
+        }
+    }
+
+    fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.used_bytes = 0;
+        self.context = None;
+    }
+
+    /// Invalidates cached frames whenever scene/resolution/camera context changes, while
+    /// keeping accumulated frames intact across scrubbing and playback.
+    fn sync_context(&mut self, ctx: PreviewCacheContext) {
+        if self.context != Some(ctx) {
+            self.entries.clear();
+            self.used_bytes = 0;
+            self.context = Some(ctx);
+        }
+    }
+
+    fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        if max_bytes == 0 {
+            self.entries.clear();
+            self.used_bytes = 0;
+            return;
+        }
+        self.evict_to_budget(0);
+    }
+
+    fn get_mut(
+        &mut self,
+        frame_bucket: i64,
+        exact_frame_index: i64,
+        allow_bucket_hit: bool,
+    ) -> Option<&T> {
+        if self.max_bytes == 0 {
+            return None;
+        }
+        let next_tick = self.tick.wrapping_add(1);
+        let entry = self.entries.get_mut(&frame_bucket)?;
+        if !allow_bucket_hit && entry.exact_frame_index != exact_frame_index {
+            return None;
+        }
+        self.tick = next_tick;
+        entry.last_used_tick = next_tick;
+        Some(&entry.value)
+    }
+
+    fn insert(
+        &mut self,
+        frame_bucket: i64,
+        exact_frame_index: i64,
+        bytes: usize,
+        value: T,
+    ) -> bool {
+        if self.max_bytes == 0 || bytes > self.max_bytes {
+            return false;
+        }
+        if let Some(prev) = self.entries.remove(&frame_bucket) {
+            self.used_bytes = self.used_bytes.saturating_sub(prev.bytes);
+        }
+        self.evict_to_budget(bytes);
+        if self.used_bytes.saturating_add(bytes) > self.max_bytes {
+            return false;
+        }
+        self.tick = self.tick.wrapping_add(1);
+        self.entries.insert(
+            frame_bucket,
+            CachedPreviewEntry {
+                exact_frame_index,
+                bytes,
+                last_used_tick: self.tick,
+                value,
+            },
+        );
+        self.used_bytes = self.used_bytes.saturating_add(bytes);
+        true
+    }
+
+    fn evict_to_budget(&mut self, incoming_bytes: usize) {
+        let entry_cap = if incoming_bytes > 0 {
+            self.max_entries.saturating_sub(1)
+        } else {
+            self.max_entries
+        };
+        while !self.entries.is_empty()
+            && (self.used_bytes.saturating_add(incoming_bytes) > self.max_bytes
+                || self.entries.len() > entry_cap)
+        {
+            let Some((&oldest_key, _)) = self.entries.iter().min_by_key(|(_, e)| e.last_used_tick)
+            else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest_key) {
+                self.used_bytes = self.used_bytes.saturating_sub(evicted.bytes);
+            }
+        }
+    }
+
+    /// Coalesces cached integer frame buckets into sorted, contiguous `[start, end)` spans
+    /// for the timeline ruler's green preview-cache bar.
+    fn cached_spans(&self) -> Vec<(f64, f64)> {
+        if self.entries.is_empty() {
+            return Vec::new();
+        }
+        let mut frames: Vec<i64> = self.entries.keys().copied().collect();
+        frames.sort_unstable();
+        let mut spans = Vec::new();
+        let mut run_start = frames[0];
+        let mut run_end = frames[0];
+        for f in frames.into_iter().skip(1) {
+            if f <= run_end.saturating_add(1) {
+                run_end = f;
+            } else {
+                spans.push((run_start as f64, (run_end + 1) as f64));
+                run_start = f;
+                run_end = f;
+            }
+        }
+        spans.push((run_start as f64, (run_end + 1) as f64));
+        spans
+    }
 }
 
 fn hash_optional_str(opt: Option<&str>) -> u64 {
@@ -151,7 +350,9 @@ struct ViewportGpuPresenter {
     display_target: Option<RenderTarget>,
     egui_texture_id: Option<egui::TextureId>,
     last_render_key: Option<ViewportRenderKey>,
+    last_active_composition_id: Option<Uuid>,
     cache_budget_mib: u32,
+    preview_cache: PreviewFrameCache<wgpu::Texture>,
 }
 
 impl ViewportGpuPresenter {
@@ -160,13 +361,17 @@ impl ViewportGpuPresenter {
         let device = Arc::new(render_state.device.clone());
         let queue = Arc::new(render_state.queue.clone());
         let engine = ProjectRenderEngine::from_device_queue(device, queue)?;
+        let default_mib: u32 = 512;
+        let default_bytes = (default_mib as usize).saturating_mul(1024 * 1024);
         Ok(Self {
             engine,
             render_state,
             display_target: None,
             egui_texture_id: None,
             last_render_key: None,
-            cache_budget_mib: 512,
+            last_active_composition_id: None,
+            cache_budget_mib: default_mib,
+            preview_cache: PreviewFrameCache::new(default_bytes),
         })
     }
 
@@ -176,7 +381,15 @@ impl ViewportGpuPresenter {
 
     fn invalidate(&mut self) {
         self.last_render_key = None;
+        self.preview_cache.clear();
         self.engine.invalidate_caches();
+    }
+
+    fn sync_active_composition(&mut self, active_composition_id: Option<Uuid>) {
+        if self.last_active_composition_id != active_composition_id {
+            self.invalidate();
+            self.last_active_composition_id = active_composition_id;
+        }
     }
 
     fn sync_cache_budget(&mut self, mib: u32) {
@@ -184,11 +397,54 @@ impl ViewportGpuPresenter {
             self.cache_budget_mib = mib;
             let bytes = (mib as usize).saturating_mul(1024 * 1024);
             self.engine.cache.set_max_bytes(bytes);
+            self.preview_cache.set_max_bytes(bytes);
         }
     }
 
+    fn preview_cache_used_bytes(&self) -> u64 {
+        self.preview_cache.used_bytes() as u64
+    }
+
+    fn preview_cache_spans(&self) -> Vec<(f64, f64)> {
+        self.preview_cache.cached_spans()
+    }
+
+    fn copy_texture_full(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("zc-preview-cache-copy"),
+        });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: src,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: dst,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+    }
+
     /// Renders the viewport frame via `zc_render::ProjectRenderEngine` directly into the
-    /// shared GPU display texture whenever `key` changed. Zero CPU readback occurs during
+    /// shared GPU display texture whenever `key` changed, caching finished GPU textures
+    /// inside `preview_cache` within `cache_budget_mib`. Zero CPU readback occurs during
     /// interactive editing or playback.
     #[allow(clippy::too_many_arguments)]
     fn render_viewport_if_dirty(
@@ -202,7 +458,30 @@ impl ViewportGpuPresenter {
         editor_cam: &EditorCameraState,
         key: ViewportRenderKey,
     ) -> Result<bool, RenderError> {
+        self.sync_active_composition(session.document().active_composition_id);
+        self.preview_cache.sync_context(key.cache_context());
         if self.last_render_key == Some(key) && self.egui_texture_id.is_some() {
+            return Ok(false);
+        }
+
+        let frame_bucket = frame.floor().max(0.0) as i64;
+        let is_playing = session.playback.is_playing();
+        self.ensure_display_target_and_texture(width, height)?;
+
+        if let Some(cached_tex) =
+            self.preview_cache
+                .get_mut(frame_bucket, key.frame_index, is_playing)
+            && let Some(display) = &self.display_target
+        {
+            Self::copy_texture_full(
+                &self.render_state.device,
+                &self.render_state.queue,
+                cached_tex,
+                &display.texture,
+                width,
+                height,
+            );
+            self.last_render_key = Some(key);
             return Ok(false);
         }
 
@@ -222,6 +501,7 @@ impl ViewportGpuPresenter {
                 editing_camera_clip_id: Some(clip_uuid),
                 editing_camera: Some(params),
                 selected_object_ids: Vec::new(),
+                is_scene_camera_override: true,
             })
         });
 
@@ -251,14 +531,15 @@ impl ViewportGpuPresenter {
                     editor_cam.far,
                 )),
                 selected_object_ids,
+                is_scene_camera_override: false,
             })
         } else {
             None
         };
 
-        self.ensure_display_target_and_texture(width, height)?;
+        let render_project = project_for_live_viewport(session);
         let _ = self.engine.render_frame_to_texture_with_overrides(
-            &session.project,
+            render_project.as_ref(),
             &session.plugins,
             frame,
             width,
@@ -267,6 +548,42 @@ impl ViewportGpuPresenter {
         )?;
         if let Some(display) = &self.display_target {
             self.engine.blit_output_to(display);
+            let frame_bytes = (width as usize)
+                .saturating_mul(height as usize)
+                .saturating_mul(4);
+            if frame_bytes > 0 && self.preview_cache.max_bytes() >= frame_bytes {
+                let cached_tex =
+                    self.render_state
+                        .device
+                        .create_texture(&wgpu::TextureDescriptor {
+                            label: Some("zc-viewport-preview-cache"),
+                            size: wgpu::Extent3d {
+                                width,
+                                height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                Self::copy_texture_full(
+                    &self.render_state.device,
+                    &self.render_state.queue,
+                    &display.texture,
+                    &cached_tex,
+                    width,
+                    height,
+                );
+                let _ = self.preview_cache.insert(
+                    frame_bucket,
+                    key.frame_index,
+                    frame_bytes,
+                    cached_tex,
+                );
+            }
         }
         self.last_render_key = Some(key);
         Ok(true)
@@ -281,8 +598,9 @@ impl ViewportGpuPresenter {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, RenderError> {
+        let render_project = project_for_live_viewport(session);
         let premul = self.engine.render_frame_rgba8(
-            &session.project,
+            render_project.as_ref(),
             &session.plugins,
             frame,
             width,
@@ -393,6 +711,7 @@ impl Drop for ViewportGpuPresenter {
             self.render_state.renderer.write().free_texture(&id);
         }
         self.display_target = None;
+        self.preview_cache.clear();
         self.engine.invalidate_caches();
         self.engine.targets.clear();
     }
@@ -599,6 +918,53 @@ fn promote_active_composition_for_export(
     project.compositions.insert(prev_root.id, prev_root);
 }
 
+/// Returns the `Project` to pass into `ProjectRenderEngine` for live viewport rendering.
+///
+/// When editing the root sequence (`active_composition_id` is `None`), borrows `&session.project`
+/// with zero cloning. When editing a child composition (`Some(comp_id)` present in
+/// `session.project.compositions`), clones the project and promotes `comp_id` via
+/// [`promote_active_composition_for_export`] so the live viewport isolates the child composition
+/// while preserving root `sequence.controls` for expressions and never mutating `session.project`.
+fn project_for_live_viewport(session: &Session) -> Cow<'_, Project> {
+    let Some(comp_id) = session.document().active_composition_id else {
+        return Cow::Borrowed(&session.project);
+    };
+    if !session.project.compositions.contains_key(&comp_id) {
+        return Cow::Borrowed(&session.project);
+    }
+    let mut promoted = session.project.clone();
+    promote_active_composition_for_export(&mut promoted, Some(&comp_id.to_string()));
+    Cow::Owned(promoted)
+}
+
+/// Formats a GPU render error into a concise single-line transient UI toast message.
+fn format_viewport_render_error_toast(err_msg: &str) -> String {
+    let collapsed: String = err_msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let (prefix, body) = if let Some(rest) = trimmed
+        .strip_prefix("shader error:")
+        .or_else(|| trimmed.strip_prefix("Shader error:"))
+    {
+        ("Shader error: ", rest.trim())
+    } else if lower.contains("shader") || lower.contains("glsl") || lower.contains("wgsl") {
+        ("Shader error: ", trimmed)
+    } else {
+        ("Viewport render error: ", trimmed)
+    };
+    const MAX_BODY_CHARS: usize = 160;
+    let body_count = body.chars().count();
+    if body_count > MAX_BODY_CHARS {
+        let truncated: String = body
+            .chars()
+            .take(MAX_BODY_CHARS.saturating_sub(3))
+            .collect();
+        format!("{prefix}{truncated}...")
+    } else {
+        format!("{prefix}{body}")
+    }
+}
+
 struct ZoidCraftApp {
     session: Session,
     theme: Cm3Theme,
@@ -650,6 +1016,14 @@ struct ZoidCraftApp {
     last_autosave_revision: u64,
     /// Optional non-blocking crash-recovery banner offered on launch when a recovery snapshot exists.
     startup_recovery_banner: Option<RecoverySnapshotInfo>,
+    /// Whether `egui-winit`'s in-memory clipboard stub has been seeded with `CLIPBOARD_SENTINEL`.
+    clipboard_bridge_seeded: bool,
+    /// Cached `session.revision()` for `cached_missing_plugins`.
+    cached_missing_plugins_revision: Option<u64>,
+    /// Disabled built-in plugin IDs currently required by the open project.
+    cached_missing_plugins: Vec<String>,
+    /// Disabled required plugin IDs dismissed by the user for the current project session.
+    dismissed_missing_plugins: BTreeSet<String>,
     pending_eyedropper: Option<(String, String)>,
     eyedropper_swallow_pointer: bool,
     pending_unsaved_dialog: Option<PendingUnsavedAction>,
@@ -660,6 +1034,8 @@ struct ZoidCraftApp {
     last_tick: Instant,
     last_title: String,
     status_toast: Option<(String, Instant)>,
+    /// Last GPU viewport render error emitted (throttles stderr spam and UI error toasts until error changes or clears).
+    last_viewport_render_error: Option<String>,
 }
 
 impl ZoidCraftApp {
@@ -673,7 +1049,9 @@ impl ZoidCraftApp {
         let theme = Cm3Theme::default();
         apply_cm3_style(&cc.egui_ctx, &theme);
 
-        let session = Session::new();
+        let mut session = Session::new();
+        auto_select_default_scene_clip(&mut session);
+        session.playback.editing_camera = false;
 
         let mut workspace = Cm3Workspace::new();
         sync_export_settings_from_session(&session, &mut workspace.panels.export_settings);
@@ -749,6 +1127,10 @@ impl ZoidCraftApp {
             last_autosave_at: Instant::now(),
             last_autosave_revision: init_revision,
             startup_recovery_banner,
+            clipboard_bridge_seeded: false,
+            cached_missing_plugins_revision: None,
+            cached_missing_plugins: Vec::new(),
+            dismissed_missing_plugins: BTreeSet::new(),
             pending_eyedropper: None,
             eyedropper_swallow_pointer: false,
             pending_unsaved_dialog: None,
@@ -759,11 +1141,35 @@ impl ZoidCraftApp {
             last_tick: Instant::now(),
             last_title: String::new(),
             status_toast: None,
+            last_viewport_render_error: None,
         }
     }
 
     fn show_toast(&mut self, message: impl Into<String>) {
         self.status_toast = Some((message.into(), Instant::now()));
+    }
+
+    /// Records the outcome of a live GPU viewport render pass:
+    /// - Clears `last_viewport_render_error` as soon as a frame renders cleanly.
+    /// - Logs `tracing::error!` and emits a transient UI error toast ONLY when the error
+    ///   message changes (preventing 60Hz stderr flooding on broken GLSL/WGSL shaders).
+    fn record_viewport_render_result(&mut self, result: Result<bool, String>) -> bool {
+        match result {
+            Ok(_) => {
+                self.last_viewport_render_error = None;
+                false
+            }
+            Err(err_msg) => {
+                if self.last_viewport_render_error.as_deref() != Some(err_msg.as_str()) {
+                    self.last_viewport_render_error = Some(err_msg.clone());
+                    tracing::error!("viewport GPU render error: {err_msg}");
+                    self.show_toast(format_viewport_render_error_toast(&err_msg));
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     fn has_unsaved_changes(&self) -> bool {
@@ -1138,6 +1544,7 @@ impl ZoidCraftApp {
             width: render_w,
             height: render_h,
             scene_hash: compute_scene_hash(&self.session),
+            active_composition_id: self.session.document().active_composition_id,
             editing_camera,
             active_camera_hash,
             camera_bits: if editing_camera {
@@ -1155,6 +1562,10 @@ impl ZoidCraftApp {
         }
 
         let cache_budget = self.workspace.panels.app_settings.preview_cache_mib;
+        let active_comp_id = self.session.document().active_composition_id;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.sync_active_composition(active_comp_id);
+        }
         let player_plus_enabled = self.session.plugins.is_enabled("player-plus");
         if player_plus_enabled && self.workspace.player_plus.drawing_paused {
             if self.force_single_render || self.workspace.player_plus.single_render_requested {
@@ -1175,28 +1586,31 @@ impl ZoidCraftApp {
 
         let (frame, render_w, render_h, editing_camera, key) = self.current_viewport_render_key();
         let active_camera_id = self.viewport.active_camera_id.clone();
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
+        let render_result = {
+            let Some(renderer) = self.renderer.as_mut() else {
+                return;
+            };
+            renderer.sync_cache_budget(cache_budget);
+            renderer
+                .render_viewport_if_dirty(
+                    &self.session,
+                    frame,
+                    render_w,
+                    render_h,
+                    editing_camera,
+                    active_camera_id.as_deref(),
+                    &self.viewport.camera,
+                    key,
+                )
+                .map_err(|err| err.to_string())
         };
-        renderer.sync_cache_budget(cache_budget);
-
-        if let Err(err) = renderer.render_viewport_if_dirty(
-            &self.session,
-            frame,
-            render_w,
-            render_h,
-            editing_camera,
-            active_camera_id.as_deref(),
-            &self.viewport.camera,
-            key,
-        ) {
-            tracing::error!("viewport GPU render error: {err}");
-        }
+        let _ = self.record_viewport_render_result(render_result);
     }
 
     fn reset_ephemeral_ui_state(&mut self) {
         self.pending_eyedropper = None;
         self.eyedropper_swallow_pointer = false;
+        self.last_viewport_render_error = None;
 
         // Reset ephemeral panel states (plugin_notice, shader_editor, expr_editor,
         // tree drag/rename states, pickers, floating windows) while preserving user
@@ -1274,9 +1688,14 @@ impl ZoidCraftApp {
         }
         let _ = self.session.execute(Command::NewProject);
         self.session.selection.clear_all();
+        auto_select_default_scene_clip(&mut self.session);
+        self.session.playback.editing_camera = false;
         self.session.mark_saved();
         self.current_file = None;
         self.pending_unsaved_dialog = None;
+        self.cached_missing_plugins_revision = None;
+        self.cached_missing_plugins.clear();
+        self.dismissed_missing_plugins.clear();
         self.reset_live_audio_output();
         self.audio_clock.set_frame(0.0);
         self.last_audio_epoch = self.session.playback.epoch_id;
@@ -1358,13 +1777,20 @@ impl ZoidCraftApp {
         } else {
             match load_zcraft(path) {
                 Ok(project) => {
-                    let missing_plugins =
-                        plugins.missing_required_plugins(&project.plugin_requirements);
                     self.load_project_into_session(project, Some(path.to_path_buf()));
+                    let missing_plugins = self
+                        .session
+                        .plugins
+                        .missing_required_plugins(&self.session.project.plugin_requirements);
                     if !missing_plugins.is_empty() {
                         let missing_labels: Vec<&str> = missing_plugins
                             .iter()
-                            .map(|id| plugins.get(id).map_or(id.as_str(), |p| p.name.as_str()))
+                            .map(|id| {
+                                self.session
+                                    .plugins
+                                    .get(id)
+                                    .map_or(id.as_str(), |p| p.name.as_str())
+                            })
                             .collect();
                         self.workspace.panels.plugin_notice = Some(format!(
                             "Loaded project requires disabled plugins: {}",
@@ -1384,12 +1810,20 @@ impl ZoidCraftApp {
 
     fn load_project_into_session(&mut self, project: Project, path: Option<PathBuf>) {
         self.detach_active_export();
-        let plugins = self.session.plugins.clone();
+        let mut plugins = self.session.plugins.clone();
+        // Automatically re-enable safe built-in plugins recorded when this `.zcraft` was saved
+        // so reopening a saved project renders identically without a false warning banner.
+        for plugin_id in extract_saved_enabled_plugins(&project) {
+            let _ = plugins.enable(&plugin_id);
+        }
         self.session = Session::from_project(project, plugins);
         self.session.selection.clear_all();
         self.session.mark_saved();
         self.current_file = path;
         self.pending_unsaved_dialog = None;
+        self.cached_missing_plugins_revision = None;
+        self.cached_missing_plugins.clear();
+        self.dismissed_missing_plugins.clear();
         self.reset_live_audio_output();
         self.audio_clock
             .set_frame(self.session.playback.current_frame);
@@ -1436,18 +1870,23 @@ impl ZoidCraftApp {
             chosen
         };
 
+        self.save_project_to_path(&target_path, include_assets)
+    }
+
+    fn save_project_to_path(&mut self, target_path: &Path, include_assets: bool) -> bool {
+        if self.session.history.is_in_transaction() {
+            let _ = self.session.commit_transaction(true);
+        }
+
         if !include_assets
             && let Err(msg) =
-                validate_save_without_assets_target(self.current_file.as_deref(), &target_path)
+                validate_save_without_assets_target(self.current_file.as_deref(), target_path)
         {
             self.show_toast(msg);
             return false;
         }
 
-        let mut project_to_save = self.session.project.clone();
-        for dep in self.session.active_plugin_dependencies() {
-            project_to_save.plugin_requirements.insert(dep);
-        }
+        let mut project_to_save = prepare_project_for_zcraft_save(&self.session);
         let mut omitted_embedded_count = 0usize;
         if !include_assets {
             for rec in project_to_save.assets.values_mut() {
@@ -1461,10 +1900,10 @@ impl ZoidCraftApp {
             }
         }
 
-        match save_zcraft(&project_to_save, &target_path) {
+        match save_zcraft(&project_to_save, target_path) {
             Ok(()) => {
                 if include_assets {
-                    self.current_file = Some(target_path.clone());
+                    self.current_file = Some(target_path.to_path_buf());
                     self.session.mark_saved();
                 }
                 let name = target_path
@@ -1817,6 +2256,53 @@ impl ZoidCraftApp {
                             self.timeline
                                 .audio_peaks
                                 .insert(clip_id.to_owned(), ui_peaks);
+                        }
+                    }
+                    Err(err) => {
+                        placement_warning = Some(format!(
+                            "Imported {filename} to Media (could not place clip: {err})"
+                        ));
+                    }
+                }
+            }
+        } else if matches!(kind, AssetKind::Image) || (kind == AssetKind::Av && !is_audio_ext) {
+            let clip_kind = if kind == AssetKind::Image {
+                "image"
+            } else {
+                "video"
+            };
+            let desired_start = self.session.playback.current_frame.round().max(0.0);
+            let length = 150.0_f64;
+            let track_id = choose_free_video_track_at(&self.session, desired_start, length)
+                .or_else(|| {
+                    self.session
+                        .execute(Command::AddVideoTrack { name: None })
+                        .ok()
+                        .and_then(|res| {
+                            res.get("track_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                });
+            if let Some(track_id) = track_id {
+                match self.session.execute(Command::AddClip {
+                    track_id,
+                    kind: clip_kind.to_owned(),
+                    name: Some(filename.clone()),
+                    start: desired_start,
+                    length,
+                }) {
+                    Ok(res) => {
+                        if let Some(clip_id) = res.get("clip_id").and_then(Value::as_str) {
+                            let _ = self.session.execute(Command::SetPropertyValue {
+                                target_id: clip_id.to_owned(),
+                                property: "assetId".to_owned(),
+                                value: json!(asset_id),
+                            });
+                            let _ =
+                                self.session
+                                    .selection
+                                    .select_clip(clip_id, Some(clip_kind), false);
                         }
                     }
                     Err(err) => {
@@ -2515,7 +3001,7 @@ impl ZoidCraftApp {
             if self.session.history.is_in_transaction() {
                 return;
             }
-            let project_to_save = prepare_project_for_pz_export(&self.session);
+            let project_to_save = prepare_project_for_zcraft_save(&self.session);
             match save_recovery_snapshot_to_dir(
                 &project_to_save,
                 &self.recovery_dir,
@@ -2538,7 +3024,7 @@ impl ZoidCraftApp {
         if self.session.history.is_in_transaction() {
             let _ = self.session.commit_transaction(true);
         }
-        let project_to_save = prepare_project_for_pz_export(&self.session);
+        let project_to_save = prepare_project_for_zcraft_save(&self.session);
         match save_recovery_snapshot_to_dir(
             &project_to_save,
             &self.recovery_dir,
@@ -2564,7 +3050,13 @@ impl ZoidCraftApp {
                     .and_then(|n| n.to_str())
                     .unwrap_or("recovery snapshot")
                     .to_owned();
+                let before_restore = self.session.snapshot();
                 self.load_project_into_session(project, None);
+                // Mark the restored snapshot dirty (`*`) so unsaved-changes protection triggers
+                // until the user explicitly saves, while allowing Cmd+Z to undo the restore.
+                self.session
+                    .history
+                    .push("Restore Recovery Snapshot", before_restore);
                 self.startup_recovery_banner = None;
                 self.last_autosave_at = Instant::now();
                 self.last_autosave_revision = self.session.revision();
@@ -2573,6 +3065,57 @@ impl ZoidCraftApp {
             Err(err) => {
                 self.show_toast(format!("Failed to restore recovery snapshot: {err}"));
             }
+        }
+    }
+
+    fn visible_missing_required_plugins(&mut self) -> Vec<String> {
+        let rev = self.session.revision();
+        if self.cached_missing_plugins_revision != Some(rev) {
+            self.cached_missing_plugins = collect_disabled_required_plugins(&self.session);
+            self.cached_missing_plugins_revision = Some(rev);
+        }
+        self.cached_missing_plugins
+            .iter()
+            .filter(|id| !self.dismissed_missing_plugins.contains(*id))
+            .cloned()
+            .collect()
+    }
+
+    fn enable_required_plugins(&mut self, plugin_ids: &[String]) {
+        let mut enabled_names = Vec::new();
+        for plugin_id in plugin_ids {
+            if self
+                .session
+                .execute(Command::EnablePlugin {
+                    plugin_id: plugin_id.clone(),
+                })
+                .is_ok()
+            {
+                let label = self
+                    .session
+                    .plugins
+                    .get(plugin_id)
+                    .map_or_else(|| plugin_id.clone(), |p| p.name.clone());
+                enabled_names.push(label);
+                self.dismissed_missing_plugins.remove(plugin_id);
+            }
+        }
+        self.cached_missing_plugins_revision = None;
+        self.workspace.panels.plugin_notice = None;
+        self.force_single_render = true;
+        if let Some(r) = self.renderer.as_mut() {
+            r.invalidate();
+        }
+        if !enabled_names.is_empty() {
+            self.show_toast(format!(
+                "Enabled required {}: {}",
+                if enabled_names.len() == 1 {
+                    "plugin"
+                } else {
+                    "plugins"
+                },
+                enabled_names.join(", ")
+            ));
         }
     }
 
@@ -2778,8 +3321,17 @@ impl ZoidCraftApp {
                         .font(self.theme.font(FONT_SMALL))
                         .color(TEXT_BRIGHT),
                 );
-                ui.add_space(10.0);
+                ui.add_space(12.0);
+                let primary_fill = Color32::from_rgb(0x2d, 0x67, 0xc4);
+                let primary_stroke = Stroke::new(1.0, Color32::from_rgb(0x52, 0x8b, 0xe4));
+                let destructive_fill = Color32::from_rgb(0x6e, 0x25, 0x25);
+                let destructive_stroke = Stroke::new(1.0, WARNING_BAR);
+                let destructive_text = Color32::from_rgb(0xf6, 0xd8, 0xd8);
+                let neutral_stroke = Stroke::new(1.0, BORDER_PANEL);
+                let btn_min_size = Vec2::new(78.0, 26.0);
+
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     if has_unsaved {
                         let save_lbl = if has_export {
                             "Cancel Export & Save"
@@ -2791,10 +3343,29 @@ impl ZoidCraftApp {
                         } else {
                             "Don't Save"
                         };
-                        if ui.button(save_lbl).clicked() {
+                        let save_btn = egui::Button::new(
+                            egui::RichText::new(save_lbl)
+                                .font(self.theme.font(FONT_SMALL))
+                                .color(TEXT_BRIGHT),
+                        )
+                        .fill(primary_fill)
+                        .stroke(primary_stroke)
+                        .corner_radius(CornerRadius::same(2))
+                        .min_size(btn_min_size);
+                        if ui.add(save_btn).clicked() {
                             choice = Some(1);
                         }
-                        if ui.button(discard_lbl).clicked() {
+
+                        let discard_btn = egui::Button::new(
+                            egui::RichText::new(discard_lbl)
+                                .font(self.theme.font(FONT_SMALL))
+                                .color(destructive_text),
+                        )
+                        .fill(destructive_fill)
+                        .stroke(destructive_stroke)
+                        .corner_radius(CornerRadius::same(2))
+                        .min_size(btn_min_size);
+                        if ui.add(discard_btn).clicked() {
                             choice = Some(2);
                         }
                     } else {
@@ -2803,13 +3374,30 @@ impl ZoidCraftApp {
                         } else {
                             "Cancel Export & Proceed"
                         };
-                        if ui.button(proceed_lbl).clicked() {
+                        let proceed_btn = egui::Button::new(
+                            egui::RichText::new(proceed_lbl)
+                                .font(self.theme.font(FONT_SMALL))
+                                .color(destructive_text),
+                        )
+                        .fill(destructive_fill)
+                        .stroke(destructive_stroke)
+                        .corner_radius(CornerRadius::same(2))
+                        .min_size(btn_min_size);
+                        if ui.add(proceed_btn).clicked() {
                             choice = Some(2);
                         }
                     }
                     let cancel_lbl = if has_export { "Keep Running" } else { "Cancel" };
-                    if ui.button(cancel_lbl).clicked() || ctx.input(|i| i.key_pressed(Key::Escape))
-                    {
+                    let cancel_btn = egui::Button::new(
+                        egui::RichText::new(cancel_lbl)
+                            .font(self.theme.font(FONT_SMALL))
+                            .color(TEXT_PRIMARY),
+                    )
+                    .fill(BG_BUTTON)
+                    .stroke(neutral_stroke)
+                    .corner_radius(CornerRadius::same(2))
+                    .min_size(btn_min_size);
+                    if ui.add(cancel_btn).clicked() || ctx.input(|i| i.key_pressed(Key::Escape)) {
                         choice = Some(0);
                     }
                 });
@@ -2891,40 +3479,234 @@ impl ZoidCraftApp {
                 });
         }
 
-        // Non-blocking startup crash-recovery banner.
+        // Non-blocking missing-plugin warning banner anchored at top-center of the viewport
+        // (strictly clamped within `viewport_rect.shrink(8.0)`) with 1-click plugin enablement.
+        if self.pending_eyedropper.is_none() {
+            let missing_plugins = self.visible_missing_required_plugins();
+            if !missing_plugins.is_empty() {
+                let plugin_names: Vec<String> = missing_plugins
+                    .iter()
+                    .map(|id| {
+                        self.session
+                            .plugins
+                            .get(id)
+                            .map_or_else(|| id.clone(), |p| p.name.clone())
+                    })
+                    .collect();
+                let full_list = plugin_names.join(", ");
+                let mut enable_clicked = false;
+                let mut dismiss_clicked = false;
+
+                let (banner_w, clamp_bounds) = self
+                    .last_viewport_rect
+                    .and_then(|vp| compute_viewport_banner_bounds(vp, 560.0))
+                    .map_or((480.0, None), |(w, b)| (w, Some(b)));
+                let inner_w = (banner_w - 18.0).max(120.0);
+
+                let mut area =
+                    Area::new(Id::unique("zc_missing_plugins_banner")).order(Order::Middle);
+                if let Some(bounds) = clamp_bounds {
+                    let left = (bounds.center().x - banner_w * 0.5)
+                        .clamp(
+                            bounds.left(),
+                            (bounds.right() - banner_w).max(bounds.left()),
+                        )
+                        .round();
+                    area = area
+                        .constrain_to(bounds)
+                        .fixed_pos(Pos2::new(left, bounds.top().round()));
+                } else {
+                    area = area.anchor(Align2::CENTER_TOP, Vec2::new(0.0, 10.0));
+                }
+
+                let warn_border = Color32::from_rgb(0xd4, 0x9b, 0x38);
+                let enable_fill = Color32::from_rgb(0x2d, 0x67, 0xc4);
+                let enable_stroke = Stroke::new(1.0, Color32::from_rgb(0x52, 0x8b, 0xe4));
+                let narrow = banner_w < 380.0;
+                let text_font = self
+                    .theme
+                    .font(if narrow { FONT_COMPACT } else { FONT_SMALL });
+                let enable_label = if narrow {
+                    "Enable Plugins"
+                } else {
+                    "Enable Required Plugins"
+                };
+
+                area.show(ctx, |ui| {
+                    Frame::NONE
+                        .fill(BG_TITLE)
+                        .stroke(Stroke::new(1.0, warn_border))
+                        .inner_margin(egui::Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            ui.set_min_width(inner_w);
+                            ui.set_max_width(inner_w);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(inner_w, 24.0),
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let dismiss_btn = egui::Button::new(
+                                        egui::RichText::new("×")
+                                            .font(self.theme.font(FONT_SMALL))
+                                            .color(TEXT_PRIMARY),
+                                    )
+                                    .fill(BG_BUTTON)
+                                    .stroke(Stroke::new(1.0, BORDER_PANEL))
+                                    .corner_radius(CornerRadius::same(2))
+                                    .min_size(Vec2::new(22.0, 22.0));
+                                    if ui
+                                        .add(dismiss_btn)
+                                        .on_hover_text("Dismiss for this session")
+                                        .clicked()
+                                    {
+                                        dismiss_clicked = true;
+                                    }
+
+                                    let enable_btn = egui::Button::new(
+                                        egui::RichText::new(enable_label)
+                                            .font(text_font.clone())
+                                            .color(TEXT_BRIGHT),
+                                    )
+                                    .fill(enable_fill)
+                                    .stroke(enable_stroke)
+                                    .corner_radius(CornerRadius::same(2))
+                                    .min_size(Vec2::new(0.0, 22.0));
+                                    if ui.add(enable_btn).clicked() {
+                                        enable_clicked = true;
+                                    }
+
+                                    let avail_lbl_w = ui.available_width().max(40.0);
+                                    let msg = format_missing_plugins_banner_summary(
+                                        &plugin_names,
+                                        narrow,
+                                    );
+                                    let tooltip = format!(
+                                        "This project uses features from {} disabled {}:\n{}",
+                                        plugin_names.len(),
+                                        if plugin_names.len() == 1 {
+                                            "plugin"
+                                        } else {
+                                            "plugins"
+                                        },
+                                        full_list
+                                    );
+                                    ui.add_sized(
+                                        [avail_lbl_w, 20.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(msg)
+                                                .font(text_font)
+                                                .color(Color32::from_rgb(0xf2, 0xd1, 0x8b)),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(tooltip);
+                                },
+                            );
+                        });
+                });
+
+                if enable_clicked {
+                    self.enable_required_plugins(&missing_plugins);
+                } else if dismiss_clicked {
+                    for id in missing_plugins {
+                        self.dismissed_missing_plugins.insert(id);
+                    }
+                }
+            }
+        }
+
+        // Non-blocking startup crash-recovery banner positioned cleanly at the bottom-center
+        // of the viewport and strictly clamped inside `viewport_rect.shrink(8.0)` so even at
+        // 800×540 it never spills left onto the Media sidebar.
+        let mut recovery_banner_extra_bottom_inset = 0.0_f32;
         if self.pending_eyedropper.is_none()
             && let Some(snap) = self.startup_recovery_banner.clone()
         {
             let mut restore_clicked = false;
             let mut dismiss_clicked = false;
-            Area::new(Id::unique("zc_recovery_banner"))
-                .order(Order::Foreground)
-                .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 10.0))
-                .show(ctx, |ui| {
-                    Frame::NONE
-                        .fill(BG_TITLE)
-                        .stroke(Stroke::new(1.0, self.theme.accent()))
-                        .inner_margin(egui::Margin::symmetric(10, 6))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Recovery snapshot available: {}",
-                                        snap.filename
-                                    ))
-                                    .font(self.theme.font(FONT_SMALL))
-                                    .color(TEXT_BRIGHT),
-                                );
-                                if ui.button("Restore Latest").clicked() {
-                                    restore_clicked = true;
-                                }
-                                if ui.button("Dismiss").clicked() {
+            let formatted_ts = format_recovery_timestamp(snap.timestamp_secs);
+            let (banner_w, clamp_bounds) = self
+                .last_viewport_rect
+                .and_then(|vp| compute_viewport_banner_bounds(vp, 460.0))
+                .map_or((420.0, None), |(w, b)| (w, Some(b)));
+            let inner_w = (banner_w - 18.0).max(120.0);
+            let narrow = banner_w < 360.0;
+            let text_font = self
+                .theme
+                .font(if narrow { FONT_COMPACT } else { FONT_SMALL });
+
+            let mut area = Area::new(Id::unique("zc_recovery_banner")).order(Order::Middle);
+            if let Some(bounds) = clamp_bounds {
+                let left = (bounds.center().x - banner_w * 0.5)
+                    .clamp(
+                        bounds.left(),
+                        (bounds.right() - banner_w).max(bounds.left()),
+                    )
+                    .round();
+                area = area
+                    .constrain_to(bounds)
+                    .pivot(Align2::LEFT_BOTTOM)
+                    .fixed_pos(Pos2::new(left, bounds.bottom().round()));
+            } else {
+                area = area.anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -14.0));
+            }
+            let banner_resp = area.show(ctx, |ui| {
+                Frame::NONE
+                    .fill(BG_TITLE)
+                    .stroke(Stroke::new(1.0, self.theme.accent()))
+                    .inner_margin(egui::Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        ui.set_min_width(inner_w);
+                        ui.set_max_width(inner_w);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(inner_w, 24.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let dismiss_btn = egui::Button::new(
+                                    egui::RichText::new("Dismiss")
+                                        .font(text_font.clone())
+                                        .color(TEXT_PRIMARY),
+                                )
+                                .fill(BG_BUTTON)
+                                .stroke(Stroke::new(1.0, BORDER_PANEL))
+                                .corner_radius(CornerRadius::same(2))
+                                .min_size(Vec2::new(0.0, 22.0));
+                                if ui.add(dismiss_btn).clicked() {
                                     dismiss_clicked = true;
                                 }
-                            });
-                        });
-                });
+
+                                let restore_btn = egui::Button::new(
+                                    egui::RichText::new("Restore")
+                                        .font(text_font.clone())
+                                        .color(TEXT_BRIGHT),
+                                )
+                                .fill(Color32::from_rgb(0x2d, 0x67, 0xc4))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(0x52, 0x8b, 0xe4)))
+                                .corner_radius(CornerRadius::same(2))
+                                .min_size(Vec2::new(0.0, 22.0));
+                                if ui.add(restore_btn).clicked() {
+                                    restore_clicked = true;
+                                }
+
+                                let label_w = ui.available_width().max(40.0);
+                                let banner_label = format!("Recovery: {formatted_ts}");
+                                ui.add_sized(
+                                    [label_w, 20.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(banner_label)
+                                            .font(text_font)
+                                            .color(TEXT_BRIGHT),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(format!("Autosave snapshot: {}", snap.filename));
+                            },
+                        );
+                    });
+            });
+            recovery_banner_extra_bottom_inset =
+                (banner_resp.response.rect.height() + 10.0).max(46.0);
             if restore_clicked {
                 self.handle_restore_recovery_snapshot(&snap.path);
             } else if dismiss_clicked {
@@ -2954,24 +3736,45 @@ impl ZoidCraftApp {
                 });
         }
 
-        // Transient status toast.
+        // Transient status/error toast clamped strictly inside viewport_rect (left of the VU meter
+        // and offset strictly above the autosave Recovery banner whenever visible).
         if let Some((msg, created)) = &self.status_toast {
             if created.elapsed() < TOAST_LIFETIME {
                 let text = msg.clone();
+                let is_error = text.starts_with("Shader error:")
+                    || text.starts_with("Viewport render error:")
+                    || text.starts_with("Failed");
+                let screen_rect = ctx.input(|i| i.viewport_rect());
+                let placement = compute_status_toast_bounds_with_bottom_inset(
+                    self.last_viewport_rect,
+                    screen_rect,
+                    recovery_banner_extra_bottom_inset,
+                );
+                let inner_max_w = (placement.max_width - 20.0).max(40.0);
                 Area::new(Id::unique("zc_status_toast"))
                     .order(Order::Foreground)
-                    .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-14.0, -14.0))
+                    .interactable(false)
+                    .pivot(Align2::RIGHT_BOTTOM)
+                    .fixed_pos(placement.anchor_pos)
+                    .constrain_to(placement.bounds)
                     .show(ctx, |ui| {
                         Frame::NONE
                             .fill(BG_PANEL)
-                            .stroke(Stroke::new(1.0, BORDER_PANEL))
+                            .stroke(Stroke::new(
+                                1.0,
+                                if is_error { WARNING_BAR } else { BORDER_PANEL },
+                            ))
                             .corner_radius(CornerRadius::ZERO)
                             .inner_margin(egui::Margin::symmetric(10, 6))
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(text)
-                                        .font(self.theme.font(FONT_SMALL))
-                                        .color(TEXT_PRIMARY),
+                                ui.set_max_width(inner_max_w);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(text)
+                                            .font(self.theme.font(FONT_SMALL))
+                                            .color(TEXT_PRIMARY),
+                                    )
+                                    .wrap(),
                                 );
                             });
                     });
@@ -3001,8 +3804,21 @@ impl eframe::App for ZoidCraftApp {
         CLEAR_BG_RGBA
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        ui::clipboard::bridge_raw_input_paste(raw_input, &mut ui::clipboard::read_system_clipboard);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        ui::controls::reset_transient_popover_escape_flag(&ctx);
+
+        // 0. Seed `egui-winit`'s in-memory clipboard stub once on launch with a non-empty
+        //    sentinel (without touching the user's real OS clipboard) so `Cmd/Ctrl+V` always
+        //    emits `Event::Paste` that `raw_input_hook` refreshes from the live OS clipboard.
+        if !self.clipboard_bridge_seeded {
+            self.clipboard_bridge_seeded = true;
+            ctx.copy_text(ui::clipboard::CLIPBOARD_SENTINEL.to_owned());
+        }
 
         // 1. Live theme & history-budget sync (only updates when values changed).
         if self.applied_theme.as_ref() != Some(&self.theme) {
@@ -3060,7 +3876,15 @@ impl eframe::App for ZoidCraftApp {
         let eyedropper_cancelled = self.handle_eyedropper_click(&ctx);
 
         // 3. Dispatch full keyboard shortcuts (respecting Timeline focus for C/L,
-        //    reporting floating-window Undo/Redo errors, and handling Escape for floating windows).
+        //    reporting floating-window Undo/Redo errors, and handling LIFO Escape while
+        //    yielding Escape to any open foreground transient popover like Color Picker).
+        if let Some(ref fid) = self.workspace.panels.floating_windows.focused_id
+            && !self.workspace.panels.floating_windows.is_open(fid)
+        {
+            self.workspace.panels.floating_windows.clear_focus();
+        }
+        let transient_popover_owns_esc = ui::controls::is_transient_popover_open(&ctx)
+            || ui::controls::transient_popover_consumed_escape(&ctx);
         if !eyedropper_cancelled && self.pending_unsaved_dialog.is_none() {
             if let Some(focused_win_id) = self.workspace.panels.floating_windows.focused_id.clone()
             {
@@ -3097,17 +3921,18 @@ impl eframe::App for ZoidCraftApp {
                     } else if save_with_assets || save_no_assets {
                         let _ = self.handle_save_project(save_with_assets);
                         consume_dispatched_shortcut_keys(&ctx, &[Key::S]);
-                    } else if esc {
-                        if let Some(win) = self
-                            .workspace
+                    } else if esc && !transient_popover_owns_esc {
+                        // Close only the topmost focused floating window in LIFO order,
+                        // transferring focus to the next highest open window.
+                        self.workspace
                             .panels
                             .floating_windows
-                            .windows
-                            .get_mut(&focused_win_id)
+                            .close(&focused_win_id);
+                        if self.workspace.panels.floating_windows.focused_id.is_none()
+                            && self.graph_editor.open
                         {
-                            win.open = false;
+                            self.graph_editor.window_focused = true;
                         }
-                        self.workspace.panels.floating_windows.clear_focus();
                         consume_dispatched_shortcut_keys(&ctx, &[Key::Escape]);
                     }
                 }
@@ -3141,15 +3966,23 @@ impl eframe::App for ZoidCraftApp {
                     Vec::new()
                 };
 
-                let shortcut_outcome = dispatch_shortcuts(
+                let shortcut_outcome = dispatch_shortcuts_with_context(
                     &ctx,
                     &mut self.session,
                     &mut self.timeline,
                     &mut self.graph_editor,
                     &mut self.viewport,
+                    self.workspace.focused_panel,
+                    self.workspace.active_tab,
                 );
-                if !shortcut_outcome.handled_keys.is_empty() {
-                    consume_dispatched_shortcut_keys(&ctx, &shortcut_outcome.handled_keys);
+                if !shortcut_outcome.handled_keys.is_empty()
+                    || shortcut_outcome.consumed_clipboard_events
+                {
+                    consume_dispatched_shortcut_events(
+                        &ctx,
+                        &shortcut_outcome.handled_keys,
+                        shortcut_outcome.consumed_clipboard_events,
+                    );
                 }
                 if !stashed_timeline_keys.is_empty() {
                     ctx.input_mut(|i| i.events.extend(stashed_timeline_keys));
@@ -3165,26 +3998,46 @@ impl eframe::App for ZoidCraftApp {
                 }
                 if let Some(err) = shortcut_outcome.last_error {
                     self.show_toast(err);
+                } else if let Some(msg) = shortcut_outcome.status_message {
+                    self.show_toast(msg);
                 }
             }
         }
 
-        // 4. Dirty-tracked zero-copy GPU viewport render.
+        // Keep `editing_camera` synced with selection so the toolbar button and Camera Switcher
+        // never indicate Editing Camera ON while the viewport renders Preview mode.
+        if self.session.playback.editing_camera && !selected_clip_is_scene3d(&self.session) {
+            self.session.playback.editing_camera = false;
+        }
+
+        // 4. Dirty-tracked zero-copy GPU viewport render & preview cache telemetry sync.
         self.update_viewport_gpu();
-        let viewport_tex = self
-            .renderer
-            .as_ref()
-            .and_then(ViewportGpuPresenter::texture_id);
+        let (viewport_tex, cached_spans, cached_used_bytes) = self.renderer.as_ref().map_or_else(
+            || (None, Vec::new(), 0_u64),
+            |r| {
+                (
+                    r.texture_id(),
+                    r.preview_cache_spans(),
+                    r.preview_cache_used_bytes(),
+                )
+            },
+        );
+        self.timeline.cached_frame_spans = cached_spans;
+        ctx.data_mut(|d| {
+            d.insert_temp(Id::unique("zc_preview_cache_used_bytes"), cached_used_bytes);
+        });
 
         // 5. Render pixel-exact Workspace shell inside CentralPanel (eframe 0.37 API).
         let mut ui_actions = Vec::new();
         let mut open_graph_target: Option<(String, String)> = None;
         let mut canvas_rect_this_frame: Option<Rect> = None;
         let mut viewport_rect_this_frame: Option<Rect> = None;
+        let mut viewport_force_refresh = false;
 
         // Sync shortcuts -> toolbar before workspace renders so toolbar reflects V/P/Q immediately.
         let draw_tool_before_ui = self.viewport.active_draw_tool;
         self.workspace.viewport_draw_tool = draw_tool_before_ui;
+        self.workspace.external_shortcuts_dispatched = true;
 
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(BG_SUNKEN))
@@ -3192,6 +4045,8 @@ impl eframe::App for ZoidCraftApp {
                 let palette = self.theme.palette;
                 self.viewport.transparency_grid = self.workspace.transparency_grid;
                 self.viewport.motion_path_visible = self.workspace.motion_path_visible;
+                self.viewport.show_fps_overlay =
+                    self.workspace.panels.app_settings.show_fps_overlay;
                 self.workspace.graph_open = self.graph_editor.open;
                 let viewport_state = &mut self.viewport;
                 let timeline_state = &mut self.timeline;
@@ -3205,6 +4060,9 @@ impl eframe::App for ZoidCraftApp {
                             show_viewport(vp_ui, session, viewport_state, viewport_tex, &palette);
                         viewport_rect_this_frame = vp_action.panel_rect.or(Some(vp_rect));
                         canvas_rect_this_frame = vp_action.canvas_rect;
+                        if vp_action.force_refresh {
+                            viewport_force_refresh = true;
+                        }
                     },
                     |tl_ui, _tl_rect, _focused, session| {
                         let tl_action = show_timeline(tl_ui, session, timeline_state, &palette);
@@ -3214,6 +4072,10 @@ impl eframe::App for ZoidCraftApp {
                     },
                 );
             });
+
+        if viewport_force_refresh {
+            self.force_single_render = true;
+        }
 
         // Bidirectional draw-tool sync: toolbar clicks propagate into viewport; viewport mutations propagate back.
         if self.workspace.viewport_draw_tool != draw_tool_before_ui {
@@ -3228,11 +4090,13 @@ impl eframe::App for ZoidCraftApp {
         self.prune_export_queue_snapshots();
 
         // 6. Process bubbled workspace/panel/timeline actions.
+        let fw_focus_before_graph = self.workspace.panels.floating_windows.focused_id.clone();
         if let Some((target_id, prop)) = open_graph_target {
             self.graph_editor.focused_property = Some((target_id, prop));
             self.graph_editor.follow_selection = false;
             self.graph_editor.open = true;
             self.graph_editor.window_focused = true;
+            self.workspace.panels.floating_windows.clear_focus();
         }
 
         for action in ui_actions {
@@ -3256,6 +4120,7 @@ impl eframe::App for ZoidCraftApp {
                     } else {
                         self.graph_editor.open = true;
                         self.graph_editor.window_focused = true;
+                        self.workspace.panels.floating_windows.clear_focus();
                     }
                 }
                 UiAction::OpenGraphForProperty {
@@ -3266,6 +4131,7 @@ impl eframe::App for ZoidCraftApp {
                     self.graph_editor.follow_selection = false;
                     self.graph_editor.open = true;
                     self.graph_editor.window_focused = true;
+                    self.workspace.panels.floating_windows.clear_focus();
                 }
                 UiAction::StartExport(cfg) => self.handle_start_export(cfg),
                 UiAction::AddToExportQueue(cfg) => self.handle_add_to_export_queue(cfg),
@@ -3305,6 +4171,7 @@ impl eframe::App for ZoidCraftApp {
 
         // 7. Floating dual-mode Graph Editor / Graph Editor 2 + Easing+ window.
         let graph_open_before_window = self.graph_editor.open;
+        let graph_focused_before_window = self.graph_editor.window_focused;
         if self.graph_editor.open {
             let _ = show_graph_editor_window(
                 &ctx,
@@ -3312,6 +4179,9 @@ impl eframe::App for ZoidCraftApp {
                 &mut self.graph_editor,
                 &self.theme.palette,
             );
+            if self.graph_editor.window_focused && !graph_focused_before_window {
+                self.workspace.panels.floating_windows.clear_focus();
+            }
         }
         self.workspace.graph_open = self.graph_editor.open;
         if self.graph_editor.open != graph_open_before_window {
@@ -3334,6 +4204,11 @@ impl eframe::App for ZoidCraftApp {
                 &mut self.session,
                 &self.theme,
             );
+        }
+        if self.workspace.panels.floating_windows.focused_id != fw_focus_before_graph
+            && self.workspace.panels.floating_windows.focused_id.is_some()
+        {
+            self.graph_editor.window_focused = false;
         }
 
         // 8. Post-UI repaint scheduling & transport synchronization so UI mutations
@@ -3359,31 +4234,20 @@ impl eframe::App for ZoidCraftApp {
             ctx.request_repaint();
         }
 
-        // 9. Optional FPS overlay, status toasts, and native window title sync.
-        if self.workspace.panels.app_settings.show_fps_overlay
-            && let Some(rect) = self
-                .last_viewport_rect
-                .or(self.last_canvas_rect)
-                .map(|vp| self.last_canvas_rect.map_or(vp, |c| c.intersect(vp)))
-            && rect.width() > 0.0
-            && rect.height() > 0.0
-        {
-            let dt = ctx.input(|i| i.stable_dt).max(1e-4);
-            let fps = 1.0 / dt;
-            let painter =
-                ctx.layer_painter(egui::LayerId::new(Order::Foreground, Id::unique("fps")));
-            painter.text(
-                Pos2::new(rect.left() + 8.0, rect.top() + 8.0),
-                Align2::LEFT_TOP,
-                format!("{fps:.1} fps"),
-                self.theme.font(FONT_COMPACT),
-                Color32::from_rgb(0xce, 0xce, 0x62),
-            );
-        }
-
+        // 9. Modals, status overlays, native window title sync, and OS clipboard mirroring.
+        // (The single canonical FPS pill lives in `viewport.rs` and is driven by
+        // `self.viewport.show_fps_overlay`.)
         self.show_unsaved_changes_modal(&ctx);
         self.show_status_overlays(&ctx);
         self.update_window_title(&ctx);
+
+        // Mirror `Cmd+C`/`Cmd+X` from any focused `TextEdit` widget (Expression Editor,
+        // Shader Editor, 2D Text, etc.) to the native OS clipboard.
+        let output_commands = ctx.output(|o| o.commands.clone());
+        ui::clipboard::mirror_output_copy_commands(
+            &output_commands,
+            &mut ui::clipboard::write_os_clipboard_raw,
+        );
     }
 }
 
@@ -3392,11 +4256,22 @@ impl eframe::App for ZoidCraftApp {
 // ---------------------------------------------------------------------------
 
 fn consume_dispatched_shortcut_keys(ctx: &egui::Context, handled_keys: &[Key]) {
-    if handled_keys.is_empty() {
+    consume_dispatched_shortcut_events(ctx, handled_keys, false);
+}
+
+fn consume_dispatched_shortcut_events(
+    ctx: &egui::Context,
+    handled_keys: &[Key],
+    consume_clipboard: bool,
+) {
+    if handled_keys.is_empty() && !consume_clipboard {
         return;
     }
     ctx.input_mut(|i| {
         i.events.retain(|ev| {
+            if consume_clipboard && matches!(ev, egui::Event::Copy | egui::Event::Paste(_)) {
+                return false;
+            }
             !matches!(
                 ev,
                 egui::Event::Key {
@@ -3707,6 +4582,217 @@ fn find_non_overlapping_start(
     }
 }
 
+/// Auto-selects the default `Scene` clip on `V1` (or first `"scene"` clip in the sequence)
+/// on fresh blank startup so inspectors are immediately populated instead of blank.
+fn auto_select_default_scene_clip(session: &mut Session) {
+    let scene_clip_id = session
+        .document()
+        .video_tracks
+        .first()
+        .and_then(|v1| v1.clips.iter().find(|c| c.kind == "scene"))
+        .or_else(|| {
+            session
+                .document()
+                .video_tracks
+                .iter()
+                .flat_map(|t| t.clips.iter())
+                .find(|c| c.kind == "scene")
+        })
+        .map(|c| c.id.clone());
+    if let Some(clip_id) = scene_clip_id {
+        let _ = session.selection.select_clip(clip_id, Some("scene"), false);
+    }
+}
+
+/// Computes the bottom-center anchor point inside the viewport for the non-blocking
+/// crash-recovery banner so it never obscures the top toolbar, sidebar, top-left viewport
+/// HUD, or floating Graph Editor titlebar.
+#[cfg(test)]
+fn recovery_banner_anchor_pos(viewport_rect: Option<Rect>) -> Option<Pos2> {
+    let vp = viewport_rect?;
+    if vp.width() <= 60.0 || vp.height() <= 40.0 {
+        return None;
+    }
+    Some(Pos2::new(
+        vp.center().x.round(),
+        (vp.bottom() - 10.0).round(),
+    ))
+}
+
+/// Computes `(clamped_banner_width, viewport_inner_bounds)` strictly within
+/// `viewport_rect.shrink(8.0)` so viewport banners never spill onto the Media sidebar
+/// even at compact `800×540` window sizes.
+fn compute_viewport_banner_bounds(viewport_rect: Rect, max_width: f32) -> Option<(f32, Rect)> {
+    let bounds = viewport_rect.shrink(8.0);
+    if bounds.width() <= 40.0 || bounds.height() <= 30.0 {
+        return None;
+    }
+    let width = bounds.width().min(max_width).floor();
+    Some((width, bounds))
+}
+
+/// Clamped placement geometry for transient bottom-right status/error toasts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StatusToastBounds {
+    bounds: Rect,
+    anchor_pos: Pos2,
+    max_width: f32,
+}
+
+/// Computes strictly clamped bottom-right toast bounds inside `viewport_rect` (left of the
+/// 44px Audio Level Meter + 3px divider reserve) with a bounded maximum width so long error
+/// messages wrap cleanly and never overlap Track A1 or the right VU meter.
+#[cfg(test)]
+fn compute_status_toast_bounds(
+    viewport_rect: Option<Rect>,
+    screen_rect: Rect,
+) -> StatusToastBounds {
+    compute_status_toast_bounds_with_bottom_inset(viewport_rect, screen_rect, 0.0)
+}
+
+/// Computes strictly clamped bottom-right toast bounds inside `viewport_rect` with an optional
+/// `extra_bottom_inset` (e.g., to lift the toast strictly above the autosave Recovery banner).
+fn compute_status_toast_bounds_with_bottom_inset(
+    viewport_rect: Option<Rect>,
+    screen_rect: Rect,
+    extra_bottom_inset: f32,
+) -> StatusToastBounds {
+    const EDGE_PAD: f32 = 10.0;
+    const VU_METER_RESERVE: f32 = 56.0; // 44px VU meter + 3px divider + 9px margin
+    const MAX_TOAST_WIDTH: f32 = 420.0;
+
+    let base = viewport_rect
+        .map(|vp| vp.intersect(screen_rect))
+        .filter(|vp| vp.width() >= 80.0 && vp.height() >= 40.0)
+        .unwrap_or(screen_rect);
+
+    let left = (base.left() + EDGE_PAD).min(base.right());
+    let top = (base.top() + EDGE_PAD).min(base.bottom());
+    let right_margin = if base.width() > 240.0 {
+        VU_METER_RESERVE
+    } else {
+        EDGE_PAD
+    };
+    let right = (base.right() - right_margin)
+        .max(left + 40.0)
+        .min(base.right());
+    let bottom_pad = EDGE_PAD + extra_bottom_inset.max(0.0);
+    let bottom = (base.bottom() - bottom_pad)
+        .max(top + 20.0)
+        .min(base.bottom());
+    let bounds = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
+    let max_width = bounds.width().clamp(40.0, MAX_TOAST_WIDTH).floor();
+    StatusToastBounds {
+        bounds,
+        anchor_pos: Pos2::new(bounds.right().round(), bounds.bottom().round()),
+        max_width,
+    }
+}
+
+/// Formats a concise missing-plugin banner label with explicit total count and `+{N} more`
+/// overflow suffix so long lists never clip mid-word (hover tooltip always lists every plugin).
+fn format_missing_plugins_banner_summary(plugin_names: &[String], narrow: bool) -> String {
+    match plugin_names {
+        [] => String::new(),
+        [only] => format!("Disabled plugin (1): {only}"),
+        [first, second] => {
+            if !narrow && first.chars().count() + second.chars().count() <= 24 {
+                format!("Disabled plugins (2): {first}, {second}")
+            } else {
+                format!("Disabled plugins (2): {first}, +1 more")
+            }
+        }
+        [first, second, rest @ ..] => {
+            let total = 2 + rest.len();
+            if !narrow && first.chars().count() + second.chars().count() <= 22 {
+                format!(
+                    "Disabled plugins ({total}): {first}, {second}, +{} more",
+                    rest.len()
+                )
+            } else {
+                format!("Disabled plugins ({total}): {first}, +{} more", total - 1)
+            }
+        }
+    }
+}
+
+/// Formats a Unix timestamp (seconds) as clean human-readable `YYYY-MM-DD HH:MM UTC`
+/// using Howard Hinnant's civil-from-days conversion (zero external dependencies).
+fn format_recovery_timestamp(timestamp_secs: u64) -> String {
+    if timestamp_secs == 0 {
+        return "unsaved snapshot".to_owned();
+    }
+    let secs_per_day = 86_400_u64;
+    let days = (timestamp_secs / secs_per_day) as i64;
+    let secs_of_day = timestamp_secs % secs_per_day;
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+
+    // Civil date from days since 1970-01-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = y + i64::from(month <= 2);
+
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+/// Detects built-in plugins required by the currently open project that are disabled in
+/// `session.plugins`, producing zero false positives on a fresh blank project.
+fn collect_disabled_required_plugins(session: &Session) -> Vec<String> {
+    let mut required = session.active_plugin_dependencies();
+    if !session.project.compositions.is_empty() {
+        required.insert("precomp-plus".to_owned());
+    }
+    for track in &session.document().video_tracks {
+        for clip in &track.clips {
+            if clip.kind.eq_ignore_ascii_case("precomp")
+                || clip.kind.to_ascii_lowercase().contains("precomp-plus")
+            {
+                required.insert("precomp-plus".to_owned());
+            }
+            for obj in &clip.objects_3d {
+                let kind_lc = obj.kind.to_ascii_lowercase();
+                if kind_lc == "flare" || kind_lc.contains("optical-flare") {
+                    required.insert("optical-flares".to_owned());
+                }
+            }
+        }
+    }
+    required
+        .into_iter()
+        .filter(|id| session.plugins.get(id).is_some() && !session.plugins.is_enabled(id))
+        .collect()
+}
+
+/// Picks the first unlocked video track with no overlapping clip at `[desired_start, desired_start + length)`.
+/// Returns `None` if all unlocked video tracks overlap so the caller creates a new video track
+/// above and places the imported clip right at the playhead.
+fn choose_free_video_track_at(
+    session: &Session,
+    desired_start: f64,
+    length: f64,
+) -> Option<String> {
+    session
+        .document()
+        .video_tracks
+        .iter()
+        .find(|t| {
+            !t.locked
+                && !t.clips.iter().any(|c| {
+                    c.start < desired_start + length - 1e-6
+                        && desired_start < c.start + c.length - 1e-6
+                })
+        })
+        .map(|t| t.id.clone())
+}
+
 /// Picks an unlocked audio track with no overlap at `desired_start`, or the earliest
 /// non-overlapping start on the first unlocked audio track (returns `None` when no unlocked
 /// audio track exists, signaling the caller to create a new audio track).
@@ -3943,18 +5029,27 @@ fn compute_scene_hash(session: &Session) -> u64 {
     let project_hash = zc_render::cache::project_render_hash(&session.project, &session.plugins);
     fnv_mix(&mut h, &project_hash.to_le_bytes());
 
-    // Also fold live `SessionDocument` + selection state (selection drives editing-camera AABB highlights).
+    // Also fold live `SessionDocument` + active composition + selection state
+    // (selection drives editing-camera AABB highlights).
     let doc = session.document();
+    if let Some(comp_id) = doc.active_composition_id {
+        fnv_mix(&mut h, &[1]);
+        fnv_mix(&mut h, comp_id.as_bytes());
+    } else {
+        fnv_mix(&mut h, &[0]);
+    }
     fnv_mix(&mut h, &doc.resolution[0].to_le_bytes());
     fnv_mix(&mut h, &doc.resolution[1].to_le_bytes());
     fnv_mix_f64(&mut h, doc.fps);
     fnv_mix_f64(&mut h, doc.sequence_length);
     fnv_mix_props(&mut h, &doc.sequence_properties);
-    for cid in &session.selection.clip_ids {
-        fnv_mix(&mut h, cid.as_bytes());
-    }
-    for oid in &session.selection.object_3d_ids {
-        fnv_mix(&mut h, oid.as_bytes());
+    if session.playback.editing_camera {
+        for cid in &session.selection.clip_ids {
+            fnv_mix(&mut h, cid.as_bytes());
+        }
+        for oid in &session.selection.object_3d_ids {
+            fnv_mix(&mut h, oid.as_bytes());
+        }
     }
     for track in &doc.video_tracks {
         fnv_mix(&mut h, track.id.as_bytes());
@@ -4889,11 +5984,66 @@ fn sample_live_audio_meter(
     (rms_l, rms_r)
 }
 
+/// Prepares a cloned [`Project`] for native `.zcraft` saving, syncing active plugin
+/// requirements and recording all currently enabled safe built-in plugins inside
+/// `sequence.preserved["zoidcraftEnabledPlugins"]` so reopening preserves the exact look.
+fn prepare_project_for_zcraft_save(session: &Session) -> Project {
+    let mut project = session.project.clone();
+    for dep in session.active_plugin_dependencies() {
+        project.plugin_requirements.insert(dep);
+    }
+    let mut enabled: Vec<String> = session
+        .plugins
+        .enabled_ids()
+        .iter()
+        .filter(|id| id.as_str() != "core")
+        .cloned()
+        .collect();
+    enabled.sort();
+    enabled.dedup();
+    if enabled.is_empty() {
+        project
+            .sequence
+            .preserved
+            .remove(ZOIDCRAFT_ENABLED_PLUGINS_KEY);
+    } else {
+        project
+            .sequence
+            .preserved
+            .insert(ZOIDCRAFT_ENABLED_PLUGINS_KEY.to_owned(), json!(enabled));
+    }
+    project
+}
+
+/// Extracts persisted enabled built-in plugin IDs saved into `sequence.preserved` by
+/// [`prepare_project_for_zcraft_save`].
+fn extract_saved_enabled_plugins(project: &Project) -> Vec<String> {
+    let Some(arr) = project
+        .sequence
+        .preserved
+        .get(ZOIDCRAFT_ENABLED_PLUGINS_KEY)
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn prepare_project_for_pz_export(session: &Session) -> Project {
     let mut project = session.project.clone();
     for dep in session.active_plugin_dependencies() {
         project.plugin_requirements.insert(dep);
     }
+    // Never pollute vanilla CM3 `.pz` archives with ZoidCraft-only persisted plugin state.
+    project
+        .sequence
+        .preserved
+        .remove(ZOIDCRAFT_ENABLED_PLUGINS_KEY);
     project
 }
 
@@ -4923,6 +6073,12 @@ fn sanitize_filename(raw: &str) -> String {
 fn main() -> eframe::Result {
     tracing_subscriber::fmt::init();
 
+    let initial_project = std::env::args_os()
+        .skip(1)
+        .find(|arg| !arg.to_string_lossy().starts_with('-'))
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
@@ -4935,7 +6091,16 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "ZoidCraft",
         options,
-        Box::new(|cc| Ok(Box::new(ZoidCraftApp::new(cc)))),
+        Box::new(move |cc| {
+            let mut app = ZoidCraftApp::new(cc);
+            if let Some(ref path) = initial_project {
+                app.open_project_from_path(path);
+                // When opening a project directly via CLI, keep focus on the opened project
+                // instead of showing a stale autosave recovery banner over it.
+                app.startup_recovery_banner = None;
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -5841,6 +7006,10 @@ mod tests {
             last_autosave_at: Instant::now(),
             last_autosave_revision: 0,
             startup_recovery_banner: None,
+            clipboard_bridge_seeded: false,
+            cached_missing_plugins_revision: None,
+            cached_missing_plugins: Vec::new(),
+            dismissed_missing_plugins: BTreeSet::new(),
             pending_eyedropper: None,
             eyedropper_swallow_pointer: false,
             pending_unsaved_dialog: None,
@@ -5851,6 +7020,7 @@ mod tests {
             last_tick: Instant::now(),
             last_title: String::new(),
             status_toast: None,
+            last_viewport_render_error: None,
         }
     }
 
@@ -6990,6 +8160,1101 @@ mod tests {
                 .iter()
                 .any(|c| c.id == "ctl-global-gain" && c.name == "GlobalGain"),
             "promoted child export must retain root-only sequence controls as fallbacks"
+        );
+    }
+
+    #[test]
+    fn practical_headless_intro_build_and_gpu_render_e2e() {
+        let Ok(mut engine) = ProjectRenderEngine::new_headless() else {
+            return;
+        };
+        let mut session = Session::new();
+        for pid in [
+            "particles-plus",
+            "repeater-plus",
+            "effector-plus",
+            "shape-plus",
+            "camera-plus",
+            "material-plus",
+            "sglow-hq-v2-preview",
+        ] {
+            let _ = session.plugins.enable(pid);
+        }
+        session
+            .execute(Command::SetProjectName {
+                name: "Practical Intro Test".to_owned(),
+            })
+            .expect("project name");
+        session
+            .execute(Command::SetResolution {
+                width: 640,
+                height: 360,
+            })
+            .expect("resolution");
+        session.execute(Command::SetFps { fps: 60.0 }).expect("fps");
+        session
+            .execute(Command::SetSequenceLength { frames: 180.0 })
+            .expect("sequence length");
+
+        // Track 0 (V1): Reuse the default 3D Scene clip if present, or create one.
+        let scene_clip_id = if let Some(existing) = session
+            .document()
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.kind == "scene")
+        {
+            existing.id.clone()
+        } else {
+            let v0 = session.document().video_tracks[0].id.clone();
+            session
+                .execute(Command::AddClip {
+                    track_id: v0,
+                    kind: "scene".to_owned(),
+                    name: Some("Intro 3D Scene".to_owned()),
+                    start: 0.0,
+                    length: 180.0,
+                })
+                .expect("add 3d scene")["clip_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        // Find or create Scene Camera and animate zoom-in (Z: 125 -> 62 -> 52).
+        let cam_id = if let Some(existing_cam) = session
+            .document()
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == scene_clip_id)
+            .and_then(|c| {
+                c.objects_3d
+                    .iter()
+                    .find(|o| o.kind.to_ascii_lowercase().contains("camera"))
+            }) {
+            existing_cam.id.clone()
+        } else {
+            session
+                .execute(Command::AddObject3D {
+                    clip_id: scene_clip_id.clone(),
+                    kind: "PerspectiveCamera".to_owned(),
+                    name: Some("Main Camera".to_owned()),
+                    parent_id: None,
+                })
+                .expect("add camera")["object_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for (f, pos) in [
+            (0.0, [0.0, 12.0, 145.0]),
+            (45.0, [6.0, 4.0, 88.0]),
+            (120.0, [-6.0, 2.0, 76.0]),
+        ] {
+            session
+                .execute(Command::SetKeyframe {
+                    target_id: cam_id.clone(),
+                    property: "position".to_owned(),
+                    frame: f,
+                    value: json!(pos),
+                    tween: Some(3),
+                })
+                .expect("camera keyframe");
+        }
+
+        // Reuse default Text3D object if present (or add one) and configure "ZOIDCRAFT" + SourceCodePro + Bevel + rotation.
+        let text3d_id = if let Some(existing_text) = session
+            .document()
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == scene_clip_id)
+            .and_then(|c| {
+                c.objects_3d
+                    .iter()
+                    .find(|o| o.kind.to_ascii_lowercase().contains("text"))
+            }) {
+            existing_text.id.clone()
+        } else {
+            session
+                .execute(Command::AddObject3D {
+                    clip_id: scene_clip_id.clone(),
+                    kind: "Text3D".to_owned(),
+                    name: Some("Hero Title".to_owned()),
+                    parent_id: None,
+                })
+                .expect("add Text3D")["object_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: text3d_id.clone(),
+                property: "text".to_owned(),
+                value: json!("ZOIDCRAFT"),
+            })
+            .expect("set 3d text");
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: text3d_id.clone(),
+                property: "font".to_owned(),
+                value: json!("SourceCodePro-Regular.ttf"),
+            })
+            .expect("set 3d font");
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: text3d_id.clone(),
+                property: "bevel".to_owned(),
+                value: json!(true),
+            })
+            .expect("enable bevel");
+        for (f, rot) in [(0.0, [0.0, -0.5, 0.0]), (90.0, [0.0, 0.25, 0.0])] {
+            session
+                .execute(Command::SetKeyframe {
+                    target_id: text3d_id.clone(),
+                    property: "rotation".to_owned(),
+                    frame: f,
+                    value: json!(rot),
+                    tween: Some(4),
+                })
+                .expect("text3d rot kf");
+        }
+
+        // Add 3D Directional + Ambient light so 3D PBR meshes (Ring Cube) and bevels catch crisp shading.
+        let light_id = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_clip_id.clone(),
+                kind: "DirectionalLight".to_owned(),
+                name: Some("Key Light".to_owned()),
+                parent_id: None,
+            })
+            .expect("add DirectionalLight")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: light_id,
+                property: "position".to_owned(),
+                value: json!([40.0, 60.0, 80.0]),
+            })
+            .expect("light pos");
+        let _amb_id = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_clip_id.clone(),
+                kind: "AmbientLight".to_owned(),
+                name: Some("Fill Light".to_owned()),
+                parent_id: None,
+            })
+            .expect("add AmbientLight");
+
+        // Add 3D Particles+ burst with star_4 sprite preset (keeping valid GradientStop JSON for size/color).
+        let part_id = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_clip_id.clone(),
+                kind: "Particles".to_owned(),
+                name: Some("Sparkles".to_owned()),
+                parent_id: None,
+            })
+            .expect("add Particles")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for (prop, val) in [
+            ("position", json!([0.0, 0.0, -24.0])),
+            ("particles.spritePreset", json!("star_4")),
+            ("particles.rate", json!(45.0)),
+            ("particles.vspread", json!([65.0, 38.0, 35.0])),
+        ] {
+            session
+                .execute(Command::SetPropertyValue {
+                    target_id: part_id.clone(),
+                    property: prop.to_owned(),
+                    value: val,
+                })
+                .expect("set particle prop");
+        }
+
+        // Add Radial Repeater + Box child positioned behind the title.
+        let rep_id = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_clip_id.clone(),
+                kind: "zoidium:repeater/radial".to_owned(),
+                name: Some("Orbit Ring".to_owned()),
+                parent_id: None,
+            })
+            .expect("add Radial Repeater")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: rep_id.clone(),
+                property: "position".to_owned(),
+                value: json!([0.0, 0.0, -32.0]),
+            })
+            .expect("repeater pos");
+        let box_id = session
+            .execute(Command::AddObject3D {
+                clip_id: scene_clip_id.clone(),
+                kind: "Box".to_owned(),
+                name: Some("Ring Cube".to_owned()),
+                parent_id: Some(rep_id),
+            })
+            .expect("add Box under repeater")["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: box_id,
+                property: "scale".to_owned(),
+                value: json!([0.28, 0.28, 0.28]),
+            })
+            .expect("box scale");
+
+        // Add Bloom + RGB Shift effects to the 3D scene clip.
+        let bloom_id = session
+            .execute(Command::AddEffect {
+                clip_id: scene_clip_id.clone(),
+                kind: "bloom".to_owned(),
+                name: Some("Bloom".to_owned()),
+            })
+            .expect("add bloom")["effect_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: bloom_id,
+                property: "amount".to_owned(),
+                value: json!(1.1),
+            })
+            .expect("bloom amount");
+
+        let rgb_id = session
+            .execute(Command::AddEffect {
+                clip_id: scene_clip_id.clone(),
+                kind: "rgbshift".to_owned(),
+                name: Some("RGB Shift".to_owned()),
+            })
+            .expect("add rgbshift")["effect_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: rgb_id,
+                property: "amount".to_owned(),
+                value: json!(4.5),
+            })
+            .expect("rgbshift amount");
+
+        // Track 1: 2D Subtitle Text with Geist Mono font positioned below the 3D title.
+        let v1 = session
+            .execute(Command::AddVideoTrack {
+                name: Some("V2 Subtitle".to_owned()),
+            })
+            .expect("create V2")["track_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let text2d_clip_id = session
+            .execute(Command::AddClip {
+                track_id: v1,
+                kind: "text".to_owned(),
+                name: Some("Subtitle".to_owned()),
+                start: 15.0,
+                length: 165.0,
+            })
+            .expect("add text2d")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: text2d_clip_id.clone(),
+                property: "text".to_owned(),
+                value: json!("MOTION ENGINE v0.2"),
+            })
+            .expect("set 2d text");
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: text2d_clip_id.clone(),
+                property: "font".to_owned(),
+                value: json!("GeistMono-Regular.ttf"),
+            })
+            .expect("set 2d font");
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: text2d_clip_id.clone(),
+                property: "position".to_owned(),
+                value: json!([0.0, -95.0]),
+            })
+            .expect("set 2d position");
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: text2d_clip_id,
+                property: "fontSize".to_owned(),
+                value: json!(24.0),
+            })
+            .expect("set 2d size");
+
+        // Track 2: Shape+ sleek cyan accent frame (stroke only so it frames the intro cleanly).
+        let v2 = session
+            .execute(Command::AddVideoTrack {
+                name: Some("V3 Shape+".to_owned()),
+            })
+            .expect("create V3")["track_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let shape_plus_id = session
+            .execute(Command::AddClip {
+                track_id: v2,
+                kind: "zoidium:shape-plus/shape-layer".to_owned(),
+                name: Some("Accent Frame".to_owned()),
+                start: 0.0,
+                length: 180.0,
+            })
+            .expect("add Shape+")["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let shape_plus_uuid = Uuid::parse_str(&shape_plus_id).expect("shape plus uuid");
+        session
+            .execute(Command::UpdateShapePlusPayload {
+                clip_id: shape_plus_uuid,
+                payload: json!({
+                    "schemaVersion": 1,
+                    "renderVersion": 1,
+                    "nextId": 4,
+                    "contents": [
+                        {
+                            "id": "s1",
+                            "kind": "group",
+                            "properties": {
+                                "name": "Accent Border",
+                                "enabled": 1,
+                                "anchor": [0.0, 0.0],
+                                "position": [0.0, 0.0],
+                                "scale": [1.0, 1.0],
+                                "rotation": 0.0,
+                                "opacity": 0.85
+                            },
+                            "contents": [
+                                {
+                                    "id": "s2",
+                                    "kind": "rectangle",
+                                    "properties": {
+                                        "name": "Frame",
+                                        "enabled": 1,
+                                        "size": [580.0, 310.0],
+                                        "position": [0.0, 0.0],
+                                        "roundness": 12.0
+                                    }
+                                },
+                                {
+                                    "id": "s3",
+                                    "kind": "stroke",
+                                    "properties": {
+                                        "name": "Cyan Border",
+                                        "enabled": 1,
+                                        "color": [0.25, 0.85, 1.0],
+                                        "opacity": 0.9,
+                                        "width": 2.5
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }),
+            })
+            .expect("configure Shape+ cyan border");
+
+        // Drive headless UI workspace + viewport for 1 frame in both modes to verify zero panics & clean HUD.
+        let _ = session
+            .selection
+            .select_clip(scene_clip_id.clone(), Some("scene"), false);
+        let _ = session
+            .selection
+            .select_object_3d(text3d_id, "Text3D", false);
+        let ctx = egui::Context::default();
+        let mut ws = Cm3Workspace::new();
+        let mut theme = Cm3Theme::default();
+        let mut vp = ViewportState::new();
+        let mut tl = TimelineViewState::new();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        session.playback.editing_camera = false;
+        let palette = theme.palette;
+        let mut ui_out = ctx.run_ui(raw, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |ui, _r, _focused, sess| {
+                    let _ = show_viewport(ui, sess, &mut vp, None, &palette);
+                },
+                |ui, _r, _focused, sess| {
+                    let _ = show_timeline(ui, sess, &mut tl, &palette);
+                },
+            );
+        });
+        ui_out.textures_delta.clear();
+
+        // Render real GPU intro frames (f=0, f=45, f=90) and verify visible animation & save/export roundtrip.
+        let project = session.to_project();
+        let f0 = engine
+            .render_frame_rgba8(&project, &session.plugins, 0.0, 640, 360)
+            .expect("render f0");
+        let f45 = engine
+            .render_frame_rgba8(&project, &session.plugins, 45.0, 640, 360)
+            .expect("render f45");
+        let f90 = engine
+            .render_frame_rgba8(&project, &session.plugins, 90.0, 640, 360)
+            .expect("render f90");
+
+        let non_black_f45 = f45
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[0] > 4 || px[1] > 4 || px[2] > 4)
+            .count();
+        assert!(
+            non_black_f45 > 2000,
+            "intro frame 45 must contain rich rendered 3D+2D visuals, non_black={non_black_f45}"
+        );
+        assert_ne!(f0, f45, "intro must animate between frame 0 and frame 45");
+        assert_ne!(f45, f90, "intro must animate between frame 45 and frame 90");
+
+        // Round-trip save `.zcraft` and export `.pz` cleanly.
+        let out_dir = std::env::temp_dir().join("zoidcraft_practical_intro_e2e");
+        let _ = fs::create_dir_all(&out_dir);
+        let zcraft_path = out_dir.join("intro.zcraft");
+        let pz_path = out_dir.join("intro.pz");
+        save_zcraft(&project, &zcraft_path).expect("save intro.zcraft");
+        let reloaded = load_zcraft(&zcraft_path).expect("load intro.zcraft");
+        assert!(
+            reloaded.sequence.video_tracks.len() >= 3,
+            "reloaded project must preserve all video tracks (got {})",
+            reloaded.sequence.video_tracks.len()
+        );
+        export_pz(&project, &pz_path).expect("export intro.pz");
+        let imported = import_pz(&pz_path).expect("reimport intro.pz");
+        assert!(imported.project.sequence.video_tracks.len() >= 3);
+
+        // Save preview PNGs for visual inspection.
+        for (name, buf) in [
+            ("intro_f0.png", &f0),
+            ("intro_f45.png", &f45),
+            ("intro_f90.png", &f90),
+        ] {
+            let straight = unpremultiply_rgba8(buf);
+            let png_bytes = encode_png(&straight, 640, 360).expect("encode png");
+            fs::write(out_dir.join(name), &png_bytes).expect("write png");
+        }
+    }
+
+    #[test]
+    fn blank_startup_auto_selects_default_scene_and_disables_editing_camera() {
+        let mut session = Session::new();
+        auto_select_default_scene_clip(&mut session);
+        session.playback.editing_camera = false;
+
+        assert!(
+            selected_clip_is_scene3d(&session),
+            "fresh startup must auto-select V1's default Scene clip"
+        );
+        assert!(
+            !session.playback.editing_camera,
+            "fresh startup must default to Preview mode (editing_camera = false)"
+        );
+    }
+
+    #[test]
+    fn recovery_banner_anchors_to_bottom_center_of_viewport() {
+        let vp = Rect::from_min_size(Pos2::new(400.0, 43.0), Vec2::new(880.0, 420.0));
+        let anchor = recovery_banner_anchor_pos(Some(vp)).expect("viewport anchor");
+        assert!((anchor.x - vp.center().x.round()).abs() < 1e-3);
+        assert!((anchor.y - (vp.bottom() - 10.0).round()).abs() < 1e-3);
+        assert!(
+            anchor.y > vp.top() + 100.0,
+            "recovery banner must sit near bottom of viewport, away from top HUD & toolbar"
+        );
+        assert!(recovery_banner_anchor_pos(None).is_none());
+    }
+
+    #[test]
+    fn video_import_creates_new_track_above_at_playhead_when_v1_overlaps() {
+        let mut app = make_headless_app_for_test();
+        app.session.playback.current_frame = 12.0;
+
+        // V1 already has the default Scene clip spanning [0, 300), so no existing video track is free at frame 12.
+        assert!(choose_free_video_track_at(&app.session, 12.0, 150.0).is_none());
+
+        // Write a tiny valid 2x2 PNG to temp dir and import it via `import_media_from_path`.
+        let png_bytes = encode_png(&[255u8; 2 * 2 * 4], 2, 2).expect("encode tiny png");
+        let tmp_png = std::env::temp_dir().join("zoidcraft_qa_import_overlap_test.png");
+        fs::write(&tmp_png, &png_bytes).expect("write tiny png");
+
+        let msg = app
+            .import_media_from_path(&tmp_png)
+            .expect("import image at overlapping playhead");
+        let _ = fs::remove_file(&tmp_png);
+        assert!(msg.contains("Imported"), "unexpected toast: {msg}");
+
+        // Must have created V2 above V1 and placed the new image clip right at frame 12!
+        assert_eq!(
+            app.session.document().video_tracks.len(),
+            2,
+            "overlapping import must create a new video track above V1"
+        );
+        let v2_clips = &app.session.document().video_tracks[1].clips;
+        assert_eq!(v2_clips.len(), 1);
+        assert_eq!(v2_clips[0].kind, "image");
+        assert!(
+            (v2_clips[0].start - 12.0).abs() < 1e-6,
+            "newly imported image clip must start at current_frame=12, got {}",
+            v2_clips[0].start
+        );
+        assert_eq!(
+            app.session.selection.clip_ids.first().map(String::as_str),
+            Some(v2_clips[0].id.as_str())
+        );
+    }
+
+    #[test]
+    fn app_cmd_v_paste_event_attaches_shader_effect_and_consumes_clipboard_events() {
+        ui::shortcuts::clear_test_clipboard();
+        let mut app = make_headless_app_for_test();
+        app.workspace.active_tab = ui::panels::SideTab::Effects;
+        app.workspace.focused_panel = PanelFocus::SideInspector;
+        let clip_id = app.session.document().video_tracks[0].clips[0].id.clone();
+        let _ = app
+            .session
+            .selection
+            .select_clip(clip_id, Some("scene"), false);
+        let initial_fx = app.session.document().video_tracks[0].clips[0]
+            .effects
+            .len();
+
+        let ctx = egui::Context::default();
+        let raw_glsl =
+            "uniform sampler2D tDiffuse; void main() { gl_FragColor = vec4(1.0, 0.2, 0.4, 1.0); }";
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::Paste(raw_glsl.to_owned()));
+        raw.events.push(egui::Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+
+        let mut remaining_paste_events = 0usize;
+        let mut full = ctx.run_ui(raw, |ui| {
+            let outcome = dispatch_shortcuts_with_context(
+                ui.ctx(),
+                &mut app.session,
+                &mut app.timeline,
+                &mut app.graph_editor,
+                &mut app.viewport,
+                app.workspace.focused_panel,
+                app.workspace.active_tab,
+            );
+            assert!(outcome.consumed_clipboard_events);
+            assert!(outcome.last_error.is_none());
+            assert_eq!(
+                outcome.status_message.as_deref(),
+                Some("Pasted 1 effect from clipboard")
+            );
+            consume_dispatched_shortcut_events(
+                ui.ctx(),
+                &outcome.handled_keys,
+                outcome.consumed_clipboard_events,
+            );
+            remaining_paste_events = ui.ctx().input(|i| {
+                i.events
+                    .iter()
+                    .filter(|ev| {
+                        matches!(
+                            ev,
+                            egui::Event::Paste(_) | egui::Event::Key { key: Key::V, .. }
+                        )
+                    })
+                    .count()
+            });
+        });
+        full.textures_delta.clear();
+
+        assert_eq!(
+            remaining_paste_events, 0,
+            "consumed clipboard events must be stripped so downstream panels never double-paste"
+        );
+        assert_eq!(
+            app.session.document().video_tracks[0].clips[0]
+                .effects
+                .len(),
+            initial_fx + 1
+        );
+    }
+
+    #[test]
+    fn missing_required_plugins_banner_detects_and_enables_with_zero_blank_false_positives() {
+        let mut app = make_headless_app_for_test();
+        assert!(
+            app.visible_missing_required_plugins().is_empty(),
+            "fresh blank project must produce zero false-positive missing-plugin warnings"
+        );
+
+        // Add a composition to `project.compositions` while `precomp-plus` is disabled by default.
+        let comp_seq = zc_project::Sequence {
+            name: "Precomp 1".to_owned(),
+            ..Default::default()
+        };
+        app.session
+            .project
+            .compositions
+            .insert(comp_seq.id, comp_seq);
+        app.session
+            .project
+            .plugin_requirements
+            .insert("optical-flares".to_owned());
+        app.cached_missing_plugins_revision = None;
+
+        let missing = app.visible_missing_required_plugins();
+        assert!(
+            missing.contains(&"precomp-plus".to_owned()),
+            "project with compositions must flag disabled precomp-plus: {missing:?}"
+        );
+        assert!(
+            missing.contains(&"optical-flares".to_owned()),
+            "project requiring optical-flares must flag disabled optical-flares: {missing:?}"
+        );
+
+        // 1-click enable enables all required plugins and clears the warning banner.
+        app.enable_required_plugins(&missing);
+        assert!(app.session.plugins.is_enabled("precomp-plus"));
+        assert!(app.session.plugins.is_enabled("optical-flares"));
+        assert!(
+            app.visible_missing_required_plugins().is_empty(),
+            "missing-plugin banner must clear after 1-click enable"
+        );
+    }
+
+    #[test]
+    fn recovery_banner_clamps_within_800x540_formats_timestamp_and_marks_dirty_on_restore() {
+        // 1. At 800x540, viewport right pane sits at x=273..800 (width 527px).
+        let vp_800 = Rect::from_min_size(Pos2::new(273.0, 0.0), Vec2::new(527.0, 310.0));
+        let (banner_w, bounds) =
+            compute_viewport_banner_bounds(vp_800, 460.0).expect("banner bounds at 800x540");
+        let left = (bounds.center().x - banner_w * 0.5)
+            .clamp(
+                bounds.left(),
+                (bounds.right() - banner_w).max(bounds.left()),
+            )
+            .round();
+        assert!(
+            left >= vp_800.left() + 8.0 - 0.5 && left + banner_w <= vp_800.right() - 8.0 + 0.5,
+            "recovery banner [{left}..{}] must stay strictly inside viewport.shrink(8) [{}..{}]",
+            left + banner_w,
+            vp_800.left() + 8.0,
+            vp_800.right() - 8.0
+        );
+
+        // Even at ultra-narrow 220px viewport width, banner width strictly clamps inside bounds.
+        let vp_tiny = Rect::from_min_size(Pos2::new(273.0, 0.0), Vec2::new(220.0, 200.0));
+        let (tiny_w, tiny_bounds) =
+            compute_viewport_banner_bounds(vp_tiny, 460.0).expect("tiny banner bounds");
+        assert!(tiny_w <= tiny_bounds.width() + 0.5);
+
+        // 2. Clean UTC timestamp formatting.
+        assert_eq!(format_recovery_timestamp(0), "unsaved snapshot");
+        assert_eq!(
+            format_recovery_timestamp(1_700_000_000),
+            "2023-11-14 22:13 UTC"
+        );
+
+        // 3. Restoring a recovery snapshot marks the session dirty (`*`) so unsaved-changes triggers.
+        let mut app = make_headless_app_for_test();
+        let tmp_dir = std::env::temp_dir().join("zoidcraft_test_recovery_dirty");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let snap_info =
+            save_recovery_snapshot_to_dir(&app.session.project, &tmp_dir, MAX_RECOVERY_SNAPSHOTS)
+                .expect("write recovery snapshot");
+        app.startup_recovery_banner = Some(snap_info.clone());
+
+        app.handle_restore_recovery_snapshot(&snap_info.path);
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        assert!(
+            app.session.is_dirty() && app.has_unsaved_changes(),
+            "restoring a recovery snapshot must mark the session dirty so unsaved-changes triggers"
+        );
+        assert!(app.startup_recovery_banner.is_none());
+    }
+
+    #[test]
+    fn live_viewport_isolates_active_child_composition_and_preserves_root_controls() {
+        let mut project = Project::new_cm3_default();
+        let root_seq_id = project.sequence.id;
+        let root_track_ids: Vec<Uuid> =
+            project.sequence.video_tracks.iter().map(|t| t.id).collect();
+
+        // Add a root-only sequence control so we verify expressions in child compositions keep it.
+        project.sequence.controls.push(zc_project::SequenceControl {
+            id: "ctl-root-master".to_owned(),
+            name: "MasterDrive".to_owned(),
+            kind: zc_project::SequenceControlKind::Slider,
+            track: zc_project::PropertyTrack::constant(zc_project::PropertyValue::Number(1.25)),
+            preserved: BTreeMap::new(),
+        });
+
+        // Create a distinct child composition with its own unique track ID and no local controls.
+        let mut child = Project::new_cm3_default().sequence;
+        let child_id = Uuid::new_v4();
+        let child_track_id = Uuid::new_v4();
+        child.id = child_id;
+        child.name = "Precomp 1".to_owned();
+        child.controls.clear();
+        child.video_tracks[0].id = child_track_id;
+        child.video_tracks.truncate(1);
+        project.compositions.insert(child_id, child);
+
+        let mut session = Session::from_project(project, PluginRegistry::default());
+
+        // When active_composition_id is None, live viewport borrows Root without cloning.
+        let root_hash = compute_scene_hash(&session);
+        let vp_root = project_for_live_viewport(&session);
+        assert!(matches!(vp_root, Cow::Borrowed(_)));
+        assert_eq!(vp_root.sequence.id, root_seq_id);
+        assert_eq!(
+            vp_root
+                .sequence
+                .video_tracks
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            root_track_ids
+        );
+
+        // Switching into Precomp 1 must isolate child_id's tracks (NOT Root's), preserve root
+        // sequence.controls, leave session.project unmutated, and change compute_scene_hash!
+        session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(child_id),
+            })
+            .expect("switch active composition to Precomp 1");
+        assert_eq!(session.document().active_composition_id, Some(child_id));
+
+        let child_hash = compute_scene_hash(&session);
+        assert_ne!(
+            root_hash, child_hash,
+            "switching active_composition_id must invalidate scene_hash"
+        );
+
+        let vp_child = project_for_live_viewport(&session);
+        assert!(matches!(vp_child, Cow::Owned(_)));
+        assert_eq!(vp_child.sequence.id, child_id);
+        assert_eq!(vp_child.sequence.video_tracks.len(), 1);
+        assert_eq!(vp_child.sequence.video_tracks[0].id, child_track_id);
+        assert_ne!(
+            vp_child.sequence.video_tracks[0].id, root_track_ids[0],
+            "isolated child viewport render must use Precomp 1's tracks, not Root's"
+        );
+        assert!(
+            vp_child
+                .sequence
+                .controls
+                .iter()
+                .any(|c| c.id == "ctl-root-master" && c.name == "MasterDrive"),
+            "isolated child viewport render must preserve root sequence.controls for expressions"
+        );
+        assert!(
+            vp_child.compositions.contains_key(&root_seq_id),
+            "promoted project must keep root sequence in compositions"
+        );
+        // Critical: session.project itself must remain untouched (root stays root).
+        assert_eq!(session.project.sequence.id, root_seq_id);
+        assert!(session.project.compositions.contains_key(&child_id));
+    }
+
+    #[test]
+    fn viewport_gpu_render_error_throttles_duplicates_emits_shader_toast_and_clears_on_ok() {
+        let mut app = make_headless_app_for_test();
+        assert!(app.last_viewport_render_error.is_none());
+        assert!(app.status_toast.is_none());
+
+        // First broken GLSL error logs & emits a user-visible "Shader error: ..." toast.
+        let err1 = "shader error: GLSL 450 parse error at line 4: unexpected token";
+        assert!(app.record_viewport_render_result(Err(err1.to_owned())));
+        assert_eq!(app.last_viewport_render_error.as_deref(), Some(err1));
+        let toast1 = app
+            .status_toast
+            .as_ref()
+            .expect("shader error must emit UI toast")
+            .0
+            .clone();
+        assert!(
+            toast1.starts_with("Shader error:"),
+            "expected 'Shader error: ...' toast, got {toast1}"
+        );
+
+        // Repeating the identical error on subsequent 60Hz frames must be throttled (no log/toast spam).
+        app.status_toast = None;
+        for _ in 0..10 {
+            assert!(!app.record_viewport_render_result(Err(err1.to_owned())));
+            assert!(
+                app.status_toast.is_none(),
+                "identical repeated shader error must not re-emit toast or spam logs"
+            );
+        }
+
+        // A DIFFERENT shader error emits a fresh toast and updates tracked error.
+        let err2 = "shader error: GLSL 450 parse error at line 9: unknown identifier";
+        assert!(app.record_viewport_render_result(Err(err2.to_owned())));
+        assert_eq!(app.last_viewport_render_error.as_deref(), Some(err2));
+        assert!(app.status_toast.is_some());
+
+        // Clean render clears last_viewport_render_error so future errors will be reported again.
+        assert!(!app.record_viewport_render_result(Ok(true)));
+        assert!(app.last_viewport_render_error.is_none());
+        assert!(app.record_viewport_render_result(Err(err1.to_owned())));
+    }
+
+    #[test]
+    fn status_toast_clamps_inside_viewport_left_of_vu_meter_and_above_timeline() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        // Standard 1280x720 workspace: viewport is top-right (x=398..1280, y=0..466);
+        // Playback toolbar + Timeline (Track A1) + 44px VU meter sit below y=469.
+        let vp = Rect::from_min_size(Pos2::new(398.0, 0.0), Vec2::new(882.0, 466.0));
+        let vu_meter_left = screen.right() - 44.0 - 3.0; // 1233.0
+        let timeline_top = 466.0 + 3.0 + 40.0 + 3.0; // 512.0
+
+        let p = compute_status_toast_bounds(Some(vp), screen);
+        assert!(
+            p.bounds.left() >= vp.left() && p.bounds.right() <= vp.right(),
+            "toast bounds must stay horizontally inside viewport_rect"
+        );
+        assert!(
+            p.bounds.top() >= vp.top() && p.bounds.bottom() <= vp.bottom(),
+            "toast bounds must stay vertically inside viewport_rect"
+        );
+        assert!(
+            p.anchor_pos.x <= vu_meter_left,
+            "toast right edge ({}) must stay left of the right VU meter ({vu_meter_left})",
+            p.anchor_pos.x
+        );
+        assert!(
+            p.anchor_pos.y < timeline_top,
+            "toast bottom edge ({}) must stay strictly above timeline Track A1 ({timeline_top})",
+            p.anchor_pos.y
+        );
+        assert!(
+            p.max_width <= 420.0 && p.max_width <= p.bounds.width() + 0.5,
+            "long error messages must be clamped to max width <= 420px inside bounds: max_width={}",
+            p.max_width
+        );
+    }
+
+    #[test]
+    fn enabled_required_plugins_persist_across_zcraft_save_and_reload_without_polluting_pz() {
+        let mut app = make_headless_app_for_test();
+        app.session
+            .project
+            .plugin_requirements
+            .insert("camera-plus".to_owned());
+        app.session
+            .project
+            .plugin_requirements
+            .insert("light-plus".to_owned());
+        app.session
+            .project
+            .plugin_requirements
+            .insert("graph-plus".to_owned());
+        app.cached_missing_plugins_revision = None;
+
+        let missing = app.visible_missing_required_plugins();
+        assert_eq!(missing.len(), 3);
+
+        // 1. Enable required plugins (simulating "Enable Required Plugins" banner click).
+        app.enable_required_plugins(&missing);
+        assert!(app.visible_missing_required_plugins().is_empty());
+        assert!(app.session.plugins.is_enabled("camera-plus"));
+        assert!(app.session.plugins.is_enabled("light-plus"));
+        assert!(app.session.plugins.is_enabled("graph-plus"));
+
+        // 2. Save `.zcraft` via real GUI save helper.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("zoidcraft_plugin_persist_{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let zcraft_path = tmp_dir.join("persisted_plugins.zcraft");
+        assert!(
+            app.save_project_to_path(&zcraft_path, true),
+            "saving .zcraft with enabled plugins must succeed"
+        );
+
+        // Vanilla `.pz` export preparation must NOT leak `zoidcraftEnabledPlugins`.
+        let pz_proj = prepare_project_for_pz_export(&app.session);
+        assert!(
+            !pz_proj
+                .sequence
+                .preserved
+                .contains_key(ZOIDCRAFT_ENABLED_PLUGINS_KEY),
+            ".pz export must not be polluted with ZoidCraft-only persisted plugin state"
+        );
+
+        // 3. Reopen the saved `.zcraft` in a completely fresh ZoidCraftApp (vanilla startup state).
+        let mut fresh_app = make_headless_app_for_test();
+        assert!(!fresh_app.session.plugins.is_enabled("camera-plus"));
+        assert!(!fresh_app.session.plugins.is_enabled("light-plus"));
+        assert!(!fresh_app.session.plugins.is_enabled("graph-plus"));
+
+        fresh_app.open_project_from_path(&zcraft_path);
+        assert!(
+            fresh_app.session.plugins.is_enabled("camera-plus"),
+            "camera-plus must stay enabled after reload"
+        );
+        assert!(
+            fresh_app.session.plugins.is_enabled("light-plus"),
+            "light-plus must stay enabled after reload"
+        );
+        assert!(
+            fresh_app.session.plugins.is_enabled("graph-plus"),
+            "graph-plus must stay enabled after reload"
+        );
+        assert!(
+            fresh_app.visible_missing_required_plugins().is_empty(),
+            "reopening saved .zcraft must produce zero missing-plugin banner warnings"
+        );
+        assert!(
+            fresh_app.workspace.panels.plugin_notice.is_none(),
+            "plugin_notice must stay None when saved enabled plugins are restored"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn preview_frame_cache_accumulates_across_scrubbing_and_invalidates_on_edit() {
+        let mut app = make_headless_app_for_test();
+        let w = 640_u32;
+        let h = 360_u32;
+        let frame_bytes = (w as usize) * (h as usize) * 4;
+        app.last_canvas_rect = Some(Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(w as f32, h as f32),
+        ));
+
+        let budget_bytes = 512 * 1024 * 1024;
+        let mut cache: PreviewFrameCache<u32> = PreviewFrameCache::new(budget_bytes);
+
+        // Scrub across 5 frames (0..5): every frame must accumulate without invalidating earlier frames.
+        for f in 0..5_u32 {
+            app.session
+                .execute(Command::SetFrame {
+                    frame: f64::from(f),
+                })
+                .expect("scrub frame");
+            let (frame, rw, rh, _, key) = app.current_viewport_render_key();
+            assert_eq!((rw, rh), (w, h));
+            cache.sync_context(key.cache_context());
+            let bucket = frame.floor().max(0.0) as i64;
+            assert!(
+                cache.get_mut(bucket, key.frame_index, false).is_none(),
+                "first visit to frame {f} must miss cache"
+            );
+            assert!(cache.insert(bucket, key.frame_index, frame_bytes, f));
+        }
+
+        assert_eq!(
+            cache.len(),
+            5,
+            "scrubbing 5 frames must accumulate 5 cached frames"
+        );
+        assert_eq!(
+            cache.used_bytes(),
+            5 * frame_bytes,
+            "used_bytes must equal 5 * frame_bytes (> 0)"
+        );
+        assert!(cache.used_bytes() > 0);
+        assert_eq!(
+            cache.cached_spans(),
+            vec![(0.0, 5.0)],
+            "5 consecutive scrubbed frames must coalesce into a single contiguous [0, 5) span"
+        );
+
+        // Scrubbing back to frame 2 must hit cache without clearing other frames.
+        app.session
+            .execute(Command::SetFrame { frame: 2.0 })
+            .expect("scrub back to frame 2");
+        let (frame, _, _, _, key2) = app.current_viewport_render_key();
+        cache.sync_context(key2.cache_context());
+        assert_eq!(
+            cache.get_mut(frame.floor() as i64, key2.frame_index, false),
+            Some(&2),
+            "revisiting frame 2 must hit preview cache"
+        );
+        assert_eq!(cache.len(), 5);
+
+        // Real edit (mutating sequence background color) must invalidate cached frames cleanly.
+        app.session
+            .execute(Command::SetPropertyValue {
+                target_id: "sequence".to_owned(),
+                property: "backgroundColor".to_owned(),
+                value: json!([0.2, 0.4, 0.8]),
+            })
+            .expect("edit backgroundColor");
+        let (_, _, _, _, edited_key) = app.current_viewport_render_key();
+        cache.sync_context(edited_key.cache_context());
+        assert_eq!(
+            cache.len(),
+            0,
+            "real project edit must invalidate preview cache cleanly"
+        );
+        assert_eq!(cache.used_bytes(), 0);
+        assert!(cache.cached_spans().is_empty());
+    }
+
+    #[test]
+    fn missing_plugins_banner_summary_and_toast_recovery_clearance() {
+        let five: Vec<String> = vec![
+            "Camera+".to_owned(),
+            "Light+".to_owned(),
+            "Graph Editor 2".to_owned(),
+            "Optical Flares".to_owned(),
+            "Precomp+".to_owned(),
+        ];
+        assert_eq!(
+            format_missing_plugins_banner_summary(&five, false),
+            "Disabled plugins (5): Camera+, Light+, +3 more"
+        );
+        assert_eq!(
+            format_missing_plugins_banner_summary(&five, true),
+            "Disabled plugins (5): Camera+, +4 more"
+        );
+        let one = vec!["Camera+".to_owned()];
+        assert_eq!(
+            format_missing_plugins_banner_summary(&one, false),
+            "Disabled plugin (1): Camera+"
+        );
+
+        // Status toast with Recovery banner visible must shift vertically above the Recovery banner.
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let vp = Rect::from_min_size(Pos2::new(398.0, 0.0), Vec2::new(882.0, 466.0));
+        let normal = compute_status_toast_bounds_with_bottom_inset(Some(vp), screen, 0.0);
+        let with_recovery = compute_status_toast_bounds_with_bottom_inset(Some(vp), screen, 46.0);
+        assert!(
+            with_recovery.anchor_pos.y <= normal.anchor_pos.y - 46.0 + 0.5,
+            "toast with recovery banner ({}) must sit strictly above normal bottom ({})",
+            with_recovery.anchor_pos.y,
+            normal.anchor_pos.y
         );
     }
 }

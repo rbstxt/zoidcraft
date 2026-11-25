@@ -12,11 +12,13 @@ use egui::{
 use zc_session::{Command, Session};
 
 use super::panels::{ExportSettings, PanelAction, PanelsState, SideTab, show_side_panel};
+use super::shortcuts::{selected_clip_is_scene3d, toggle_editing_camera_synced};
 use super::theme::{
-    AUDIO_PEAK_YELLOW, BG_INPUT, BG_PANEL, BG_SUNKEN, BG_TITLE, BG_TOOLBAR, BORDER_CONTROL,
-    BORDER_PANEL, BORDER_RAIL_FOCUS, Cm3Icon, Cm3Theme, FONT_BODY, FONT_SMALL, FONT_TAB,
-    TEXT_BRIGHT, TEXT_DISABLED, TEXT_MUTED, TEXT_PRIMARY, TEXT_STRONG, TOGGLE_ACTIVE,
-    TOOLBAR_ICON_INACTIVE, VOID_BLACK, paint_cm3_icon,
+    AUDIO_PEAK_YELLOW, BG_DROPDOWN_HOVER, BG_INPUT, BG_PANEL, BG_SUNKEN, BG_TITLE, BG_TOOLBAR,
+    BORDER_BUTTON_HOVER, BORDER_CONTROL, BORDER_OPTION_ACTIVE, BORDER_PANEL, BORDER_RAIL_FOCUS,
+    Cm3Icon, Cm3Theme, FONT_BODY, FONT_COMPACT, FONT_SMALL, FONT_TAB, TEXT_BRIGHT, TEXT_DISABLED,
+    TEXT_MUTED, TEXT_PRIMARY, TEXT_STRONG, TOGGLE_ACTIVE, TOOLBAR_ICON_INACTIVE, VOID_BLACK,
+    paint_cm3_icon,
 };
 
 // ---------------------------------------------------------------------------
@@ -200,9 +202,31 @@ fn paint_motion_path_icon(painter: &Painter, rect: Rect, color: Color32) {
 // 1. Recursive Binary Split Panel Engine (Spec 01 §1.1)
 // ---------------------------------------------------------------------------
 
-/// Exact CM3 splitter thickness (`3 px` visual gap and pointer hitbox).
+/// Exact CM3 visual splitter gap (`3 px`).
 pub const SPLITTER_SIZE: f32 = 3.0;
+/// Invisible pointer hover/drag hitbox thickness for split panel dividers (`8 px`).
+pub const SPLITTER_HITBOX_SIZE: f32 = 8.0;
 const HALF_SPLITTER: f32 = SPLITTER_SIZE * 0.5;
+
+/// Computes the `8 px` invisible pointer hover/drag hitbox centered on `split_rect`
+/// and clamped strictly inside `container`.
+#[must_use]
+pub fn compute_splitter_hitbox(split_rect: Rect, container: Rect, horiz: bool) -> Rect {
+    let half_hit = SPLITTER_HITBOX_SIZE * 0.5;
+    if horiz {
+        let cx = split_rect.center().x;
+        Rect::from_min_max(
+            Pos2::new((cx - half_hit).max(container.left()), split_rect.top()),
+            Pos2::new((cx + half_hit).min(container.right()), split_rect.bottom()),
+        )
+    } else {
+        let cy = split_rect.center().y;
+        Rect::from_min_max(
+            Pos2::new(split_rect.left(), (cy - half_hit).max(container.top())),
+            Pos2::new(split_rect.right(), (cy + half_hit).min(container.bottom())),
+        )
+    }
+}
 
 /// Split orientation matching Spec 01 §1.1 (`Vertical = 0`, `Horizontal = 1`, `Auto = -1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,30 +344,92 @@ impl SplitPanelState {
     }
 }
 
-/// Draws and handles dragging for a `3 px` CM3 Split Panel bar, returning `(pane_0_rect, pane_1_rect)`.
-pub fn begin_split_panel(
-    ui: &mut Ui,
-    id: Id,
-    rect: Rect,
-    state: &mut SplitPanelState,
-) -> (Rect, Rect) {
-    let horiz = state.resolved_horizontal(rect);
-    let (p0, split_rect, _p1) = state.compute_rects(rect);
+/// Per-drag anchor stored in egui temp memory so dragging a splitter tracks exact pointer
+/// displacement from `press_origin` with zero Frame-1 `drag_delta()` snap and zero drift.
+#[derive(Debug, Clone, Copy, Default)]
+struct SplitDragAnchor {
+    origin_axis: f32,
+    start_p0_extent: f32,
+}
 
-    let resp = ui
-        .interact(split_rect, id.with("splitter"), Sense::drag())
-        .on_hover_cursor(if horiz {
-            CursorIcon::ResizeHorizontal
-        } else {
-            CursorIcon::ResizeVertical
-        });
-    if resp.dragged() {
+fn update_split_ratio_from_anchor(
+    rect: Rect,
+    horiz: bool,
+    state: &mut SplitPanelState,
+    anchor: SplitDragAnchor,
+    cur_axis: f32,
+) -> bool {
+    let extent = if horiz {
+        rect.width().max(1.0)
+    } else {
+        rect.height().max(1.0)
+    };
+    let max_p0 = (extent - state.min_pane_1 - SPLITTER_SIZE).max(0.0);
+    let min_p0 = state.min_pane_0.min(max_p0);
+    let new_p0 = (anchor.start_p0_extent + (cur_axis - anchor.origin_axis)).clamp(min_p0, max_p0);
+    let new_ratio = ((new_p0 + HALF_SPLITTER) / extent).clamp(0.0, 1.0);
+    if (state.ratio - new_ratio).abs() > 1e-6 {
+        state.ratio = new_ratio;
+        true
+    } else {
+        false
+    }
+}
+
+fn handle_split_drag_response(
+    ui: &Ui,
+    anchor_id: Id,
+    rect: Rect,
+    horiz: bool,
+    p0: Rect,
+    state: &mut SplitPanelState,
+    resp: &egui::Response,
+) -> bool {
+    if !resp.dragged() {
+        ui.ctx()
+            .data_mut(|d| d.remove_temp::<SplitDragAnchor>(anchor_id));
+        return false;
+    }
+
+    let cur_p0_extent = if horiz { p0.width() } else { p0.height() };
+    let (press_origin, interact_pos) = ui
+        .ctx()
+        .input(|i| (i.pointer.press_origin(), i.pointer.interact_pos()));
+
+    let anchor = if resp.drag_started() {
+        press_origin.or(interact_pos).map(|origin| {
+            let a = SplitDragAnchor {
+                origin_axis: if horiz { origin.x } else { origin.y },
+                start_p0_extent: cur_p0_extent,
+            };
+            ui.ctx().data_mut(|d| d.insert_temp(anchor_id, a));
+            a
+        })
+    } else {
+        ui.ctx()
+            .data(|d| d.get_temp::<SplitDragAnchor>(anchor_id))
+            .or_else(|| {
+                let origin = press_origin.or(interact_pos)?;
+                let a = SplitDragAnchor {
+                    origin_axis: if horiz { origin.x } else { origin.y },
+                    start_p0_extent: cur_p0_extent,
+                };
+                ui.ctx().data_mut(|d| d.insert_temp(anchor_id, a));
+                Some(a)
+            })
+    };
+
+    if let (Some(anchor), Some(pos)) = (anchor, interact_pos) {
+        let cur_axis = if horiz { pos.x } else { pos.y };
+        update_split_ratio_from_anchor(rect, horiz, state, anchor, cur_axis)
+    } else if !resp.drag_started() {
+        // Fallback when pointer position is unavailable: apply incremental delta only after frame 0
+        // so a pre-click cursor jump can never snap the pane to its minimum extent.
         let extent = if horiz {
             rect.width().max(1.0)
         } else {
             rect.height().max(1.0)
         };
-        let cur_p0_extent = if horiz { p0.width() } else { p0.height() };
         let delta = if horiz {
             resp.drag_delta().x
         } else {
@@ -352,13 +438,125 @@ pub fn begin_split_panel(
         let max_p0 = (extent - state.min_pane_1 - SPLITTER_SIZE).max(0.0);
         let min_p0 = state.min_pane_0.min(max_p0);
         let new_p0 = (cur_p0_extent + delta).clamp(min_p0, max_p0);
-        state.ratio = ((new_p0 + HALF_SPLITTER) / extent).clamp(0.0, 1.0);
+        let new_ratio = ((new_p0 + HALF_SPLITTER) / extent).clamp(0.0, 1.0);
+        if (state.ratio - new_ratio).abs() > 1e-6 {
+            state.ratio = new_ratio;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
     }
+}
+
+fn paint_splitter_bar(ui: &Ui, split_rect: Rect, horiz: bool, hovered: bool, dragged: bool) {
+    ui.painter()
+        .rect_filled(split_rect, CornerRadius::ZERO, VOID_BLACK);
+    if hovered || dragged {
+        let line_color = if dragged {
+            BORDER_OPTION_ACTIVE
+        } else {
+            BORDER_BUTTON_HOVER
+        };
+        if horiz {
+            let lx = split_rect.center().x.floor();
+            paint_crisp_rect_filled(
+                ui.painter(),
+                Rect::from_min_max(
+                    Pos2::new(lx, split_rect.top()),
+                    Pos2::new(lx + 1.0, split_rect.bottom()),
+                ),
+                line_color,
+            );
+        } else {
+            let ly = split_rect.center().y.floor();
+            paint_crisp_rect_filled(
+                ui.painter(),
+                Rect::from_min_max(
+                    Pos2::new(split_rect.left(), ly),
+                    Pos2::new(split_rect.right(), ly + 1.0),
+                ),
+                line_color,
+            );
+        }
+    }
+}
+
+/// Applies any active splitter drag BEFORE laying out child panes (zero-lag resize),
+/// returning `(pane_0_rect, pane_1_rect)`. Must be paired with [`finish_split_panel`]
+/// after both panes are drawn so the `8 px` splitter hitbox sits above child panes on the
+/// same layer and never loses hover/drag to adjacent scrollbars or canvas regions.
+fn pre_layout_split_panel(
+    ui: &Ui,
+    id: Id,
+    rect: Rect,
+    state: &mut SplitPanelState,
+) -> (Rect, Rect) {
+    let splitter_id = id.with("splitter");
+    let anchor_id = splitter_id.with("drag_anchor");
+    let horiz = state.resolved_horizontal(rect);
+    if ui.ctx().is_being_dragged(splitter_id)
+        && let Some(anchor) = ui.ctx().data(|d| d.get_temp::<SplitDragAnchor>(anchor_id))
+        && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+    {
+        let cur_axis = if horiz { pos.x } else { pos.y };
+        let _ = update_split_ratio_from_anchor(rect, horiz, state, anchor, cur_axis);
+    }
+    let (p0, _split, p1) = state.compute_rects(rect);
+    (p0, p1)
+}
+
+/// Registers the `8 px` splitter hover/drag hitbox AFTER child panes have been drawn
+/// and paints the `3 px` divider + crisp `1 px` hover/active line.
+fn finish_split_panel(ui: &mut Ui, id: Id, rect: Rect, state: &mut SplitPanelState) {
+    let splitter_id = id.with("splitter");
+    let anchor_id = splitter_id.with("drag_anchor");
+    let horiz = state.resolved_horizontal(rect);
+    let (p0, split_rect, _p1) = state.compute_rects(rect);
+    let hit_rect = compute_splitter_hitbox(split_rect, rect, horiz);
+
+    let resp = ui
+        .interact(hit_rect, splitter_id, Sense::drag())
+        .on_hover_cursor(if horiz {
+            CursorIcon::ResizeHorizontal
+        } else {
+            CursorIcon::ResizeVertical
+        });
+    if handle_split_drag_response(ui, anchor_id, rect, horiz, p0, state, &resp) {
+        ui.ctx().request_repaint();
+    }
+
+    let (_p0, new_split_rect, _p1) = state.compute_rects(rect);
+    paint_splitter_bar(ui, new_split_rect, horiz, resp.hovered(), resp.dragged());
+}
+
+/// Draws and handles dragging for a CM3 Split Panel bar (`8 px` invisible hover/drag hitbox
+/// with crisp `1 px` hover/active line over the `3 px` visual gap), returning `(pane_0_rect, pane_1_rect)`.
+pub fn begin_split_panel(
+    ui: &mut Ui,
+    id: Id,
+    rect: Rect,
+    state: &mut SplitPanelState,
+) -> (Rect, Rect) {
+    let splitter_id = id.with("splitter");
+    let anchor_id = splitter_id.with("drag_anchor");
+    let horiz = state.resolved_horizontal(rect);
+    let (p0, split_rect, _p1) = state.compute_rects(rect);
+    let hit_rect = compute_splitter_hitbox(split_rect, rect, horiz);
+
+    let resp = ui
+        .interact(hit_rect, splitter_id, Sense::drag())
+        .on_hover_cursor(if horiz {
+            CursorIcon::ResizeHorizontal
+        } else {
+            CursorIcon::ResizeVertical
+        });
+    let _ = handle_split_drag_response(ui, anchor_id, rect, horiz, p0, state, &resp);
 
     // Recompute rects AFTER updating ratio and paint splitter at its live zero-lag position.
     let (p0, new_split_rect, p1) = state.compute_rects(rect);
-    ui.painter()
-        .rect_filled(new_split_rect, CornerRadius::ZERO, VOID_BLACK);
+    paint_splitter_bar(ui, new_split_rect, horiz, resp.hovered(), resp.dragged());
     (p0, p1)
 }
 
@@ -594,6 +792,17 @@ impl PreviewQuality {
         }
     }
 
+    /// Compact quality label used in narrow viewports (`800×540`) so `"Quarter"` never clips.
+    #[must_use]
+    pub const fn compact_label(self) -> &'static str {
+        match self {
+            Self::Full => "Full",
+            Self::Half => "1/2",
+            Self::Quarter => "1/4",
+            Self::Eighth => "1/8",
+        }
+    }
+
     #[must_use]
     pub const fn divisor(self) -> u32 {
         match self {
@@ -603,6 +812,26 @@ impl PreviewQuality {
             Self::Eighth => 8,
         }
     }
+}
+
+/// Responsive geometry metrics for the Playback & Viewport bottom toolbar.
+#[derive(Debug, Clone, Copy)]
+pub struct PlaybackToolbarMetrics {
+    pub btn_size: f32,
+    pub btn_gap: f32,
+    pub pill_gap: f32,
+    pub icon_size: f32,
+    pub edge_pad: f32,
+    pub right_pad: f32,
+    pub group_gap: f32,
+    pub pill_font: f32,
+    pub speed_dd_w: f32,
+    pub q_w: f32,
+    pub compact_quality_labels: bool,
+    pub pill_left_inset: f32,
+    pub pill_chevron_reserve: f32,
+    pub chevron_size: f32,
+    pub chevron_right_inset: f32,
 }
 
 /// Runtime state for `player-plus` viewport toolbar controls.
@@ -690,10 +919,15 @@ pub struct Cm3Workspace {
     split_inspector_focus_bottom: bool,
     /// Whether the Graph Editor floating window is currently open (drives Graph toolbar button border).
     pub graph_open: bool,
+    /// Whether the Player+ playback speed / render-pause popup menu is open.
+    speed_menu_open: bool,
     /// All side-panel inspector states.
     pub panels: PanelsState,
     /// When `true` (e.g. a modal confirmation dialog is open), suppresses workspace shortcuts.
     pub suppress_shortcuts: bool,
+    /// When `true`, the host shell already ran `shortcuts::dispatch_shortcuts_with_focus`, so
+    /// `handle_global_shortcuts` only processes workspace-exclusive keys (`Backtick` maximize).
+    pub external_shortcuts_dispatched: bool,
 }
 
 impl Default for Cm3Workspace {
@@ -703,11 +937,11 @@ impl Default for Cm3Workspace {
 }
 
 impl Cm3Workspace {
-    /// Creates a new CM3 workspace initialized with exact Spec 01 §1.2 ratios.
+    /// Creates a new CM3 workspace initialized with roomy, responsive split ratios.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            root_split: SplitPanelState::new(0.30, SplitOrientation::Horizontal, 200.0, 260.0),
+            root_split: SplitPanelState::new(0.31, SplitOrientation::Horizontal, 270.0, 420.0),
             right_split: SplitPanelState::new(0.65, SplitOrientation::Vertical, 120.0, 120.0),
             timeline_meter_split: SplitPanelState::new(
                 1.0,
@@ -728,12 +962,28 @@ impl Cm3Workspace {
             audio_meter: AudioMeterState::default(),
             player_plus: PlayerPlusState::default(),
             transparency_grid: false,
-            motion_path_visible: true,
+            motion_path_visible: false,
             viewport_draw_tool: None,
             split_inspector_focus_bottom: false,
             graph_open: false,
+            speed_menu_open: false,
             panels: PanelsState::default(),
             suppress_shortcuts: false,
+            external_shortcuts_dispatched: false,
+        }
+    }
+
+    /// Responsive minimum sidebar width: keeps inspector controls cleanly usable (`>= 300px`)
+    /// at standard/wide windows (`>= 1000px`) while scaling smoothly down to `270px` for `800×540`.
+    #[must_use]
+    pub fn compute_root_min_sidebar_width(window_width: f32) -> f32 {
+        if window_width >= 1000.0 {
+            300.0
+        } else if window_width <= 800.0 {
+            270.0
+        } else {
+            let t = (window_width - 800.0) / 200.0;
+            (270.0 + t * 30.0).round()
         }
     }
 
@@ -810,8 +1060,11 @@ impl Cm3Workspace {
             }
         }
 
+        // Keep minimum sidebar width responsive (>= 300px at >= 1000px, scaling smoothly down to 270px at 800x540).
+        self.root_split.min_pane_0 = Self::compute_root_min_sidebar_width(root_rect.width());
+
         // Root Horizontal Split: 30% Left Column | 70% Right Workspace
-        let (left_rect, right_rect) = begin_split_panel(
+        let (left_rect, right_rect) = pre_layout_split_panel(
             ui,
             Id::unique("cm3_root_split"),
             root_rect,
@@ -848,8 +1101,10 @@ impl Cm3Workspace {
             Id::unique("cm3_root_split_p1"),
             right_rect,
             |ui, right_rect| {
-                // Vertical Split: 65% Viewport / 35% (40px Playback Toolbar + Timeline/Audio Meter)
-                let (vp_rect, bottom_rect) = begin_split_panel(
+                // Vertical Split: 65% Viewport / 35% (40px Playback Toolbar + Timeline/Audio Meter).
+                // The 8px hitbox sits strictly on the viewport/playback-toolbar seam (40+ px above
+                // the timeline ruler) and is registered post-pane so child widgets cannot steal it.
+                let (vp_rect, bottom_rect) = pre_layout_split_panel(
                     ui,
                     Id::unique("cm3_right_split"),
                     right_rect,
@@ -938,7 +1193,19 @@ impl Cm3Workspace {
                         );
                     },
                 );
+                finish_split_panel(
+                    ui,
+                    Id::unique("cm3_right_split"),
+                    right_rect,
+                    &mut self.right_split,
+                );
             },
+        );
+        finish_split_panel(
+            ui,
+            Id::unique("cm3_root_split"),
+            root_rect,
+            &mut self.root_split,
         );
 
         actions
@@ -967,10 +1234,18 @@ impl Cm3Workspace {
         }
 
         let inner = snap_rect(rect.shrink(1.0));
-        // 5 buttons (29px each) + 4 gaps (5px) + 15px undo/redo separator = 180px
-        let buttons_total_w = 5.0 * 29.0 + 4.0 * 5.0 + 15.0;
-        // Exact CSS grid: minmax(100px, 1fr) auto minmax(0, 1fr)
-        let show_name_col = inner.width() >= 105.0 + buttons_total_w;
+        let compact = inner.width() < 310.0;
+        let btn_sz = if compact { 26.0_f32 } else { 29.0_f32 };
+        let btn_gap = if compact { 3.0_f32 } else { 4.0_f32 };
+        let sep_w = if compact { 7.0_f32 } else { 10.0_f32 };
+        let icon_sz = if compact { 22.0_f32 } else { 25.0_f32 };
+        let edge_pad = if compact { 4.0_f32 } else { 5.0_f32 };
+        let name_gap = if compact { 5.0_f32 } else { 6.0_f32 };
+        // 5 buttons (New, Open, Save | Undo, Redo) + 3 inner gaps + Undo/Redo separator
+        let buttons_total_w = 5.0 * btn_sz + 3.0 * btn_gap + sep_w;
+        let avail_for_name =
+            (inner.width() - edge_pad - name_gap - buttons_total_w - edge_pad).max(0.0);
+        let show_name_col = avail_for_name >= 56.0;
 
         let now = ui.input(|i| i.time);
         let is_dirty = session.is_dirty();
@@ -983,7 +1258,7 @@ impl Cm3Workspace {
             .dirty_since_sec
             .is_some_and(|start| now - start >= 300.0);
 
-        // Column 1: Zoidium inline project name input (min 100x29 at x=inner.left()+5, y=inner.top()+5)
+        // Column 1: Zoidium inline project name input (always visible down to narrow widths)
         let name_edit_id = Id::unique("zoidium_toolbar_project_name");
         if !self.project_name_editing {
             let trimmed = session.document().project_name.trim();
@@ -995,18 +1270,13 @@ impl Cm3Workspace {
         }
 
         let mut cursor_x = if show_name_col {
-            let free_w = (inner.width() - buttons_total_w).max(0.0);
-            let col1_w = (free_w * 0.5)
-                .max(105.0)
-                .min((inner.width() - buttons_total_w).max(105.0))
-                .round();
-            let name_w = (col1_w - 5.0)
-                .max(100.0)
-                .min((inner.width() - buttons_total_w - 5.0).max(100.0))
-                .round();
+            let max_name_w = if compact { 112.0_f32 } else { 184.0_f32 };
+            let name_w = avail_for_name.min(max_name_w).round();
+            let name_h = 29.0_f32.min((inner.height() - 6.0).max(20.0)).round();
+            let name_y = (inner.top() + (inner.height() - name_h) * 0.5).round();
             let name_rect = snap_rect(Rect::from_min_size(
-                Pos2::new((inner.left() + 5.0).round(), (inner.top() + 5.0).round()),
-                Vec2::new(name_w, 29.0),
+                Pos2::new((inner.left() + edge_pad).round(), name_y),
+                Vec2::new(name_w, name_h),
             ));
             let name_focused = ui.memory(|m| m.has_focus(name_edit_id));
             // Always paint BG_INPUT (#202020) fill & crisp 1px BORDER_CONTROL (#1b1b1b) border even when unfocused
@@ -1024,7 +1294,7 @@ impl Cm3Workspace {
             let (esc_pressed, enter_pressed) =
                 ui.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::Enter)));
             let edit_rect = Rect::from_min_max(
-                Pos2::new(name_rect.left() + 6.0, name_rect.top() + 4.0),
+                Pos2::new(name_rect.left() + 6.0, name_rect.top() + 3.0),
                 Pos2::new(
                     (name_rect.right() - 4.0).max(name_rect.left() + 7.0),
                     (name_rect.bottom() - 2.0).max(name_rect.top() + 5.0),
@@ -1041,7 +1311,7 @@ impl Cm3Workspace {
                             TextEdit::singleline(&mut self.project_name_buf)
                                 .id(name_edit_id)
                                 .frame(Frame::NONE)
-                                .font(theme.font(FONT_BODY))
+                                .font(theme.font(if compact { FONT_SMALL } else { FONT_BODY }))
                                 .text_color(theme.value())
                                 .desired_width((name_w - 10.0).max(20.0)),
                         )
@@ -1081,7 +1351,7 @@ impl Cm3Workspace {
             } else if resp.has_focus() {
                 self.project_name_editing = true;
             }
-            name_rect.right().round()
+            (name_rect.right() + name_gap).round()
         } else {
             (inner.center().x - buttons_total_w * 0.5)
                 .max(inner.left() + 2.0)
@@ -1089,24 +1359,33 @@ impl Cm3Workspace {
         };
 
         // Column 2: New, Load, Save [dirty dot], divider gap, Undo, Redo
-        let btn_y = (inner.top() + 5.0).round();
+        let btn_y = (inner.top() + (inner.height() - btn_sz) * 0.5).round();
+        let disabled_icon_tint = Color32::from_rgb(0x52, 0x52, 0x52);
 
         let toolbar_btn = |cursor_x: &mut f32,
                            icon: Cm3Icon,
                            tip: &str,
                            enabled: bool,
-                           dirty_dot: bool|
+                           dirty_dot: bool,
+                           advance_gap: f32|
          -> bool {
             let b_rect = snap_rect(Rect::from_min_size(
                 Pos2::new(cursor_x.round(), btn_y),
-                Vec2::splat(29.0),
+                Vec2::splat(btn_sz),
             ));
-            *cursor_x += 34.0; // 29px + 5px right margin
-            let resp = ui
-                .interact(b_rect, Id::unique(("ftb", tip)), Sense::click())
-                .on_hover_cursor(CursorIcon::PointingHand)
+            *cursor_x += btn_sz + advance_gap;
+            let sense = if enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            };
+            let mut resp = ui
+                .interact(b_rect, Id::unique(("ftb", tip)), sense)
                 .on_hover_text(tip);
-            if resp.hovered() && !resp.has_focus() {
+            if enabled {
+                resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+            }
+            if enabled && resp.hovered() && !resp.has_focus() {
                 ui.painter().rect_filled(
                     b_rect,
                     CornerRadius::ZERO,
@@ -1114,7 +1393,7 @@ impl Cm3Workspace {
                 );
             }
             // 2px theme.accent() border ONLY on keyboard/active focus (not passive hover)
-            if resp.has_focus() {
+            if enabled && resp.has_focus() {
                 ui.painter().rect_stroke(
                     b_rect,
                     CornerRadius::ZERO,
@@ -1122,9 +1401,13 @@ impl Cm3Workspace {
                     StrokeKind::Inside,
                 );
             }
-            let icon_rect = Rect::from_center_size(b_rect.center(), Vec2::splat(25.0));
-            // Render all 5 toolbar icons at full #acacac unconditionally (do not dim Undo/Redo)
-            paint_cm3_icon(ui.painter(), icon_rect, icon, TOOLBAR_ICON_INACTIVE);
+            let icon_rect = Rect::from_center_size(b_rect.center(), Vec2::splat(icon_sz));
+            let tint = if enabled {
+                TOOLBAR_ICON_INACTIVE
+            } else {
+                disabled_icon_tint
+            };
+            paint_cm3_icon(ui.painter(), icon_rect, icon, tint);
 
             // Zoidium 8px save reminder dot at top-right of Save (radius 4px, center right-7.5, top+6.5)
             if dirty_dot {
@@ -1139,23 +1422,44 @@ impl Cm3Workspace {
             enabled && resp.clicked()
         };
 
-        if toolbar_btn(&mut cursor_x, Cm3Icon::New, "new (ctrl-m)", true, false) {
+        if toolbar_btn(
+            &mut cursor_x,
+            Cm3Icon::New,
+            "new (ctrl-m)",
+            true,
+            false,
+            btn_gap,
+        ) {
             actions.push(UiAction::NewProject);
         }
-        if toolbar_btn(&mut cursor_x, Cm3Icon::Load, "open (ctrl-o)", true, false) {
+        if toolbar_btn(
+            &mut cursor_x,
+            Cm3Icon::Load,
+            "open (ctrl-o)",
+            true,
+            false,
+            btn_gap,
+        ) {
             actions.push(UiAction::OpenProject);
         }
-        if toolbar_btn(&mut cursor_x, Cm3Icon::Save, "save (ctrl-s)", true, true) {
+        if toolbar_btn(
+            &mut cursor_x,
+            Cm3Icon::Save,
+            "save (ctrl-s)",
+            true,
+            true,
+            sep_w,
+        ) {
             let include_assets = !ui.input(|i| i.modifiers.shift);
             actions.push(UiAction::SaveProject { include_assets });
         }
-        cursor_x += 15.0; // separator before Undo/Redo
         if toolbar_btn(
             &mut cursor_x,
             Cm3Icon::Undo,
             "undo (ctrl-z)",
             session.history.can_undo(),
             false,
+            btn_gap,
         ) {
             let _ = session.execute(Command::Undo);
         }
@@ -1165,6 +1469,7 @@ impl Cm3Workspace {
             "redo (ctrl-y)",
             session.history.can_redo(),
             false,
+            0.0,
         ) {
             let _ = session.execute(Command::Redo);
         }
@@ -1192,6 +1497,10 @@ impl Cm3Workspace {
     ) {
         let rect = snap_rect(rect);
         let viewport_rect = snap_rect(viewport_rect);
+        let assets_enabled = session.plugins.is_enabled("asset-manager");
+        if !assets_enabled && self.active_tab == SideTab::Assets {
+            self.active_tab = SideTab::Media;
+        }
 
         // Animate rail width: 200ms expand, 50ms collapse (Spec 01 §1.4 & §7)
         let max_rail_w = 300.0_f32.min(viewport_rect.width().max(60.0)).round();
@@ -1404,7 +1713,7 @@ impl Cm3Workspace {
                             .id_salt("cm3_elevator_drawer_content"),
                         |ui| {
                             ui.set_clip_rect(drawer_rect);
-                            self.show_elevator_rail(ui, drawer_rect, theme);
+                            self.show_elevator_rail(ui, drawer_rect, assets_enabled, theme);
                         },
                     );
                 });
@@ -1413,19 +1722,147 @@ impl Cm3Workspace {
                 rect.left_top(),
                 Vec2::new(rail_base_w, rect.height()),
             ));
-            self.show_elevator_rail(ui, rail_rect, theme);
+            self.show_elevator_rail(ui, rail_rect, assets_enabled, theme);
         }
     }
 
-    fn show_elevator_rail(&mut self, ui: &mut Ui, rail_rect: Rect, theme: &Cm3Theme) {
+    /// Computes the ordered sidebar tabs visible for the current plugin state (hiding `Assets`
+    /// when `asset-manager` is disabled, e.g. in Core Mode).
+    #[must_use]
+    pub fn visible_side_tabs(assets_enabled: bool) -> Vec<SideTab> {
+        SideTab::ALL
+            .iter()
+            .copied()
+            .filter(|tab| assets_enabled || *tab != SideTab::Assets)
+            .collect()
+    }
+
+    /// Computes per-slot vertical height so the menu toggle and all visible sidebar tabs fit
+    /// cleanly even at compact heights like `900×600`, while preserving exact `50px` slots at
+    /// standard heights (`>= 720px`).
+    #[must_use]
+    pub fn compute_elevator_slot_height(rail_height: f32, visible_tab_count: usize) -> f32 {
+        let total_slots = (visible_tab_count + 1).max(1) as f32;
+        (rail_height / total_slots).floor().clamp(34.0, 50.0)
+    }
+
+    /// Computes a fixed-width Player+ Speed/Pause pill that accommodates `"Paused"` + chevron
+    /// with zero clipping even in compact `900×600` layout and zero horizontal jump on play/pause.
+    #[must_use]
+    pub fn compute_speed_pill_width(compact: bool, paused_label_width: f32) -> f32 {
+        let base: f32 = if compact { 80.0 } else { 88.0 };
+        // 6px left inset + full `"Paused"` label + 20px right breathing room & chevron.
+        let needed = paused_label_width.ceil() + 26.0;
+        base.max(needed).min(112.0).round()
+    }
+
+    /// Computes responsive sizing for the 3-group Playback & Viewport toolbar across wide,
+    /// compact (`900×600`), narrow (`800×540` ~525px), and ultra-narrow (`>= 418px`) widths
+    /// so `Loop`, `Graph`, `Paused`, and `Full` are never clipped off the right edge.
+    #[must_use]
+    pub fn compute_playback_toolbar_metrics(
+        inner_width: f32,
+        paused_w_small: f32,
+        paused_w_compact: f32,
+    ) -> PlaybackToolbarMetrics {
+        if inner_width >= 690.0 {
+            PlaybackToolbarMetrics {
+                btn_size: 29.0,
+                btn_gap: 2.0,
+                pill_gap: 2.0,
+                icon_size: 25.0,
+                edge_pad: 5.0,
+                right_pad: 8.0,
+                group_gap: 6.0,
+                pill_font: FONT_SMALL,
+                speed_dd_w: Self::compute_speed_pill_width(false, paused_w_small),
+                q_w: 54.0,
+                compact_quality_labels: false,
+                pill_left_inset: 6.0,
+                pill_chevron_reserve: 17.0,
+                chevron_size: 11.0,
+                chevron_right_inset: 8.5,
+            }
+        } else if inner_width >= 565.0 {
+            PlaybackToolbarMetrics {
+                btn_size: 25.0,
+                btn_gap: 1.0,
+                pill_gap: 1.0,
+                icon_size: 21.0,
+                edge_pad: 3.0,
+                right_pad: 4.0,
+                group_gap: 4.0,
+                pill_font: FONT_SMALL,
+                speed_dd_w: Self::compute_speed_pill_width(true, paused_w_small),
+                q_w: 50.0,
+                compact_quality_labels: false,
+                pill_left_inset: 6.0,
+                pill_chevron_reserve: 17.0,
+                chevron_size: 11.0,
+                chevron_right_inset: 8.5,
+            }
+        } else if inner_width >= 490.0 {
+            PlaybackToolbarMetrics {
+                btn_size: 22.0,
+                btn_gap: 1.0,
+                pill_gap: 1.0,
+                icon_size: 18.0,
+                edge_pad: 2.0,
+                right_pad: 3.0,
+                group_gap: 3.0,
+                pill_font: FONT_COMPACT,
+                speed_dd_w: (paused_w_compact.ceil() + 20.0).clamp(62.0, 74.0).round(),
+                q_w: 38.0,
+                compact_quality_labels: true,
+                pill_left_inset: 4.0,
+                pill_chevron_reserve: 14.0,
+                chevron_size: 9.0,
+                chevron_right_inset: 7.0,
+            }
+        } else {
+            PlaybackToolbarMetrics {
+                btn_size: 19.0,
+                btn_gap: 0.0,
+                pill_gap: 1.0,
+                icon_size: 16.0,
+                edge_pad: 2.0,
+                right_pad: 2.0,
+                group_gap: 2.0,
+                pill_font: FONT_COMPACT,
+                speed_dd_w: (paused_w_compact.ceil() + 18.0).clamp(56.0, 66.0).round(),
+                q_w: 32.0,
+                compact_quality_labels: true,
+                pill_left_inset: 4.0,
+                pill_chevron_reserve: 13.0,
+                chevron_size: 9.0,
+                chevron_right_inset: 6.5,
+            }
+        }
+    }
+
+    fn show_elevator_rail(
+        &mut self,
+        ui: &mut Ui,
+        rail_rect: Rect,
+        assets_enabled: bool,
+        theme: &Cm3Theme,
+    ) {
         let rail_rect = snap_rect(rail_rect);
         ui.painter()
             .rect_filled(rail_rect, CornerRadius::ZERO, VOID_BLACK);
         let rail_focused = self.focused_panel == PanelFocus::ElevatorRail;
-        let tab_count = SideTab::ALL.len();
+        let visible_tabs = Self::visible_side_tabs(assets_enabled);
+        let tab_count = visible_tabs.len();
         if tab_count > 0 && self.rail_focus_index >= tab_count {
             self.rail_focus_index = tab_count - 1;
         }
+        let slot_h = Self::compute_elevator_slot_height(rail_rect.height(), tab_count);
+        let icon_sz = (slot_h - 16.0).clamp(22.0, 30.0).round();
+        let tab_font_sz = if slot_h < 42.0 {
+            (FONT_TAB * (slot_h / 50.0)).clamp(15.0, FONT_TAB)
+        } else {
+            FONT_TAB
+        };
 
         // Keyboard navigation when rail has focus (Spec 01 §1.4)
         let mut rail_key_navigated = false;
@@ -1442,16 +1879,16 @@ impl Cm3Workspace {
                     self.rail_focus_index = (self.rail_focus_index + tab_count - 1) % tab_count;
                     rail_key_navigated = true;
                 } else if i.key_pressed(Key::Enter) {
-                    self.active_tab = SideTab::ALL[self.rail_focus_index];
+                    self.active_tab = visible_tabs[self.rail_focus_index];
                     self.rail_expanded = false;
                 }
             });
         }
 
-        // Top 50px Menu Toggle button (30x30 icon horizontally centered at x = left + 15px)
+        // Top Menu Toggle button (scales smoothly with slot_h so all 12 items fit at 900×600)
         let menu_rect = snap_rect(Rect::from_min_size(
             rail_rect.left_top(),
-            Vec2::new(rail_rect.width(), 50.0_f32.min(rail_rect.height())),
+            Vec2::new(rail_rect.width(), slot_h.min(rail_rect.height())),
         ));
         let menu_resp = ui
             .interact(menu_rect, Id::unique("elevator_menu_btn"), Sense::click())
@@ -1474,12 +1911,12 @@ impl Cm3Workspace {
                 StrokeKind::Inside,
             );
         }
-        let menu_icon_rect = Rect::from_min_size(
+        let menu_icon_rect = Rect::from_center_size(
             Pos2::new(
-                (menu_rect.left() + 15.0).round(),
-                (menu_rect.top() + 10.0).round(),
+                (menu_rect.left() + 30.0).round(),
+                menu_rect.center().y.round(),
             ),
-            Vec2::splat(30.0),
+            Vec2::splat(icon_sz),
         );
         paint_cm3_icon(ui.painter(), menu_icon_rect, Cm3Icon::Menu, TEXT_STRONG);
         if menu_resp.clicked() {
@@ -1488,7 +1925,7 @@ impl Cm3Workspace {
             self.panels.floating_windows.clear_focus();
         }
 
-        // Scrollable Tab Strip (top: 50px to bottom, 50px rows, all 11 Zoidium tabs)
+        // Scrollable Tab Strip (scales cleanly to fit all tabs at 900×600, scrolls if even shorter)
         let strip_rect = snap_rect(Rect::from_min_max(
             Pos2::new(rail_rect.left(), menu_rect.bottom()),
             rail_rect.right_bottom(),
@@ -1513,13 +1950,15 @@ impl Cm3Workspace {
                 ui.set_clip_rect(ui.clip_rect().intersect(strip_rect));
                 ScrollArea::vertical()
                     .id_salt("elevator_tabs_scroll")
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
-                        for (idx, tab) in SideTab::ALL.iter().copied().enumerate() {
+                        for (idx, tab) in visible_tabs.iter().copied().enumerate() {
                             let (row_rect, row_resp) = ui.allocate_exact_size(
-                                Vec2::new(strip_rect.width(), 50.0),
+                                Vec2::new(strip_rect.width(), slot_h),
                                 Sense::click(),
                             );
                             let draw_row = snap_rect(row_rect);
@@ -1550,24 +1989,23 @@ impl Cm3Workspace {
                             }
 
                             let fg = if selected { selected_fg } else { TEXT_STRONG };
-                            // 30x30 icon centered in 60px rail at x = left + 15px, y = top + 11px
-                            let icon_rect = Rect::from_min_size(
+                            let icon_rect = Rect::from_center_size(
                                 Pos2::new(
-                                    (draw_row.left() + 15.0).round(),
-                                    (draw_row.top() + 11.0).round(),
+                                    (draw_row.left() + 30.0).round(),
+                                    draw_row.center().y.round(),
                                 ),
-                                Vec2::splat(30.0),
+                                Vec2::splat(icon_sz),
                             );
                             paint_cm3_icon(ui.painter(), icon_rect, tab.icon(), fg);
 
-                            // 22px label when expanded at left + 62px
+                            // Tab label when expanded at left + 62px
                             if strip_rect.width() > 64.0 {
                                 let label_x = (draw_row.left() + 62.0).round();
                                 ui.painter().with_clip_rect(draw_row).text(
                                     Pos2::new(label_x, draw_row.center().y),
                                     Align2::LEFT_CENTER,
                                     tab.title(),
-                                    theme.font(FONT_TAB),
+                                    theme.font(tab_font_sz),
                                     fg,
                                 );
                             }
@@ -1681,10 +2119,40 @@ impl Cm3Workspace {
         let inner = snap_rect(rect.shrink(1.0));
         let player_plus = session.plugins.is_enabled("player-plus");
         let motion_path = session.plugins.is_enabled("motion-path");
-        let by = (inner.top() + (inner.height() - 29.0) * 0.5).floor();
-        const BTN_SIZE: f32 = 29.0;
-        const BTN_GAP: f32 = 2.0;
-        const BTN_STEP: f32 = BTN_SIZE + BTN_GAP; // 31px
+        let scene_selected = selected_clip_is_scene3d(session);
+        let editing_camera_active = session
+            .selection
+            .is_editing_camera_active(&session.playback, scene_selected);
+
+        // Responsive pitch so all 3 groups (including Loop, Graph, Speed/Pause, Quality)
+        // fit cleanly with zero clipping across wide, 900×600, 800×540, and 420px min-width layouts.
+        let paused_label_w_small = ui
+            .painter()
+            .layout_no_wrap("Paused".to_owned(), theme.font(FONT_SMALL), theme.value())
+            .size()
+            .x;
+        let paused_label_w_compact = ui
+            .painter()
+            .layout_no_wrap("Paused".to_owned(), theme.font(FONT_COMPACT), theme.value())
+            .size()
+            .x;
+        let m = Self::compute_playback_toolbar_metrics(
+            inner.width(),
+            paused_label_w_small,
+            paused_label_w_compact,
+        );
+        let btn_size = m.btn_size;
+        let btn_gap = m.btn_gap;
+        let pill_gap = m.pill_gap;
+        let btn_step = btn_size + btn_gap;
+        let icon_size = m.icon_size;
+        let edge_pad = m.edge_pad;
+        let right_pad = m.right_pad;
+        let group_gap = m.group_gap;
+        let speed_dd_w = m.speed_dd_w;
+        let q_w = m.q_w;
+        let by = (inner.top() + (inner.height() - btn_size) * 0.5).floor();
+        let disabled_tint = Color32::from_rgb(0x52, 0x52, 0x52);
 
         #[derive(Clone, Copy)]
         enum PbIcon {
@@ -1695,46 +2163,64 @@ impl Cm3Workspace {
             MotionPath,
         }
 
+        let pb_icon_btn_enabled = |cx: &mut f32,
+                                   icon: PbIcon,
+                                   id_key: &str,
+                                   tip: &str,
+                                   tint: Color32,
+                                   accent_border: bool,
+                                   enabled: bool|
+         -> bool {
+            let b_rect = snap_rect(Rect::from_min_size(
+                Pos2::new(cx.round(), by),
+                Vec2::splat(btn_size),
+            ));
+            *cx += btn_step;
+            let sense = if enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            };
+            let mut resp = ui
+                .interact(b_rect, Id::unique(("pbtb", id_key)), sense)
+                .on_hover_text(tip);
+            if enabled {
+                resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+            }
+            if enabled && resp.hovered() && !resp.has_focus() && !accent_border {
+                ui.painter().rect_filled(
+                    b_rect,
+                    CornerRadius::ZERO,
+                    Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 10),
+                );
+            }
+            // 2px theme.accent() border ONLY on focus or active open state (never passive hover)
+            if enabled && (resp.has_focus() || accent_border) {
+                ui.painter().rect_stroke(
+                    b_rect,
+                    CornerRadius::ZERO,
+                    Stroke::new(2.0, theme.accent()),
+                    StrokeKind::Inside,
+                );
+            }
+            let ic = Rect::from_center_size(b_rect.center(), Vec2::splat(icon_size));
+            match icon {
+                PbIcon::Std(icon) => paint_cm3_icon(ui.painter(), ic, icon, tint),
+                PbIcon::ShapePen => paint_shape_pen_icon(ui.painter(), ic, tint),
+                PbIcon::BezierPen => paint_bezier_pen_icon(ui.painter(), ic, tint),
+                PbIcon::DrawPencil => paint_draw_pencil_icon(ui.painter(), ic, tint),
+                PbIcon::MotionPath => paint_motion_path_icon(ui.painter(), ic, tint),
+            }
+            enabled && resp.clicked()
+        };
+
         let pb_icon_btn =
             |cx: &mut f32, icon: PbIcon, tip: &str, tint: Color32, accent_border: bool| -> bool {
-                let b_rect = snap_rect(Rect::from_min_size(
-                    Pos2::new(cx.round(), by),
-                    Vec2::splat(BTN_SIZE),
-                ));
-                *cx += BTN_STEP;
-                let resp = ui
-                    .interact(b_rect, Id::unique(("pbtb", tip)), Sense::click())
-                    .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text(tip);
-                if resp.hovered() && !resp.has_focus() && !accent_border {
-                    ui.painter().rect_filled(
-                        b_rect,
-                        CornerRadius::ZERO,
-                        Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 10),
-                    );
-                }
-                // 2px theme.accent() border ONLY on focus or active open state (never passive hover)
-                if resp.has_focus() || accent_border {
-                    ui.painter().rect_stroke(
-                        b_rect,
-                        CornerRadius::ZERO,
-                        Stroke::new(2.0, theme.accent()),
-                        StrokeKind::Inside,
-                    );
-                }
-                let ic = Rect::from_center_size(b_rect.center(), Vec2::splat(25.0));
-                match icon {
-                    PbIcon::Std(icon) => paint_cm3_icon(ui.painter(), ic, icon, tint),
-                    PbIcon::ShapePen => paint_shape_pen_icon(ui.painter(), ic, tint),
-                    PbIcon::BezierPen => paint_bezier_pen_icon(ui.painter(), ic, tint),
-                    PbIcon::DrawPencil => paint_draw_pencil_icon(ui.painter(), ic, tint),
-                    PbIcon::MotionPath => paint_motion_path_icon(ui.painter(), ic, tint),
-                }
-                resp.clicked()
+                pb_icon_btn_enabled(cx, icon, tip, tip, tint, accent_border, true)
             };
 
-        // --- LEFT group (starting inner.left() + 5px, 29x29 buttons, 2px gap -> 31px pitch) ---
-        let mut left_x = (inner.left() + 5.0).round();
+        // --- LEFT group ---
+        let mut left_x = (inner.left() + edge_pad).round();
         if player_plus {
             if pb_icon_btn(
                 &mut left_x,
@@ -1759,16 +2245,25 @@ impl Cm3Workspace {
                 self.player_plus.single_render_requested = true;
                 actions.push(UiAction::SingleFrameRender);
             }
-            if pb_icon_btn(
+            let checker_enabled = !editing_camera_active;
+            if pb_icon_btn_enabled(
                 &mut left_x,
                 PbIcon::Std(Cm3Icon::TransparencyGrid),
-                "Player+: toggle transparency grid",
-                if self.transparency_grid {
+                "transparency_grid",
+                if checker_enabled {
+                    "Player+: toggle transparency grid"
+                } else {
+                    "Checkerboard applies in Preview mode (exit Editing Camera)"
+                },
+                if !checker_enabled {
+                    disabled_tint
+                } else if self.transparency_grid {
                     theme.value()
                 } else {
                     TEXT_MUTED
                 },
-                self.transparency_grid,
+                checker_enabled && self.transparency_grid,
+                checker_enabled,
             ) {
                 self.transparency_grid = !self.transparency_grid;
             }
@@ -1777,14 +2272,14 @@ impl Cm3Workspace {
             &mut left_x,
             PbIcon::Std(Cm3Icon::Camera),
             "editing camera (c)",
-            if session.playback.editing_camera {
+            if editing_camera_active {
                 TOGGLE_ACTIVE
             } else {
                 TOOLBAR_ICON_INACTIVE
             },
             false,
         ) {
-            session.playback.toggle_editing_camera();
+            let _ = toggle_editing_camera_synced(session);
         }
         if pb_icon_btn(
             &mut left_x,
@@ -1865,13 +2360,31 @@ impl Cm3Workspace {
         {
             self.motion_path_visible = !self.motion_path_visible;
         }
-        let left_end = (left_x - BTN_GAP).max(inner.left());
+        let left_end = (left_x - btn_gap).max(inner.left());
 
-        // --- CENTER group (horizontally centered on inner.center().x, 29x29 buttons, 2px gap) ---
-        let transport_w = 5.0 * BTN_SIZE + 4.0 * BTN_GAP; // 153px
+        // Precompute RIGHT group fixed width so CENTER clamps without ever pushing RIGHT off-screen,
+        // and so Loop/Graph NEVER jump horizontally when toggling play/pause or cycling quality.
+        let right_edge = (inner.right() - right_pad).round();
+        let base_right_w = btn_size + btn_gap + btn_size; // Loop + Graph
+        let pp_extra_w = pill_gap + speed_dd_w + pill_gap + q_w;
+        let transport_w = 5.0 * btn_size + 4.0 * btn_gap;
+        let max_right_avail =
+            (right_edge - (left_end + group_gap + transport_w + group_gap)).max(0.0);
+        let show_pp_right = player_plus && max_right_avail >= base_right_w + pp_extra_w;
+        let right_w = if show_pp_right {
+            base_right_w + pp_extra_w
+        } else {
+            base_right_w
+        };
+
+        // --- CENTER group (horizontally centered on inner.center().x, clamped between LEFT & RIGHT) ---
+        let min_center_x = (left_end + group_gap).round();
+        let max_center_x = (right_edge - right_w - group_gap - transport_w)
+            .round()
+            .max(min_center_x);
         let mut center_x = (inner.center().x - transport_w * 0.5)
             .round()
-            .max(left_end + 6.0);
+            .clamp(min_center_x, max_center_x);
         if pb_icon_btn(
             &mut center_x,
             PbIcon::Std(Cm3Icon::Start),
@@ -1931,31 +2444,14 @@ impl Cm3Workspace {
             let end_f = (session.document().sequence_length - 1.0).max(0.0);
             let _ = session.execute(Command::SetFrame { frame: end_f });
         }
-        let transport_end = center_x - BTN_GAP;
+        let transport_end = center_x - btn_gap;
 
-        // --- RIGHT group (right-aligned from inner.right() - 11px, matching Zoidium R0..R4) ---
-        let is_playing = session.playback.is_playing();
-        let right_edge = (inner.right() - 11.0).round();
-        let right_avail = (right_edge - (transport_end + 6.0)).max(0.0);
-        let q_label = self.player_plus.preview_quality.label();
-        let q_w = (q_label.len() as f32 * 8.5 + 20.0).ceil().max(54.0);
-        let paused_dd_w = 82.0_f32;
-        let show_paused_dd = player_plus && !is_playing;
-        let base_right_w = BTN_SIZE + BTN_GAP + BTN_SIZE; // Loop + Graph = 60px
-        let pp_extra_w = if show_paused_dd {
-            BTN_GAP + paused_dd_w + q_w
-        } else {
-            BTN_GAP + q_w
-        };
-        let show_pp_right = player_plus && right_avail >= base_right_w + pp_extra_w;
-        let right_w = if show_pp_right {
-            base_right_w + pp_extra_w
-        } else {
-            base_right_w
-        };
-        let mut rx = (right_edge - right_w).round().max(transport_end + 6.0);
+        // --- RIGHT group (fixed-width Speed/Pause pill + fixed-width Quality -> zero layout jump) ---
+        let mut rx = (right_edge - right_w)
+            .round()
+            .max(transport_end + group_gap);
 
-        if rx + BTN_SIZE <= right_edge + 0.5
+        if rx + btn_size <= right_edge + 0.5
             && pb_icon_btn(
                 &mut rx,
                 PbIcon::Std(Cm3Icon::Loop),
@@ -1970,7 +2466,7 @@ impl Cm3Workspace {
         {
             let _ = session.execute(Command::ToggleLoop);
         }
-        if rx + BTN_SIZE <= right_edge + 0.5
+        if rx + btn_size <= right_edge + 0.5
             && pb_icon_btn(
                 &mut rx,
                 PbIcon::Std(Cm3Icon::Graph),
@@ -1984,75 +2480,250 @@ impl Cm3Workspace {
         }
 
         if show_pp_right {
-            let ctrl_h = 27.0_f32;
+            let ctrl_h = (btn_size - 2.0).clamp(19.0, 27.0);
             let ctrl_y = (inner.top() + (inner.height() - ctrl_h) * 0.5).floor();
+            let q_label = if m.compact_quality_labels {
+                self.player_plus.preview_quality.compact_label()
+            } else {
+                self.player_plus.preview_quality.label()
+            };
 
-            // 82x27 "Paused ▾" dropdown right to the left of "Full" whenever
-            // player-plus is enabled and playback is paused (matching Zoidium startup toolbar).
-            if show_paused_dd {
-                let paused_rect = snap_rect(Rect::from_min_size(
-                    Pos2::new(rx.round(), ctrl_y),
-                    Vec2::new(paused_dd_w, ctrl_h),
-                ));
-                rx += paused_dd_w;
-                let p_resp = ui
-                    .interact(
-                        paused_rect,
-                        Id::unique("pp_paused_dropdown"),
-                        Sense::click(),
-                    )
-                    .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text(if self.player_plus.drawing_paused {
-                        "Player+: paused preview (drawing held; click to resume)"
-                    } else {
-                        "Player+: paused preview quality / hold mode"
-                    });
-                let bg = if self.player_plus.drawing_paused {
-                    TOGGLE_ACTIVE
+            // Align gap between Graph button and Speed/Pause pill when btn_gap < pill_gap.
+            rx += (pill_gap - btn_gap).max(0.0);
+
+            // Always-visible fixed-width Speed / Render-Pause pill (both playing and paused)
+            let speed_rect = snap_rect(Rect::from_min_size(
+                Pos2::new(rx.round(), ctrl_y),
+                Vec2::new(speed_dd_w, ctrl_h),
+            ));
+            rx += speed_dd_w + pill_gap;
+            let pill_label = if self.player_plus.drawing_paused {
+                "Held".to_owned()
+            } else if !playing {
+                "Paused".to_owned()
+            } else {
+                let s = session.playback.speed;
+                if (s - s.round()).abs() < 1e-3 || ((s * 10.0) - (s * 10.0).round()).abs() < 1e-3 {
+                    format!("{s:.1}x")
                 } else {
-                    BG_INPUT
-                };
-                let fg = if self.player_plus.drawing_paused {
-                    TEXT_BRIGHT
-                } else {
-                    theme.value()
-                };
-                ui.painter()
-                    .rect_filled(paused_rect, CornerRadius::ZERO, bg);
-                if p_resp.hovered() && !p_resp.has_focus() && !self.player_plus.drawing_paused {
-                    ui.painter().rect_filled(
-                        paused_rect,
-                        CornerRadius::ZERO,
-                        Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 10),
-                    );
+                    format!("{s:.2}x")
                 }
-                paint_panel_border(
-                    ui.painter(),
-                    paused_rect,
-                    if p_resp.has_focus() {
-                        theme.accent()
-                    } else {
-                        BORDER_CONTROL
-                    },
+            };
+            let p_resp = ui
+                .interact(
+                    speed_rect,
+                    Id::unique("pp_speed_pause_dropdown"),
+                    Sense::click(),
+                )
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Player+: playback speed presets & render pause");
+            let bg = if self.player_plus.drawing_paused {
+                TOGGLE_ACTIVE
+            } else {
+                BG_INPUT
+            };
+            let fg = if self.player_plus.drawing_paused {
+                TEXT_BRIGHT
+            } else {
+                theme.value()
+            };
+            ui.painter().rect_filled(speed_rect, CornerRadius::ZERO, bg);
+            if p_resp.hovered() && !p_resp.has_focus() && !self.player_plus.drawing_paused {
+                ui.painter().rect_filled(
+                    speed_rect,
+                    CornerRadius::ZERO,
+                    Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 10),
                 );
-                ui.painter().text(
-                    Pos2::new(paused_rect.left() + 8.0, paused_rect.center().y),
-                    Align2::LEFT_CENTER,
-                    "Paused",
-                    theme.font(FONT_SMALL),
-                    fg,
-                );
-                let chevron_rect = Rect::from_center_size(
-                    Pos2::new(paused_rect.right() - 9.5, paused_rect.center().y - 0.5),
-                    Vec2::splat(13.0),
-                );
-                paint_cm3_icon(ui.painter(), chevron_rect, Cm3Icon::ChevronDown, fg);
-                if p_resp.clicked() {
-                    self.player_plus.drawing_paused = !self.player_plus.drawing_paused;
+            }
+            paint_panel_border(
+                ui.painter(),
+                speed_rect,
+                if self.speed_menu_open || p_resp.has_focus() {
+                    theme.accent()
+                } else {
+                    BORDER_CONTROL
+                },
+            );
+            let pill_text_clip = Rect::from_min_max(
+                speed_rect.left_top(),
+                Pos2::new(
+                    (speed_rect.right() - m.pill_chevron_reserve).max(speed_rect.left()),
+                    speed_rect.bottom(),
+                ),
+            );
+            ui.painter().with_clip_rect(pill_text_clip).text(
+                Pos2::new(speed_rect.left() + m.pill_left_inset, speed_rect.center().y),
+                Align2::LEFT_CENTER,
+                &pill_label,
+                theme.font(m.pill_font),
+                fg,
+            );
+            let chevron_rect = Rect::from_center_size(
+                Pos2::new(
+                    speed_rect.right() - m.chevron_right_inset,
+                    speed_rect.center().y - 0.5,
+                ),
+                Vec2::splat(m.chevron_size),
+            );
+            paint_cm3_icon(ui.painter(), chevron_rect, Cm3Icon::ChevronDown, fg);
+            if p_resp.clicked() {
+                self.speed_menu_open = !self.speed_menu_open;
+                if !self.speed_menu_open {
+                    ui.memory_mut(|m| m.surrender_focus(p_resp.id));
                 }
             }
 
-            // Borderless quality text trigger ("Full" / "Half" / "Quarter", theme.value() #7e8fb9)
+            if self.speed_menu_open {
+                let presets: [f64; 5] = [0.25, 0.5, 1.0, 1.5, 2.0];
+                let row_h = 24.0_f32;
+                let sep_h = 5.0_f32;
+                let popup_w = 136.0_f32;
+                let popup_h = (presets.len() + 1) as f32 * row_h + sep_h + 4.0;
+                let screen_rect = ui.ctx().input(|i| i.viewport_rect());
+                let mut popup_x = speed_rect.left().round();
+                if popup_x + popup_w > screen_rect.right() - 4.0 {
+                    popup_x = (screen_rect.right() - popup_w - 4.0).max(screen_rect.left() + 4.0);
+                }
+                let mut popup_y = speed_rect.top().round() - popup_h - 2.0;
+                if popup_y < screen_rect.top() + 4.0 {
+                    popup_y = (speed_rect.bottom().round() + 2.0)
+                        .min((screen_rect.bottom() - popup_h - 4.0).max(screen_rect.top() + 4.0));
+                }
+                let mut close_menu = ui.input(|i| i.key_pressed(Key::Escape));
+                let area_resp = Area::new(Id::unique("pp_speed_menu_popup"))
+                    .order(Order::Foreground)
+                    .fixed_pos(Pos2::new(popup_x, popup_y))
+                    .interactable(true)
+                    .show(ui.ctx(), |ui| {
+                        let inner_w = popup_w - 4.0;
+                        let frame_resp = Frame::NONE
+                            .fill(BG_INPUT)
+                            .inner_margin(egui::Margin::same(2))
+                            .show(ui, |ui| {
+                                ui.set_min_width(inner_w);
+                                ui.set_max_width(inner_w);
+                                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                                let menu_active_bg = theme.menu_active();
+                                let menu_active_fg = theme.contrast_fg(menu_active_bg);
+                                for &spd in &presets {
+                                    let (r_rect, r_resp) = ui.allocate_exact_size(
+                                        Vec2::new(inner_w, row_h),
+                                        Sense::click(),
+                                    );
+                                    let is_cur =
+                                        playing && (session.playback.speed - spd).abs() < 1e-3;
+                                    if r_resp.hovered() {
+                                        ui.painter().rect_filled(
+                                            r_rect,
+                                            CornerRadius::ZERO,
+                                            menu_active_bg,
+                                        );
+                                    } else if is_cur {
+                                        ui.painter().rect_filled(
+                                            r_rect,
+                                            CornerRadius::ZERO,
+                                            BG_DROPDOWN_HOVER,
+                                        );
+                                    }
+                                    let label = if (spd - spd.round()).abs() < 1e-3
+                                        || ((spd * 10.0) - (spd * 10.0).round()).abs() < 1e-3
+                                    {
+                                        format!("{spd:.1}x")
+                                    } else {
+                                        format!("{spd:.2}x")
+                                    };
+                                    ui.painter().text(
+                                        Pos2::new(r_rect.left() + 8.0, r_rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        label,
+                                        theme.font(FONT_SMALL),
+                                        if r_resp.hovered() {
+                                            menu_active_fg
+                                        } else if is_cur {
+                                            TEXT_BRIGHT
+                                        } else {
+                                            TEXT_PRIMARY
+                                        },
+                                    );
+                                    if r_resp.clicked() {
+                                        let _ = session.execute(Command::SetSpeed { speed: spd });
+                                        close_menu = true;
+                                    }
+                                }
+
+                                // Separator line
+                                let (sep_rect, _) = ui
+                                    .allocate_exact_size(Vec2::new(inner_w, sep_h), Sense::hover());
+                                let sy = sep_rect.center().y.round();
+                                ui.painter().rect_filled(
+                                    Rect::from_min_max(
+                                        Pos2::new(sep_rect.left() + 4.0, sy),
+                                        Pos2::new(sep_rect.right() - 4.0, sy + 1.0),
+                                    ),
+                                    CornerRadius::ZERO,
+                                    BORDER_PANEL,
+                                );
+
+                                // Pause Render toggle
+                                let (pr_rect, pr_resp) = ui
+                                    .allocate_exact_size(Vec2::new(inner_w, row_h), Sense::click());
+                                if pr_resp.hovered() {
+                                    ui.painter().rect_filled(
+                                        pr_rect,
+                                        CornerRadius::ZERO,
+                                        menu_active_bg,
+                                    );
+                                } else if self.player_plus.drawing_paused {
+                                    ui.painter().rect_filled(
+                                        pr_rect,
+                                        CornerRadius::ZERO,
+                                        BG_DROPDOWN_HOVER,
+                                    );
+                                }
+                                let pr_label = if self.player_plus.drawing_paused {
+                                    "✓ Pause Render"
+                                } else {
+                                    "Pause Render"
+                                };
+                                ui.painter().text(
+                                    Pos2::new(pr_rect.left() + 8.0, pr_rect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    pr_label,
+                                    theme.font(FONT_SMALL),
+                                    if pr_resp.hovered() {
+                                        menu_active_fg
+                                    } else if self.player_plus.drawing_paused {
+                                        TEXT_BRIGHT
+                                    } else {
+                                        TEXT_PRIMARY
+                                    },
+                                );
+                                if pr_resp.clicked() {
+                                    self.player_plus.drawing_paused =
+                                        !self.player_plus.drawing_paused;
+                                    close_menu = true;
+                                }
+                            });
+                        paint_panel_border(ui.painter(), frame_resp.response.rect, theme.accent());
+                    });
+
+                let clicked_outside = ui.input(|i| {
+                    i.pointer.primary_pressed()
+                        && i.pointer.interact_pos().is_some_and(|p| {
+                            !area_resp.response.rect.contains(p) && !speed_rect.contains(p)
+                        })
+                });
+                if close_menu || clicked_outside {
+                    self.speed_menu_open = false;
+                    // Ensure closed speed dropdown never retains egui keyboard focus so
+                    // Delete/Backspace and transport shortcuts continue firing immediately.
+                    ui.memory_mut(|m| m.surrender_focus(p_resp.id));
+                }
+            } else if p_resp.has_focus() {
+                ui.memory_mut(|m| m.surrender_focus(p_resp.id));
+            }
+
+            // Fixed-width quality text trigger ("Full" / "Half" / "Quarter" / "1/8")
             let q_rect = snap_rect(Rect::from_min_size(
                 Pos2::new(rx.round(), ctrl_y),
                 Vec2::new(q_w, ctrl_h),
@@ -2080,7 +2751,7 @@ impl Cm3Workspace {
                 Pos2::new(q_rect.center().x, q_rect.center().y - 0.5),
                 Align2::CENTER_CENTER,
                 q_label,
-                theme.font(FONT_SMALL),
+                theme.font(m.pill_font),
                 theme.value(),
             );
             if q_resp.clicked() {
@@ -2090,7 +2761,10 @@ impl Cm3Workspace {
                     .unwrap_or(0);
                 self.player_plus.preview_quality =
                     PreviewQuality::ALL[(idx + 1) % PreviewQuality::ALL.len()];
+                ui.memory_mut(|m| m.surrender_focus(q_resp.id));
             }
+        } else {
+            self.speed_menu_open = false;
         }
 
         let border = if focused {
@@ -2152,7 +2826,11 @@ impl Cm3Workspace {
         actions: &mut Vec<UiAction>,
     ) {
         // Strict input-focus & modal guard (Spec 01 §6.1)
-        if self.suppress_shortcuts || ctx.egui_wants_keyboard_input() {
+        if self.suppress_shortcuts
+            || ctx.egui_wants_keyboard_input()
+            || ctx.text_edit_focused()
+            || self.project_name_editing
+        {
             return;
         }
 
@@ -2160,6 +2838,29 @@ impl Cm3Workspace {
         let in_floating = self.panels.floating_windows.focused_id.is_some();
         let in_shader_editor =
             self.panels.floating_windows.focused_id.as_deref() == Some("shader_editor");
+
+        // When host shell already dispatched shortcuts via `shortcuts::dispatch_shortcuts_with_focus`,
+        // only handle workspace-exclusive Backtick maximize so suppressed keys (e.g. Space during
+        // pointer drag or Inspector Delete) are never re-fired here.
+        if self.external_shortcuts_dispatched {
+            if !in_floating {
+                ctx.input(|i| {
+                    let ctrl = i.modifiers.ctrl || i.modifiers.command;
+                    let alt = i.modifiers.alt;
+                    if !ctrl && !alt && i.key_pressed(Key::Backtick) {
+                        if self.maximized_panel.is_some() {
+                            self.maximized_panel = None;
+                        } else if matches!(
+                            self.focused_panel,
+                            PanelFocus::Viewport | PanelFocus::Timeline | PanelFocus::SideInspector
+                        ) {
+                            self.maximized_panel = Some(self.focused_panel);
+                        }
+                    }
+                });
+            }
+            return;
+        }
 
         ctx.input(|i| {
             let ctrl = i.modifiers.ctrl || i.modifiers.command;
@@ -2186,6 +2887,19 @@ impl Cm3Workspace {
                 return;
             }
 
+            let non_repeat_space = i.events.iter().any(|ev| {
+                matches!(
+                    ev,
+                    egui::Event::Key {
+                        key: Key::Space,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if !modifiers.ctrl && !modifiers.command && !modifiers.shift && !modifiers.alt
+                )
+            });
+
             if ctrl && !shift && !alt && (i.key_pressed(Key::N) || i.key_pressed(Key::M)) {
                 actions.push(UiAction::NewProject);
             } else if ctrl && !shift && !alt && i.key_pressed(Key::O) {
@@ -2204,7 +2918,7 @@ impl Cm3Workspace {
                 ) {
                     self.maximized_panel = Some(self.focused_panel);
                 }
-            } else if !ctrl && !shift && !alt && i.key_pressed(Key::Space) {
+            } else if non_repeat_space && !i.pointer.primary_down() {
                 let _ = session.execute(Command::TogglePlay);
             } else if !ctrl && !shift && !alt && i.key_pressed(Key::Home) {
                 let _ = session.execute(Command::SetFrame { frame: 0.0 });
@@ -2236,7 +2950,7 @@ impl Cm3Workspace {
                 && i.key_pressed(Key::C)
                 && self.focused_panel != PanelFocus::Timeline
             {
-                session.playback.toggle_editing_camera();
+                let _ = toggle_editing_camera_synced(session);
             } else if !ctrl && !shift && !alt && i.key_pressed(Key::T) {
                 session.playback.toggle_transform_controls_2d();
             }
@@ -2253,4 +2967,461 @@ fn _keep_theme_imports_used() -> (Color32, Color32, Color32, Frame, Shape) {
         Frame::NONE,
         Shape::Noop,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elevator_rail_fits_all_tabs_at_900x600_and_hides_assets_in_core_mode() {
+        // Full mode: 11 tabs + 1 menu button = 12 slots; at 900x600 lower rail height is 557px.
+        let full_tabs = Cm3Workspace::visible_side_tabs(true);
+        assert_eq!(full_tabs.len(), 11);
+        assert!(full_tabs.contains(&SideTab::Assets));
+        assert!(full_tabs.contains(&SideTab::About));
+        assert!(full_tabs.contains(&SideTab::Settings));
+
+        let slot_h_600 = Cm3Workspace::compute_elevator_slot_height(557.0, full_tabs.len());
+        assert!(
+            slot_h_600 * (full_tabs.len() + 1) as f32 <= 557.0,
+            "all 12 rail slots (including About & Settings) must fit within 900x600 height: slot_h={slot_h_600}"
+        );
+        // At 1280x720 (rail height 677px), slots stay exact 50px.
+        let slot_h_720 = Cm3Workspace::compute_elevator_slot_height(677.0, full_tabs.len());
+        assert!((slot_h_720 - 50.0).abs() < 1e-3);
+
+        // Core Mode (asset-manager disabled): Assets tab is hidden.
+        let core_tabs = Cm3Workspace::visible_side_tabs(false);
+        assert_eq!(core_tabs.len(), 10);
+        assert!(!core_tabs.contains(&SideTab::Assets));
+    }
+
+    #[test]
+    fn responsive_900x600_workspace_keeps_sidebar_and_toolbars_visible() {
+        let ctx = egui::Context::default();
+        let mut ws = Cm3Workspace::new();
+        let mut session = Session::new();
+        let mut theme = Cm3Theme::default();
+
+        // Enforce sensible minimum width at 900x600.
+        let root_900 = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        let (left_900, _sp, right_900) = ws.root_split.compute_rects(root_900);
+        assert!(
+            left_900.width() >= 270.0,
+            "left sidebar must stay >= 270px at 900x600, got {}",
+            left_900.width()
+        );
+        assert!(right_900.width() >= 580.0);
+
+        // Render full workspace at 900x600 without panics or zero-size clipping.
+        let raw = egui::RawInput {
+            screen_rect: Some(root_900),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |_ui, _r, _f, _s| {},
+                |_ui, _r, _f, _s| {},
+            );
+        });
+        out.textures_delta.clear();
+
+        // Core Mode redirect: if Assets tab was active and asset-manager is disabled, switches away.
+        ws.active_tab = SideTab::Assets;
+        let no_deps = std::collections::BTreeSet::new();
+        session
+            .plugins
+            .disable("asset-manager", &no_deps)
+            .expect("disable asset-manager");
+        let raw2 = egui::RawInput {
+            screen_rect: Some(root_900),
+            ..Default::default()
+        };
+        let mut out2 = ctx.run_ui(raw2, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |_ui, _r, _f, _s| {},
+                |_ui, _r, _f, _s| {},
+            );
+        });
+        out2.textures_delta.clear();
+        assert_ne!(
+            ws.active_tab,
+            SideTab::Assets,
+            "disabling asset-manager must leave the Assets tab"
+        );
+    }
+
+    #[test]
+    fn speed_pause_pill_fits_paused_label_without_clipping_at_900x600() {
+        let ctx = egui::Context::default();
+        super::super::theme::install_cm3_fonts(&ctx);
+        let theme = Cm3Theme::default();
+        let mut paused_w = 0.0_f32;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            paused_w = ui
+                .painter()
+                .layout_no_wrap("Paused".to_owned(), theme.font(FONT_SMALL), theme.value())
+                .size()
+                .x;
+        });
+        out.textures_delta.clear();
+
+        let compact_w = Cm3Workspace::compute_speed_pill_width(true, paused_w);
+        let normal_w = Cm3Workspace::compute_speed_pill_width(false, paused_w);
+        assert!(compact_w >= 80.0);
+        assert!(normal_w >= 88.0);
+        // Text starts at +6px and clips at right - 17px => available text span = width - 23px.
+        assert!(
+            paused_w + 2.0 <= compact_w - 23.0,
+            "compact Speed/Pause pill ({compact_w}px) must fit full 'Paused' ({paused_w}px) + chevron without clipping 'd'"
+        );
+        // Verify full 3-group compact playback toolbar still fits inside 900x600 right pane (~617px inner).
+        let left_w = 9.0 * 25.0 + 8.0 * 1.0;
+        let center_w = 5.0 * 25.0 + 4.0 * 1.0;
+        let right_w = (25.0 + 1.0 + 25.0) + (1.0 + compact_w + 1.0 + 50.0);
+        let total_needed = 3.0 + left_w + 4.0 + center_w + 4.0 + right_w + 4.0;
+        assert!(
+            total_needed <= 617.0,
+            "compact playback toolbar with widened Speed/Pause pill must fit 900x600: needed={total_needed}"
+        );
+    }
+
+    #[test]
+    fn splitter_hitbox_is_8px_and_clamped_to_container() {
+        let container = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 540.0));
+        let h_split = SplitPanelState::new(0.35, SplitOrientation::Horizontal, 270.0, 420.0);
+        let (_p0, split_rect, _p1) = h_split.compute_rects(container);
+        assert!((split_rect.width() - SPLITTER_SIZE).abs() < 1e-3);
+        let h_hit = compute_splitter_hitbox(split_rect, container, true);
+        assert!(
+            (h_hit.width() - SPLITTER_HITBOX_SIZE).abs() < 1e-3,
+            "horizontal splitter hitbox must be 8px, got {}",
+            h_hit.width()
+        );
+        assert!(h_hit.left() >= container.left() && h_hit.right() <= container.right());
+
+        let v_split = SplitPanelState::new(0.65, SplitOrientation::Vertical, 120.0, 120.0);
+        let (_vp0, v_split_rect, _vp1) = v_split.compute_rects(container);
+        let v_hit = compute_splitter_hitbox(v_split_rect, container, false);
+        assert!(
+            (v_hit.height() - SPLITTER_HITBOX_SIZE).abs() < 1e-3,
+            "vertical splitter hitbox must be 8px, got {}",
+            v_hit.height()
+        );
+        assert!(v_hit.top() >= container.top() && v_hit.bottom() <= container.bottom());
+    }
+
+    #[test]
+    fn playback_toolbar_fits_all_controls_at_800x540_and_min_pane_width() {
+        let ctx = egui::Context::default();
+        super::super::theme::install_cm3_fonts(&ctx);
+        let theme = Cm3Theme::default();
+        let mut paused_small = 0.0_f32;
+        let mut paused_compact = 0.0_f32;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            paused_small = ui
+                .painter()
+                .layout_no_wrap("Paused".to_owned(), theme.font(FONT_SMALL), theme.value())
+                .size()
+                .x;
+            paused_compact = ui
+                .painter()
+                .layout_no_wrap("Paused".to_owned(), theme.font(FONT_COMPACT), theme.value())
+                .size()
+                .x;
+        });
+        out.textures_delta.clear();
+
+        // Check both 800x540 default right pane (inner ~525px) and min_pane_1=420px (inner 418px).
+        for inner_w in [525.0_f32, 418.0_f32] {
+            let m = Cm3Workspace::compute_playback_toolbar_metrics(
+                inner_w,
+                paused_small,
+                paused_compact,
+            );
+            let left_w = 9.0 * m.btn_size + 8.0 * m.btn_gap;
+            let center_w = 5.0 * m.btn_size + 4.0 * m.btn_gap;
+            let right_w = (m.btn_size + m.btn_gap + m.btn_size)
+                + (m.pill_gap + m.speed_dd_w + m.pill_gap + m.q_w);
+            let total_needed =
+                m.edge_pad + left_w + m.group_gap + center_w + m.group_gap + right_w + m.right_pad;
+            assert!(
+                total_needed <= inner_w,
+                "all playback controls (Graph, Paused, Full) must fit inside inner_w={inner_w}: needed={total_needed}"
+            );
+            let text_span = m.speed_dd_w - m.pill_left_inset - m.pill_chevron_reserve;
+            assert!(
+                paused_compact <= text_span + 0.5,
+                "Paused label ({paused_compact}px) must fit inside pill text span ({text_span}px) at inner_w={inner_w}"
+            );
+        }
+    }
+
+    #[test]
+    fn vertical_sidebar_splitter_1px_drag_tracks_smoothly_without_snap() {
+        let ctx = egui::Context::default();
+        let mut ws = Cm3Workspace::new();
+        let mut session = Session::new();
+        let mut theme = Cm3Theme::default();
+        let root_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Frame 0: establish initial layout and place pointer far to the right (x=800),
+        // reproducing the exact pre-click jump condition that used to snap sidebar to 271px.
+        let mut raw0 = egui::RawInput {
+            screen_rect: Some(root_rect),
+            ..Default::default()
+        };
+        raw0.events
+            .push(egui::Event::PointerMoved(Pos2::new(800.0, 360.0)));
+        let mut out0 = ctx.run_ui(raw0, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |_ui, _r, _f, _s| {},
+                |_ui, _r, _f, _s| {},
+            );
+        });
+        out0.textures_delta.clear();
+
+        let (initial_left, initial_split, _initial_right) = ws.root_split.compute_rects(root_rect);
+        let initial_w = initial_left.width();
+        let split_x = initial_split.center().x;
+        assert!(
+            (initial_w - 395.0).abs() <= 2.0,
+            "expected initial sidebar width ~395px at 1280px, got {initial_w}"
+        );
+
+        // Frame 1: pointer jumps from x=800 to the splitter border and presses primary button.
+        let mut raw1 = egui::RawInput {
+            screen_rect: Some(root_rect),
+            ..Default::default()
+        };
+        raw1.events
+            .push(egui::Event::PointerMoved(Pos2::new(split_x, 360.0)));
+        raw1.events.push(egui::Event::PointerButton {
+            pos: Pos2::new(split_x, 360.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut out1 = ctx.run_ui(raw1, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |_ui, _r, _f, _s| {},
+                |_ui, _r, _f, _s| {},
+            );
+        });
+        out1.textures_delta.clear();
+
+        let (after_press_left, _, _) = ws.root_split.compute_rects(root_rect);
+        assert!(
+            (after_press_left.width() - initial_w).abs() <= 1.0,
+            "pressing splitter after cursor jump must NOT snap sidebar width: initial={initial_w}, after_press={}",
+            after_press_left.width()
+        );
+
+        // Frame 2: drag right by exactly 1px.
+        let mut raw2 = egui::RawInput {
+            screen_rect: Some(root_rect),
+            ..Default::default()
+        };
+        raw2.events
+            .push(egui::Event::PointerMoved(Pos2::new(split_x + 1.0, 360.0)));
+        let mut out2 = ctx.run_ui(raw2, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |_ui, _r, _f, _s| {},
+                |_ui, _r, _f, _s| {},
+            );
+        });
+        out2.textures_delta.clear();
+
+        let (after_1px_left, _, _) = ws.root_split.compute_rects(root_rect);
+        assert!(
+            (after_1px_left.width() - (initial_w + 1.0)).abs() <= 1.0,
+            "1px drag on vertical splitter must move smoothly from {initial_w} to ~{}, got {}",
+            initial_w + 1.0,
+            after_1px_left.width()
+        );
+
+        // Frame 3: release pointer and verify responsive min sidebar width >= 300px at >= 1000px.
+        let mut raw3 = egui::RawInput {
+            screen_rect: Some(root_rect),
+            ..Default::default()
+        };
+        raw3.events.push(egui::Event::PointerButton {
+            pos: Pos2::new(split_x + 1.0, 360.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut out3 = ctx.run_ui(raw3, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |_ui, _r, _f, _s| {},
+                |_ui, _r, _f, _s| {},
+            );
+        });
+        out3.textures_delta.clear();
+
+        assert_eq!(Cm3Workspace::compute_root_min_sidebar_width(1440.0), 300.0);
+        assert_eq!(Cm3Workspace::compute_root_min_sidebar_width(1000.0), 300.0);
+        assert_eq!(Cm3Workspace::compute_root_min_sidebar_width(800.0), 270.0);
+    }
+
+    #[test]
+    fn horizontal_viewport_timeline_splitter_drags_down_and_up_without_ruler_conflict() {
+        let ctx = egui::Context::default();
+        let mut ws = Cm3Workspace::new();
+        let mut session = Session::new();
+        let mut theme = Cm3Theme::default();
+        let root_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+
+        // Frame 0: initial layout with pointer up near viewport top (y=80).
+        let mut raw0 = egui::RawInput {
+            screen_rect: Some(root_rect),
+            ..Default::default()
+        };
+        raw0.events
+            .push(egui::Event::PointerMoved(Pos2::new(800.0, 80.0)));
+        let mut timeline_rect_seen = Rect::NOTHING;
+        let mut out0 = ctx.run_ui(raw0, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |vp_ui, vp_r, _f, _s| {
+                    // Simulate viewport full-rect click_and_drag widget to ensure it does not steal splitter hitbox.
+                    let _ =
+                        vp_ui.interact(vp_r, Id::unique("test_vp_drag"), Sense::click_and_drag());
+                },
+                |_tl_ui, tl_r, _f, _s| {
+                    timeline_rect_seen = tl_r;
+                },
+            );
+        });
+        out0.textures_delta.clear();
+
+        let (_left, _root_sp, right_rect) = ws.root_split.compute_rects(root_rect);
+        let (init_vp, init_h_split, _init_bot) = ws.right_split.compute_rects(right_rect);
+        let h_hit = compute_splitter_hitbox(init_h_split, right_rect, false);
+        assert!(
+            h_hit.bottom() + 35.0 < timeline_rect_seen.top(),
+            "horizontal splitter 8px hitbox (bottom={}) must sit cleanly on viewport/toolbar seam well above timeline ruler (top={})",
+            h_hit.bottom(),
+            timeline_rect_seen.top()
+        );
+
+        let init_vp_h = init_vp.height();
+        let grab_x = right_rect.center().x;
+        // Grab inside the 8px hitbox slightly into the viewport side (1.5px above the 3px gap)
+        // to prove post-pane splitter registration wins over viewport click_and_drag.
+        let grab_y = init_h_split.top() - 1.5;
+
+        // Frame 1: press on horizontal splitter after cursor jump from y=80.
+        let mut raw1 = egui::RawInput {
+            screen_rect: Some(root_rect),
+            ..Default::default()
+        };
+        raw1.events
+            .push(egui::Event::PointerMoved(Pos2::new(grab_x, grab_y)));
+        raw1.events.push(egui::Event::PointerButton {
+            pos: Pos2::new(grab_x, grab_y),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut out1 = ctx.run_ui(raw1, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |vp_ui, vp_r, _f, _s| {
+                    let _ =
+                        vp_ui.interact(vp_r, Id::unique("test_vp_drag"), Sense::click_and_drag());
+                },
+                |_tl_ui, _tl_r, _f, _s| {},
+            );
+        });
+        out1.textures_delta.clear();
+
+        let (vp_after_press, _, _) = ws.right_split.compute_rects(right_rect);
+        assert!(
+            (vp_after_press.height() - init_vp_h).abs() <= 1.0,
+            "pressing horizontal splitter must not jump viewport height: init={init_vp_h}, after_press={}",
+            vp_after_press.height()
+        );
+
+        // Frame 2: drag DOWN by +40px.
+        let mut raw2 = egui::RawInput {
+            screen_rect: Some(root_rect),
+            ..Default::default()
+        };
+        raw2.events
+            .push(egui::Event::PointerMoved(Pos2::new(grab_x, grab_y + 40.0)));
+        let mut out2 = ctx.run_ui(raw2, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |vp_ui, vp_r, _f, _s| {
+                    let _ =
+                        vp_ui.interact(vp_r, Id::unique("test_vp_drag"), Sense::click_and_drag());
+                },
+                |_tl_ui, _tl_r, _f, _s| {},
+            );
+        });
+        out2.textures_delta.clear();
+
+        let (vp_after_down, _, _) = ws.right_split.compute_rects(right_rect);
+        assert!(
+            (vp_after_down.height() - (init_vp_h + 40.0)).abs() <= 1.5,
+            "dragging horizontal splitter down +40px must grow viewport to ~{}, got {}",
+            init_vp_h + 40.0,
+            vp_after_down.height()
+        );
+
+        // Frame 3: drag BACK UP by -60px (net -20px from start).
+        let mut raw3 = egui::RawInput {
+            screen_rect: Some(root_rect),
+            ..Default::default()
+        };
+        raw3.events
+            .push(egui::Event::PointerMoved(Pos2::new(grab_x, grab_y - 20.0)));
+        let mut out3 = ctx.run_ui(raw3, |ui| {
+            let _ = ws.show(
+                ui,
+                &mut session,
+                &mut theme,
+                |vp_ui, vp_r, _f, _s| {
+                    let _ =
+                        vp_ui.interact(vp_r, Id::unique("test_vp_drag"), Sense::click_and_drag());
+                },
+                |_tl_ui, _tl_r, _f, _s| {},
+            );
+        });
+        out3.textures_delta.clear();
+
+        let (vp_after_up, _, _) = ws.right_split.compute_rects(right_rect);
+        assert!(
+            (vp_after_up.height() - (init_vp_h - 20.0)).abs() <= 1.5,
+            "dragging horizontal splitter back up -60px must move viewport to ~{}, got {}",
+            init_vp_h - 20.0,
+            vp_after_up.height()
+        );
+    }
 }

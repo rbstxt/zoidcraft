@@ -7,7 +7,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f32::consts::{PI, TAU};
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use image::AnimationDecoder;
 use tracing::{debug, warn};
@@ -49,9 +50,9 @@ use zc_scene::{
     apply_voronoi_fracture_with_params, apply_warp_with_params, build_box, build_capsule,
     build_circle, build_cylinder, build_dodecahedron, build_donut, build_fallback_text_mesh,
     build_fallback_text_mesh_with_options, build_icosahedron, build_octahedron, build_preset_model,
-    build_rectangle, build_sphere, build_tetrahedron, build_text3d_character_meshes,
-    build_text3d_mesh, build_text3d_mesh_with_options, build_wire, compute_deformer_frame,
-    compute_shared_deformer_bounds, evaluate_camera_shake, evaluate_particles_cm3_lut,
+    build_rectangle, build_sphere, build_tetrahedron, build_text3d_mesh_with_fallback,
+    build_wire_in_bounds, compute_deformer_frame, compute_shared_deformer_bounds,
+    evaluate_camera_shake, evaluate_particles_cm3_lut, font_has_missing_glyphs,
     generate_particle_sprite_by_name, parse_character_ranges, parse_gltf_or_glb, parse_obj,
     repeater_echo_frames, repeater_instance_transform,
 };
@@ -74,12 +75,13 @@ use crate::effects::{
 };
 use crate::scene3d::{
     CameraParams, CompatMode as RenderCompatMode, CullSide, CustomMaterial3DDrawCall,
-    DofPassParams, GpuMesh, LightKind as RenderLightKind, LineVertex, MAX_SCENE_LIGHTS,
-    MaterialBlend, MaterialParams, MeshDrawCall, MeshExtraMaps, MeshVertex, OpticalFlareDrawCall,
-    ParticleBlend, ParticleDrawCall, ParticleInstance as RenderParticleInstance,
-    Scene3DExtendedOptions, Scene3DPassInput, Scene3DRenderOptions, Scene3DRenderer, SceneLight,
-    ShadingModel, TextureWrap, build_camera_helper_lines, build_light_helper_lines, mat4_identity,
-    mat4_mul, mat4_orthographic_rh, mat4_perspective_rh,
+    DofPassParams, GlslCustomMaterial3DDrawCall, GpuMesh, LightKind as RenderLightKind, LineVertex,
+    MAX_SCENE_LIGHTS, MaterialBlend, MaterialParams, MeshDrawCall, MeshExtraMaps, MeshVertex,
+    OpticalFlareDrawCall, ParticleBlend, ParticleDrawCall,
+    ParticleInstance as RenderParticleInstance, Scene3DExtendedOptions, Scene3DPassInput,
+    Scene3DRenderOptions, Scene3DRenderer, SceneLight, ShadingModel, TextureWrap,
+    build_camera_helper_lines, build_light_helper_lines, mat4_identity, mat4_mul,
+    mat4_orthographic_rh, mat4_perspective_rh,
 };
 use crate::shape_plus::{
     EvaluatedMask as ShapePlusMask, eval_prop_f64 as shape_plus_eval_prop_f64, rasterize_masks_aa,
@@ -92,6 +94,9 @@ use crate::text_plus_2d::{
 /// Built-in OFL TrueType fallback font (`Geist-Regular.ttf`) used for 3D Text and 2D Text
 /// when the referenced font preset/asset key is not embedded in `project.assets`.
 static DEFAULT_TTF_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/Geist-Regular.ttf");
+static GEIST_MONO_TTF_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/GeistMono-Regular.ttf");
+static SOURCE_CODE_PRO_TTF_FONT_BYTES: &[u8] =
+    include_bytes!("../assets/fonts/SourceCodePro-Regular.ttf");
 
 /// Alias for [`GpuContext`] exposed alongside [`ProjectRenderEngine`].
 pub type RenderContext = GpuContext;
@@ -217,13 +222,17 @@ impl EffectSelfTestReport {
 #[derive(Debug, Clone, Default)]
 pub struct RenderOverrides {
     /// When set, the matching `VideoClip` (by UUID) renders using `editing_camera` and
-    /// displays the CM3 editing grid + selection AABB wireframe.
+    /// displays the CM3 editing grid + selection AABB wireframe (unless `is_scene_camera_override`
+    /// is `true`).
     pub editing_camera_clip_id: Option<Uuid>,
-    /// Interactive Editing Camera overriding the active 3D scene camera.
+    /// Interactive Editing Camera (or explicit Scene Camera override) overriding the active 3D scene camera.
     pub editing_camera: Option<CameraParams>,
     /// Selected 3D object UUIDs whose combined world AABB is drawn as a wireframe when
     /// Editing Camera is active.
     pub selected_object_ids: Vec<Uuid>,
+    /// When `true`, `editing_camera` represents a Scene Camera Switcher preview rather than
+    /// Editing Camera mode, so effects remain enabled and editor grid/wireframes are NOT drawn.
+    pub is_scene_camera_override: bool,
 }
 
 /// Frame-level rendering options (transparent alpha export + optional viewport overrides).
@@ -239,6 +248,7 @@ pub struct RenderFrameOptions {
 struct Scene3DOverride<'a> {
     editing_camera: CameraParams,
     selected_object_ids: &'a [Uuid],
+    show_editor_overlays: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1096,6 +1106,88 @@ impl ProjectRenderEngine {
         // P9 P1-9: Solo state checks `t.solo` regardless of `enabled` (matching Zoidium).
         let any_solo = sequence.video_tracks.iter().any(|t| t.solo);
 
+        // Editing Camera mode (`C`): isolate the selected 3D Scene clip directly as a raw 3D
+        // viewport (with editor grid & selection AABB) — never applying clip effects, masks,
+        // 2D transforms, or adjustment/other tracks over the editing camera view.
+        if comp_depth == 0
+            && let Some(ov) = overrides
+            && !ov.is_scene_camera_override
+            && let (Some(target_clip_id), Some(cam)) =
+                (ov.editing_camera_clip_id, ov.editing_camera)
+        {
+            for track in &sequence.video_tracks {
+                if let Some(clip) = track.clips.iter().find(|c| {
+                    c.id == target_clip_id
+                        && c.length > 0.0
+                        && base_frame >= c.start
+                        && base_frame < c.start + c.length
+                }) {
+                    let local_frame = eval_frame - clip.start;
+                    let empty_props = BTreeMap::new();
+                    let raw_time = eval_clip_time_curve_raw(&clip.time_curve, local_frame, fps);
+                    let time_env = EvalEnv {
+                        frame: local_frame,
+                        abs_frame: eval_frame,
+                        time: raw_time,
+                        fps,
+                        sequence_resolution: sequence.resolution,
+                        project,
+                        sequence,
+                        plugins,
+                        controls: &controls,
+                        parent_props: &empty_props,
+                        active_clip_id: Some(clip.id),
+                        active_layer_id: Some(clip.layer.id),
+                        active_object_id: None,
+                        active_effect_id: None,
+                        active_property_id: Some(format!("prop:clip:{}:time", clip.id)),
+                        expr_stack: &expr_stack,
+                    };
+                    let clip_time = eval_clip_time_with_env(&clip.time_curve, &time_env);
+                    let clip_env = EvalEnv {
+                        frame: local_frame,
+                        abs_frame: eval_frame,
+                        time: clip_time,
+                        fps,
+                        sequence_resolution: sequence.resolution,
+                        project,
+                        sequence,
+                        plugins,
+                        controls: &controls,
+                        parent_props: &empty_props,
+                        active_clip_id: Some(clip.id),
+                        active_layer_id: Some(clip.layer.id),
+                        active_object_id: None,
+                        active_effect_id: None,
+                        active_property_id: None,
+                        expr_stack: &expr_stack,
+                    };
+                    let scene_override = Scene3DOverride {
+                        editing_camera: cam,
+                        selected_object_ids: &ov.selected_object_ids,
+                        show_editor_overlays: true,
+                    };
+                    let layer_env = clip_env.with_layer(clip.layer.id);
+                    if let Some(raw_3d) = self.render_layer_content(
+                        &canvas,
+                        &clip.layer,
+                        &layer_env,
+                        width,
+                        height,
+                        visited_comps,
+                        visited_tracks,
+                        comp_depth,
+                        None,
+                        Some(&scene_override),
+                    )? {
+                        self.targets.release(canvas);
+                        return Ok(raw_3d);
+                    }
+                    return Ok(canvas);
+                }
+            }
+        }
+
         // Spec 03 §7.3: render video tracks strictly bottom-to-top (0 -> N - 1).
         for (track_idx, track) in sequence.video_tracks.iter().enumerate() {
             if !track.enabled || (any_solo && !track.solo) {
@@ -1112,9 +1204,7 @@ impl ProjectRenderEngine {
                 let local_frame = eval_frame - clip.start;
                 let empty_props = BTreeMap::new();
                 // P7 P0-8: Pass pre-expression keyframed time to clip `time` expression.
-                let raw_time = eval_track_keyframes_only(&clip.time_curve, local_frame)
-                    .as_f64()
-                    .unwrap_or(local_frame / fps);
+                let raw_time = eval_clip_time_curve_raw(&clip.time_curve, local_frame, fps);
                 let time_env = EvalEnv {
                     frame: local_frame,
                     abs_frame: eval_frame,
@@ -1133,7 +1223,7 @@ impl ProjectRenderEngine {
                     active_property_id: Some(format!("prop:clip:{}:time", clip.id)),
                     expr_stack: &expr_stack,
                 };
-                let clip_time = eval_f64(&clip.time_curve, &time_env);
+                let clip_time = eval_clip_time_with_env(&clip.time_curve, &time_env);
                 let clip_env = EvalEnv {
                     frame: local_frame,
                     abs_frame: eval_frame,
@@ -1161,6 +1251,7 @@ impl ProjectRenderEngine {
                     clip_matches.then_some(Scene3DOverride {
                         editing_camera: cam,
                         selected_object_ids: &ov.selected_object_ids,
+                        show_editor_overlays: !ov.is_scene_camera_override,
                     })
                 });
 
@@ -1271,9 +1362,7 @@ impl ProjectRenderEngine {
                 }
                 let local_frame = eval_frame - clip.start;
                 let empty_props = BTreeMap::new();
-                let raw_time = eval_track_keyframes_only(&clip.time_curve, local_frame)
-                    .as_f64()
-                    .unwrap_or(local_frame / fps);
+                let raw_time = eval_clip_time_curve_raw(&clip.time_curve, local_frame, fps);
                 let time_env = EvalEnv {
                     frame: local_frame,
                     abs_frame: eval_frame,
@@ -1292,7 +1381,7 @@ impl ProjectRenderEngine {
                     active_property_id: Some(format!("prop:clip:{}:time", clip.id)),
                     expr_stack: &expr_stack,
                 };
-                let clip_time = eval_f64(&clip.time_curve, &time_env);
+                let clip_time = eval_clip_time_with_env(&clip.time_curve, &time_env);
                 let clip_env = EvalEnv {
                     frame: local_frame,
                     abs_frame: eval_frame,
@@ -1681,9 +1770,7 @@ impl ProjectRenderEngine {
         let local_frame = env.abs_frame - clip.start;
         let fps = env.fps.max(1.0);
         let empty_props = BTreeMap::new();
-        let raw_time = eval_track_keyframes_only(&clip.time_curve, local_frame)
-            .as_f64()
-            .unwrap_or(local_frame / fps);
+        let raw_time = eval_clip_time_curve_raw(&clip.time_curve, local_frame, fps);
         let time_env = EvalEnv {
             frame: local_frame,
             abs_frame: env.abs_frame,
@@ -1702,7 +1789,7 @@ impl ProjectRenderEngine {
             active_property_id: Some(format!("prop:clip:{}:time", clip.id)),
             expr_stack: env.expr_stack,
         };
-        let clip_time = eval_f64(&clip.time_curve, &time_env);
+        let clip_time = eval_clip_time_with_env(&clip.time_curve, &time_env);
         let clip_env = EvalEnv {
             frame: local_frame,
             abs_frame: env.abs_frame,
@@ -1918,13 +2005,14 @@ impl ProjectRenderEngine {
                     height,
                     wgpu::TextureFormat::Rgba8Unorm,
                 )?;
-                self.compositor
-                    .clear_target(&self.ctx, &dst, wgpu::Color::TRANSPARENT);
+                let fill_color = eval_generator_layer_color(layer, env);
+                self.compositor.clear_target(&self.ctx, &dst, fill_color);
                 Ok(Some(dst))
             }
             LayerKind::Image { image } => {
-                // P6 P0 + Animated GIF support (`gif-support`): honor `layer.resolution` and
-                // decode animated GIF frame matching `env.time % total_duration` when enabled.
+                // P6 P0 + Animated GIF support (`gif-support`): preserve natural image aspect
+                // ratio (contain/fit cleanly within scaled `layer.resolution`) so square/16:9
+                // images never stretch anisotropically on vertical (9:16) or odd-aspect outputs.
                 let gif_enabled = env.plugins.is_enabled("gif-support");
                 let tex_opt = image.as_deref().and_then(|asset_id| {
                     if gif_enabled
@@ -1950,16 +2038,14 @@ impl ProjectRenderEngine {
                     } else {
                         tex.height
                     };
-                    let target_w = ((natural_w as f32) * scale_x)
-                        .round()
-                        .max(1.0)
-                        .min(self.ctx.device.limits().max_texture_dimension_2d as f32)
-                        as u32;
-                    let target_h = ((natural_h as f32) * scale_y)
-                        .round()
-                        .max(1.0)
-                        .min(self.ctx.device.limits().max_texture_dimension_2d as f32)
-                        as u32;
+                    let box_w = (natural_w as f32) * scale_x;
+                    let box_h = (natural_h as f32) * scale_y;
+                    let tex_w = tex.width.max(1) as f32;
+                    let tex_h = tex.height.max(1) as f32;
+                    let fit = (box_w / tex_w).min(box_h / tex_h);
+                    let max_dim = self.ctx.device.limits().max_texture_dimension_2d as f32;
+                    let target_w = (tex_w * fit).round().max(1.0).min(max_dim) as u32;
+                    let target_h = (tex_h * fit).round().max(1.0).min(max_dim) as u32;
                     let dst = self.targets.acquire(
                         &self.ctx,
                         target_w,
@@ -1981,7 +2067,8 @@ impl ProjectRenderEngine {
                 }
             }
             LayerKind::Video { media } => {
-                // P6 P0 + P7 P0: Honor `layer.resolution` AND sample video at `env.time`!
+                // P6 P0 + P7 P0: Honor `layer.resolution`, preserve natural aspect ratio,
+                // AND sample video at `env.time`!
                 let sample_time = env.time.max(0.0);
                 let gif_enabled = env.plugins.is_enabled("gif-support");
                 let tex_opt = media.as_deref().and_then(|asset_id| {
@@ -2005,16 +2092,14 @@ impl ProjectRenderEngine {
                     } else {
                         tex.height
                     };
-                    let target_w = ((natural_w as f32) * scale_x)
-                        .round()
-                        .max(1.0)
-                        .min(self.ctx.device.limits().max_texture_dimension_2d as f32)
-                        as u32;
-                    let target_h = ((natural_h as f32) * scale_y)
-                        .round()
-                        .max(1.0)
-                        .min(self.ctx.device.limits().max_texture_dimension_2d as f32)
-                        as u32;
+                    let box_w = (natural_w as f32) * scale_x;
+                    let box_h = (natural_h as f32) * scale_y;
+                    let tex_w = tex.width.max(1) as f32;
+                    let tex_h = tex.height.max(1) as f32;
+                    let fit = (box_w / tex_w).min(box_h / tex_h);
+                    let max_dim = self.ctx.device.limits().max_texture_dimension_2d as f32;
+                    let target_w = (tex_w * fit).round().max(1.0).min(max_dim) as u32;
+                    let target_h = (tex_h * fit).round().max(1.0).min(max_dim) as u32;
                     let dst = self.targets.acquire(
                         &self.ctx,
                         target_w,
@@ -2153,12 +2238,14 @@ impl ProjectRenderEngine {
                     .is_enabled("text-plus")
                     .then(|| layer.preserved.get("zoidiumTextPlus2D"))
                     .flatten();
+                let text_align = parse_text2d_align(&layer.preserved);
                 let target = self.render_text_2d(
                     layer.id,
                     text,
                     font.as_deref(),
                     *size,
                     shapes,
+                    text_align,
                     text_plus_2d,
                     env,
                     width,
@@ -2356,6 +2443,43 @@ impl ProjectRenderEngine {
             },
         };
 
+        // Zero-light 3D PBR studio fallback: when no explicit lights exist in the scene, provide
+        // a gentle camera-relative studio headlight + soft hemisphere fill (shadowless) so newly
+        // added 3D PBR primitives are never pitch-black invisible. Adding any explicit light object
+        // disables this fallback automatically.
+        if collected.lights.is_empty() {
+            let eye = Vec3::from_array(camera.eye_position);
+            let key_pos = eye + Vec3::new(12.0, 18.0, 10.0);
+            collected.lights.push(SceneLight {
+                kind: RenderLightKind::Directional,
+                color: [1.0, 0.99, 0.97],
+                ground_color: [0.2, 0.2, 0.25],
+                position: key_pos.to_array(),
+                target: [0.0, 0.0, 0.0],
+                intensity: 0.78,
+                angle_deg: 45.0,
+                distance: 0.0,
+                decay: 1.0,
+                penumbra: 0.5,
+                cast_shadow: false,
+                shadow_bias: 0.0,
+            });
+            collected.lights.push(SceneLight {
+                kind: RenderLightKind::Hemisphere,
+                color: [0.85, 0.9, 1.0],
+                ground_color: [0.24, 0.24, 0.28],
+                position: [0.0, 1.0, 0.0],
+                target: [0.0, 0.0, 0.0],
+                intensity: 0.35,
+                angle_deg: 45.0,
+                distance: 0.0,
+                decay: 1.0,
+                penumbra: 0.5,
+                cast_shadow: false,
+                shadow_bias: 0.0,
+            });
+        }
+
         let mut selection_aabb: Option<([f32; 3], [f32; 3])> = None;
         let mut extra_wireframe_lines: Vec<LineVertex> = Vec::new();
         if let Some(ov) = scene_override
@@ -2491,6 +2615,7 @@ impl ProjectRenderEngine {
             ProjectCompatMode::Legacy => RenderCompatMode::Legacy,
         };
 
+        let is_editing_view = scene_override.is_some_and(|ov| ov.show_editor_overlays);
         let mut render_res = self.scene3d.render_with_extended_options(
             &self.ctx,
             &color,
@@ -2501,18 +2626,14 @@ impl ProjectRenderEngine {
                 meshes: &meshes_draw,
                 particles: &particle_draws,
                 compat_mode,
-                editing_camera: scene_override.is_some(),
+                editing_camera: is_editing_view,
                 selection_aabb,
             },
             &Scene3DExtendedOptions {
                 base: Scene3DRenderOptions {
                     extra_lines: &extra_wireframe_lines,
                     mesh_extra_maps: &mesh_extra_maps,
-                    dof: if scene_override.is_some() {
-                        None
-                    } else {
-                        collected.dof
-                    },
+                    dof: if is_editing_view { None } else { collected.dof },
                     linear_lighting: false,
                     particle_sprites_straight_alpha: true,
                 },
@@ -2525,25 +2646,73 @@ impl ProjectRenderEngine {
         // Render 3D CustomShader material meshes into `(color, depth)` while depth buffer is live.
         if render_res.is_ok() {
             for cm in &collected.custom_material_meshes {
-                let draw = CustomMaterial3DDrawCall {
-                    mesh: cm.mesh.as_ref(),
-                    model: cm.model,
-                    normal_matrix: cm.normal_matrix,
-                    side: cm.side,
-                    blend: cm.blend,
-                    time: env.time as f32,
-                    params_a: cm.params_a,
-                    params_b: cm.params_b,
-                };
-                if let Err(err) = self.scene3d.render_custom_material_mesh(
-                    &self.ctx,
-                    &color,
-                    &depth,
-                    &camera,
-                    &cm.shader_key,
-                    &draw,
-                ) {
-                    warn!(shader_key = %cm.shader_key, error = %err, "custom 3D material draw failed");
+                if cm.is_glsl {
+                    let mut uniforms = cm.glsl_uniforms.clone();
+                    let t = env.time as f32;
+                    uniforms
+                        .entry("time".to_owned())
+                        .or_insert(UniformValue::Float(t));
+                    uniforms
+                        .entry("uTime".to_owned())
+                        .or_insert(UniformValue::Float(t));
+                    uniforms
+                        .entry("iTime".to_owned())
+                        .or_insert(UniformValue::Float(t));
+                    let res = [width as f32, height as f32];
+                    uniforms
+                        .entry("resolution".to_owned())
+                        .or_insert(UniformValue::Vec2(res));
+                    uniforms
+                        .entry("uResolution".to_owned())
+                        .or_insert(UniformValue::Vec2(res));
+                    uniforms
+                        .entry("iResolution".to_owned())
+                        .or_insert(UniformValue::Vec2(res));
+                    uniforms
+                        .entry("cameraPosition".to_owned())
+                        .or_insert(UniformValue::Vec3(camera.eye_position));
+                    uniforms
+                        .entry("uCameraPos".to_owned())
+                        .or_insert(UniformValue::Vec3(camera.eye_position));
+                    let draw = GlslCustomMaterial3DDrawCall {
+                        mesh: cm.mesh.as_ref(),
+                        model: cm.model,
+                        normal_matrix: cm.normal_matrix,
+                        side: cm.side,
+                        blend: cm.blend,
+                        uniform_values: &uniforms,
+                    };
+                    if let Err(err) = self.scene3d.render_glsl_custom_material_mesh(
+                        &self.ctx,
+                        &color,
+                        &depth,
+                        &camera,
+                        &cm.shader_key,
+                        &draw,
+                    ) {
+                        warn!(shader_key = %cm.shader_key, error = %err, "GLSL custom 3D material draw failed");
+                    }
+                } else {
+                    let draw = CustomMaterial3DDrawCall {
+                        mesh: cm.mesh.as_ref(),
+                        model: cm.model,
+                        normal_matrix: cm.normal_matrix,
+                        side: cm.side,
+                        blend: cm.blend,
+                        time: env.time as f32,
+                        params_a: cm.params_a,
+                        params_b: cm.params_b,
+                    };
+                    if let Err(err) = self.scene3d.render_custom_material_mesh(
+                        &self.ctx,
+                        &color,
+                        &depth,
+                        &camera,
+                        &cm.shader_key,
+                        &draw,
+                    ) {
+                        warn!(shader_key = %cm.shader_key, error = %err, "custom 3D material draw failed");
+                    }
                 }
             }
         }
@@ -2692,18 +2861,8 @@ impl ProjectRenderEngine {
                         out.camera_is_camera_plus = cam.active && is_cam_plus;
                         out.dof = eval_camera_dof(cam, &node_env);
                     }
-                    let zoom = eval_f32(&cam.zoom, &node_env).max(1e-4);
-                    let fov_deg = match cam.kind {
-                        CameraKind::Perspective => {
-                            let fov_rad =
-                                eval_f32(&cam.fov, &node_env).clamp(1.0, 179.0).to_radians();
-                            let effective_fov = (2.0 * ((fov_rad * 0.5).tan() / zoom).atan())
-                                .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians());
-                            effective_fov.to_degrees()
-                        }
-                        CameraKind::Orthographic => 0.0,
-                    };
                     let aspect = out.viewport_dims[0].max(1.0) / out.viewport_dims[1].max(1.0);
+                    let fov_deg = eval_camera_effective_fov_deg(cam, aspect, &node_env);
                     let near = (cam.near as f32).max(1e-4);
                     let far = (cam.far as f32).max(near + 1.0);
                     out.camera_helpers.push(CollectedCameraHelper {
@@ -2956,7 +3115,32 @@ impl ProjectRenderEngine {
                                 self_world: self_world_tf,
                             };
 
-                            let readers: Vec<SceneEtPropReader<'_>> = et_layers_owned
+                            // Honor `randomAnimationSpeed > 0` across frames even when `randomMode`
+                            // stays at its static default (0 = Random), by switching effective mode
+                            // to smooth continuous Noise (2) while `randomAnimationSpeed > 0`.
+                            let mut et_layers_effective = et_layers_owned;
+                            for layer in &mut et_layers_effective {
+                                if layer.kind == ExpressTextEffectorKind::Random {
+                                    let speed = layer
+                                        .props
+                                        .get("randomAnimationSpeed")
+                                        .map_or(0.0, |tr| eval_f64(tr, &node_env));
+                                    let mode = layer
+                                        .props
+                                        .get("randomMode")
+                                        .map_or(0.0, |tr| eval_f64(tr, &node_env))
+                                        .round()
+                                        as i32;
+                                    if speed > 0.0 && mode != 2 && mode != 3 {
+                                        layer.props.insert(
+                                            "randomMode".to_owned(),
+                                            PropertyTrack::number(2.0),
+                                        );
+                                    }
+                                }
+                            }
+
+                            let readers: Vec<SceneEtPropReader<'_>> = et_layers_effective
                                 .iter()
                                 .map(|layer| SceneEtPropReader {
                                     base_env: &node_env,
@@ -2964,7 +3148,7 @@ impl ProjectRenderEngine {
                                     props: &layer.props,
                                 })
                                 .collect();
-                            let et_layers: Vec<ExpressTextLayer<'_>> = et_layers_owned
+                            let et_layers: Vec<ExpressTextLayer<'_>> = et_layers_effective
                                 .iter()
                                 .zip(readers.iter())
                                 .map(|(layer, reader)| ExpressTextLayer {
@@ -2988,14 +3172,27 @@ impl ProjectRenderEngine {
                                 if g_kind == TextPlus3DGroupKind::CharacterMaterial {
                                     let g_obj = eval_graph.nodes[g_idx].obj;
                                     let g_env = env.with_object(g_obj.id);
-                                    let sel_raw = eval_obj_str(
+                                    let sel = match eval_obj_str(
                                         g_obj,
                                         &["characterNumbers", "characters"],
                                         &g_env,
-                                    )
-                                    .unwrap_or_else(|| "1".to_owned());
-                                    let sel =
-                                        parse_character_selection(&sel_raw, char_meshes.len());
+                                    ) {
+                                        Some(raw) => {
+                                            let trimmed = raw.trim();
+                                            if trimmed.is_empty()
+                                                || trimmed == "*"
+                                                || trimmed.eq_ignore_ascii_case("all")
+                                            {
+                                                (0..char_meshes.len()).collect()
+                                            } else {
+                                                parse_character_selection(
+                                                    trimmed,
+                                                    char_meshes.len(),
+                                                )
+                                            }
+                                        }
+                                        None => (0..char_meshes.len()).collect(),
+                                    };
                                     let gm =
                                         self.evaluate_material(g_obj.material.as_ref(), &g_env);
                                     let gsm = self.evaluate_object_slot_materials(g_obj, &g_env);
@@ -3076,12 +3273,15 @@ impl ProjectRenderEngine {
                                 }
 
                                 // 3. ExpressText+ Voronoi shatter effector (`shatter_glyph_triangles` + `apply_chunk_pose_to_positions`).
+                                // Keep the glyph completely intact when `distance == 0 && scatter == 0`.
                                 let mut ch_mesh = apply_object_effectors(ch.mesh, obj, &node_env);
                                 let mut et_voronoi_applied = false;
                                 if !et_layers.is_empty()
                                     && let Some(vparams) = evaluate_expresstext_voronoi_params(
                                         &et_layers, env.frame, eff_idx, &list, base_local,
                                     )
+                                    && (vparams.distance.abs() > 1e-5
+                                        || vparams.scatter.abs() > 1e-5)
                                 {
                                     let shattered =
                                         shatter_mesh_data_expresstext(&ch_mesh, &vparams);
@@ -3526,20 +3726,22 @@ impl ProjectRenderEngine {
                 let velocity = eval_obj_f32(obj, &["velocity"], 12.0, env);
                 let gravity = eval_obj_f32(obj, &["gravity"], -4.0, env);
                 let spread = eval_obj_vec3(obj, &["emitterSize", "spread"], Vec3::splat(6.0), env);
+                let sprite_name = eval_obj_str(obj, &["spritePreset", "sprite"], env)
+                    .unwrap_or_else(|| "circle_soft".to_owned());
                 let params = ParticleSystemParams {
                     count,
                     rate,
                     lifetime,
                     position_dist: PositionDistribution::Sphere,
                     origin: Vec3::ZERO,
-                    position_spread: spread,
-                    radius: spread.length() * 0.25,
-                    radius_spread: spread.length() * 0.25,
+                    position_spread: spread * 1.5,
+                    radius: spread.length() * 0.55,
+                    radius_spread: spread.length() * 0.45,
                     velocity_dist: VelocityDistribution::Sphere,
                     velocity: Vec3::new(0.0, velocity * 0.25, 0.0),
-                    velocity_spread: Vec3::splat(velocity * 0.5),
+                    velocity_spread: Vec3::splat(velocity * 0.55),
                     radial_velocity: velocity,
-                    radial_velocity_spread: velocity * 0.35,
+                    radial_velocity_spread: velocity * 0.4,
                     gravity: Vec3::new(0.0, gravity, 0.0),
                     blending: ParticleBlending::Add,
                     color_gradient: vec![
@@ -3552,36 +3754,44 @@ impl ProjectRenderEngine {
                             color: [color[0], color[1], color[2], 0.0],
                         },
                     ],
+                    // Keep LUT size normalized in [0, 1] so `size` scales billboards cleanly
+                    // without saturating the RGBA8 LUT or blowing out to screen-filling white blobs.
                     size_gradient: vec![
                         ParticleGradientStop {
                             position: 0.0,
-                            color: [size, size, size, 1.0],
+                            color: [1.0, 1.0, 1.0, 1.0],
                         },
                         ParticleGradientStop {
                             position: 1.0,
-                            color: [size * 0.3, size * 0.3, size * 0.3, 1.0],
+                            color: [0.3, 0.3, 0.3, 1.0],
                         },
                     ],
                     ..ParticleSystemParams::default()
                 };
-                let sim_t = t + (seed.unsigned_abs() % 17) as f32 * 0.07;
+                // Pre-warm emitter by 0.6 * lifetime so frame 0 already displays a dispersed 3D particle cloud.
+                let sim_t = t + lifetime * 0.6 + (seed.unsigned_abs() % 17) as f32 * 0.07;
                 let eval_list = evaluate_particles_cm3_lut(sim_t, &params, false);
                 let mut instances = Vec::with_capacity(eval_list.len());
+                // Convert Particular point-size units (`default = 3.0`) to CM3 point-sprite scale (~48px at 1280px, dist=100)
+                // and moderate additive alpha so overlapping particles stay crisp & colorful rather than pure white.
+                let size_factor = (size * 0.025).clamp(0.004, 0.35);
                 for p in eval_list {
                     if !p.alive || p.size <= 0.0 {
                         continue;
                     }
                     let wp = world.transform_point3(Vec3::from_array(p.position));
-                    let a = p.color[3].clamp(0.0, 1.0);
+                    let a = (p.color[3].clamp(0.0, 1.0) * 0.65).clamp(0.0, 1.0);
                     instances.push(RenderParticleInstance {
                         position: wp.to_array(),
-                        size: (p.size * world_scale).max(1e-4),
+                        size: (p.size * size_factor * world_scale).max(1e-4),
                         rotation: p.angle,
                         color: [p.color[0] * a, p.color[1] * a, p.color[2] * a, a],
                     });
                 }
                 if !instances.is_empty() {
-                    let sprite = self.ensure_particle_sprite_preset_texture("circle_soft");
+                    let sprite = self
+                        .ensure_particle_sprite_preset_texture(&sprite_name)
+                        .or_else(|| self.ensure_particle_sprite_preset_texture("circle_soft"));
                     out.particles.push(PreparedParticlesSpec {
                         instances,
                         sprite,
@@ -4173,8 +4383,10 @@ impl ProjectRenderEngine {
                     ao_map,
                     env_map,
                     custom_shader_key: None,
+                    custom_shader_is_glsl: false,
                     custom_params_a: [0.0; 4],
                     custom_params_b: [0.0; 4],
+                    custom_glsl_uniforms: BTreeMap::new(),
                 }
             }
             MaterialSpec::Matcap(m) => {
@@ -4232,10 +4444,22 @@ impl ProjectRenderEngine {
                 resolution, graph, ..
             } => {
                 let bake_res = (*resolution).clamp(32, 1024);
-                let mut h = fnv1a_hash64(b"node_material_v1");
+                let unwrapped = unwrap_node_material_graph(graph);
+                let (sanitized_graph, direct_asset_slots) =
+                    prepare_node_material_graph_with_assets(&unwrapped, env.project);
+                let mut h = fnv1a_hash64(b"node_material_v2");
                 h = hash_u64(h, u64::from(bake_res));
-                if let Ok(bytes) = serde_json::to_vec(graph) {
+                if let Ok(bytes) = serde_json::to_vec(&sanitized_graph) {
                     h = hash_u64(h, fnv1a_hash64(&bytes));
+                }
+                for (slot_name, asset_id) in &direct_asset_slots {
+                    h = hash_u64(h, fnv1a_hash64(slot_name.as_bytes()));
+                    h = hash_u64(h, fnv1a_hash64(asset_id.as_bytes()));
+                    if let Some(rec) = env.project.assets.get(asset_id)
+                        && let Some(bytes) = rec.bytes.as_deref()
+                    {
+                        h = hash_u64(h, fnv1a_hash64(bytes));
+                    }
                 }
                 if let Some(entry) = self.node_material_cache.get_mut(&h) {
                     self.cache_tick = self.cache_tick.wrapping_add(1);
@@ -4243,7 +4467,13 @@ impl ProjectRenderEngine {
                     return entry.eval.clone();
                 }
 
-                let eval = match bake_node_material_maps(graph, bake_res) {
+                let resolve_direct_tex =
+                    |engine: &mut Self, slot_name: &str| -> Option<Arc<RenderTarget>> {
+                        let asset_id = direct_asset_slots.get(slot_name)?;
+                        engine.ensure_image_asset_texture(env.project, asset_id, false)
+                    };
+
+                let eval = match bake_node_material_maps(&sanitized_graph, bake_res) {
                     Ok(baked) => {
                         let upload_baked = |engine: &mut Self,
                                             chan: &str,
@@ -4269,14 +4499,18 @@ impl ProjectRenderEngine {
                                 .ok()?;
                             Some(engine.insert_cached_texture(key, tex))
                         };
-                        let albedo = upload_baked(self, "color", baked.color.as_ref());
-                        let emissive_map = upload_baked(self, "emissive", baked.emissive.as_ref());
-                        let roughness_map =
-                            upload_baked(self, "roughness", baked.roughness.as_ref());
-                        let metalness_map =
-                            upload_baked(self, "metalness", baked.metalness.as_ref());
-                        let normal = upload_baked(self, "normal", baked.normal.as_ref());
-                        let alpha_map = upload_baked(self, "opacity", baked.opacity.as_ref());
+                        let albedo = resolve_direct_tex(self, "color")
+                            .or_else(|| upload_baked(self, "color", baked.color.as_ref()));
+                        let emissive_map = resolve_direct_tex(self, "emissive")
+                            .or_else(|| upload_baked(self, "emissive", baked.emissive.as_ref()));
+                        let roughness_map = resolve_direct_tex(self, "roughness")
+                            .or_else(|| upload_baked(self, "roughness", baked.roughness.as_ref()));
+                        let metalness_map = resolve_direct_tex(self, "metalness")
+                            .or_else(|| upload_baked(self, "metalness", baked.metalness.as_ref()));
+                        let normal = resolve_direct_tex(self, "normal")
+                            .or_else(|| upload_baked(self, "normal", baked.normal.as_ref()));
+                        let alpha_map = resolve_direct_tex(self, "opacity")
+                            .or_else(|| upload_baked(self, "opacity", baked.opacity.as_ref()));
 
                         let has_alpha_map = alpha_map.is_some();
                         let opacity_factor = baked.opacity_factor.clamp(0.0, 1.0);
@@ -4329,8 +4563,10 @@ impl ProjectRenderEngine {
                             ao_map: None,
                             env_map: None,
                             custom_shader_key: None,
+                            custom_shader_is_glsl: false,
                             custom_params_a: [0.0; 4],
                             custom_params_b: [0.0; 4],
+                            custom_glsl_uniforms: BTreeMap::new(),
                         }
                     }
                     Err(err) => {
@@ -4367,22 +4603,46 @@ impl ProjectRenderEngine {
             } => {
                 let mut params_a = [1.0_f32, 1.0, 1.0, 1.0];
                 let mut params_b = [0.0_f32; 4];
+                let mut glsl_uniforms: BTreeMap<String, UniformValue> = BTreeMap::new();
                 let mut slot = 0usize;
                 for cp in custom_properties {
                     let val = eval_property_track(&cp.track, env);
-                    let vals: Vec<f32> = match val {
-                        PropertyValue::Number(v) => vec![v as f32],
-                        PropertyValue::Vec2(v) => vec![v[0] as f32, v[1] as f32],
-                        PropertyValue::Vec3(v) | PropertyValue::Color(v) => {
-                            vec![v[0] as f32, v[1] as f32, v[2] as f32]
+                    let (vals, uval): (Vec<f32>, Option<UniformValue>) = match val {
+                        PropertyValue::Number(v) => {
+                            (vec![v as f32], Some(UniformValue::Float(v as f32)))
                         }
-                        PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) => {
-                            vec![v[0] as f32, v[1] as f32, v[2] as f32, v[3] as f32]
+                        PropertyValue::Vec2(v) => (
+                            vec![v[0] as f32, v[1] as f32],
+                            Some(UniformValue::Vec2([v[0] as f32, v[1] as f32])),
+                        ),
+                        PropertyValue::Vec3(v) | PropertyValue::Color(v) => (
+                            vec![v[0] as f32, v[1] as f32, v[2] as f32],
+                            Some(UniformValue::Vec3([v[0] as f32, v[1] as f32, v[2] as f32])),
+                        ),
+                        PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) => (
+                            vec![v[0] as f32, v[1] as f32, v[2] as f32, v[3] as f32],
+                            Some(UniformValue::Vec4([
+                                v[0] as f32,
+                                v[1] as f32,
+                                v[2] as f32,
+                                v[3] as f32,
+                            ])),
+                        ),
+                        PropertyValue::Bool(b) => {
+                            (vec![if b { 1.0 } else { 0.0 }], Some(UniformValue::Bool(b)))
                         }
-                        PropertyValue::Bool(b) => vec![if b { 1.0 } else { 0.0 }],
-                        PropertyValue::Option(o) => vec![o as f32],
-                        _ => Vec::new(),
+                        PropertyValue::Option(o) => {
+                            (vec![o as f32], Some(UniformValue::Int(o as i32)))
+                        }
+                        _ => (Vec::new(), None),
                     };
+                    if let Some(uv) = uval {
+                        glsl_uniforms.insert(cp.name.clone(), uv.clone());
+                        let fixed = fix_property_name(&cp.name);
+                        if fixed != cp.name {
+                            glsl_uniforms.insert(fixed, uv);
+                        }
+                    }
                     for v in vals {
                         if slot < 4 {
                             params_a[slot] = v;
@@ -4392,39 +4652,77 @@ impl ProjectRenderEngine {
                         slot += 1;
                     }
                 }
-                let wgsl_body: Cow<'_, str> = if frag_shader.contains("fn custom_material_fs") {
-                    Cow::Borrowed(frag_shader.as_str())
-                } else {
-                    // Fallback WGSL body for non-WGSL 3D CustomShader materials so they still render distinctly.
-                    Cow::Borrowed(
-                        "fn custom_material_fs(world_pos: vec3<f32>, world_normal: vec3<f32>, uv: vec2<f32>, vertex_color: vec4<f32>, camera_pos: vec3<f32>, time: f32, params_a: vec4<f32>, params_b: vec4<f32>) -> vec4<f32> {\n    let n = normalize(world_normal);\n    let v = normalize(camera_pos - world_pos);\n    let ndotv = max(dot(n, v), 0.15);\n    let col = clamp(params_a.rgb * ndotv * vertex_color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return vec4<f32>(col, clamp(params_a.a * vertex_color.a, 0.0, 1.0));\n}",
-                    )
-                };
-                let key = format!("custom3d:{:016x}", fnv1a_hash64(wgsl_body.as_bytes()));
-                if !self.registered_custom_3d_materials.contains(&key) {
-                    match self
-                        .scene3d
-                        .register_custom_material_shader(&self.ctx, &key, &wgsl_body)
-                    {
-                        Ok(()) => {
-                            self.registered_custom_3d_materials.insert(key.clone());
-                        }
-                        Err(err) => {
-                            warn!(shader_key = %key, error = %err, "failed to register 3D CustomShader material");
-                            return EvaluatedMaterial::default();
+                if frag_shader.contains("fn custom_material_fs") {
+                    let key = format!("custom3d:{:016x}", fnv1a_hash64(frag_shader.as_bytes()));
+                    if !self.registered_custom_3d_materials.contains(&key) {
+                        match self.scene3d.register_custom_material_shader(
+                            &self.ctx,
+                            &key,
+                            frag_shader,
+                        ) {
+                            Ok(()) => {
+                                self.registered_custom_3d_materials.insert(key.clone());
+                            }
+                            Err(err) => {
+                                warn!(shader_key = %key, error = %err, "failed to register 3D WGSL CustomShader material");
+                                return EvaluatedMaterial::default();
+                            }
                         }
                     }
-                }
-                EvaluatedMaterial {
-                    params: MaterialParams {
-                        side: CullSide::Front,
-                        blend: MaterialBlend::Opaque,
+                    EvaluatedMaterial {
+                        params: MaterialParams {
+                            side: CullSide::Front,
+                            blend: MaterialBlend::Opaque,
+                            ..Default::default()
+                        },
+                        custom_shader_key: Some(key),
+                        custom_shader_is_glsl: false,
+                        custom_params_a: params_a,
+                        custom_params_b: params_b,
+                        custom_glsl_uniforms: BTreeMap::new(),
                         ..Default::default()
-                    },
-                    custom_shader_key: Some(key),
-                    custom_params_a: params_a,
-                    custom_params_b: params_b,
-                    ..Default::default()
+                    }
+                } else {
+                    // GLSL ES 1.00 3D custom fragment shader path (via `zc-shader` transpiler).
+                    let prepared_glsl = prepare_glsl_3d_material_source(frag_shader);
+                    let key = format!(
+                        "custom3d_glsl:{:016x}",
+                        fnv1a_hash64(prepared_glsl.as_bytes())
+                    );
+                    if !self.registered_custom_3d_materials.contains(&key) {
+                        match zc_shader::translate_glsl_es100(&prepared_glsl) {
+                            Ok(compiled) => {
+                                match self.scene3d.register_glsl_custom_material_shader(
+                                    &self.ctx, &key, &compiled,
+                                ) {
+                                    Ok(()) => {
+                                        self.registered_custom_3d_materials.insert(key.clone());
+                                    }
+                                    Err(err) => {
+                                        warn!(shader_key = %key, error = %err, "failed to register 3D GLSL CustomShader material pipeline");
+                                        return EvaluatedMaterial::default();
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                warn!(shader_key = %key, error = %err, "failed to translate 3D GLSL CustomShader material");
+                                return EvaluatedMaterial::default();
+                            }
+                        }
+                    }
+                    EvaluatedMaterial {
+                        params: MaterialParams {
+                            side: CullSide::Front,
+                            blend: MaterialBlend::Opaque,
+                            ..Default::default()
+                        },
+                        custom_shader_key: Some(key),
+                        custom_shader_is_glsl: true,
+                        custom_params_a: params_a,
+                        custom_params_b: params_b,
+                        custom_glsl_uniforms: glsl_uniforms,
+                        ..Default::default()
+                    }
                 }
             }
             MaterialSpec::Unknown { .. } => EvaluatedMaterial::default(),
@@ -4746,6 +5044,7 @@ impl ProjectRenderEngine {
         font: Option<&str>,
         size: u32,
         shapes: &[Shape2DNode],
+        text_align: TextAlignMode,
         text_plus_2d: Option<&serde_json::Value>,
         env: &EvalEnv<'_>,
         width: u32,
@@ -4770,7 +5069,16 @@ impl ProjectRenderEngine {
             .iter()
             .any(|op| matches!(op, EvalPaintOp::Stroke(_, w) if *w > 0.0));
         let text_transform = extract_primary_shape_transform(shapes, env);
-        let font_bytes = resolve_font_bytes(env.project, font);
+        let resolved_font = resolve_font_bytes(env.project, font);
+        let primary_bytes = resolved_font
+            .as_ref()
+            .map_or(DEFAULT_TTF_FONT_BYTES, ResolvedFont::as_slice);
+        let cjk_fallback = if font_has_missing_glyphs(primary_bytes, text) {
+            resolve_system_cjk_fallback_font()
+        } else {
+            None
+        };
+        let fallback_slice = cjk_fallback.as_deref();
 
         // Text+ 2D (`zoidiumTextPlus2D`) per-character transform path!
         if let Some(tp_json) = text_plus_2d {
@@ -4783,26 +5091,33 @@ impl ProjectRenderEngine {
                 bevel_thickness: 0.0,
                 bevel_size: 0.0,
                 bevel_segments: 1,
-                align: TextAlignMode::Center,
+                align: text_align,
                 uv_mode: UvMode::Current,
                 letter_spacing: 0.0,
                 line_height: 1.2,
             };
             let ext_opts = Text3DExtendedOptions::default();
-            let char_meshes = font_bytes
-                .and_then(|b| build_text3d_character_meshes(b, &params, &ext_opts, Vec3::ONE).ok())
+            let char_meshes = zc_scene::build_text3d_character_meshes_with_fallback(
+                primary_bytes,
+                fallback_slice,
+                &params,
+                &ext_opts,
+                Vec3::ONE,
+            )
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                zc_scene::build_text3d_character_meshes_with_fallback(
+                    DEFAULT_TTF_FONT_BYTES,
+                    fallback_slice,
+                    &params,
+                    &ext_opts,
+                    Vec3::ONE,
+                )
+                .ok()
                 .filter(|v| !v.is_empty())
-                .or_else(|| {
-                    build_text3d_character_meshes(
-                        DEFAULT_TTF_FONT_BYTES,
-                        &params,
-                        &ext_opts,
-                        Vec3::ONE,
-                    )
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                })
-                .unwrap_or_default();
+            })
+            .unwrap_or_default();
             if !char_meshes.is_empty() {
                 let expr_cb = |expr_src: &str, f: f64| -> Option<f64> {
                     eval_scalar_expr_at_frame(expr_src, env, f)
@@ -4853,8 +5168,14 @@ impl ProjectRenderEngine {
                             * Mat4::from_scale(Vec3::new(ct.scale[0], ct.scale[1], 1.0))
                             * Mat4::from_translation(ch.mesh_offset)
                             * Mat4::from_scale(ch.mesh_scale);
-                        let mut mh = fnv1a_hash64(b"text2d_tp_char_v1");
+                        let mut mh = fnv1a_hash64(b"text2d_tp_char_v2");
                         mh = hash_u64(mh, fnv1a_hash64(text.as_bytes()));
+                        if let Some(f) = font {
+                            mh = hash_u64(mh, fnv1a_hash64(f.as_bytes()));
+                            if let Some(rec) = env.project.assets.get(f) {
+                                mh = hash_u64(mh, hash_asset_record(rec));
+                            }
+                        }
                         mh = hash_u64(mh, u64::from(px_size.to_bits()));
                         mh = hash_u64(mh, ci as u64);
                         let key = MeshCacheKey {
@@ -4946,7 +5267,7 @@ impl ProjectRenderEngine {
             }
         }
 
-        let mut h = fnv1a_hash64(b"text_2d_v2");
+        let mut h = fnv1a_hash64(b"text_2d_v3");
         h = hash_u64(h, fnv1a_hash64(text.as_bytes()));
         if let Some(f) = font {
             h = hash_u64(h, fnv1a_hash64(f.as_bytes()));
@@ -4956,6 +5277,7 @@ impl ProjectRenderEngine {
         }
         h = hash_u64(h, u64::from(px_size.to_bits()));
         h = hash_u64(h, u64::from(curve_segments));
+        h = hash_u64(h, u64::from(text_align as u32));
         let mesh_key = MeshCacheKey {
             object_id: layer_id,
             content_hash: h,
@@ -4973,20 +5295,27 @@ impl ProjectRenderEngine {
                 bevel_thickness: 0.0,
                 bevel_size: 0.0,
                 bevel_segments: 1,
-                align: TextAlignMode::Center,
+                align: text_align,
                 uv_mode: UvMode::Current,
                 letter_spacing: 0.0,
                 line_height: 1.2,
             };
-            let mesh = font_bytes
-                .and_then(|bytes| build_text3d_mesh(bytes, &params).ok())
-                .filter(|m| !m.indices.is_empty())
-                .or_else(|| {
-                    build_text3d_mesh(DEFAULT_TTF_FONT_BYTES, &params)
+            let ext_opts = Text3DExtendedOptions::default();
+            let mesh =
+                build_text3d_mesh_with_fallback(primary_bytes, fallback_slice, &params, &ext_opts)
+                    .ok()
+                    .filter(|m| !m.indices.is_empty())
+                    .or_else(|| {
+                        build_text3d_mesh_with_fallback(
+                            DEFAULT_TTF_FONT_BYTES,
+                            fallback_slice,
+                            &params,
+                            &ext_opts,
+                        )
                         .ok()
                         .filter(|m| !m.indices.is_empty())
-                })
-                .unwrap_or_else(|| build_fallback_text_mesh(&params));
+                    })
+                    .unwrap_or_else(|| build_fallback_text_mesh(&params));
             if mesh.indices.is_empty() {
                 None
             } else {
@@ -5752,9 +6081,7 @@ impl ProjectRenderEngine {
         // P7 P0-8: Re-evaluate the clip's `time_curve` at `sample_frame` instead of
         // assuming linear `env.time + frame_offset / fps`!
         let sample_time = if let Some(tc) = tctx.time_curve {
-            let raw_t = eval_track_keyframes_only(tc, sample_frame)
-                .as_f64()
-                .unwrap_or(sample_frame / fps);
+            let raw_t = eval_clip_time_curve_raw(tc, sample_frame, fps);
             let time_env = EvalEnv {
                 frame: sample_frame,
                 abs_frame: sample_abs_frame,
@@ -5762,7 +6089,7 @@ impl ProjectRenderEngine {
                 fps,
                 ..env.clone()
             };
-            eval_f64(tc, &time_env)
+            eval_clip_time_with_env(tc, &time_env)
         } else {
             env.time + frame_offset / fps
         };
@@ -5891,6 +6218,25 @@ impl ProjectRenderEngine {
             [width as f32, height as f32],
             env.time as f32,
             env.frame as f32,
+        );
+        reg_params.set(
+            "_absTime",
+            RegParamValue::Float((env.abs_frame / env.fps.max(1.0)) as f32),
+        );
+        if canonical_id == "beam"
+            && param_tracks
+                .get("time")
+                .and_then(|t| t.expression.as_deref())
+                .is_some()
+        {
+            reg_params.set("_timeIsSeconds", RegParamValue::Bool(true));
+        }
+        reg_params.set(
+            "_sequenceResolution",
+            RegParamValue::Vec2([
+                env.sequence_resolution[0].max(1) as f32,
+                env.sequence_resolution[1].max(1) as f32,
+            ]),
         );
         let mut aux_tex: Option<Arc<RenderTarget>> = None;
         let mut source_image_asset: Option<String> = None;
@@ -6798,14 +7144,26 @@ impl ProjectRenderEngine {
         if matches!(effect_id, "timeremap" | "time-remap")
             && let Some(tctx) = temporal_ctx.as_deref_mut()
         {
+            // Zoidium `remap` option (0 = off / bypass, 1 = enabled).
+            if matches!(
+                reg_params.values.get("remap"),
+                Some(RegParamValue::Int(0) | RegParamValue::Bool(false))
+            ) {
+                return Ok(source);
+            }
             let fps = env.fps.max(1.0);
             let mode = reg_params.int_or("mode", 0);
+            let remap_is_float = matches!(
+                reg_params.values.get("remap"),
+                Some(RegParamValue::Float(_))
+            );
             let has_direct_time = mode == 1
-                || reg_params.values.contains_key("sourceTime")
-                || reg_params.values.contains_key("remap")
-                || reg_params.values.contains_key("time");
+                || remap_is_float
+                || (!reg_params.values.contains_key("mode")
+                    && (reg_params.values.contains_key("sourceTime")
+                        || reg_params.values.contains_key("time")));
             let target_frame = if has_direct_time {
-                let src_time = if reg_params.values.contains_key("remap") {
+                let src_time = if remap_is_float {
                     f64::from(reg_params.float_or("remap", env.time as f32))
                 } else if reg_params.values.contains_key("sourceTime") {
                     f64::from(reg_params.float_or("sourceTime", env.time as f32))
@@ -6818,14 +7176,14 @@ impl ProjectRenderEngine {
                     || speed_track.expression.is_some()
                     || !speed_track.keyframes.is_empty())
             {
-                // Trapezoidal integration of animated `speed(f) / 100.0` across `[0..env.frame]`.
+                // Trapezoidal integration of animated `speed(f)` multiplier across `[0..env.frame]`.
                 let end_f = env.frame.max(0.0);
                 let steps = (end_f.ceil() as usize).clamp(1, 2000);
                 let df = end_f / (steps as f64);
                 let mut acc = 0.0_f64;
                 let eval_sp = |f: f64| -> f64 {
                     let e = env_at_frame(env, f);
-                    eval_f64(speed_track, &e) / 100.0
+                    eval_f64(speed_track, &e)
                 };
                 let mut prev_s = eval_sp(0.0);
                 for i in 1..=steps {
@@ -6835,7 +7193,7 @@ impl ProjectRenderEngine {
                 }
                 acc
             } else {
-                let speed = f64::from(reg_params.float_or("speed", 100.0)) / 100.0;
+                let speed = f64::from(reg_params.float_or("speed", 1.0));
                 env.frame * speed
             };
             if !target_frame.is_finite() {
@@ -8206,8 +8564,16 @@ impl ProjectRenderEngine {
             .limits()
             .max_texture_dimension_2d
             .clamp(16, 2048);
-        let font_bytes =
-            resolve_font_bytes(env.project, opts.font.as_deref()).unwrap_or(DEFAULT_TTF_FONT_BYTES);
+        let resolved_font = resolve_font_bytes(env.project, opts.font.as_deref());
+        let font_bytes = resolved_font
+            .as_ref()
+            .map_or(DEFAULT_TTF_FONT_BYTES, ResolvedFont::as_slice);
+        let cjk_fallback = if font_has_missing_glyphs(font_bytes, &opts.text) {
+            resolve_system_cjk_fallback_font()
+        } else {
+            None
+        };
+        let fallback_slice = cjk_fallback.as_deref();
 
         let build_glyph_mesh = |text: &str,
                                 height: f32,
@@ -8230,13 +8596,19 @@ impl ProjectRenderEngine {
                 letter_spacing,
                 line_height,
             };
-            build_text3d_mesh(font_bytes, &params)
+            let ext_opts = Text3DExtendedOptions::default();
+            build_text3d_mesh_with_fallback(font_bytes, fallback_slice, &params, &ext_opts)
                 .ok()
                 .filter(|m| !m.indices.is_empty())
                 .or_else(|| {
-                    build_text3d_mesh(DEFAULT_TTF_FONT_BYTES, &params)
-                        .ok()
-                        .filter(|m| !m.indices.is_empty())
+                    build_text3d_mesh_with_fallback(
+                        DEFAULT_TTF_FONT_BYTES,
+                        fallback_slice,
+                        &params,
+                        &ext_opts,
+                    )
+                    .ok()
+                    .filter(|m| !m.indices.is_empty())
                 })
                 .unwrap_or_else(|| build_fallback_text_mesh(&params))
         };
@@ -8554,8 +8926,10 @@ struct PreparedCustomMaterialMesh {
     side: CullSide,
     blend: MaterialBlend,
     shader_key: String,
+    is_glsl: bool,
     params_a: [f32; 4],
     params_b: [f32; 4],
+    glsl_uniforms: BTreeMap<String, UniformValue>,
 }
 
 struct CollectedOpticalFlare {
@@ -8612,8 +8986,10 @@ struct EvaluatedMaterial {
     ao_map: Option<Arc<RenderTarget>>,
     env_map: Option<Arc<RenderTarget>>,
     custom_shader_key: Option<String>,
+    custom_shader_is_glsl: bool,
     custom_params_a: [f32; 4],
     custom_params_b: [f32; 4],
+    custom_glsl_uniforms: BTreeMap<String, UniformValue>,
 }
 
 struct CollectedCameraHelper {
@@ -9178,7 +9554,6 @@ fn evaluate_active_camera_layer(
                             node.world_mat,
                             &obj_env,
                             viewport_dims,
-                            true,
                         ));
                     }
                 }
@@ -9210,7 +9585,6 @@ fn evaluate_active_camera_layer(
                 world,
                 &layer_env,
                 viewport_dims,
-                true,
             ));
         }
     }
@@ -9854,8 +10228,7 @@ fn build_camera_params_from_node(
         euler_order,
     };
     let base_world = parent_world * local_tf.to_matrix();
-    let is_camera_plus = is_camera_plus_object(obj, env.plugins);
-    build_camera_params_without_vibrate(cam, base_world, env, viewport_dims, is_camera_plus)
+    build_camera_params_without_vibrate(cam, base_world, env, viewport_dims)
 }
 
 fn is_camera_plus_object(obj: &Object3D, plugins: &PluginRegistry) -> bool {
@@ -9916,10 +10289,33 @@ fn build_camera_params_without_vibrate(
     base_world: Mat4,
     env: &EvalEnv<'_>,
     viewport_dims: [f32; 2],
-    is_camera_plus: bool,
 ) -> CameraParams {
     let world = base_world * eval_camera_shake_matrix(cam, env);
-    build_camera_params_from_world(cam, world, env, viewport_dims, is_camera_plus)
+    build_camera_params_from_world(cam, world, env, viewport_dims)
+}
+
+fn eval_camera_effective_fov_deg(
+    cam: &zc_project::CameraData,
+    aspect: f32,
+    env: &EvalEnv<'_>,
+) -> f32 {
+    match cam.kind {
+        CameraKind::Perspective => {
+            if env.plugins.is_enabled("camera-plus") {
+                let zoom = eval_f32(&cam.zoom, env).max(1e-4);
+                let focal_length = eval_f32(&cam.focal_length, env).max(1e-3);
+                let film_gate = (cam.film_gate as f32).max(1e-3);
+                let film_height = film_gate / aspect.max(1.0);
+                let half_tan = (film_height * 0.5) / focal_length / zoom;
+                (2.0 * half_tan.atan())
+                    .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians())
+                    .to_degrees()
+            } else {
+                eval_f32(&cam.fov, env).clamp(1.0, 179.0)
+            }
+        }
+        CameraKind::Orthographic => 0.0,
+    }
 }
 
 fn build_camera_params_from_world(
@@ -9927,7 +10323,6 @@ fn build_camera_params_from_world(
     world: Mat4,
     env: &EvalEnv<'_>,
     viewport_dims: [f32; 2],
-    is_camera_plus: bool,
 ) -> CameraParams {
     let view_mat = if world.determinant().abs() > 1e-10 {
         world.inverse()
@@ -9955,27 +10350,58 @@ fn build_camera_params_from_world(
     let view = view_mat.to_cols_array_2d();
     let eye_position = world.w_axis.truncate().to_array();
 
-    let zoom = eval_f32(&cam.zoom, env).max(1e-4);
-    let near = (cam.near as f32).max(1e-4);
-    let far = (cam.far as f32).max(near + 1.0);
+    let camera_plus_enabled = env.plugins.is_enabled("camera-plus");
+    let zoom = if camera_plus_enabled {
+        eval_f32(&cam.zoom, env).max(1e-4)
+    } else {
+        1.0
+    };
+    let raw_near = cam.near as f32;
+    let raw_far = cam.far as f32;
+    let (near, far) = if !raw_near.is_finite()
+        || !raw_far.is_finite()
+        || raw_near <= 0.0
+        || raw_far <= raw_near
+    {
+        warn!(
+            raw_near,
+            raw_far, "clamping singular/invalid camera near/far clip planes"
+        );
+        let n = if raw_near.is_finite() {
+            raw_near.max(1e-4)
+        } else {
+            0.1
+        };
+        let f = if raw_far.is_finite() {
+            raw_far.max(n + 1.0)
+        } else {
+            (n + 5000.0).max(n + 1.0)
+        };
+        (n, f)
+    } else {
+        (raw_near, raw_far)
+    };
     let w = viewport_dims[0].max(1.0);
     let h = viewport_dims[1].max(1.0);
     let aspect = w / h;
-    let film_offset_x = eval_f32(&cam.film_offset_x, env);
-    let film_offset_y = eval_f32(&cam.film_offset_y, env);
+    let film_offset_x = if camera_plus_enabled {
+        eval_f32(&cam.film_offset_x, env)
+    } else {
+        0.0
+    };
+    let film_offset_y = if camera_plus_enabled {
+        eval_f32(&cam.film_offset_y, env)
+    } else {
+        0.0
+    };
 
     match cam.kind {
         CameraKind::Perspective => {
-            let focal_length = eval_f32(&cam.focal_length, env).max(1e-3);
-            let film_gate = (cam.film_gate as f32).max(1e-3);
-            let uses_film_gate = is_camera_plus
-                || (cam.film_gate - 36.0).abs() > 1e-4
-                || cam.focal_length.animated
-                || cam.focal_length.expression.is_some()
-                || cam.focal_length.keyframes.len() > 1
-                || (focal_length - 35.0).abs() > 1e-4;
-            let has_film_offset = film_offset_x.abs() > 1e-6 || film_offset_y.abs() > 1e-6;
-            if uses_film_gate {
+            if camera_plus_enabled {
+                // Single continuous physical lens projection across ALL focal lengths
+                // for both standard Camera and Camera+ objects (zero 35mm cliff, zero .pz shift).
+                let focal_length = eval_f32(&cam.focal_length, env).max(1e-3);
+                let film_gate = (cam.film_gate as f32).max(1e-3);
                 CameraParams::perspective_film_gate(
                     view,
                     eye_position,
@@ -9988,27 +10414,24 @@ fn build_camera_params_from_world(
                     near,
                     far,
                 )
-            } else if has_film_offset {
-                let fov_rad = eval_f32(&cam.fov, env).clamp(1.0, 179.0).to_radians();
-                let film_height = film_gate / aspect.max(1.0);
-                let equiv_focal = (film_height * 0.5) / (fov_rad * 0.5).tan().max(1e-5);
-                CameraParams::perspective_film_gate(
-                    view,
-                    eye_position,
-                    equiv_focal,
-                    film_gate,
-                    aspect,
-                    zoom,
-                    film_offset_x,
-                    film_offset_y,
-                    near,
-                    far,
-                )
             } else {
-                let fov_rad = eval_f32(&cam.fov, env).clamp(1.0, 179.0).to_radians();
-                let effective_fov = (2.0 * ((fov_rad * 0.5).tan() / zoom.max(1e-4)).atan())
-                    .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians());
-                let proj = mat4_perspective_rh(effective_fov, aspect, near, far);
+                // When `camera-plus` is disabled, strictly honor native `cam.fov` guarded to 1..=175 deg.
+                let raw_fov = eval_f32(&cam.fov, env);
+                let safe_fov_deg = if !raw_fov.is_finite() || !(1.0..=175.0).contains(&raw_fov) {
+                    warn!(
+                        raw_fov,
+                        "clamping singular/invalid perspective camera FOV to 1..=175 deg"
+                    );
+                    if raw_fov.is_finite() {
+                        raw_fov.clamp(1.0, 175.0)
+                    } else {
+                        45.0
+                    }
+                } else {
+                    raw_fov
+                };
+                let fov_rad = safe_fov_deg.to_radians();
+                let proj = mat4_perspective_rh(fov_rad, aspect, near, far);
                 CameraParams {
                     view,
                     proj,
@@ -10448,16 +10871,17 @@ impl<'a> EngineExprContext<'a> {
                     [res_w, res_h],
                 );
                 let view = Mat4::from_cols_array_2d(&params.view);
-                let zoom = eval_f32(&cam.zoom, &node_env).max(1e-4);
+                let zoom = if node_env.plugins.is_enabled("camera-plus") {
+                    eval_f32(&cam.zoom, &node_env).max(1e-4)
+                } else {
+                    1.0
+                };
                 let near = (cam.near as f32).max(1e-4);
                 let far = (cam.far as f32).max(near + 1.0);
                 // GL NDC depth [-1, +1] matching Zoidium `world.js:5-14`.
                 let proj_gl = match cam.kind {
                     CameraKind::Perspective => {
-                        let fov_rad = eval_f32(&cam.fov, &node_env).clamp(1.0, 179.0).to_radians();
-                        let eff_fov = (2.0 * ((fov_rad * 0.5).tan() / zoom).atan())
-                            .clamp(1.0_f32.to_radians(), 179.0_f32.to_radians())
-                            .to_degrees();
+                        let eff_fov = eval_camera_effective_fov_deg(cam, aspect, &node_env);
                         zc_geom::CameraProjection::Perspective {
                             fov_deg: eff_fov,
                             aspect,
@@ -11581,6 +12005,33 @@ fn eval_channel_tracks(track: &PropertyTrack, env: &EvalEnv<'_>) -> PropertyValu
     assemble_channel_value(&track.value, &comps)
 }
 
+/// Evaluates a clip's `time_curve` keyframes at `local_frame`, falling back to linear
+/// playback time `local_frame / fps` when the track is an unconfigured zero placeholder
+/// (`keyframes.is_empty() && expression.is_none() && value == 0.0`).
+fn eval_clip_time_curve_raw(tc: &PropertyTrack, local_frame: f64, fps: f64) -> f64 {
+    if tc.keyframes.is_empty()
+        && tc.expression.is_none()
+        && tc.value.as_f64().is_some_and(|v| v == 0.0)
+    {
+        return local_frame / fps.max(1.0);
+    }
+    eval_track_keyframes_only(tc, local_frame)
+        .as_f64()
+        .unwrap_or(local_frame / fps.max(1.0))
+}
+
+/// Evaluates a clip's `time_curve` with full expression support, preserving linear
+/// `time_env.time` for an unconfigured zero placeholder track.
+fn eval_clip_time_with_env(tc: &PropertyTrack, time_env: &EvalEnv<'_>) -> f64 {
+    if tc.keyframes.is_empty()
+        && tc.expression.is_none()
+        && tc.value.as_f64().is_some_and(|v| v == 0.0)
+    {
+        return time_env.time;
+    }
+    eval_f64(tc, time_env)
+}
+
 fn eval_track_keyframes_only(track: &PropertyTrack, frame: f64) -> PropertyValue {
     // P7 P1-3: Whenever a track has multiple keyframes, evaluate the full keyframe curve
     // (matching CM3 `PZ.property.dynamic.keyframes.prototype.get`).
@@ -11942,7 +12393,469 @@ fn parse_json_rgba(val: &serde_json::Value) -> Option<[f32; 4]> {
             ])
         }
         serde_json::Value::String(s) => Some(parse_css_rgba(s)),
+        serde_json::Value::Object(map) => {
+            if let Some(inner) = map.get("value") {
+                return parse_json_rgba(inner);
+            }
+            if let (Some(r), Some(g), Some(b)) = (
+                map.get("r").and_then(serde_json::Value::as_f64),
+                map.get("g").and_then(serde_json::Value::as_f64),
+                map.get("b").and_then(serde_json::Value::as_f64),
+            ) {
+                let (r, g, b) = (r as f32, g as f32, b as f32);
+                let a = map
+                    .get("a")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(1.0) as f32;
+                let scale = if r > 1.0 || g > 1.0 || b > 1.0 {
+                    1.0 / 255.0
+                } else {
+                    1.0
+                };
+                let a_norm = if a > 1.0 { a / 255.0 } else { a };
+                return Some([
+                    (r * scale).clamp(0.0, 1.0),
+                    (g * scale).clamp(0.0, 1.0),
+                    (b * scale).clamp(0.0, 1.0),
+                    a_norm.clamp(0.0, 1.0),
+                ]);
+            }
+            None
+        }
         _ => None,
+    }
+}
+
+/// Evaluates solid fill color for CM3 `type: 5` (`LayerKind::Generator`) from `layer.preserved`.
+fn eval_generator_layer_color(layer: &Layer, env: &EvalEnv<'_>) -> wgpu::Color {
+    const COLOR_KEYS: &[&str] = &[
+        "childProperty.color",
+        "property.color",
+        "color",
+        "childProperty.fillColor",
+        "fillColor",
+        "childProperty.backgroundColor",
+        "backgroundColor",
+    ];
+    for &key in COLOR_KEYS {
+        let Some(val) = layer.preserved.get(key) else {
+            continue;
+        };
+        if let Some([r, g, b, a]) = parse_json_rgba(val) {
+            let a_c = f64::from(a.clamp(0.0, 1.0));
+            return wgpu::Color {
+                r: f64::from(r.clamp(0.0, 1.0)) * a_c,
+                g: f64::from(g.clamp(0.0, 1.0)) * a_c,
+                b: f64::from(b.clamp(0.0, 1.0)) * a_c,
+                a: a_c,
+            };
+        }
+        let tr = json_to_property_track(val, PropertyValue::Color([0.0, 0.0, 0.0]));
+        let rgb = eval_color_rgb(&tr, env, [0.0, 0.0, 0.0]);
+        let alpha = layer
+            .preserved
+            .get("childProperty.alpha")
+            .or_else(|| layer.preserved.get("childProperty.opacity"))
+            .map(|v| {
+                let tr_a = json_to_property_track(v, PropertyValue::Number(1.0));
+                f64::from(eval_f32(&tr_a, env).clamp(0.0, 1.0))
+            })
+            .unwrap_or(1.0);
+        return wgpu::Color {
+            r: f64::from(rgb[0].clamp(0.0, 1.0)) * alpha,
+            g: f64::from(rgb[1].clamp(0.0, 1.0)) * alpha,
+            b: f64::from(rgb[2].clamp(0.0, 1.0)) * alpha,
+            a: alpha,
+        };
+    }
+    wgpu::Color::TRANSPARENT
+}
+
+/// Unwraps `.pz`-imported `NodeMaterial` JSON wrappers (`{ properties: { graph: "<json>" } }`,
+/// `{ graph: ... }`, or stringified JSON) down to the inner `{ nodes, links }` graph object.
+fn unwrap_node_material_graph(raw: &serde_json::Value) -> serde_json::Value {
+    let mut cur = raw.clone();
+    for _ in 0..4 {
+        match &cur {
+            serde_json::Value::String(s) => {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                    cur = parsed;
+                } else {
+                    break;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if map.contains_key("nodes") {
+                    break;
+                }
+                if let Some(inner) = map
+                    .get("properties")
+                    .and_then(|p| p.get("graph"))
+                    .or_else(|| map.get("graph"))
+                    .or_else(|| map.get("value"))
+                {
+                    cur = inner.clone();
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    cur
+}
+
+/// Resolves image/texture nodes in a `NodeMaterial` graph against `project.assets`.
+///
+/// - Direct links from an image/texture node into the `output` node's PBR ports are returned
+///   in `direct_slots` (`"color"`, `"emissive"`, `"roughness"`, `"metalness"`, `"normal"`, `"opacity"`)
+///   so the GPU binds the full-resolution texture asset directly.
+/// - Any image/texture nodes in the returned sanitized graph are replaced with `"color"` nodes
+///   carrying the decoded asset's mean RGB so `bake_node_material_maps` succeeds cleanly for
+///   both direct and downstream procedural graphs instead of failing on unsupported node type.
+fn prepare_node_material_graph_with_assets(
+    graph: &serde_json::Value,
+    project: &Project,
+) -> (serde_json::Value, HashMap<String, String>) {
+    let mut direct_slots: HashMap<String, String> = HashMap::new();
+    let Some(root_obj) = graph.as_object() else {
+        return (graph.clone(), direct_slots);
+    };
+    let Some(raw_nodes) = root_obj.get("nodes").and_then(serde_json::Value::as_array) else {
+        return (graph.clone(), direct_slots);
+    };
+
+    let mut image_node_assets: HashMap<String, String> = HashMap::new();
+    let mut output_node_ids: HashSet<String> = HashSet::new();
+    for n in raw_nodes {
+        let Some(no) = n.as_object() else {
+            continue;
+        };
+        let Some(id) = no.get("id").and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_i64().map(|x| x.to_string()))
+        }) else {
+            continue;
+        };
+        let kind_low = no
+            .get("type")
+            .or_else(|| no.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(
+            kind_low.as_str(),
+            "output" | "pbroutput" | "pbr_output" | "materialoutput"
+        ) {
+            output_node_ids.insert(id);
+            continue;
+        }
+        if matches!(
+            kind_low.as_str(),
+            "image" | "imagetexture" | "image_texture" | "texture" | "bitmap" | "assettexture"
+        ) {
+            let find_asset_in_map = |m: &serde_json::Map<String, serde_json::Value>| {
+                for k in [
+                    "assetId", "asset_id", "asset", "image", "texture", "src", "media", "file",
+                    "url",
+                ] {
+                    if let Some(s) = m.get(k).and_then(|v| {
+                        v.as_str()
+                            .or_else(|| v.get("value").and_then(serde_json::Value::as_str))
+                    }) && !s.is_empty()
+                    {
+                        return Some(s.to_owned());
+                    }
+                }
+                None
+            };
+            let asset_id = no
+                .get("params")
+                .and_then(serde_json::Value::as_object)
+                .and_then(find_asset_in_map)
+                .or_else(|| {
+                    no.get("values")
+                        .and_then(serde_json::Value::as_object)
+                        .and_then(find_asset_in_map)
+                })
+                .or_else(|| {
+                    no.get("inputs")
+                        .and_then(serde_json::Value::as_object)
+                        .and_then(find_asset_in_map)
+                })
+                .or_else(|| find_asset_in_map(no));
+            if let Some(aid) = asset_id {
+                image_node_assets.insert(id, aid);
+            }
+        }
+    }
+
+    // Collect all existing incoming (node_id, port_lower) pairs and direct links from image nodes.
+    let mut incoming_ports: HashSet<(String, String)> = HashSet::new();
+    let link_array_key = if root_obj.contains_key("links") {
+        "links"
+    } else if root_obj.contains_key("edges") {
+        "edges"
+    } else if root_obj.contains_key("connections") {
+        "connections"
+    } else {
+        "links"
+    };
+    if let Some(raw_links) = root_obj
+        .get(link_array_key)
+        .and_then(serde_json::Value::as_array)
+    {
+        for link in raw_links {
+            let Some(lo) = link.as_object() else {
+                continue;
+            };
+            let from_id = lo
+                .get("from")
+                .or_else(|| lo.get("fromNode"))
+                .or_else(|| lo.get("source"))
+                .and_then(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .or_else(|| v.as_i64().map(|x| x.to_string()))
+                });
+            let to_id = lo
+                .get("to")
+                .or_else(|| lo.get("toNode"))
+                .or_else(|| lo.get("target"))
+                .and_then(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .or_else(|| v.as_i64().map(|x| x.to_string()))
+                });
+            let to_port = lo
+                .get("toPort")
+                .or_else(|| lo.get("targetPort"))
+                .or_else(|| lo.get("toSocket"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if let Some(tid) = to_id.as_ref() {
+                incoming_ports.insert((tid.clone(), to_port.clone()));
+            }
+            if let (Some(fid), Some(tid)) = (from_id, to_id)
+                && output_node_ids.contains(&tid)
+                && let Some(asset_id) = image_node_assets.get(&fid)
+            {
+                let canon_slot = match to_port.as_str() {
+                    "color" | "basecolor" | "albedo" => Some("color"),
+                    "emissive" | "emission" | "luminance" => Some("emissive"),
+                    "roughness" => Some("roughness"),
+                    "metalness" | "metallic" => Some("metalness"),
+                    "normal" => Some("normal"),
+                    "opacity" | "alpha" => Some("opacity"),
+                    _ => None,
+                };
+                if let Some(slot) = canon_slot {
+                    direct_slots.insert(slot.to_owned(), asset_id.clone());
+                }
+            }
+        }
+    }
+
+    // Materialize inline `a`/`base` and `b`/`top` color params on `mix`/`blend`/`cosineMix`
+    // nodes (such as the built-in "Brushed Metal" preset) when those input sockets are not
+    // wired, because `zc_shader`'s baker defaults unwired `mix` inputs to black `[0, 0, 0]`.
+    let mut synth_nodes: Vec<serde_json::Value> = Vec::new();
+    let mut synth_links: Vec<serde_json::Value> = Vec::new();
+    for n in raw_nodes {
+        let Some(no) = n.as_object() else {
+            continue;
+        };
+        let Some(id) = no.get("id").and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_i64().map(|x| x.to_string()))
+        }) else {
+            continue;
+        };
+        let kind_low = no
+            .get("type")
+            .or_else(|| no.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(kind_low.as_str(), "mix" | "blend" | "cosinemix") {
+            continue;
+        }
+        let Some(params) = no.get("params").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (port, aliases) in [("a", &["a", "base"][..]), ("b", &["b", "top"][..])] {
+            let already_wired = aliases
+                .iter()
+                .any(|al| incoming_ports.contains(&(id.clone(), (*al).to_owned())));
+            if already_wired {
+                continue;
+            }
+            let inline_val = aliases.iter().find_map(|al| params.get(*al));
+            let Some(val) = inline_val else {
+                continue;
+            };
+            let rgb = if let Some(rgba) = parse_json_rgba(val) {
+                Some([rgba[0], rgba[1], rgba[2]])
+            } else {
+                val.as_f64().map(|x| {
+                    let xf = x as f32;
+                    [xf, xf, xf]
+                })
+            };
+            if let Some(c) = rgb {
+                let synth_id = format!("__zc_inline_{id}_{port}");
+                synth_nodes.push(serde_json::json!({
+                    "id": synth_id,
+                    "type": "color",
+                    "params": { "color": [c[0], c[1], c[2]] }
+                }));
+                synth_links.push(serde_json::json!({
+                    "from": synth_id,
+                    "fromPort": "out",
+                    "to": id,
+                    "toPort": port
+                }));
+            }
+        }
+    }
+
+    if image_node_assets.is_empty() && synth_nodes.is_empty() {
+        return (graph.clone(), direct_slots);
+    }
+
+    // Substitute image/texture nodes in a sanitized clone with `"color"` nodes carrying the
+    // decoded image's mean RGB so `bake_node_material_maps` succeeds cleanly on all downstream nodes.
+    let mut sanitized = graph.clone();
+    if let Some(obj_mut) = sanitized.as_object_mut() {
+        if let Some(nodes_mut) = obj_mut
+            .get_mut("nodes")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for n in nodes_mut.iter_mut() {
+                let Some(no) = n.as_object_mut() else {
+                    continue;
+                };
+                let Some(id) = no.get("id").and_then(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .or_else(|| v.as_i64().map(|x| x.to_string()))
+                }) else {
+                    continue;
+                };
+                let Some(asset_id) = image_node_assets.get(&id) else {
+                    continue;
+                };
+                let mean_rgb = project
+                    .assets
+                    .get(asset_id)
+                    .and_then(|rec| rec.bytes.as_deref())
+                    .and_then(|bytes| image::load_from_memory(bytes).ok())
+                    .map(|img| {
+                        let rgba = img.to_rgba8();
+                        let n_px = (rgba.width() as u64 * rgba.height() as u64).max(1) as f64;
+                        let (mut sr, mut sg, mut sb) = (0.0_f64, 0.0_f64, 0.0_f64);
+                        for p in rgba.pixels() {
+                            sr += f64::from(p[0]) / 255.0;
+                            sg += f64::from(p[1]) / 255.0;
+                            sb += f64::from(p[2]) / 255.0;
+                        }
+                        [sr / n_px, sg / n_px, sb / n_px]
+                    })
+                    .unwrap_or([0.8, 0.8, 0.8]);
+                no.insert("type".to_owned(), serde_json::json!("color"));
+                no.insert(
+                    "params".to_owned(),
+                    serde_json::json!({ "color": mean_rgb }),
+                );
+            }
+            nodes_mut.extend(synth_nodes);
+        }
+        if !synth_links.is_empty() {
+            if let Some(links_mut) = obj_mut
+                .get_mut(link_array_key)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                links_mut.extend(synth_links);
+            } else {
+                obj_mut.insert(
+                    link_array_key.to_owned(),
+                    serde_json::Value::Array(synth_links),
+                );
+            }
+        }
+    }
+    (sanitized, direct_slots)
+}
+
+/// Checks if `ident` appears as a whole identifier token in GLSL source `src`.
+fn glsl_contains_ident(src: &str, ident: &str) -> bool {
+    let bytes = src.as_bytes();
+    let needle = ident.as_bytes();
+    if needle.is_empty() || bytes.len() < needle.len() {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut start = 0usize;
+    while let Some(rel) = src[start..].find(ident) {
+        let idx = start + rel;
+        let prev_ok = idx == 0 || !is_word(bytes[idx - 1]);
+        let next_idx = idx + needle.len();
+        let next_ok = next_idx >= bytes.len() || !is_word(bytes[next_idx]);
+        if prev_ok && next_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
+/// Checks whether a GLSL varying/uniform declaration for `ident` already exists in `src`.
+fn glsl_has_decl(src: &str, qualifier: &str, ident: &str) -> bool {
+    for line in src.lines() {
+        let t = line.trim();
+        if t.starts_with(qualifier) && glsl_contains_ident(t, ident) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Augments a 3D GLSL ES 1.00 fragment shader with standard 3D varying/uniform declarations
+/// (`vNormal`, `vPosition`, `vColor`, `time`, `cameraPosition`) if referenced without declaration.
+fn prepare_glsl_3d_material_source(frag_shader: &str) -> String {
+    let mut prelude = String::new();
+    for (ident, decl) in [
+        ("vNormal", "varying vec3 vNormal;\n"),
+        ("vWorldNormal", "varying vec3 vWorldNormal;\n"),
+        ("vPosition", "varying vec3 vPosition;\n"),
+        ("vWorldPosition", "varying vec3 vWorldPosition;\n"),
+        ("vColor", "varying vec4 vColor;\n"),
+    ] {
+        if glsl_contains_ident(frag_shader, ident) && !glsl_has_decl(frag_shader, "varying", ident)
+        {
+            prelude.push_str(decl);
+        }
+    }
+    for (ident, decl) in [
+        ("time", "uniform float time;\n"),
+        ("uTime", "uniform float uTime;\n"),
+        ("cameraPosition", "uniform vec3 cameraPosition;\n"),
+    ] {
+        if glsl_contains_ident(frag_shader, ident) && !glsl_has_decl(frag_shader, "uniform", ident)
+        {
+            prelude.push_str(decl);
+        }
+    }
+    if prelude.is_empty() {
+        frag_shader.to_owned()
+    } else {
+        format!("{prelude}{frag_shader}")
     }
 }
 
@@ -12094,8 +13007,10 @@ fn push_prepared_mesh_ex(
             side: mat_eval.params.side,
             blend: mat_eval.params.blend,
             shader_key: shader_key.clone(),
+            is_glsl: mat_eval.custom_shader_is_glsl,
             params_a: mat_eval.custom_params_a,
             params_b: mat_eval.custom_params_b,
+            glsl_uniforms: mat_eval.custom_glsl_uniforms.clone(),
         });
         return;
     }
@@ -12113,8 +13028,10 @@ fn push_prepared_mesh_ex(
                     side: effective.params.side,
                     blend: effective.params.blend,
                     shader_key: shader_key.clone(),
+                    is_glsl: effective.custom_shader_is_glsl,
                     params_a: effective.custom_params_a,
                     params_b: effective.custom_params_b,
+                    glsl_uniforms: effective.custom_glsl_uniforms.clone(),
                 });
                 continue;
             }
@@ -12503,9 +13420,21 @@ fn apply_pbr_plus_surface_props(
         params.ramp_enabled = true;
         params.ramp_factor =
             eval_num(&["rampFactor", "ramp_factor", "rampStrength"], 1.0).clamp(0.0, 1.0);
+        let unwrap_val = |v: &serde_json::Value| -> serde_json::Value {
+            if let Some(kfs) = v.get("keyframes").and_then(serde_json::Value::as_array)
+                && let Some(first_val) = kfs.first().and_then(|kf| kf.get("value"))
+            {
+                return first_val.clone();
+            }
+            if let Some(inner) = v.get("value") {
+                return inner.clone();
+            }
+            v.clone()
+        };
         params.ramp_source = match preserved
             .get("rampSource")
             .or_else(|| preserved.get("ramp_source"))
+            .map(unwrap_val)
         {
             Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0) as u32,
             Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
@@ -12517,27 +13446,49 @@ fn apply_pbr_plus_surface_props(
             },
             _ => 0,
         };
-        if let Some(stops) = preserved
+        let ramp_raw = preserved
             .get("ramp")
+            .or_else(|| preserved.get("colorRamp"))
             .or_else(|| preserved.get("rampColors"))
-            .and_then(|v| {
-                v.as_array()
-                    .or_else(|| v.get("stops").and_then(serde_json::Value::as_array))
-            })
+            .or_else(|| preserved.get("ramp_colors"))
+            .or_else(|| preserved.get("rampStops"))
+            .or_else(|| preserved.get("ramp_stops"))
+            .map(unwrap_val);
+        if let Some(ref rv) = ramp_raw
+            && let Some(stops) = rv
+                .as_array()
+                .or_else(|| rv.get("stops").and_then(serde_json::Value::as_array))
+                .or_else(|| rv.get("colorStops").and_then(serde_json::Value::as_array))
+                .or_else(|| {
+                    rv.get("gradient")
+                        .and_then(|g| g.get("stops"))
+                        .and_then(serde_json::Value::as_array)
+                })
             && !stops.is_empty()
         {
             let mut parsed: Vec<[f32; 4]> = Vec::new();
-            for (i, st) in stops.iter().take(4).enumerate() {
-                let default_pos = if stops.len() <= 1 {
+            let take_n = stops.len().min(4);
+            for (i, st) in stops.iter().take(take_n).enumerate() {
+                let default_pos = if take_n <= 1 {
                     0.0
                 } else {
-                    i as f32 / (stops.len().min(4) - 1) as f32
+                    i as f32 / (take_n - 1) as f32
                 };
                 let pos = st
                     .get("position")
                     .or_else(|| st.get("pos"))
+                    .or_else(|| st.get("offset"))
+                    .or_else(|| st.get("t"))
                     .and_then(serde_json::Value::as_f64)
-                    .map_or(default_pos, |p| (p as f32).clamp(0.0, 1.0));
+                    .map_or(default_pos, |p| {
+                        let pf = p as f32;
+                        let norm = if pf > 1.0 && pf <= 100.0 {
+                            pf / 100.0
+                        } else {
+                            pf
+                        };
+                        norm.clamp(0.0, 1.0)
+                    });
                 let rgba = st
                     .get("color")
                     .and_then(parse_json_rgba)
@@ -12545,6 +13496,7 @@ fn apply_pbr_plus_surface_props(
                     .unwrap_or([1.0, 1.0, 1.0, 1.0]);
                 parsed.push([rgba[0], rgba[1], rgba[2], pos]);
             }
+            parsed.sort_by(|a, b| a[3].total_cmp(&b[3]));
             while parsed.len() < 4 {
                 let last = *parsed.last().unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
                 parsed.push([last[0], last[1], last[2], 1.0]);
@@ -12656,7 +13608,7 @@ fn build_shape_mesh_cpu(shape: &Shape3DKind, env: &EvalEnv<'_>) -> MeshData {
             loops,
             inner_segments,
             outer_segments,
-        } => build_wire(
+        } => build_wire_in_bounds(
             Vec3::new(size[0] as f32, size[1] as f32, size[2] as f32),
             *thickness as f32,
             *loops,
@@ -12950,16 +13902,28 @@ fn build_text3d_mesh_cpu(
     env: &EvalEnv<'_>,
 ) -> MeshData {
     let (params, options) = build_text3d_params_and_options(data, obj);
-    data.font
-        .as_deref()
-        .and_then(|font_id| env.project.assets.get(font_id))
-        .and_then(|rec| rec.bytes.as_deref())
-        .and_then(|bytes| build_text3d_mesh_with_options(bytes, &params, &options).ok())
+    let resolved = resolve_font_bytes(env.project, data.font.as_deref());
+    let primary_bytes = resolved
+        .as_ref()
+        .map_or(DEFAULT_TTF_FONT_BYTES, ResolvedFont::as_slice);
+    let cjk_fallback = if font_has_missing_glyphs(primary_bytes, &params.text) {
+        resolve_system_cjk_fallback_font()
+    } else {
+        None
+    };
+    let fallback_slice = cjk_fallback.as_deref();
+    build_text3d_mesh_with_fallback(primary_bytes, fallback_slice, &params, &options)
+        .ok()
         .filter(|m| !m.indices.is_empty())
         .or_else(|| {
-            build_text3d_mesh_with_options(DEFAULT_TTF_FONT_BYTES, &params, &options)
-                .ok()
-                .filter(|m| !m.indices.is_empty())
+            build_text3d_mesh_with_fallback(
+                DEFAULT_TTF_FONT_BYTES,
+                fallback_slice,
+                &params,
+                &options,
+            )
+            .ok()
+            .filter(|m| !m.indices.is_empty())
         })
         .unwrap_or_else(|| build_fallback_text_mesh_with_options(&params, &options))
 }
@@ -12971,18 +13935,37 @@ fn build_text3d_character_meshes_with_fallback(
     options: &Text3DExtendedOptions,
     text_scale: Vec3,
 ) -> Vec<zc_scene::Text3DCharacterMesh> {
-    data.font
-        .as_deref()
-        .and_then(|font_id| project.assets.get(font_id))
-        .and_then(|rec| rec.bytes.as_deref())
-        .and_then(|bytes| build_text3d_character_meshes(bytes, params, options, text_scale).ok())
+    let resolved = resolve_font_bytes(project, data.font.as_deref());
+    let primary_bytes = resolved
+        .as_ref()
+        .map_or(DEFAULT_TTF_FONT_BYTES, ResolvedFont::as_slice);
+    let cjk_fallback = if font_has_missing_glyphs(primary_bytes, &params.text) {
+        resolve_system_cjk_fallback_font()
+    } else {
+        None
+    };
+    let fallback_slice = cjk_fallback.as_deref();
+    zc_scene::build_text3d_character_meshes_with_fallback(
+        primary_bytes,
+        fallback_slice,
+        params,
+        options,
+        text_scale,
+    )
+    .ok()
+    .filter(|v| !v.is_empty())
+    .or_else(|| {
+        zc_scene::build_text3d_character_meshes_with_fallback(
+            DEFAULT_TTF_FONT_BYTES,
+            fallback_slice,
+            params,
+            options,
+            text_scale,
+        )
+        .ok()
         .filter(|v| !v.is_empty())
-        .or_else(|| {
-            build_text3d_character_meshes(DEFAULT_TTF_FONT_BYTES, params, options, text_scale)
-                .ok()
-                .filter(|v| !v.is_empty())
-        })
-        .unwrap_or_default()
+    })
+    .unwrap_or_default()
 }
 
 fn build_model_mesh_cpu(data: &zc_project::ModelData, env: &EvalEnv<'_>) -> MeshData {
@@ -13020,6 +14003,8 @@ fn build_model_mesh_cpu(data: &zc_project::ModelData, env: &EvalEnv<'_>) -> Mesh
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SceneEffectorKind {
     Repeater(RepeaterMode),
+    RadialRepeater,
+    GridRepeater,
     Twist,
     Warp,
     Plain,
@@ -13054,6 +14039,13 @@ fn detect_scene_effector_kind(obj: &Object3D) -> Option<SceneEffectorKind> {
         }
         "zoidium:repeater/echo-repeater" | "echo-repeater" => {
             Some(SceneEffectorKind::Repeater(RepeaterMode::Echo))
+        }
+        "zoidium:repeater/radial"
+        | "zoidium:repeater/radial-repeater"
+        | "radial-repeater"
+        | "radial" => Some(SceneEffectorKind::RadialRepeater),
+        "zoidium:repeater/grid" | "zoidium:repeater/grid-repeater" | "grid-repeater" | "grid" => {
+            Some(SceneEffectorKind::GridRepeater)
         }
         "zoidium:repeater/twist" | "twist" | "7" => Some(SceneEffectorKind::Twist),
         "zoidium:repeater/warp" | "warp" | "8" => Some(SceneEffectorKind::Warp),
@@ -13233,6 +14225,154 @@ fn apply_scene_effector_chain(
                     }
                     instances = next;
                 }
+            }
+            SceneEffectorKind::RadialRepeater => {
+                let count = eval_obj_u32(e_node.obj, &["count", "copies", "repeats"], 8, &e_env)
+                    .clamp(1, MAX_REPEATS);
+                let radius = eval_obj_f32(e_node.obj, &["radius"], 20.0, &e_env);
+                let start_angle_deg =
+                    eval_obj_f32(e_node.obj, &["startAngle", "start_angle"], 0.0, &e_env);
+                let end_angle_deg =
+                    eval_obj_f32(e_node.obj, &["endAngle", "end_angle"], 360.0, &e_env);
+                let align_to_circle = if let Some(s) = eval_obj_str(
+                    e_node.obj,
+                    &["alignToCircle", "align_to_circle", "align"],
+                    &e_env,
+                ) {
+                    !matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "no" | "off"
+                    )
+                } else {
+                    eval_obj_u32(
+                        e_node.obj,
+                        &["alignToCircle", "align_to_circle", "align"],
+                        1,
+                        &e_env,
+                    ) != 0
+                };
+                // Axis: 0 = X (YZ plane), 1 = Y (XZ plane), 2 = Z (XY plane, default facing camera).
+                let axis = if let Some(s) = eval_obj_str(e_node.obj, &["axis"], &e_env) {
+                    match s.trim().to_ascii_lowercase().as_str() {
+                        "x" | "0" => 0u32,
+                        "y" | "1" => 1u32,
+                        _ => 2u32,
+                    }
+                } else {
+                    eval_obj_u32(e_node.obj, &["axis"], 2, &e_env).min(2)
+                };
+                let span_deg = end_angle_deg - start_angle_deg;
+                let full_circle = (span_deg.abs() - 360.0).abs() < 1e-3;
+                let inv_r = if e_world.determinant().abs() > 1e-9 {
+                    e_world.inverse()
+                } else {
+                    Mat4::IDENTITY
+                };
+                let euler_order = map_euler_order(e_node.obj.euler_order);
+                let mut next = Vec::with_capacity(instances.len() * count as usize);
+                for inst in &instances {
+                    let rel = inv_r * inst.world;
+                    for copy_i in 0..count {
+                        let angle_deg = if count <= 1 {
+                            start_angle_deg
+                        } else if full_circle {
+                            start_angle_deg + span_deg * (copy_i as f32) / (count as f32)
+                        } else {
+                            start_angle_deg + span_deg * (copy_i as f32) / ((count - 1) as f32)
+                        };
+                        let a = angle_deg.to_radians();
+                        let (s, c) = a.sin_cos();
+                        let (pos, rot) = match axis {
+                            0 => (
+                                Vec3::new(0.0, c * radius, s * radius),
+                                if align_to_circle {
+                                    Vec3::new(a, 0.0, 0.0)
+                                } else {
+                                    Vec3::ZERO
+                                },
+                            ),
+                            1 => (
+                                Vec3::new(c * radius, 0.0, s * radius),
+                                if align_to_circle {
+                                    Vec3::new(0.0, -a, 0.0)
+                                } else {
+                                    Vec3::ZERO
+                                },
+                            ),
+                            _ => (
+                                Vec3::new(c * radius, s * radius, 0.0),
+                                if align_to_circle {
+                                    Vec3::new(0.0, 0.0, a)
+                                } else {
+                                    Vec3::ZERO
+                                },
+                            ),
+                        };
+                        let copy_local = Transform3D {
+                            position: pos,
+                            rotation: rot,
+                            scale: Vec3::ONE,
+                            euler_order,
+                        }
+                        .to_matrix();
+                        next.push(DeformedInstance {
+                            mesh: Arc::clone(&inst.mesh),
+                            world: e_world * copy_local * rel,
+                        });
+                    }
+                }
+                instances = next;
+            }
+            SceneEffectorKind::GridRepeater => {
+                let nx = eval_obj_u32(e_node.obj, &["countX", "count_x", "xCount"], 3, &e_env)
+                    .clamp(1, 32);
+                let ny = eval_obj_u32(e_node.obj, &["countY", "count_y", "yCount"], 3, &e_env)
+                    .clamp(1, 32);
+                let nz = eval_obj_u32(e_node.obj, &["countZ", "count_z", "zCount"], 1, &e_env)
+                    .clamp(1, 32);
+                let default_sp = eval_obj_f32(e_node.obj, &["spacing"], 12.0, &e_env);
+                let spacing_v = eval_obj_vec3(
+                    e_node.obj,
+                    &["spacing", "gridSpacing", "step"],
+                    Vec3::splat(default_sp),
+                    &e_env,
+                );
+                let sp_x =
+                    eval_obj_f32(e_node.obj, &["spacingX", "spacing_x"], spacing_v.x, &e_env);
+                let sp_y =
+                    eval_obj_f32(e_node.obj, &["spacingY", "spacing_y"], spacing_v.y, &e_env);
+                let sp_z =
+                    eval_obj_f32(e_node.obj, &["spacingZ", "spacing_z"], spacing_v.z, &e_env);
+                let inv_r = if e_world.determinant().abs() > 1e-9 {
+                    e_world.inverse()
+                } else {
+                    Mat4::IDENTITY
+                };
+                let total_cap = (nx * ny * nz).min(MAX_REPEATS) as usize;
+                let mut next = Vec::with_capacity(instances.len() * total_cap);
+                for inst in &instances {
+                    let rel = inv_r * inst.world;
+                    let mut emitted = 0usize;
+                    'grid: for iz in 0..nz {
+                        let oz = (iz as f32 - (nz as f32 - 1.0) * 0.5) * sp_z;
+                        for iy in 0..ny {
+                            let oy = (iy as f32 - (ny as f32 - 1.0) * 0.5) * sp_y;
+                            for ix in 0..nx {
+                                if emitted >= total_cap {
+                                    break 'grid;
+                                }
+                                let ox = (ix as f32 - (nx as f32 - 1.0) * 0.5) * sp_x;
+                                let copy_local = Mat4::from_translation(Vec3::new(ox, oy, oz));
+                                next.push(DeformedInstance {
+                                    mesh: Arc::clone(&inst.mesh),
+                                    world: e_world * copy_local * rel,
+                                });
+                                emitted += 1;
+                            }
+                        }
+                    }
+                }
+                instances = next;
             }
             SceneEffectorKind::Twist => {
                 let params = parse_twist_params(e_node.obj, &e_env);
@@ -13692,8 +14832,11 @@ fn parse_effector_field_from_obj(obj: &Object3D, env: &EvalEnv<'_>) -> Option<Ef
 }
 
 fn parse_twist_params(obj: &Object3D, env: &EvalEnv<'_>) -> TwistParams {
+    // Zoidium/ZoidCraft UI stores Twist `angle` in degrees (default 90.0, range -3600..3600).
+    let angle_deg = eval_obj_f32(obj, &["angle", "twistAngle"], 0.0, env);
+    let strength = eval_obj_f32(obj, &["strength", "twistStrength"], 1.0, env);
     TwistParams {
-        angle: eval_obj_f32(obj, &["angle", "twistAngle"], 0.0, env),
+        angle: (angle_deg * strength).to_radians(),
         axis: parse_deform_axis_from_obj(obj, &["axis", "twistAxis"], DeformAxis::Y, env),
         offset: eval_obj_f32(obj, &["offset", "twistOffset"], 0.0, env),
         subdivision: parse_subdivision_from_obj(obj, env),
@@ -13702,16 +14845,26 @@ fn parse_twist_params(obj: &Object3D, env: &EvalEnv<'_>) -> TwistParams {
 }
 
 fn parse_warp_params(obj: &Object3D, env: &EvalEnv<'_>) -> WarpParams {
+    let strength = eval_obj_f32(
+        obj,
+        &["strength", "bend", "angle", "warpStrength"],
+        0.0,
+        env,
+    );
+    let is_legacy = obj
+        .preserved
+        .get("zoidiumSubdivisionMode")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("legacy"));
+    let mut subdivision = parse_subdivision_from_obj(obj, env);
+    if !is_legacy && strength.abs() > 1e-4 && subdivision <= 1 {
+        subdivision = 16;
+    }
     WarpParams {
-        strength: eval_obj_f32(
-            obj,
-            &["strength", "bend", "angle", "warpStrength"],
-            0.0,
-            env,
-        ),
+        strength,
         axis: parse_warp_axis_from_obj(obj, &["axis", "warpAxis"], env),
         offset: eval_obj_f32(obj, &["offset", "warpOffset"], 0.0, env),
-        subdivision: parse_subdivision_from_obj(obj, env),
+        subdivision,
         field: parse_effector_field_from_obj(obj, env),
     }
 }
@@ -15997,12 +17150,243 @@ struct EvaluatedZoidiumMask {
     invert: bool,
 }
 
-fn resolve_font_bytes<'a>(project: &'a Project, font: Option<&str>) -> Option<&'a [u8]> {
-    let font_key = font?;
+enum ResolvedFont<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Arc<[u8]>),
+}
+
+impl ResolvedFont<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(b) => b,
+            Self::Owned(b) => b,
+        }
+    }
+}
+
+fn parse_text2d_align(preserved: &BTreeMap<String, serde_json::Value>) -> TextAlignMode {
+    let val = preserved
+        .get("align")
+        .or_else(|| preserved.get("textAlign"))
+        .or_else(|| preserved.get("alignment"))
+        .or_else(|| preserved.get("positionMode"));
+    match val {
+        Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "left" | "start" | "1" => TextAlignMode::Left,
+            "right" | "end" | "2" => TextAlignMode::Right,
+            _ => TextAlignMode::Center,
+        },
+        Some(serde_json::Value::Number(n)) => match n.as_u64() {
+            Some(1) => TextAlignMode::Left,
+            Some(2) => TextAlignMode::Right,
+            _ => TextAlignMode::Center,
+        },
+        _ => TextAlignMode::Center,
+    }
+}
+
+const MAX_SYSTEM_FONT_BYTES: u64 = 64 * 1024 * 1024;
+
+type DiskFontCache = Mutex<HashMap<PathBuf, Option<Arc<[u8]>>>>;
+
+fn load_font_file_cached(path: &Path) -> Option<Arc<[u8]>> {
+    static DISK_FONT_CACHE: OnceLock<DiskFontCache> = OnceLock::new();
+    let cache = DISK_FONT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(entry) = guard.get(path)
+    {
+        return entry.clone();
+    }
+    let loaded: Option<Arc<[u8]>> = (|| {
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_SYSTEM_FONT_BYTES {
+            return None;
+        }
+        let bytes = std::fs::read(path).ok()?;
+        Some(Arc::<[u8]>::from(bytes))
+    })();
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(path.to_path_buf(), loaded.clone());
+    }
+    loaded
+}
+
+fn normalize_font_token(raw: &str) -> String {
+    raw.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '_' | '.'))
+        .collect()
+}
+
+fn system_font_index() -> &'static [(String, PathBuf)] {
+    static INDEX: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        #[cfg(target_os = "macos")]
+        {
+            dirs.push(PathBuf::from("/System/Library/Fonts"));
+            dirs.push(PathBuf::from("/System/Library/Fonts/Supplemental"));
+            dirs.push(PathBuf::from("/Library/Fonts"));
+            if let Some(home) = std::env::var_os("HOME") {
+                dirs.push(PathBuf::from(home).join("Library/Fonts"));
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            dirs.push(PathBuf::from(r"C:\Windows\Fonts"));
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        {
+            dirs.push(PathBuf::from("/usr/share/fonts"));
+            dirs.push(PathBuf::from("/usr/local/share/fonts"));
+            if let Some(home) = std::env::var_os("HOME") {
+                let h = PathBuf::from(home);
+                dirs.push(h.join(".local/share/fonts"));
+                dirs.push(h.join(".fonts"));
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut stack = dirs;
+        let mut visited_dirs = 0usize;
+        while let Some(dir) = stack.pop() {
+            if visited_dirs >= 64 {
+                break;
+            }
+            visited_dirs += 1;
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_ascii_lowercase);
+                if matches!(ext.as_deref(), Some("ttf" | "otf" | "ttc"))
+                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                {
+                    out.push((normalize_font_token(stem), path));
+                }
+            }
+        }
+        out
+    })
+}
+
+fn resolve_system_font_by_name(font_key: &str) -> Option<Arc<[u8]>> {
+    let trimmed = font_key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 1. Direct path on disk (supports `.ttf`, `.otf`, `.ttc`)
+    let as_path = Path::new(trimmed);
+    if as_path.is_file() {
+        return load_font_file_cached(as_path);
+    }
+
+    // 2. Common family aliases (e.g. "Hiragino Sans" -> macOS CJK TTC, "Helvetica" -> Helvetica.ttc)
+    let norm = normalize_font_token(trimmed);
+    #[cfg(target_os = "macos")]
+    {
+        let alias_candidates: &[&str] = match norm.as_str() {
+            "hiraginosans" | "hiraginokakugothicpron" | "hiraginokakugothicstd" => &[
+                "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
+                "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            ],
+            "hiraginosansgb" => &["/System/Library/Fonts/Hiragino Sans GB.ttc"],
+            "helvetica" => &["/System/Library/Fonts/Helvetica.ttc"],
+            "helveticaneue" => &["/System/Library/Fonts/HelveticaNeue.ttc"],
+            "arial" => &[
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            ],
+            "arialunicode" | "arialunicodems" => {
+                &["/System/Library/Fonts/Supplemental/Arial Unicode.ttf"]
+            }
+            _ => &[],
+        };
+        for cand in alias_candidates {
+            if let Some(bytes) = load_font_file_cached(Path::new(cand)) {
+                return Some(bytes);
+            }
+        }
+    }
+
+    // 3. Index lookup across OS font directories by normalized stem (exact match first, then prefix).
+    let index = system_font_index();
+    if let Some((_, path)) = index.iter().find(|(stem, _)| stem == &norm) {
+        return load_font_file_cached(path);
+    }
+    if norm.len() >= 4
+        && let Some((_, path)) = index.iter().find(|(stem, _)| stem.starts_with(&norm))
+    {
+        return load_font_file_cached(path);
+    }
+    None
+}
+
+fn resolve_system_cjk_fallback_font() -> Option<Arc<[u8]>> {
+    static CJK_FALLBACK: OnceLock<Option<Arc<[u8]>>> = OnceLock::new();
+    CJK_FALLBACK
+        .get_or_init(|| {
+            let candidates: &[&str] = {
+                #[cfg(target_os = "macos")]
+                {
+                    &[
+                        "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
+                        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+                        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                        "/System/Library/Fonts/STHeiti Medium.ttc",
+                    ]
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    &[
+                        r"C:\Windows\Fonts\YuGothM.ttc",
+                        r"C:\Windows\Fonts\YuGothR.ttc",
+                        r"C:\Windows\Fonts\meiryo.ttc",
+                        r"C:\Windows\Fonts\msgothic.ttc",
+                        r"C:\Windows\Fonts\msyh.ttc",
+                    ]
+                }
+                #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+                {
+                    &[
+                        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    ]
+                }
+            };
+            for path_str in candidates {
+                if let Some(bytes) = load_font_file_cached(Path::new(path_str)) {
+                    return Some(bytes);
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+fn resolve_font_bytes<'a>(project: &'a Project, font: Option<&str>) -> Option<ResolvedFont<'a>> {
+    let font_key = font?.trim();
+    if font_key.is_empty() {
+        return None;
+    }
     if let Some(rec) = project.assets.get(font_key)
         && let Some(bytes) = rec.bytes.as_deref()
     {
-        return Some(bytes);
+        return Some(ResolvedFont::Borrowed(bytes));
     }
     // Fallback lookup by URL, filename, or legacy `.pz` asset key in `project.assets`.
     for rec in project.assets.values() {
@@ -16014,10 +17398,24 @@ fn resolve_font_bytes<'a>(project: &'a Project, font: Option<&str>) -> Option<&'
                 .and_then(serde_json::Value::as_str)
                 == Some(font_key);
         if matches && let Some(bytes) = rec.bytes.as_deref() {
-            return Some(bytes);
+            return Some(ResolvedFont::Borrowed(bytes));
         }
     }
-    None
+    // Built-in bundled OFL fonts available offline without embedding.
+    match font_key.to_ascii_lowercase().as_str() {
+        "geist-regular.ttf" | "builtin:geist" | "geist" => {
+            return Some(ResolvedFont::Borrowed(DEFAULT_TTF_FONT_BYTES));
+        }
+        "geistmono-regular.ttf" | "builtin:geist-mono" | "geist mono" => {
+            return Some(ResolvedFont::Borrowed(GEIST_MONO_TTF_FONT_BYTES));
+        }
+        "sourcecodepro-regular.ttf" | "builtin:source-code-pro" | "source code pro" => {
+            return Some(ResolvedFont::Borrowed(SOURCE_CODE_PRO_TTF_FONT_BYTES));
+        }
+        _ => {}
+    }
+    // System font path (`.ttf`/`.otf`/`.ttc`) or installed OS font family name (cached).
+    resolve_system_font_by_name(font_key).map(ResolvedFont::Owned)
 }
 
 fn eval_draw_op(op: &DrawOp, env: &EvalEnv<'_>) -> EvalPaintOp {
@@ -18158,7 +19556,7 @@ DOMAIN_MAX 0.9 0.8 0.7
             ..Default::default()
         };
         let params =
-            build_camera_params_without_vibrate(&cam, Mat4::IDENTITY, &env, [200.0, 100.0], false);
+            build_camera_params_without_vibrate(&cam, Mat4::IDENTITY, &env, [200.0, 100.0]);
         // half_h = 0.05 * 500 = 25.0 -> proj[1][1] = 1 / 25.0
         // aspect = 2.0 -> half_w = 50.0 -> proj[0][0] = 1 / 50.0
         assert!((params.proj[1][1] - (1.0 / 25.0)).abs() < 1e-5);
@@ -19745,14 +21143,16 @@ DOMAIN_MAX 0.9 0.8 0.7
             "Default Camera+ (36/35) on 1:1 must have ~54.43° vertical FOV, got {fov_1_1:.3}°"
         );
 
-        // GPU check on 1:1 canvas: default Camera+ (54.43°) shows cube larger than native 60° camera.
+        // GPU check on 1:1 canvas: default Camera+ (54.43° with camera-plus enabled) shows cube
+        // larger than native 60° camera (with camera-plus disabled), while standard Camera and
+        // Camera+ render identically when camera-plus is enabled.
         let mut native_60 = Object3D::new_perspective_camera();
         native_60.position = PropertyTrack::vec3([0.0, 0.0, 35.0]);
         let proj_nat_1_1 = make_test_scene_project(vec![native_60, cube.clone()], [96, 96]);
         let proj_cp_1_1 = make_test_scene_project(vec![cam_plus_close, cube], [96, 96]);
         let lit_nat_1_1 = count_lit(
             &engine
-                .render_frame_rgba8(&proj_nat_1_1, &plugins_on, 0.0, 96, 96)
+                .render_frame_rgba8(&proj_nat_1_1, &plugins_off, 0.0, 96, 96)
                 .expect("native 1:1"),
         );
         let lit_cp_1_1 = count_lit(
@@ -19795,6 +21195,174 @@ DOMAIN_MAX 0.9 0.8 0.7
         assert!(
             eval_camera_dof(&dof_cam, &env_off).is_none(),
             "eval_camera_dof must return None when camera-plus plugin is disabled"
+        );
+    }
+
+    #[test]
+    fn gpu_regression_camera_plus_continuous_focal_length_parity_and_plugin_gating() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+
+        let mut plugins_on = PluginRegistry::new();
+        plugins_on
+            .enable("camera-plus")
+            .expect("enable camera-plus");
+        let mut plugins_off = PluginRegistry::new();
+        plugins_off.disable_all_optional();
+
+        let mut cube = Object3D::new_shape_3d(
+            "LensCube",
+            Shape3DKind::Box {
+                size: [10.0, 10.0, 10.0],
+            },
+        );
+        cube.material = Some(MaterialSpec::SingleColor {
+            color: PropertyTrack::color([1.0, 1.0, 1.0]),
+            side: 2,
+        });
+        let count_lit =
+            |px: &[u8]| -> usize { px.as_chunks::<4>().0.iter().filter(|p| p[0] > 200).count() };
+
+        // 1. Monotonic zoom across 24 -> 30 -> 34.5 -> 35.0 -> 35.5 -> 50 -> 85mm on a standard
+        //    Camera with `camera-plus` enabled (zero cliff at 35.0mm!).
+        let focal_lengths = [24.0_f64, 30.0, 34.5, 35.0, 35.5, 50.0, 85.0];
+        let mut prev_fov_deg = f32::INFINITY;
+        let mut prev_lit = 0usize;
+        let controls = RefCell::new(BTreeMap::new());
+        let parent_props = BTreeMap::new();
+        let stack = RefCell::new(HashSet::new());
+
+        for fl in focal_lengths {
+            let mut cam = Object3D::new_perspective_camera();
+            cam.position = PropertyTrack::vec3([0.0, 0.0, 80.0]);
+            if let Object3DKind::Camera(ref mut c) = cam.kind {
+                c.fov = PropertyTrack::number(60.0);
+                c.focal_length = PropertyTrack::number(fl);
+                c.film_gate = 36.0;
+            }
+            let proj = make_test_scene_project(vec![cam.clone(), cube.clone()], [128, 72]);
+            let env_on = test_eval_env(
+                &proj,
+                &plugins_on,
+                &controls,
+                &parent_props,
+                &stack,
+                0.0,
+                0.0,
+                30.0,
+            );
+            let Object3DKind::Camera(ref cam_data) = cam.kind else {
+                panic!("expected camera");
+            };
+            let params = build_camera_params_from_node(
+                cam_data,
+                &cam,
+                Mat4::IDENTITY,
+                Vec3::new(0.0, 0.0, 80.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+                GeomEulerOrder::XYZ,
+                &env_on,
+                [128.0, 72.0],
+            );
+            let fov_deg = 2.0 * (1.0 / params.proj[1][1]).atan().to_degrees();
+            assert!(
+                fov_deg < prev_fov_deg,
+                "vertical FOV must strictly decrease as focal_length increases (fl={fl}mm, fov={fov_deg:.3}°, prev={prev_fov_deg:.3}°)"
+            );
+            prev_fov_deg = fov_deg;
+
+            let px = engine
+                .render_frame_rgba8(&proj, &plugins_on, 0.0, 128, 72)
+                .expect("render focal sweep");
+            let lit = count_lit(&px);
+            assert!(
+                lit >= prev_lit && lit > 0,
+                "GPU rendered cube coverage must increase monotonically across focal_length sweep (fl={fl}mm, lit={lit}, prev={prev_lit})"
+            );
+            prev_lit = lit;
+        }
+
+        // 2. Standard Camera and `zoidium:camera-plus/camera` with identical params (including
+        //    focal_length=35.0mm) render byte-for-byte identically AND survive `.pz` round-trip
+        //    with zero zoom shift!
+        let mut std_cam = Object3D::new_perspective_camera();
+        std_cam.position = PropertyTrack::vec3([0.0, 0.0, 60.0]);
+        if let Object3DKind::Camera(ref mut c) = std_cam.kind {
+            c.fov = PropertyTrack::number(60.0);
+            c.focal_length = PropertyTrack::number(35.0);
+            c.film_gate = 36.0;
+            // Attach a Camera+ feature so pz_export upgrades it to `zoidium:camera-plus/camera`
+            c.dof = Some(zc_project::CameraDofParams {
+                enabled: false,
+                enabled_track: None,
+                aperture: PropertyTrack::number(2.8),
+                focus_distance: PropertyTrack::number(60.0),
+                focus_area_width: PropertyTrack::number(5.0),
+                near_blur: PropertyTrack::number(100.0),
+                far_blur: PropertyTrack::number(100.0),
+            });
+        }
+        let mut cp_cam = std_cam.clone();
+        cp_cam.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:camera-plus/camera"),
+        );
+
+        let proj_std = make_test_scene_project(vec![std_cam, cube.clone()], [128, 72]);
+        let proj_cp = make_test_scene_project(vec![cp_cam, cube.clone()], [128, 72]);
+        let px_std = engine
+            .render_frame_rgba8(&proj_std, &plugins_on, 0.0, 128, 72)
+            .expect("render standard camera");
+        let px_cp = engine
+            .render_frame_rgba8(&proj_cp, &plugins_on, 0.0, 128, 72)
+            .expect("render camera-plus camera");
+        assert_eq!(
+            px_std, px_cp,
+            "Standard Camera and zoidium:camera-plus/camera with identical params must render identically"
+        );
+
+        let pz_bytes = zc_project::export_pz_to_bytes(&proj_std).expect("export pz");
+        let rt_proj = zc_project::import_pz_from_bytes(&pz_bytes)
+            .expect("import pz")
+            .project;
+        let px_rt = engine
+            .render_frame_rgba8(&rt_proj, &plugins_on, 0.0, 128, 72)
+            .expect("render round-tripped pz");
+        assert_eq!(
+            px_std, px_rt,
+            "export-pz -> import-pz round-trip must produce zero zoom shift"
+        );
+
+        // 3. With `camera-plus` disabled, focal_length=85mm / film_gate / film_offset / zoom
+        //    must NOT override native fov=60°.
+        let mut native_clean = Object3D::new_perspective_camera();
+        native_clean.position = PropertyTrack::vec3([0.0, 0.0, 60.0]);
+        if let Object3DKind::Camera(ref mut c) = native_clean.kind {
+            c.fov = PropertyTrack::number(60.0);
+        }
+        let mut cam_85 = native_clean.clone();
+        if let Object3DKind::Camera(ref mut c) = cam_85.kind {
+            c.focal_length = PropertyTrack::number(85.0);
+            c.film_gate = 24.89;
+            c.film_offset_x = PropertyTrack::number(35.0);
+            c.zoom = PropertyTrack::number(2.0);
+        }
+
+        let proj_clean = make_test_scene_project(vec![native_clean, cube.clone()], [128, 72]);
+        let proj_85 = make_test_scene_project(vec![cam_85, cube], [128, 72]);
+        let px_off_clean = engine
+            .render_frame_rgba8(&proj_clean, &plugins_off, 0.0, 128, 72)
+            .expect("render clean off");
+        let px_off_85 = engine
+            .render_frame_rgba8(&proj_85, &plugins_off, 0.0, 128, 72)
+            .expect("render 85mm off");
+        assert_eq!(
+            px_off_clean, px_off_85,
+            "With camera-plus disabled, focal_length=85mm must NOT override fov=60°"
         );
     }
 
@@ -20987,6 +22555,1103 @@ DOMAIN_MAX 0.9 0.8 0.7
             (110..=145).contains(&r),
             "constant 0.5 opacity emissive white box over black must render ~128 (0.5), not ~64 (0.25); got center RGBA={:?}",
             &px[center..center + 4]
+        );
+    }
+
+    #[test]
+    fn gpu_editing_camera_skips_clip_effects_and_font_changes_render_distinct_glyphs() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let plugins = PluginRegistry::new();
+
+        // 1. Editing Camera MUST bypass clip effects (e.g. RGB Shift) so the editor grid & view stay clean.
+        let mut text_obj = Object3D::new_text_3d("ZOID");
+        if let Object3DKind::Text3D(ref mut t) = text_obj.kind {
+            t.font = Some("Geist-Regular.ttf".to_owned());
+        }
+        let mut cam = Object3D::new_perspective_camera();
+        cam.position = PropertyTrack::vec3([0.0, 0.0, 90.0]);
+        let mut project = make_test_scene_project(vec![cam, text_obj], [160, 90]);
+        let scene_clip_id = project.sequence.video_tracks[0].clips[0].id;
+
+        let editor_cam = CameraParams::perspective_look_at(
+            [0.0, 25.0, 80.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            60.0,
+            160.0 / 90.0,
+            0.1,
+            5000.0,
+        );
+        let edit_ov = RenderOverrides {
+            editing_camera_clip_id: Some(scene_clip_id),
+            editing_camera: Some(editor_cam),
+            selected_object_ids: Vec::new(),
+            is_scene_camera_override: false,
+        };
+
+        let edit_no_fx = engine
+            .render_frame_rgba8_with_options(
+                &project,
+                &plugins,
+                0.0,
+                160,
+                90,
+                &RenderFrameOptions {
+                    transparent_background: false,
+                    overrides: Some(edit_ov.clone()),
+                },
+            )
+            .expect("edit camera without fx");
+        let preview_no_fx = engine
+            .render_frame_rgba8(&project, &plugins, 0.0, 160, 90)
+            .expect("normal preview without fx");
+
+        // Add strong RGB Shift effect on the 3D scene clip.
+        let mut rgb = zc_project::create_effect_by_id("rgbshift").expect("rgbshift effect");
+        rgb.params
+            .insert("amount".to_owned(), PropertyTrack::number(40.0));
+        project.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .push(rgb);
+        engine.invalidate_caches();
+
+        let edit_with_fx = engine
+            .render_frame_rgba8_with_options(
+                &project,
+                &plugins,
+                0.0,
+                160,
+                90,
+                &RenderFrameOptions {
+                    transparent_background: false,
+                    overrides: Some(edit_ov),
+                },
+            )
+            .expect("edit camera with fx");
+        let preview_with_fx = engine
+            .render_frame_rgba8(&project, &plugins, 0.0, 160, 90)
+            .expect("normal preview with fx");
+
+        assert_eq!(
+            edit_no_fx, edit_with_fx,
+            "Editing Camera view must bypass clip effects like RGB Shift"
+        );
+        assert_ne!(
+            preview_no_fx, preview_with_fx,
+            "Normal preview (Editing Camera OFF) must still apply RGB Shift"
+        );
+
+        // 2. Switching built-in fonts on Text3D & Text2D must produce visibly distinct pixels.
+        project.sequence.video_tracks[0].clips[0]
+            .layer
+            .effects
+            .clear();
+        engine.invalidate_caches();
+        let text3d_geist = engine
+            .render_frame_rgba8(&project, &plugins, 0.0, 160, 90)
+            .expect("text3d geist");
+        if let LayerKind::Scene3D {
+            ref mut objects, ..
+        } = project.sequence.video_tracks[0].clips[0].layer.kind
+            && let Object3DKind::Text3D(ref mut t) = objects[1].kind
+        {
+            t.font = Some("SourceCodePro-Regular.ttf".to_owned());
+        }
+        engine.invalidate_caches();
+        let text3d_scp = engine
+            .render_frame_rgba8(&project, &plugins, 0.0, 160, 90)
+            .expect("text3d source code pro");
+        let diff_3d = text3d_geist
+            .iter()
+            .zip(text3d_scp.iter())
+            .filter(|(a, b)| a.abs_diff(**b) > 8)
+            .count();
+        assert!(
+            diff_3d > 80,
+            "Text3D font change (Geist -> SourceCodePro) must produce visibly different glyphs, diff={diff_3d}"
+        );
+
+        // Text2D font change check.
+        let mut p2d = Project::new_cm3_default();
+        p2d.sequence.resolution = [160, 90];
+        p2d.sequence.video_tracks[0].clips.clear();
+        p2d.sequence.video_tracks[0]
+            .clips
+            .push(zc_project::VideoClip {
+                id: Uuid::new_v4(),
+                name: "Text2D".to_owned(),
+                start: 0.0,
+                length: 30.0,
+                link: None,
+                media: None,
+                time_curve: PropertyTrack::linear_time_curve(30.0, 30),
+                layer: Layer::new(
+                    "Text2D",
+                    LayerKind::Text2D {
+                        text: "AgW1".to_owned(),
+                        font: Some("Geist-Regular.ttf".to_owned()),
+                        size: 42,
+                        shapes: Vec::new(),
+                    },
+                    [160, 90],
+                ),
+                preserved: BTreeMap::new(),
+            });
+        let text2d_geist = engine
+            .render_frame_rgba8(&p2d, &plugins, 0.0, 160, 90)
+            .expect("text2d geist");
+        assert!(
+            count_non_black_rgb_pixels(&text2d_geist) > 50,
+            "Text2D baseline render must produce visible glyphs"
+        );
+        if let LayerKind::Text2D { ref mut font, .. } =
+            p2d.sequence.video_tracks[0].clips[0].layer.kind
+        {
+            *font = Some("SourceCodePro-Regular.ttf".to_owned());
+        } else {
+            panic!("expected Text2D clip at clips[0]");
+        }
+        engine.invalidate_caches();
+        let text2d_scp = engine
+            .render_frame_rgba8(&p2d, &plugins, 0.0, 160, 90)
+            .expect("text2d source code pro");
+        let diff_2d = text2d_geist
+            .iter()
+            .zip(text2d_scp.iter())
+            .filter(|(a, b)| a.abs_diff(**b) > 8)
+            .count();
+        assert!(
+            diff_2d > 40,
+            "Text2D font change (Geist -> SourceCodePro) must produce visibly different glyphs, diff={diff_2d}"
+        );
+    }
+
+    #[test]
+    fn gpu_qa_fixes_zero_light_pbr_particles_presets_particular_repeaters_and_cjk() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        let _ = plugins.enable("particles-plus");
+        let _ = plugins.enable("trapcode-suite");
+        let _ = plugins.enable("repeater");
+
+        // 1. Zero-light 3D PBR Sphere renders lit (studio headlight fallback), never pitch-black!
+        let mut cam = Object3D::new_perspective_camera();
+        cam.position = PropertyTrack::vec3([0.0, 0.0, 45.0]);
+        let mut sphere = Object3D::new_shape_3d(
+            "PbrSphere",
+            Shape3DKind::Sphere {
+                radius: 12.0,
+                width_segments: 24,
+                height_segments: 16,
+            },
+        );
+        sphere.material = Some(MaterialSpec::PbrPlus(Box::new(
+            zc_project::PbrPlusMaterial {
+                base_color: PropertyTrack::color([0.9, 0.3, 0.2]),
+                roughness: PropertyTrack::number(0.5),
+                metalness: PropertyTrack::number(0.1),
+                ..Default::default()
+            },
+        )));
+        let mut pbr_proj = make_test_scene_project(vec![cam.clone(), sphere], [64, 64]);
+        pbr_proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        let pbr_px = engine
+            .render_frame_rgba8(&pbr_proj, &plugins, 0.0, 64, 64)
+            .expect("zero-light pbr sphere");
+        let center = (32 * 64 + 32) * 4;
+        assert!(
+            pbr_px[center] > 60,
+            "zero-light 3D PBR sphere must be lit by studio fallback, got {:?}",
+            &pbr_px[center..center + 4]
+        );
+
+        // 2. Particles+ sprite presets (`star_4` vs `circle_soft` vs `spark`) produce distinct GPU pixels!
+        let render_preset = |engine: &mut ProjectRenderEngine, preset: &str| {
+            let mut pcam = Object3D::new_perspective_camera();
+            pcam.position = PropertyTrack::vec3([0.0, 0.0, 80.0]);
+            let pdata = zc_project::ParticlesData {
+                texture: None,
+                sprite_preset: Some(preset.to_owned()),
+                number: 1,
+                rate: 60.0,
+                lifetime: 10.0,
+                pspread: [0.0, 0.0, 0.0],
+                iradius: 0.0,
+                vspread: [0.0, 0.0, 0.0],
+                ..zc_project::ParticlesData::default()
+            };
+            let pobj = Object3D::new("P", Object3DKind::Particles(Box::new(pdata)));
+            let mut proj = make_test_scene_project(vec![pcam, pobj], [64, 64]);
+            proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+            engine.invalidate_caches();
+            engine
+                .render_frame_rgba8(&proj, &plugins, 15.0, 64, 64)
+                .expect("render preset")
+        };
+        let px_star4 = render_preset(&mut engine, "star_4");
+        let px_soft = render_preset(&mut engine, "circle_soft");
+        let px_spark = render_preset(&mut engine, "spark");
+        let diff_count = |a: &[u8], b: &[u8]| -> usize {
+            a.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(b.as_chunks::<4>().0.iter())
+                .filter(|(p, q)| p[0].abs_diff(q[0]) > 12)
+                .count()
+        };
+        assert!(
+            diff_count(&px_star4, &px_soft) > 30,
+            "star_4 and circle_soft must render visibly distinct particle sprites"
+        );
+        assert!(
+            diff_count(&px_spark, &px_soft) > 30,
+            "spark and circle_soft must render visibly distinct particle sprites"
+        );
+        assert!(
+            diff_count(&px_star4, &px_spark) > 30,
+            "star_4 and spark must render visibly distinct particle sprites"
+        );
+
+        // 3. Trapcode Particular default: colorful cyan-blue particles, NOT pure-white screen blowout!
+        let mut tc_obj = Object3D::new(
+            "Particular",
+            Object3DKind::Group {
+                children: Vec::new(),
+                custom_properties: Vec::new(),
+                reflection_visibility: 0,
+            },
+        );
+        tc_obj.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:trapcode-suite/particular"),
+        );
+        tc_obj.preserved.insert(
+            "properties".to_owned(),
+            serde_json::json!({
+                "count": 64,
+                "particleSize": 3.0,
+                "particleColor": [0.2, 0.85, 1.0],
+                "opacity": 1.0
+            }),
+        );
+        let mut tc_cam = Object3D::new_perspective_camera();
+        tc_cam.position = PropertyTrack::vec3([0.0, 0.0, 100.0]);
+        let mut tc_proj = make_test_scene_project(vec![tc_cam, tc_obj], [96, 96]);
+        tc_proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        engine.invalidate_caches();
+        let tc_px = engine
+            .render_frame_rgba8(&tc_proj, &plugins, 0.0, 96, 96)
+            .expect("render particular");
+        let total_px = 96 * 96;
+        let lit_tc = count_non_black_rgb_pixels(&tc_px);
+        let blown_white = tc_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 245 && p[1] > 245 && p[2] > 245)
+            .count();
+        assert!(
+            lit_tc > 20 && blown_white < total_px / 4,
+            "Particular must render crisp colorful particles without full-frame white blowout (lit={lit_tc}, blown_white={blown_white}/{total_px})"
+        );
+
+        // 4. Radial & Grid Repeaters expand a child Box into multiple distinct spatial regions!
+        let make_box_child = || {
+            let mut b = Object3D::new_shape_3d(
+                "ChildBox",
+                Shape3DKind::Box {
+                    size: [4.0, 4.0, 4.0],
+                },
+            );
+            b.material = Some(MaterialSpec::SingleColor {
+                color: PropertyTrack::color([1.0, 1.0, 1.0]),
+                side: 2,
+            });
+            b
+        };
+        let mut rcam = Object3D::new_perspective_camera();
+        rcam.position = PropertyTrack::vec3([0.0, 0.0, 90.0]);
+        let single_proj = make_test_scene_project(vec![rcam.clone(), make_box_child()], [96, 96]);
+        engine.invalidate_caches();
+        let px_single = engine
+            .render_frame_rgba8(&single_proj, &plugins, 0.0, 96, 96)
+            .expect("single box");
+        let lit_single = count_non_black_rgb_pixels(&px_single);
+
+        let mut radial_rep = Object3D::new(
+            "RadialRep",
+            Object3DKind::Group {
+                children: vec![make_box_child()],
+                custom_properties: Vec::new(),
+                reflection_visibility: 0,
+            },
+        );
+        radial_rep.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:repeater/radial"),
+        );
+        radial_rep.preserved.insert(
+            "repeaterProperties".to_owned(),
+            serde_json::json!({
+                "count": 8,
+                "radius": 20.0,
+                "axis": 2,
+                "alignToCircle": 1
+            }),
+        );
+        let radial_proj = make_test_scene_project(vec![rcam.clone(), radial_rep], [96, 96]);
+        engine.invalidate_caches();
+        let px_radial = engine
+            .render_frame_rgba8(&radial_proj, &plugins, 0.0, 96, 96)
+            .expect("radial repeater");
+        let lit_radial = count_non_black_rgb_pixels(&px_radial);
+        assert!(
+            lit_radial > lit_single * 3,
+            "zoidium:repeater/radial must instantiate ring copies (single={lit_single}, radial={lit_radial})"
+        );
+
+        let mut grid_rep = Object3D::new(
+            "GridRep",
+            Object3DKind::Group {
+                children: vec![make_box_child()],
+                custom_properties: Vec::new(),
+                reflection_visibility: 0,
+            },
+        );
+        grid_rep.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:repeater/grid"),
+        );
+        grid_rep.preserved.insert(
+            "repeaterProperties".to_owned(),
+            serde_json::json!({
+                "countX": 3,
+                "countY": 3,
+                "countZ": 1,
+                "spacing": [12.0, 12.0, 0.0]
+            }),
+        );
+        let grid_proj = make_test_scene_project(vec![rcam, grid_rep], [96, 96]);
+        engine.invalidate_caches();
+        let px_grid = engine
+            .render_frame_rgba8(&grid_proj, &plugins, 0.0, 96, 96)
+            .expect("grid repeater");
+        let lit_grid = count_non_black_rgb_pixels(&px_grid);
+        assert!(
+            lit_grid > lit_single * 3,
+            "zoidium:repeater/grid must instantiate 3x3 grid copies (single={lit_single}, grid={lit_grid})"
+        );
+
+        // 5. Automatic OS CJK fallback font renders real Japanese glyphs (`テスト`) distinct from `???`!
+        if resolve_system_cjk_fallback_font().is_some() {
+            let mut tcam = Object3D::new_perspective_camera();
+            tcam.position = PropertyTrack::vec3([0.0, 0.0, 80.0]);
+            let make_t3d = |txt: &str| {
+                let mut t = Object3D::new_text_3d(txt);
+                if let Object3DKind::Text3D(ref mut d) = t.kind {
+                    d.font = Some("Geist-Regular.ttf".to_owned());
+                    d.size = [20.0, 2.0];
+                }
+                t.material = Some(MaterialSpec::SingleColor {
+                    color: PropertyTrack::color([1.0, 1.0, 1.0]),
+                    side: 2,
+                });
+                t
+            };
+            let proj_jp =
+                make_test_scene_project(vec![tcam.clone(), make_t3d("テスト")], [128, 64]);
+            let proj_q = make_test_scene_project(vec![tcam, make_t3d("???")], [128, 64]);
+            engine.invalidate_caches();
+            let px_jp = engine
+                .render_frame_rgba8(&proj_jp, &plugins, 0.0, 128, 64)
+                .expect("render jp");
+            engine.invalidate_caches();
+            let px_q = engine
+                .render_frame_rgba8(&proj_q, &plugins, 0.0, 128, 64)
+                .expect("render ???");
+            assert!(
+                count_non_black_rgb_pixels(&px_jp) > 80,
+                "CJK text must render visible glyphs"
+            );
+            assert!(
+                diff_count(&px_jp, &px_q) > 80,
+                "CJK Japanese text (`テスト`) must use OS CJK fallback glyphs rather than rendering `???`"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_regression_c5_time_driven_fx_and_timeremap_defaults() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(e) => e,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to init headless engine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        let _ = plugins.enable("native-fx");
+
+        let make_fx_proj = |fx: EffectInstance, animated_pos: bool| {
+            let mut project = Project::new_cm3_default();
+            project.sequence.resolution = [128, 72];
+            project.sequence.fps = 30;
+            project.sequence.length_frames = 90.0;
+            let mut shape_layer = Layer::new(
+                "Square",
+                LayerKind::PresetShape2D {
+                    preset: PresetShapeKind::Rectangle,
+                    shapes: vec![Shape2DNode {
+                        id: Uuid::new_v4(),
+                        name: "Box".to_owned(),
+                        kind: Shape2DKind::Group {
+                            children: Vec::new(),
+                        },
+                        position: PropertyTrack::vec2([0.0, 0.0]),
+                        rotation: PropertyTrack::number(0.0),
+                        scale: PropertyTrack::vec2([0.4, 0.5]),
+                        operations: vec![DrawOp::Fill {
+                            color: PropertyTrack::constant(PropertyValue::ColorRgba([
+                                0.1, 0.9, 1.0, 1.0,
+                            ])),
+                        }],
+                        preserved: BTreeMap::new(),
+                    }],
+                },
+                [128, 72],
+            );
+            if animated_pos {
+                let mut pos = PropertyTrack::vec2([-36.0, 0.0]);
+                pos.animated = true;
+                pos.keyframes = vec![
+                    zc_project::PropertyKeyframe::linear(0.0, PropertyValue::Vec2([-36.0, 0.0])),
+                    zc_project::PropertyKeyframe::linear(30.0, PropertyValue::Vec2([36.0, 0.0])),
+                ];
+                shape_layer.position = pos;
+            }
+            shape_layer.effects.push(fx);
+            project.sequence.video_tracks[0].clips = vec![VideoClip {
+                id: Uuid::new_v4(),
+                name: "Clip".to_owned(),
+                start: 0.0,
+                length: 90.0,
+                link: None,
+                media: None,
+                // Deliberately unkeyframed zero placeholder (as produced by QA4-10 projects).
+                time_curve: PropertyTrack::number(0.0),
+                layer: shape_layer,
+                preserved: BTreeMap::new(),
+            }];
+            project
+        };
+
+        // 1. timecode, radiowaves, ccpixelpolly must advance cleanly across frames (not frozen at t=0).
+        for (fx_id, frames) in [
+            ("timecode", [15.0_f64, 45.0, 67.0]),
+            ("radiowaves", [6.0, 15.0, 67.0]),
+            ("ccpixelpolly", [15.0, 45.0, 67.0]),
+        ] {
+            let fx = zc_project::create_zoidium_effect(fx_id).expect("create zoidium fx");
+            let proj = make_fx_proj(fx, false);
+            engine.invalidate_caches();
+            let pa = engine
+                .render_frame_rgba8(&proj, &plugins, frames[0], 128, 72)
+                .expect("render fa");
+            let pb = engine
+                .render_frame_rgba8(&proj, &plugins, frames[1], 128, 72)
+                .expect("render fb");
+            let pc = engine
+                .render_frame_rgba8(&proj, &plugins, frames[2], 128, 72)
+                .expect("render fc");
+            assert_ne!(
+                pa, pb,
+                "{fx_id} must NOT stay frozen between frame {} and frame {}",
+                frames[0], frames[1]
+            );
+            assert_ne!(
+                pb, pc,
+                "{fx_id} must NOT stay frozen between frame {} and frame {}",
+                frames[1], frames[2]
+            );
+        }
+
+        // 2. pulse with default expr="time" must stay alive across t > 1 (f15 and f67).
+        let pulse_fx = zc_project::create_standard_effect("pulse").expect("pulse");
+        let pulse_proj = make_fx_proj(pulse_fx, false);
+        let base_proj = make_fx_proj(
+            EffectInstance {
+                id: Uuid::new_v4(),
+                name: "Disabled".to_owned(),
+                enabled: PropertyTrack::option(0),
+                kind: EffectKind::Standard("pulse".to_owned()),
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            },
+            false,
+        );
+        engine.invalidate_caches();
+        let base_px = engine
+            .render_frame_rgba8(&base_proj, &plugins, 15.0, 128, 72)
+            .expect("base");
+        let pulse_f15 = engine
+            .render_frame_rgba8(&pulse_proj, &plugins, 15.0, 128, 72)
+            .expect("pulse f15");
+        let pulse_f67 = engine
+            .render_frame_rgba8(&pulse_proj, &plugins, 67.0, 128, 72)
+            .expect("pulse f67");
+        assert_ne!(
+            pulse_f15, base_px,
+            "pulse default expr=time must distort frame 15"
+        );
+        assert_ne!(
+            pulse_f67, base_px,
+            "pulse default expr=time must loop/wrap and distort frame 67 (t > 1)"
+        );
+
+        // 3. timeremap default (remap=1, mode=0, sourceTime=0, speed=1.0) must NOT jump f0/f15 to f30.
+        let tr_fx = zc_project::create_zoidium_effect("timeremap").expect("timeremap");
+        let tr_proj = make_fx_proj(tr_fx, true);
+        let no_tr_proj = make_fx_proj(
+            EffectInstance {
+                id: Uuid::new_v4(),
+                name: "NoTR".to_owned(),
+                enabled: PropertyTrack::option(0),
+                kind: EffectKind::Standard("exposure".to_owned()),
+                params: BTreeMap::new(),
+                preserved: BTreeMap::new(),
+            },
+            true,
+        );
+        for f in [0.0_f64, 15.0, 30.0] {
+            engine.invalidate_caches();
+            let got = engine
+                .render_frame_rgba8(&tr_proj, &plugins, f, 128, 72)
+                .expect("timeremap render");
+            let want = engine
+                .render_frame_rgba8(&no_tr_proj, &plugins, f, 128, 72)
+                .expect("baseline render");
+            assert_eq!(
+                got, want,
+                "timeremap default (speed=1.0, mode=0) must match baseline at frame {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_qa6_metallic_ibl_glsl_3d_bump_ramp_matcap_generator_char_mat_nodemat_aspect_and_expresstext()
+     {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(engine) => engine,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to initialize ProjectRenderEngine: {err}"),
+        };
+        let mut plugins = PluginRegistry::new();
+        for p in [
+            "material-plus",
+            "geometry-plus",
+            "repeater",
+            "text-plus",
+            "expresstext-plus",
+            "shape-plus",
+        ] {
+            let _ = plugins.enable(p);
+        }
+
+        let mut cam = Object3D::new_perspective_camera();
+        cam.position = PropertyTrack::vec3([0.0, 0.0, 42.0]);
+        let make_key_light = || {
+            let mut l = Object3D::new_spot_light();
+            if let Object3DKind::Light(ref mut ld) = l.kind {
+                ld.kind = ProjectLightKind::Directional;
+                ld.color = PropertyTrack::color([1.0, 1.0, 1.0]);
+                ld.intensity = PropertyTrack::number(1.2);
+                ld.cast_shadow = false;
+            }
+            l.position = PropertyTrack::vec3([18.0, 22.0, 26.0]);
+            l
+        };
+
+        // 1. High-metalness CustomPbr (metalness = 0.95 gold) & Brushed Metal NodeMaterial (0.92)
+        // must render bright metallic luster under directional lighting (NOT 97% pitch black).
+        let mut gold_sphere = Object3D::new_shape_3d(
+            "GoldSphere",
+            Shape3DKind::Sphere {
+                radius: 11.0,
+                width_segments: 24,
+                height_segments: 16,
+            },
+        );
+        gold_sphere.material = Some(MaterialSpec::CustomPbr(Box::new(
+            zc_project::CustomPbrMaterial {
+                color: PropertyTrack::color([1.0, 0.82, 0.25]),
+                roughness: PropertyTrack::number(0.25),
+                metalness: PropertyTrack::number(0.95),
+                ..Default::default()
+            },
+        )));
+        let gold_proj =
+            make_test_scene_project(vec![cam.clone(), make_key_light(), gold_sphere], [96, 96]);
+        let gold_px = engine
+            .render_frame_rgba8(&gold_proj, &plugins, 0.0, 96, 96)
+            .expect("render metallic gold");
+        let gold_bright_count = gold_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 70 && p[1] > 45 && p[0] > p[2].saturating_add(20))
+            .count();
+        assert!(
+            gold_bright_count > 400,
+            "high-metalness gold CustomPbr must render lustrous gold reflection, got only {gold_bright_count} warm metallic pixels"
+        );
+
+        // 1b. High-metalness NodeMaterial ("Brushed Metal", metalness=0.92) also renders bright metallic IBL.
+        let mut brushed_sphere = Object3D::new_shape_3d(
+            "BrushedMetalSphere",
+            Shape3DKind::Sphere {
+                radius: 12.0,
+                width_segments: 24,
+                height_segments: 16,
+            },
+        );
+        brushed_sphere.material = Some(MaterialSpec::NodeMaterial {
+            schema_version: 1,
+            resolution: 64,
+            graph: serde_json::json!({
+                "nodes": [
+                    { "id": "n1", "type": "voronoi", "params": { "scale": 10.0 } },
+                    { "id": "n2", "type": "fresnel", "params": { "ior": 1.8 } },
+                    { "id": "n3", "type": "float", "params": { "value": 0.92 } },
+                    { "id": "n4", "type": "mix", "params": { "a": [0.48, 0.56, 0.68], "b": [0.88, 0.92, 0.98] } },
+                    { "id": "n5", "type": "output" }
+                ],
+                "links": [
+                    { "from": "n2", "fromPort": "out", "to": "n4", "toPort": "factor" },
+                    { "from": "n4", "fromPort": "color", "to": "n5", "toPort": "color" },
+                    { "from": "n3", "fromPort": "out", "to": "n5", "toPort": "metalness" },
+                    { "from": "n1", "fromPort": "distance", "to": "n5", "toPort": "roughness" }
+                ]
+            }),
+        });
+        let brushed_proj = make_test_scene_project(
+            vec![cam.clone(), make_key_light(), brushed_sphere],
+            [96, 96],
+        );
+        let brushed_px = engine
+            .render_frame_rgba8(&brushed_proj, &plugins, 0.0, 96, 96)
+            .expect("render brushed metal NodeMaterial");
+        let brushed_lit_count = brushed_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 55 && p[1] > 55 && p[2] > 55)
+            .count();
+        assert!(
+            brushed_lit_count > 400,
+            "high-metalness NodeMaterial (Brushed Metal) must not render pitch-black, got only {brushed_lit_count} lit metallic pixels"
+        );
+
+        // 2. 3D MaterialSpec::CustomShader with GLSL ES 1.00 fragment shader renders real GLSL color.
+        let mut glsl_box = Object3D::new_shape_3d(
+            "GlslBox",
+            Shape3DKind::Box {
+                size: [18.0, 18.0, 18.0],
+            },
+        );
+        glsl_box.material = Some(MaterialSpec::CustomShader {
+            frag_shader:
+                "precision mediump float;\nuniform vec3 tint;\nvoid main() {\n    gl_FragColor = vec4(tint, 1.0);\n}\n"
+                    .to_owned(),
+            custom_properties: vec![CustomProperty {
+                name: "tint".to_owned(),
+                prop_type: None,
+                track: PropertyTrack::color([0.1, 0.9, 0.25]),
+                metadata: BTreeMap::new(),
+            }],
+        });
+        let glsl_proj = make_test_scene_project(vec![cam.clone(), glsl_box], [96, 96]);
+        let glsl_px = engine
+            .render_frame_rgba8(&glsl_proj, &plugins, 0.0, 96, 96)
+            .expect("render 3D GLSL custom shader");
+        let center_idx = (48 * 96 + 48) * 4;
+        assert!(
+            glsl_px[center_idx] < 50
+                && glsl_px[center_idx + 1] > 190
+                && glsl_px[center_idx + 2] < 90,
+            "3D GLSL CustomShader must render green tint [~25, ~230, ~64], got {:?}",
+            &glsl_px[center_idx..center_idx + 4]
+        );
+
+        // 3. PbrPlus BumpNoise (bumpStrength=1.0, bumpNoiseScale=8.0) renders smooth bump relief
+        //    without blown-out white TV static (< 5% clipped white pixels).
+        let mut bump_sphere = Object3D::new_shape_3d(
+            "BumpSphere",
+            Shape3DKind::Sphere {
+                radius: 11.0,
+                width_segments: 24,
+                height_segments: 16,
+            },
+        );
+        let mut bump_pbr = zc_project::PbrPlusMaterial {
+            base_color: PropertyTrack::color([0.45, 0.55, 0.7]),
+            roughness: PropertyTrack::number(0.4),
+            metalness: PropertyTrack::number(0.1),
+            ..Default::default()
+        };
+        bump_pbr
+            .preserved
+            .insert("bumpNoise".to_owned(), serde_json::json!(1));
+        bump_pbr
+            .preserved
+            .insert("bumpStrength".to_owned(), serde_json::json!(1.0));
+        bump_pbr
+            .preserved
+            .insert("bumpNoiseScale".to_owned(), serde_json::json!(8.0));
+        bump_sphere.material = Some(MaterialSpec::PbrPlus(Box::new(bump_pbr)));
+        let bump_proj =
+            make_test_scene_project(vec![cam.clone(), make_key_light(), bump_sphere], [96, 96]);
+        let bump_px = engine
+            .render_frame_rgba8(&bump_proj, &plugins, 0.0, 96, 96)
+            .expect("render bump sphere");
+        let mut bump_lit = 0usize;
+        let mut bump_white = 0usize;
+        for p in bump_px.as_chunks::<4>().0 {
+            if p[0] > 5 || p[1] > 5 || p[2] > 5 {
+                bump_lit += 1;
+                if p[0] > 245 && p[1] > 245 && p[2] > 245 {
+                    bump_white += 1;
+                }
+            }
+        }
+        assert!(bump_lit > 400, "bump sphere should be visible");
+        assert!(
+            bump_white * 20 < bump_lit,
+            "PbrPlus BumpNoise must not blow out into white static ({bump_white}/{bump_lit} white pixels)"
+        );
+
+        // 4. PbrPlus ColorRamp (`rampEnabled: 1`, purple -> pink -> yellow) remaps lit shading!
+        let mut ramp_sphere = Object3D::new_shape_3d(
+            "RampSphere",
+            Shape3DKind::Sphere {
+                radius: 11.0,
+                width_segments: 24,
+                height_segments: 16,
+            },
+        );
+        let mut ramp_pbr = zc_project::PbrPlusMaterial {
+            base_color: PropertyTrack::color([1.0, 1.0, 1.0]),
+            roughness: PropertyTrack::number(0.5),
+            metalness: PropertyTrack::number(0.0),
+            ..Default::default()
+        };
+        ramp_pbr
+            .preserved
+            .insert("rampEnabled".to_owned(), serde_json::json!(1));
+        ramp_pbr.preserved.insert(
+            "ramp".to_owned(),
+            serde_json::json!({
+                "stops": [
+                    { "position": 0.0, "color": [0.35, 0.05, 0.65] },
+                    { "position": 0.5, "color": [0.95, 0.25, 0.65] },
+                    { "position": 1.0, "color": [1.0, 0.95, 0.15] }
+                ]
+            }),
+        );
+        ramp_sphere.material = Some(MaterialSpec::PbrPlus(Box::new(ramp_pbr)));
+        let ramp_proj =
+            make_test_scene_project(vec![cam.clone(), make_key_light(), ramp_sphere], [96, 96]);
+        let ramp_px = engine
+            .render_frame_rgba8(&ramp_proj, &plugins, 0.0, 96, 96)
+            .expect("render color ramp sphere");
+        let has_purple_shadow = ramp_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[2] > 100 && p[2] > p[1].saturating_add(50));
+        let has_yellow_highlight = ramp_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[0] > 200 && p[1] > 170 && p[2] < 120);
+        assert!(
+            has_purple_shadow && has_yellow_highlight,
+            "PbrPlus ColorRamp must remap shadow->purple ({has_purple_shadow}) and highlight->yellow ({has_yellow_highlight})"
+        );
+
+        // 5. Matcap with texture: None renders smooth analytical studio clay shading (std_luma > 15).
+        let mut mc_sphere = Object3D::new_shape_3d(
+            "MatcapSphere",
+            Shape3DKind::Sphere {
+                radius: 11.0,
+                width_segments: 24,
+                height_segments: 16,
+            },
+        );
+        mc_sphere.material = Some(MaterialSpec::Matcap(Box::new(zc_project::MatcapMaterial {
+            texture: None,
+            ..Default::default()
+        })));
+        let mc_proj = make_test_scene_project(vec![cam.clone(), mc_sphere], [96, 96]);
+        let mc_px = engine
+            .render_frame_rgba8(&mc_proj, &plugins, 0.0, 96, 96)
+            .expect("render matcap fallback sphere");
+        let lumas: Vec<f32> = mc_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 5 || p[1] > 5 || p[2] > 5)
+            .map(|p| f32::from(p[0]))
+            .collect();
+        let mean_l = lumas.iter().sum::<f32>() / (lumas.len().max(1) as f32);
+        let var_l = lumas
+            .iter()
+            .map(|&l| (l - mean_l) * (l - mean_l))
+            .sum::<f32>()
+            / (lumas.len().max(1) as f32);
+        assert!(
+            var_l.sqrt() > 15.0,
+            "Matcap texture:None must render smooth clay sphere shading (std_luma={})",
+            var_l.sqrt()
+        );
+
+        // 6. LayerKind::Generator solid fill color honors `childProperty.color` and layer masks.
+        let mut gen_proj = Project::new_cm3_default();
+        gen_proj.sequence.resolution = [64, 64];
+        gen_proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        let mut gen_layer = Layer::new("ColorGen", LayerKind::Generator, [64, 64]);
+        gen_layer.preserved.insert(
+            "childProperty.color".to_owned(),
+            serde_json::json!([0.1, 0.85, 0.2]),
+        );
+        let gen_layer_id = gen_layer.id;
+        gen_proj.sequence.layer_masks.insert(
+            gen_layer_id,
+            vec![zc_project::LayerMask {
+                id: "mask-left-half".to_owned(),
+                name: "LeftHalf".to_owned(),
+                enabled: true,
+                mode: zc_project::MaskMode::Add,
+                invert: false,
+                feather: 0.0,
+                expansion: 0.0,
+                opacity: 1.0,
+                closed: true,
+                locked: false,
+                outline_color: String::new(),
+                vertex_ids: vec![
+                    "v0".to_owned(),
+                    "v1".to_owned(),
+                    "v2".to_owned(),
+                    "v3".to_owned(),
+                ],
+                vertex_modes: BTreeMap::new(),
+                path: PropertyTrack::constant(PropertyValue::Json(serde_json::json!([
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 32.0, 0.0, 0.0, 0.0, 0.0, 0.0, 32.0, 64.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 64.0, 0.0, 0.0, 0.0, 0.0
+                ]))),
+                preserved: BTreeMap::new(),
+            }],
+        );
+        gen_proj.sequence.video_tracks[0].clips[0].layer = gen_layer;
+        let gen_px = engine
+            .render_frame_rgba8(&gen_proj, &plugins, 0.0, 64, 64)
+            .expect("render generator layer with mask");
+        let left_px = &gen_px[(32 * 64 + 10) * 4..(32 * 64 + 10) * 4 + 4];
+        let right_px = &gen_px[(32 * 64 + 54) * 4..(32 * 64 + 54) * 4 + 4];
+        assert!(
+            left_px[1] > 180 && left_px[0] < 50 && right_px[1] < 15,
+            "Generator layer must fill solid green inside mask ({left_px:?}) and respect mask outside ({right_px:?})"
+        );
+
+        // 7. NodeMaterial imported in `.pz` wrapper format with bound texture asset renders texture.
+        let mut nm_proj = make_test_scene_project(vec![cam.clone(), make_key_light()], [64, 64]);
+        let tex_rgba = [255_u8, 40, 200, 255].repeat(16); // 4x4 bright magenta PNG
+        let asset_id = nm_proj.insert_binary_asset(
+            zc_project::AssetKind::Image,
+            "magenta.png",
+            encode_test_png(4, 4, tex_rgba),
+        );
+        let inner_graph = serde_json::json!({
+            "nodes": [
+                { "id": "img", "type": "imageTexture", "params": { "assetId": asset_id } },
+                { "id": "out", "type": "output" }
+            ],
+            "links": [
+                { "from": "img", "fromPort": "out", "to": "out", "toPort": "color" }
+            ]
+        });
+        let pz_wrapped = serde_json::json!({
+            "type": "zoidium:material-plus/nodes",
+            "properties": {
+                "bakeResolution": 1,
+                "graph": inner_graph.to_string()
+            }
+        });
+        let mut nm_quad =
+            Object3D::new_shape_3d("NmQuad", Shape3DKind::Rectangle { size: [30.0, 30.0] });
+        nm_quad.material = Some(MaterialSpec::NodeMaterial {
+            schema_version: 1,
+            resolution: 64,
+            graph: pz_wrapped,
+        });
+        if let LayerKind::Scene3D { objects, .. } =
+            &mut nm_proj.sequence.video_tracks[0].clips[0].layer.kind
+        {
+            objects.push(nm_quad);
+        }
+        let nm_px = engine
+            .render_frame_rgba8(&nm_proj, &plugins, 0.0, 64, 64)
+            .expect("render .pz wrapped NodeMaterial");
+        let nm_c = &nm_px[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4];
+        assert!(
+            nm_c[0] > 140 && nm_c[2] > 100 && nm_c[1] < 80,
+            ".pz NodeMaterial with bound texture must render magenta texture (not flat white), got {nm_c:?}"
+        );
+
+        // 8. 2D Image Layer aspect-ratio preservation on vertical 108x192 (9:16) sequence.
+        let mut img_proj = Project::new_cm3_default();
+        img_proj.sequence.resolution = [108, 192];
+        img_proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        let sq_rgba = [255_u8, 128, 0, 255].repeat(64 * 64);
+        let sq_id = img_proj.insert_binary_asset(
+            zc_project::AssetKind::Image,
+            "square.png",
+            encode_test_png(64, 64, sq_rgba),
+        );
+        let img_layer = Layer::new("SqImg", LayerKind::Image { image: Some(sq_id) }, [108, 192]);
+        img_proj.sequence.video_tracks[0].clips[0].layer = img_layer;
+        let img_px = engine
+            .render_frame_rgba8(&img_proj, &plugins, 0.0, 108, 192)
+            .expect("render 9:16 image");
+        let (mut min_x, mut max_x, mut min_y, mut max_y) = (108usize, 0usize, 192usize, 0usize);
+        for y in 0..192 {
+            for x in 0..108 {
+                if img_px[(y * 108 + x) * 4] > 100 {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        let span_w = (max_x + 1).saturating_sub(min_x) as f32;
+        let span_h = (max_y + 1).saturating_sub(min_y) as f32;
+        assert!(
+            (span_w - span_h).abs() <= 2.0 && span_w > 100.0,
+            "square PNG on 108x192 must stay square (~108x108), got {span_w}x{span_h}"
+        );
+
+        // 9. Text+ character-material without characterNumbers applies to ALL glyphs (not just glyph 0).
+        let mut text_obj = Object3D::new_text_3d("ABC");
+        text_obj.material = Some(MaterialSpec::SingleColor {
+            color: PropertyTrack::color([0.1, 0.1, 0.9]),
+            side: 0,
+        });
+        let mut cm_grp = Object3D::new(
+            "CharMat",
+            Object3DKind::Group {
+                reflection_visibility: 0,
+                custom_properties: Vec::new(),
+                children: vec![text_obj],
+            },
+        );
+        cm_grp.preserved.insert(
+            "zoidiumPluginObjectType".to_owned(),
+            serde_json::json!("zoidium:text-plus/character-material"),
+        );
+        cm_grp.material_slots.insert(
+            "front".to_owned(),
+            MaterialSpec::SingleColor {
+                color: PropertyTrack::color([1.0, 0.1, 0.1]),
+                side: 0,
+            },
+        );
+        let cm_proj = make_test_scene_project(vec![cam.clone(), cm_grp], [160, 80]);
+        let cm_px = engine
+            .render_frame_rgba8(&cm_proj, &plugins, 0.0, 160, 80)
+            .expect("render character-material all glyphs");
+        let right_half_red = (85..155)
+            .flat_map(|x| (10..70).map(move |y| (x, y)))
+            .filter(|&(x, y)| {
+                let o = (y * 160 + x) * 4;
+                cm_px[o] > 180 && cm_px[o + 2] < 60
+            })
+            .count();
+        assert!(
+            right_half_red > 20,
+            "character-material with no filter must color right-side glyphs too, got {right_half_red} red pixels on right half"
+        );
+
+        // 10. ExpressText+ Random honors randomAnimationSpeed > 0 across frames,
+        //     and Voronoi stays intact at frame 0 when distance == 0 && scatter == 0.
+        let mut rand_text = Object3D::new_text_3d("HI");
+        rand_text.material = Some(MaterialSpec::SingleColor {
+            color: PropertyTrack::color([1.0, 1.0, 1.0]),
+            side: 0,
+        });
+        rand_text.preserved.insert(
+            "expressProperties".to_owned(),
+            serde_json::json!({
+                "effectors": [{
+                    "kind": "random",
+                    "properties": {
+                        "randomAnimationSpeed": 120.0,
+                        "randomPositionMin": [-8.0, -8.0, 0.0],
+                        "randomPositionMax": [8.0, 8.0, 0.0]
+                    }
+                }]
+            }),
+        );
+        let rand_proj = make_test_scene_project(vec![cam.clone(), rand_text], [120, 80]);
+        let rand_f0 = engine
+            .render_frame_rgba8(&rand_proj, &plugins, 0.0, 120, 80)
+            .expect("et random f0");
+        let rand_f20 = engine
+            .render_frame_rgba8(&rand_proj, &plugins, 20.0, 120, 80)
+            .expect("et random f20");
+        assert_ne!(
+            rand_f0, rand_f20,
+            "ExpressText+ Random with randomAnimationSpeed > 0 must animate across frames"
+        );
+
+        let mut base_v_text = Object3D::new_text_3d("HI");
+        base_v_text.material = Some(MaterialSpec::SingleColor {
+            color: PropertyTrack::color([1.0, 1.0, 1.0]),
+            side: 0,
+        });
+        let mut vor_v_text = base_v_text.clone();
+        vor_v_text.preserved.insert(
+            "expressProperties".to_owned(),
+            serde_json::json!({
+                "effectors": [{
+                    "kind": "voronoi",
+                    "properties": {
+                        "voronoiChunks": 8.0,
+                        "voronoiDistance": 0.0,
+                        "voronoiScatter": 0.0,
+                        "voronoiSpin": [45.0, 45.0, 45.0]
+                    }
+                }]
+            }),
+        );
+        let base_v_proj = make_test_scene_project(vec![cam.clone(), base_v_text], [120, 80]);
+        let vor_v_proj = make_test_scene_project(vec![cam, vor_v_text], [120, 80]);
+        let base_v_px = engine
+            .render_frame_rgba8(&base_v_proj, &plugins, 0.0, 120, 80)
+            .expect("base voronoi text");
+        let vor_v_px = engine
+            .render_frame_rgba8(&vor_v_proj, &plugins, 0.0, 120, 80)
+            .expect("voronoi distance=0 text");
+        assert_eq!(
+            base_v_px, vor_v_px,
+            "ExpressText+ Voronoi must keep text 100% intact when distance == 0 && scatter == 0"
         );
     }
 }

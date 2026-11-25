@@ -48,7 +48,7 @@ fn rbs_hash(p: vec2<f32>) -> f32 {
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     const SAMPLES: i32 = 24;
-    let center_offset = vec2<f32>(0.5) + u.p0.xy * 0.45;
+    let center_offset = u.p0.xy;
     let density = u.p0.z;
     let dither = u.p0.w;
     let decay = u.p1.x;
@@ -1085,8 +1085,10 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 
     let cadence = floor(eff_t * max(speed, 0.01) * 6.0) + seed * 17.0;
     if (has_aux && hash12(vec2<f32>(cadence, 17.0)) < hold) {
-        let anch_rgb = unpremultiply(sample_aux(in_v.v_uv));
-        return premultiply(mix(orig_rgb, anch_rgb, amount), orig.a);
+        let anch = sample_aux(in_v.v_uv);
+        let held = mix(orig, anch, amount);
+        let ha = clamp(held.a, 0.0, 1.0);
+        return vec4<f32>(clamp(held.rgb, vec3<f32>(0.0), vec3<f32>(ha)), ha);
     }
 
     // Motion-matching path (algorithm == 0 with live motion field)
@@ -1097,17 +1099,19 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         let mv_dims = max(vec2<f32>(textureDimensions(t_aux2, 0)), vec2<f32>(1.0));
         let total = sample_aux2(clamp((blk + vec2<f32>(0.5)) / mv_dims, vec2<f32>(0.0), vec2<f32>(1.0))).rg;
         let v = dm_transform_motion(total, blk, p, res) * speed;
-        var moshed = unpremultiply(sample_aux(dm_tex_coord(p - v, res)));
-        let stretched = unpremultiply(sample_aux(dm_tex_coord(p - v * accel * 0.5, res)));
-        moshed = mix(moshed, stretched, clamp(accel * 0.45, 0.0, 0.8));
+        let m1 = sample_aux(dm_tex_coord(p - v, res));
+        let m2 = sample_aux(dm_tex_coord(p - v * accel * 0.5, res));
+        let moshed_rgba = mix(m1, m2, clamp(accel * 0.45, 0.0, 0.8));
+        let moshed = unpremultiply(moshed_rgba);
         let c_delta = abs(orig_rgb - moshed);
-        let diff = max(c_delta.r, max(c_delta.g, c_delta.b));
+        let diff = max(max(c_delta.r, max(c_delta.g, c_delta.b)), abs(orig.a - moshed_rgba.a));
         let jit = (hash12(blk + vec2<f32>(seed, u.p3.z)) - 0.5) * 0.30 * intensity;
         let act = smoothstep(threshold, threshold + 0.22, diff + jit);
         let m = clamp(act * blend_w * 1.4 * amount, 0.0, 1.0);
-        var col = mix(orig_rgb, moshed, m);
-        col = col + vec3<f32>((hash12(floor(p) + vec2<f32>(u.frame, seed * 1.7)) - 0.5) * 0.02 * m);
-        return premultiply(col, orig.a);
+        var out_rgba = mix(orig, moshed_rgba, m);
+        let out_a = clamp(out_rgba.a, 0.0, 1.0);
+        let grain = (hash12(floor(p) + vec2<f32>(u.frame, seed * 1.7)) - 0.5) * 0.02 * m * out_a;
+        return vec4<f32>(clamp(out_rgba.rgb + vec3<f32>(grain), vec3<f32>(0.0), vec3<f32>(out_a)), out_a);
     }
 
     // Analytic look families (algorithm >= 1, or single-frame fallback)
@@ -1189,11 +1193,14 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
             m_uv = vec2<f32>(in_v.v_uv.x, max(in_v.v_uv.y, 1.0 - in_v.v_uv.y));
         }
         m_uv = clamp(in_v.v_uv + (m_uv - in_v.v_uv) * speed, vec2<f32>(0.0), vec2<f32>(1.0));
-        let mc = unpremultiply(select(sample_diffuse(m_uv), sample_aux(m_uv), has_aux));
+        let mc_rgba = select(sample_diffuse(m_uv), sample_aux(m_uv), has_aux);
+        let mc = unpremultiply(mc_rgba);
         let delta = abs(orig_rgb - mc);
-        act = max(act, smoothstep(threshold, threshold + 0.22, max(delta.r, max(delta.g, delta.b))));
+        act = max(act, smoothstep(threshold, threshold + 0.22, max(max(delta.r, max(delta.g, delta.b)), abs(orig.a - mc_rgba.a))));
         let mm = clamp(act * amount * clamp(blend_w * 1.5, 0.0, 1.0), 0.0, 1.0);
-        return premultiply(mix(orig_rgb, mc, mm), orig.a);
+        let out_m = mix(orig, mc_rgba, mm);
+        let ma = clamp(out_m.a, 0.0, 1.0);
+        return vec4<f32>(clamp(out_m.rgb, vec3<f32>(0.0), vec3<f32>(ma)), ma);
     } else if (a < 52.5) {
         let sp = fract(eff_t * (0.1 + speed * 0.25));
         var s_uv = in_v.v_uv;
@@ -1206,11 +1213,14 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         } else {
             s_uv.y = fract(in_v.v_uv.y - sp * inten * 2.0);
         }
-        let sc = unpremultiply(select(sample_diffuse(s_uv), sample_aux(s_uv), has_aux));
+        let sc_rgba = select(sample_diffuse(s_uv), sample_aux(s_uv), has_aux);
+        let sc = unpremultiply(sc_rgba);
         let delta = abs(orig_rgb - sc);
-        act = max(act, smoothstep(threshold, threshold + 0.22, max(delta.r, max(delta.g, delta.b))));
+        act = max(act, smoothstep(threshold, threshold + 0.22, max(max(delta.r, max(delta.g, delta.b)), abs(orig.a - sc_rgba.a))));
         let sm = clamp(act * amount * clamp(blend_w * 1.5, 0.0, 1.0), 0.0, 1.0);
-        return premultiply(mix(orig_rgb, sc, sm), orig.a);
+        let out_s = mix(orig, sc_rgba, sm);
+        let sa = clamp(out_s.a, 0.0, 1.0);
+        return vec4<f32>(clamp(out_s.rgb, vec3<f32>(0.0), vec3<f32>(sa)), sa);
     } else {
         let sx = sin(bid.y * 0.45 + eff_t * (2.0 + speed * 2.0));
         let cy = cos(bid.x * 0.4 + eff_t * 2.5);
@@ -1221,17 +1231,19 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     v = v * speed;
     let suv = clamp(in_v.v_uv - v * act * 0.05, vec2<f32>(0.0), vec2<f32>(1.0));
     let q = clamp(floor(suv * res / bs) * bs / res + (vec2<f32>(bs * 0.5) / res), vec2<f32>(0.0), vec2<f32>(1.0));
-    var mosh = unpremultiply(select(sample_diffuse(q), sample_aux(q), has_aux));
+    let s1 = select(sample_diffuse(q), sample_aux(q), has_aux);
     let q_str = clamp(q - v * act * 0.05 * accel, vec2<f32>(0.0), vec2<f32>(1.0));
-    let stretched = unpremultiply(select(sample_diffuse(q_str), sample_aux(q_str), has_aux));
-    mosh = mix(mosh, stretched, clamp(accel * 0.45, 0.0, 0.8));
+    let s2 = select(sample_diffuse(q_str), sample_aux(q_str), has_aux);
+    let mosh_rgba = mix(s1, s2, clamp(accel * 0.45, 0.0, 0.8));
+    let mosh = unpremultiply(mosh_rgba);
 
     let c_delta = abs(orig_rgb - mosh);
-    act = max(act, smoothstep(threshold, threshold + 0.22, max(c_delta.r, max(c_delta.g, c_delta.b))));
+    act = max(act, smoothstep(threshold, threshold + 0.22, max(max(c_delta.r, max(c_delta.g, c_delta.b)), abs(orig.a - mosh_rgba.a))));
     let m = clamp(act * blend_w * 1.4 * amount, 0.0, 1.0);
-    var col = mix(orig_rgb, mosh, m);
-    col = col + vec3<f32>((hash12(floor(in_v.v_uv * res) + vec2<f32>(cadence, cadence * 1.7)) - 0.5) * 0.02 * m);
-    return premultiply(col, orig.a);
+    let out_rgba = mix(orig, mosh_rgba, m);
+    let out_a = clamp(out_rgba.a, 0.0, 1.0);
+    let grain = (hash12(floor(in_v.v_uv * res) + vec2<f32>(cadence, cadence * 1.7)) - 0.5) * 0.02 * m * out_a;
+    return vec4<f32>(clamp(out_rgba.rgb + vec3<f32>(grain), vec3<f32>(0.0), vec3<f32>(out_a)), out_a);
 }
 "#;
 
@@ -1729,7 +1741,7 @@ fn ascii_glyph_bit(charset: u32, band: u32, gx: u32, gy: u32, font_style: u32) -
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let res = max(u.resolution, vec2<f32>(1.0));
-    let cell_sz = max(u.p0.xy, vec2<f32>(4.0));
+    let cell_sz = max(u.p0.xy, vec2<f32>(2.0));
     var px = in_v.v_uv * res;
     let t = u.time;
 
@@ -2188,8 +2200,14 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let light = clamp(u.p2.w, 0.0, 1.0);
     rgb = rgb * mix(vec3<f32>(1.0), 2.0 * source.rgb, light);
     rgb = max(rgb, vec3<f32>(0.0));
-
-    let coverage = clamp(max(rgb.r, max(rgb.g, rgb.b)), 0.0, 1.0);
+    // Softly cut off negligible far-field glow haze so transparent corners stay strictly alpha = 0.
+    let raw_peak = max(rgb.r, max(rgb.g, rgb.b));
+    let tail_gate = smoothstep(0.005, 0.018, raw_peak);
+    rgb = rgb * tail_gate;
+    let coverage_raw = clamp(max(rgb.r, max(rgb.g, rgb.b)), 0.0, 1.0);
+    let keep_glow = coverage_raw >= 0.004;
+    let coverage = select(0.0, coverage_raw, keep_glow);
+    rgb = select(vec3<f32>(0.0), rgb, keep_glow);
     let affect = clamp(u.p0.w, 0.0, 1.0);
     let source_opacity = clamp(u.p0.y, 0.0, 1.0);
     let preserve = 1.0 - affect;
@@ -2232,15 +2250,18 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 /// - `p1 = [shutterStart (-0.5 default), shutterSpan (1.0 default), 0, 0]`.
 pub const SHADER_SMART_MOTION_BLUR: &str = r#"
 fn smb_luma_cur(uv: vec2<f32>) -> f32 {
-    return luma601(unpremultiply(sample_diffuse(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)))));
+    let c = sample_diffuse(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+    return luma601(c.rgb) + c.a * 0.2;
 }
 
 fn smb_luma_prev(uv: vec2<f32>) -> f32 {
-    return luma601(unpremultiply(sample_aux(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)))));
+    let c = sample_aux(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+    return luma601(c.rgb) + c.a * 0.2;
 }
 
 fn smb_luma_next(uv: vec2<f32>) -> f32 {
-    return luma601(unpremultiply(sample_aux2(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)))));
+    let c = sample_aux2(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+    return luma601(c.rgb) + c.a * 0.2;
 }
 
 fn smb_structure_tensor_flow(

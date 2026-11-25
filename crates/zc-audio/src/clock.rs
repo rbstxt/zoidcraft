@@ -745,8 +745,8 @@ impl MasterPlaybackClock {
             });
 
         let shared_cb = Arc::clone(&self.shared);
-        let err_fn = |err| {
-            tracing::error!("cpal output stream error: {err}");
+        let err_fn = |err: cpal::Error| {
+            log_cpal_stream_error(&err);
         };
 
         let ch_usize = usize::from(device_channels);
@@ -962,6 +962,23 @@ impl MasterPlaybackClock {
             loop_head_slot,
             loop_head_gen,
         })
+    }
+}
+
+#[inline]
+fn is_transient_cpal_xrun(err: &cpal::Error) -> bool {
+    if err.kind() == cpal::ErrorKind::Xrun {
+        return true;
+    }
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("underrun") || msg.contains("overrun")
+}
+
+fn log_cpal_stream_error(err: &cpal::Error) {
+    if is_transient_cpal_xrun(err) {
+        tracing::debug!("cpal output stream transient xrun: {err}");
+    } else {
+        tracing::error!("cpal output stream error: {err}");
     }
 }
 
@@ -1628,5 +1645,32 @@ mod tests {
             "expected loop_head sample 0.75 after wrap, got {}",
             out[2_000 * 2]
         );
+    }
+
+    #[test]
+    fn cpal_xrun_classified_as_transient_while_device_errors_remain_errors() {
+        assert!(is_transient_cpal_xrun(&cpal::Error::new(
+            cpal::ErrorKind::Xrun
+        )));
+        assert!(is_transient_cpal_xrun(&cpal::Error::with_message(
+            cpal::ErrorKind::BackendError,
+            "A buffer underrun or overrun occurred."
+        )));
+        assert!(is_transient_cpal_xrun(&cpal::Error::with_message(
+            cpal::ErrorKind::Other,
+            "CoreAudio buffer OVERRUN on startup"
+        )));
+        assert!(!is_transient_cpal_xrun(&cpal::Error::new(
+            cpal::ErrorKind::DeviceNotAvailable
+        )));
+        assert!(!is_transient_cpal_xrun(&cpal::Error::new(
+            cpal::ErrorKind::HostUnavailable
+        )));
+        assert!(!is_transient_cpal_xrun(&cpal::Error::new(
+            cpal::ErrorKind::StreamInvalidated
+        )));
+        assert!(!is_transient_cpal_xrun(&cpal::Error::new(
+            cpal::ErrorKind::BackendError
+        )));
     }
 }

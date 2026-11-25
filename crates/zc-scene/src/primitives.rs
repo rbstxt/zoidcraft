@@ -385,6 +385,10 @@ fn extrude_star_contour_z(
 
 /// Geometry+ `RoundedBox` (`zoidium:geometry-plus/rounded-box`) with independent XY corner radius,
 /// corner segments, Z-edge bevel size, bevel segments, and smooth/flat shading toggle.
+///
+/// Generates exact analytical normals so flat face interiors have crisp planar normals
+/// transitioning smoothly into XY corner fillets and Z bevels without cap-edge seams
+/// or pillowy diagonal shading.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn build_rounded_box_ext(
@@ -402,44 +406,263 @@ pub fn build_rounded_box_ext(
     let d = depth.max(0.1);
     let hw = w * 0.5;
     let hh = h * 0.5;
+    let half_z = d * 0.5;
     let radius = corner_radius.max(0.0).min(hw).min(hh);
     let c_segs = corner_segments.max(1);
 
-    let mut contour: Vec<Vec2> = Vec::new();
-    if radius <= 1e-5 {
-        contour.push(Vec2::new(-hw, -hh));
-        contour.push(Vec2::new(hw, -hh));
-        contour.push(Vec2::new(hw, hh));
-        contour.push(Vec2::new(-hw, hh));
+    let max_bevel = (half_z * 0.98).min(hw * 0.48).min(hh * 0.48);
+    let bevel = bevel_size.max(0.0).min(max_bevel);
+    let b_segs = if bevel > 1e-5 {
+        bevel_segments.max(1)
     } else {
-        // 4 CCW corner arcs: bottom-right, top-right, top-left, bottom-left.
-        let corners = [
-            (Vec2::new(hw - radius, -hh + radius), -FRAC_PI_2, 0.0_f32),
-            (Vec2::new(hw - radius, hh - radius), 0.0_f32, FRAC_PI_2),
-            (Vec2::new(-hw + radius, hh - radius), FRAC_PI_2, PI),
-            (Vec2::new(-hw + radius, -hh + radius), PI, PI + FRAC_PI_2),
+        0
+    };
+
+    // Build analytical profile rings: (z, inset, radial_normal_weight, z_normal).
+    // At the cap boundaries (front k=0, back k=b_segs), normal is exactly (0, 0, +-1)
+    // so the bevel blends seamlessly into the flat caps with zero "square sticker" seam.
+    let mut rings_spec: Vec<(f32, f32, f32, f32)> = Vec::new();
+    if b_segs > 0 {
+        let straight_half = (half_z - bevel).max(0.0);
+        for k in 0..=b_segs {
+            let a = FRAC_PI_2 * (k as f32 / b_segs as f32);
+            let (sin_a, cos_a) = a.sin_cos();
+            let z = straight_half + bevel * cos_a;
+            let inset = bevel * (1.0 - sin_a);
+            rings_spec.push((z, inset, sin_a, cos_a));
+        }
+        let back_start = if straight_half > 1e-5 { 0 } else { 1 };
+        for k in back_start..=b_segs {
+            let a = FRAC_PI_2 * (k as f32 / b_segs as f32);
+            let (sin_a, cos_a) = a.sin_cos();
+            let z = -straight_half - bevel * sin_a;
+            let inset = bevel * (1.0 - cos_a);
+            rings_spec.push((z, inset, cos_a, -sin_a));
+        }
+    } else {
+        rings_spec.push((half_z, 0.0, 1.0, 0.0));
+        rings_spec.push((-half_z, 0.0, 1.0, 0.0));
+    }
+
+    let mut vertices: Vec<Vertex3D> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let ring_count = rings_spec.len() as u32;
+
+    if radius <= 1e-5 {
+        // Sharp 90-degree XY corners: emit 4 independent planar side strips so flat walls
+        // never average normals across 90-degree creases (eliminating pillowy diagonals)
+        // while each bevel strip curves smoothly from (0,0,+-1) cap normals into (nx,ny,0).
+        struct SideStrip {
+            s0: [f32; 2],
+            s1: [f32; 2],
+            side_n: Vec2,
+            u0: f32,
+            u1: f32,
+        }
+        let sides = [
+            SideStrip {
+                s0: [-1.0, -1.0],
+                s1: [1.0, -1.0],
+                side_n: Vec2::new(0.0, -1.0),
+                u0: 0.0,
+                u1: 0.25,
+            },
+            SideStrip {
+                s0: [1.0, -1.0],
+                s1: [1.0, 1.0],
+                side_n: Vec2::new(1.0, 0.0),
+                u0: 0.25,
+                u1: 0.50,
+            },
+            SideStrip {
+                s0: [1.0, 1.0],
+                s1: [-1.0, 1.0],
+                side_n: Vec2::new(0.0, 1.0),
+                u0: 0.50,
+                u1: 0.75,
+            },
+            SideStrip {
+                s0: [-1.0, 1.0],
+                s1: [-1.0, -1.0],
+                side_n: Vec2::new(-1.0, 0.0),
+                u0: 0.75,
+                u1: 1.0,
+            },
         ];
-        for (center, a0, a1) in corners {
+
+        for SideStrip {
+            s0,
+            s1,
+            side_n,
+            u0,
+            u1,
+        } in sides
+        {
+            let base = vertices.len() as u32;
+            for &(z, inset, nr, nz) in &rings_spec {
+                let ihw = (hw - inset).max(0.0);
+                let ihh = (hh - inset).max(0.0);
+                let n_vec = Vec3::new(side_n.x * nr, side_n.y * nr, nz).normalize_or_zero();
+                let n_arr = if n_vec.length_squared() > 1e-12 {
+                    n_vec.to_array()
+                } else {
+                    [side_n.x, side_n.y, 0.0]
+                };
+                let v_coord = (z + half_z) / d;
+                vertices.push(Vertex3D::new(
+                    [s0[0] * ihw, s0[1] * ihh, z],
+                    n_arr,
+                    [u0, v_coord],
+                    1,
+                ));
+                vertices.push(Vertex3D::new(
+                    [s1[0] * ihw, s1[1] * ihh, z],
+                    n_arr,
+                    [u1, v_coord],
+                    1,
+                ));
+            }
+            for r in 0..(ring_count - 1) {
+                let r0 = base + r * 2;
+                let r1 = base + (r + 1) * 2;
+                indices.extend_from_slice(&[r0, r1, r1 + 1, r0, r1 + 1, r0 + 1]);
+            }
+        }
+
+        // Front (+Z) and Back (-Z) flat rectangular caps matching the inner cap inset.
+        let cap_inset = rings_spec[0].1;
+        let chw = (hw - cap_inset).max(0.0);
+        let chh = (hh - cap_inset).max(0.0);
+        let cap_corners = [
+            Vec2::new(-chw, -chh),
+            Vec2::new(chw, -chh),
+            Vec2::new(chw, chh),
+            Vec2::new(-chw, chh),
+        ];
+        for (z, is_front) in [(half_z, true), (-half_z, false)] {
+            let normal = [0.0, 0.0, if is_front { 1.0 } else { -1.0 }];
+            let base = vertices.len() as u32;
+            for p in cap_corners {
+                let uv = [(p.x + hw) / w, (p.y + hh) / h];
+                vertices.push(Vertex3D::new([p.x, p.y, z], normal, uv, 0));
+            }
+            if is_front {
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            } else {
+                indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+            }
+        }
+    } else {
+        // Rounded XY corners: 4 CCW quarter-circle arcs connected by 4 straight edges.
+        // Arc endpoints carry exact cardinal normals ((0,-1), (1,0), (0,1), (-1,0)), so
+        // straight faces stay strictly planar and blend C1-smoothly into corners and Z bevels.
+        let corners_spec: [(f32, f32, f32, f32); 4] = [
+            (1.0, -1.0, -FRAC_PI_2, 0.0),
+            (1.0, 1.0, 0.0, FRAC_PI_2),
+            (-1.0, 1.0, FRAC_PI_2, PI),
+            (-1.0, -1.0, PI, PI + FRAC_PI_2),
+        ];
+
+        // Build per-sample parametric template around the closed CCW perimeter (4 * (c_segs + 1) + 1 seam).
+        let mut ring_samples: Vec<(f32, f32, Vec2)> =
+            Vec::with_capacity((4 * (c_segs + 1) + 1) as usize);
+        for (sx, sy, a0, a1) in corners_spec {
             for k in 0..=c_segs {
                 let t = k as f32 / c_segs as f32;
                 let angle = a0 + (a1 - a0) * t;
-                let pt = center + Vec2::new(angle.cos() * radius, angle.sin() * radius);
-                if contour
-                    .last()
-                    .is_none_or(|prev| prev.distance_squared(pt) > 1e-8)
-                {
-                    contour.push(pt);
+                ring_samples.push((sx, sy, Vec2::new(angle.cos(), angle.sin())));
+            }
+        }
+        // Close the loop explicitly at the seam (same as sample 0, u = 1.0).
+        ring_samples.push(ring_samples[0]);
+
+        let sample_point = |sx: f32, sy: f32, xy_n: Vec2, inset: f32| -> Vec2 {
+            let eff_r = (radius - inset).max(0.0);
+            let cx = sx * (hw - radius.max(inset)).max(0.0);
+            let cy = sy * (hh - radius.max(inset)).max(0.0);
+            Vec2::new(cx, cy) + xy_n * eff_r
+        };
+
+        // Compute normalized arc-length U along outer perimeter (inset = 0).
+        let outer_pts: Vec<Vec2> = ring_samples
+            .iter()
+            .map(|&(sx, sy, xy_n)| sample_point(sx, sy, xy_n, 0.0))
+            .collect();
+        let mut cum_u = Vec::with_capacity(outer_pts.len());
+        cum_u.push(0.0_f32);
+        let mut perim = 0.0_f32;
+        for pair in outer_pts.windows(2) {
+            perim += pair[0].distance(pair[1]);
+            cum_u.push(perim);
+        }
+        let inv_perim = if perim > 1e-6 { 1.0 / perim } else { 1.0 };
+
+        let stride = ring_samples.len() as u32;
+        let strip_base = vertices.len() as u32;
+        for &(z, inset, nr, nz) in &rings_spec {
+            let v_coord = (z + half_z) / d;
+            for (j, &(sx, sy, xy_n)) in ring_samples.iter().enumerate() {
+                let p2 = sample_point(sx, sy, xy_n, inset);
+                let n_vec = Vec3::new(xy_n.x * nr, xy_n.y * nr, nz).normalize_or_zero();
+                let n_arr = if n_vec.length_squared() > 1e-12 {
+                    n_vec.to_array()
+                } else {
+                    [xy_n.x, xy_n.y, 0.0]
+                };
+                vertices.push(Vertex3D::new(
+                    [p2.x, p2.y, z],
+                    n_arr,
+                    [cum_u[j] * inv_perim, v_coord],
+                    1,
+                ));
+            }
+        }
+        for r in 0..(ring_count - 1) {
+            let r0 = strip_base + r * stride;
+            let r1 = strip_base + (r + 1) * stride;
+            for j in 0..(stride - 1) {
+                let a = r0 + j;
+                let b = r1 + j;
+                let c = r1 + j + 1;
+                let d_idx = r0 + j + 1;
+                indices.extend_from_slice(&[a, b, c, a, c, d_idx]);
+            }
+        }
+
+        // Front (+Z) & Back (-Z) flat caps matching the inner bevel ring (inset = rings_spec[0].1).
+        let cap_inset = rings_spec[0].1;
+        let cap_ring: Vec<Vec2> = ring_samples[..ring_samples.len() - 1]
+            .iter()
+            .map(|&(sx, sy, xy_n)| sample_point(sx, sy, xy_n, cap_inset))
+            .collect();
+        let cap_n = cap_ring.len() as u32;
+        for (z, is_front) in [(half_z, true), (-half_z, false)] {
+            let normal = [0.0, 0.0, if is_front { 1.0 } else { -1.0 }];
+            let c_idx = vertices.len() as u32;
+            vertices.push(Vertex3D::new([0.0, 0.0, z], normal, [0.5, 0.5], 0));
+            let ring_start = vertices.len() as u32;
+            for &p in &cap_ring {
+                let uv = [(p.x + hw) / w, (p.y + hh) / h];
+                vertices.push(Vertex3D::new([p.x, p.y, z], normal, uv, 0));
+            }
+            for i in 0..cap_n {
+                let a = ring_start + i;
+                let b = ring_start + ((i + 1) % cap_n);
+                if is_front {
+                    indices.extend_from_slice(&[c_idx, a, b]);
+                } else {
+                    indices.extend_from_slice(&[c_idx, b, a]);
                 }
             }
         }
-        while contour.len() > 3
-            && contour[0].distance_squared(*contour.last().unwrap_or(&contour[0])) <= 1e-8
-        {
-            contour.pop();
-        }
     }
 
-    extrude_star_contour_z(&contour, d, bevel_size, bevel_segments, smooth)
+    let mut mesh = MeshData::new(vertices, indices);
+    mesh.center_at_origin();
+    if !smooth {
+        apply_flat_normals(&mut mesh);
+    }
+    mesh
 }
 
 /// Geometry+ `Gear` (`zoidium:geometry-plus/gear`): extruded toothed gear with optional bevels.

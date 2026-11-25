@@ -37,7 +37,7 @@ pub use mesh::{
     MAX_SMOOTH_TRIANGLES, MeshData, Vertex3D, budget_subdivision, build_box, build_capsule,
     build_circle, build_cylinder, build_dodecahedron, build_donut, build_icosahedron,
     build_octahedron, build_rectangle, build_rounded_box, build_sphere, build_tetrahedron,
-    build_wire, compute_bounds, subdivide_mesh, subdivision_polygons,
+    build_wire, build_wire_in_bounds, compute_bounds, subdivide_mesh, subdivision_polygons,
 };
 pub use obj_loader::{ObjLoadError, parse_obj};
 pub use particles::{
@@ -57,8 +57,10 @@ pub use primitives::{
 pub use text3d::{
     BevelProfile, BevelSide, Text3DCharacterMesh, Text3DError, Text3DExtendedOptions, Text3DParams,
     TextAlignMode, TextScaleMode, UvMode, build_fallback_text_mesh,
-    build_fallback_text_mesh_with_options, build_text3d_character_meshes, build_text3d_mesh,
-    build_text3d_mesh_with_options, extrude_contours, extrude_contours_with_options,
+    build_fallback_text_mesh_with_options, build_text3d_character_meshes,
+    build_text3d_character_meshes_with_fallback, build_text3d_mesh,
+    build_text3d_mesh_with_fallback, build_text3d_mesh_with_options, extrude_contours,
+    extrude_contours_with_options, font_has_missing_glyphs,
 };
 
 #[cfg(test)]
@@ -998,33 +1000,49 @@ mod tests {
             ..Text3DParams::default()
         };
 
-        // Outside bevel expands XY bounds to 10 + 2*1 = 12; Inside bevel keeps XY bounds at 10!
-        let m_out = extrude_contours_with_options(
+        // Both bevels front & back (Z span = 4 + 2*1 = 6); Front bevels front only (Z span = 5);
+        // Back bevels back only (Z span = 5). All keep clean XY outset = 10 + 2*1 = 12 without cap holes.
+        let m_both = extrude_contours_with_options(
             &rect,
             &base_params,
             &Text3DExtendedOptions {
-                bevel_side: BevelSide::Outside,
+                bevel_side: BevelSide::Both,
                 bevel_profile: BevelProfile::Round,
                 bevel_tension: 0.5,
                 ..Text3DExtendedOptions::default()
             },
         )
-        .expect("outside bevel");
-        let m_in = extrude_contours_with_options(
+        .expect("both bevel");
+        let m_front = extrude_contours_with_options(
             &rect,
             &base_params,
             &Text3DExtendedOptions {
-                bevel_side: BevelSide::Inside,
+                bevel_side: BevelSide::Front,
                 bevel_profile: BevelProfile::Round,
                 bevel_tension: 0.5,
                 ..Text3DExtendedOptions::default()
             },
         )
-        .expect("inside bevel");
-        assert_valid_mesh(&m_out, "bevel_outside");
-        assert_valid_mesh(&m_in, "bevel_inside");
-        assert!(((m_out.bounds.max.x - m_out.bounds.min.x) - 12.0).abs() < 1e-3);
-        assert!(((m_in.bounds.max.x - m_in.bounds.min.x) - 10.0).abs() < 1e-3);
+        .expect("front bevel");
+        let m_back = extrude_contours_with_options(
+            &rect,
+            &base_params,
+            &Text3DExtendedOptions {
+                bevel_side: BevelSide::Back,
+                bevel_profile: BevelProfile::Round,
+                bevel_tension: 0.5,
+                ..Text3DExtendedOptions::default()
+            },
+        )
+        .expect("back bevel");
+        assert_valid_mesh(&m_both, "bevel_both");
+        assert_valid_mesh(&m_front, "bevel_front");
+        assert_valid_mesh(&m_back, "bevel_back");
+        assert!(((m_both.bounds.max.x - m_both.bounds.min.x) - 12.0).abs() < 1e-3);
+        assert!(((m_both.bounds.max.z - m_both.bounds.min.z) - 6.0).abs() < 1e-3);
+        assert!(((m_front.bounds.max.z - m_front.bounds.min.z) - 5.0).abs() < 1e-3);
+        assert!(((m_back.bounds.max.z - m_back.bounds.min.z) - 5.0).abs() < 1e-3);
+        assert_ne!(m_front.vertices, m_back.vertices);
 
         // Flat vs Round profile and different bevelTension produce distinct intermediate bevel vertices.
         let m_flat = extrude_contours_with_options(
@@ -1048,8 +1066,8 @@ mod tests {
         .expect("tense bevel");
         assert_valid_mesh(&m_flat, "bevel_flat");
         assert_valid_mesh(&m_tense, "bevel_tense");
-        assert_ne!(m_out.vertices, m_flat.vertices);
-        assert_ne!(m_out.vertices, m_tense.vertices);
+        assert_ne!(m_both.vertices, m_flat.vertices);
+        assert_ne!(m_both.vertices, m_tense.vertices);
 
         // Font line height from bbox (yMax=700, yMin=0, underline=0, upem=1000, height=20 -> lineHeight=14.0)
         // and TextScaleMode Current vs Legacy per-character split.
@@ -1889,5 +1907,263 @@ f 2 5 6 3
         assert_eq!(parse_character_ranges("3-1", 4, false), vec![false; 4]);
         assert_eq!(parse_character_ranges("1,,2", 4, false), vec![false; 4]);
         assert_eq!(parse_character_ranges("abc", 4, true), vec![false; 4]);
+    }
+
+    #[test]
+    fn particles_plus_presets_star4_circle_soft_spark_are_distinct() {
+        let (_, _, star4) =
+            generate_particle_sprite_by_name("star_4", 48).expect("star_4 must resolve");
+        let (_, _, circle_soft) =
+            generate_particle_sprite_by_name("circle_soft", 48).expect("circle_soft must resolve");
+        let (_, _, spark) =
+            generate_particle_sprite_by_name("spark", 48).expect("spark must resolve");
+        let (_, _, star_glow) =
+            generate_particle_sprite_by_name("star_glow", 48).expect("star_glow must resolve");
+
+        assert_ne!(star4, circle_soft, "star_4 must differ from circle_soft");
+        assert_ne!(star4, spark, "star_4 must differ from spark");
+        assert_ne!(circle_soft, spark, "circle_soft must differ from spark");
+        assert_ne!(
+            star_glow, circle_soft,
+            "star_glow must differ from circle_soft"
+        );
+        // Alias parity: star-4pt matches star_4
+        let (_, _, star4_alias) =
+            generate_particle_sprite_by_name("star-4pt", 48).expect("star-4pt alias must resolve");
+        assert_eq!(star4, star4_alias);
+    }
+
+    #[test]
+    fn text3d_bevel_sides_miter_clamp_and_tension_1_no_spikes() {
+        let params = Text3DParams {
+            text: String::from("AVWBG&8RO"),
+            height: 20.0,
+            thickness: 4.0,
+            bevel_enabled: true,
+            bevel_thickness: 1.0,
+            bevel_size: 1.5,
+            bevel_segments: 4,
+            align: TextAlignMode::Center,
+            ..Text3DParams::default()
+        };
+        let un_beveled = build_fallback_text_mesh(&Text3DParams {
+            bevel_enabled: false,
+            ..params.clone()
+        });
+        let base_w = un_beveled.bounds.max.x - un_beveled.bounds.min.x;
+        let base_h = un_beveled.bounds.max.y - un_beveled.bounds.min.y;
+
+        for (code, expected_side, expected_z_span) in [
+            (0u32, BevelSide::Both, 6.0_f32),
+            (1u32, BevelSide::Front, 5.0_f32),
+            (2u32, BevelSide::Back, 5.0_f32),
+        ] {
+            assert_eq!(BevelSide::from_u32(code), expected_side);
+            let m = build_fallback_text_mesh_with_options(
+                &params,
+                &Text3DExtendedOptions {
+                    bevel_side: expected_side,
+                    bevel_tension: 1.0,
+                    ..Text3DExtendedOptions::default()
+                },
+            );
+            assert_valid_mesh(&m, "bevel_no_spikes");
+            let w = m.bounds.max.x - m.bounds.min.x;
+            let h = m.bounds.max.y - m.bounds.min.y;
+            let z = m.bounds.max.z - m.bounds.min.z;
+            assert!(
+                (z - expected_z_span).abs() < 1e-3,
+                "bevel_side={expected_side:?} expected Z span {expected_z_span}, got {z}"
+            );
+            // Clamped miter limit prevents needle spikes exceeding ~2 * bevel_size per side.
+            assert!(
+                w <= base_w + 4.5 * params.bevel_size && h <= base_h + 4.5 * params.bevel_size,
+                "bevel_side={expected_side:?} produced spike bounds (base=({base_w},{base_h}), got=({w},{h}))"
+            );
+        }
+    }
+
+    #[test]
+    fn text3d_multiline_per_line_alignment_left_center_right() {
+        let ttf = make_minimal_test_ttf();
+        let make_params = |align| Text3DParams {
+            text: String::from("A\nAAAAA\nAA"),
+            height: 20.0,
+            thickness: 2.0,
+            align,
+            ..Text3DParams::default()
+        };
+
+        let left_chars = build_text3d_character_meshes(
+            &ttf,
+            &make_params(TextAlignMode::Left),
+            &Text3DExtendedOptions::default(),
+            Vec3::ONE,
+        )
+        .expect("left");
+        let center_chars = build_text3d_character_meshes(
+            &ttf,
+            &make_params(TextAlignMode::Center),
+            &Text3DExtendedOptions::default(),
+            Vec3::ONE,
+        )
+        .expect("center");
+        let right_chars = build_text3d_character_meshes(
+            &ttf,
+            &make_params(TextAlignMode::Right),
+            &Text3DExtendedOptions::default(),
+            Vec3::ONE,
+        )
+        .expect("right");
+
+        // Index 0 is the single 'A' on line 0; index 1 is the first 'A' on line 1 ("AAAAA").
+        assert!(
+            (left_chars[0].layout_pos.x - left_chars[1].layout_pos.x).abs() < 1e-3,
+            "Left alignment must keep line 0 flush-left with line 1"
+        );
+        assert!(
+            center_chars[0].layout_pos.x > left_chars[0].layout_pos.x + 10.0,
+            "Center alignment must shift shorter line 0 rightward toward line 1 center"
+        );
+        assert!(
+            right_chars[0].layout_pos.x > center_chars[0].layout_pos.x + 10.0,
+            "Right alignment must shift shorter line 0 further right than Center"
+        );
+
+        // Also check monolithic mesh X-centroid of line 0 (top line, highest Y) shifts L < C < R.
+        let top_line_mean_x = |align: TextAlignMode| -> f32 {
+            let m = build_text3d_mesh(&ttf, &make_params(align)).expect("mesh");
+            let max_y = m.bounds.max.y;
+            let top_xs: Vec<f32> = m
+                .vertices
+                .iter()
+                .filter(|v| v.position[1] > max_y - 10.0)
+                .map(|v| v.position[0])
+                .collect();
+            top_xs.iter().sum::<f32>() / (top_xs.len().max(1) as f32)
+        };
+        let cx_center = top_line_mean_x(TextAlignMode::Center);
+        let cx_left = top_line_mean_x(TextAlignMode::Left);
+        let cx_right = top_line_mean_x(TextAlignMode::Right);
+        // Under Center, top line centroid sits near 0; under Left it sits on left half of [0, W];
+        // under Right it sits on right half of [-W, 0].
+        assert!(
+            cx_center.abs() < 1.0,
+            "Center-aligned top line should be centered near x=0, got {cx_center}"
+        );
+        // Compare relative to the bottom/longest line centroid:
+        assert!(cx_left > 0.0 && cx_right < 0.0);
+    }
+
+    #[test]
+    fn qa6_twist_warp_rounded_box_and_wire_bounds_regressions() {
+        // 1. Twist at 90 deg (FRAC_PI_2) across subdivision = 1..=8 stays watertight & bounded.
+        let tall_box = build_box(10.0, 26.0, 10.0);
+        for sub in 1..=8_u32 {
+            let twisted = apply_twist_with_params(
+                &tall_box,
+                &TwistParams {
+                    angle: std::f32::consts::FRAC_PI_2,
+                    axis: DeformAxis::Y,
+                    offset: 0.0,
+                    subdivision: sub,
+                    field: None,
+                },
+                None,
+                None,
+            );
+            assert_valid_mesh(&twisted, &format!("twist_sub_{sub}"));
+            let sz = twisted.bounds.size();
+            // Max diagonal of 10x10 cross-section is 10*sqrt(2) ~= 14.142; height stays 26.
+            assert!(
+                sz.x > 9.5 && sz.x <= 14.5 && sz.z > 9.5 && sz.z <= 14.5,
+                "twist sub={sub} cross-section out of expected bounds: {sz:?}"
+            );
+            assert!((sz.y - 26.0).abs() < 1e-3);
+        }
+
+        // 2. Warp at strength = 5, 10, 20 must NEVER collapse 10x26x10 box to a 1px vertical needle.
+        let mut prev_max_y = tall_box.bounds.max.y;
+        for strength in [5.0_f32, 10.0, 20.0] {
+            let warped = apply_warp_with_params(
+                &tall_box,
+                &WarpParams {
+                    strength,
+                    axis: WarpAxis::IntoY,
+                    offset: 0.0,
+                    subdivision: 16,
+                    field: None,
+                },
+                None,
+                None,
+            );
+            assert_valid_mesh(&warped, &format!("warp_s_{strength}"));
+            let sz = warped.bounds.size();
+            assert!(
+                sz.x >= 6.0,
+                "Warp strength={strength} collapsed box width to {sz:?} (expected >= 6.0)"
+            );
+            assert!(
+                warped.bounds.max.y > prev_max_y + 0.5,
+                "Warp strength={strength} should bend progressively deeper (max.y={} vs prev={prev_max_y})",
+                warped.bounds.max.y
+            );
+            prev_max_y = warped.bounds.max.y;
+        }
+
+        // 3. RoundedBox normals:
+        // (a) radius=0, bevel_size=0, smooth=true -> crisp cardinal face normals (zero pillowy diagonals).
+        let sharp_rb = build_rounded_box_ext(20.0, 20.0, 20.0, 0.0, 4, 0.0, 4, true);
+        assert_valid_mesh(&sharp_rb, "rounded_box_sharp");
+        for v in &sharp_rb.vertices {
+            let l1 = v.normal[0].abs() + v.normal[1].abs() + v.normal[2].abs();
+            assert!(
+                (l1 - 1.0).abs() < 1e-3,
+                "sharp RoundedBox vertex must have cardinal planar normal, got {:?}",
+                v.normal
+            );
+        }
+        // (b) radius=0, bevel_size=3.5, smooth=true -> cap-edge bevel vertices have exact [0,0,+-1]
+        //     matching flat caps (eliminating the "square sticker" seam).
+        let beveled_rb = build_rounded_box_ext(20.0, 20.0, 20.0, 0.0, 4, 3.5, 4, true);
+        assert_valid_mesh(&beveled_rb, "rounded_box_bevel_only");
+        let front_cap_seam_ok = beveled_rb
+            .vertices
+            .iter()
+            .filter(|v| v.material_slot == 1 && (v.position[2] - 10.0).abs() < 1e-3)
+            .all(|v| {
+                (v.normal[2] - 1.0).abs() < 1e-3
+                    && v.normal[0].abs() < 1e-3
+                    && v.normal[1].abs() < 1e-3
+            });
+        assert!(
+            front_cap_seam_ok,
+            "bevel ring meeting front cap must have exact [0, 0, 1] normal to avoid sticker seam"
+        );
+        // (c) radius=3.0, bevel_size=2.0, smooth=true -> smooth cap transition and valid geometry.
+        let full_rb = build_rounded_box_ext(20.0, 20.0, 20.0, 3.0, 4, 2.0, 4, true);
+        assert_valid_mesh(&full_rb, "rounded_box_full");
+        let full_seam_ok = full_rb
+            .vertices
+            .iter()
+            .filter(|v| v.material_slot == 1 && (v.position[2] - 10.0).abs() < 1e-3)
+            .all(|v| (v.normal[2] - 1.0).abs() < 1e-3);
+        assert!(
+            full_seam_ok,
+            "rounded+beveled box cap seam must have normal +Z"
+        );
+
+        // 4. Wire fitted to size [20, 20, 20] must fit cleanly inside 20x20x20 bounding box.
+        let wire = build_wire_in_bounds(Vec3::splat(20.0), 1.0, 3, 12, 24);
+        assert_valid_mesh(&wire, "wire_in_bounds");
+        let wsz = wire.bounds.size();
+        assert!(
+            wsz.x <= 20.1 && wsz.y <= 20.1 && wsz.z <= 20.1,
+            "Wire with size [20,20,20] exceeded bounding box: {wsz:?}"
+        );
+        assert!(
+            wsz.x >= 17.0 && wsz.y >= 17.0 && wsz.z >= 17.0,
+            "Wire with size [20,20,20] unexpectedly shrunken: {wsz:?}"
+        );
     }
 }

@@ -597,7 +597,7 @@ pub fn speed_handle_to_tangent(
         30.0
     };
     let span = segment_span.max(1e-3);
-    let min_dx = (span * 0.02).clamp(1e-3, 0.5);
+    let min_dx = (span * 0.02).clamp(1e-3, 0.5).min(span);
     let dx = if is_out {
         dx_frames.clamp(min_dx, span)
     } else {
@@ -1128,10 +1128,10 @@ fn expand_single_property(
                 .collect();
             kfs.sort_by(|a, b| a.local_frame.total_cmp(&b.local_frame));
             let color = if graph_plus {
-                let hue = ((47 * string_hash_u32(name)) % 360) as f32;
+                let hue = (string_hash_u32(name).wrapping_mul(47) % 360) as f32;
                 hsl_color(hue, 0.70, 0.62)
             } else {
-                let hue = ((40 * string_hash_u32(name)) % 360) as f32;
+                let hue = (string_hash_u32(name).wrapping_mul(40) % 360) as f32;
                 hsl_color(hue, 0.40, 0.45)
             };
             out.push(CurveTrack {
@@ -1222,15 +1222,28 @@ pub fn show_graph_editor_window(
         COLOR_WINDOW_BORDER
     };
 
+    let screen = ctx.input(|i| i.viewport_rect());
+    let default_w =
+        (if graph_plus { 820.0_f32 } else { 640.0_f32 }).min((screen.width() - 48.0).max(480.0));
+    let default_h =
+        (if graph_plus { 520.0_f32 } else { 400.0_f32 }).min((screen.height() - 96.0).max(300.0));
+    // Spawn centered over the viewport region (right of the ~300px sidebar, clear of top HUD),
+    // clamped cleanly inside screen bounds instead of overlapping the sidebar at (16, 46).
+    let viewport_center_x = (screen.left() + 300.0 + screen.right()) * 0.5;
+    let spawn_x = (viewport_center_x - default_w * 0.5)
+        .max(screen.left() + 24.0)
+        .min((screen.right() - default_w - 16.0).max(screen.left() + 16.0))
+        .round();
+    let spawn_y = (screen.top() + 72.0)
+        .min((screen.bottom() - default_h - 24.0).max(screen.top() + 32.0))
+        .round();
+
     let mut window = Window::new(title)
         .id(win_id)
         .title_bar(false)
         .movable(!state.maximized)
-        .default_size(if graph_plus {
-            vec2(900.0, 600.0)
-        } else {
-            vec2(600.0, 400.0)
-        })
+        .default_pos(pos2(spawn_x, spawn_y))
+        .default_size(vec2(default_w, default_h))
         .min_size(if state.collapsed {
             vec2(260.0, 30.0)
         } else {
@@ -1449,7 +1462,8 @@ pub fn show_graph_editor_panel(
         );
     } else {
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+            ui.spacing_mut().button_padding = vec2(4.0, 2.0);
             if show_plot_mode_toggle(ui, state, palette) {
                 let doc = session.document().clone();
                 state.fit_curves_for_mode(&tracks, &doc, fps, est_canvas_size);
@@ -1497,6 +1511,16 @@ pub fn show_graph_editor_panel(
             if toolbar_chip(ui, "33 Easings", state.show_all_easings_popup, palette) {
                 state.show_all_easings_popup = !state.show_all_easings_popup;
             }
+            ui.separator();
+            if toolbar_chip(ui, "Copy Curve JSON", false, palette) {
+                let _ = copy_curve_track_as_pz_json(ui.ctx(), session, state, &tracks);
+            }
+            if toolbar_chip(ui, "Paste Curve JSON", false, palette)
+                && let Some(sys_text) = crate::ui::clipboard::read_system_clipboard()
+            {
+                let _ =
+                    try_paste_pz_keyframes_json(session, state, &tracks, &sys_text, &mut action);
+            }
         });
     }
 
@@ -1518,9 +1542,10 @@ pub fn show_graph_editor_panel(
 
     // Split left channel track list & right 2D curve canvas (Vanilla CM3 uses 33% left width).
     let left_w = if graph_plus {
-        TRACK_LIST_WIDTH.min(main_rect.width() * 0.35)
+        TRACK_LIST_WIDTH.min((main_rect.width() * 0.35).max(0.0))
     } else {
-        (main_rect.width() * 0.33).clamp(110.0, main_rect.width() * 0.5)
+        let max_w = (main_rect.width() * 0.5).max(0.0);
+        (main_rect.width() * 0.33).clamp(110.0_f32.min(max_w), max_w)
     };
     let track_list_rect = Rect::from_min_size(main_rect.min, vec2(left_w, main_rect.height()));
     let right_rect = Rect::from_min_max(
@@ -1560,35 +1585,30 @@ pub fn show_graph_editor_panel(
         if has_copy {
             if !state.selected_keys.is_empty() {
                 copy_selected_graph_keys(state, &tracks);
+                let _ = copy_curve_track_as_pz_json(ui.ctx(), session, state, &tracks);
             }
             if easing_plus || state.selected_keys.is_empty() {
                 let [x1, y1, x2, y2] = state.easing_plus_curve;
                 let css = format!("cubic-bezier({x1:.4}, {y1:.4}, {x2:.4}, {y2:.4})");
                 state.easing_clipboard = Some(css.clone());
-                if state.selected_keys.is_empty() {
-                    ui.ctx().copy_text(css);
+                if state.selected_keys.is_empty()
+                    && (easing_plus
+                        || copy_curve_track_as_pz_json(ui.ctx(), session, state, &tracks).is_none())
+                {
+                    crate::ui::clipboard::write_system_clipboard(ui.ctx(), &css);
                 }
             }
         }
 
-        if let Some(ref text) = pasted_text {
-            let trimmed = text.trim();
-            let looks_like_css = trimmed.to_ascii_lowercase().contains("cubic-bezier");
-            if looks_like_css && let Some(parsed) = parse_cubic_bezier_str(trimmed) {
-                apply_parsed_easing_curve(session, state, &tracks, parsed, &mut action);
-            } else if !state.copied_keys.is_empty() {
-                paste_graph_keys_at_playhead(session, state, &tracks, &mut action);
-            } else if let Some(parsed) = parse_cubic_bezier_str(trimmed) {
-                apply_parsed_easing_curve(session, state, &tracks, parsed, &mut action);
-            }
-        } else if has_paste_key {
-            if !state.copied_keys.is_empty() {
-                paste_graph_keys_at_playhead(session, state, &tracks, &mut action);
-            } else if let Some(ref clip) = state.easing_clipboard.clone()
-                && let Some(parsed) = parse_cubic_bezier_str(clip)
-            {
-                apply_parsed_easing_curve(session, state, &tracks, parsed, &mut action);
-            }
+        if pasted_text.is_some() || has_paste_key {
+            let effective_text = pasted_text.or_else(crate::ui::clipboard::read_system_clipboard);
+            let _ = handle_graph_paste_text(
+                session,
+                state,
+                &tracks,
+                effective_text.as_deref(),
+                &mut action,
+            );
         }
     }
 
@@ -1681,6 +1701,70 @@ pub fn show_graph_editor_panel(
 // Left Channel / Property Track List
 // ---------------------------------------------------------------------------
 
+/// Abbreviates common property tokens (e.g. `.position` -> `.pos`, `.rotation` -> `.rot`)
+/// before middle-eliding so channels like `Camera.position.X` and `Camera.rotation.X` remain
+/// cleanly distinguishable even in narrow Speed Mode legends.
+#[must_use]
+fn elide_channel_name(name: &str, max_chars: usize) -> String {
+    if name.chars().count() <= max_chars {
+        return name.to_owned();
+    }
+
+    // Step 1: abbreviate common dot-separated property segments while keeping axis suffixes intact.
+    let mut parts: Vec<String> = name
+        .split('.')
+        .map(|seg| match seg.to_ascii_lowercase().as_str() {
+            "position" => "pos".to_owned(),
+            "rotation" => "rot".to_owned(),
+            "scale" => "scl".to_owned(),
+            "opacity" => "op".to_owned(),
+            "amount" => "amt".to_owned(),
+            "intensity" => "int".to_owned(),
+            "strength" => "str".to_owned(),
+            "radius" => "rad".to_owned(),
+            "anchor" => "anc".to_owned(),
+            _ => seg.to_owned(),
+        })
+        .collect();
+    let mut candidate = parts.join(".");
+    if candidate.chars().count() <= max_chars {
+        return candidate;
+    }
+
+    // Step 2: if still too long and prefixed with `Camera.`, shorten `Camera` -> `Cam`.
+    if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("camera") {
+        parts[0] = "Cam".to_owned();
+        candidate = parts.join(".");
+        if candidate.chars().count() <= max_chars {
+            return candidate;
+        }
+    }
+
+    let chars: Vec<char> = candidate.chars().collect();
+    if max_chars <= 3 {
+        return chars[chars.len().saturating_sub(max_chars)..]
+            .iter()
+            .collect();
+    }
+    // Preserve trailing axis suffix (`.X`, `.Y`, `.Z`, `.W`, `.R`, `.G`, `.B`, `.A`) plus the
+    // abbreviated property token immediately before it (e.g. `pos.X`, `rot.X`).
+    let suffix_len = if chars.len() >= 2 && chars[chars.len() - 2] == '.' {
+        let ideal_tail = 5.min(max_chars.saturating_sub(2));
+        ideal_tail.max(2).min(chars.len())
+    } else {
+        (max_chars / 2).clamp(2.min(chars.len()), chars.len())
+    };
+    let head_len = max_chars.saturating_sub(suffix_len + 2);
+    if head_len == 0 {
+        let keep = max_chars.saturating_sub(2);
+        let tail: String = chars[chars.len().saturating_sub(keep)..].iter().collect();
+        return format!("..{tail}");
+    }
+    let head: String = chars[..head_len].iter().collect();
+    let tail: String = chars[chars.len() - suffix_len..].iter().collect();
+    format!("{head}..{tail}")
+}
+
 fn show_channel_track_list(
     ui: &mut Ui,
     session: &Session,
@@ -1703,11 +1787,15 @@ fn show_channel_track_list(
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(4.0)), |ui| {
         ScrollArea::vertical()
             .id_salt("graph_editor_track_list")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 if tracks.is_empty() {
                     ui.colored_label(COLOR_LABEL_MUTED, "No animated curves");
                     return;
                 }
+                // Reserve 12 px right-side gutter so the vertical scrollbar never overlaps
+                // or intercepts clicks on Solo (`O`) buttons.
+                const SCROLLBAR_GUTTER_PX: f32 = 12.0;
                 for track in tracks {
                     let visible = state.is_track_visible(&track.track_key);
                     let soloed = state.solo_track.as_deref() == Some(track.track_key.as_str());
@@ -1741,10 +1829,9 @@ fn show_channel_track_list(
                             }
                         }
                     };
-                    let has_solo = track.channel_index.is_some();
 
-                    // Row order per Spec 02 §4.2: [swatch] [fx?] [name] [value] [Eye] [Solo (axes only)].
-                    let row_w = ui.available_width().max(40.0);
+                    // Row order: [swatch] [fx?] [name] [value] [Eye] [Solo] [scrollbar gutter].
+                    let row_w = (ui.available_width() - SCROLLBAR_GUTTER_PX).max(40.0);
                     let (row_rect, _) = ui.allocate_exact_size(vec2(row_w, 20.0), Sense::hover());
                     let p = ui.painter();
                     let cy = row_rect.center().y;
@@ -1754,48 +1841,47 @@ fn show_channel_track_list(
                         Rect::from_center_size(pos2(row_rect.left() + 7.0, cy), vec2(12.0, 4.0));
                     p.rect_filled(bar, CornerRadius::same(1), track.color);
 
-                    // Allocate right-hand buttons from right edge inward: [Solo (axes only)] [Eye] [value].
+                    // Allocate right-hand buttons from right edge inward: [Solo] [Eye] [value].
                     let mut right_cursor = row_rect.right();
 
-                    if has_solo {
-                        right_cursor -= 16.0;
-                        let solo_rect =
-                            Rect::from_center_size(pos2(right_cursor + 8.0, cy), vec2(16.0, 16.0));
-                        let solo_resp = ui
-                            .interact(
-                                solo_rect,
-                                ui.scope_id().with(("g_solo", &track.track_key)),
-                                Sense::click(),
-                            )
-                            .on_hover_cursor(CursorIcon::PointingHand)
-                            .on_hover_text("Solo axis");
-                        if solo_resp.hovered() {
-                            p.rect_filled(
-                                solo_rect,
-                                CornerRadius::ZERO,
-                                Color32::from_rgb(0x36, 0x36, 0x36),
-                            );
-                        }
-                        let solo_fg = if soloed {
-                            Color32::from_rgb(0xd4, 0x48, 0x48)
-                        } else if solo_resp.hovered() {
-                            COLOR_TEXT_BRIGHT
-                        } else {
-                            Color32::from_rgb(0xac, 0xac, 0xac)
-                        };
-                        paint_cm3_icon(p, solo_rect.shrink(2.5), Cm3Icon::SoloCircle, solo_fg);
-                        if soloed {
-                            p.circle_filled(solo_rect.center(), 2.0, solo_fg);
-                        }
-                        if solo_resp.clicked() {
-                            state.solo_track = if soloed {
-                                None
-                            } else {
-                                Some(track.track_key.clone())
-                            };
-                        }
-                        right_cursor -= 2.0;
+                    // Solo button rendered on ALL tracks (both vector axes and scalar properties).
+                    right_cursor -= 16.0;
+                    let solo_rect =
+                        Rect::from_center_size(pos2(right_cursor + 8.0, cy), vec2(16.0, 16.0));
+                    let solo_resp = ui
+                        .interact(
+                            solo_rect,
+                            ui.scope_id().with(("g_solo", &track.track_key)),
+                            Sense::click(),
+                        )
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(if soloed { "Unsolo curve" } else { "Solo curve" });
+                    if solo_resp.hovered() {
+                        p.rect_filled(
+                            solo_rect,
+                            CornerRadius::ZERO,
+                            Color32::from_rgb(0x36, 0x36, 0x36),
+                        );
                     }
+                    let solo_fg = if soloed {
+                        Color32::from_rgb(0xd4, 0x48, 0x48)
+                    } else if solo_resp.hovered() {
+                        COLOR_TEXT_BRIGHT
+                    } else {
+                        Color32::from_rgb(0xac, 0xac, 0xac)
+                    };
+                    paint_cm3_icon(p, solo_rect.shrink(2.5), Cm3Icon::SoloCircle, solo_fg);
+                    if soloed {
+                        p.circle_filled(solo_rect.center(), 2.0, solo_fg);
+                    }
+                    if solo_resp.clicked() {
+                        state.solo_track = if soloed {
+                            None
+                        } else {
+                            Some(track.track_key.clone())
+                        };
+                    }
+                    right_cursor -= 2.0;
 
                     // Eye visibility toggle.
                     right_cursor -= 16.0;
@@ -1842,28 +1928,27 @@ fn show_channel_track_list(
                     }
                     right_cursor -= 4.0;
 
-                    // Live value readout (Graph Editor 2 or Speed mode) positioned left of Eye/Solo.
+                    // Live value readout (Graph Editor 2 or Speed mode) positioned left of Eye/Solo
+                    // with clear horizontal separation from the channel name.
                     if graph_plus || state.plot_mode == GraphPlotMode::Speed {
                         let val_str = match state.plot_mode {
                             GraphPlotMode::Value => format!("{live_val:.2}"),
-                            GraphPlotMode::Speed => format!("{live_val:.1}u/s"),
+                            GraphPlotMode::Speed => format!("{live_val:.1} u/s"),
                         };
-                        let val_w = (val_str.len() as f32 * 6.2).clamp(32.0, 62.0);
+                        let val_w = (val_str.len() as f32 * 6.3 + 4.0).clamp(36.0, 74.0);
+                        let val_left = (right_cursor - val_w).max(row_rect.left() + 64.0);
                         let val_rect = Rect::from_min_max(
-                            pos2(
-                                (right_cursor - val_w).max(row_rect.left() + 40.0),
-                                row_rect.top(),
-                            ),
+                            pos2(val_left, row_rect.top()),
                             pos2(right_cursor, row_rect.bottom()),
                         );
                         ui.painter().with_clip_rect(val_rect).text(
                             pos2(val_rect.right(), cy),
                             Align2::RIGHT_CENTER,
                             val_str,
-                            FontId::monospace(10.5),
+                            FontId::monospace(10.0),
                             Color32::from_rgb(0x7e, 0x8f, 0xb9),
                         );
-                        right_cursor = val_rect.left() - 4.0;
+                        right_cursor = val_rect.left() - 6.0;
                     }
 
                     // Expression `fx` badge when this track is driven by an expression.
@@ -1897,11 +1982,13 @@ fn show_channel_track_list(
                         name_left = fx_rect.right() + 4.0;
                     }
 
-                    // Truncated channel / property name between swatch/fx and value/icons.
+                    // Middle-elided channel / property name preserving `.X`/`.Y`/`.Z` suffixes.
                     let name_rect = Rect::from_min_max(
                         pos2(name_left, row_rect.top()),
                         pos2(right_cursor.max(name_left), row_rect.bottom()),
                     );
+                    let max_chars = ((name_rect.width() / 6.8).floor() as usize).max(3);
+                    let shown_name = elide_channel_name(&track.display_name, max_chars);
                     let label_color = if visible {
                         COLOR_TEXT
                     } else {
@@ -1910,10 +1997,19 @@ fn show_channel_track_list(
                     ui.painter().with_clip_rect(name_rect).text(
                         pos2(name_rect.left(), cy),
                         Align2::LEFT_CENTER,
-                        &track.display_name,
-                        FontId::monospace(11.5),
+                        &shown_name,
+                        FontId::monospace(11.0),
                         label_color,
                     );
+                    if shown_name != track.display_name {
+                        let _ = ui
+                            .interact(
+                                name_rect,
+                                ui.scope_id().with(("g_name_tip", &track.track_key)),
+                                Sense::hover(),
+                            )
+                            .on_hover_text(&track.display_name);
+                    }
                 }
             });
     });
@@ -2495,7 +2591,10 @@ fn show_curve_canvas(
             if let Some(last) = track.keyframes.last() {
                 let lx = state
                     .frame_to_screen_x(track.frame_offset + last.local_frame, rect)
-                    .clamp(rect.left() + 8.0, rect.right() - 72.0);
+                    .clamp(
+                        rect.left() + 8.0,
+                        (rect.right() - 72.0).max(rect.left() + 8.0),
+                    );
                 let label_val = match state.plot_mode {
                     GraphPlotMode::Value => {
                         if track.is_expression {
@@ -2513,9 +2612,10 @@ fn show_curve_canvas(
                         eval_curve_velocity(track, last.local_frame, fps, &state.handles)
                     }
                 };
-                let ly = state
-                    .value_to_screen_y(label_val, rect)
-                    .clamp(rect.top() + 10.0, rect.bottom() - 10.0);
+                let ly = state.value_to_screen_y(label_val, rect).clamp(
+                    rect.top() + 10.0,
+                    (rect.bottom() - 10.0).max(rect.top() + 10.0),
+                );
                 painter.text(
                     pos2(lx + 8.0, ly - 8.0),
                     Align2::LEFT_BOTTOM,
@@ -2638,6 +2738,7 @@ fn paint_adaptive_grid(
     let max_v = state.screen_y_to_value(rect.top(), rect);
     let fy0 = (min_v / minor_y).floor() as i64;
     let fy1 = (max_v / minor_y).ceil() as i64;
+    let mut painted_zero_label = false;
     for i in fy0..=fy1 {
         let v = i as f64 * minor_y;
         let y = state.value_to_screen_y(v, rect).round();
@@ -2664,7 +2765,9 @@ fn paint_adaptive_grid(
             color,
         );
         if i % 5 == 0 {
-            let num = if major_y >= 1.0 {
+            let num = if is_zero {
+                "0".to_owned()
+            } else if major_y >= 1.0 {
                 format!("{v:.0}")
             } else {
                 format!("{v:.2}")
@@ -2673,18 +2776,75 @@ fn paint_adaptive_grid(
                 GraphPlotMode::Value => num,
                 GraphPlotMode::Speed => format!("{num} u/s"),
             };
-            painter.text(
-                pos2(rect.left() + 4.0, y - 2.0),
-                Align2::LEFT_BOTTOM,
-                label,
-                FontId::monospace(10.0),
-                if is_zero && state.plot_mode == GraphPlotMode::Speed {
-                    COLOR_TEXT
-                } else {
-                    COLOR_LABEL_MUTED
-                },
-            );
+            let (label_pos, align) = if y - 2.0 < rect.top() + 12.0 {
+                (
+                    pos2(rect.left() + 4.0, (y + 2.0).max(rect.top() + 2.0)),
+                    Align2::LEFT_TOP,
+                )
+            } else {
+                (
+                    pos2(rect.left() + 4.0, (y - 2.0).min(rect.bottom() - 2.0)),
+                    Align2::LEFT_BOTTOM,
+                )
+            };
+            if label_pos.y >= rect.top() && label_pos.y <= rect.bottom() {
+                painter.text(
+                    label_pos,
+                    align,
+                    label,
+                    FontId::monospace(10.0),
+                    if is_zero {
+                        COLOR_TEXT
+                    } else {
+                        COLOR_LABEL_MUTED
+                    },
+                );
+                if is_zero {
+                    painted_zero_label = true;
+                }
+            }
         }
+    }
+
+    // Guarantee a visible `0` baseline label whenever `0.0` lies within the visible Y range
+    // (including right after `Fit (\)` when `0.0` sits near the top or bottom border).
+    if !painted_zero_label && min_v <= 0.0 && max_v >= 0.0 {
+        let y = state
+            .value_to_screen_y(0.0, rect)
+            .round()
+            .clamp(rect.top(), (rect.bottom() - 1.0).max(rect.top()));
+        let zero_line_col = if state.plot_mode == GraphPlotMode::Speed {
+            Color32::from_rgb(0x88, 0x99, 0xbb)
+        } else {
+            zero_col
+        };
+        painter.rect_filled(
+            Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), 1.0)),
+            CornerRadius::ZERO,
+            zero_line_col,
+        );
+        let zero_label = match state.plot_mode {
+            GraphPlotMode::Value => "0",
+            GraphPlotMode::Speed => "0 u/s",
+        };
+        let (label_pos, align) = if y < rect.top() + 14.0 {
+            (
+                pos2(rect.left() + 4.0, (y + 2.0).max(rect.top() + 2.0)),
+                Align2::LEFT_TOP,
+            )
+        } else {
+            (
+                pos2(rect.left() + 4.0, (y - 2.0).min(rect.bottom() - 2.0)),
+                Align2::LEFT_BOTTOM,
+            )
+        };
+        painter.text(
+            label_pos,
+            align,
+            zero_label,
+            FontId::monospace(10.0),
+            COLOR_TEXT,
+        );
     }
 }
 
@@ -3155,6 +3315,20 @@ fn paint_curve_track(
     }
 }
 
+/// Returns `true` when a segment with `tween_code` supports interactive Bezier tangent handles
+/// (`Hold` and `Linear` segments must NOT display or hit-test Bezier handles).
+#[must_use]
+fn segment_shows_bezier_handles(tween_code: u16) -> bool {
+    let (mode, easing) = InterpolationMode::from_cm3_tween_code(tween_code);
+    match mode {
+        InterpolationMode::Discrete => false,
+        InterpolationMode::Interpolated => {
+            easing != EasingKind::Hold && easing != EasingKind::Linear
+        }
+        InterpolationMode::Bezier => true,
+    }
+}
+
 fn effective_in_tangent(
     state: &GraphEditorState,
     track: &CurveTrack,
@@ -3163,6 +3337,9 @@ fn effective_in_tangent(
 ) -> Option<[f64; 2]> {
     let prev = idx.checked_sub(1).and_then(|p| track.keyframes.get(p))?;
     let kf = &track.keyframes[idx];
+    if !segment_shows_bezier_handles(kf.tween) {
+        return None;
+    }
     let prev_id = GraphKeyId::new(
         &track.target_id,
         &track.property,
@@ -3187,6 +3364,10 @@ fn effective_out_tangent(
 ) -> Option<[f64; 2]> {
     let next = track.keyframes.get(idx + 1)?;
     let kf = &track.keyframes[idx];
+    let (kf_mode, _) = InterpolationMode::from_cm3_tween_code(kf.tween);
+    if !segment_shows_bezier_handles(next.tween) || kf_mode == InterpolationMode::Discrete {
+        return None;
+    }
     let next_id = GraphKeyId::new(
         &track.target_id,
         &track.property,
@@ -3816,52 +3997,70 @@ fn show_cm3_33_easings_strip(
     palette: &ThemePalette,
     action: &mut GraphEditorAction,
 ) {
-    ScrollArea::horizontal()
+    let avail_w = (ui.available_width() - 16.0).max(140.0);
+    let tile_w = 64.0_f32;
+    let tile_h = 48.0_f32;
+    let gap = 4.0_f32;
+    let cols = ((avail_w + gap) / (tile_w + gap)).floor().max(2.0) as usize;
+
+    ScrollArea::vertical()
         .id_salt("graph_cm3_33_easings")
-        .max_height(66.0)
+        .max_height(108.0)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (idx, &kind) in EasingKind::ALL_CM3.iter().enumerate() {
-                    let (tile_rect, resp) =
-                        ui.allocate_exact_size(vec2(66.0, 52.0), Sense::click());
-                    let bg = if resp.hovered() {
-                        COLOR_TILE_HOVER
-                    } else {
-                        COLOR_TILE_BG
-                    };
-                    let p = ui.painter();
-                    p.rect(
-                        tile_rect,
-                        CornerRadius::same(2),
-                        bg,
-                        Stroke::new(
-                            1.0,
-                            if resp.hovered() {
-                                rgb_color(palette.focus)
-                            } else {
-                                COLOR_BORDER
-                            },
-                        ),
-                        StrokeKind::Inside,
-                    );
-                    let plot = Rect::from_min_max(
-                        pos2(tile_rect.left() + 8.0, tile_rect.top() + 8.0),
-                        pos2(tile_rect.right() - 8.0, tile_rect.bottom() - 16.0),
-                    );
-                    paint_easing_thumbnail(p, plot, kind, Color32::from_rgb(0x7e, 0x8f, 0xb9));
-                    p.text(
-                        pos2(tile_rect.center().x, tile_rect.bottom() - 3.0),
-                        Align2::CENTER_BOTTOM,
-                        short_easing_name(kind),
-                        FontId::monospace(9.5),
-                        COLOR_TEXT,
-                    );
-                    let resp = resp.on_hover_text(kind.display_name());
-                    if resp.clicked() {
-                        apply_tween_to_selected(session, state, tracks, idx as u16, action);
+            ui.spacing_mut().item_spacing = vec2(gap, gap);
+            for row_chunk in EasingKind::ALL_CM3.chunks(cols) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(gap, gap);
+                    for &kind in row_chunk {
+                        let idx = EasingKind::ALL_CM3
+                            .iter()
+                            .position(|&k| k == kind)
+                            .unwrap_or(0);
+                        let (tile_rect, resp) =
+                            ui.allocate_exact_size(vec2(tile_w, tile_h), Sense::click());
+                        let bg = if resp.hovered() {
+                            COLOR_TILE_HOVER
+                        } else {
+                            COLOR_TILE_BG
+                        };
+                        let p = ui.painter();
+                        p.rect(
+                            tile_rect,
+                            CornerRadius::same(2),
+                            bg,
+                            Stroke::new(
+                                1.0,
+                                if resp.hovered() {
+                                    rgb_color(palette.focus)
+                                } else {
+                                    COLOR_BORDER
+                                },
+                            ),
+                            StrokeKind::Inside,
+                        );
+                        let plot = Rect::from_min_max(
+                            pos2(tile_rect.left() + 8.0, tile_rect.top() + 7.0),
+                            pos2(tile_rect.right() - 8.0, tile_rect.bottom() - 15.0),
+                        );
+                        paint_easing_thumbnail(p, plot, kind, Color32::from_rgb(0x7e, 0x8f, 0xb9));
+                        p.text(
+                            pos2(tile_rect.center().x, tile_rect.bottom() - 3.0),
+                            Align2::CENTER_BOTTOM,
+                            short_easing_name(kind),
+                            FontId::monospace(9.5),
+                            COLOR_TEXT,
+                        );
+                        let resp = resp
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text(kind.display_name());
+                        if resp.clicked() {
+                            apply_tween_to_selected(session, state, tracks, idx as u16, action);
+                        }
                     }
-                }
-            });
+                });
+            }
         });
 }
 
@@ -4106,7 +4305,7 @@ fn show_easing_plus_panel(
                 );
                 state.easing_clipboard = Some(css.clone());
                 state.easing_css_input = css.clone();
-                ui.ctx().copy_text(css);
+                crate::ui::clipboard::write_system_clipboard(ui.ctx(), &css);
             }
         });
 
@@ -4154,12 +4353,18 @@ fn show_easing_plus_panel(
                 curve_edited = true;
             }
             if toolbar_chip(ui, "Paste CSS", false, palette) {
-                let parsed = parse_cubic_bezier_str(&state.easing_css_input).or_else(|| {
-                    state
-                        .easing_clipboard
-                        .as_deref()
-                        .and_then(parse_cubic_bezier_str)
-                });
+                let parsed = parse_cubic_bezier_str(&state.easing_css_input)
+                    .or_else(|| {
+                        crate::ui::clipboard::read_system_clipboard()
+                            .as_deref()
+                            .and_then(parse_cubic_bezier_str)
+                    })
+                    .or_else(|| {
+                        state
+                            .easing_clipboard
+                            .as_deref()
+                            .and_then(parse_cubic_bezier_str)
+                    });
                 if let Some(parsed) = parsed {
                     nx1 = parsed[0];
                     ny1 = parsed[1];
@@ -4976,7 +5181,7 @@ fn toolbar_chip(ui: &mut Ui, label: &str, active: bool, palette: &ThemePalette) 
     let btn = egui::Button::new(
         egui::RichText::new(label)
             .monospace()
-            .size(12.0)
+            .size(11.0)
             .color(COLOR_TEXT_BRIGHT),
     )
     .fill(fill)
@@ -5445,10 +5650,13 @@ fn show_g2_toolbar(
                     "Copy",
                     "C",
                     false,
-                    "Copy selected keyframes",
+                    "Copy selected keyframes / curve JSON",
                     palette,
                 ) {
-                    copy_selected_graph_keys(state, tracks);
+                    if !state.selected_keys.is_empty() {
+                        copy_selected_graph_keys(state, tracks);
+                    }
+                    let _ = copy_curve_track_as_pz_json(ui.ctx(), session, state, tracks);
                 }
                 if g2_tool_tile(
                     ui,
@@ -5456,10 +5664,17 @@ fn show_g2_toolbar(
                     "Paste",
                     "P",
                     !state.copied_keys.is_empty(),
-                    "Paste keyframes at playhead",
+                    "Paste keyframes / curve JSON at playhead",
                     palette,
                 ) {
-                    paste_graph_keys_at_playhead(session, state, tracks, action);
+                    let sys_text = crate::ui::clipboard::read_system_clipboard();
+                    let _ = handle_graph_paste_text(
+                        session,
+                        state,
+                        tracks,
+                        sys_text.as_deref(),
+                        action,
+                    );
                 }
                 if g2_tool_tile(
                     ui,
@@ -5482,6 +5697,14 @@ fn show_g2_toolbar(
                     palette,
                 ) {
                     state.show_help_card = !state.show_help_card;
+                }
+                if toolbar_chip(ui, "Copy Curve JSON", false, palette) {
+                    let _ = copy_curve_track_as_pz_json(ui.ctx(), session, state, tracks);
+                }
+                if toolbar_chip(ui, "Paste Curve JSON", false, palette)
+                    && let Some(sys_text) = crate::ui::clipboard::read_system_clipboard()
+                {
+                    let _ = try_paste_pz_keyframes_json(session, state, tracks, &sys_text, action);
                 }
             });
         });
@@ -6023,6 +6246,393 @@ fn paste_graph_keys_at_playhead(
     }
 }
 
+fn resolve_active_curve_target_with_channel(
+    state: &GraphEditorState,
+    tracks: &[CurveTrack],
+) -> Option<(String, String, f64, Option<usize>)> {
+    if let Some(sel) = state.selected_keys.first() {
+        let offset = tracks
+            .iter()
+            .find(|t| t.target_id == sel.target_id && t.property == sel.property)
+            .map_or(0.0, |t| t.frame_offset);
+        return Some((
+            sel.target_id.clone(),
+            sel.property.clone(),
+            offset,
+            sel.channel_index,
+        ));
+    }
+    if let Some(ref solo) = state.solo_track
+        && let Some(t) = tracks.iter().find(|t| &t.track_key == solo)
+    {
+        return Some((
+            t.target_id.clone(),
+            t.property.clone(),
+            t.frame_offset,
+            t.channel_index,
+        ));
+    }
+    if let Some((ref tid, ref prop)) = state.focused_property {
+        let matching = tracks
+            .iter()
+            .find(|t| {
+                &t.target_id == tid && &t.property == prop && state.is_track_visible(&t.track_key)
+            })
+            .or_else(|| {
+                tracks
+                    .iter()
+                    .find(|t| &t.target_id == tid && &t.property == prop)
+            });
+        let offset = matching.map_or(0.0, |t| t.frame_offset);
+        let ch = matching.and_then(|t| t.channel_index);
+        return Some((tid.clone(), prop.clone(), offset, ch));
+    }
+    tracks
+        .iter()
+        .find(|t| state.is_track_visible(&t.track_key))
+        .or_else(|| tracks.first())
+        .map(|t| {
+            (
+                t.target_id.clone(),
+                t.property.clone(),
+                t.frame_offset,
+                t.channel_index,
+            )
+        })
+}
+
+fn resolve_active_curve_target(
+    state: &GraphEditorState,
+    tracks: &[CurveTrack],
+) -> Option<(String, String, f64)> {
+    resolve_active_curve_target_with_channel(state, tracks)
+        .map(|(tid, prop, offset, _)| (tid, prop, offset))
+}
+
+fn find_session_property<'a>(
+    doc: &'a zc_session::SessionDocument,
+    target_id: &str,
+    prop_name: &str,
+) -> Option<&'a SessionProperty> {
+    if target_id == "sequence" {
+        return doc.sequence_properties.get(prop_name);
+    }
+    for track in doc.video_tracks.iter().chain(doc.audio_tracks.iter()) {
+        for clip in &track.clips {
+            if clip.id == target_id {
+                return clip.properties.get(prop_name);
+            }
+            if let Some(obj) = clip.objects_3d.iter().find(|o| o.id == target_id) {
+                return obj.properties.get(prop_name);
+            }
+            if let Some(fx) = clip.effects.iter().find(|e| e.id == target_id) {
+                return fx.properties.get(prop_name);
+            }
+        }
+    }
+    None
+}
+
+fn numeric_array_len(v: &Value) -> Option<usize> {
+    let arr = v.as_array()?;
+    if (2..=4).contains(&arr.len()) && arr.iter().all(Value::is_number) {
+        Some(arr.len())
+    } else {
+        None
+    }
+}
+
+fn vector_property_dim(prop: &SessionProperty) -> Option<usize> {
+    if let Some(len) = prop
+        .keyframes
+        .iter()
+        .find_map(|kf| numeric_array_len(&kf.value))
+    {
+        return Some(len);
+    }
+    numeric_array_len(&prop.default_value)
+}
+
+fn extract_vec_components(v: &Value, dim: usize, fallback: &[f64]) -> Vec<f64> {
+    let mut out = fallback.to_vec();
+    out.resize(dim, 0.0);
+    if let Some(arr) = v.as_array() {
+        for (i, item) in arr.iter().take(dim).enumerate() {
+            if let Some(n) = item.as_f64()
+                && n.is_finite()
+            {
+                out[i] = n;
+            }
+        }
+    }
+    out
+}
+
+fn eval_vector_prop_at(prop: &SessionProperty, local_frame: f64, dim: usize) -> Vec<f64> {
+    let zero = vec![0.0; dim];
+    let default_vec = extract_vec_components(&prop.default_value, dim, &zero);
+    if prop.keyframes.is_empty() {
+        return default_vec;
+    }
+    if prop.keyframes.len() == 1 || local_frame <= prop.keyframes[0].frame {
+        return extract_vec_components(&prop.keyframes[0].value, dim, &default_vec);
+    }
+    let last = &prop.keyframes[prop.keyframes.len() - 1];
+    if local_frame >= last.frame {
+        return extract_vec_components(&last.value, dim, &default_vec);
+    }
+    let idx = prop
+        .keyframes
+        .partition_point(|k| k.frame <= local_frame)
+        .clamp(1, prop.keyframes.len() - 1);
+    let k0 = &prop.keyframes[idx - 1];
+    let k1 = &prop.keyframes[idx];
+    let span = (k1.frame - k0.frame).max(1e-9);
+    let u = ((local_frame - k0.frame) / span).clamp(0.0, 1.0);
+    let v0 = extract_vec_components(&k0.value, dim, &default_vec);
+    let v1 = extract_vec_components(&k1.value, dim, &default_vec);
+    (0..dim).map(|i| v0[i] + (v1[i] - v0[i]) * u).collect()
+}
+
+fn normalize_pz_keyframe_object(
+    obj: &serde_json::Map<String, Value>,
+) -> Option<serde_json::Map<String, Value>> {
+    let frame = obj
+        .get("frame")
+        .or_else(|| obj.get("t"))
+        .or_else(|| obj.get("f"))
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())?;
+    let value = obj
+        .get("value")
+        .or_else(|| obj.get("v"))
+        .or_else(|| obj.get("val"))?
+        .clone();
+    let mut out = obj.clone();
+    out.remove("t");
+    out.remove("f");
+    out.remove("v");
+    out.remove("val");
+    out.insert("frame".to_owned(), Value::from(frame));
+    out.insert("value".to_owned(), value);
+    if !out.contains_key("tween")
+        && let Some(e) = out.remove("e")
+    {
+        out.insert("tween".to_owned(), e);
+    }
+    Some(out)
+}
+
+/// Normalizes PanZoid shorthand keyframe JSON (`t`/`v`/`e` -> `frame`/`value`/`tween`) and,
+/// when pasting scalar keyframes onto a `Vec2`/`Vec3`/`Vec4`/`Color` property, lifts each scalar
+/// into the active vector channel while preserving/interpolating all other vector components.
+fn prepare_curve_paste_json(
+    existing_prop: Option<&SessionProperty>,
+    active_channel: Option<usize>,
+    raw_json: &str,
+    at_frame: Option<f64>,
+) -> (String, Option<f64>) {
+    let Ok(parsed) = serde_json::from_str::<Value>(raw_json) else {
+        return (raw_json.to_owned(), at_frame);
+    };
+    let vec_dim = existing_prop.and_then(vector_property_dim);
+
+    match parsed {
+        Value::Array(items) => {
+            let Some(mut normalized) = items
+                .iter()
+                .map(|item| item.as_object().and_then(normalize_pz_keyframe_object))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return (raw_json.to_owned(), at_frame);
+            };
+            if normalized.is_empty() {
+                return (raw_json.to_owned(), at_frame);
+            }
+
+            let all_scalar = normalized
+                .iter()
+                .all(|k| k.get("value").is_some_and(Value::is_number));
+            if let (Some(prop), Some(dim)) = (existing_prop, vec_dim)
+                && all_scalar
+            {
+                let ch = active_channel.filter(|&c| c < dim).unwrap_or(0);
+                let min_f = normalized
+                    .iter()
+                    .filter_map(|k| k.get("frame").and_then(Value::as_f64))
+                    .fold(f64::INFINITY, f64::min);
+                let delta = match at_frame {
+                    Some(target_f) if min_f.is_finite() => target_f - min_f,
+                    _ => 0.0,
+                };
+                for kf in &mut normalized {
+                    let raw_f = kf.get("frame").and_then(Value::as_f64).unwrap_or(0.0);
+                    let dest_f = (raw_f + delta).max(0.0);
+                    let scalar = kf.get("value").and_then(Value::as_f64).unwrap_or(0.0);
+                    let mut vec_val = eval_vector_prop_at(prop, dest_f, dim);
+                    vec_val[ch] = scalar;
+                    kf.insert("frame".to_owned(), Value::from(dest_f));
+                    kf.insert("value".to_owned(), serde_json::json!(vec_val));
+                }
+                let out_arr = Value::Array(normalized.into_iter().map(Value::Object).collect());
+                return (out_arr.to_string(), None);
+            }
+
+            let out_arr = Value::Array(normalized.into_iter().map(Value::Object).collect());
+            (out_arr.to_string(), at_frame)
+        }
+        Value::Object(mut obj) => {
+            if let Some(kfs_arr) = obj.get("keyframes").and_then(Value::as_array)
+                && let Some(mut normalized) = kfs_arr
+                    .iter()
+                    .map(|item| item.as_object().and_then(normalize_pz_keyframe_object))
+                    .collect::<Option<Vec<_>>>()
+            {
+                let all_scalar = !normalized.is_empty()
+                    && normalized
+                        .iter()
+                        .all(|k| k.get("value").is_some_and(Value::is_number));
+                if let (Some(prop), Some(dim)) = (existing_prop, vec_dim)
+                    && all_scalar
+                {
+                    let ch = active_channel.filter(|&c| c < dim).unwrap_or(0);
+                    for kf in &mut normalized {
+                        let f = kf
+                            .get("frame")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0)
+                            .max(0.0);
+                        let scalar = kf.get("value").and_then(Value::as_f64).unwrap_or(0.0);
+                        let mut vec_val = eval_vector_prop_at(prop, f, dim);
+                        vec_val[ch] = scalar;
+                        kf.insert("frame".to_owned(), Value::from(f));
+                        kf.insert("value".to_owned(), serde_json::json!(vec_val));
+                    }
+                    if let Some(scalar_default) = obj.get("value").and_then(Value::as_f64) {
+                        let mut base_default = eval_vector_prop_at(prop, 0.0, dim);
+                        base_default[ch] = scalar_default;
+                        obj.insert("value".to_owned(), serde_json::json!(base_default));
+                    }
+                }
+                obj.insert(
+                    "keyframes".to_owned(),
+                    Value::Array(normalized.into_iter().map(Value::Object).collect()),
+                );
+                return (Value::Object(obj).to_string(), at_frame);
+            }
+            (raw_json.to_owned(), at_frame)
+        }
+        _ => (raw_json.to_owned(), at_frame),
+    }
+}
+
+fn copy_curve_track_as_pz_json(
+    ctx: &egui::Context,
+    session: &mut Session,
+    state: &GraphEditorState,
+    tracks: &[CurveTrack],
+) -> Option<String> {
+    let (target_id, property, _) = resolve_active_curve_target(state, tracks)?;
+    let json = session
+        .copy_property_as_pz_json(&target_id, &property)
+        .ok()?;
+    crate::ui::clipboard::write_system_clipboard(ctx, &json);
+    Some(json)
+}
+
+fn try_paste_pz_keyframes_json(
+    session: &mut Session,
+    state: &mut GraphEditorState,
+    tracks: &[CurveTrack],
+    text: &str,
+    action: &mut GraphEditorAction,
+) -> bool {
+    let trimmed = text.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return false;
+    }
+    let Some((target_id, property, frame_offset, active_channel)) =
+        resolve_active_curve_target_with_channel(state, tracks)
+    else {
+        return false;
+    };
+    let at_frame = if trimmed.starts_with('[') {
+        Some(
+            (session.playback.current_frame - frame_offset)
+                .max(0.0)
+                .round(),
+        )
+    } else {
+        None
+    };
+    let existing_prop = find_session_property(session.document(), &target_id, &property).cloned();
+    let (prepared_json, prepared_at_frame) =
+        prepare_curve_paste_json(existing_prop.as_ref(), active_channel, trimmed, at_frame);
+    if session
+        .execute(Command::PastePzJson {
+            json: prepared_json,
+            hint: Some("keyframes".to_owned()),
+            target_clip_id: None,
+            parent_object_id: None,
+            target_object_id: Some(target_id),
+            target_property: Some(property),
+            at_frame: prepared_at_frame,
+        })
+        .is_ok()
+    {
+        state.selected_keys.clear();
+        state.handles.clear();
+        action.curves_modified = true;
+        return true;
+    }
+    false
+}
+
+fn handle_graph_paste_text(
+    session: &mut Session,
+    state: &mut GraphEditorState,
+    tracks: &[CurveTrack],
+    text: Option<&str>,
+    action: &mut GraphEditorAction,
+) -> bool {
+    if let Some(raw) = text {
+        let trimmed = raw.trim();
+        let looks_like_css = trimmed.to_ascii_lowercase().contains("cubic-bezier");
+        if looks_like_css && let Some(parsed) = parse_cubic_bezier_str(trimmed) {
+            apply_parsed_easing_curve(session, state, tracks, parsed, action);
+            return true;
+        }
+        if !trimmed.is_empty()
+            && !crate::ui::clipboard::matches_last_internal_copy(raw)
+            && try_paste_pz_keyframes_json(session, state, tracks, trimmed, action)
+        {
+            return true;
+        }
+        if !state.copied_keys.is_empty() {
+            paste_graph_keys_at_playhead(session, state, tracks, action);
+            return true;
+        }
+        if !trimmed.is_empty()
+            && try_paste_pz_keyframes_json(session, state, tracks, trimmed, action)
+        {
+            return true;
+        }
+        if let Some(parsed) = parse_cubic_bezier_str(trimmed) {
+            apply_parsed_easing_curve(session, state, tracks, parsed, action);
+            return true;
+        }
+    } else if !state.copied_keys.is_empty() {
+        paste_graph_keys_at_playhead(session, state, tracks, action);
+        return true;
+    } else if let Some(ref clip) = state.easing_clipboard.clone()
+        && let Some(parsed) = parse_cubic_bezier_str(clip)
+    {
+        apply_parsed_easing_curve(session, state, tracks, parsed, action);
+        return true;
+    }
+    false
+}
+
 fn paint_dashed_polyline(
     painter: &egui::Painter,
     pts: &[Pos2],
@@ -6476,5 +7086,378 @@ mod tests {
             (state.center_y - cy_r).abs() < 1e-9,
             "ruler trackpad pan must leave center_y unchanged"
         );
+    }
+
+    #[test]
+    fn elide_channel_name_preserves_axis_suffixes() {
+        let short = elide_channel_name("Hero.pos.X", 20);
+        assert_eq!(short, "Hero.pos.X");
+
+        let elided_x = elide_channel_name("HeroTitleText.position.X", 12);
+        assert!(
+            elided_x.ends_with(".X"),
+            "elided channel name must preserve .X suffix, got '{elided_x}'"
+        );
+        assert!(elided_x.chars().count() <= 12);
+
+        let elided_z = elide_channel_name("VeryLongObjectName.rotation.Z", 10);
+        assert!(
+            elided_z.ends_with(".Z"),
+            "elided channel name must preserve .Z suffix, got '{elided_z}'"
+        );
+        assert!(elided_z.chars().count() <= 10);
+    }
+
+    #[test]
+    fn hold_and_linear_segments_omit_bezier_handles() {
+        let state = GraphEditorState::new();
+        let make_track = |tween0: u16, tween1: u16| CurveTrack {
+            track_key: "t:p".to_owned(),
+            target_id: "t".to_owned(),
+            property: "p".to_owned(),
+            channel_index: None,
+            display_name: "p".to_owned(),
+            color: Color32::WHITE,
+            frame_offset: 0.0,
+            is_expression: false,
+            expression: None,
+            keyframes: vec![
+                CurveKeyframe {
+                    local_frame: 0.0,
+                    value: 0.0,
+                    full_value: serde_json::json!(0.0),
+                    tween: tween0,
+                    control_points: [[0.25, 0.25], [0.75, 0.75]],
+                    continuous_tangent: true,
+                },
+                CurveKeyframe {
+                    local_frame: 30.0,
+                    value: 100.0,
+                    full_value: serde_json::json!(100.0),
+                    tween: tween1,
+                    control_points: [[0.25, 0.25], [0.75, 0.75]],
+                    continuous_tangent: true,
+                },
+            ],
+        };
+        let hp = BezierHandlePair {
+            in_tangent: [-5.0, 0.0],
+            out_tangent: [5.0, 0.0],
+            continuous: true,
+        };
+
+        // Hold (0) and Linear (1) must NOT produce tangent handles.
+        let hold_track = make_track(1, 0);
+        assert!(effective_in_tangent(&state, &hold_track, 1, hp).is_none());
+        assert!(effective_out_tangent(&state, &hold_track, 0, hp).is_none());
+
+        let linear_track = make_track(1, 1);
+        assert!(effective_in_tangent(&state, &linear_track, 1, hp).is_none());
+        assert!(effective_out_tangent(&state, &linear_track, 0, hp).is_none());
+
+        // Ease (7) and Bezier must produce tangent handles.
+        let ease_track = make_track(1, 7);
+        assert!(effective_in_tangent(&state, &ease_track, 1, hp).is_some());
+        assert!(effective_out_tangent(&state, &ease_track, 0, hp).is_some());
+    }
+
+    #[test]
+    fn scalar_tracks_render_solo_and_zero_baseline_label_always_visible() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session
+            .selection
+            .select_clip(clip_id.clone(), Some("scene"), false);
+        let fx_id = session
+            .execute(Command::AddEffect {
+                clip_id: clip_id.clone(),
+                kind: "bloom".to_owned(),
+                name: Some("Bloom".to_owned()),
+            })
+            .unwrap()["effect_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let _ = session.execute(Command::SetKeyframe {
+            target_id: fx_id.clone(),
+            property: "amount".to_owned(),
+            frame: 0.0,
+            value: serde_json::json!(0.0),
+            tween: Some(7),
+        });
+        let _ = session.execute(Command::SetKeyframe {
+            target_id: fx_id.clone(),
+            property: "amount".to_owned(),
+            frame: 30.0,
+            value: serde_json::json!(-10.0),
+            tween: Some(7),
+        });
+
+        let mut state = GraphEditorState::new();
+        state.open = true;
+        // Position 0.0 very close to the top of the Y viewport so naive LEFT_BOTTOM would clip it.
+        state.center_y = -5.0;
+        state.zoom_y = 0.04;
+
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let mut raw = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            time: Some(0.0),
+            focused: true,
+            ..Default::default()
+        };
+        // Frame 0 runs egui::Window's sizing pass; Frame 1 paints the visible canvas & Y-axis labels.
+        let mut out0 = ctx.run_ui(raw.clone(), |ui| {
+            let _ = show_graph_editor_window(ui.ctx(), &mut session, &mut state, &palette);
+        });
+        out0.textures_delta.clear();
+        raw.time = Some(0.02);
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            let _ = show_graph_editor_window(ui.ctx(), &mut session, &mut state, &palette);
+        });
+        out.textures_delta.clear();
+        let has_zero_label = out
+            .shapes
+            .iter()
+            .any(|cs| matches!(&cs.shape, Shape::Text(ts) if ts.galley.text() == "0"));
+        assert!(
+            has_zero_label,
+            "Y-axis must render visible '0' baseline label whenever 0.0 is in visible range"
+        );
+
+        // Verify scalar track (`Bloom.amount`) has a Solo button rendered (no channel_index).
+        let tracks = collect_curve_tracks(&session, &state, false);
+        let scalar = tracks
+            .iter()
+            .find(|t| t.property == "amount" && t.channel_index.is_none())
+            .expect("scalar Bloom.amount track");
+        assert!(state.is_track_visible(&scalar.track_key));
+        state.solo_track = Some(scalar.track_key.clone());
+        raw.time = Some(0.05);
+        let mut out2 = ctx.run_ui(raw, |ui| {
+            let _ = show_graph_editor_window(ui.ctx(), &mut session, &mut state, &palette);
+        });
+        out2.textures_delta.clear();
+        assert_eq!(state.solo_track.as_deref(), Some(scalar.track_key.as_str()));
+    }
+
+    #[test]
+    fn elide_channel_name_distinguishes_camera_position_rotation_scale() {
+        // Previously both Camera.position.X and Camera.rotation.X collapsed to `Came..ion.X`.
+        let pos_11 = elide_channel_name("Camera.position.X", 11);
+        let rot_11 = elide_channel_name("Camera.rotation.X", 11);
+        let scl_11 = elide_channel_name("Camera.scale.X", 11);
+        assert_eq!(pos_11, "Cam.pos.X");
+        assert_eq!(rot_11, "Cam.rot.X");
+        assert_eq!(scl_11, "Cam.scl.X");
+        assert_ne!(pos_11, rot_11);
+        assert_ne!(pos_11, scl_11);
+        assert_ne!(rot_11, scl_11);
+
+        // Even at ultra-narrow widths (7..=16), position vs rotation must stay distinct.
+        for width in 7..=16 {
+            let p = elide_channel_name("Camera.position.X", width);
+            let r = elide_channel_name("Camera.rotation.X", width);
+            assert!(p.chars().count() <= width, "width={width}, got '{p}'");
+            assert!(r.chars().count() <= width, "width={width}, got '{r}'");
+            assert!(p.ends_with(".X"), "width={width}, got '{p}'");
+            assert!(r.ends_with(".X"), "width={width}, got '{r}'");
+            assert_ne!(
+                p, r,
+                "Camera.position.X and Camera.rotation.X collided as '{p}' at width={width}"
+            );
+        }
+
+        // Common scalar property abbreviations.
+        assert_eq!(elide_channel_name("Camera.opacity", 10), "Camera.op");
+        assert_eq!(elide_channel_name("Bloom.amount", 10), "Bloom.amt");
+    }
+
+    #[test]
+    fn graph_editor_pastes_property_track_and_keyframe_array_json_and_css_easing() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session.selection.select_clip(clip_id.clone(), None, false);
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: "opacity".to_owned(),
+                frame: 0.0,
+                value: serde_json::json!(1.0),
+                tween: Some(1),
+            })
+            .expect("seed opacity keyframe");
+
+        let mut state = GraphEditorState::new();
+        state.focused_property = Some((clip_id.clone(), "opacity".to_owned()));
+        state.follow_selection = false;
+        let tracks = collect_curve_tracks(&session, &state, false);
+        assert!(!tracks.is_empty());
+
+        // 1. Paste full property-track JSON with expression + keyframes.
+        let prop_track_json = r#"{
+            "animated": true,
+            "expression": "Math.abs(Math.sin(time))",
+            "keyframes": [
+                { "frame": 0, "value": 0.2, "tween": 1 },
+                { "frame": 24, "value": 0.9, "tween": 1 }
+            ]
+        }"#;
+        let mut action = GraphEditorAction::default();
+        assert!(handle_graph_paste_text(
+            &mut session,
+            &mut state,
+            &tracks,
+            Some(prop_track_json),
+            &mut action,
+        ));
+        assert!(action.curves_modified);
+        let prop = &session.document().video_tracks[0].clips[0].properties["opacity"];
+        assert_eq!(prop.keyframes.len(), 2);
+        assert_eq!(prop.expression.as_deref(), Some("Math.abs(Math.sin(time))"));
+        assert!((prop.keyframes[1].frame - 24.0).abs() < 1e-6);
+
+        // 2. Paste bare keyframe array JSON shifted to current playhead (frame 10).
+        session.playback.current_frame = 10.0;
+        let kf_array_json = r#"[
+            { "frame": 0, "value": 0.1, "tween": 1 },
+            { "frame": 15, "value": 0.8, "tween": 1 }
+        ]"#;
+        let mut action2 = GraphEditorAction::default();
+        assert!(handle_graph_paste_text(
+            &mut session,
+            &mut state,
+            &tracks,
+            Some(kf_array_json),
+            &mut action2,
+        ));
+        assert!(action2.curves_modified);
+        let prop2 = &session.document().video_tracks[0].clips[0].properties["opacity"];
+        assert_eq!(prop2.keyframes.len(), 2);
+        assert!((prop2.keyframes[0].frame - 10.0).abs() < 1e-6);
+        assert!((prop2.keyframes[1].frame - 25.0).abs() < 1e-6);
+
+        // 3. Round-trip copy_property_as_pz_json succeeds on the pasted track.
+        let exported = session
+            .copy_property_as_pz_json(&clip_id, "opacity")
+            .expect("export property track json");
+        assert!(exported.contains("\"keyframes\""));
+
+        // 4. CSS cubic-bezier(...) still parses and updates easing_plus_curve cleanly.
+        let tracks2 = collect_curve_tracks(&session, &state, false);
+        let mut action3 = GraphEditorAction::default();
+        assert!(handle_graph_paste_text(
+            &mut session,
+            &mut state,
+            &tracks2,
+            Some("cubic-bezier(0.20, 0.80, 0.40, 1.00)"),
+            &mut action3,
+        ));
+        assert!((state.easing_plus_curve[0] - 0.20).abs() < 1e-4);
+        assert!((state.easing_plus_curve[1] - 0.80).abs() < 1e-4);
+    }
+
+    #[test]
+    fn graph_editor_scalar_curve_json_paste_onto_vec3_preserves_other_channels_and_roundtrips_copy()
+    {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session.selection.select_clip(clip_id.clone(), None, false);
+
+        // Seed a Vec3 animated property (`position`) with distinct X/Y/Z trajectories.
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: "position".to_owned(),
+                frame: 0.0,
+                value: serde_json::json!([10.0, 20.0, 30.0]),
+                tween: Some(1),
+            })
+            .expect("seed position kf0");
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: "position".to_owned(),
+                frame: 60.0,
+                value: serde_json::json!([10.0, 80.0, 90.0]),
+                tween: Some(1),
+            })
+            .expect("seed position kf1");
+
+        let mut state = GraphEditorState::new();
+        state.focused_property = Some((clip_id.clone(), "position".to_owned()));
+        state.follow_selection = false;
+        session.playback.current_frame = 0.0;
+
+        let tracks = collect_curve_tracks(&session, &state, true);
+        assert_eq!(tracks.len(), 3, "Vec3 position must expand to .X/.Y/.Z");
+
+        // 1. Paste shorthand scalar PanZoid keyframe array onto default active channel (.X = 0).
+        let scalar_json = r#"[{"t":0,"v":0},{"t":30,"v":100}]"#;
+        let mut action = GraphEditorAction::default();
+        assert!(try_paste_pz_keyframes_json(
+            &mut session,
+            &mut state,
+            &tracks,
+            scalar_json,
+            &mut action,
+        ));
+        assert!(action.curves_modified);
+
+        let prop = &session.document().video_tracks[0].clips[0].properties["position"];
+        assert_eq!(prop.keyframes.len(), 2);
+        let kf0 = prop.keyframes[0]
+            .value
+            .as_array()
+            .expect("kf0 must remain Vec3 array, not collapse to scalar");
+        let kf1 = prop.keyframes[1]
+            .value
+            .as_array()
+            .expect("kf1 must remain Vec3 array, not collapse to scalar");
+        assert_eq!(kf0.len(), 3);
+        assert_eq!(kf1.len(), 3);
+        // X updated to 0 -> 100; Y interpolated 20 -> 50; Z interpolated 30 -> 60.
+        assert!((kf0[0].as_f64().unwrap() - 0.0).abs() < 1e-6);
+        assert!((kf0[1].as_f64().unwrap() - 20.0).abs() < 1e-6);
+        assert!((kf0[2].as_f64().unwrap() - 30.0).abs() < 1e-6);
+        assert!((kf1[0].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        assert!((kf1[1].as_f64().unwrap() - 50.0).abs() < 1e-6);
+        assert!((kf1[2].as_f64().unwrap() - 60.0).abs() < 1e-6);
+
+        // .X/.Y/.Z tracks must still exist intact AND Copy Curve JSON must succeed!
+        let tracks_after = collect_curve_tracks(&session, &state, true);
+        assert_eq!(
+            tracks_after.len(),
+            3,
+            "Vec3 position must still expose all 3 (.X/.Y/.Z) channels after scalar paste"
+        );
+        let copied = session
+            .copy_property_as_pz_json(&clip_id, "position")
+            .expect("Copy Curve JSON must succeed seamlessly after scalar paste onto Vec3");
+        assert!(copied.contains("\"keyframes\""));
+
+        // 2. Select a key on .Y (channel_index = Some(1)) and paste another scalar curve:
+        //    only .Y updates while .X and .Z remain intact!
+        state.selected_keys = vec![GraphKeyId::new(&clip_id, "position", Some(1), 0.0)];
+        let scalar_y_json = r#"[{"t":0,"v":5},{"t":30,"v":55}]"#;
+        let mut action2 = GraphEditorAction::default();
+        assert!(try_paste_pz_keyframes_json(
+            &mut session,
+            &mut state,
+            &tracks_after,
+            scalar_y_json,
+            &mut action2,
+        ));
+        let prop2 = &session.document().video_tracks[0].clips[0].properties["position"];
+        let y0 = prop2.keyframes[0].value.as_array().expect("Vec3");
+        let y1 = prop2.keyframes[1].value.as_array().expect("Vec3");
+        assert!((y0[0].as_f64().unwrap() - 0.0).abs() < 1e-6);
+        assert!((y0[1].as_f64().unwrap() - 5.0).abs() < 1e-6);
+        assert!((y0[2].as_f64().unwrap() - 30.0).abs() < 1e-6);
+        assert!((y1[0].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        assert!((y1[1].as_f64().unwrap() - 55.0).abs() < 1e-6);
+        assert!((y1[2].as_f64().unwrap() - 60.0).abs() < 1e-6);
     }
 }

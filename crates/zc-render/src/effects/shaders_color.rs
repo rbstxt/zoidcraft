@@ -228,13 +228,16 @@ fn exp_set_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
 }
 
 fn exp_ramp(t_in: f32) -> f32 {
-    var t = t_in * 2.0;
+    let t_clamped = clamp(t_in, 0.0, 1.0);
+    let t = t_clamped * 2.0;
     if (t >= 1.0) {
-        t = t - 1.0;
-        let denom = max(0.5 * (1.0 - t) + 0.9332 * t, 1e-4);
-        t = log(0.5) / log(denom);
+        let s = t - 1.0;
+        let denom = clamp(0.5 * (1.0 - s) + 0.9332 * s, 1e-4, 0.9999);
+        return clamp(log(0.5) / log(denom), 1.0, 10.0);
     }
-    return clamp(t, 0.001, 10.0);
+    let s = 1.0 - t;
+    let denom = clamp(0.5 * (1.0 - s) + 0.9332 * s, 1e-4, 0.9999);
+    return clamp(log(denom) / log(0.5), 0.1, 1.0);
 }
 
 @fragment
@@ -244,7 +247,8 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
     let base = clamp(col.rgb / col.a, vec3<f32>(0.0), vec3<f32>(1.0));
-    let amt = mix(0.009, 0.98, u.p0.x);
+    let exp_in = clamp(u.p0.x, -1.0, 1.0);
+    let amt = select(mix(0.009, 0.98, exp_in), 0.0, abs(exp_in) < 1e-5);
     var res: vec3<f32>;
     if (amt < 0.0) {
         res = mix(vec3<f32>(0.0), base, amt + 1.0);

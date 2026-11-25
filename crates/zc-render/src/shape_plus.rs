@@ -5467,8 +5467,8 @@ fn rasterize_polygons_aa<F>(
     if edges.is_empty() || !min_y.is_finite() || !max_y.is_finite() {
         return;
     }
-    let y0 = (min_y.floor() as isize).max(0) as usize;
-    let y1 = (max_y.ceil() as isize).min(height as isize) as usize;
+    let y0 = (min_y.floor() as isize).clamp(0, height as isize) as usize;
+    let y1 = (max_y.ceil() as isize).clamp(0, height as isize) as usize;
     if y0 >= y1 {
         return;
     }
@@ -6893,14 +6893,39 @@ fn close_mask_vertices(vertices: &[[f32; 6]], closed: bool, scale: f64) -> Vec<B
     out
 }
 
+/// Returns `true` when `points` spans a non-degenerate 2D bounding box, allowing
+/// self-intersecting polygons (such as symmetric bowties whose signed area sums to zero)
+/// to rasterize cleanly.
+fn has_non_degenerate_bbox(points: &[[f64; 2]]) -> bool {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for &[x, y] in points {
+        if x.is_finite() && y.is_finite() {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+    }
+    (max_x - min_x) > 1e-6 && (max_y - min_y) > 1e-6
+}
+
 /// Hard-edge even-odd fill used to obtain exact far-field sign for SDF expansion.
 fn fill_polygon_evenodd_hard(points: &[[f64; 2]], width: usize, height: usize, dst: &mut [f32]) {
+    if width == 0 || height == 0 {
+        return;
+    }
     let (edges, min_y, max_y) = build_scanline_edges(&[points.to_vec()]);
     if edges.is_empty() || !min_y.is_finite() || !max_y.is_finite() {
         return;
     }
-    let y0 = (min_y.floor() as isize).max(0) as usize;
-    let y1 = (max_y.ceil() as isize).min(height as isize) as usize;
+    let y0 = (min_y.floor() as isize).clamp(0, height as isize) as usize;
+    let y1 = (max_y.ceil() as isize).clamp(0, height as isize) as usize;
+    if y0 >= y1 {
+        return;
+    }
     let mut crossings = Vec::new();
     for y in y0..y1 {
         let py = y as f64 + 0.5;
@@ -6916,10 +6941,11 @@ fn fill_polygon_evenodd_hard(points: &[[f64; 2]], width: usize, height: usize, d
         crossings.sort_by(f64::total_cmp);
         let row = &mut dst[y * width..(y + 1) * width];
         for pair in crossings.as_chunks::<2>().0 {
-            let x0 = ((pair[0] - 0.5).ceil() as isize).max(0) as usize;
-            let x1 = ((pair[1] - 0.5).floor() as isize).min(width as isize - 1);
-            if x1 >= x0 as isize {
-                for px in &mut row[x0..=(x1 as usize)] {
+            let x0 = ((pair[0] - 0.5).ceil() as isize).clamp(0, width as isize) as usize;
+            let x1_excl = (((pair[1] - 0.5).floor() as isize).saturating_add(1))
+                .clamp(0, width as isize) as usize;
+            if x0 < x1_excl {
+                for px in &mut row[x0..x1_excl] {
                     *px = 1.0;
                 }
             }
@@ -6936,7 +6962,7 @@ fn expand_mask_sdf(
     height: usize,
     dst: &mut [f32],
 ) {
-    if points.len() < 3 || signed_area(points).abs() < 1e-9 {
+    if width == 0 || height == 0 || points.len() < 3 || !has_non_degenerate_bbox(points) {
         return;
     }
     fill_polygon_evenodd_hard(points, width, height, dst);
@@ -6951,14 +6977,21 @@ fn expand_mask_sdf(
     for s in 0..n {
         let a = points[s];
         let b = points[(s + 1) % n];
-        let fx = (((a[0].min(b[0]) - pad) / cell).floor() as isize).clamp(0, cells_x as isize - 1)
-            as usize;
-        let tx = (((a[0].max(b[0]) + pad) / cell).floor() as isize).clamp(0, cells_x as isize - 1)
-            as usize;
-        let fy = (((a[1].min(b[1]) - pad) / cell).floor() as isize).clamp(0, cells_y as isize - 1)
-            as usize;
-        let ty = (((a[1].max(b[1]) + pad) / cell).floor() as isize).clamp(0, cells_y as isize - 1)
-            as usize;
+        let seg_min_x = a[0].min(b[0]) - pad;
+        let seg_max_x = a[0].max(b[0]) + pad;
+        let seg_min_y = a[1].min(b[1]) - pad;
+        let seg_max_y = a[1].max(b[1]) + pad;
+        if seg_max_x < 0.0
+            || seg_min_x >= width as f64
+            || seg_max_y < 0.0
+            || seg_min_y >= height as f64
+        {
+            continue;
+        }
+        let fx = ((seg_min_x / cell).floor() as isize).clamp(0, cells_x as isize - 1) as usize;
+        let tx = ((seg_max_x / cell).floor() as isize).clamp(0, cells_x as isize - 1) as usize;
+        let fy = ((seg_min_y / cell).floor() as isize).clamp(0, cells_y as isize - 1) as usize;
+        let ty = ((seg_max_y / cell).floor() as isize).clamp(0, cells_y as isize - 1) as usize;
         for cy in fy..=ty {
             for cx in fx..=tx {
                 grid.entry(cy * cells_x + cx).or_default().push(s);
@@ -7137,7 +7170,7 @@ pub fn rasterize_masks_aa(masks: &[EvaluatedMask], width: u32, height: u32) -> V
     let mut first = true;
 
     for mask in masks.iter().take(32) {
-        if !mask.enabled {
+        if !mask.enabled || mask.vertices.len() < 3 {
             continue;
         }
         scratch.fill(0.0);
@@ -7145,7 +7178,7 @@ pub fn rasterize_masks_aa(masks: &[EvaluatedMask], width: u32, height: u32) -> V
         let closed_verts = close_mask_vertices(&mask.vertices, mask.closed, scale);
         if closed_verts.len() >= 2 {
             let flat = flatten_vertices(&closed_verts, true, DEFAULT_TOLERANCE);
-            if flat.points.len() >= 3 && signed_area(&flat.points).abs() >= 1e-9 {
+            if flat.points.len() >= 3 && has_non_degenerate_bbox(&flat.points) {
                 if expansion.abs() < 1e-6 {
                     // 4x supersampled subpixel AA even at feather==0 && expansion==0!
                     rasterize_polygons_aa(&[flat.points], rw, rh, true, |y, cov| {
@@ -7185,6 +7218,10 @@ pub fn rasterize_masks_aa(masks: &[EvaluatedMask], width: u32, height: u32) -> V
             };
         }
         first = false;
+    }
+
+    if first {
+        return vec![255_u8; width as usize * height as usize];
     }
 
     if rw != width as usize || rh != height as usize {
@@ -7778,5 +7815,106 @@ mod tests {
         let inv_plane = rasterize_masks_aa(&[inv_mask], 200, 200);
         assert_eq!(inv_plane[0], 255);
         assert!((i32::from(inv_plane[100 * 200 + 100]) - 128).abs() <= 2);
+    }
+
+    #[test]
+    fn offscreen_negative_y_mask_with_expansion_does_not_hang_and_is_zero() {
+        let offscreen_expanded = EvaluatedMask {
+            vertices: vec![
+                [20.0, -250.0, 0.0, 0.0, 0.0, 0.0],
+                [180.0, -250.0, 0.0, 0.0, 0.0, 0.0],
+                [180.0, -110.0, 0.0, 0.0, 0.0, 0.0],
+                [20.0, -110.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            expansion: 4.0,
+            ..EvaluatedMask::default()
+        };
+        let cov_exp = rasterize_masks_aa(std::slice::from_ref(&offscreen_expanded), 200, 200);
+        assert_eq!(cov_exp.len(), 200 * 200);
+        assert!(
+            cov_exp.iter().all(|&b| b == 0),
+            "offscreen y=-250..-110 expanded mask must produce all-zero coverage"
+        );
+
+        let mut offscreen_aa = offscreen_expanded;
+        offscreen_aa.expansion = 0.0;
+        let cov_aa = rasterize_masks_aa(&[offscreen_aa], 200, 200);
+        assert_eq!(cov_aa.len(), 200 * 200);
+        assert!(
+            cov_aa.iter().all(|&b| b == 0),
+            "offscreen y=-250..-110 AA mask must produce all-zero coverage"
+        );
+    }
+
+    #[test]
+    fn symmetric_bowtie_mask_renders_both_lobes_and_lt3_masks_pass_through() {
+        // Symmetric bowtie: opposing-winding left & right triangles have signed_area == 0.
+        let bowtie_pts = [
+            [40.0_f64, 40.0],
+            [160.0, 160.0],
+            [160.0, 40.0],
+            [40.0, 160.0],
+        ];
+        assert!(signed_area(&bowtie_pts).abs() < 1e-9);
+
+        let bowtie = EvaluatedMask {
+            vertices: bowtie_pts
+                .iter()
+                .map(|p| [p[0] as f32, p[1] as f32, 0.0, 0.0, 0.0, 0.0])
+                .collect(),
+            ..EvaluatedMask::default()
+        };
+        let cov = rasterize_masks_aa(std::slice::from_ref(&bowtie), 200, 200);
+        assert_eq!(
+            cov[100 * 200 + 60],
+            255,
+            "left lobe of symmetric bowtie must be opaque"
+        );
+        assert_eq!(
+            cov[100 * 200 + 140],
+            255,
+            "right lobe of symmetric bowtie must be opaque"
+        );
+        assert_eq!(cov[20 * 200 + 100], 0, "exterior must stay transparent");
+
+        // Expanded bowtie must also render both lobes cleanly.
+        let mut bowtie_exp = bowtie.clone();
+        bowtie_exp.expansion = 2.0;
+        let cov_exp = rasterize_masks_aa(&[bowtie_exp], 200, 200);
+        assert_eq!(cov_exp[100 * 200 + 60], 255);
+        assert_eq!(cov_exp[100 * 200 + 140], 255);
+
+        // Degenerate <3 vertex masks (0, 1, 2 vertices) pass through as full-opaque (255).
+        for verts in [
+            vec![],
+            vec![[50.0, 50.0, 0.0, 0.0, 0.0, 0.0]],
+            vec![
+                [50.0, 50.0, 0.0, 0.0, 0.0, 0.0],
+                [150.0, 150.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+        ] {
+            let deg = EvaluatedMask {
+                vertices: verts,
+                ..EvaluatedMask::default()
+            };
+            let plane = rasterize_masks_aa(&[deg], 64, 64);
+            assert!(
+                plane.iter().all(|&b| b == 255),
+                "<3 vertex degenerate mask must pass through full opaque"
+            );
+        }
+
+        // An unfinished 2-vertex mask alongside a valid mask must not disturb the valid mask.
+        let unfinished = EvaluatedMask {
+            vertices: vec![
+                [10.0, 10.0, 0.0, 0.0, 0.0, 0.0],
+                [20.0, 20.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            mode: "intersect".to_owned(),
+            ..EvaluatedMask::default()
+        };
+        let combined = rasterize_masks_aa(&[bowtie, unfinished], 200, 200);
+        assert_eq!(combined[100 * 200 + 60], 255);
+        assert_eq!(combined[100 * 200 + 140], 255);
     }
 }

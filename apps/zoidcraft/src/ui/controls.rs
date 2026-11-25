@@ -22,6 +22,101 @@ use super::theme::{
 };
 
 // ---------------------------------------------------------------------------
+// 0. Transient Popover Escape Coordination (LIFO Dismissal Priority)
+// ---------------------------------------------------------------------------
+
+fn transient_popover_consumed_esc_bool_id() -> Id {
+    Id::unique("zc_transient_popover_consumed_esc")
+}
+
+fn transient_popover_consumed_esc_pass_id() -> Id {
+    Id::unique("zc_transient_popover_consumed_esc_pass")
+}
+
+fn transient_popover_open_pass_id() -> Id {
+    Id::unique("zc_transient_popover_open_pass")
+}
+
+/// Resets the per-frame `bool` Escape-consumed flag at the start of each frame so sibling
+/// windows (e.g. pro editors reading `zc_transient_popover_consumed_esc` as `bool`) stay
+/// synchronized across frames.
+pub fn reset_transient_popover_escape_flag(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(transient_popover_consumed_esc_bool_id(), false));
+}
+
+/// Consumes `Key::Escape` from egui's input state for the current pass so no underlying
+/// floating window or global shortcut handler also fires on the same keypress.
+fn consume_escape_key_event(ctx: &egui::Context) {
+    ctx.input_mut(|i| {
+        let _ = i.consume_key(egui::Modifiers::NONE, Key::Escape);
+        i.events.retain(|ev| {
+            !matches!(
+                ev,
+                egui::Event::Key {
+                    key: Key::Escape,
+                    pressed: true,
+                    ..
+                }
+            )
+        });
+    });
+}
+
+/// Records that a foreground transient popover (color picker, dropdown, easing menu) is open
+/// on the current egui pass so shortcut dispatchers at the top of the next pass yield `Escape`.
+pub fn mark_transient_popover_open(ctx: &egui::Context) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(transient_popover_open_pass_id(), pass));
+}
+
+/// Clears the open-popover pass marker when a popover closes via non-Escape interaction
+/// without clobbering another popover that opened during the current pass.
+fn clear_transient_popover_open_if_stale(ctx: &egui::Context) {
+    let cur = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| {
+        if d.get_temp::<u64>(transient_popover_open_pass_id())
+            .is_some_and(|open_pass| open_pass < cur)
+        {
+            d.remove::<u64>(transient_popover_open_pass_id());
+        }
+    });
+}
+
+/// Marks that a foreground transient popover consumed `Key::Escape` during the current pass,
+/// strips `Key::Escape` from input, and clears the open-popover marker.
+pub fn consume_transient_popover_escape(ctx: &egui::Context) {
+    let cur = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| {
+        d.insert_temp(transient_popover_consumed_esc_bool_id(), true);
+        d.insert_temp(transient_popover_consumed_esc_pass_id(), cur);
+        d.remove::<u64>(transient_popover_open_pass_id());
+    });
+    consume_escape_key_event(ctx);
+}
+
+/// Returns `true` if a foreground transient popover is currently open (either on this pass
+/// or still open from the immediately preceding pass before widgets run).
+#[must_use]
+pub fn is_transient_popover_open(ctx: &egui::Context) -> bool {
+    let cur = ctx.cumulative_pass_nr();
+    ctx.data(|d| d.get_temp::<u64>(transient_popover_open_pass_id()))
+        .is_some_and(|open_pass| cur <= open_pass.saturating_add(1))
+}
+
+/// Returns `true` if a foreground transient popover already consumed `Key::Escape` during
+/// the current egui pass.
+#[must_use]
+pub fn transient_popover_consumed_escape(ctx: &egui::Context) -> bool {
+    let cur = ctx.cumulative_pass_nr();
+    ctx.data(|d| {
+        d.get_temp::<u64>(transient_popover_consumed_esc_pass_id())
+            .is_some_and(|consumed_pass| consumed_pass == cur)
+            || d.get_temp::<bool>(transient_popover_consumed_esc_bool_id())
+                .unwrap_or(false)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // 1. Numeric Scrub Input (Exact CM3 Spec 01 §4.3 State Machine)
 // ---------------------------------------------------------------------------
 
@@ -207,6 +302,18 @@ fn cm3_scrub_number_inner(
     config: ScrubConfig,
     theme: &Cm3Theme,
 ) -> (ScrubEvent, Option<(f64, bool)>) {
+    cm3_scrub_number_styled(ui, id, value, config, theme, FONT_BODY, 3.0)
+}
+
+fn cm3_scrub_number_styled(
+    ui: &mut Ui,
+    id: Id,
+    value: &mut f64,
+    config: ScrubConfig,
+    theme: &Cm3Theme,
+    font_size: f32,
+    left_inset: f32,
+) -> (ScrubEvent, Option<(f64, bool)>) {
     let safe_scale = if config.scale_factor.is_finite() && config.scale_factor.abs() > 1e-12 {
         config.scale_factor
     } else {
@@ -236,11 +343,14 @@ fn cm3_scrub_number_inner(
         let formatted = format!("{:.*}", config.decimals, display_val);
         let galley = ui
             .painter()
-            .layout_no_wrap(formatted, theme.font(FONT_BODY), TEXT_DISABLED);
-        let desired = Vec2::new(galley.size().x.max(18.0) + 3.0, 24.0);
+            .layout_no_wrap(formatted, theme.font(font_size), TEXT_DISABLED);
+        let desired = Vec2::new(galley.size().x.max(14.0) + left_inset, 24.0);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         ui.painter().galley(
-            Pos2::new(rect.left() + 3.0, rect.center().y - galley.size().y * 0.5),
+            Pos2::new(
+                rect.left() + left_inset,
+                rect.center().y - galley.size().y * 0.5,
+            ),
             galley,
             TEXT_DISABLED,
         );
@@ -347,17 +457,17 @@ fn cm3_scrub_number_inner(
         }
         ScrubMode::Idle => {
             let formatted = format!("{:.*}", config.decimals, display_val);
-            let font = theme.font(FONT_BODY);
+            let font = theme.font(font_size);
             let base_galley =
                 ui.painter()
                     .layout_no_wrap(formatted.clone(), font.clone(), theme.value());
-            let desired = Vec2::new(base_galley.size().x.max(18.0) + 3.0, 24.0);
+            let desired = Vec2::new(base_galley.size().x.max(14.0) + left_inset, 24.0);
             let (_, rect) = ui.allocate_space(desired);
             let resp = ui
                 .interact(rect, id.with("hit"), Sense::click_and_drag())
                 .on_hover_cursor(CursorIcon::ResizeHorizontal);
 
-            // Clean flat Zoidium value text with +3px left inset; highlight text on hover.
+            // Clean flat Zoidium value text; highlight text on hover.
             let (galley, text_color) = if resp.hovered() {
                 (
                     ui.painter()
@@ -368,7 +478,10 @@ fn cm3_scrub_number_inner(
                 (base_galley, theme.value())
             };
             ui.painter().galley(
-                Pos2::new(rect.left() + 3.0, rect.center().y - galley.size().y * 0.5),
+                Pos2::new(
+                    rect.left() + left_inset,
+                    rect.center().y - galley.size().y * 0.5,
+                ),
                 galley,
                 text_color,
             );
@@ -400,16 +513,19 @@ fn cm3_scrub_number_inner(
             let formatted = format!("{:.*}", config.decimals, display_val);
             let galley = ui.painter().layout_no_wrap(
                 formatted.clone(),
-                theme.font(FONT_BODY),
+                theme.font(font_size),
                 theme.value_strong(),
             );
-            let desired = Vec2::new(galley.size().x.max(18.0) + 3.0, 24.0);
+            let desired = Vec2::new(galley.size().x.max(14.0) + left_inset, 24.0);
             let (_, rect) = ui.allocate_space(desired);
             let _resp = ui
                 .interact(rect, id.with("hit"), Sense::click_and_drag())
                 .on_hover_cursor(CursorIcon::ResizeHorizontal);
             ui.painter().galley(
-                Pos2::new(rect.left() + 3.0, rect.center().y - galley.size().y * 0.5),
+                Pos2::new(
+                    rect.left() + left_inset,
+                    rect.center().y - galley.size().y * 0.5,
+                ),
                 galley,
                 theme.value_strong(),
             );
@@ -527,14 +643,17 @@ fn cm3_scrub_number_inner(
             let formatted = format!("{:.*}", config.decimals, cur_disp);
             let galley =
                 ui.painter()
-                    .layout_no_wrap(formatted, theme.font(FONT_BODY), theme.value_strong());
-            let desired = Vec2::new(galley.size().x.max(18.0) + 3.0, 24.0);
+                    .layout_no_wrap(formatted, theme.font(font_size), theme.value_strong());
+            let desired = Vec2::new(galley.size().x.max(14.0) + left_inset, 24.0);
             let (_, rect) = ui.allocate_space(desired);
             let _resp = ui
                 .interact(rect, id.with("hit"), Sense::click_and_drag())
                 .on_hover_cursor(CursorIcon::ResizeHorizontal);
             ui.painter().galley(
-                Pos2::new(rect.left() + 3.0, rect.center().y - galley.size().y * 0.5),
+                Pos2::new(
+                    rect.left() + left_inset,
+                    rect.center().y - galley.size().y * 0.5,
+                ),
                 galley,
                 theme.value_strong(),
             );
@@ -543,6 +662,74 @@ fn cm3_scrub_number_inner(
 
     ui.data_mut(|d| d.insert_temp(id, mem));
     (ev, text_commit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_vector_inline_width(
+    ui: &Ui,
+    values: &[f64],
+    config: ScrubConfig,
+    sep: &str,
+    theme: &Cm3Theme,
+    font_size: f32,
+    inset: f32,
+    spacing: f32,
+) -> f32 {
+    let safe_scale = if config.scale_factor.is_finite() && config.scale_factor.abs() > 1e-12 {
+        config.scale_factor
+    } else {
+        1.0
+    };
+    let font = theme.font(font_size);
+    let sep_w = ui
+        .painter()
+        .layout_no_wrap(sep.to_owned(), font.clone(), TEXT_DISABLED)
+        .size()
+        .x;
+    let mut total = 0.0_f32;
+    for (idx, &v) in values.iter().enumerate() {
+        if idx > 0 {
+            total += spacing + sep_w + spacing;
+        }
+        let disp = clamp_and_round(v / safe_scale, config);
+        let s = format!("{:.*}", config.decimals, disp);
+        let w = ui
+            .painter()
+            .layout_no_wrap(s, font.clone(), theme.value())
+            .size()
+            .x
+            .max(14.0)
+            + inset;
+        total += w;
+    }
+    total
+}
+
+/// Chooses `(font_size, left_inset, item_spacing)` so all inline vector components fit inside
+/// `avail_w` without clipping the rightmost component off the inspector edge.
+fn choose_vector_inline_style(
+    ui: &Ui,
+    values: &[f64],
+    config: ScrubConfig,
+    sep: &str,
+    theme: &Cm3Theme,
+) -> (f32, f32, f32) {
+    let avail_w = ui.available_width().max(60.0);
+    // Prefer exact default styling when everything fits cleanly; step down smoothly for dense
+    // Vec3 values or narrow viewports so the rightmost digit never clips off the right border.
+    for &(font_size, inset, spacing) in &[
+        (FONT_BODY, 2.0, 2.0),
+        (14.5, 1.5, 1.5),
+        (13.0, 1.0, 1.0),
+        (11.5, 0.5, 0.5),
+    ] {
+        if measure_vector_inline_width(ui, values, config, sep, theme, font_size, inset, spacing)
+            <= avail_w - 2.0
+        {
+            return (font_size, inset, spacing);
+        }
+    }
+    (11.0, 0.5, 0.5)
 }
 
 // ---------------------------------------------------------------------------
@@ -574,20 +761,29 @@ pub fn cm3_vector2_with_sep(
     let alt_held = ui.input(|i| i.modifiers.alt);
     let mut total = ScrubEvent::default();
     let sep_color = Color32::from_rgb(0x99, 0x99, 0x99);
+    let (font_size, left_inset, item_spacing) =
+        choose_vector_inline_style(ui, values, config, sep, theme);
 
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.5;
+        ui.spacing_mut().item_spacing.x = item_spacing;
         let mut started_axis: Option<usize> = None;
         for axis in 0..2 {
             if axis > 0 {
                 ui.label(
                     egui::RichText::new(sep)
-                        .font(theme.font(FONT_BODY))
+                        .font(theme.font(font_size))
                         .color(sep_color),
                 );
             }
-            let (ev, text_commit) =
-                cm3_scrub_number_inner(ui, id.with(axis), &mut values[axis], config, theme);
+            let (ev, text_commit) = cm3_scrub_number_styled(
+                ui,
+                id.with(axis),
+                &mut values[axis],
+                config,
+                theme,
+                font_size,
+                left_inset,
+            );
             if ev.started {
                 started_axis = Some(axis);
                 link_mem.active_axis = Some(axis);
@@ -715,28 +911,99 @@ pub fn cm3_vector3(
         .unwrap_or_default();
     let alt_held = ui.input(|i| i.modifiers.alt);
     let mut total = ScrubEvent::default();
+    let avail_w = ui.available_width().max(60.0);
+    let (font_size, left_inset, item_spacing) =
+        choose_vector_inline_style(ui, values, config, ",", theme);
+    let fits_inline = measure_vector_inline_width(
+        ui,
+        values,
+        config,
+        ",",
+        theme,
+        font_size,
+        left_inset,
+        item_spacing,
+    ) <= avail_w - 2.0;
+    let (wrap_font, wrap_inset, wrap_spacing) = if fits_inline {
+        (font_size, left_inset, item_spacing)
+    } else {
+        let s0 = choose_vector_inline_style(ui, &values[0..2], config, ",", theme);
+        let s1 = choose_vector_inline_style(ui, &values[2..3], config, ",", theme);
+        (s0.0.min(s1.0), s0.1.min(s1.1), s0.2.min(s1.2))
+    };
 
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.5;
-        let mut started_axis: Option<usize> = None;
-        for axis in 0..3 {
-            if axis > 0 {
-                ui.label(
-                    egui::RichText::new(",")
-                        .font(theme.font(FONT_BODY))
-                        .color(TEXT_DISABLED),
-                );
+    let mut started_axis: Option<usize> = None;
+    let mut render_axis = |ui: &mut Ui,
+                           axis: usize,
+                           show_leading_comma: bool,
+                           font_sz: f32,
+                           inset: f32| {
+        if show_leading_comma {
+            ui.label(
+                egui::RichText::new(",")
+                    .font(theme.font(font_sz))
+                    .color(TEXT_DISABLED),
+            );
+        }
+        let (ev, text_commit) = cm3_scrub_number_styled(
+            ui,
+            id.with(axis),
+            &mut values[axis],
+            config,
+            theme,
+            font_sz,
+            inset,
+        );
+        if ev.started {
+            started_axis = Some(axis);
+            link_mem.active_axis = Some(axis);
+            link_mem.initial_values = *values;
+            link_mem.unlinked = alt_held || !link_ratio;
+            if !link_mem.unlinked {
+                if values[axis].abs() > 1e-9 {
+                    let denom = values[axis];
+                    for (ratio, &val) in link_mem.ratios.iter_mut().zip(values.iter()) {
+                        *ratio = val / denom;
+                    }
+                } else if values.iter().all(|v| v.abs() <= 1e-9) {
+                    link_mem.ratios = [1.0; 3];
+                } else {
+                    link_mem.ratios = [1.0; 3];
+                    link_mem.unlinked = true;
+                }
             }
-            let (ev, text_commit) =
-                cm3_scrub_number_inner(ui, id.with(axis), &mut values[axis], config, theme);
-            if ev.started {
-                started_axis = Some(axis);
-                link_mem.active_axis = Some(axis);
+        }
+        if let Some((start_value, alt_at_start)) = text_commit {
+            if ev.committed && link_ratio && !alt_at_start && !alt_held {
+                let v = values[axis];
+                if start_value.abs() > 1e-9 {
+                    let factor = v / start_value;
+                    for (other, slot) in values.iter_mut().enumerate() {
+                        if other != axis {
+                            *slot = clamp_stored_bounds(*slot * factor, config);
+                        }
+                    }
+                } else if values
+                    .iter()
+                    .enumerate()
+                    .all(|(other, val)| other == axis || val.abs() <= 1e-9)
+                {
+                    for (other, slot) in values.iter_mut().enumerate() {
+                        if other != axis {
+                            *slot = clamp_stored_bounds(v, config);
+                        }
+                    }
+                }
+            }
+            // Refresh an earlier axis's same-frame PendingDrag snapshot after a TextEdit commit.
+            if ev.committed
+                && let Some(prev_axis) = started_axis
+                && prev_axis != axis
+            {
                 link_mem.initial_values = *values;
-                link_mem.unlinked = alt_held || !link_ratio;
                 if !link_mem.unlinked {
-                    if values[axis].abs() > 1e-9 {
-                        let denom = values[axis];
+                    if values[prev_axis].abs() > 1e-9 {
+                        let denom = values[prev_axis];
                         for (ratio, &val) in link_mem.ratios.iter_mut().zip(values.iter()) {
                             *ratio = val / denom;
                         }
@@ -747,108 +1014,170 @@ pub fn cm3_vector3(
                         link_mem.unlinked = true;
                     }
                 }
-            }
-            if let Some((start_value, alt_at_start)) = text_commit {
-                if ev.committed && link_ratio && !alt_at_start && !alt_held {
-                    let v = values[axis];
-                    if start_value.abs() > 1e-9 {
-                        let factor = v / start_value;
-                        for (other, slot) in values.iter_mut().enumerate() {
-                            if other != axis {
-                                *slot = clamp_stored_bounds(*slot * factor, config);
-                            }
-                        }
-                    } else if values
-                        .iter()
-                        .enumerate()
-                        .all(|(other, val)| other == axis || val.abs() <= 1e-9)
+                let safe_scale =
+                    if config.scale_factor.is_finite() && config.scale_factor.abs() > 1e-12 {
+                        config.scale_factor
+                    } else {
+                        1.0
+                    };
+                let new_disp = clamp_and_round(values[prev_axis] / safe_scale, config);
+                ui.data_mut(|d| {
+                    if let Some(mut sm) = d.get_temp::<ScrubMemory>(id.with(prev_axis))
+                        && let ScrubMode::PendingDrag {
+                            initial_display,
+                            start_value,
+                            accum_display,
+                            ..
+                        } = &mut sm.mode
                     {
-                        for (other, slot) in values.iter_mut().enumerate() {
-                            if other != axis {
-                                *slot = clamp_stored_bounds(v, config);
-                            }
-                        }
+                        *initial_display = new_disp;
+                        *start_value = values[prev_axis];
+                        *accum_display = new_disp;
+                        d.insert_temp(id.with(prev_axis), sm);
                     }
-                }
-                // Refresh an earlier axis's same-frame PendingDrag snapshot after a TextEdit commit.
-                if ev.committed
-                    && let Some(prev_axis) = started_axis
-                    && prev_axis != axis
-                {
-                    link_mem.initial_values = *values;
-                    if !link_mem.unlinked {
-                        if values[prev_axis].abs() > 1e-9 {
-                            let denom = values[prev_axis];
-                            for (ratio, &val) in link_mem.ratios.iter_mut().zip(values.iter()) {
-                                *ratio = val / denom;
-                            }
-                        } else if values.iter().all(|v| v.abs() <= 1e-9) {
-                            link_mem.ratios = [1.0; 3];
-                        } else {
-                            link_mem.ratios = [1.0; 3];
-                            link_mem.unlinked = true;
-                        }
-                    }
-                    let safe_scale =
-                        if config.scale_factor.is_finite() && config.scale_factor.abs() > 1e-12 {
-                            config.scale_factor
-                        } else {
-                            1.0
-                        };
-                    let new_disp = clamp_and_round(values[prev_axis] / safe_scale, config);
-                    ui.data_mut(|d| {
-                        if let Some(mut sm) = d.get_temp::<ScrubMemory>(id.with(prev_axis))
-                            && let ScrubMode::PendingDrag {
-                                initial_display,
-                                start_value,
-                                accum_display,
-                                ..
-                            } = &mut sm.mode
-                        {
-                            *initial_display = new_disp;
-                            *start_value = values[prev_axis];
-                            *accum_display = new_disp;
-                            d.insert_temp(id.with(prev_axis), sm);
-                        }
-                    });
-                }
-            } else if (ev.changed || ev.committed)
-                && link_mem.active_axis == Some(axis)
-                && !link_mem.unlinked
-                && link_ratio
+                });
+            }
+        } else if (ev.changed || ev.committed)
+            && link_mem.active_axis == Some(axis)
+            && !link_mem.unlinked
+            && link_ratio
+        {
+            let v = values[axis];
+            for (other, (slot, &ratio)) in values.iter_mut().zip(link_mem.ratios.iter()).enumerate()
             {
-                let v = values[axis];
-                for (other, (slot, &ratio)) in
-                    values.iter_mut().zip(link_mem.ratios.iter()).enumerate()
-                {
-                    if other != axis {
-                        *slot = clamp_stored_bounds(v * ratio, config);
-                    }
+                if other != axis {
+                    *slot = clamp_stored_bounds(v * ratio, config);
                 }
             }
-            if ev.cancelled
-                && link_mem.active_axis == Some(axis)
-                && !link_mem.unlinked
-                && link_ratio
-            {
-                for (other, (slot, &init_val)) in values
-                    .iter_mut()
-                    .zip(link_mem.initial_values.iter())
-                    .enumerate()
-                {
-                    if other != axis {
-                        *slot = init_val;
-                    }
-                }
-            }
-            if (ev.committed || ev.cancelled) && link_mem.active_axis == Some(axis) {
-                link_mem.active_axis = None;
-            }
-            total = total.merge(ev);
         }
-    });
+        if ev.cancelled && link_mem.active_axis == Some(axis) && !link_mem.unlinked && link_ratio {
+            for (other, (slot, &init_val)) in values
+                .iter_mut()
+                .zip(link_mem.initial_values.iter())
+                .enumerate()
+            {
+                if other != axis {
+                    *slot = init_val;
+                }
+            }
+        }
+        if (ev.committed || ev.cancelled) && link_mem.active_axis == Some(axis) {
+            link_mem.active_axis = None;
+        }
+        total = total.merge(ev);
+    };
+
+    if fits_inline {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = item_spacing;
+            for axis in 0..3 {
+                render_axis(ui, axis, axis > 0, font_size, left_inset);
+            }
+        });
+    } else {
+        // Automatic 2+1 wrap when panel is very narrow (e.g. 220px): (X, Y) on row 1, (Z) on row 2.
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = wrap_spacing;
+                render_axis(ui, 0, false, wrap_font, wrap_inset);
+                render_axis(ui, 1, true, wrap_font, wrap_inset);
+            });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = wrap_spacing;
+                render_axis(ui, 2, false, wrap_font, wrap_inset);
+            });
+        });
+    }
 
     ui.data_mut(|d| d.insert_temp(id.with("link"), link_mem));
+    total
+}
+
+/// Adaptive CM3 Vector4 control (`X, Y, Z, W`) with compact inline scaling and automatic
+/// 2×2 grid wrap when `ui.available_width()` is narrower than the readable inline width,
+/// ensuring all 4 components stay 100% readable without right-edge clipping.
+pub fn cm3_vector4(
+    ui: &mut Ui,
+    id: Id,
+    values: &mut [f64; 4],
+    config: ScrubConfig,
+    theme: &Cm3Theme,
+) -> ScrubEvent {
+    let avail_w = ui.available_width().max(60.0);
+    let inline_fit = [
+        (FONT_BODY, 2.0, 2.0),
+        (14.5, 1.5, 1.5),
+        (13.0, 1.0, 1.0),
+        (11.5, 0.5, 1.0),
+    ]
+    .into_iter()
+    .find(|&(font_size, inset, spacing)| {
+        measure_vector_inline_width(ui, values, config, ",", theme, font_size, inset, spacing)
+            <= avail_w - 2.0
+    });
+
+    let mut total = ScrubEvent::default();
+    if let Some((font_size, left_inset, item_spacing)) = inline_fit {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = item_spacing;
+            for (axis, slot) in values.iter_mut().enumerate() {
+                if axis > 0 {
+                    ui.label(
+                        egui::RichText::new(",")
+                            .font(theme.font(font_size))
+                            .color(TEXT_DISABLED),
+                    );
+                }
+                let (ev, _) = cm3_scrub_number_styled(
+                    ui,
+                    id.with(axis),
+                    slot,
+                    config,
+                    theme,
+                    font_size,
+                    left_inset,
+                );
+                total = total.merge(ev);
+            }
+        });
+    } else {
+        // Automatic 2×2 wrap: (X, Y) on row 1, (Z, W) on row 2 with uniform style.
+        let s0 = choose_vector_inline_style(ui, &values[0..2], config, ",", theme);
+        let s1 = choose_vector_inline_style(ui, &values[2..4], config, ",", theme);
+        let font_size = s0.0.min(s1.0);
+        let left_inset = s0.1.min(s1.1);
+        let item_spacing = s0.2.min(s1.2);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for row in 0..2 {
+                let start = row * 2;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = item_spacing;
+                    for offset in 0..2 {
+                        let axis = start + offset;
+                        if offset > 0 {
+                            ui.label(
+                                egui::RichText::new(",")
+                                    .font(theme.font(font_size))
+                                    .color(TEXT_DISABLED),
+                            );
+                        }
+                        let (ev, _) = cm3_scrub_number_styled(
+                            ui,
+                            id.with(axis),
+                            &mut values[axis],
+                            config,
+                            theme,
+                            font_size,
+                            left_inset,
+                        );
+                        total = total.merge(ev);
+                    }
+                });
+            }
+        });
+    }
     total
 }
 
@@ -1126,11 +1455,13 @@ pub fn cm3_keyframe_bar(
         let pos = clamp_popup_pos(easing_btn_rect, popup_size, state.viewport_rect);
 
         let mut close_popup = false;
+        let mut closed_by_escape = false;
         let mut key_navigated = false;
         let pointer_moved = ui.input(|i| i.pointer.delta() != Vec2::ZERO);
         ui.input(|i| {
             if i.key_pressed(Key::Escape) {
                 close_popup = true;
+                closed_by_escape = true;
             } else if i.key_pressed(Key::ArrowDown) {
                 popup_state.highlighted = (popup_state.highlighted + 1) % EasingKind::ALL_CM3.len();
                 key_navigated = true;
@@ -1238,7 +1569,16 @@ pub fn cm3_keyframe_bar(
         });
         if close_popup || clicked_outside {
             popup_state.open = false;
+            if closed_by_escape {
+                consume_transient_popover_escape(ui.ctx());
+            } else {
+                clear_transient_popover_open_if_stale(ui.ctx());
+            }
         }
+    }
+
+    if popup_state.open {
+        mark_transient_popover_open(ui.ctx());
     }
 
     ui.data_mut(|d| d.insert_temp(popup_id, popup_state));
@@ -1511,6 +1851,7 @@ pub fn cm3_hsva_color_picker(
         ev.cancelled = true;
         ev.changed = was_dirty;
         ui.memory_mut(|m| m.surrender_focus(popup_id.with("hex_input")));
+        clear_transient_popover_open_if_stale(ui.ctx());
     }
 
     let mut swatch_rect = Rect::NOTHING;
@@ -1559,6 +1900,7 @@ pub fn cm3_hsva_color_picker(
                         ev.started = true;
                     } else {
                         state.open = false;
+                        clear_transient_popover_open_if_stale(ui.ctx());
                         if state.dirty {
                             push_recent_swatch(ui, color.rgb());
                             ev.committed = true;
@@ -1617,8 +1959,15 @@ pub fn cm3_hsva_color_picker(
                     content_ui.allocate_exact_size(Vec2::splat(250.0), Sense::click_and_drag());
                 let sv_rect = snap_rect_px(sv_rect);
                 paint_sv_square(content_ui.painter(), sv_rect, state.hsv.h);
-                if (sv_resp.clicked() || sv_resp.dragged())
-                    && let Some(p) = content_ui.input(|i| i.pointer.interact_pos())
+                let sv_pressed_or_dragged = sv_resp.clicked()
+                    || sv_resp.dragged()
+                    || (sv_resp.is_pointer_button_down_on()
+                        && content_ui.input(|i| i.pointer.primary_down()));
+                if sv_pressed_or_dragged
+                    && let Some(p) = sv_resp.interact_pointer_pos().or_else(|| {
+                        content_ui
+                            .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+                    })
                 {
                     state.hsv.s = ((p.x - sv_rect.left()) / sv_rect.width()).clamp(0.0, 1.0);
                     state.hsv.v = (1.0 - (p.y - sv_rect.top()) / sv_rect.height()).clamp(0.0, 1.0);
@@ -1632,8 +1981,9 @@ pub fn cm3_hsva_color_picker(
                     (sv_rect.left() + state.hsv.s * sv_rect.width()).round(),
                     (sv_rect.top() + (1.0 - state.hsv.v) * sv_rect.height()).round(),
                 );
-                // Paint reticle on outer ui.painter() so edge overhang into the 5px padding is never clipped.
-                ui.painter().circle_stroke(
+                // Clip reticle strictly inside the SV square so corner positions like
+                // rgb(255,255,255) never overflow onto the popup border or inspector above.
+                ui.painter().with_clip_rect(sv_rect).circle_stroke(
                     reticle,
                     4.0,
                     Stroke::new(1.0, Color32::from_gray(0xaa)),
@@ -1644,8 +1994,15 @@ pub fn cm3_hsva_color_picker(
                     content_ui.allocate_exact_size(Vec2::new(25.0, 250.0), Sense::click_and_drag());
                 let hue_rect = snap_rect_px(hue_rect);
                 paint_hue_bar(content_ui.painter(), hue_rect);
-                if (hue_resp.clicked() || hue_resp.dragged())
-                    && let Some(p) = content_ui.input(|i| i.pointer.interact_pos())
+                let hue_pressed_or_dragged = hue_resp.clicked()
+                    || hue_resp.dragged()
+                    || (hue_resp.is_pointer_button_down_on()
+                        && content_ui.input(|i| i.pointer.primary_down()));
+                if hue_pressed_or_dragged
+                    && let Some(p) = hue_resp.interact_pointer_pos().or_else(|| {
+                        content_ui
+                            .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+                    })
                 {
                     state.hsv.h = ((p.y - hue_rect.top()) / hue_rect.height()).clamp(0.0, 0.9999);
                     let rgb = Rgb::from_hsv(state.hsv);
@@ -1659,7 +2016,11 @@ pub fn cm3_hsva_color_picker(
                     Pos2::new(hue_rect.left(), hy - 3.0),
                     Pos2::new(hue_rect.right(), hy + 3.0),
                 );
-                paint_crisp_border_1px(ui.painter(), h_cursor, Color32::from_gray(0xaa));
+                paint_crisp_border_1px(
+                    &ui.painter().with_clip_rect(hue_rect),
+                    h_cursor,
+                    Color32::from_gray(0xaa),
+                );
 
                 // 3. Optional 25x250 Alpha bar (borderless, un-squashed 25x6 1px #aaaaaa cursor)
                 if has_alpha {
@@ -1667,8 +2028,16 @@ pub fn cm3_hsva_color_picker(
                         .allocate_exact_size(Vec2::new(25.0, 250.0), Sense::click_and_drag());
                     let a_rect = snap_rect_px(a_rect);
                     paint_alpha_bar(content_ui.painter(), a_rect, Rgb::from_hsv(state.hsv));
-                    if (a_resp.clicked() || a_resp.dragged())
-                        && let Some(p) = content_ui.input(|i| i.pointer.interact_pos())
+                    let alpha_pressed_or_dragged = a_resp.clicked()
+                        || a_resp.dragged()
+                        || (a_resp.is_pointer_button_down_on()
+                            && content_ui.input(|i| i.pointer.primary_down()));
+                    if alpha_pressed_or_dragged
+                        && let Some(p) = a_resp.interact_pointer_pos().or_else(|| {
+                            content_ui.input(|i| {
+                                i.pointer.interact_pos().or_else(|| i.pointer.latest_pos())
+                            })
+                        })
                     {
                         state.alpha =
                             (1.0 - (p.y - a_rect.top()) / a_rect.height()).clamp(0.0, 1.0);
@@ -1682,7 +2051,11 @@ pub fn cm3_hsva_color_picker(
                         Pos2::new(a_rect.left(), ay - 3.0),
                         Pos2::new(a_rect.right(), ay + 3.0),
                     );
-                    paint_crisp_border_1px(ui.painter(), a_cursor, Color32::from_gray(0xaa));
+                    paint_crisp_border_1px(
+                        &ui.painter().with_clip_rect(a_rect),
+                        a_cursor,
+                        Color32::from_gray(0xaa),
+                    );
                 }
 
                 // 4. Right panel (185x250 px): 25px preview + 5px gap + 185px 6x6 grid + 14px gap + 21px input
@@ -1871,8 +2244,12 @@ pub fn cm3_hsva_color_picker(
             *color = state.initial;
             state.open = false;
             ev.cancelled = true;
+            ui.memory_mut(|m| m.surrender_focus(popup_id.with("hex_input")));
+            consume_transient_popover_escape(ui.ctx());
         } else if commit_now {
             state.open = false;
+            ui.memory_mut(|m| m.surrender_focus(popup_id.with("hex_input")));
+            clear_transient_popover_open_if_stale(ui.ctx());
             if state.dirty {
                 push_recent_swatch(ui, color.rgb());
                 ev.committed = true;
@@ -1880,6 +2257,10 @@ pub fn cm3_hsva_color_picker(
                 ev.cancelled = true;
             }
         }
+    }
+
+    if state.open && !read_only {
+        mark_transient_popover_open(ui.ctx());
     }
 
     ui.data_mut(|d| d.insert_temp(popup_id, state));
@@ -2331,6 +2712,38 @@ pub fn cm3_icon_button(
 struct DropdownPopupState {
     open: bool,
     highlighted: usize,
+    last_option_count: usize,
+    open_epoch: u64,
+}
+
+/// Truncates `text` with a trailing ellipsis (`…`) so it fits strictly within `max_width`.
+fn layout_truncated_dropdown_label(
+    painter: &Painter,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    if max_width <= 6.0 {
+        return painter.layout_no_wrap(String::new(), font, color);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    let mut best = painter.layout_no_wrap("…".to_owned(), font.clone(), color);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let mut candidate: String = chars[..mid].iter().collect();
+        candidate.push('…');
+        let g = painter.layout_no_wrap(candidate, font.clone(), color);
+        if g.size().x <= max_width {
+            best = g;
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
 }
 
 /// Exact CM3 `.pz-inputbox` dropdown select (`#202020` bg, `1px solid #1b1b1b`, `#7e8fb9` text).
@@ -2367,7 +2780,13 @@ pub fn cm3_dropdown(
         .unwrap_or(DropdownPopupState {
             open: false,
             highlighted: *selected_idx,
+            last_option_count: options.len(),
+            open_epoch: 0,
         });
+    if popup_state.last_option_count != options.len() {
+        popup_state.last_option_count = options.len();
+        popup_state.open_epoch = popup_state.open_epoch.wrapping_add(1);
+    }
     let mut changed = false;
 
     let font = theme.font(13.3);
@@ -2387,7 +2806,9 @@ pub fn cm3_dropdown(
             .layout_no_wrap(current_label.to_owned(), font.clone(), theme.value())
     });
     let max_w = ui.available_width().max(46.0);
-    let width = (max_opt_w + 22.0).clamp(46.0, max_w).round();
+    // Reserve 5px left inset + 23px right chrome (28px total) when room exists so selected
+    // labels never crowd or clip against the chevron.
+    let width = (max_opt_w + 28.0).clamp(46.0, max_w).round();
     let (_, raw_slot_rect) = ui.allocate_space(Vec2::new(width, 23.0));
     let btn_rect = snap_rect_px(Rect::from_min_size(
         Pos2::new(raw_slot_rect.left(), raw_slot_rect.top() + 2.0),
@@ -2409,25 +2830,36 @@ pub fn cm3_dropdown(
         },
     );
 
-    let clip_painter = ui.painter().with_clip_rect(Rect::from_min_max(
+    let label_left = btn_rect.left() + 5.0;
+    let label_right = (btn_rect.right() - 19.0).max(label_left);
+    let label_avail_w = (label_right - label_left).max(0.0);
+    let rendered_galley = if label_galley.size().x <= label_avail_w + 0.5 {
+        label_galley
+    } else {
+        layout_truncated_dropdown_label(
+            ui.painter(),
+            current_label,
+            font.clone(),
+            theme.value(),
+            label_avail_w,
+        )
+    };
+    let label_clip = ui.clip_rect().intersect(Rect::from_min_max(
         btn_rect.left_top(),
-        Pos2::new(
-            (btn_rect.right() - 15.0).max(btn_rect.left()),
-            btn_rect.bottom(),
-        ),
+        Pos2::new(label_right, btn_rect.bottom()),
     ));
-    clip_painter.galley(
+    ui.painter().with_clip_rect(label_clip).galley(
         Pos2::new(
-            btn_rect.left() + 5.0,
-            (btn_rect.center().y - label_galley.size().y * 0.5).round(),
+            label_left,
+            (btn_rect.center().y - rendered_galley.size().y * 0.5).round(),
         ),
-        label_galley,
+        rendered_galley,
         theme.value(),
     );
 
     let caret_rect = Rect::from_center_size(
-        Pos2::new(btn_rect.right() - 8.5, btn_rect.center().y),
-        Vec2::splat(12.0),
+        Pos2::new(btn_rect.right() - 9.0, btn_rect.center().y),
+        Vec2::splat(11.0),
     );
     paint_cm3_icon(
         ui.painter(),
@@ -2439,21 +2871,36 @@ pub fn cm3_dropdown(
     if btn_resp.clicked() {
         popup_state.open = !popup_state.open;
         popup_state.highlighted = *selected_idx;
+        if popup_state.open {
+            popup_state.open_epoch = popup_state.open_epoch.wrapping_add(1);
+            popup_state.last_option_count = options.len();
+        }
     }
 
     if popup_state.open {
         popup_state.highlighted = popup_state.highlighted.min(options.len().saturating_sub(1));
         let row_h = 24.0;
-        let popup_h = (options.len() as f32 * row_h + 6.0).min(280.0);
-        let popup_size = Vec2::new(width, popup_h);
+        let total_rows_h = options.len() as f32 * row_h;
+        let needs_scroll = total_rows_h > 276.0;
+        let inner_h = total_rows_h.min(276.0);
+        let popup_h = inner_h + 4.0;
+        let scrollbar_pad = if needs_scroll { 14.0 } else { 0.0 };
+        let max_popup_w = (viewport_rect.width() - 8.0).max(width).min(280.0);
+        let popup_w = (max_opt_w + 22.0 + scrollbar_pad)
+            .max(width)
+            .min(max_popup_w)
+            .round();
+        let popup_size = Vec2::new(popup_w, popup_h);
         let pos = clamp_popup_pos(btn_rect, popup_size, viewport_rect);
         let mut close_now = false;
+        let mut closed_by_escape = false;
         let mut key_navigated = false;
         let pointer_moved = ui.input(|i| i.pointer.delta() != Vec2::ZERO);
 
         ui.input(|i| {
             if i.key_pressed(Key::Escape) {
                 close_now = true;
+                closed_by_escape = true;
             } else if i.key_pressed(Key::ArrowDown) {
                 popup_state.highlighted = (popup_state.highlighted + 1) % options.len();
                 key_navigated = true;
@@ -2470,7 +2917,10 @@ pub fn cm3_dropdown(
             }
         });
 
-        let area_resp = Area::new(popup_id)
+        // Key the popup Area by (open_epoch, options.len()) so egui never reuses stale
+        // cached Area/ScrollArea geometry when dynamic option lists grow or shrink mid-session.
+        let area_id = popup_id.with(("area", popup_state.open_epoch, options.len()));
+        let area_resp = Area::new(area_id)
             .order(Order::Foreground)
             .fixed_pos(pos)
             .interactable(true)
@@ -2483,8 +2933,9 @@ pub fn cm3_dropdown(
                         ui.set_min_width(inner_w);
                         ui.set_max_width(inner_w);
                         ScrollArea::vertical()
-                            .id_salt(popup_id.with("scroll"))
-                            .max_height(popup_h - 4.0)
+                            .id_salt(area_id.with("scroll"))
+                            .min_scrolled_height(inner_h)
+                            .max_height(inner_h)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -2552,7 +3003,16 @@ pub fn cm3_dropdown(
         });
         if close_now || outside {
             popup_state.open = false;
+            if closed_by_escape {
+                consume_transient_popover_escape(ui.ctx());
+            } else {
+                clear_transient_popover_open_if_stale(ui.ctx());
+            }
         }
+    }
+
+    if popup_state.open {
+        mark_transient_popover_open(ui.ctx());
     }
 
     ui.data_mut(|d| d.insert_temp(popup_id, popup_state));
@@ -2889,6 +3349,9 @@ pub fn cm3_fuzzy_picker(
             }
         }
     });
+    if event == FuzzyPickerEvent::Cancelled {
+        consume_transient_popover_escape(ui.ctx());
+    }
     if event != FuzzyPickerEvent::None {
         return event;
     }
@@ -2998,7 +3461,7 @@ pub fn cm3_fuzzy_picker(
 // 8. Resizable 2-Column Property Row Helper (Spec 01 §4.1)
 // ---------------------------------------------------------------------------
 
-/// Shared column width state for CM3 property trees (`layout = 0`, default `53.3%`).
+/// Shared column width state for CM3 property trees (`layout = 0`, default `48%` label / `52%` value).
 #[derive(Debug, Clone, Copy)]
 pub struct PropertyColumnState {
     pub label_ratio: f32,
@@ -3006,11 +3469,11 @@ pub struct PropertyColumnState {
 
 impl Default for PropertyColumnState {
     fn default() -> Self {
-        Self { label_ratio: 0.533 }
+        Self { label_ratio: 0.48 }
     }
 }
 
-/// Interactive full-height `5 px` column splitter inside a property panel (Spec 01 §4.1).
+/// Interactive full-height column splitter inside a property panel (`8 px` hitbox, `1 px` visual line).
 pub fn cm3_column_adjust_splitter(
     ui: &mut Ui,
     id: Id,
@@ -3019,11 +3482,11 @@ pub fn cm3_column_adjust_splitter(
 ) {
     let split_x = (panel_rect.left()
         + (panel_rect.width() * col_state.label_ratio)
-            .clamp(72.0, (panel_rect.width() - 60.0).max(72.0)))
+            .clamp(72.0, (panel_rect.width() - 72.0).max(72.0)))
     .round();
     let hit = Rect::from_min_max(
-        Pos2::new(split_x - 2.5, panel_rect.top()),
-        Pos2::new(split_x + 2.5, panel_rect.bottom()),
+        Pos2::new(split_x - 4.0, panel_rect.top()),
+        Pos2::new(split_x + 4.0, panel_rect.bottom()),
     );
     let resp = ui
         .interact(hit, id, Sense::drag())
@@ -3044,7 +3507,7 @@ pub fn cm3_column_adjust_splitter(
     }
     if resp.dragged() {
         let new_w = (split_x + resp.drag_delta().x - panel_rect.left())
-            .clamp(50.0, (panel_rect.width() - 60.0).max(50.0));
+            .clamp(50.0, (panel_rect.width() - 72.0).max(50.0));
         col_state.label_ratio = (new_w / panel_rect.width().max(1.0)).clamp(0.15, 0.80);
     }
 }
@@ -3068,9 +3531,9 @@ fn cm3_property_row_inner<R>(
         let row_top = ui.cursor().top().round();
         let row_right = (row_left + total_w).round();
         let split_x = (row_left
-            + (total_w * col_state.label_ratio).clamp(72.0, (total_w - 60.0).max(72.0)))
+            + (total_w * col_state.label_ratio).clamp(72.0, (total_w - 72.0).max(72.0)))
         .round();
-        let col1_right = (split_x - 11.0).max(row_left + 40.0);
+        let col1_right = (split_x - 8.0).max(row_left + 40.0);
 
         // Column 2 runs first (disjoint horizontal rect [split_x .. row_right]) so Column 1
         // knows whether this row contains a dropdown or color picker for exact vertical centering.
@@ -3445,9 +3908,16 @@ pub fn cm3_floating_window(
     let min_w = spec.min_size.x.max(180.0);
     let min_h = spec.min_size.y.max(80.0);
 
-    // Escape closes the focused floating window unless a text input owns keyboard focus (Spec 01 §4.8)
-    if is_focused && !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+    // Escape closes the focused floating window unless a text input or foreground transient
+    // popover (color picker / dropdown / easing menu) owns Escape (Spec 01 §4.8).
+    if is_focused
+        && !ctx.egui_wants_keyboard_input()
+        && !is_transient_popover_open(ctx)
+        && !transient_popover_consumed_escape(ctx)
+        && ctx.input(|i| i.key_pressed(Key::Escape))
+    {
         manager.close(&spec.id);
+        consume_escape_key_event(ctx);
         ev.closed = true;
         return ev;
     }
@@ -4442,5 +4912,470 @@ mod tests {
         let merged = a.merge(b);
         assert!(merged.started && merged.changed && merged.committed && !merged.cancelled);
         assert_eq!(b.merge(a), merged);
+    }
+
+    #[test]
+    fn hsv_color_picker_single_click_in_sv_square_picks_immediately() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let id = Id::unique("test_hsv_sv_single_click");
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut color = Rgba::new(1.0, 1.0, 1.0, 1.0); // white: S=0, V=1
+
+        // Frame 1: measure swatch position.
+        let mut swatch_center = Pos2::ZERO;
+        run_frame(&ctx, vec![], |ui| {
+            let start = ui.cursor().min;
+            let _ = cm3_hsva_color_picker(ui, id, &mut color, false, false, vp, &theme);
+            swatch_center = Pos2::new(start.x + 15.0, start.y + 12.0);
+        });
+
+        // Frame 2: click swatch to open HSVA popup.
+        let mut open_ev = ColorPickerEvent::default();
+        run_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(swatch_center),
+                egui::Event::PointerButton {
+                    pos: swatch_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: swatch_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            |ui| {
+                open_ev = cm3_hsva_color_picker(ui, id, &mut color, false, false, vp, &theme);
+            },
+        );
+        assert!(open_ev.started);
+
+        // Frame 3: render open popup once so layout settles.
+        run_frame(&ctx, vec![], |ui| {
+            let _ = cm3_hsva_color_picker(ui, id, &mut color, false, false, vp, &theme);
+        });
+
+        // Frame 4: single pointer-down inside the lower-right of the 250x250 SV square (no drag!).
+        let popup_pos = clamp_popup_pos(
+            Rect::from_min_size(
+                Pos2::new(swatch_center.x - 15.0, swatch_center.y - 10.0),
+                Vec2::new(30.0, 20.0),
+            ),
+            Vec2::new(482.0, 262.0),
+            vp,
+        );
+        let sv_click = Pos2::new(popup_pos.x + 6.0 + 200.0, popup_pos.y + 6.0 + 125.0);
+        let mut pick_ev = ColorPickerEvent::default();
+        run_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(sv_click),
+                egui::Event::PointerButton {
+                    pos: sv_click,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            |ui| {
+                pick_ev = cm3_hsva_color_picker(ui, id, &mut color, false, false, vp, &theme);
+            },
+        );
+        assert!(
+            pick_ev.changed,
+            "single click press in SV square must pick immediately without requiring a drag"
+        );
+        let hsv = color.rgb().to_hsv();
+        assert!(
+            hsv.s > 0.6 && hsv.v < 0.7,
+            "expected high saturation / mid value from SV click, got hsv={hsv:?}"
+        );
+    }
+
+    #[test]
+    fn dropdown_dynamic_option_count_reanchors_flush_to_button() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let id = Id::unique("test_dd_dynamic_opts");
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut selected = 0usize;
+        let opts_5 = ["Basic", "Lambert", "Phong", "Standard", "Physical"];
+        let opts_9 = [
+            "Basic", "Lambert", "Phong", "Standard", "Physical", "Toon", "Matcap", "Normal",
+            "Depth",
+        ];
+
+        // Position button near bottom of viewport so the 9-option popup flips above cleanly.
+        let mut btn_center = Pos2::ZERO;
+        run_frame(&ctx, vec![], |ui| {
+            ui.add_space(430.0);
+            let top_left = ui.cursor().min;
+            let _ = cm3_dropdown(ui, id, &mut selected, &opts_5, false, vp, &theme);
+            btn_center = Pos2::new(top_left.x + 30.0, top_left.y + 12.0);
+        });
+
+        // Open with 5 options.
+        run_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(btn_center),
+                egui::Event::PointerButton {
+                    pos: btn_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: btn_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            |ui| {
+                ui.add_space(430.0);
+                let _ = cm3_dropdown(ui, id, &mut selected, &opts_5, false, vp, &theme);
+            },
+        );
+        let popup_id = id.with("dropdown_popup");
+        let st1 = ctx
+            .data_mut(|d| d.get_temp::<DropdownPopupState>(popup_id))
+            .expect("popup state after 5 options");
+        assert!(st1.open);
+        assert_eq!(st1.last_option_count, 5);
+        let epoch1 = st1.open_epoch;
+
+        // Grow options dynamically from 5 to 9 mid-session (e.g. Material+ enabled).
+        run_frame(&ctx, vec![], |ui| {
+            ui.add_space(430.0);
+            let _ = cm3_dropdown(ui, id, &mut selected, &opts_9, false, vp, &theme);
+        });
+        let st2 = ctx
+            .data_mut(|d| d.get_temp::<DropdownPopupState>(popup_id))
+            .expect("popup state after 9 options");
+        assert_eq!(st2.last_option_count, 9);
+        assert_ne!(
+            st2.open_epoch, epoch1,
+            "growing option count must bump open_epoch so egui never reuses stale cached Area height"
+        );
+    }
+
+    #[test]
+    fn vector3_fits_within_default_property_column_without_clipping() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let col_state = PropertyColumnState::default();
+        let id = Id::unique("test_vec3_fit");
+        let cfg = ScrubConfig::new(-10000.0, 10000.0, 1.0, 2);
+        let mut vals = [100.0_f64, 100.0, 100.0];
+        let mut row_right = 0.0_f32;
+        let mut used_right = 0.0_f32;
+
+        run_frame(&ctx, vec![], |ui| {
+            ui.allocate_ui(Vec2::new(324.0, 120.0), |ui| {
+                row_right = ui.max_rect().right();
+                cm3_property_row_aligned(
+                    ui,
+                    "Scale",
+                    true,
+                    col_state,
+                    &theme,
+                    |_| {},
+                    |ui| {
+                        let _ = cm3_vector3(ui, id, &mut vals, cfg, false, &theme);
+                        used_right = ui.min_rect().right();
+                    },
+                );
+            });
+        });
+        assert!(
+            used_right <= row_right + 1.0,
+            "Vec3 (100.00, 100.00, 100.00) must fit inside default inspector column without clipping: used_right={used_right}, row_right={row_right}"
+        );
+    }
+
+    #[test]
+    fn vector4_fits_inline_and_wraps_to_2x2_when_narrow_without_clipping() {
+        let ctx = egui::Context::default();
+        super::super::theme::install_cm3_fonts(&ctx);
+        let theme = Cm3Theme::default();
+        let col_state = PropertyColumnState::default();
+        let cfg = ScrubConfig::new(-10000.0, 10000.0, 0.5, 1);
+
+        // 1. Standard 1280px inspector column (~330px total -> ~198px Col 2) fits 4 components cleanly.
+        let mut vals = [12.0_f64, 12.0, 40.0, 20.0];
+        let mut row_right = 0.0_f32;
+        let mut used_right = 0.0_f32;
+        run_frame(&ctx, vec![], |ui| {
+            ui.allocate_ui(Vec2::new(330.0, 120.0), |ui| {
+                row_right = ui.max_rect().right();
+                cm3_property_row_aligned(
+                    ui,
+                    "Amplitude",
+                    true,
+                    col_state,
+                    &theme,
+                    |_| {},
+                    |ui| {
+                        let _ = cm3_vector4(
+                            ui,
+                            Id::unique("test_vec4_fit_std"),
+                            &mut vals,
+                            cfg,
+                            &theme,
+                        );
+                        used_right = ui.min_rect().right();
+                    },
+                );
+            });
+        });
+        assert!(
+            used_right <= row_right + 1.0,
+            "Vec4 [12.0, 12.0, 40.0, 20.0] must fit inside default inspector column without clipping: used_right={used_right}, row_right={row_right}"
+        );
+
+        // 2. Narrow column (~200px total -> ~120px Col 2) with wide 2-decimal numbers wraps into
+        //    a neat 2x2 grid (height >= 44px) and NEVER clips past row_right.
+        let mut wide_vals = [120.25_f64, 120.50, 400.75, 200.00];
+        let wide_cfg = ScrubConfig::new(-10000.0, 10000.0, 0.1, 2);
+        let mut narrow_row_right = 0.0_f32;
+        let mut narrow_used_right = 0.0_f32;
+        let mut narrow_used_h = 0.0_f32;
+        run_frame(&ctx, vec![], |ui| {
+            ui.allocate_ui(Vec2::new(200.0, 160.0), |ui| {
+                narrow_row_right = ui.max_rect().right();
+                cm3_property_row_aligned(
+                    ui,
+                    "Noise",
+                    true,
+                    col_state,
+                    &theme,
+                    |_| {},
+                    |ui| {
+                        let top = ui.cursor().top();
+                        let _ = cm3_vector4(
+                            ui,
+                            Id::unique("test_vec4_fit_narrow"),
+                            &mut wide_vals,
+                            wide_cfg,
+                            &theme,
+                        );
+                        narrow_used_right = ui.min_rect().right();
+                        narrow_used_h = ui.min_rect().bottom() - top;
+                    },
+                );
+            });
+        });
+        assert!(
+            narrow_used_right <= narrow_row_right + 1.0,
+            "Wrapped 2x2 Vec4 must never clip right edge: used_right={narrow_used_right}, row_right={narrow_row_right}"
+        );
+        assert!(
+            narrow_used_h >= 40.0,
+            "Narrow Vec4 should wrap cleanly into 2 rows (2x2 grid), got height={narrow_used_h}"
+        );
+    }
+
+    #[test]
+    fn dropdown_reserves_chevron_padding_and_ellipsizes_when_constrained() {
+        let ctx = egui::Context::default();
+        super::super::theme::install_cm3_fonts(&ctx);
+        let theme = Cm3Theme::default();
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let opts = ["Classic Dark", "High Contrast", "Ocean Slate"];
+        let mut selected = 0usize;
+
+        // Roomy container: dropdown allocates max_opt_w + 28px so full label never touches chevron.
+        let mut full_box_w = 0.0_f32;
+        let mut classic_w = 0.0_f32;
+        run_frame(&ctx, vec![], |ui| {
+            classic_w = ui
+                .painter()
+                .layout_no_wrap("Classic Dark".to_owned(), theme.font(13.3), theme.value())
+                .size()
+                .x;
+            ui.allocate_ui(Vec2::new(240.0, 40.0), |ui| {
+                let start = ui.cursor().left();
+                let _ = cm3_dropdown(
+                    ui,
+                    Id::unique("test_dd_roomy"),
+                    &mut selected,
+                    &opts,
+                    false,
+                    vp,
+                    &theme,
+                );
+                full_box_w = ui.min_rect().right() - start;
+            });
+        });
+        // Label starts at +5px and clips at right - 19px => available label width = full_box_w - 24px.
+        assert!(
+            classic_w <= full_box_w - 24.0,
+            "roomy dropdown ({full_box_w}px) must leave full clearance for 'Classic Dark' ({classic_w}px) before chevron"
+        );
+
+        // Constrained container: helper produces clean ellipsis fitting strictly within max_width.
+        run_frame(&ctx, vec![], |ui| {
+            let max_w = (classic_w * 0.65).max(24.0);
+            let g = layout_truncated_dropdown_label(
+                ui.painter(),
+                "Classic Dark",
+                theme.font(13.3),
+                theme.value(),
+                max_w,
+            );
+            assert!(
+                g.text().ends_with('…'),
+                "expected ellipsis, got '{}'",
+                g.text()
+            );
+            assert!(
+                g.size().x <= max_w + 0.5,
+                "truncated label ({}px) must fit strictly within {}px before chevron",
+                g.size().x,
+                max_w
+            );
+        });
+    }
+
+    #[test]
+    fn property_column_default_ratio_rebalanced_and_usable_at_220px() {
+        let col = PropertyColumnState::default();
+        assert!(
+            (col.label_ratio - 0.48).abs() < 1e-6,
+            "default PropertyColumnState::label_ratio must be 0.48, got {}",
+            col.label_ratio
+        );
+
+        let ctx = egui::Context::default();
+        super::super::theme::install_cm3_fonts(&ctx);
+        let theme = Cm3Theme::default();
+        let cfg = ScrubConfig::new(-10000.0, 10000.0, 1.0, 2);
+        let mut vals = [100.0_f64, 100.0, 100.0];
+        let mut row_right = 0.0_f32;
+        let mut col2_left = 0.0_f32;
+        let mut used_right = 0.0_f32;
+
+        run_frame(&ctx, vec![], |ui| {
+            ui.allocate_ui(Vec2::new(220.0, 120.0), |ui| {
+                row_right = ui.max_rect().right();
+                cm3_property_row_aligned(
+                    ui,
+                    "Position",
+                    true,
+                    col,
+                    &theme,
+                    |_| {},
+                    |ui| {
+                        col2_left = ui.cursor().left();
+                        let _ = cm3_vector3(
+                            ui,
+                            Id::unique("test_vec3_220px"),
+                            &mut vals,
+                            cfg,
+                            false,
+                            &theme,
+                        );
+                        used_right = ui.min_rect().right();
+                    },
+                );
+            });
+        });
+
+        let col2_w = row_right - col2_left;
+        assert!(
+            col2_w >= 100.0,
+            "220px panel must preserve >=100px value column, got {col2_w}"
+        );
+        assert!(
+            used_right <= row_right + 1.0,
+            "220px panel Vec3 must not clip past right border: used_right={used_right}, row_right={row_right}"
+        );
+    }
+
+    #[test]
+    fn floating_windows_and_color_picker_dismiss_in_strict_lifo_order_on_escape() {
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let picker_id = Id::unique("test_lifo_color_picker");
+        let mut color = Rgba::new(1.0, 1.0, 1.0, 1.0); // top-left white corner (QA6-01 #5)
+
+        let mut mgr = FloatingWindowManager::default();
+        let spec_a = FloatingWindowSpec::new("expr_editor", "Expression Editor");
+        let spec_b = FloatingWindowSpec::new("shader_editor", "Shader Editor");
+        mgr.open_or_focus(&spec_a, vp);
+        mgr.open_or_focus(&spec_b, vp);
+        assert_eq!(mgr.focused_id.as_deref(), Some("shader_editor"));
+
+        // Open color picker popover on top of both floating windows.
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                picker_id.with("hsva_popup"),
+                ColorPopupState {
+                    open: true,
+                    initial: color,
+                    hsv: color.rgb().to_hsv(),
+                    alpha: 1.0,
+                    hex_buf: "rgb(255, 255, 255)".to_owned(),
+                    dirty: false,
+                },
+            );
+        });
+
+        let esc_event = || {
+            vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+
+        // 1st Escape: closes ONLY the color picker; both floating windows stay open.
+        let mut picker_ev = ColorPickerEvent::default();
+        let mut ev_b = FloatingWindowEvent::default();
+        let mut ev_a = FloatingWindowEvent::default();
+        reset_transient_popover_escape_flag(&ctx);
+        run_frame(&ctx, esc_event(), |ui| {
+            picker_ev = cm3_hsva_color_picker(ui, picker_id, &mut color, false, false, vp, &theme);
+            ev_b = cm3_floating_window(ui.ctx(), &mut mgr, &spec_b, vp, &theme, |_| {});
+            ev_a = cm3_floating_window(ui.ctx(), &mut mgr, &spec_a, vp, &theme, |_| {});
+        });
+        assert!(picker_ev.cancelled, "1st Escape must dismiss color picker");
+        assert!(
+            !ev_b.closed && mgr.is_open("shader_editor"),
+            "Shader Editor must stay open when color picker consumed Escape"
+        );
+        assert!(
+            !ev_a.closed && mgr.is_open("expr_editor"),
+            "Expression Editor must stay open when color picker consumed Escape"
+        );
+
+        // 2nd Escape: closes ONLY the topmost focused window (Shader Editor), transferring focus to Expression Editor.
+        reset_transient_popover_escape_flag(&ctx);
+        run_frame(&ctx, esc_event(), |ui| {
+            ev_b = cm3_floating_window(ui.ctx(), &mut mgr, &spec_b, vp, &theme, |_| {});
+            ev_a = cm3_floating_window(ui.ctx(), &mut mgr, &spec_a, vp, &theme, |_| {});
+        });
+        assert!(ev_b.closed && !mgr.is_open("shader_editor"));
+        assert!(
+            !ev_a.closed && mgr.is_open("expr_editor"),
+            "Expression Editor must NOT close on the same Escape press that closed Shader Editor"
+        );
+        assert_eq!(mgr.focused_id.as_deref(), Some("expr_editor"));
+
+        // 3rd Escape: closes Expression Editor.
+        reset_transient_popover_escape_flag(&ctx);
+        run_frame(&ctx, esc_event(), |ui| {
+            ev_a = cm3_floating_window(ui.ctx(), &mut mgr, &spec_a, vp, &theme, |_| {});
+        });
+        assert!(ev_a.closed && !mgr.is_open("expr_editor"));
     }
 }

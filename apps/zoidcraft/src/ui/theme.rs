@@ -466,9 +466,46 @@ const SOURCE_CODE_PRO_TTF: &[u8] = include_bytes!("../../assets/fonts/SourceCode
 /// Embedded open-source Geist Mono Regular font bytes (SIL OFL 1.1).
 const GEIST_MONO_TTF: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Regular.ttf");
 
+/// Standard OS CJK fallback font candidates probed once at startup via safe `std::fs::read`
+/// so Japanese/Chinese/Korean text renders crisply in egui controls without tofu boxes.
+const SYSTEM_CJK_FALLBACK_PATHS: &[&str] = &[
+    // macOS
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    // Windows
+    r"C:\Windows\Fonts\YuGothR.ttc",
+    r"C:\Windows\Fonts\meiryo.ttc",
+    r"C:\Windows\Fonts\msgothic.ttc",
+    // Linux
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+];
+
+fn load_system_cjk_fallback_font() -> Option<std::sync::Arc<egui::FontData>> {
+    static CACHED: std::sync::OnceLock<Option<std::sync::Arc<egui::FontData>>> =
+        std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            for path in SYSTEM_CJK_FALLBACK_PATHS {
+                if let Ok(bytes) = std::fs::read(path)
+                    && !bytes.is_empty()
+                {
+                    let mut font_data = egui::FontData::from_owned(bytes);
+                    font_data.index = 0;
+                    return Some(std::sync::Arc::new(font_data));
+                }
+            }
+            None
+        })
+        .clone()
+}
+
 /// Rebuilds `FontDefinitions` with both bundled SIL OFL 1.1 fonts (`"source_code_pro"` and
 /// `"geist_mono"`) registered and the selected `font` placed first in both `Monospace` and
-/// `Proportional` families while preserving egui's built-in fallback fonts.
+/// `Proportional` families while preserving egui's built-in fallback fonts and an optional
+/// OS CJK fallback font appended after primary UI fonts.
 pub fn apply_editor_font(ctx: &egui::Context, font: EditorFontChoice) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -479,6 +516,14 @@ pub fn apply_editor_font(ctx: &egui::Context, font: EditorFontChoice) {
         "geist_mono".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(GEIST_MONO_TTF)),
     );
+    let has_cjk_fallback = if let Some(cjk_font) = load_system_cjk_fallback_font() {
+        fonts
+            .font_data
+            .insert("system_cjk_fallback".to_owned(), cjk_font);
+        true
+    } else {
+        false
+    };
     let (primary, secondary) = match font {
         EditorFontChoice::SourceCodePro => ("source_code_pro", "geist_mono"),
         EditorFontChoice::GeistMono => ("geist_mono", "source_code_pro"),
@@ -487,6 +532,9 @@ pub fn apply_editor_font(ctx: &egui::Context, font: EditorFontChoice) {
         if let Some(list) = fonts.families.get_mut(&family) {
             list.insert(0, secondary.to_owned());
             list.insert(0, primary.to_owned());
+            if has_cjk_fallback {
+                list.push("system_cjk_fallback".to_owned());
+            }
         }
     }
     ctx.set_fonts(fonts);
@@ -1551,4 +1599,123 @@ pub fn paint_badge(painter: &Painter, rect: Rect, text: &str, bg: Color32, fg: C
         });
     painter.rect_filled(rect, CornerRadius::same(8), bg);
     painter.text(rect.center(), Align2::CENTER_CENTER, text, font, fg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_cm3_fonts_runs_cleanly_and_layouts_cjk_text() {
+        let ctx = egui::Context::default();
+        install_cm3_fonts(&ctx);
+
+        let mut mono_size = Vec2::ZERO;
+        let mut prop_size = Vec2::ZERO;
+        let mut cjk_glyph_distinct = false;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mono_galley = ui.painter().layout_no_wrap(
+                "日本語テスト Zoid 漢字".to_owned(),
+                FontId::new(FONT_BODY, FontFamily::Monospace),
+                TEXT_PRIMARY,
+            );
+            let prop_galley = ui.painter().layout_no_wrap(
+                "日本語テスト Zoid 漢字".to_owned(),
+                FontId::new(FONT_BODY, FontFamily::Proportional),
+                TEXT_PRIMARY,
+            );
+            mono_size = mono_galley.size();
+            prop_size = prop_galley.size();
+
+            // Verify CJK characters resolve distinct glyph geometry when a system CJK font exists
+            // (instead of falling back to identical replacement/tofu boxes).
+            let g_a = ui.painter().layout_no_wrap(
+                "日".to_owned(),
+                FontId::new(FONT_BODY, FontFamily::Monospace),
+                TEXT_PRIMARY,
+            );
+            let g_b = ui.painter().layout_no_wrap(
+                "漢".to_owned(),
+                FontId::new(FONT_BODY, FontFamily::Monospace),
+                TEXT_PRIMARY,
+            );
+            if let (Some(r0), Some(r1)) = (g_a.rows.first(), g_b.rows.first())
+                && let (Some(gl0), Some(gl1)) = (r0.glyphs.first(), r1.glyphs.first())
+            {
+                cjk_glyph_distinct = gl0.uv_rect != gl1.uv_rect;
+            }
+        });
+        out.textures_delta.clear();
+
+        assert!(mono_size.x > 0.0 && mono_size.y > 0.0);
+        assert!(prop_size.x > 0.0 && prop_size.y > 0.0);
+        if load_system_cjk_fallback_font().is_some() {
+            assert!(
+                cjk_glyph_distinct,
+                "with OS CJK fallback loaded, distinct kanji ('日' vs '漢') must map to distinct glyph UVs, not identical tofu boxes"
+            );
+        }
+
+        // Switching editor font must also preserve clean CJK layout without panicking.
+        apply_editor_font(&ctx, EditorFontChoice::GeistMono);
+        let mut out2 = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let g = ui.painter().layout_no_wrap(
+                "日本語テスト".to_owned(),
+                FontId::new(FONT_BODY, FontFamily::Monospace),
+                TEXT_PRIMARY,
+            );
+            assert!(g.size().x > 0.0);
+        });
+        out2.textures_delta.clear();
+    }
+
+    #[test]
+    fn inactive_interp_bezier_icon_paints_monochrome_without_red_dots() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::splat(25.0));
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0))),
+                ..Default::default()
+            },
+            |ui| {
+                paint_cm3_icon(
+                    ui.painter(),
+                    rect,
+                    Cm3Icon::InterpBezier,
+                    TOOLBAR_ICON_INACTIVE,
+                );
+            },
+        );
+        out.textures_delta.clear();
+
+        let mut inspected = 0usize;
+        for clipped in &out.shapes {
+            match &clipped.shape {
+                Shape::Circle(c) => {
+                    inspected += 1;
+                    assert_eq!(
+                        c.fill, TOOLBAR_ICON_INACTIVE,
+                        "inactive Bezier icon dots must be monochrome neutral gray, not red"
+                    );
+                }
+                Shape::Path(p) => {
+                    inspected += 1;
+                    assert_eq!(
+                        p.stroke.color,
+                        egui::epaint::ColorMode::Solid(TOOLBAR_ICON_INACTIVE)
+                    );
+                }
+                Shape::LineSegment { stroke, .. } => {
+                    inspected += 1;
+                    assert_eq!(stroke.color, TOOLBAR_ICON_INACTIVE);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            inspected >= 3,
+            "expected curve, tangent segments, and monochrome handle dots to be painted"
+        );
+    }
 }

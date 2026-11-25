@@ -80,38 +80,55 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         for (var i: i32 = -half_k; i <= half_k; i = i + 1) {
             let fi = f32(i);
             let w = exp(-fi * fi * inv_two_sigma2);
-            let uv_s = clamp(in_v.v_uv + step_uv * fi, vec2<f32>(0.0), vec2<f32>(1.0));
-            sum = sum + sample_diffuse(uv_s) * w;
+            sum = sum + sample_diffuse_clamped_zero(in_v.v_uv + step_uv * fi) * w;
             w_sum = w_sum + w;
         }
         return sum / max(w_sum, EPS);
     }
     if (u.pass_idx == 2u) {
         let mip = sample_diffuse(in_v.v_uv);
-        let gain = u.p0.x;
+        let gain = max(u.p0.x, 0.0);
         return vec4<f32>(mip.rgb * u.c0.xyz * gain, mip.a * gain);
     }
     let src = sample_diffuse(in_v.v_uv);
     let flare = sample_aux(in_v.v_uv);
-    let bright_tex = select(src, sample_aux2(in_v.v_uv), (u.flags & 1u) != 0u);
-    let lum_bright = luma601(bright_tex.rgb);
+    // Use continuous source luma so soft blurred alpha edges (`gaussianblur -> bloom`)
+    // never suffer a step-discontinuity contour ring at the high-pass threshold.
+    let lum_src = luma601(src.rgb);
     let lo = u.p0.y - u.p0.z;
     let hi = max(u.p0.y + u.p0.z, lo + 1e-4);
-    let atten = (1.0 - smoothstep(lo, hi, lum_bright)) * u.p0.x;
-    return vec4<f32>(
-        min(src.rgb + flare.rgb * atten, vec3<f32>(1.0)),
-        clamp(src.a + flare.a * atten, 0.0, 1.0),
-    );
+    let atten = clamp(1.0 - smoothstep(lo, hi, lum_src), 0.0, 1.0) * max(u.p0.x, 0.0);
+    let glow_rgb_raw = max(flare.rgb, vec3<f32>(0.0)) * atten;
+    let glow_peak = max(glow_rgb_raw.r, max(glow_rgb_raw.g, glow_rgb_raw.b));
+    // Softly zero sub-visible far-field Gaussian tails so empty transparent corners stay strictly alpha = 0.
+    let tail_gate = smoothstep(0.025, 0.06, glow_peak);
+    let glow_rgb_gated = glow_rgb_raw * tail_gate;
+    let glow_a_raw = clamp(max(max(flare.a, 0.0) * atten, glow_peak) * tail_gate, 0.0, 1.0);
+    let keep_glow = glow_a_raw >= 0.004;
+    let glow_rgb = select(vec3<f32>(0.0), glow_rgb_gated, keep_glow);
+    let glow_a = select(0.0, glow_a_raw, keep_glow);
+    let out_a = clamp(src.a + glow_a * (1.0 - src.a), 0.0, 1.0);
+    let out_rgb = clamp(src.rgb + glow_rgb, vec3<f32>(0.0), vec3<f32>(out_a));
+    return vec4<f32>(out_rgb, out_a);
 }
 "#;
 
 /// Box Blur (`boxblur`).
 /// Matches `fx_boxblur.glsl`: 21 taps (`i = -10..=10`) with step `i * delta * pixelSize`,
 /// dropping OOB taps and dividing by in-bounds count `total`.
+/// `pass_idx == 99u`: 4-tap anti-aliased 2x2 downsample used for large-radius pyramid blur.
 /// `p0.xy = axis_step_uv`, `p0.z = delta`.
 pub const SHADER_BOX_BLUR: &str = r#"
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
+    if (u.pass_idx == 99u) {
+        let h = u.p0.xy;
+        let c0 = sample_diffuse(clamp(in_v.v_uv + vec2<f32>(-h.x, -h.y), vec2<f32>(0.0), vec2<f32>(1.0)));
+        let c1 = sample_diffuse(clamp(in_v.v_uv + vec2<f32>( h.x, -h.y), vec2<f32>(0.0), vec2<f32>(1.0)));
+        let c2 = sample_diffuse(clamp(in_v.v_uv + vec2<f32>(-h.x,  h.y), vec2<f32>(0.0), vec2<f32>(1.0)));
+        let c3 = sample_diffuse(clamp(in_v.v_uv + vec2<f32>( h.x,  h.y), vec2<f32>(0.0), vec2<f32>(1.0)));
+        return (c0 + c1 + c2 + c3) * 0.25;
+    }
     let step_uv = u.p0.xy * u.p0.z;
     var acc = vec4<f32>(0.0);
     var total = 0.0;
@@ -242,25 +259,35 @@ fn glitch_trunc_v2(x: vec2<f32>, num_levels: vec2<f32>) -> vec2<f32> {
 
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
-    let t_raw = u.p0.x / 30.0;
-    let time_s = t_raw - 32.0 * floor(t_raw / 32.0);
-    let amount = max(u.p0.y, EPS);
+    let amount = clamp(u.p0.y, 0.0, 1.0);
+    if (amount <= EPS) {
+        return sample_diffuse(in_v.v_uv);
+    }
     let offset = u.p0.z;
-    let speed = u.p0.w;
+    let speed = max(u.p0.w, 0.1);
+    let time_s = u.p0.x + 1.37;
 
-    let time_frq = speed * 4.0;
-    let min_change_frq = speed;
-    let ct = glitch_trunc_f(time_s, min_change_frq);
-    let change_rnd = glitch_rand(glitch_trunc_v2(in_v.v_uv.yy, vec2<f32>(16.0)) + vec2<f32>(150.0 * ct));
+    let tick_coarse = glitch_trunc_f(time_s, speed * 2.0);
+    let tick_fine = glitch_trunc_f(time_s, speed * 5.0);
 
-    let tf = time_frq * change_rnd;
-    let t = 5.0 * glitch_trunc_f(time_s, tf);
-    var vt_rnd = 0.5 * glitch_rand(glitch_trunc_v2(in_v.v_uv.yy + vec2<f32>(t), vec2<f32>(11.0)));
-    vt_rnd = vt_rnd + 0.5 * glitch_rand(glitch_trunc_v2(in_v.v_uv.yy + vec2<f32>(t), vec2<f32>(7.0)));
-    vt_rnd = vt_rnd * 2.0 - 1.0;
-    vt_rnd = sign(vt_rnd) * clamp((abs(vt_rnd) - 1.0 + amount) / amount, 0.0, 1.0);
+    let band_coarse = glitch_trunc_v2(in_v.v_uv.yy, vec2<f32>(11.0));
+    let band_fine = glitch_trunc_v2(in_v.v_uv.yy, vec2<f32>(23.0));
 
-    let uv_nm = clamp(in_v.v_uv + vec2<f32>(offset * vt_rnd, 0.0), vec2<f32>(0.0), vec2<f32>(1.0));
+    let gate_coarse = glitch_rand(band_coarse + vec2<f32>(17.3 * tick_coarse + 3.1, 9.7));
+    let gate_fine = glitch_rand(band_fine + vec2<f32>(31.1 * tick_fine + 5.7, 13.3));
+
+    var shift = 0.0;
+    if (gate_coarse < amount) {
+        let mag = glitch_rand(band_coarse + vec2<f32>(53.0 * tick_coarse + 1.9, 29.1)) * 2.0 - 1.0;
+        let strength = clamp((amount - gate_coarse) / max(amount, EPS), 0.25, 1.0);
+        shift = shift + mag * strength * offset;
+    }
+    if (gate_fine < amount * 0.75) {
+        let mag = glitch_rand(band_fine + vec2<f32>(71.0 * tick_fine + 4.3, 41.7)) * 2.0 - 1.0;
+        shift = shift + mag * offset * 0.6;
+    }
+
+    let uv_nm = clamp(in_v.v_uv + vec2<f32>(shift, 0.0), vec2<f32>(0.0), vec2<f32>(1.0));
     return sample_diffuse(uv_nm);
 }
 "#;
@@ -310,22 +337,28 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 /// RGB Shift (`rgbshift`).
-/// Matches `fx_rgbshift.glsl`: zeros OOB R/B taps and preserves center green alpha `c_g.a`.
+/// Shifts R/B channels along `angle` by `amount` px, covers shifted chromatic fringes cleanly
+/// on transparent layers, and keeps empty transparent corners strictly `alpha = 0`.
 /// `p0.x = amount` (px), `p0.y = angle` (rad).
 pub const SHADER_RGB_SHIFT: &str = r#"
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let delta = vec2<f32>(cos(u.p0.y), sin(u.p0.y)) * (u.p0.x / max(u.resolution, vec2<f32>(1.0)));
-    let c_r = sample_diffuse_clamped_zero(in_v.v_uv + delta);
+    let c_r = sample_diffuse(clamp(in_v.v_uv + delta, vec2<f32>(0.0), vec2<f32>(1.0)));
     let c_g = sample_diffuse(in_v.v_uv);
-    let c_b = sample_diffuse_clamped_zero(in_v.v_uv - delta);
-    return vec4<f32>(c_r.r, c_g.g, c_b.b, c_g.a);
+    let c_b = sample_diffuse(clamp(in_v.v_uv - delta, vec2<f32>(0.0), vec2<f32>(1.0)));
+    let rgb = vec3<f32>(c_r.r, c_g.g, c_b.b);
+    let channel_peak = max(rgb.r, max(rgb.g, rgb.b));
+    let max_a = max(c_r.a, max(c_g.a, c_b.a));
+    let out_a = clamp(min(max(c_g.a, channel_peak), max_a), 0.0, 1.0);
+    let out_rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(out_a));
+    return vec4<f32>(out_rgb, out_a);
 }
 "#;
 
 /// Scan Lines (`scanlines`).
-/// Matches `fx_scanlines.glsl`: centered `(vUv - 0.5) * resolution` guide projection and
-/// dual `smoothstep` on `mod(pos, 2.0)`.
+/// Centered guide projection with half-texel phase alignment for crisp 1px scanlines on even
+/// resolutions, masked source-atop by `texel.a` so transparent background pixels stay `alpha = 0`.
 /// `c0.xyz = color`, `p0 = [opacity, thickness, offset, feather]`, `p1.x = angle`.
 pub const SHADER_SCANLINES: &str = r#"
 @fragment
@@ -336,12 +369,13 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let guide = guide_len * vec2<f32>(cos(u.p1.x), sin(u.p1.x));
     let pos_raw = dot(guide, (in_v.v_uv - vec2<f32>(0.5)) * res) / max(dot(guide, guide), EPS) * guide_len;
     let thickness = max(u.p0.y, 1e-4);
-    let pos = (pos_raw + u.p0.z) / thickness;
+    let pos = (pos_raw + u.p0.z) / thickness + 0.5;
     let m = pos - 2.0 * floor(pos * 0.5);
     let f = max(u.p0.w, 1e-5);
     let stripe = smoothstep(0.5 - f, 0.5 + f, m) - smoothstep(1.5 - f, 1.5 + f, m);
     let alpha = clamp(stripe * u.p0.x, 0.0, 1.0);
-    return vec4<f32>(u.c0.xyz * alpha, alpha) + texel * (1.0 - alpha);
+    let out_rgb = u.c0.xyz * (alpha * texel.a) + texel.rgb * (1.0 - alpha);
+    return vec4<f32>(out_rgb, texel.a);
 }
 "#;
 
@@ -422,16 +456,47 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let n = fract(r.x * r.y * (1000.0 + coord.x));
 
     let col = sample_diffuse(in_v.v_uv);
-    var noise = vec4<f32>(vec3<f32>(n), 1.0);
-    if (u.mode == 1u) {
-        noise = col + noise;
-    } else if (u.mode == 2u) {
-        noise = col - noise;
-    } else if (u.mode == 3u) {
-        noise = col * noise;
+    if (col.a <= EPS) {
+        return vec4<f32>(0.0);
     }
-    let out_c = clamp(mix(col, noise, amount), vec4<f32>(0.0), vec4<f32>(1.0));
-    return vec4<f32>(min(out_c.rgb, vec3<f32>(out_c.a)), out_c.a);
+    let n_pm = vec3<f32>(n) * col.a;
+    var blended_n = n_pm;
+    if (u.mode == 1u) {
+        blended_n = col.rgb + n_pm;
+    } else if (u.mode == 2u) {
+        blended_n = col.rgb - n_pm;
+    } else if (u.mode == 3u) {
+        blended_n = col.rgb * vec3<f32>(n);
+    }
+    let out_rgb = clamp(mix(col.rgb, blended_n, amount), vec3<f32>(0.0), vec3<f32>(col.a));
+    return vec4<f32>(out_rgb, col.a);
+}
+"#;
+
+/// Vignette (`vignette`).
+/// Smooth radial edge darkening preserving premultiplied source alpha.
+/// - `u.mode == 0u`: `p0 = [centerX, centerY, radius, softness]`, `p1 = [strength, aspectMul, 0, 0]`, `c0.xyz = color`.
+/// - `u.mode == 1u` (CM3 offset/darkness): `p0 = [centerX, centerY, offset, darkness]`, `c0.xyz = color`.
+pub const SHADER_VIGNETTE: &str = r#"
+@fragment
+fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
+    let col = sample_diffuse(in_v.v_uv);
+    if (col.a <= EPS) {
+        return vec4<f32>(0.0);
+    }
+    var v: f32 = 0.0;
+    if (u.mode == 1u) {
+        let d_vec = (in_v.v_uv - u.p0.xy) * max(u.p0.z, 0.0);
+        v = clamp(dot(d_vec, d_vec) * clamp(u.p0.w, 0.0, 4.0), 0.0, 1.0);
+    } else {
+        let d_vec = (in_v.v_uv - u.p0.xy) * vec2<f32>(max(u.p1.y, 0.01), 1.0);
+        let dist = length(d_vec) * 2.0;
+        let lo = u.p0.z - u.p0.w;
+        let hi = max(u.p0.z + u.p0.w, lo + 1e-4);
+        v = smoothstep(lo, hi, dist) * clamp(u.p1.x, 0.0, 1.0);
+    }
+    let out_rgb = mix(col.rgb, u.c0.xyz * col.a, v);
+    return vec4<f32>(clamp(out_rgb, vec3<f32>(0.0), vec3<f32>(col.a)), col.a);
 }
 "#;
 

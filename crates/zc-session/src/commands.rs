@@ -334,6 +334,34 @@ pub enum Command {
     },
     #[serde(rename = "assets.purge_unused")]
     PurgeUnusedAssets,
+
+    // --- PanZoid (CM3 / Zoidium) Bi-Directional Clipboard ---
+    #[serde(rename = "clipboard.paste_pz_json")]
+    PastePzJson {
+        json: String,
+        #[serde(default)]
+        hint: Option<String>,
+        #[serde(default)]
+        target_clip_id: Option<String>,
+        #[serde(default)]
+        parent_object_id: Option<String>,
+        #[serde(default)]
+        target_object_id: Option<String>,
+        #[serde(default)]
+        target_property: Option<String>,
+        #[serde(default)]
+        at_frame: Option<f64>,
+    },
+    #[serde(rename = "clipboard.copy_pz_json")]
+    CopyPzJson {
+        kind: String,
+        #[serde(default)]
+        clip_id: Option<String>,
+        #[serde(default)]
+        target_ids: Vec<String>,
+        #[serde(default)]
+        property: Option<String>,
+    },
 }
 
 impl Command {
@@ -415,6 +443,8 @@ impl Command {
             Self::ReverseClip { .. } => "timeline.reverse_clip",
             Self::RelinkAsset { .. } => "assets.relink",
             Self::PurgeUnusedAssets => "assets.purge_unused",
+            Self::PastePzJson { .. } => "clipboard.paste_pz_json",
+            Self::CopyPzJson { .. } => "clipboard.copy_pz_json",
         }
     }
 
@@ -466,7 +496,6 @@ impl Command {
                 | Self::DuplicateComposition { .. }
                 | Self::DeleteComposition { .. }
                 | Self::PrecomposeClips { .. }
-                | Self::SetActiveComposition { .. }
                 | Self::SetPrecompClipTarget { .. }
                 | Self::UpdateLayerPreserved { .. }
                 | Self::SetPresetShapeKind { .. }
@@ -483,6 +512,7 @@ impl Command {
                 | Self::ReverseClip { .. }
                 | Self::RelinkAsset { .. }
                 | Self::PurgeUnusedAssets
+                | Self::PastePzJson { .. }
         )
     }
 
@@ -613,6 +643,8 @@ fn resolve_canonical_command_id(name: &str) -> Option<&'static str> {
         "timeline.reverse_clip" | "ReverseClip" => Some("timeline.reverse_clip"),
         "assets.relink" | "RelinkAsset" => Some("assets.relink"),
         "assets.purge_unused" | "PurgeUnusedAssets" => Some("assets.purge_unused"),
+        "clipboard.paste_pz_json" | "PastePzJson" => Some("clipboard.paste_pz_json"),
+        "clipboard.copy_pz_json" | "CopyPzJson" => Some("clipboard.copy_pz_json"),
         _ => None,
     }
 }
@@ -1435,7 +1467,7 @@ fn builtin_command_metadata() -> Vec<CommandMeta> {
             "Composition/Switch Active Composition",
             "Switch active timeline editing between root sequence (null) and a nested composition",
             None,
-            true,
+            false,
             object_schema(json!({ "comp_id": { "type": ["string", "null"] } }), &[]),
         ),
         CommandMeta::new(
@@ -1659,6 +1691,41 @@ fn builtin_command_metadata() -> Vec<CommandMeta> {
             true,
             empty_schema(),
         ),
+        CommandMeta::new(
+            "clipboard.paste_pz_json",
+            "Edit/Paste PanZoid JSON",
+            "Parse and paste PanZoid (CM3 / Zoidium) JSON or raw GLSL shader code into the active sequence",
+            None,
+            true,
+            object_schema(
+                json!({
+                    "json": { "type": "string" },
+                    "hint": { "type": "string" },
+                    "target_clip_id": { "type": "string" },
+                    "parent_object_id": { "type": "string" },
+                    "target_object_id": { "type": "string" },
+                    "target_property": { "type": "string" },
+                    "at_frame": { "type": "number" }
+                }),
+                &["json"],
+            ),
+        ),
+        CommandMeta::new(
+            "clipboard.copy_pz_json",
+            "Edit/Copy PanZoid JSON",
+            "Serialize selected effects, 3D objects, clips, materials, properties, masks, or Shape+ contents as PanZoid CM3 JSON",
+            None,
+            false,
+            object_schema(
+                json!({
+                    "kind": { "type": "string" },
+                    "clip_id": { "type": "string" },
+                    "target_ids": { "type": "array", "items": { "type": "string" } },
+                    "property": { "type": "string" }
+                }),
+                &["kind"],
+            ),
+        ),
     ]
 }
 
@@ -1669,7 +1736,7 @@ mod tests {
     #[test]
     fn registry_contains_all_builtin_commands() {
         let reg = CommandRegistry::new_default();
-        assert_eq!(reg.len(), 74);
+        assert_eq!(reg.len(), 76);
         assert!(reg.get("project.new").is_some());
         assert!(reg.get("NewProject").is_some());
         assert!(reg.get("property.remove").is_some());
@@ -1679,6 +1746,8 @@ mod tests {
         assert!(reg.get("mask.add").is_some());
         assert!(reg.get("comp.precompose_clips").is_some());
         assert!(reg.get("assets.purge_unused").is_some());
+        assert!(reg.get("clipboard.paste_pz_json").is_some());
+        assert!(reg.get("clipboard.copy_pz_json").is_some());
     }
 
     #[test]

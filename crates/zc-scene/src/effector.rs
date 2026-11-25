@@ -938,7 +938,16 @@ pub fn apply_twist_with_params(
     }
 
     let mut out = if params.subdivision > 1 {
-        subdivide_mesh(mesh, params.subdivision)
+        let mut effective_sub = params.subdivision;
+        // When twisting past 180 deg with subdivision enabled, ensure enough levels
+        // so individual vertical segments stay well below 60 deg and never pinch/shred.
+        let abs_angle = f64::from(params.angle).abs();
+        if abs_angle > PI {
+            let needed_steps = (abs_angle / (PI / 3.0)).ceil().max(2.0);
+            let min_level = (needed_steps.log2().ceil() as u32).clamp(1, 4);
+            effective_sub = effective_sub.max(4_u32.pow(min_level));
+        }
+        subdivide_mesh(mesh, effective_sub)
     } else {
         mesh.clone()
     };
@@ -1122,7 +1131,18 @@ pub fn apply_warp_with_params(
         return mesh.clone();
     }
     let pivot = 0.5 * (min_x + max_x) + finite_or(f64::from(params.offset), 0.0);
-    let curvature = f64::from(params.strength) / size;
+    let raw_strength = f64::from(params.strength);
+    let abs_strength = raw_strength.abs();
+    // Preserve exact Zoidium sinc / (1-cos)/theta formula for |strength| <= PI.
+    // For |strength| > PI (e.g., strength = 5..20), clamp the horizontal contraction arc
+    // half-angle at +-PI/2 so the mesh never folds back onto x = pivot (1px vertical needle
+    // collapse) while smoothly continuing the bend displacement along `bend_axis`.
+    let (arc_strength, bend_boost) = if abs_strength <= PI {
+        (raw_strength, 1.0)
+    } else {
+        (raw_strength.signum() * PI, 1.0 + 0.18 * (abs_strength - PI))
+    };
+    let curvature = arc_strength / size;
 
     let prepared_field = params.field.as_ref().map(|f| {
         if let Some(sb) = shared_bounds {
@@ -1146,8 +1166,9 @@ pub fn apply_warp_with_params(
         let theta = effective * along;
         let mut next = p;
         next[along_axis] = (pivot + along * sinc_series(theta)) as f32;
-        next[bend_axis] =
-            (f64::from(p[bend_axis]) + along * one_minus_cos_over_series(theta)) as f32;
+        next[bend_axis] = (f64::from(p[bend_axis])
+            + along * one_minus_cos_over_series(theta) * bend_boost)
+            as f32;
         v.position = next;
     }
 

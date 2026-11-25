@@ -75,21 +75,26 @@ impl TextAlignMode {
     }
 }
 
-/// Zoidium Text+ bevel side (`bevelSide`: `0 = outside`, `1 = inside`).
+/// Text3D bevel side (`bevelSide`: `0 = both`, `1 = front`, `2 = back`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(u32)]
 pub enum BevelSide {
+    /// Bevel both front and back faces (`bevelSide = 0`).
     #[default]
-    Outside = 0,
-    Inside = 1,
+    Both = 0,
+    /// Bevel front face only (`bevelSide = 1`).
+    Front = 1,
+    /// Bevel back face only (`bevelSide = 2`).
+    Back = 2,
 }
 
 impl BevelSide {
     #[must_use]
     pub const fn from_u32(value: u32) -> Self {
         match value {
-            1 => Self::Inside,
-            _ => Self::Outside,
+            1 => Self::Front,
+            2 => Self::Back,
+            _ => Self::Both,
         }
     }
 }
@@ -143,7 +148,7 @@ pub struct Text3DExtendedOptions {
 impl Default for Text3DExtendedOptions {
     fn default() -> Self {
         Self {
-            bevel_side: BevelSide::Outside,
+            bevel_side: BevelSide::Both,
             bevel_profile: BevelProfile::Round,
             bevel_tension: 0.5,
             kerning: false,
@@ -334,6 +339,32 @@ fn compute_font_line_step(
     }
 }
 
+/// Returns `true` if `font_bytes` cannot be parsed or lacks a glyph for any non-whitespace
+/// character in `text` (useful to lazily load an OS CJK/Unicode fallback font only when needed).
+#[must_use]
+pub fn font_has_missing_glyphs(font_bytes: &[u8], text: &str) -> bool {
+    let Ok(face) = Face::parse(font_bytes, 0) else {
+        return true;
+    };
+    text.chars()
+        .filter(|&ch| !matches!(ch, '\n' | '\r' | ' ' | '\t'))
+        .any(|ch| face.glyph_index(ch).is_none())
+}
+
+#[inline]
+fn line_horizontal_offset(align: TextAlignMode, line_width: f32, max_line_width: f32) -> f32 {
+    let extra = (max_line_width - line_width).max(0.0);
+    match align {
+        TextAlignMode::Left => 0.0,
+        TextAlignMode::Right => extra,
+        TextAlignMode::Center
+        | TextAlignMode::Top
+        | TextAlignMode::Bottom
+        | TextAlignMode::Front
+        | TextAlignMode::Back => extra * 0.5,
+    }
+}
+
 /// Builds a 3D extruded & beveled text mesh from TTF/OTF font bytes using CM3-compatible defaults
 /// (no TTF kerning, font bbox + underline line height, exact CM3 `positionMode` alignment).
 pub fn build_text3d_mesh(
@@ -350,29 +381,62 @@ pub fn build_text3d_mesh_with_options(
     params: &Text3DParams,
     options: &Text3DExtendedOptions,
 ) -> Result<MeshData, Text3DError> {
+    build_text3d_mesh_with_fallback(font_bytes, None, params, options)
+}
+
+/// Builds a 3D extruded & beveled text mesh with per-glyph fallback to `fallback_font_bytes`
+/// (for CJK/Unicode characters missing from the primary font) and per-line multiline alignment.
+pub fn build_text3d_mesh_with_fallback(
+    font_bytes: &[u8],
+    fallback_font_bytes: Option<&[u8]>,
+    params: &Text3DParams,
+    options: &Text3DExtendedOptions,
+) -> Result<MeshData, Text3DError> {
     let face = Face::parse(font_bytes, 0)?;
     if params.text.is_empty() {
         return Ok(MeshData::empty());
     }
+    let fb_face = fallback_font_bytes.and_then(|b| Face::parse(b, 0).ok());
 
+    let height = params.height.max(1e-3);
     let upem = f32::from(face.units_per_em().max(1));
-    let scale = params.height.max(1e-3) / upem;
+    let scale = height / upem;
+    let fb_scale = fb_face
+        .as_ref()
+        .map_or(scale, |fb| height / f32::from(fb.units_per_em().max(1)));
     let line_step = compute_font_line_step(&face, params, options);
     let space_advance = face
         .glyph_index(' ')
         .and_then(|gid| face.glyph_hor_advance(gid))
         .map_or(params.height * 0.35, |a| f32::from(a) * scale);
 
-    let mut all_contours: Vec<Vec<Vec2>> = Vec::new();
+    struct LineContours {
+        contours: Vec<Vec<Vec2>>,
+        width: f32,
+    }
+
+    let mut lines: Vec<LineContours> = Vec::new();
+    let mut cur_contours: Vec<Vec<Vec2>> = Vec::new();
     let mut pen_x = 0.0_f32;
     let mut pen_y = 0.0_f32;
-    let mut prev_glyph = None;
+    let mut line_has_chars = false;
+    let mut prev_primary_glyph = None;
 
     for ch in params.text.chars() {
         if ch == '\n' {
+            let line_w = if line_has_chars {
+                (pen_x - params.letter_spacing).max(0.0)
+            } else {
+                0.0
+            };
+            lines.push(LineContours {
+                contours: std::mem::take(&mut cur_contours),
+                width: line_w,
+            });
             pen_x = 0.0;
             pen_y -= line_step;
-            prev_glyph = None;
+            line_has_chars = false;
+            prev_primary_glyph = None;
             continue;
         }
         if ch == '\r' {
@@ -380,19 +444,37 @@ pub fn build_text3d_mesh_with_options(
         }
         if ch == ' ' {
             pen_x += space_advance + params.letter_spacing;
-            prev_glyph = face.glyph_index(' ');
+            line_has_chars = true;
+            prev_primary_glyph = face.glyph_index(' ');
             continue;
         }
 
-        let gid_opt = face.glyph_index(ch).or_else(|| face.glyph_index('?'));
-        let Some(gid) = gid_opt else {
+        let resolved = if let Some(gid) = face.glyph_index(ch) {
+            Some((&face, gid, scale, true))
+        } else if let Some(fb) = fb_face.as_ref()
+            && let Some(gid) = fb.glyph_index(ch)
+        {
+            Some((fb, gid, fb_scale, false))
+        } else if let Some(gid) = face.glyph_index('?') {
+            Some((&face, gid, scale, true))
+        } else if let Some(fb) = fb_face.as_ref()
+            && let Some(gid) = fb.glyph_index('?')
+        {
+            Some((fb, gid, fb_scale, false))
+        } else {
+            None
+        };
+
+        let Some((glyph_face, gid, glyph_scale, is_primary)) = resolved else {
             pen_x += space_advance + params.letter_spacing;
-            prev_glyph = None;
+            line_has_chars = true;
+            prev_primary_glyph = None;
             continue;
         };
 
         if options.kerning
-            && let Some(prev) = prev_glyph
+            && is_primary
+            && let Some(prev) = prev_primary_glyph
             && let Some(kern) = face.tables().kern
         {
             for subtable in kern.subtables {
@@ -407,16 +489,43 @@ pub fn build_text3d_mesh_with_options(
         }
 
         let mut collector =
-            GlyphContourCollector::new(scale, Vec2::new(pen_x, pen_y), params.curve_segments);
-        face.outline_glyph(gid, &mut collector);
+            GlyphContourCollector::new(glyph_scale, Vec2::new(pen_x, pen_y), params.curve_segments);
+        glyph_face.outline_glyph(gid, &mut collector);
         collector.finish_current();
-        all_contours.extend(clean_and_orient_contours(&collector.contours));
+        cur_contours.extend(clean_and_orient_contours(&collector.contours));
 
-        let advance = face
+        let advance = glyph_face
             .glyph_hor_advance(gid)
-            .map_or(params.height * 0.55, |a| f32::from(a) * scale);
+            .map_or(params.height * 0.55, |a| f32::from(a) * glyph_scale);
         pen_x += advance + params.letter_spacing;
-        prev_glyph = Some(gid);
+        line_has_chars = true;
+        prev_primary_glyph = if is_primary { Some(gid) } else { None };
+    }
+
+    let final_line_w = if line_has_chars {
+        (pen_x - params.letter_spacing).max(0.0)
+    } else {
+        0.0
+    };
+    lines.push(LineContours {
+        contours: cur_contours,
+        width: final_line_w,
+    });
+
+    let max_line_w = lines.iter().map(|l| l.width).fold(0.0_f32, f32::max);
+    let mut all_contours: Vec<Vec<Vec2>> = Vec::new();
+    for line in lines {
+        let dx = line_horizontal_offset(params.align, line.width, max_line_w);
+        if dx.abs() > 1e-6 {
+            for mut contour in line.contours {
+                for p in &mut contour {
+                    p.x += dx;
+                }
+                all_contours.push(contour);
+            }
+        } else {
+            all_contours.extend(line.contours);
+        }
     }
 
     extrude_oriented_contours_with_options(&all_contours, params, options, true)
@@ -435,13 +544,30 @@ pub fn build_text3d_character_meshes(
     options: &Text3DExtendedOptions,
     text_scale: Vec3,
 ) -> Result<Vec<Text3DCharacterMesh>, Text3DError> {
+    build_text3d_character_meshes_with_fallback(font_bytes, None, params, options, text_scale)
+}
+
+/// Builds per-character 3D meshes with optional per-glyph CJK/Unicode fallback font
+/// and per-line multiline alignment.
+pub fn build_text3d_character_meshes_with_fallback(
+    font_bytes: &[u8],
+    fallback_font_bytes: Option<&[u8]>,
+    params: &Text3DParams,
+    options: &Text3DExtendedOptions,
+    text_scale: Vec3,
+) -> Result<Vec<Text3DCharacterMesh>, Text3DError> {
     let face = Face::parse(font_bytes, 0)?;
     if params.text.is_empty() {
         return Ok(Vec::new());
     }
+    let fb_face = fallback_font_bytes.and_then(|b| Face::parse(b, 0).ok());
 
+    let height = params.height.max(1e-3);
     let upem = f32::from(face.units_per_em().max(1));
-    let scale = params.height.max(1e-3) / upem;
+    let scale = height / upem;
+    let fb_scale = fb_face
+        .as_ref()
+        .map_or(scale, |fb| height / f32::from(fb.units_per_em().max(1)));
     let line_step = compute_font_line_step(&face, params, options);
     let space_advance = face
         .glyph_index(' ')
@@ -452,43 +578,70 @@ pub fn build_text3d_character_meshes(
         ch: char,
         index: usize,
         source_index: usize,
+        line_idx: usize,
         layout_pos: Vec2,
         advance: f32,
         mesh: MeshData,
     }
 
     let mut pending: Vec<PendingChar> = Vec::new();
-    let mut total_min = Vec3::splat(f32::INFINITY);
-    let mut total_max = Vec3::splat(f32::NEG_INFINITY);
-    let mut has_bounds = false;
+    let mut line_widths: Vec<f32> = Vec::new();
 
     let mut pen_x = 0.0_f32;
     let mut pen_y = 0.0_f32;
-    let mut prev_glyph = None;
+    let mut line_idx = 0usize;
+    let mut line_has_chars = false;
+    let mut prev_primary_glyph = None;
 
     for (source_index, ch) in params.text.chars().enumerate() {
         if ch == '\n' {
+            let line_w = if line_has_chars {
+                (pen_x - params.letter_spacing).max(0.0)
+            } else {
+                0.0
+            };
+            line_widths.push(line_w);
+            line_idx += 1;
             pen_x = 0.0;
             pen_y -= line_step;
-            prev_glyph = None;
+            line_has_chars = false;
+            prev_primary_glyph = None;
             continue;
         }
         if ch == '\r' {
             continue;
         }
 
-        let (gid_opt, advance) = if ch == ' ' {
-            (face.glyph_index(' '), space_advance)
+        let (resolved, advance) = if ch == ' ' {
+            (
+                face.glyph_index(' ').map(|gid| (&face, gid, scale, true)),
+                space_advance,
+            )
         } else {
-            let gid_opt = face.glyph_index(ch).or_else(|| face.glyph_index('?'));
-            let adv = gid_opt
-                .and_then(|gid| face.glyph_hor_advance(gid))
-                .map_or(0.0, |a| f32::from(a) * scale);
-            (gid_opt, adv)
+            let res = if let Some(gid) = face.glyph_index(ch) {
+                Some((&face, gid, scale, true))
+            } else if let Some(fb) = fb_face.as_ref()
+                && let Some(gid) = fb.glyph_index(ch)
+            {
+                Some((fb, gid, fb_scale, false))
+            } else if let Some(gid) = face.glyph_index('?') {
+                Some((&face, gid, scale, true))
+            } else if let Some(fb) = fb_face.as_ref()
+                && let Some(gid) = fb.glyph_index('?')
+            {
+                Some((fb, gid, fb_scale, false))
+            } else {
+                None
+            };
+            let adv = res
+                .and_then(|(f, gid, sc, _)| f.glyph_hor_advance(gid).map(|a| f32::from(a) * sc))
+                .unwrap_or(0.0);
+            (res, adv)
         };
 
         if options.kerning
-            && let (Some(prev), Some(gid)) = (prev_glyph, gid_opt)
+            && let Some((_, gid, _, true)) = resolved
+            && let Some(prev) = prev_primary_glyph
             && let Some(kern) = face.tables().kern
         {
             for subtable in kern.subtables {
@@ -503,11 +656,11 @@ pub fn build_text3d_character_meshes(
         }
 
         let mesh = if ch != ' '
-            && let Some(gid) = gid_opt
+            && let Some((glyph_face, gid, glyph_scale, _)) = resolved
         {
             let mut collector =
-                GlyphContourCollector::new(scale, Vec2::ZERO, params.curve_segments);
-            face.outline_glyph(gid, &mut collector);
+                GlyphContourCollector::new(glyph_scale, Vec2::ZERO, params.curve_segments);
+            glyph_face.outline_glyph(gid, &mut collector);
             collector.finish_current();
             let oriented = clean_and_orient_contours(&collector.contours);
             if oriented.is_empty() {
@@ -519,25 +672,45 @@ pub fn build_text3d_character_meshes(
             MeshData::empty()
         };
 
-        if !mesh.vertices.is_empty() {
-            let shift = Vec3::new(pen_x, pen_y, 0.0);
-            total_min = total_min.min(mesh.bounds.min + shift);
-            total_max = total_max.max(mesh.bounds.max + shift);
-            has_bounds = true;
-        }
-
         let idx = pending.len();
         pending.push(PendingChar {
             ch,
             index: idx,
             source_index,
+            line_idx,
             layout_pos: Vec2::new(pen_x, pen_y),
             advance,
             mesh,
         });
 
         pen_x += advance + params.letter_spacing;
-        prev_glyph = gid_opt;
+        line_has_chars = true;
+        prev_primary_glyph = match resolved {
+            Some((_, gid, _, true)) => Some(gid),
+            _ => None,
+        };
+    }
+
+    let final_line_w = if line_has_chars {
+        (pen_x - params.letter_spacing).max(0.0)
+    } else {
+        0.0
+    };
+    line_widths.push(final_line_w);
+
+    let max_line_w = line_widths.iter().copied().fold(0.0_f32, f32::max);
+    let mut total_min = Vec3::splat(f32::INFINITY);
+    let mut total_max = Vec3::splat(f32::NEG_INFINITY);
+    let mut has_bounds = false;
+    for item in &mut pending {
+        let lw = line_widths.get(item.line_idx).copied().unwrap_or(0.0);
+        item.layout_pos.x += line_horizontal_offset(params.align, lw, max_line_w);
+        if !item.mesh.vertices.is_empty() {
+            let shift = Vec3::new(item.layout_pos.x, item.layout_pos.y, 0.0);
+            total_min = total_min.min(item.mesh.bounds.min + shift);
+            total_max = total_max.max(item.mesh.bounds.max + shift);
+            has_bounds = true;
+        }
     }
 
     let center_offset = if has_bounds {
@@ -601,14 +774,23 @@ pub fn build_fallback_text_mesh_with_options(
 
     let h = params.height.max(1e-3);
     let line_step = h * params.line_height.max(0.1);
-    let mut contours: Vec<Vec<Vec2>> = Vec::new();
+    let mut lines: Vec<(Vec<Vec<Vec2>>, f32)> = Vec::new();
+    let mut cur_contours: Vec<Vec<Vec2>> = Vec::new();
     let mut pen_x = 0.0_f32;
     let mut pen_y = 0.0_f32;
+    let mut line_has_chars = false;
 
     for ch in params.text.chars() {
         if ch == '\n' {
+            let lw = if line_has_chars {
+                (pen_x - params.letter_spacing).max(0.0)
+            } else {
+                0.0
+            };
+            lines.push((std::mem::take(&mut cur_contours), lw));
             pen_x = 0.0;
             pen_y -= line_step;
+            line_has_chars = false;
             continue;
         }
         if ch == '\r' {
@@ -625,10 +807,34 @@ pub fn build_fallback_text_mesh_with_options(
                 if (!is_hole && area < 0.0) || (is_hole && area > 0.0) {
                     cleaned.reverse();
                 }
-                contours.push(cleaned);
+                cur_contours.push(cleaned);
             }
         }
         pen_x += advance_norm * h + params.letter_spacing;
+        line_has_chars = true;
+    }
+
+    let final_lw = if line_has_chars {
+        (pen_x - params.letter_spacing).max(0.0)
+    } else {
+        0.0
+    };
+    lines.push((cur_contours, final_lw));
+
+    let max_lw = lines.iter().map(|(_, w)| *w).fold(0.0_f32, f32::max);
+    let mut contours: Vec<Vec<Vec2>> = Vec::new();
+    for (line_contours, lw) in lines {
+        let dx = line_horizontal_offset(params.align, lw, max_lw);
+        if dx.abs() > 1e-6 {
+            for mut c in line_contours {
+                for p in &mut c {
+                    p.x += dx;
+                }
+                contours.push(c);
+            }
+        } else {
+            contours.extend(line_contours);
+        }
     }
 
     extrude_oriented_contours_with_options(&contours, params, options, true)
@@ -654,57 +860,6 @@ pub fn extrude_contours_with_options(
 ) -> Result<MeshData, Text3DError> {
     let cleaned = clean_and_orient_contours(raw_contours);
     extrude_oriented_contours_with_options(&cleaned, params, options, true)
-}
-
-fn compute_contour_miters(contour: &[Vec2]) -> Vec<Vec2> {
-    let n = contour.len();
-    let mut edge_normals = Vec::with_capacity(n);
-    for i in 0..n {
-        let a = contour[i];
-        let b = contour[(i + 1) % n];
-        let d = b - a;
-        let len = d.length();
-        let en = if len > 1e-8 {
-            Vec2::new(d.y / len, -d.x / len)
-        } else {
-            Vec2::Y
-        };
-        edge_normals.push(en);
-    }
-
-    let mut miters = Vec::with_capacity(n);
-    for i in 0..n {
-        let prev_n = edge_normals[(i + n - 1) % n];
-        let next_n = edge_normals[i];
-        let sum = prev_n + next_n;
-        if sum.length_squared() > 1e-6 {
-            let avg = sum.normalize();
-            let miter_scale = (1.0 / avg.dot(next_n).max(0.4)).min(2.5);
-            miters.push(avg * miter_scale);
-        } else {
-            miters.push(next_n);
-        }
-    }
-    miters
-}
-
-fn shift_contour_by_miter(contour: &[Vec2], shift: f32) -> Vec<Vec2> {
-    if shift.abs() <= 1e-7 || contour.len() < 3 {
-        return contour.to_vec();
-    }
-    let miters = compute_contour_miters(contour);
-    let shifted: Vec<Vec2> = contour
-        .iter()
-        .zip(miters)
-        .map(|(&p, m)| p + m * shift)
-        .collect();
-    let orig_area = signed_area_2d(contour);
-    let new_area = signed_area_2d(&shifted);
-    if orig_area * new_area > 0.0 && new_area.abs() > 1e-8 {
-        shifted
-    } else {
-        contour.to_vec()
-    }
 }
 
 fn extrude_oriented_contours_with_options(
@@ -739,36 +894,29 @@ fn extrude_oriented_contours_with_options(
         0.0
     };
     let bevel_s = if use_bevel { params.bevel_size } else { 0.0 };
-    let bevel_shift = if use_bevel && options.bevel_side == BevelSide::Inside {
-        bevel_s
-    } else {
-        0.0
-    };
+    let bevel_front = use_bevel && matches!(options.bevel_side, BevelSide::Both | BevelSide::Front);
+    let bevel_back = use_bevel && matches!(options.bevel_side, BevelSide::Both | BevelSide::Back);
     let bevel_round = options.bevel_profile == BevelProfile::Round;
     let bevel_tension = options.bevel_tension.clamp(0.0, 1.0);
-    let bevel_profile_pow = 2.0_f32.powf((bevel_tension - 0.5) * 4.0);
+    // Smooth curve exponent in [0.5, 2.0] so bevel_tension = 1.0 stays smooth instead of
+    // collapsing into a 90° staircase.
+    let bevel_profile_pow = 2.0_f32.powf((bevel_tension - 0.5) * 2.0);
 
-    let z_back = -bevel_t;
-    let z_front = thickness + bevel_t;
+    let z_back = if bevel_back { -bevel_t } else { 0.0 };
+    let z_front = if bevel_front {
+        thickness + bevel_t
+    } else {
+        thickness
+    };
     let height_scale = {
         let span_y = max_y - min_y;
         if span_y > 1e-6 { span_y } else { 1.0 }
     };
 
-    // For BevelSide::Inside, caps sit inset by `-bevel_shift` so the outer walls keep the
-    // exact glyph silhouette while the bevel chamfers inward (matching runtime-resources-stage.js).
-    let cap_contours: Vec<Vec<Vec2>> = if bevel_shift > 1e-6 {
-        cleaned
-            .iter()
-            .map(|c| shift_contour_by_miter(c, -bevel_shift))
-            .collect()
-    } else {
-        cleaned.to_vec()
-    };
-
-    // Tessellate 2D cap contours via lyon_tessellation
+    // Always tessellate caps from the clean, un-shifted glyph contours so narrow strokes
+    // and inner holes (`A`, `B`, `G`, `&`, `8`, `R`, `O`) never self-intersect or drop cap holes.
     let mut path_builder = Path::builder();
-    for contour in &cap_contours {
+    for contour in cleaned {
         if let Some((&first, rest)) = contour.split_first() {
             path_builder.begin(point(first.x, first.y));
             for &p in rest {
@@ -865,8 +1013,7 @@ fn extrude_oriented_contours_with_options(
         }
     }
 
-    // Build loft profile rings: (xy_outset, z) matching Zoidium's patched Three.js r91 ExtrudeGeometry
-    // (`tools/runtime-resources-stage.js:141-185`).
+    // Build loft profile rings: (xy_outset, z) for Both / Front / Back bevel modes.
     let mut rings: Vec<(f32, f32)> = Vec::new();
     let push_ring = |rings: &mut Vec<(f32, f32)>, ring: (f32, f32)| {
         if let Some(&last) = rings.last()
@@ -893,28 +1040,37 @@ fn extrude_oriented_contours_with_options(
                 bevel_t * (1.0 - w)
             };
             let u_out = if bevel_round {
-                bevel_s * (w * FRAC_PI_2).sin() - bevel_shift
+                bevel_s * (w * FRAC_PI_2).sin()
             } else {
-                bevel_s * w - bevel_shift
+                bevel_s * w
             };
             (u_out, fa)
         };
 
-        // Back bevel: R = 0..steps -> z from -bevel_t to 0
-        for r in 0..steps {
-            let (u_out, fa) = eval_bevel_step(r);
-            push_ring(&mut rings, (u_out, -fa));
+        // Back side: bevel from (0, -bevel_t) -> (bevel_s, 0) OR flat rim (0, 0) -> (bevel_s, 0).
+        if bevel_back {
+            for r in 0..steps {
+                let (u_out, fa) = eval_bevel_step(r);
+                push_ring(&mut rings, (u_out, -fa));
+            }
+        } else {
+            push_ring(&mut rings, (0.0, 0.0));
         }
-        // Extrusion body: z = 0 to z = thickness at outset = bevel_s - bevel_shift
-        let body_out = bevel_s - bevel_shift;
-        push_ring(&mut rings, (body_out, 0.0));
+
+        // Extrusion body: z = 0 to z = thickness at outset = bevel_s.
+        push_ring(&mut rings, (bevel_s, 0.0));
         if thickness > 1e-6 {
-            push_ring(&mut rings, (body_out, thickness));
+            push_ring(&mut rings, (bevel_s, thickness));
         }
-        // Front bevel: R = steps-1 down to 0 -> z from thickness to thickness + bevel_t
-        for r in (0..steps).rev() {
-            let (u_out, fa) = eval_bevel_step(r);
-            push_ring(&mut rings, (u_out, thickness + fa));
+
+        // Front side: bevel from (bevel_s, thickness) -> (0, thickness + bevel_t) OR flat rim to (0, thickness).
+        if bevel_front {
+            for r in (0..steps).rev() {
+                let (u_out, fa) = eval_bevel_step(r);
+                push_ring(&mut rings, (u_out, thickness + fa));
+            }
+        } else {
+            push_ring(&mut rings, (0.0, thickness));
         }
     } else if thickness > 1e-6 {
         rings.push((0.0, 0.0));
@@ -960,18 +1116,24 @@ fn emit_contour_walls(
         return;
     }
 
-    // Outward 2D edge normals and clamped miter vectors
+    // Outward 2D edge normals, edge lengths, and arc lengths.
     let mut edge_normals = Vec::with_capacity(n);
+    let mut edge_lengths = Vec::with_capacity(n);
     let mut arc_lengths = Vec::with_capacity(n + 1);
     arc_lengths.push(0.0_f32);
     let mut acc = 0.0_f32;
+    let mut c_min = Vec2::splat(f32::INFINITY);
+    let mut c_max = Vec2::splat(f32::NEG_INFINITY);
     for i in 0..n {
         let a = contour[i];
         let b = contour[(i + 1) % n];
+        c_min = c_min.min(a);
+        c_max = c_max.max(a);
         let d = b - a;
         let len = d.length();
         acc += len;
         arc_lengths.push(acc);
+        edge_lengths.push(len);
         let en = if len > 1e-8 {
             Vec2::new(d.y / len, -d.x / len)
         } else {
@@ -980,30 +1142,69 @@ fn emit_contour_walls(
         edge_normals.push(en);
     }
 
+    // Clamp hole-contour outset safely against narrow glyph counters (`A`, `B`, `O`, `R`, `8`, `&`)
+    // so inward-moving hole bevels never invert or cross through the hole center.
+    let max_ring_off = rings.iter().map(|r| r.0.abs()).fold(0.0_f32, f32::max);
+    let contour_off_scale = if signed_area_2d(contour) < 0.0 && max_ring_off > 1e-6 {
+        let c_span = (c_max.x - c_min.x).min(c_max.y - c_min.y).max(0.0);
+        let safe_hole_off = c_span * 0.35;
+        (safe_hole_off / max_ring_off).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let eff_max_off = max_ring_off * contour_off_scale;
+
     let mut miters = Vec::with_capacity(n);
     let mut smooth_n2d = Vec::with_capacity(n);
     let mut is_smooth = Vec::with_capacity(n);
     for i in 0..n {
-        let prev_n = edge_normals[(i + n - 1) % n];
+        let prev_idx = (i + n - 1) % n;
+        let prev_n = edge_normals[prev_idx];
         let next_n = edge_normals[i];
-        let dot = prev_n.dot(next_n);
+        let dot = prev_n.dot(next_n).clamp(-1.0, 1.0);
+        let cross = prev_n.x * next_n.y - prev_n.y * next_n.x;
         let sum = prev_n + next_n;
         if sum.length_squared() > 1e-6 {
             let avg = sum.normalize();
-            let miter_scale = (1.0 / avg.dot(next_n).max(0.4)).min(2.5);
+            let cos_half = avg.dot(next_n).clamp(0.0, 1.0);
+            // Clamp miter_limit <= 2.0 and smoothly damp acute tips (< 60°) so `A`/`V`/`W` never spike.
+            let mut miter_scale = if cos_half > 0.5 {
+                (1.0 / cos_half).min(2.0)
+            } else {
+                1.0 + (cos_half / 0.5) * 0.5
+            };
+            // On concave inner corners (`cross < 0`), bound the offset by local radius of curvature
+            // so neighboring offset vertices never cross or form dark diagonal cracks.
+            if cross < -1e-4 && eff_max_off > 1e-6 {
+                let sin_half = (1.0 - cos_half * cos_half).max(0.0).sqrt();
+                if sin_half > 1e-4 {
+                    let min_edge = edge_lengths[prev_idx].min(edge_lengths[i]);
+                    let safe_radius = 0.80 * min_edge / (2.0 * sin_half);
+                    let max_scale = safe_radius / eff_max_off;
+                    miter_scale = miter_scale.min(max_scale.max(0.0));
+                }
+            }
             miters.push(avg * miter_scale);
             smooth_n2d.push(avg);
             is_smooth.push(dot > 0.707);
         } else {
-            miters.push(next_n);
+            // 180° hairpin vertex: keep bounded unit offset without spiking.
+            let perp = Vec2::new(-next_n.y, next_n.x);
+            miters.push(if eff_max_off > 1e-6 {
+                perp * 0.25
+            } else {
+                next_n
+            });
             smooth_n2d.push(next_n);
             is_smooth.push(false);
         }
     }
 
     for ring_pair in rings.windows(2) {
-        let (off0, z0) = ring_pair[0];
-        let (off1, z1) = ring_pair[1];
+        let (raw_off0, z0) = ring_pair[0];
+        let (raw_off1, z1) = ring_pair[1];
+        let off0 = raw_off0 * contour_off_scale;
+        let off1 = raw_off1 * contour_off_scale;
         let doff = off1 - off0;
         let dz = z1 - z0;
         let prof_len = (doff * doff + dz * dz).sqrt();

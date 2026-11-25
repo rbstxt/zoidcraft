@@ -924,6 +924,27 @@ pub fn build_wire(
     mesh
 }
 
+/// Builds a CM3 `Wire` helix fitted cleanly inside a bounding box of dimensions `size`
+/// (`[-size/2, +size/2]` on all three axes, accounting for tube `thickness` and `loops`).
+#[must_use]
+pub fn build_wire_in_bounds(
+    size: Vec3,
+    thickness: f32,
+    loops: u32,
+    inner_segs: u32,
+    outer_segs: u32,
+) -> MeshData {
+    let loops = loops.max(1);
+    let outer = outer_segs.max(3);
+    let radius = thickness.max(1e-4);
+    let rx = (size.x.abs() * 0.5 - radius).max(0.0);
+    let ry = (size.y.abs() * 0.5 - radius).max(0.0);
+    let total_spine_z = (size.z.abs() - 2.0 * radius).max(0.0);
+    let max_frac = ((loops * outer - 1) as f32 / outer as f32).max(1e-4);
+    let pitch_z = total_spine_z / max_frac;
+    build_wire(Vec3::new(rx, ry, pitch_z), radius, loops, inner_segs, outer)
+}
+
 /// Geometry+ `RoundedBox`: axis-aligned box with smooth filleted edges and corners.
 #[must_use]
 pub fn build_rounded_box(

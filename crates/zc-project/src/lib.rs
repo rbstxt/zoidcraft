@@ -8,6 +8,7 @@
 pub mod atomic;
 pub mod effects;
 pub mod model;
+pub mod pz_clipboard;
 pub mod pz_export;
 pub mod pz_import;
 pub mod sha256;
@@ -33,6 +34,12 @@ pub use model::{
     Shape2DKind, Shape2DNode, Shape3DKind, StaticBehavior, Text3DAlign, Text3DData,
     TextureMaterial, TrackToConstraint, VideoClip, VideoMaterial, VideoTrack,
     cm3_blend_mode_from_index, normalize_blend_mode_token,
+};
+pub use pz_clipboard::{
+    MAX_CLIPBOARD_JSON_BYTES, PzClipboardClip, PzClipboardHint, PzClipboardParseResult,
+    PzClipboardPayload, parse_pz_clipboard_text, serialize_pz_clips_json,
+    serialize_pz_effects_json, serialize_pz_masks_json, serialize_pz_material_json,
+    serialize_pz_objects3d_json, serialize_pz_property_track_json,
 };
 pub use pz_export::{export_pz, export_pz_to_bytes};
 pub use pz_import::{PzImportResult, import_pz, import_pz_from_bytes};

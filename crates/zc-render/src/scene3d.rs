@@ -1,8 +1,11 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::f32::consts::PI;
 
 use bytemuck::{Pod, Zeroable};
+use zc_shader::{
+    CompiledCustomShader, TextureBinding, UniformBlockLayout, UniformValue, pack_uniforms,
+};
 
 use crate::context::{GpuContext, RenderError, RenderTarget};
 
@@ -465,6 +468,16 @@ pub struct CustomMaterial3DDrawCall<'a> {
     pub time: f32,
     pub params_a: [f32; 4],
     pub params_b: [f32; 4],
+}
+
+/// Per-mesh draw submission for a registered GLSL ES 1.00 3D custom material shader.
+pub struct GlslCustomMaterial3DDrawCall<'a> {
+    pub mesh: &'a GpuMesh,
+    pub model: [[f32; 4]; 4],
+    pub normal_matrix: [[f32; 4]; 4],
+    pub side: CullSide,
+    pub blend: MaterialBlend,
+    pub uniform_values: &'a BTreeMap<String, UniformValue>,
 }
 
 /// Camera transform and projection matrices (column-major, right-handed, `[0, 1]` Z).
@@ -977,6 +990,24 @@ struct CustomMaterialPipelineKey {
     blend: MaterialBlend,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct GlslCustom3DTransformUniforms {
+    view_proj: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
+    normal_matrix: [[f32; 4]; 4],
+    camera_pos_pad: [f32; 4],
+}
+
+struct RegisteredGlslCustom3D {
+    vert_module: wgpu::ShaderModule,
+    frag_module: wgpu::ShaderModule,
+    frag_bgl: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    uniform_layout: UniformBlockLayout,
+    texture_bindings: Vec<TextureBinding>,
+}
+
 struct ShadowAssignment {
     /// For each light index `0..MAX_SCENE_LIGHTS`: `-1.0` = none, `0..4` = 2D layer, `100..102` = point slot.
     light_slots: [f32; MAX_SCENE_LIGHTS],
@@ -1014,6 +1045,9 @@ pub struct Scene3DRenderer {
     optical_flare_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     custom_material_shaders: HashMap<String, wgpu::ShaderModule>,
     custom_material_pipelines: HashMap<CustomMaterialPipelineKey, wgpu::RenderPipeline>,
+    glsl_custom_xform_bgl: wgpu::BindGroupLayout,
+    glsl_custom_shaders: HashMap<String, RegisteredGlslCustom3D>,
+    glsl_custom_pipelines: HashMap<CustomMaterialPipelineKey, wgpu::RenderPipeline>,
     shadow_map_size_2d: u32,
     _shadow_maps_2d_tex: wgpu::Texture,
     shadow_maps_2d_array_view: wgpu::TextureView,
@@ -1118,6 +1152,21 @@ impl Scene3DRenderer {
         );
         let dof_composite_bgl = create_dof_composite_bind_group_layout(ctx);
         let optical_flare_bgl = create_optical_flare_bind_group_layout(ctx);
+        let glsl_custom_xform_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("zc-render glsl custom 3d xform bgl"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
 
         let initial_shadow_size = clamp_shadow_map_size(ctx, SHADOW_MAP_SIZE);
         let (shadow_maps_2d_tex, shadow_maps_2d_array_view, shadow_maps_2d_layer_views) =
@@ -1222,6 +1271,9 @@ impl Scene3DRenderer {
             optical_flare_pipelines: HashMap::new(),
             custom_material_shaders: HashMap::new(),
             custom_material_pipelines: HashMap::new(),
+            glsl_custom_xform_bgl,
+            glsl_custom_shaders: HashMap::new(),
+            glsl_custom_pipelines: HashMap::new(),
             shadow_map_size_2d: initial_shadow_size,
             _shadow_maps_2d_tex: shadow_maps_2d_tex,
             shadow_maps_2d_array_view,
@@ -2173,6 +2225,313 @@ impl Scene3DRenderer {
             rpass.draw_indexed(0..draw.mesh.index_count, 0, 0..1);
         }
         ctx.queue.submit(std::iter::once(encoder.finish()));
+        Ok(())
+    }
+
+    /// Compiles and caches a GLSL ES 1.00 custom 3D material shader (translated via `zc-shader`)
+    /// under `key`, generating a matching WGSL vertex shader whose `@location(N)` outputs bind
+    /// `vUv`, `vUvScaled`, `vNormal`, `vPosition`, `vColor`, and any custom varyings.
+    pub fn register_glsl_custom_material_shader(
+        &mut self,
+        ctx: &GpuContext,
+        key: &str,
+        compiled: &CompiledCustomShader,
+    ) -> Result<(), RenderError> {
+        let vert_src = build_glsl_custom_3d_vertex_wgsl(&compiled.glsl450_source);
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let vert_module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zc-render glsl custom 3d vert wgsl"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(vert_src)),
+            });
+        let frag_module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("zc-render glsl custom 3d frag wgsl"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(&compiled.wgsl)),
+            });
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            return Err(RenderError::Shader(format!(
+                "GLSL custom 3D material '{key}' compilation failed: {err}"
+            )));
+        }
+
+        let mut frag_entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::new();
+        if compiled.uniform_layout.byte_size > 0 {
+            frag_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
+        for tb in &compiled.texture_bindings {
+            frag_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: tb.texture_binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            });
+            frag_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: tb.sampler_binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            });
+        }
+        let frag_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zc-render glsl custom 3d frag bgl"),
+                entries: &frag_entries,
+            });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zc-render glsl custom 3d pipeline layout"),
+                bind_group_layouts: &[Some(&frag_bgl), Some(&self.glsl_custom_xform_bgl)],
+                immediate_size: 0,
+            });
+
+        self.glsl_custom_pipelines
+            .retain(|k, _| k.shader_key != key);
+        self.glsl_custom_shaders.insert(
+            key.to_owned(),
+            RegisteredGlslCustom3D {
+                vert_module,
+                frag_module,
+                frag_bgl,
+                pipeline_layout,
+                uniform_layout: compiled.uniform_layout.clone(),
+                texture_bindings: compiled.texture_bindings.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Draws a 3D mesh using a registered GLSL ES 1.00 custom material shader directly into
+    /// `(color_target, depth_target)` with `LoadOp::Load`.
+    pub fn render_glsl_custom_material_mesh(
+        &mut self,
+        ctx: &GpuContext,
+        color_target: &RenderTarget,
+        depth_target: &RenderTarget,
+        camera: &CameraParams,
+        shader_key: &str,
+        draw: &GlslCustomMaterial3DDrawCall<'_>,
+    ) -> Result<(), RenderError> {
+        if depth_target.format != wgpu::TextureFormat::Depth32Float {
+            return Err(RenderError::UnsupportedFormat(depth_target.format));
+        }
+        if color_target.width != depth_target.width || color_target.height != depth_target.height {
+            return Err(RenderError::InvalidDimensions {
+                width: depth_target.width,
+                height: depth_target.height,
+            });
+        }
+        if !self.glsl_custom_shaders.contains_key(shader_key) {
+            return Err(RenderError::Shader(format!(
+                "GLSL custom 3D material shader '{shader_key}' is not registered"
+            )));
+        }
+        if draw.mesh.index_count == 0 {
+            return Ok(());
+        }
+
+        let neg_scale = mat4_upper3x3_det(draw.model) < 0.0;
+        let key = CustomMaterialPipelineKey {
+            shader_key: shader_key.to_owned(),
+            format: color_target.format,
+            side: effective_cull_side(draw.side, neg_scale),
+            blend: draw.blend,
+        };
+        self.ensure_glsl_custom_material_pipeline(ctx, &key)?;
+        let entry = &self.glsl_custom_shaders[shader_key];
+        let pipeline = &self.glsl_custom_pipelines[&key];
+
+        let ubo_opt = if entry.uniform_layout.byte_size > 0 {
+            let bytes = pack_uniforms(&entry.uniform_layout, draw.uniform_values);
+            Some(create_uniform_buffer(
+                ctx,
+                "zc-render glsl custom 3d frag ubo",
+                &bytes,
+            ))
+        } else {
+            None
+        };
+        let mut frag_bg_entries: Vec<wgpu::BindGroupEntry<'_>> = Vec::new();
+        if let Some(ubo) = ubo_opt.as_ref() {
+            frag_bg_entries.push(wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ubo.as_entire_binding(),
+            });
+        }
+        for tb in &entry.texture_bindings {
+            frag_bg_entries.push(wgpu::BindGroupEntry {
+                binding: tb.texture_binding,
+                resource: wgpu::BindingResource::TextureView(&self.fallback_white.view),
+            });
+            frag_bg_entries.push(wgpu::BindGroupEntry {
+                binding: tb.sampler_binding,
+                resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+            });
+        }
+        let frag_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zc-render glsl custom 3d frag bg"),
+            layout: &entry.frag_bgl,
+            entries: &frag_bg_entries,
+        });
+
+        let xform = GlslCustom3DTransformUniforms {
+            view_proj: camera.view_proj,
+            model: draw.model,
+            normal_matrix: draw.normal_matrix,
+            camera_pos_pad: [
+                camera.eye_position[0],
+                camera.eye_position[1],
+                camera.eye_position[2],
+                0.0,
+            ],
+        };
+        let xform_ubo = create_uniform_buffer(
+            ctx,
+            "zc-render glsl custom 3d xform ubo",
+            bytemuck::bytes_of(&xform),
+        );
+        let xform_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zc-render glsl custom 3d xform bg"),
+            layout: &self.glsl_custom_xform_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: xform_ubo.as_entire_binding(),
+            }],
+        });
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zc-render glsl custom 3d mat encoder"),
+            });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("zc-render glsl custom 3d mat pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_target.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(pipeline);
+            rpass.set_bind_group(0, &frag_bg, &[]);
+            rpass.set_bind_group(1, &xform_bg, &[]);
+            rpass.set_vertex_buffer(0, draw.mesh.vertex_buffer.slice(..));
+            rpass.set_vertex_buffer(1, draw.mesh.color_buffer.slice(..));
+            rpass.set_index_buffer(draw.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            rpass.draw_indexed(0..draw.mesh.index_count, 0, 0..1);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        Ok(())
+    }
+
+    fn ensure_glsl_custom_material_pipeline(
+        &mut self,
+        ctx: &GpuContext,
+        key: &CustomMaterialPipelineKey,
+    ) -> Result<(), RenderError> {
+        if self.glsl_custom_pipelines.contains_key(key) {
+            return Ok(());
+        }
+        let entry = self
+            .glsl_custom_shaders
+            .get(&key.shader_key)
+            .ok_or_else(|| {
+                RenderError::Shader(format!(
+                    "GLSL custom 3D material shader '{}' is not registered",
+                    key.shader_key
+                ))
+            })?;
+        let cull_mode = match key.side {
+            CullSide::Front => Some(wgpu::Face::Back),
+            CullSide::Back => Some(wgpu::Face::Front),
+            CullSide::Both => None,
+        };
+        // GLSL ES 1.00 fragment shaders output straight RGBA in `gl_FragColor`.
+        let (blend_state, depth_write) = match key.blend {
+            MaterialBlend::Opaque => (wgpu::BlendState::REPLACE, true),
+            MaterialBlend::Normal => (wgpu::BlendState::ALPHA_BLENDING, false),
+            other => material_blend_state(other),
+        };
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("zc-render glsl custom 3d material pipeline"),
+                layout: Some(&entry.pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &entry.vert_module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(MeshVertex::layout()), Some(MeshVertexColor::layout())],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &entry.frag_module,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: key.format,
+                        blend: Some(blend_state),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            return Err(RenderError::Shader(format!(
+                "GLSL custom 3D material '{}' pipeline failed: {err}",
+                key.shader_key
+            )));
+        }
+        self.glsl_custom_pipelines.insert(key.clone(), pipeline);
         Ok(())
     }
 
@@ -4332,14 +4691,63 @@ pub fn mat4_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 }
 
 /// Right-handed perspective projection matrix for `wgpu` `[0, 1]` NDC depth.
+///
+/// Guards singular FOV (`1..=175 deg`), non-positive/inverted clip planes (`0 < near < far`),
+/// and non-positive/non-finite aspect ratios so degenerate cameras never emit NaN/Inf matrices.
 pub fn mat4_perspective_rh(fov_y_rad: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
-    let f = 1.0 / (0.5 * fov_y_rad).tan();
-    let nf = 1.0 / (near - far);
+    let min_fov = 1.0_f32.to_radians();
+    let max_fov = 175.0_f32.to_radians();
+    let safe_fov = if !fov_y_rad.is_finite() || !(min_fov..=max_fov).contains(&fov_y_rad) {
+        tracing::warn!(
+            fov_y_deg = fov_y_rad.to_degrees(),
+            "clamping singular/invalid perspective camera FOV to 1..=175 deg"
+        );
+        if fov_y_rad.is_finite() {
+            fov_y_rad.clamp(min_fov, max_fov)
+        } else {
+            45.0_f32.to_radians()
+        }
+    } else {
+        fov_y_rad
+    };
+    let safe_aspect = if aspect.is_finite() && aspect > 1e-5 {
+        aspect
+    } else {
+        tracing::warn!(aspect, "clamping invalid perspective camera aspect ratio");
+        if aspect.is_finite() {
+            aspect.max(1e-5)
+        } else {
+            1.0
+        }
+    };
+    let (safe_near, safe_far) =
+        if !near.is_finite() || !far.is_finite() || near <= 0.0 || far <= near {
+            tracing::warn!(
+                near,
+                far,
+                "clamping singular/invalid perspective camera near/far clip planes"
+            );
+            let n = if near.is_finite() {
+                near.max(1e-4)
+            } else {
+                0.1
+            };
+            let f = if far.is_finite() {
+                far.max(n + 1e-2)
+            } else {
+                (n + 5000.0).max(n + 1.0)
+            };
+            (n, f)
+        } else {
+            (near, far)
+        };
+    let f = 1.0 / (0.5 * safe_fov).tan();
+    let nf = 1.0 / (safe_near - safe_far);
     [
-        [f / aspect.max(1e-5), 0.0, 0.0, 0.0],
+        [f / safe_aspect, 0.0, 0.0, 0.0],
         [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, far * nf, -1.0],
-        [0.0, 0.0, far * near * nf, 0.0],
+        [0.0, 0.0, safe_far * nf, -1.0],
+        [0.0, 0.0, safe_far * safe_near * nf, 0.0],
     ]
 }
 
@@ -4352,16 +4760,36 @@ pub fn mat4_perspective_frustum_rh(
     near: f32,
     far: f32,
 ) -> [[f32; 4]; 4] {
-    let x = (2.0 * near) / (right - left);
-    let y = (2.0 * near) / (top - bottom);
-    let a = (right + left) / (right - left);
-    let b = (top + bottom) / (top - bottom);
-    let nf = 1.0 / (near - far);
+    let safe_near = if near.is_finite() {
+        near.max(1e-4)
+    } else {
+        0.1
+    };
+    let safe_far = if far.is_finite() {
+        far.max(safe_near + 1e-2)
+    } else {
+        (safe_near + 5000.0).max(safe_near + 1.0)
+    };
+    let dx = if (right - left).is_finite() && (right - left).abs() > 1e-7 {
+        right - left
+    } else {
+        1e-4
+    };
+    let dy = if (top - bottom).is_finite() && (top - bottom).abs() > 1e-7 {
+        top - bottom
+    } else {
+        1e-4
+    };
+    let x = (2.0 * safe_near) / dx;
+    let y = (2.0 * safe_near) / dy;
+    let a = (right + left) / dx;
+    let b = (top + bottom) / dy;
+    let nf = 1.0 / (safe_near - safe_far);
     [
         [x, 0.0, 0.0, 0.0],
         [0.0, y, 0.0, 0.0],
-        [a, b, far * nf, -1.0],
-        [0.0, 0.0, far * near * nf, 0.0],
+        [a, b, safe_far * nf, -1.0],
+        [0.0, 0.0, safe_far * safe_near * nf, 0.0],
     ]
 }
 
@@ -4378,19 +4806,61 @@ pub fn mat4_perspective_film_gate(
     near: f32,
     far: f32,
 ) -> [[f32; 4]; 4] {
-    let aspect = aspect.max(1e-5);
-    let gate = film_gate_mm.max(1e-4);
-    let focal = focal_length_mm.max(1e-4);
-    let zoom = zoom.max(1e-4);
-    let near = near.max(1e-4);
-    let far = far.max(near + 1e-3);
+    let aspect = if aspect.is_finite() {
+        aspect.max(1e-5)
+    } else {
+        1.0
+    };
+    let gate = if film_gate_mm.is_finite() {
+        film_gate_mm.max(1e-4)
+    } else {
+        36.0
+    };
+    let focal = if focal_length_mm.is_finite() {
+        focal_length_mm.max(1e-4)
+    } else {
+        35.0
+    };
+    let zoom = if zoom.is_finite() {
+        zoom.max(1e-4)
+    } else {
+        1.0
+    };
+    let near = if near.is_finite() {
+        near.max(1e-4)
+    } else {
+        0.1
+    };
+    let far = if far.is_finite() {
+        far.max(near + 1e-2)
+    } else {
+        (near + 5000.0).max(near + 1.0)
+    };
 
     // Three.js PerspectiveCamera: getFilmHeight() = filmGauge / max(aspect, 1),
     // getFilmWidth() = filmGauge * min(aspect, 1).
     let film_height = gate / aspect.max(1.0);
     let film_width = gate * aspect.min(1.0);
-    let half_tan = (film_height * 0.5) / focal;
-    let top = near * half_tan / zoom;
+    let min_half_tan = (0.5_f32 * 1.0_f32.to_radians()).tan();
+    let max_half_tan = (0.5_f32 * 175.0_f32.to_radians()).tan();
+    let raw_half_tan = ((film_height * 0.5) / focal) / zoom;
+    let half_tan =
+        if !raw_half_tan.is_finite() || !(min_half_tan..=max_half_tan).contains(&raw_half_tan) {
+            tracing::warn!(
+                focal_length_mm,
+                film_gate_mm,
+                zoom,
+                "clamping singular Camera+ effective FOV to 1..=175 deg"
+            );
+            if raw_half_tan.is_finite() {
+                raw_half_tan.clamp(min_half_tan, max_half_tan)
+            } else {
+                (0.5_f32 * 45.0_f32.to_radians()).tan()
+            }
+        } else {
+            raw_half_tan
+        };
+    let top = near * half_tan;
     let height = 2.0 * top;
     let width = aspect * height;
     let film_offset = gate * (film_offset_x_pct / 100.0);
@@ -4776,7 +5246,7 @@ fn shadow_bias_for_slot(slot: u32) -> f32 {
     return u_scene.shadow_biases.w;
 }
 
-fn sample_shadow_2d_pcf(slot: u32, world_pos: vec3<f32>) -> f32 {
+fn sample_shadow_2d_pcf(slot: u32, world_pos: vec3<f32>, n_dot_l: f32) -> f32 {
     let enabled = ((u_obj.flags.x & 16u) != 0u);
     if (!enabled || slot >= 4u) {
         return 1.0;
@@ -4789,7 +5259,8 @@ fn sample_shadow_2d_pcf(slot: u32, world_pos: vec3<f32>) -> f32 {
     if (!in_bounds) {
         return 1.0;
     }
-    let bias = shadow_bias_for_slot(slot);
+    let slope = clamp(1.0 - max(n_dot_l, 0.0), 0.0, 1.0);
+    let bias = max(shadow_bias_for_slot(slot), 0.0025) + slope * 0.005;
     let depth = clamp(ndc.z - bias, 0.0, 1.0);
     let texel = u_scene.shadow_params.z;
 
@@ -4803,7 +5274,7 @@ fn sample_shadow_2d_pcf(slot: u32, world_pos: vec3<f32>) -> f32 {
     return sum / 9.0;
 }
 
-fn sample_point_shadow_pcf(pslot: u32, light_pos: vec3<f32>, world_pos: vec3<f32>) -> f32 {
+fn sample_point_shadow_pcf(pslot: u32, light_pos: vec3<f32>, world_pos: vec3<f32>, n_dot_l: f32) -> f32 {
     let enabled = ((u_obj.flags.x & 16u) != 0u);
     if (!enabled || pslot >= 2u) {
         return 1.0;
@@ -4813,7 +5284,8 @@ fn sample_point_shadow_pcf(pslot: u32, light_pos: vec3<f32>, world_pos: vec3<f32
     let params = u_scene.point_shadow_params[pslot];
     let near = params.x;
     let far = params.y;
-    let bias = params.z;
+    let slope = clamp(1.0 - max(n_dot_l, 0.0), 0.0, 1.0);
+    let bias = max(params.z, 0.0025) + slope * 0.005;
     let texel = params.w;
 
     var face: i32 = 0;
@@ -4948,6 +5420,20 @@ fn safe_normalize(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
     return select(fallback, v / len, len > 1e-6);
 }
 
+fn eval_fallback_matcap(vn: vec3<f32>) -> vec3<f32> {
+    // Smooth analytical studio clay sphere shading calibrated so front-facing
+    // view normal (0, 0, 1) evaluates to ~0.50 while curved geometry shows full
+    // key diffuse, hemisphere fill, specular highlight, and grazing rim.
+    let l_key = normalize(vec3<f32>(-0.55, 0.68, 0.48));
+    let h_key = normalize(l_key + vec3<f32>(0.0, 0.0, 1.0));
+    let diff_key = max(dot(vn, l_key), 0.0);
+    let hemi = vn.y * 0.5 + 0.5;
+    let spec = pow(max(dot(vn, h_key), 0.0), 32.0) * 0.35;
+    let rim = pow(1.0 - max(vn.z, 0.0), 3.0) * 0.22;
+    let shade = clamp(0.08 + 0.55 * diff_key + 0.305 * hemi + spec + rim, 0.0, 1.0);
+    return vec3<f32>(shade);
+}
+
 @fragment
 fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
     let uv_projection = u_obj.flags.w & 255u;
@@ -4971,6 +5457,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     let dpdy_pos = dpdy(fin.world_pos);
     let dpdx_uv = dpdx(uv);
     let dpdy_uv = dpdy(uv);
+    let local_fw = length(fwidth(fin.local_pos));
 
     let has_albedo = (u_obj.flags.x & 1u) != 0u;
     let has_normal = (u_obj.flags.x & 2u) != 0u;
@@ -5037,17 +5524,25 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
         }
     }
 
-    // Material+ 3D procedural gradient-noise normal perturbation.
+    // Material+ 3D procedural gradient-noise normal perturbation with Nyquist anti-aliasing
+    // and normalized derivative scaling so high scales/strengths yield smooth bump relief
+    // instead of blown-out specular static.
     if (bump_noise_enabled) {
         let b_scale = u_obj.extra_params.z;
         let b_strength = u_obj.extra_params.y;
-        let p_noise = fin.local_pos * b_scale;
+        let freq = b_scale * 0.125;
+        let p_noise = fin.local_pos * freq;
+        let fw1 = local_fw * freq;
+        let aa1 = 1.0 - smoothstep(0.35, 1.25, fw1);
+        let aa2 = 1.0 - smoothstep(0.35, 1.25, fw1 * 2.03);
         let nd1 = noise3d_deriv(p_noise);
         let nd2 = noise3d_deriv(p_noise * 2.03 + vec3<f32>(17.3, 9.2, 5.7));
-        let grad_local = nd1.yzw * 0.6667 + nd2.yzw * 0.3333 * 2.03;
+        let grad_local = nd1.yzw * (0.35 * aa1) + nd2.yzw * (0.175 * aa2);
         let grad_world = (u_obj.normal_matrix * vec4<f32>(grad_local, 0.0)).xyz;
         let surf_grad = grad_world - n * dot(grad_world, n);
-        n = safe_normalize(n - surf_grad * b_strength, n);
+        let sg_len = length(surf_grad);
+        let clamped_sg = select(surf_grad, surf_grad * (1.5 / sg_len), sg_len > 1.5);
+        n = safe_normalize(n - clamped_sg * b_strength, n);
     }
 
     // View-space spherical Matcap projection matching Zoidium `matcap.frag.glsl:14-20`.
@@ -5087,8 +5582,10 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
         discard;
     }
 
-    // Material+ inline 4-stop Color Ramp.
-    if (ramp_enabled) {
+    // Material+ inline 4-stop Color Ramp (pre-lighting for non-luminance sources or unlit modes;
+    // luminance mode `ramp_source == 0` on lit shaders evaluates post-lighting on shaded luminance).
+    let post_lit_ramp = ramp_enabled && ramp_source == 0u && shading_mode != 0u && shading_mode != 4u;
+    if (ramp_enabled && !post_lit_ramp) {
         var ramp_t = clamp(dot(albedo, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
         if (ramp_source == 1u) {
             ramp_t = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
@@ -5124,8 +5621,9 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     }
 
     if (shading_mode == 4u) {
-        // Matcap: fallback vec4(0.5, 0.5, 0.5, 1.0), alpha = clamp(matcap.a * opacity, 0, 1).
-        let mc = select(vec4<f32>(0.5, 0.5, 0.5, 1.0), matcap_sample, has_matcap);
+        // Matcap: smooth analytical studio clay fallback when no texture is bound.
+        let fallback_mc = vec4<f32>(eval_fallback_matcap(view_n), 1.0);
+        let mc = select(fallback_mc, matcap_sample, has_matcap);
         let mc_alpha = clamp(mc.a * u_obj.base_color_opacity.w * alpha_map_factor * vcol_a, 0.0, 1.0);
         let rgb = clamp(u_obj.base_color_opacity.rgb * vcol_rgb * mc.rgb + emissive_raw, vec3<f32>(0.0), vec3<f32>(1.0));
         return vec4<f32>(rgb * mc_alpha, mc_alpha);
@@ -5150,6 +5648,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     var indirect_diff_acc = vec3<f32>(0.0);
     var direct_spec_acc = vec3<f32>(0.0);
     var indirect_spec_acc = vec3<f32>(0.0);
+    var scene_ibl_energy = 0.0;
     let light_count = u32(clamp(u_scene.camera_pos_light_count.w, 0.0, 8.0));
 
     for (var i: u32 = 0u; i < light_count; i = i + 1u) {
@@ -5163,6 +5662,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
             indirect_diff_acc = indirect_diff_acc + diffuse_albedo * l_color;
             continue;
         }
+        scene_ibl_energy = scene_ibl_energy + max(light.color_intensity.w, 0.0);
         if (kind == 4u) {
             // Hemisphere: uses normalize(light.position) as sky direction per Three.js r91.
             let hemi_dir = safe_normalize(light.position_distance.xyz, vec3<f32>(0.0, 1.0, 0.0));
@@ -5181,8 +5681,9 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
         if (kind == 3u) {
             // Directional: rays travel along direction_cos_outer.xyz
             l_dir = safe_normalize(-light.direction_cos_outer.xyz, vec3<f32>(0.0, 1.0, 0.0));
-            if (shadow_slot >= 0.0 && shadow_slot < 4.0) {
-                vis = sample_shadow_2d_pcf(u32(shadow_slot + 0.5), fin.world_pos);
+            let n_dot_l_sh = max(dot(n, l_dir), 0.0);
+            if (n_dot_l_sh > 0.0 && shadow_slot >= 0.0 && shadow_slot < 4.0) {
+                vis = sample_shadow_2d_pcf(u32(shadow_slot + 0.5), fin.world_pos, n_dot_l_sh);
             }
         } else {
             let to_light = light.position_distance.xyz - fin.world_pos;
@@ -5198,6 +5699,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
                 atten = select(pow(ratio, decay), 0.0, ratio <= 0.0);
             }
 
+            let n_dot_l_sh = max(dot(n, l_dir), 0.0);
             if (kind == 1u) {
                 // Spot cone with penumbra smoothstep falloff
                 let theta = dot(-l_dir, safe_normalize(light.direction_cos_outer.xyz, vec3<f32>(0.0, -1.0, 0.0)));
@@ -5205,12 +5707,12 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
                 let cos_inner = light.cos_inner_decay_penumbra.x;
                 let cone = smoothstep(cos_outer, max(cos_inner, cos_outer + 1e-4), theta);
                 atten = atten * cone;
-                if (shadow_slot >= 0.0 && shadow_slot < 4.0) {
-                    vis = sample_shadow_2d_pcf(u32(shadow_slot + 0.5), fin.world_pos);
+                if (n_dot_l_sh > 0.0 && shadow_slot >= 0.0 && shadow_slot < 4.0) {
+                    vis = sample_shadow_2d_pcf(u32(shadow_slot + 0.5), fin.world_pos, n_dot_l_sh);
                 }
             } else if (kind == 2u) {
-                if (shadow_slot >= 100.0 && shadow_slot < 102.0) {
-                    vis = sample_point_shadow_pcf(u32(shadow_slot - 100.0 + 0.5), light.position_distance.xyz, fin.world_pos);
+                if (n_dot_l_sh > 0.0 && shadow_slot >= 100.0 && shadow_slot < 102.0) {
+                    vis = sample_point_shadow_pcf(u32(shadow_slot - 100.0 + 0.5), light.position_distance.xyz, fin.world_pos, n_dot_l_sh);
                 }
             }
         }
@@ -5247,7 +5749,9 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     }
 
     // Environment-map IBL reflection for StandardPbr: uses equirectangular env_tex when bound,
-    // or procedural hemisphere sky/ground gradient when `reflection_enabled == true`.
+    // procedural hemisphere sky/ground gradient when `reflection_enabled == true`, or an
+    // analytical studio hemisphere/horizon IBL fallback for metallic surfaces under scene lighting
+    // so high-metalness CustomPbr and NodeMaterial ("Brushed Metal") never render pitch black.
     if (shading_mode == 1u && (has_env_map || reflection_enabled)) {
         var env_rgb = vec3<f32>(0.0);
         if (has_env_map) {
@@ -5261,6 +5765,18 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
         }
         let env_brdf = brdf_specular_ggx_env(n_dot_v, f0, roughness);
         indirect_spec_acc = indirect_spec_acc + env_rgb * u_obj.specular_refl.w * env_brdf;
+    } else if (shading_mode == 1u && metalness > 0.01 && scene_ibl_energy > 0.0) {
+        let h_t = smoothstep(0.0, 1.0, clamp(refl_dir.y * 0.5 + 0.5, 0.0, 1.0));
+        let sky_raw = vec3<f32>(0.80, 0.86, 0.94);
+        let gnd_raw = vec3<f32>(0.22, 0.20, 0.18);
+        let top_c = select(sky_raw, srgb_to_linear(sky_raw), use_linear);
+        let bot_c = select(gnd_raw, srgb_to_linear(gnd_raw), use_linear);
+        let horizon_band = exp(-abs(refl_dir.y) * mix(5.5, 1.5, roughness)) * 0.35;
+        let zenith_softbox = smoothstep(0.35, 0.95, refl_dir.y) * mix(0.28, 0.08, roughness);
+        let studio_env = mix(bot_c, top_c, h_t) + top_c * (horizon_band + zenith_softbox);
+        let studio_scale = clamp(scene_ibl_energy * 0.65, 0.45, 1.15) * metalness;
+        let env_brdf = brdf_specular_ggx_env(n_dot_v, f0, roughness);
+        indirect_spec_acc = indirect_spec_acc + studio_env * studio_scale * env_brdf;
     }
 
     // Material+ Ambient Occlusion modulation matching Zoidium `surface-shader.js:203-222`.
@@ -5295,7 +5811,13 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     }
 
     let lit = emissive_c + direct_diff_acc + indirect_diff_acc + direct_spec_acc + indirect_spec_acc;
-    let lit_clamped = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
+    var lit_clamped = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
+    if (post_lit_ramp) {
+        let shaded_luma = clamp(dot(lit_clamped, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
+        let ramp_col_raw = evaluate_ramp_4(shaded_luma);
+        let ramp_col_c = select(ramp_col_raw, srgb_to_linear(ramp_col_raw), use_linear);
+        lit_clamped = mix(lit_clamped, ramp_col_c, clamp(u_obj.fresnel_ramp_proj.y, 0.0, 1.0));
+    }
     let rgb = select(lit_clamped, linear_to_srgb(lit_clamped), use_linear);
     return vec4<f32>(rgb * final_alpha, final_alpha);
 }
@@ -5829,6 +6351,105 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(col, alpha);
 }
 "#;
+
+/// Parses `layout(location = N) in <glsl_ty> <name>;` inputs from `zc-shader`'s emitted
+/// GLSL 450 source and generates a matching WGSL vertex shader for 3D custom GLSL materials.
+fn build_glsl_custom_3d_vertex_wgsl(glsl450_source: &str) -> String {
+    let mut fields = String::new();
+    let mut assigns = String::new();
+
+    for line in glsl450_source.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("layout(location = ") else {
+            continue;
+        };
+        let Some((loc_str, after_loc)) = rest.split_once(") in ") else {
+            continue;
+        };
+        let Ok(loc) = loc_str.trim().parse::<u32>() else {
+            continue;
+        };
+        let decl = after_loc.trim_end_matches(';').trim();
+        let mut parts = decl.split_whitespace();
+        let Some(glsl_ty) = parts.next() else {
+            continue;
+        };
+        let Some(raw_name) = parts.next() else {
+            continue;
+        };
+        // Skip array varyings (rare in 3D materials) gracefully
+        if raw_name.contains('[') {
+            continue;
+        }
+        let name = raw_name.trim();
+        let (wgsl_ty, zero_expr) = match glsl_ty {
+            "float" => ("f32", "0.0"),
+            "vec2" => ("vec2<f32>", "vec2<f32>(0.0, 0.0)"),
+            "vec3" => ("vec3<f32>", "vec3<f32>(0.0, 0.0, 0.0)"),
+            "vec4" => ("vec4<f32>", "vec4<f32>(0.0, 0.0, 0.0, 1.0)"),
+            _ => continue,
+        };
+        let field_name = format!("out_{loc}");
+        fields.push_str(&format!("    @location({loc}) {field_name}: {wgsl_ty},\n"));
+
+        let low = name.to_ascii_lowercase();
+        let expr: &str = match (glsl_ty, low.as_str()) {
+            ("vec2", "vuv" | "vuvscaled" | "uv" | "vtexcoord" | "texcoord") => "v.uv",
+            ("vec3", "vnormal" | "vworldnormal" | "normal" | "worldnormal") => "world_n",
+            ("vec3", "vlocalnormal" | "localnormal") => "v.normal",
+            ("vec3", "vposition" | "vworldposition" | "vpos" | "vworldpos" | "worldpos") => {
+                "world_pos.xyz"
+            }
+            ("vec4", "vposition" | "vworldposition" | "vpos" | "vworldpos" | "worldpos") => {
+                "world_pos"
+            }
+            ("vec3", "vlocalposition" | "vlocalpos" | "localpos") => "v.position",
+            ("vec4", "vlocalposition" | "vlocalpos" | "localpos") => "vec4<f32>(v.position, 1.0)",
+            ("vec3", "vviewposition" | "vviewdir" | "viewdir") => {
+                "u_xform.camera_pos_pad.xyz - world_pos.xyz"
+            }
+            ("vec4", "vcolor" | "vvertexcolor" | "color") => "v.color",
+            ("vec3", "vcolor" | "vvertexcolor" | "color") => "v.color.rgb",
+            _ => zero_expr,
+        };
+        assigns.push_str(&format!("    out.{field_name} = {expr};\n"));
+    }
+
+    format!(
+        r#"struct GlslCustom3DTransformUniforms {{
+    view_proj: mat4x4<f32>,
+    model: mat4x4<f32>,
+    normal_matrix: mat4x4<f32>,
+    camera_pos_pad: vec4<f32>,
+}};
+
+@group(1) @binding(0) var<uniform> u_xform: GlslCustom3DTransformUniforms;
+
+struct VertexIn {{
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) material_slot: u32,
+    @location(5) color: vec4<f32>,
+}};
+
+struct VertexOut {{
+    @builtin(position) clip_pos: vec4<f32>,
+{fields}}};
+
+@vertex
+fn vs_main(v: VertexIn) -> VertexOut {{
+    var out: VertexOut;
+    let world_pos = u_xform.model * vec4<f32>(v.position, 1.0);
+    out.clip_pos = u_xform.view_proj * world_pos;
+    let n_raw = (u_xform.normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
+    let n_len = length(n_raw);
+    let world_n = select(vec3<f32>(0.0, 1.0, 0.0), n_raw / n_len, n_len > 1e-6);
+{assigns}    return out;
+}}
+"#
+    )
+}
 
 const CUSTOM_MATERIAL_3D_PRELUDE: &str = r#"
 struct CustomShader3DUniforms {
@@ -7825,5 +8446,163 @@ mod tests {
             "expected magenta custom 3D material output, got {:?}",
             &px[center..center + 4]
         );
+    }
+
+    #[test]
+    fn gpu_sphere_shadow_bias_prevents_self_shadowing_acne_at_zero_light_bias() {
+        let ctx = match GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to init GpuContext: {err}"),
+        };
+        let mut renderer = Scene3DRenderer::new(&ctx).expect("scene3d renderer");
+        let color = RenderTarget::new(
+            &ctx,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8Unorm,
+            Some("acne-color"),
+        )
+        .expect("color");
+        let depth = RenderTarget::new(
+            &ctx,
+            64,
+            64,
+            wgpu::TextureFormat::Depth32Float,
+            Some("acne-depth"),
+        )
+        .expect("depth");
+
+        let sphere_data = zc_scene::build_sphere(4.0, 32, 24);
+        let sphere_mesh = GpuMesh::from_mesh_data(&ctx, &sphere_data, Some("acne-sphere"));
+        let cam = CameraParams::perspective_look_at(
+            [0.0, 0.0, 12.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            45.0,
+            1.0,
+            0.1,
+            100.0,
+        );
+        let light = [SceneLight {
+            kind: LightKind::Directional,
+            color: [1.0, 1.0, 1.0],
+            position: [6.0, 8.0, 12.0],
+            target: [0.0, 0.0, 0.0],
+            intensity: 1.0,
+            cast_shadow: true,
+            shadow_bias: 0.0,
+            ..Default::default()
+        }];
+        let make_draw = |receive_shadow: bool| {
+            [MeshDrawCall {
+                mesh: &sphere_mesh,
+                model: mat4_identity(),
+                normal_matrix: mat4_identity(),
+                material: MaterialParams {
+                    shading: ShadingModel::Lambert,
+                    base_color: [0.85, 0.85, 0.85],
+                    receive_shadow,
+                    ..Default::default()
+                },
+                albedo_view: None,
+                normal_view: None,
+                matcap_view: None,
+                cast_shadow: true,
+                receive_shadow,
+            }]
+        };
+        let draw_no_recv = make_draw(false);
+        let draw_recv = make_draw(true);
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &light,
+                    meshes: &draw_no_recv,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render unshadowed sphere");
+        let px_ref = readback_rgba8(&ctx, &color);
+
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &light,
+                    meshes: &draw_recv,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render self-shadowed sphere");
+        let px_sh = readback_rgba8(&ctx, &color);
+
+        // On the lit front cap of a convex sphere, self-shadowing must NOT darken pixels into acne!
+        let mut max_drop = 0i32;
+        let mut bright_count = 0usize;
+        for y in 24..40usize {
+            for x in 24..40usize {
+                let idx = (y * 64 + x) * 4;
+                if px_ref[idx] > 100 {
+                    bright_count += 1;
+                    let drop = i32::from(px_ref[idx]) - i32::from(px_sh[idx]);
+                    max_drop = max_drop.max(drop);
+                }
+            }
+        }
+        assert!(bright_count > 50, "expected lit sphere center pixels");
+        assert!(
+            max_drop <= 12,
+            "convex sphere lit hemisphere must not exhibit self-shadowing acne (max_drop={max_drop})"
+        );
+    }
+
+    #[test]
+    fn singular_perspective_camera_frustum_clamps_to_finite_projection() {
+        for (fov_deg, aspect, near, far) in [
+            (0.0_f32, 16.0 / 9.0, 0.1_f32, 1000.0_f32),
+            (-45.0, 16.0 / 9.0, 0.1, 1000.0),
+            (180.0, 16.0 / 9.0, 0.1, 1000.0),
+            (360.0, 16.0 / 9.0, 0.1, 1000.0),
+            (f32::NAN, 16.0 / 9.0, 0.1, 1000.0),
+            (45.0, 16.0 / 9.0, 0.0, 0.0),
+            (45.0, 16.0 / 9.0, 100.0, 10.0),
+            (45.0, 0.0, -5.0, -1.0),
+        ] {
+            let m = mat4_perspective_rh(fov_deg.to_radians(), aspect, near, far);
+            for col in &m {
+                for &v in col {
+                    assert!(
+                        v.is_finite(),
+                        "non-finite entry in projection for fov={fov_deg}, near={near}, far={far}: {m:?}"
+                    );
+                }
+            }
+            assert!(m[0][0] > 0.0 && m[1][1] > 0.0);
+            assert!(m[2][2] < 0.0 && m[3][2] < 0.0);
+        }
+
+        let fg = mat4_perspective_film_gate(0.0, 36.0, 16.0 / 9.0, 0.0, 0.0, 0.0, 100.0, 10.0);
+        for col in &fg {
+            for &v in col {
+                assert!(
+                    v.is_finite(),
+                    "film-gate singular projection non-finite: {fg:?}"
+                );
+            }
+        }
     }
 }

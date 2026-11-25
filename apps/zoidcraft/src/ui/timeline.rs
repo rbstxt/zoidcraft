@@ -40,14 +40,18 @@ pub const KEYFRAME_ROW_HEIGHT: f32 = 20.0;
 pub const DEFAULT_VIDEO_TRACK_HEIGHT: f32 = 30.0;
 /// Default audio track row height (`50 px`, Spec 01 §1.7).
 pub const DEFAULT_AUDIO_TRACK_HEIGHT: f32 = 50.0;
+/// Dedicated non-overlapping Video / Audio pane header strip height (`20 px`).
+const TRACK_PANE_BAR_HEIGHT: f32 = 20.0;
 /// Draggable video/audio split divider height (`4 px`, Spec 02 §1.6).
 pub const DIVIDER_HEIGHT: f32 = 4.0;
 /// Overlay horizontal scrollbar height (`6 px`).
 pub const SCROLLBAR_HEIGHT: f32 = 6.0;
+/// Interactive hit-zone width on the right edge of vertically scrollable track panes (`10 px`).
+const VSCROLLBAR_HIT_WIDTH: f32 = 10.0;
 /// Fixed Audio Level Meter panel width (`45 px`).
 pub const AUDIO_METER_WIDTH: f32 = 45.0;
-/// Clip edge trim invisible hitbox width (`6 px`).
-pub const TRIM_EDGE_HITBOX_PX: f32 = 6.0;
+/// Clip edge trim invisible hitbox width (`8 px`).
+pub const TRIM_EDGE_HITBOX_PX: f32 = 8.0;
 /// Snap threshold in screen pixels (`8 px`).
 pub const SNAP_THRESHOLD_PX: f32 = 8.0;
 /// Edge auto-scroll trigger margin during playhead scrub (`24 px`).
@@ -84,7 +88,6 @@ const COLOR_TRACK_LANE_BG: Color32 = Color32::from_rgb(0x27, 0x27, 0x27);
 const COLOR_TRACK_BORDER: Color32 = Color32::from_rgb(0x21, 0x21, 0x21);
 const COLOR_CLIP_EDGE_LEFT: Color32 = Color32::from_rgb(0x83, 0x83, 0x83);
 const COLOR_CLIP_EDGE_RIGHT: Color32 = Color32::from_rgb(0x23, 0x23, 0x23);
-const COLOR_CLIP_LABEL_DARK: Color32 = Color32::from_rgb(0x2c, 0x32, 0x3f);
 const COLOR_TRIM_SELECTED: Color32 = Color32::from_rgb(0x98, 0x2b, 0x2b);
 const COLOR_WAVEFORM: Color32 = Color32::from_rgb(0x24, 0x2d, 0x42);
 const COLOR_PLAYHEAD: Color32 = Color32::from_rgb(0xb7, 0x1e, 0x1e);
@@ -471,7 +474,15 @@ pub fn hit_test_marker(
 pub struct TimelineAction {
     pub playhead_scrubbed: bool,
     pub clips_modified: bool,
+    pub clicked_timeline: bool,
     pub open_graph_editor_for: Option<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VScrollPane {
+    Video,
+    Audio,
+    Keyframes,
 }
 
 /// Persistent UI view state for the ClipMaker 3 Timeline panel.
@@ -496,13 +507,25 @@ pub struct TimelineViewState {
     pub focused: bool,
     pub box_selected_clips: BTreeSet<String>,
     pub keyframe_area_height: f32,
+    pub keyframe_area_custom: bool,
     pub cached_frame_spans: Vec<(f64, f64)>,
     pub gesture_classifier: GestureClassifier,
     pub clip_clipboard: Vec<ClipSnapshot>,
     track_height_accum: f32,
     scrollbar_drag_offset: Option<f32>,
+    vscrollbar_drag: Option<(VScrollPane, f32)>,
     kf_splitter_drag: Option<(f32, f32)>,
     context_menu: Option<TimelineContextMenu>,
+    context_menu_opened_this_frame: bool,
+    context_menu_sys_clipboard: Option<Option<String>>,
+    last_observed_frame: Option<f64>,
+    last_video_track_count: Option<usize>,
+    last_audio_track_count: Option<usize>,
+    last_active_composition_id: Option<Option<zc_project::Uuid>>,
+    last_selected_clip_id: Option<String>,
+    last_video_lanes_height: Option<f32>,
+    last_audio_lanes_height: Option<f32>,
+    status_toast: Option<(String, f64)>,
 }
 
 impl Default for TimelineViewState {
@@ -535,14 +558,30 @@ impl TimelineViewState {
             focused: false,
             box_selected_clips: BTreeSet::new(),
             keyframe_area_height: KEYFRAME_AREA_HEIGHT,
+            keyframe_area_custom: false,
             cached_frame_spans: Vec::new(),
             gesture_classifier: GestureClassifier::new(),
             clip_clipboard: Vec::new(),
             track_height_accum: 0.0,
             scrollbar_drag_offset: None,
+            vscrollbar_drag: None,
             kf_splitter_drag: None,
             context_menu: None,
+            context_menu_opened_this_frame: false,
+            context_menu_sys_clipboard: None,
+            last_observed_frame: None,
+            last_video_track_count: None,
+            last_audio_track_count: None,
+            last_active_composition_id: None,
+            last_selected_clip_id: None,
+            last_video_lanes_height: None,
+            last_audio_lanes_height: None,
+            status_toast: None,
         }
+    }
+
+    fn set_status_toast(&mut self, msg: impl Into<String>, now_sec: f64) {
+        self.status_toast = Some((msg.into(), now_sec + 2.6));
     }
 
     /// Multiplies `zoom` by `factor`, preserving the horizontal frame under `anchor_x`.
@@ -625,49 +664,53 @@ struct KeyframeLaneRow {
 fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
     let doc = session.document();
     let mut rows = Vec::new();
+    let has_obj_sel = !session.selection.object_3d_ids.is_empty();
+    let has_fx_sel = !session.selection.effect_ids.is_empty();
 
     if let Some(clip_id) = session.selection.clip_ids.first() {
         for track in doc.video_tracks.iter().chain(doc.audio_tracks.iter()) {
             if let Some(clip) = track.clips.iter().find(|c| &c.id == clip_id) {
-                push_property_rows(
-                    &mut rows,
-                    &clip.id,
-                    "",
-                    clip.start,
-                    track.locked,
-                    &clip.properties,
-                );
-                for obj in &clip.objects_3d {
-                    if session.selection.object_3d_ids.is_empty()
-                        || session.selection.object_3d_ids.contains(&obj.id)
-                    {
-                        let prefix = format!("{}.", obj.name);
-                        push_property_rows(
-                            &mut rows,
-                            &obj.id,
-                            &prefix,
-                            clip.start,
-                            track.locked,
-                            &obj.properties,
-                        );
+                if !has_obj_sel && !has_fx_sel {
+                    push_property_rows(
+                        &mut rows,
+                        &clip.id,
+                        "",
+                        clip.start,
+                        track.locked,
+                        &clip.properties,
+                    );
+                }
+                if has_obj_sel || !has_fx_sel {
+                    for obj in &clip.objects_3d {
+                        if !has_obj_sel || session.selection.object_3d_ids.contains(&obj.id) {
+                            let prefix = format!("{}.", obj.name);
+                            push_property_rows(
+                                &mut rows,
+                                &obj.id,
+                                &prefix,
+                                clip.start,
+                                track.locked,
+                                &obj.properties,
+                            );
+                        }
                     }
                 }
-                for fx in &clip.effects {
-                    if session.selection.effect_ids.is_empty()
-                        || session.selection.effect_ids.contains(&fx.id)
-                    {
-                        let prefix = format!("{}.", fx.name);
-                        push_property_rows(
-                            &mut rows,
-                            &fx.id,
-                            &prefix,
-                            clip.start,
-                            track.locked,
-                            &fx.properties,
-                        );
+                if has_fx_sel || !has_obj_sel {
+                    for fx in &clip.effects {
+                        if !has_fx_sel || session.selection.effect_ids.contains(&fx.id) {
+                            let prefix = format!("{}.", fx.name);
+                            push_property_rows(
+                                &mut rows,
+                                &fx.id,
+                                &prefix,
+                                clip.start,
+                                track.locked,
+                                &fx.properties,
+                            );
+                        }
                     }
                 }
-                if track.kind == TrackKind::Video {
+                if !has_obj_sel && !has_fx_sel && track.kind == TrackKind::Video {
                     collect_mask_and_shape_plus_keyframe_rows(&mut rows, session, clip);
                 }
                 break;
@@ -675,14 +718,16 @@ fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
         }
     }
 
-    push_property_rows(
-        &mut rows,
-        "sequence",
-        "seq.",
-        0.0,
-        false,
-        &doc.sequence_properties,
-    );
+    if !has_obj_sel && !has_fx_sel {
+        push_property_rows(
+            &mut rows,
+            "sequence",
+            "seq.",
+            0.0,
+            false,
+            &doc.sequence_properties,
+        );
+    }
     rows
 }
 
@@ -947,14 +992,15 @@ fn snap_frame(
 }
 
 /// Checks whether placing `[start, start + length)` on `track` overlaps any clip not in `exclude_ids`,
-/// and returns a non-overlapping clamped start if a flush neighbor edge is within range, or `None`
-/// if placement must be rejected.
+/// and returns a non-overlapping clamped start if a flush neighbor edge is within `max_shift`
+/// (or unrestricted when `max_shift` is `None`), or `None` if placement must be rejected.
 #[must_use]
-pub fn resolve_non_overlapping_start(
+pub fn resolve_non_overlapping_start_within_range(
     track: &SessionTrack,
     proposed_start: f64,
     length: f64,
     exclude_ids: &BTreeSet<String>,
+    max_shift: Option<f64>,
 ) -> Option<f64> {
     let start = proposed_start.max(0.0);
     let end = start + length;
@@ -986,10 +1032,92 @@ pub fn resolve_non_overlapping_start(
         candidates.push(be);
     }
 
-    candidates
+    let best = candidates
         .into_iter()
         .filter(|&c| c >= 0.0 && !overlaps(c, c + length))
-        .min_by(|a, b| (a - start).abs().total_cmp(&(b - start).abs()))
+        .min_by(|a, b| (a - start).abs().total_cmp(&(b - start).abs()))?;
+
+    if let Some(limit) = max_shift
+        && (best - start).abs() > limit.max(0.0) + 1e-6
+    {
+        return None;
+    }
+
+    Some(best)
+}
+
+/// Checks whether placing `[start, start + length)` on `track` overlaps any clip not in `exclude_ids`,
+/// and returns a non-overlapping clamped start at the nearest flush neighbor edge, or `None`
+/// if placement must be rejected.
+#[must_use]
+pub fn resolve_non_overlapping_start(
+    track: &SessionTrack,
+    proposed_start: f64,
+    length: f64,
+    exclude_ids: &BTreeSet<String>,
+) -> Option<f64> {
+    resolve_non_overlapping_start_within_range(track, proposed_start, length, exclude_ids, None)
+}
+
+/// Extracts the target child composition UUID from a Precomp clip (`PrecompRef` or
+/// `zoidium:precomp-plus/precomp` plugin layer), verifying that the composition exists in `session`.
+#[must_use]
+pub fn precomp_target_composition_id(
+    session: &Session,
+    clip: &SessionClip,
+) -> Option<zc_project::Uuid> {
+    let parse_comp_uuid = |raw: &str| -> Option<zc_project::Uuid> {
+        let id = zc_project::Uuid::parse_str(raw.trim()).ok()?;
+        session.project.compositions.contains_key(&id).then_some(id)
+    };
+
+    // 1. Check SessionClip properties (`compositionId` / `compId` / `composition_id`).
+    for key in ["compositionId", "compId", "composition_id"] {
+        if let Some(prop) = clip.properties.get(key)
+            && let Some(s) = prop
+                .keyframes
+                .first()
+                .and_then(|k| k.value.as_str())
+                .or_else(|| prop.default_value.as_str())
+            && let Some(id) = parse_comp_uuid(s)
+        {
+            return Some(id);
+        }
+    }
+
+    // 2. Fallback to the active sequence's underlying `VideoClip` layer (`PrecompRef` or `Plugin`).
+    if let Ok(clip_uuid) = zc_project::Uuid::parse_str(&clip.id) {
+        let seq = session.active_sequence();
+        if let Some(vc) = seq
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == clip_uuid)
+        {
+            match &vc.layer.kind {
+                zc_project::LayerKind::PrecompRef { composition_id } => {
+                    if session.project.compositions.contains_key(composition_id) {
+                        return Some(*composition_id);
+                    }
+                }
+                zc_project::LayerKind::Plugin {
+                    plugin_type,
+                    payload,
+                } if plugin_type.to_ascii_lowercase().contains("precomp") => {
+                    for key in ["compositionId", "compId", "composition_id"] {
+                        if let Some(s) = payload.get(key).and_then(Value::as_str)
+                            && let Some(id) = parse_comp_uuid(s)
+                        {
+                            return Some(id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    None
 }
 
 fn clip_display_name(clip: &SessionClip) -> &str {
@@ -1013,6 +1141,7 @@ pub fn show_timeline(
     palette: &ThemePalette,
 ) -> TimelineAction {
     let mut action = TimelineAction::default();
+    state.context_menu_opened_this_frame = false;
     let available = ui.available_rect_before_wrap();
     let (panel_rect, panel_resp) = ui.allocate_exact_size(available.size(), Sense::hover());
 
@@ -1021,12 +1150,27 @@ pub fn show_timeline(
     }
 
     let pointer_pos = ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.latest_pos()));
+    let press_pos = ui.input(|i| i.pointer.press_origin()).or(pointer_pos);
     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+    let is_inline_renaming = matches!(
+        state.drag_state,
+        TimelineDragState::InlineRenamingClip { .. }
+            | TimelineDragState::InlineRenamingMarker { .. }
+    );
     if primary_pressed
-        && let Some(pos) = pointer_pos
+        && let Some(pos) = press_pos
         && pointer_on_layer(ui, pos)
     {
-        state.focused = panel_rect.contains(pos);
+        if panel_rect.contains(pos) {
+            if is_inline_renaming {
+                state.focused = true;
+                action.clicked_timeline = true;
+            } else {
+                claim_timeline_focus(ui, state, &mut action);
+            }
+        } else {
+            state.focused = false;
+        }
     }
 
     let fps = session.document().fps.max(1.0);
@@ -1051,15 +1195,64 @@ pub fn show_timeline(
     let content_width = (body_rect.right() - content_left).max(1.0);
     state.last_viewport_width = content_width;
 
+    // Keyboard timeline zoom (`Cmd/Ctrl + -` and `Cmd/Ctrl + =/+`) when timeline is focused or hovered.
+    if !ui.ctx().egui_wants_keyboard_input() && (state.focused || panel_resp.hovered()) {
+        let (zoom_in_key, zoom_out_key) = ui.ctx().input_mut(|i| {
+            let zin = i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::Equals,
+            )) || i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::Plus,
+            )) || i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL,
+                egui::Key::Equals,
+            )) || i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL,
+                egui::Key::Plus,
+            ));
+            let zout = i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::Minus,
+            )) || i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL,
+                egui::Key::Minus,
+            ));
+            (zin, zout)
+        });
+        if zoom_in_key || zoom_out_key {
+            let playhead_px = frame_to_px(session.playback.current_frame, fps, state.zoom);
+            let anchor_x = (playhead_px - state.scroll_x).clamp(0.0, f64::from(content_width));
+            let factor = if zoom_in_key { 1.25 } else { 1.0 / 1.25 };
+            state.zoom_by(factor, anchor_x);
+        }
+    }
+
     let timecode_rect = Rect::from_min_size(body_rect.min, vec2(HEADER_WIDTH, RULER_HEIGHT));
     let ruler_rect = Rect::from_min_size(
         pos2(content_left, body_rect.top()),
         vec2(content_width, RULER_HEIGHT),
     );
 
+    // Collect keyframe lanes once; collapse empty keyframe area to 0 px so video tracks get full space.
+    let kf_rows = collect_keyframe_rows(session);
     let kf_top = ruler_rect.bottom();
-    let max_kf_h = (body_rect.height() - RULER_HEIGHT - KEYFRAME_SPLITTER_HEIGHT - 24.0).max(0.0);
-    let kf_height = state.keyframe_area_height.clamp(0.0, max_kf_h);
+    let max_kf_h = (body_rect.height() - RULER_HEIGHT - KEYFRAME_SPLITTER_HEIGHT - 36.0).max(0.0);
+    let (kf_height, kf_splitter_h) = if kf_rows.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let auto_h = ((kf_rows.len() as f32 * KEYFRAME_ROW_HEIGHT) + 4.0)
+            .min(KEYFRAME_ROW_HEIGHT * 4.0 + 4.0)
+            .min(max_kf_h);
+        let h = if state.keyframe_area_custom {
+            state
+                .keyframe_area_height
+                .clamp(KEYFRAME_ROW_HEIGHT.min(max_kf_h), max_kf_h)
+        } else {
+            auto_h
+        };
+        (h, KEYFRAME_SPLITTER_HEIGHT)
+    };
     let kf_header_rect = Rect::from_min_size(
         pos2(body_rect.left(), kf_top),
         vec2(HEADER_WIDTH, kf_height),
@@ -1069,18 +1262,46 @@ pub fn show_timeline(
 
     let kf_splitter_rect = Rect::from_min_size(
         pos2(body_rect.left(), kf_top + kf_height),
-        vec2(body_rect.width(), KEYFRAME_SPLITTER_HEIGHT),
+        vec2(body_rect.width(), kf_splitter_h),
     );
 
     let tracks_top = kf_splitter_rect.bottom();
     let tracks_bottom = body_rect.bottom().max(tracks_top + DIVIDER_HEIGHT);
     let tracks_height = (tracks_bottom - tracks_top).max(DIVIDER_HEIGHT);
 
+    // Track composition switches so track-count growth auto-scroll does not trigger across comps,
+    // and reset vertical scroll positions cleanly when entering/exiting a Precomp composition.
+    let active_comp_id = session.document().active_composition_id;
+    if state.last_active_composition_id != Some(active_comp_id) {
+        if state.last_active_composition_id.is_some() {
+            state.video_scroll_y = 0.0;
+            state.audio_scroll_y = 0.0;
+            state.keyframe_scroll_y = 0.0;
+        }
+        state.last_active_composition_id = Some(active_comp_id);
+        state.last_video_track_count = None;
+        state.last_audio_track_count = None;
+        state.last_selected_clip_id = None;
+        state.last_video_lanes_height = None;
+        state.last_audio_lanes_height = None;
+    }
+
+    let video_track_count = session.document().video_tracks.len();
+    let audio_track_count = session.document().audio_tracks.len();
+    let audio_has_clips = session
+        .document()
+        .audio_tracks
+        .iter()
+        .any(|t| !t.clips.is_empty());
+
     if !state.video_audio_split_custom || state.video_audio_split_y < 0.0 {
-        state.video_audio_split_y = default_video_audio_split_y(
+        state.video_audio_split_y = compute_video_audio_split_y_for_activity(
             tracks_height,
+            video_track_count,
+            audio_track_count,
             state.video_track_height,
             state.audio_track_height,
+            audio_has_clips,
         );
     } else {
         state.video_audio_split_y = state
@@ -1109,6 +1330,100 @@ pub fn show_timeline(
         Rect::from_min_max(audio_rect.min, pos2(content_left, audio_rect.bottom()));
     let audio_lanes_rect = Rect::from_min_max(pos2(content_left, audio_rect.top()), audio_rect.max);
 
+    let (_, _, video_tracks_lanes_rect) =
+        split_pane_header_strip(video_header_rect, video_lanes_rect);
+    let (_, _, audio_tracks_lanes_rect) =
+        split_pane_header_strip(audio_header_rect, audio_lanes_rect);
+
+    let effective_audio_h = effective_track_row_height(
+        TrackKind::Audio,
+        &session.document().audio_tracks,
+        state.audio_track_height,
+        audio_tracks_lanes_rect.height(),
+    );
+    let max_kf_scroll =
+        (kf_rows.len() as f32 * KEYFRAME_ROW_HEIGHT - kf_lanes_rect.height()).max(0.0);
+    let max_video_scroll = (video_track_count as f32 * state.video_track_height
+        - video_tracks_lanes_rect.height())
+    .max(0.0);
+    let max_audio_scroll =
+        (audio_track_count as f32 * effective_audio_h - audio_tracks_lanes_rect.height()).max(0.0);
+
+    // Always clamp vertical scroll offsets on every frame BEFORE wheel input or track layout
+    // so resizing taller, collapsing keyframe lanes, or closing breadcrumb bars immediately
+    // clears any stranded scroll instead of clipping top tracks.
+    state.keyframe_scroll_y = clamp_scroll_y(state.keyframe_scroll_y, max_kf_scroll);
+    state.video_scroll_y = clamp_scroll_y(state.video_scroll_y, max_video_scroll);
+    state.audio_scroll_y = clamp_scroll_y(state.audio_scroll_y, max_audio_scroll);
+
+    // Auto-scroll newly added video/audio tracks into view immediately when track count grows.
+    let prev_video_track_count = state.last_video_track_count;
+    let prev_audio_track_count = state.last_audio_track_count;
+    let video_track_added = prev_video_track_count.is_some_and(|prev| video_track_count > prev);
+    let audio_track_added = prev_audio_track_count.is_some_and(|prev| audio_track_count > prev);
+    if video_track_added {
+        state.video_scroll_y = max_video_scroll;
+    }
+    if audio_track_added {
+        state.audio_scroll_y = max_audio_scroll;
+    }
+    state.last_video_track_count = Some(video_track_count);
+    state.last_audio_track_count = Some(audio_track_count);
+
+    // Keep the selected clip's track visible when keyframe lanes expand / viewport height shrinks
+    // or when clip selection changes (without fighting manual wheel / scrollbar scrolling).
+    let selected_clip_id = session.selection.clip_ids.first().cloned();
+    let selected_clip_changed = selected_clip_id != state.last_selected_clip_id;
+    let video_lanes_h = video_tracks_lanes_rect.height();
+    let audio_lanes_h = audio_tracks_lanes_rect.height();
+    let video_lanes_shrank = state
+        .last_video_lanes_height
+        .is_some_and(|prev| video_lanes_h < prev - 0.5);
+    let audio_lanes_shrank = state
+        .last_audio_lanes_height
+        .is_some_and(|prev| audio_lanes_h < prev - 0.5);
+    if state.vscrollbar_drag.is_none()
+        && !matches!(state.drag_state, TimelineDragState::DraggingClips(_))
+        && let Some(ref clip_id) = selected_clip_id
+    {
+        if !video_track_added
+            && (selected_clip_changed || video_lanes_shrank)
+            && let Some(v_idx) = session
+                .document()
+                .video_tracks
+                .iter()
+                .position(|t| t.clips.iter().any(|c| &c.id == clip_id))
+        {
+            state.video_scroll_y = scroll_y_to_keep_track_visible(
+                state.video_scroll_y,
+                v_idx,
+                state.video_track_height,
+                video_lanes_h,
+                max_video_scroll,
+                true,
+            );
+        } else if !audio_track_added
+            && (selected_clip_changed || audio_lanes_shrank)
+            && let Some(a_idx) = session
+                .document()
+                .audio_tracks
+                .iter()
+                .position(|t| t.clips.iter().any(|c| &c.id == clip_id))
+        {
+            state.audio_scroll_y = scroll_y_to_keep_track_visible(
+                state.audio_scroll_y,
+                a_idx,
+                effective_audio_h,
+                audio_lanes_h,
+                max_audio_scroll,
+                false,
+            );
+        }
+    }
+    state.last_selected_clip_id = selected_clip_id;
+    state.last_video_lanes_height = Some(video_lanes_h);
+    state.last_audio_lanes_height = Some(audio_lanes_h);
+
     let scrollbar_rect = Rect::from_min_max(
         pos2(
             content_left,
@@ -1117,14 +1432,26 @@ pub fn show_timeline(
         pos2(body_rect.right(), body_rect.bottom()),
     );
 
-    // Playback page-flip follow auto-scroll (Spec 02 §2.2).
-    if session.playback.is_playing() {
+    // Playback page-flip follow AND off-screen playhead jump auto-scroll (e.g., Home / End / >| / |<).
+    let frame_jumped = state
+        .last_observed_frame
+        .is_some_and(|prev| (session.playback.current_frame - prev).abs() > 0.01);
+    if session.playback.is_playing()
+        || (frame_jumped && !matches!(state.drag_state, TimelineDragState::ScrubbingPlayhead))
+    {
         let ph_px = frame_to_px(session.playback.current_frame, fps, state.zoom);
         let vw = f64::from(content_width);
-        if ph_px < state.scroll_x || ph_px > state.scroll_x + vw {
-            state.scroll_x = (ph_px / vw).floor().max(0.0) * vw;
+        if ph_px < state.scroll_x || ph_px > state.scroll_x + vw - 8.0 {
+            if session.playback.is_playing() {
+                state.scroll_x = (ph_px / vw).floor().max(0.0) * vw;
+            } else if ph_px <= 8.0 {
+                state.scroll_x = 0.0;
+            } else {
+                state.scroll_x = (ph_px - vw * 0.75).max(0.0);
+            }
         }
     }
+    state.last_observed_frame = Some(session.playback.current_frame);
 
     // Clamp horizontal scroll within content width before handling wheel/pan.
     let initial_seq_px = frame_to_px(total_frames, fps, state.zoom);
@@ -1145,6 +1472,9 @@ pub fn show_timeline(
         audio_lanes_rect,
         content_left,
         initial_max_scroll_x,
+        max_kf_scroll,
+        max_video_scroll,
+        max_audio_scroll,
     );
 
     // Recompute sequence pixel width & max_scroll_x AFTER wheel zoom / pan.
@@ -1168,7 +1498,7 @@ pub fn show_timeline(
         );
     }
 
-    // 1. Timecode box (200 x 35 px: left timecode + Snap Magnet toggle + right "Render Time" toggle).
+    // 1. Timecode box (200 x 35 px: left timecode + Zoom -/+ + Snap Magnet + right "Render Time" toggle).
     paint_and_interact_timecode(ui, session, state, palette, timecode_rect, fps);
 
     // 2. Time Ruler (ticks, labels, interactive markers, selection bar, playhead scrub).
@@ -1186,17 +1516,22 @@ pub fn show_timeline(
         action.playhead_scrubbed = true;
     }
 
-    // 3. Keyframe Dope-Sheet area (default 60 px, resizable in 20 px steps) + 3 px #222222 splitter.
-    paint_and_interact_keyframes(
-        ui,
-        session,
-        state,
-        kf_header_rect,
-        kf_lanes_rect,
-        fps,
-        &mut action,
-    );
-    paint_and_interact_kf_splitter(ui, state, kf_splitter_rect, max_kf_h);
+    // 3. Keyframe Dope-Sheet area (auto-collapsed when empty) + 3 px #222222 splitter.
+    if kf_height > 0.0 {
+        paint_and_interact_keyframes(
+            ui,
+            session,
+            state,
+            &kf_rows,
+            kf_header_rect,
+            kf_lanes_rect,
+            fps,
+            &mut action,
+        );
+    }
+    if kf_splitter_h > 0.0 {
+        paint_and_interact_kf_splitter(ui, state, kf_splitter_rect, kf_height, max_kf_h);
+    }
 
     // 4. Video Tracks (bottom-up from divider: V1 immediately above divider, V2 above V1).
     paint_and_interact_tracks(
@@ -1237,8 +1572,8 @@ pub fn show_timeline(
         palette,
         ruler_rect,
         kf_lanes_rect,
-        video_lanes_rect,
-        audio_lanes_rect,
+        video_tracks_lanes_rect,
+        audio_tracks_lanes_rect,
         fps,
         total_frames,
         &mut action,
@@ -1253,11 +1588,12 @@ pub fn show_timeline(
         pos2(body_rect.right(), body_rect.bottom()),
     );
     let overlay_painter = ui.painter().with_clip_rect(content_clip);
+    let max_content_x = (body_rect.right() - 1.0).max(content_left);
     if let Some(snap_x) = state.snap_guide_x
         && snap_x >= content_left
         && snap_x <= body_rect.right()
     {
-        let sx = snap_x.round().clamp(content_left, body_rect.right() - 1.0);
+        let sx = snap_x.round().clamp(content_left, max_content_x);
         overlay_painter.rect_filled(
             Rect::from_min_size(pos2(sx, body_rect.top()), vec2(1.0, body_rect.height())),
             CornerRadius::ZERO,
@@ -1270,9 +1606,7 @@ pub fn show_timeline(
     let playhead_screen_x = content_left
         + (frame_to_px(session.playback.current_frame, fps, state.zoom) - state.scroll_x) as f32;
     if playhead_screen_x >= content_left - 0.5 && playhead_screen_x <= body_rect.right() + 0.5 {
-        let ph_x_int = playhead_screen_x
-            .round()
-            .clamp(content_left, body_rect.right() - 1.0);
+        let ph_x_int = playhead_screen_x.round().clamp(content_left, max_content_x);
         overlay_painter.rect_filled(
             Rect::from_min_size(
                 pos2(ph_x_int, body_rect.top()),
@@ -1320,7 +1654,41 @@ pub fn show_timeline(
         }
     }
 
-    // 11. Floating dark CM3 right-click context menu (clip, track lane, ruler, marker).
+    // 11. Transient timeline status toast (composition switch / blocked drop feedback).
+    let now_sec = ui.input(|i| i.time);
+    if let Some((ref msg, expires_at)) = state.status_toast {
+        if now_sec < expires_at && body_rect.width() >= 180.0 && body_rect.height() >= 36.0 {
+            let toast_w = (msg.chars().count() as f32 * 6.8 + 18.0)
+                .clamp(120.0, (content_width - 24.0).max(120.0));
+            let toast_h = 22.0;
+            let toast_rect = Rect::from_center_size(
+                pos2(
+                    (content_left + body_rect.right()) * 0.5,
+                    (body_rect.bottom() - 18.0).max(ruler_rect.bottom() + 14.0),
+                ),
+                vec2(toast_w, toast_h),
+            );
+            overlay_painter.rect_filled(
+                toast_rect,
+                CornerRadius::same(3),
+                Color32::from_rgba_unmultiplied(0x1b, 0x1f, 0x2a, 232),
+            );
+            paint_crisp_border_1px(&overlay_painter, toast_rect, rgb_to_color32(palette.focus));
+            overlay_painter.text(
+                toast_rect.center(),
+                Align2::CENTER_CENTER,
+                msg,
+                FontId::monospace(10.5),
+                Color32::from_rgb(0xe8, 0xee, 0xfc),
+            );
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(120));
+        } else if now_sec >= expires_at {
+            state.status_toast = None;
+        }
+    }
+
+    // 12. Floating dark CM3 right-click context menu (clip, track lane, ruler, marker).
     show_timeline_context_menu(ui, session, state, palette, &mut action);
 
     let _ = panel_resp;
@@ -1409,9 +1777,9 @@ fn paint_meter_channel(painter: &egui::Painter, bar: Rect, rms: f32, peak: f32) 
     }
 
     // 1 px #cece62 peak-hold indicator line at peak * 100% from bottom.
-    if peak > 0.001 {
-        let peak_y =
-            (bar.bottom() - bar.height() * peak).clamp(bar.top() + 0.5, bar.bottom() - 0.5);
+    if peak > 0.001 && bar.height() >= 1.0 {
+        let peak_y = (bar.bottom() - bar.height() * peak)
+            .clamp(bar.top() + 0.5, (bar.bottom() - 0.5).max(bar.top() + 0.5));
         painter.line_segment(
             [pos2(bar.left(), peak_y), pos2(bar.right(), peak_y)],
             Stroke::new(1.0, COLOR_METER_PEAK),
@@ -1437,6 +1805,9 @@ fn handle_wheel_and_middle_pan(
     audio_lanes_rect: Rect,
     content_left: f32,
     max_scroll_x: f64,
+    max_kf_scroll: f32,
+    max_video_scroll: f32,
+    max_audio_scroll: f32,
 ) {
     let (hover_pos, g, middle_down) = ui.input(|i| {
         (
@@ -1455,11 +1826,14 @@ fn handle_wheel_and_middle_pan(
                     *last_pos = pos;
                     state.scroll_x = (state.scroll_x - f64::from(delta.x)).clamp(0.0, max_scroll_x);
                     if video_lanes_rect.contains(pos) || video_header_rect.contains(pos) {
-                        state.video_scroll_y = (state.video_scroll_y + delta.y).max(0.0);
+                        state.video_scroll_y =
+                            clamp_scroll_y(state.video_scroll_y + delta.y, max_video_scroll);
                     } else if audio_lanes_rect.contains(pos) || audio_header_rect.contains(pos) {
-                        state.audio_scroll_y = (state.audio_scroll_y - delta.y).max(0.0);
+                        state.audio_scroll_y =
+                            clamp_scroll_y(state.audio_scroll_y - delta.y, max_audio_scroll);
                     } else if kf_lanes_rect.contains(pos) || kf_header_rect.contains(pos) {
-                        state.keyframe_scroll_y = (state.keyframe_scroll_y - delta.y).max(0.0);
+                        state.keyframe_scroll_y =
+                            clamp_scroll_y(state.keyframe_scroll_y - delta.y, max_kf_scroll);
                     }
                     ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 }
@@ -1566,17 +1940,21 @@ fn handle_wheel_and_middle_pan(
     if dy.abs() > 0.01 {
         if ruler_rect.contains(pos) {
             if g.device == ScrollDevice::MouseWheel || dx.abs() < 0.01 {
-                state.scroll_x = (state.scroll_x - f64::from(dy)).clamp(0.0, max_scroll_x);
+                let factor = (f64::from(dy) * 0.0022).clamp(-0.30, 0.30).exp();
+                state.zoom_by(factor, anchor_x);
             }
         } else {
             // Vertical scroll on hovered track pane (bottom-up for video, top-down for keyframes/audio).
             let step = -dy;
             if kf_lanes_rect.contains(pos) || kf_header_rect.contains(pos) {
-                state.keyframe_scroll_y = (state.keyframe_scroll_y + step).max(0.0);
+                state.keyframe_scroll_y =
+                    clamp_scroll_y(state.keyframe_scroll_y + step, max_kf_scroll);
             } else if video_lanes_rect.contains(pos) || video_header_rect.contains(pos) {
-                state.video_scroll_y = (state.video_scroll_y - step).max(0.0);
+                state.video_scroll_y =
+                    clamp_scroll_y(state.video_scroll_y - step, max_video_scroll);
             } else if audio_lanes_rect.contains(pos) || audio_header_rect.contains(pos) {
-                state.audio_scroll_y = (state.audio_scroll_y + step).max(0.0);
+                state.audio_scroll_y =
+                    clamp_scroll_y(state.audio_scroll_y + step, max_audio_scroll);
             }
         }
     }
@@ -1753,20 +2131,29 @@ fn paint_and_interact_timecode(
     rect: Rect,
     fps: f64,
 ) {
-    let toggle_w = 74.0;
+    let toggle_w = 56.0;
     let toggle_h = 22.0;
     let btn_top = rect.top() + 6.0;
     let toggle_rect = Rect::from_min_size(
         pos2(rect.right() - 4.0 - toggle_w, btn_top),
         vec2(toggle_w, toggle_h),
     );
-    let snap_w = 22.0;
+    let snap_w = 20.0;
     let snap_rect = Rect::from_min_size(
-        pos2(toggle_rect.left() - 4.0 - snap_w, btn_top),
+        pos2(toggle_rect.left() - 2.0 - snap_w, btn_top),
         vec2(snap_w, toggle_h),
     );
+    let zoom_w = 16.0;
+    let zoom_in_rect = Rect::from_min_size(
+        pos2(snap_rect.left() - 2.0 - zoom_w, btn_top),
+        vec2(zoom_w, toggle_h),
+    );
+    let zoom_out_rect = Rect::from_min_size(
+        pos2(zoom_in_rect.left() - 2.0 - zoom_w, btn_top),
+        vec2(zoom_w, toggle_h),
+    );
     let timecode_hit_rect =
-        Rect::from_min_max(rect.min, pos2(snap_rect.left() - 2.0, rect.bottom()));
+        Rect::from_min_max(rect.min, pos2(zoom_out_rect.left() - 2.0, rect.bottom()));
 
     let resp = ui.interact(
         timecode_hit_rect,
@@ -1775,6 +2162,36 @@ fn paint_and_interact_timecode(
     );
     if resp.secondary_clicked() {
         session.playback.cycle_time_format();
+    }
+
+    let zoom_out_resp = ui
+        .interact(
+            zoom_out_rect,
+            ui.scope_id().with("timeline_zoom_out_btn"),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Zoom out timeline (Cmd/Ctrl+-)");
+    if zoom_out_resp.clicked_by(PointerButton::Primary) {
+        let playhead_px = frame_to_px(session.playback.current_frame, fps, state.zoom);
+        let anchor_x =
+            (playhead_px - state.scroll_x).clamp(0.0, f64::from(state.last_viewport_width));
+        state.zoom_by(1.0 / 1.25, anchor_x);
+    }
+
+    let zoom_in_resp = ui
+        .interact(
+            zoom_in_rect,
+            ui.scope_id().with("timeline_zoom_in_btn"),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Zoom in timeline (Cmd/Ctrl+=)");
+    if zoom_in_resp.clicked_by(PointerButton::Primary) {
+        let playhead_px = frame_to_px(session.playback.current_frame, fps, state.zoom);
+        let anchor_x =
+            (playhead_px - state.scroll_x).clamp(0.0, f64::from(state.last_viewport_width));
+        state.zoom_by(1.25, anchor_x);
     }
 
     let snap_resp = ui
@@ -1806,18 +2223,43 @@ fn paint_and_interact_timecode(
 
     let text = session.playback.format_timecode(fps);
     let tc_font_px = if session.playback.time_format % 3 == TIME_FORMAT_FRAME_NUMBER {
-        15.0
+        14.0
     } else {
-        11.2
+        10.5
     };
     let tc_painter = ui.painter().with_clip_rect(timecode_hit_rect);
     tc_painter.text(
-        pos2(rect.left() + 7.0, rect.center().y),
+        pos2(rect.left() + 6.0, rect.center().y),
         Align2::LEFT_CENTER,
         text,
         FontId::monospace(tc_font_px),
         COLOR_TIMECODE_TEXT,
     );
+
+    // Compact `−` / `+` timeline zoom buttons.
+    for (z_rect, z_resp, glyph) in [
+        (zoom_out_rect, &zoom_out_resp, "−"),
+        (zoom_in_rect, &zoom_in_resp, "+"),
+    ] {
+        let z_bg = if z_resp.hovered() {
+            Color32::from_rgb(0x2c, 0x2c, 0x2c)
+        } else {
+            Color32::from_rgb(0x20, 0x20, 0x20)
+        };
+        painter.rect_filled(z_rect, CornerRadius::ZERO, z_bg);
+        paint_crisp_border_1px(painter, z_rect, Color32::from_rgb(0x1b, 0x1b, 0x1b));
+        painter.text(
+            z_rect.center(),
+            Align2::CENTER_CENTER,
+            glyph,
+            FontId::monospace(11.5),
+            if z_resp.hovered() {
+                Color32::from_rgb(0xea, 0xea, 0xea)
+            } else {
+                TEXT_MUTED
+            },
+        );
+    }
 
     // Visible Snap Magnet toggle button with active highlight styling.
     let snap_bg = if state.snap_enabled {
@@ -1840,12 +2282,13 @@ fn paint_and_interact_timecode(
     paint_crisp_border_1px(painter, snap_rect, snap_border);
     paint_snap_magnet_icon(painter, snap_rect, state.snap_enabled, snap_resp.hovered());
 
-    // Sunken #202020 / 1px #1b1b1b "Render Time" toggle box matching Zoidium.
+    // Sunken #202020 / 1px #1b1b1b time format toggle box.
     let fmt = session.playback.time_format % 3;
     let is_active = fmt != TIME_FORMAT_FRAME_NUMBER;
     let toggle_label = match fmt {
-        TIME_FORMAT_TIMECODE_FRAMES => "Timecode",
-        _ => "Render Time",
+        TIME_FORMAT_TIMECODE_FRAMES => "TC",
+        TIME_FORMAT_TIMECODE_MS => "Time",
+        _ => "Frames",
     };
     let toggle_bg = if toggle_resp.hovered() {
         Color32::from_rgb(0x28, 0x28, 0x28)
@@ -1946,12 +2389,14 @@ fn paint_and_interact_ruler(
                 name: name.clone(),
                 color: color.clone(),
             });
+            state.context_menu_opened_this_frame = true;
         } else {
             let content_x = (f64::from(pos.x - rect.left()) + state.scroll_x).max(0.0);
             let clicked_frame = px_to_frame(content_x, fps, state.zoom)
                 .round()
                 .clamp(0.0, (total_frames - 1.0).max(0.0));
             state.context_menu = Some(TimelineContextMenu::Ruler { pos, clicked_frame });
+            state.context_menu_opened_this_frame = true;
         }
     }
 
@@ -2063,13 +2508,17 @@ fn paint_and_interact_ruler(
         );
 
         let label = format_time_seconds(tick_sec, fps, session.playback.time_format);
-        painter.text(
-            pos2(x_major + 5.0, rect.top() + 0.5),
-            Align2::LEFT_TOP,
-            label,
-            FontId::monospace(14.0),
-            COLOR_RULER_LABEL,
-        );
+        // Skip labels that would slice mid-character against the right edge of the ruler.
+        let est_label_w = label.chars().count() as f32 * 8.6 + 6.0;
+        if x_major + 5.0 + est_label_w <= rect.right() - 2.0 {
+            painter.text(
+                pos2(x_major + 5.0, rect.top() + 0.5),
+                Align2::LEFT_TOP,
+                label,
+                FontId::monospace(14.0),
+                COLOR_RULER_LABEL,
+            );
+        }
     }
 
     // 2 px selection shadow bar at bottom of ruler spanning [min(c.start), max(c.start + c.length)] (Spec 02 §1.4).
@@ -2275,33 +2724,75 @@ fn paint_inline_marker_rename(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_and_interact_keyframes(
     ui: &mut Ui,
     session: &mut Session,
     state: &mut TimelineViewState,
+    rows: &[KeyframeLaneRow],
     header_rect: Rect,
     lanes_rect: Rect,
     fps: f64,
     action: &mut TimelineAction,
 ) {
-    let rows = collect_keyframe_rows(session);
-    let max_scroll = (rows.len() as f32 * KEYFRAME_ROW_HEIGHT - lanes_rect.height()).max(0.0);
-    state.keyframe_scroll_y = state.keyframe_scroll_y.clamp(0.0, max_scroll);
+    let total_kf_h = rows.len() as f32 * KEYFRAME_ROW_HEIGHT;
+    let max_scroll = (total_kf_h - lanes_rect.height()).max(0.0);
+    state.keyframe_scroll_y = clamp_scroll_y(state.keyframe_scroll_y, max_scroll);
+    let (vscroll_consumed, vscroll_hovered) = interact_vertical_scrollbar(
+        ui,
+        state,
+        VScrollPane::Keyframes,
+        lanes_rect,
+        max_scroll,
+        total_kf_h,
+        false,
+    );
+    let interact_lanes_rect = if max_scroll > 0.5 {
+        Rect::from_min_max(
+            lanes_rect.min,
+            pos2(
+                (lanes_rect.right() - VSCROLLBAR_HIT_WIDTH).max(lanes_rect.left()),
+                lanes_rect.bottom(),
+            ),
+        )
+    } else {
+        lanes_rect
+    };
 
     let header_painter = ui.painter().with_clip_rect(header_rect);
     header_painter.rect_filled(header_rect, CornerRadius::ZERO, COLOR_KF_EMPTY_BG);
     let lane_painter = ui.painter().with_clip_rect(lanes_rect);
     lane_painter.rect_filled(lanes_rect, CornerRadius::ZERO, COLOR_KF_EMPTY_BG);
+    // Allow frame-0 keyframe diamonds (`r = 5.5 px`) to render intact without left-edge clipping
+    // while keeping 10 px right padding on lane labels so labels never collide with frame-0 diamonds.
+    let diamond_clip = Rect::from_min_max(
+        pos2(
+            (lanes_rect.left() - 7.0).max(header_rect.right() - 8.0),
+            lanes_rect.top(),
+        ),
+        lanes_rect.max,
+    );
+    let diamond_painter = ui.painter().with_clip_rect(diamond_clip);
+    let label_clip_rect = Rect::from_min_max(
+        header_rect.min,
+        pos2(
+            (header_rect.right() - 10.0).max(header_rect.left()),
+            header_rect.bottom(),
+        ),
+    );
+    let label_painter = ui.painter().with_clip_rect(label_clip_rect);
 
     let lane_resp = ui.interact(
-        lanes_rect,
+        interact_lanes_rect,
         ui.scope_id().with("timeline_kf_lanes"),
         Sense::click_and_drag(),
     );
 
     let modifiers = ui.input(|i| i.modifiers);
-    let mut clicked_any_diamond = false;
+    let mut clicked_any_diamond = vscroll_consumed;
 
+    // First pass: paint row backgrounds, labels (clipped with right padding), and header border
+    // BEFORE diamonds so frame-0 diamonds sit cleanly intact on top of the 1 px seam.
     for (idx, row) in rows.iter().enumerate() {
         let y0 = lanes_rect.top() + idx as f32 * KEYFRAME_ROW_HEIGHT - state.keyframe_scroll_y;
         let y1 = y0 + KEYFRAME_ROW_HEIGHT;
@@ -2326,11 +2817,11 @@ fn paint_and_interact_keyframes(
             Rect::from_min_max(pos2(lanes_rect.left(), y0), pos2(lanes_rect.right(), y1));
 
         header_painter.rect_filled(row_header_rect, CornerRadius::ZERO, label_bg);
-        header_painter.text(
+        label_painter.text(
             pos2(row_header_rect.left() + 6.0, row_header_rect.center().y),
             Align2::LEFT_CENTER,
             &row.display_label,
-            FontId::monospace(14.0),
+            FontId::monospace(12.0),
             COLOR_KF_TEXT,
         );
 
@@ -2346,8 +2837,31 @@ fn paint_and_interact_keyframes(
         }
 
         lane_painter.rect_filled(row_lane_rect, CornerRadius::ZERO, lane_bg);
+    }
 
-        let hue_deg = ((40 * string_hash(&row.property)) % 360) as f32;
+    if !rows.is_empty() {
+        let rows_h = (total_kf_h - state.keyframe_scroll_y).clamp(0.0, header_rect.height());
+        if rows_h > 0.0 {
+            header_painter.rect_filled(
+                Rect::from_min_size(
+                    pos2(header_rect.right() - 1.0, header_rect.top()),
+                    vec2(1.0, rows_h),
+                ),
+                CornerRadius::ZERO,
+                COLOR_TRACK_BORDER,
+            );
+        }
+    }
+
+    // Second pass: paint and interact keyframe diamonds intact (including frame 0!).
+    for (idx, row) in rows.iter().enumerate() {
+        let y0 = lanes_rect.top() + idx as f32 * KEYFRAME_ROW_HEIGHT - state.keyframe_scroll_y;
+        let y1 = y0 + KEYFRAME_ROW_HEIGHT;
+        if y1 < lanes_rect.top() || y0 > lanes_rect.bottom() {
+            continue;
+        }
+
+        let hue_deg = (string_hash(&row.property).wrapping_mul(40) % 360) as f32;
         let fill_unselected = hsl_to_color32(hue_deg, 0.40, 0.45);
         let stroke_color = hsl_to_color32(hue_deg, 0.40, 0.60);
 
@@ -2375,15 +2889,14 @@ fn paint_and_interact_keyframes(
             let cx = lanes_rect.left()
                 + (frame_to_px(display_abs_frame, fps, state.zoom) - state.scroll_x) as f32;
             let cy = (y0 + y1) * 0.5;
-            if cx < lanes_rect.left() - 12.0 || cx > lanes_rect.right() + 12.0 {
+            if cx < lanes_rect.left() - 10.0 || cx > lanes_rect.right() + 10.0 {
                 continue;
             }
 
-            // 12 x 12 px rotated diamond => half-diagonal ~ 8.5 px (6 px half-side rotated 45 deg).
-            let r = 6.0 * std::f32::consts::SQRT_2;
-            let diamond_hit = Rect::from_center_size(pos2(cx, cy), vec2(14.0, 14.0));
+            let r = 5.5_f32;
+            let diamond_hit = Rect::from_center_size(pos2(cx, cy), vec2(13.0, 13.0));
             let kf_resp = ui.interact(
-                diamond_hit.intersect(lanes_rect),
+                diamond_hit.intersect(diamond_clip),
                 ui.scope_id()
                     .with(("kf_diamond", &row.target_id, &row.property, kf_idx)),
                 Sense::click_and_drag(),
@@ -2423,7 +2936,7 @@ fn paint_and_interact_keyframes(
                 }
                 if !row.locked && (!modifiers.shift || is_selected) {
                     let dragged =
-                        collect_selected_keyframe_infos(&rows, &session.selection.keyframes);
+                        collect_selected_keyframe_infos(rows, &session.selection.keyframes);
                     if !dragged.is_empty() {
                         let pointer_x = ui.input(|i| i.pointer.interact_pos()).map_or(cx, |p| p.x);
                         let content_x = f64::from(pointer_x - lanes_rect.left()) + state.scroll_x;
@@ -2451,7 +2964,7 @@ fn paint_and_interact_keyframes(
             } else {
                 fill_unselected
             };
-            lane_painter.add(Shape::convex_polygon(
+            diamond_painter.add(Shape::convex_polygon(
                 pts,
                 fill,
                 Stroke::new(1.0, stroke_color),
@@ -2483,29 +2996,268 @@ fn paint_and_interact_keyframes(
         }
     }
 
-    if !rows.is_empty() {
-        let rows_h = (rows.len() as f32 * KEYFRAME_ROW_HEIGHT - state.keyframe_scroll_y)
-            .clamp(0.0, header_rect.height());
-        if rows_h > 0.0 {
-            header_painter.rect_filled(
-                Rect::from_min_size(
-                    pos2(header_rect.right() - 1.0, header_rect.top()),
-                    vec2(1.0, rows_h),
-                ),
-                CornerRadius::ZERO,
-                COLOR_TRACK_BORDER,
-            );
+    // Draggable vertical scrollbar pinned strictly to `lanes_rect.right()` regardless of `scroll_x`.
+    if max_scroll > 0.5 && lanes_rect.height() >= 16.0 {
+        paint_vertical_scroll_indicator(
+            &lane_painter,
+            lanes_rect,
+            state.keyframe_scroll_y,
+            max_scroll,
+            total_kf_h,
+            false,
+            vscroll_hovered,
+            state
+                .vscrollbar_drag
+                .is_some_and(|(p, _)| p == VScrollPane::Keyframes),
+        );
+    }
+}
+
+fn vscrollbar_geometry(
+    rect: Rect,
+    scroll_y: f32,
+    max_scroll: f32,
+    total_h: f32,
+    bottom_up: bool,
+) -> Option<(Rect, Rect, Rect)> {
+    if max_scroll <= 0.5 || rect.height() < 16.0 || rect.width() <= 2.0 || total_h <= rect.height()
+    {
+        return None;
+    }
+    let hit_rect = Rect::from_min_max(
+        pos2(
+            (rect.right() - VSCROLLBAR_HIT_WIDTH).max(rect.left()),
+            rect.top(),
+        ),
+        rect.max,
+    );
+    let bar_w = 6.0_f32.min((rect.width() - 2.0).max(1.0));
+    let track_left = (rect.right() - bar_w - 2.0).max(rect.left());
+    let track_right = (rect.right() - 2.0).max(track_left + 1.0);
+    let track_rect = Rect::from_min_max(
+        pos2(track_left, rect.top() + 2.0),
+        pos2(track_right, rect.bottom() - 2.0),
+    );
+    let track_h = track_rect.height();
+    if track_h <= 2.0 {
+        return None;
+    }
+    let min_thumb = 14.0_f32.min(track_h);
+    let max_thumb = if track_h >= min_thumb + 6.0 {
+        track_h - 6.0
+    } else {
+        track_h
+    };
+    let thumb_h = (track_h * (rect.height() / total_h)).clamp(min_thumb, max_thumb);
+    let frac = (scroll_y / max_scroll).clamp(0.0, 1.0);
+    // For bottom-up video tracks (`scroll_y = 0` shows V1 at bottom; larger `scroll_y` scrolls UP),
+    // thumb starts at bottom when `scroll_y == 0` and moves upward as `scroll_y` increases.
+    let thumb_y = if bottom_up {
+        track_rect.bottom() - thumb_h - frac * (track_h - thumb_h)
+    } else {
+        track_rect.top() + frac * (track_h - thumb_h)
+    };
+    let thumb_rect = Rect::from_min_size(pos2(track_rect.left(), thumb_y), vec2(bar_w, thumb_h));
+    Some((hit_rect, track_rect, thumb_rect))
+}
+
+fn pane_scroll_y_mut(state: &mut TimelineViewState, pane: VScrollPane) -> &mut f32 {
+    match pane {
+        VScrollPane::Video => &mut state.video_scroll_y,
+        VScrollPane::Audio => &mut state.audio_scroll_y,
+        VScrollPane::Keyframes => &mut state.keyframe_scroll_y,
+    }
+}
+
+fn interact_vertical_scrollbar(
+    ui: &mut Ui,
+    state: &mut TimelineViewState,
+    pane: VScrollPane,
+    rect: Rect,
+    max_scroll: f32,
+    total_h: f32,
+    bottom_up: bool,
+) -> (bool, bool) {
+    let scroll_y = *pane_scroll_y_mut(state, pane);
+    let Some((hit_rect, track_rect, thumb_rect)) =
+        vscrollbar_geometry(rect, scroll_y, max_scroll, total_h, bottom_up)
+    else {
+        if state.vscrollbar_drag.is_some_and(|(p, _)| p == pane) {
+            state.vscrollbar_drag = None;
+        }
+        return (false, false);
+    };
+
+    let pane_tag = match pane {
+        VScrollPane::Video => "video",
+        VScrollPane::Audio => "audio",
+        VScrollPane::Keyframes => "kf",
+    };
+    let resp = ui.interact(
+        hit_rect,
+        ui.scope_id().with(("timeline_vscrollbar", pane_tag)),
+        Sense::click_and_drag(),
+    );
+
+    let (primary_pressed, primary_down, press_origin, latest_pos) = ui.input(|i| {
+        (
+            i.pointer.primary_pressed(),
+            i.pointer.primary_down(),
+            i.pointer.press_origin(),
+            i.pointer.latest_pos(),
+        )
+    });
+
+    let press_pos = press_origin.or(latest_pos);
+    let pressed_in_bar = primary_pressed
+        && press_pos.is_some_and(|p| rect_contains_unoccluded_pointer(ui, hit_rect, p));
+    let started = resp.drag_started_by(PointerButton::Primary)
+        || (pressed_in_bar && state.vscrollbar_drag.is_none());
+
+    let track_h = track_rect.height().max(1.0);
+    let thumb_h = thumb_rect.height();
+    let usable = (track_h - thumb_h).max(1.0);
+
+    let update_scroll_from_y = |state: &mut TimelineViewState, pointer_y: f32, offset: f32| {
+        let new_thumb_top = pointer_y - offset;
+        let new_frac = if bottom_up {
+            ((track_rect.bottom() - thumb_h - new_thumb_top) / usable).clamp(0.0, 1.0)
+        } else {
+            ((new_thumb_top - track_rect.top()) / usable).clamp(0.0, 1.0)
+        };
+        *pane_scroll_y_mut(state, pane) = (new_frac * max_scroll).clamp(0.0, max_scroll);
+    };
+
+    if started && let Some(p) = resp.interact_pointer_pos().or(press_pos) {
+        let offset = if thumb_rect.expand2(vec2(3.0, 2.0)).contains(p) {
+            p.y - thumb_rect.top()
+        } else {
+            thumb_h * 0.5
+        };
+        state.vscrollbar_drag = Some((pane, offset));
+        update_scroll_from_y(state, latest_pos.unwrap_or(p).y, offset);
+    } else if let Some((active_pane, offset)) = state.vscrollbar_drag
+        && active_pane == pane
+    {
+        if primary_down {
+            if let Some(p) = latest_pos {
+                update_scroll_from_y(state, p.y, offset);
+            }
+        } else {
+            state.vscrollbar_drag = None;
         }
     }
+
+    let dragging = state.vscrollbar_drag.is_some_and(|(p, _)| p == pane);
+    let hovered = resp.hovered()
+        || latest_pos.is_some_and(|p| rect_contains_unoccluded_pointer(ui, hit_rect, p));
+    if dragging {
+        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+    } else if hovered {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+
+    let consumed = dragging || pressed_in_bar || (hovered && primary_down);
+    (consumed, hovered)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_vertical_scroll_indicator(
+    painter: &egui::Painter,
+    rect: Rect,
+    scroll_y: f32,
+    max_scroll: f32,
+    total_h: f32,
+    bottom_up: bool,
+    hovered: bool,
+    dragging: bool,
+) {
+    let Some((_, track_rect, thumb_rect)) =
+        vscrollbar_geometry(rect, scroll_y, max_scroll, total_h, bottom_up)
+    else {
+        return;
+    };
+    let track_bg = if dragging || hovered {
+        Color32::from_rgba_unmultiplied(0x12, 0x12, 0x12, 235)
+    } else {
+        Color32::from_rgba_unmultiplied(0x16, 0x16, 0x16, 215)
+    };
+    painter.rect_filled(track_rect, CornerRadius::same(3), track_bg);
+    painter.rect_stroke(
+        track_rect,
+        CornerRadius::same(3),
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x44, 0x44, 0x44, 180)),
+        StrokeKind::Inside,
+    );
+    let thumb_col = if dragging {
+        Color32::from_rgba_unmultiplied(0xe6, 0xe6, 0xe6, 250)
+    } else if hovered {
+        Color32::from_rgba_unmultiplied(0xcc, 0xcc, 0xcc, 240)
+    } else {
+        Color32::from_rgba_unmultiplied(0xb4, 0xb4, 0xb4, 225)
+    };
+    painter.rect_filled(thumb_rect, CornerRadius::same(3), thumb_col);
+}
+
+fn pane_header_strip_height(pane_rect: Rect) -> f32 {
+    if pane_rect.height() >= TRACK_PANE_BAR_HEIGHT + 18.0 {
+        TRACK_PANE_BAR_HEIGHT
+    } else {
+        0.0
+    }
+}
+
+fn split_pane_header_strip(
+    header_rect: Rect,
+    lanes_rect: Rect,
+) -> (Option<(Rect, Rect)>, Rect, Rect) {
+    let strip_h = pane_header_strip_height(header_rect);
+    if strip_h > 0.0 {
+        let strip_header = Rect::from_min_size(header_rect.min, vec2(header_rect.width(), strip_h));
+        let strip_lanes = Rect::from_min_size(lanes_rect.min, vec2(lanes_rect.width(), strip_h));
+        let tracks_header = Rect::from_min_max(
+            pos2(header_rect.left(), header_rect.top() + strip_h),
+            header_rect.max,
+        );
+        let tracks_lanes = Rect::from_min_max(
+            pos2(lanes_rect.left(), lanes_rect.top() + strip_h),
+            lanes_rect.max,
+        );
+        (
+            Some((strip_header, strip_lanes)),
+            tracks_header,
+            tracks_lanes,
+        )
+    } else {
+        (None, header_rect, lanes_rect)
+    }
+}
+
+fn pinned_add_track_button_rect(
+    _kind: TrackKind,
+    header_rect: Rect,
+    _camera_plus_enabled: bool,
+) -> Rect {
+    let icon_size = vec2(18.0, 18.0);
+    let strip_h = pane_header_strip_height(header_rect);
+    let inner_right = header_rect.right() - 1.0;
+    let center_x = (inner_right - 13.0).max(header_rect.left() + 10.0);
+    let center_y = if strip_h > 0.0 {
+        header_rect.top() + strip_h * 0.5
+    } else {
+        header_rect.center().y
+    };
+    Rect::from_center_size(pos2(center_x, center_y), icon_size)
 }
 
 fn paint_and_interact_kf_splitter(
     ui: &mut Ui,
     state: &mut TimelineViewState,
     rect: Rect,
+    current_kf_h: f32,
     max_kf_h: f32,
 ) {
-    let hit_rect = rect.expand2(vec2(0.0, 2.0));
+    let hit_rect = rect.expand2(vec2(0.0, 4.0));
     let resp = ui.interact(
         hit_rect,
         ui.scope_id().with("timeline_kf_splitter"),
@@ -2516,18 +3268,24 @@ fn paint_and_interact_kf_splitter(
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
 
-    if resp.drag_started_by(PointerButton::Primary)
-        && let Some(pos) = resp.interact_pointer_pos()
+    let start_drag = resp.drag_started_by(PointerButton::Primary)
+        || (resp.hovered()
+            && state.kf_splitter_drag.is_none()
+            && ui.input(|i| i.pointer.primary_pressed()));
+    if start_drag
+        && let Some(pos) = resp
+            .interact_pointer_pos()
+            .or_else(|| ui.input(|i| i.pointer.latest_pos()))
     {
-        state.kf_splitter_drag = Some((pos.y, state.keyframe_area_height));
+        state.kf_splitter_drag = Some((pos.y, current_kf_h));
+        state.keyframe_area_custom = true;
     }
 
     if let Some((start_y, start_h)) = state.kf_splitter_drag {
         if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
             let raw_h = start_h + (pos.y - start_y);
-            let quantized = ((raw_h / KEYFRAME_ROW_HEIGHT).round().max(1.0)) * KEYFRAME_ROW_HEIGHT;
-            state.keyframe_area_height =
-                quantized.clamp(KEYFRAME_ROW_HEIGHT.min(max_kf_h), max_kf_h);
+            state.keyframe_area_height = raw_h.clamp(KEYFRAME_ROW_HEIGHT.min(max_kf_h), max_kf_h);
+            state.keyframe_area_custom = true;
         }
         if !ui.input(|i| i.pointer.primary_down()) {
             state.kf_splitter_drag = None;
@@ -2593,67 +3351,161 @@ fn paint_and_interact_tracks(
         TrackKind::Audio => session.document().audio_tracks.clone(),
     };
 
-    let total_h = tracks.len() as f32 * track_h;
-    let max_scroll = (total_h - lanes_rect.height()).max(0.0);
-    let scroll_y = match kind {
+    let (strip_rects, track_header_rect, track_lanes_rect) =
+        split_pane_header_strip(header_rect, lanes_rect);
+
+    let effective_track_h =
+        effective_track_row_height(kind, &tracks, track_h, track_lanes_rect.height());
+    let total_h = tracks.len() as f32 * effective_track_h;
+    let max_scroll = (total_h - track_lanes_rect.height()).max(0.0);
+    match kind {
         TrackKind::Video => {
-            state.video_scroll_y = state.video_scroll_y.clamp(0.0, max_scroll);
-            state.video_scroll_y
+            state.video_scroll_y = clamp_scroll_y(state.video_scroll_y, max_scroll);
         }
         TrackKind::Audio => {
-            state.audio_scroll_y = state.audio_scroll_y.clamp(0.0, max_scroll);
-            state.audio_scroll_y
+            state.audio_scroll_y = clamp_scroll_y(state.audio_scroll_y, max_scroll);
         }
+    }
+
+    // Handle draggable vertical scrollbar BEFORE clip/lane hit-testing so dragging the thumb
+    // smoothly updates scroll_y and NEVER falls through to drag or select clips underneath.
+    let vpane = match kind {
+        TrackKind::Video => VScrollPane::Video,
+        TrackKind::Audio => VScrollPane::Audio,
+    };
+    let (vscroll_consumed, vscroll_hovered) = interact_vertical_scrollbar(
+        ui,
+        state,
+        vpane,
+        track_lanes_rect,
+        max_scroll,
+        total_h,
+        kind == TrackKind::Video,
+    );
+    let scroll_y = match kind {
+        TrackKind::Video => state.video_scroll_y,
+        TrackKind::Audio => state.audio_scroll_y,
     };
 
-    let header_painter = ui.painter().with_clip_rect(header_rect);
-    header_painter.rect_filled(header_rect, CornerRadius::ZERO, COLOR_PANEL_BG);
-    let lane_painter = ui.painter().with_clip_rect(lanes_rect);
-    lane_painter.rect_filled(lanes_rect, CornerRadius::ZERO, COLOR_PANEL_BG);
+    let full_header_painter = ui.painter().with_clip_rect(header_rect);
+    full_header_painter.rect_filled(header_rect, CornerRadius::ZERO, COLOR_PANEL_BG);
+    let full_lane_painter = ui.painter().with_clip_rect(lanes_rect);
+    full_lane_painter.rect_filled(lanes_rect, CornerRadius::ZERO, COLOR_PANEL_BG);
 
-    let header_hovered = ui
-        .input(|i| i.pointer.hover_pos())
-        .is_some_and(|p| header_rect.contains(p));
-
-    if tracks.is_empty() && header_hovered && header_rect.height() >= 18.0 {
-        let add_rect = Rect::from_center_size(
-            pos2(header_rect.left() + 16.0, header_rect.top() + 15.0),
-            vec2(18.0, 18.0),
+    let camera_plus_enabled = session.plugins.is_enabled("camera-plus");
+    if let Some((strip_header, strip_lanes)) = strip_rects {
+        full_header_painter.rect_filled(
+            strip_header,
+            CornerRadius::ZERO,
+            Color32::from_rgb(0x23, 0x23, 0x23),
         );
-        if paint_track_icon_button(
-            ui,
-            add_rect.intersect(header_rect),
-            header_rect,
-            ("trk_add_empty", kind_tag(kind)),
-            TrackIcon::Add,
-            false,
-            true,
-        ) {
+        full_header_painter.rect_filled(
+            Rect::from_min_size(
+                pos2(strip_header.right() - 1.0, strip_header.top()),
+                vec2(1.0, strip_header.height()),
+            ),
+            CornerRadius::ZERO,
+            COLOR_TRACK_BORDER,
+        );
+        let strip_sep_y = (strip_header.bottom() - 1.0).round();
+        full_header_painter.rect_filled(
+            Rect::from_min_size(
+                pos2(strip_header.left(), strip_sep_y),
+                vec2(strip_header.width(), 1.0),
+            ),
+            CornerRadius::ZERO,
+            COLOR_TRACK_BORDER,
+        );
+        full_lane_painter.rect_filled(
+            Rect::from_min_size(
+                pos2(strip_lanes.left(), strip_sep_y),
+                vec2(strip_lanes.width(), 1.0),
+            ),
+            CornerRadius::ZERO,
+            COLOR_TRACK_BORDER,
+        );
+        let strip_label = match kind {
+            TrackKind::Video => "VIDEO",
+            TrackKind::Audio => "AUDIO",
+        };
+        full_header_painter.text(
+            pos2(strip_header.left() + 6.0, strip_header.center().y),
+            Align2::LEFT_CENTER,
+            strip_label,
+            FontId::monospace(10.0),
+            COLOR_TRACK_HEADER_TEXT,
+        );
+        let add_rect = pinned_add_track_button_rect(kind, header_rect, camera_plus_enabled)
+            .intersect(strip_header);
+        if add_rect.width() >= 2.0
+            && add_rect.height() >= 2.0
+            && paint_track_icon_button(
+                ui,
+                add_rect,
+                strip_header,
+                ("trk_add_pinned", kind_tag(kind)),
+                TrackIcon::Add,
+                false,
+                true,
+            )
+        {
             add_track_of_kind(session, state, kind, tracks_height);
         }
     }
 
+    let lane_painter = ui.painter().with_clip_rect(track_lanes_rect);
+    let interact_lanes_rect = if max_scroll > 0.5 {
+        Rect::from_min_max(
+            track_lanes_rect.min,
+            pos2(
+                (track_lanes_rect.right() - VSCROLLBAR_HIT_WIDTH).max(track_lanes_rect.left()),
+                track_lanes_rect.bottom(),
+            ),
+        )
+    } else {
+        track_lanes_rect
+    };
+
     let lane_bg_resp = ui.interact(
-        lanes_rect,
+        interact_lanes_rect,
         ui.scope_id().with(("track_lanes_bg", kind_tag(kind))),
         Sense::click_and_drag(),
     );
 
-    let modifiers = ui.input(|i| i.modifiers);
-    let mut interacted_clip = false;
+    let (modifiers, secondary_pressed, pointer_press_origin, pointer_latest) = ui.input(|i| {
+        (
+            i.modifiers,
+            i.pointer.secondary_pressed(),
+            i.pointer.press_origin(),
+            i.pointer.latest_pos(),
+        )
+    });
+    let mut interacted_clip = vscroll_consumed || state.vscrollbar_drag.is_some();
 
     for (track_idx, track) in tracks.iter().enumerate() {
-        let (y0, y1) = track_row_y_bounds(kind, track_idx, track_h, lanes_rect, scroll_y);
-        if y1 < lanes_rect.top() || y0 > lanes_rect.bottom() {
+        let (y0, y1) = track_row_y_bounds(
+            kind,
+            track_idx,
+            effective_track_h,
+            track_lanes_rect,
+            scroll_y,
+        );
+        if y1 < track_lanes_rect.top() || y0 > track_lanes_rect.bottom() {
+            continue;
+        }
+        let visible_row_h = y1.min(track_lanes_rect.bottom()) - y0.max(track_lanes_rect.top());
+        if visible_row_h < 8.0 {
             continue;
         }
 
-        let row_header_rect =
-            Rect::from_min_max(pos2(header_rect.left(), y0), pos2(header_rect.right(), y1));
+        let row_header_rect = Rect::from_min_max(
+            pos2(track_header_rect.left(), y0),
+            pos2(track_header_rect.right(), y1),
+        );
 
         // Paint track header cell + flat borderless Zoidium vector icon toggles.
-        let can_delete = kind == TrackKind::Audio || tracks.len() > 1;
-        let show_add_btn = track_idx == 0 && header_hovered;
+        // Visibly dim/disable `×` on the sole remaining track; `+` lives cleanly in the dedicated strip.
+        let can_delete = tracks.len() > 1;
         paint_track_header(
             ui,
             session,
@@ -2661,16 +3513,17 @@ fn paint_and_interact_tracks(
             track,
             kind,
             can_delete,
-            show_add_btn,
-            tracks_height,
+            None,
             row_header_rect,
-            header_rect,
+            track_header_rect,
         );
 
         // Paint per-track lane background (#272727) and 1 px #212121 separator border
         // (top border for bottom-up video tracks; bottom border for top-down audio tracks).
-        let row_lane_rect =
-            Rect::from_min_max(pos2(lanes_rect.left(), y0), pos2(lanes_rect.right(), y1));
+        let row_lane_rect = Rect::from_min_max(
+            pos2(track_lanes_rect.left(), y0),
+            pos2(track_lanes_rect.right(), y1),
+        );
         lane_painter.rect_filled(row_lane_rect, CornerRadius::ZERO, COLOR_TRACK_LANE_BG);
         let sep_y = match kind {
             TrackKind::Video => y0.round(),
@@ -2678,8 +3531,8 @@ fn paint_and_interact_tracks(
         };
         lane_painter.rect_filled(
             Rect::from_min_size(
-                pos2(lanes_rect.left(), sep_y),
-                vec2(lanes_rect.width(), 1.0),
+                pos2(track_lanes_rect.left(), sep_y),
+                vec2(track_lanes_rect.width(), 1.0),
             ),
             CornerRadius::ZERO,
             COLOR_TRACK_BORDER,
@@ -2687,25 +3540,25 @@ fn paint_and_interact_tracks(
 
         // Paint and interact clips on this track (29 px clip bar inside 30 px video row, 49 px inside 50 px audio row).
         let (clip_top, clip_bottom) = clip_y_bounds(kind, y0, y1);
-        let playhead_x_int = (lanes_rect.left()
+        let playhead_x_int = (track_lanes_rect.left()
             + (frame_to_px(session.playback.current_frame, fps, state.zoom) - state.scroll_x)
                 as f32)
             .round();
         for clip in &track.clips {
-            let x0 = (lanes_rect.left()
+            let x0 = (track_lanes_rect.left()
                 + (frame_to_px(clip.start, fps, state.zoom) - state.scroll_x) as f32)
                 .round();
-            let x1 = (lanes_rect.left()
+            let x1 = (track_lanes_rect.left()
                 + (frame_to_px(clip.start + clip.length, fps, state.zoom) - state.scroll_x) as f32)
                 .round();
-            if x1 < lanes_rect.left() - 2.0 || x0 > lanes_rect.right() + 2.0 {
+            if x1 < track_lanes_rect.left() - 2.0 || x0 > track_lanes_rect.right() + 2.0 {
                 continue;
             }
 
             let clip_rect =
                 Rect::from_min_max(pos2(x0, clip_top), pos2(x1.max(x0 + 2.0), clip_bottom));
-            let visible_clip_rect = clip_rect.intersect(lanes_rect);
-            if visible_clip_rect.width() <= 0.0 || visible_clip_rect.height() <= 0.0 {
+            let visible_clip_rect = clip_rect.intersect(track_lanes_rect);
+            if visible_clip_rect.width() <= 0.0 || visible_clip_rect.height() < 6.0 {
                 continue;
             }
 
@@ -2720,13 +3573,13 @@ fn paint_and_interact_tracks(
                 palette.clip
             };
             let bg_color = rgb_to_color32(bg_rgb);
-            // Default CM3 clips (#526183 unselected / #7f94c7 selected) ALWAYS use dark label
-            // text matching Zoidium `01_startup_clean.png`; custom colors use auto-contrast.
+            // High-contrast crisp light text on classic medium-blue clip bars (#526183 / #7f94c7),
+            // with auto-contrast fallback for custom bright palette colors.
             let is_default_cm3_clip = !is_box_selected
                 && (bg_rgb == ThemePalette::CLASSIC.clip
                     || bg_rgb == ThemePalette::CLASSIC.clip_selected);
             let label_color = if is_default_cm3_clip {
-                COLOR_CLIP_LABEL_DARK
+                Color32::from_rgb(0xf4, 0xf7, 0xfc)
             } else {
                 rgb_to_color32(choose_clip_label_color(bg_rgb))
             };
@@ -2784,28 +3637,30 @@ fn paint_and_interact_tracks(
                 continue;
             }
 
-            // Invisible edge trim hitboxes (6 px left/right, capped to 25% width for tiny clips).
-            // Register body_resp BEFORE left_resp and right_resp and shrink body_rect so edge trim
-            // hitboxes are always reachable in egui's hit-testing order.
+            // Edge trim hitboxes (8 px inside each clip edge, clamped to 25% of clip width,
+            // plus 2 px outer grace zone). Exclude the 10 px right vertical scrollbar gutter from
+            // clip hitboxes when vertically scrollable so scrollbar drags never grab clips.
             let edge_w = TRIM_EDGE_HITBOX_PX.min(clip_rect.width() * 0.25).max(2.0);
-            let left_edge_rect =
-                Rect::from_min_size(clip_rect.min, vec2(edge_w, clip_rect.height()))
-                    .intersect(lanes_rect);
-            let right_edge_rect = Rect::from_min_size(
-                pos2(clip_rect.right() - edge_w, clip_rect.top()),
-                vec2(edge_w, clip_rect.height()),
+            let interact_clip_rect = clip_rect.intersect(interact_lanes_rect);
+            let left_edge_rect = Rect::from_min_max(
+                pos2(clip_rect.left() - 2.0, clip_rect.top()),
+                pos2(clip_rect.left() + edge_w, clip_rect.bottom()),
             )
-            .intersect(lanes_rect);
-            let body_rect = if visible_clip_rect.width() > edge_w * 2.0 {
+            .intersect(interact_lanes_rect);
+            let right_edge_rect = Rect::from_min_max(
+                pos2(clip_rect.right() - edge_w, clip_rect.top()),
+                pos2(clip_rect.right() + 2.0, clip_rect.bottom()),
+            )
+            .intersect(interact_lanes_rect);
+            let body_left = (clip_rect.left() + edge_w).max(interact_clip_rect.left());
+            let body_right = (clip_rect.right() - edge_w).min(interact_clip_rect.right());
+            let body_rect = if body_right > body_left + 1.0 && interact_clip_rect.is_positive() {
                 Rect::from_min_max(
-                    pos2(visible_clip_rect.left() + edge_w, visible_clip_rect.top()),
-                    pos2(
-                        visible_clip_rect.right() - edge_w,
-                        visible_clip_rect.bottom(),
-                    ),
+                    pos2(body_left, interact_clip_rect.top()),
+                    pos2(body_right, interact_clip_rect.bottom()),
                 )
             } else {
-                visible_clip_rect
+                Rect::NOTHING
             };
 
             let body_resp = ui.interact(
@@ -2849,14 +3704,25 @@ fn paint_and_interact_tracks(
                 lane_painter.rect_filled(right_bar, CornerRadius::ZERO, COLOR_TRIM_SELECTED);
             }
 
-            let clipped_label_painter = ui.painter().with_clip_rect(visible_clip_rect);
-            clipped_label_painter.text(
-                pos2(clip_rect.left() + 4.0, clip_rect.top()),
-                Align2::LEFT_TOP,
-                clip_display_name(clip),
-                FontId::monospace(16.0),
-                label_color,
-            );
+            // Sticky clip label pinned inside visible lane left edge, cleanly ellipsized with `…`
+            // to fit inside the clip's padded inner width, and skipped when clipped vertically < 14 px.
+            if visible_clip_rect.width() >= 12.0 && visible_clip_rect.height() >= 14.0 {
+                let clipped_label_painter = ui.painter().with_clip_rect(visible_clip_rect);
+                let sticky_x = clip_rect.left().max(track_lanes_rect.left()) + 4.0;
+                let max_label_w = (visible_clip_rect.right() - 4.0 - sticky_x).max(0.0);
+                if let Some(galley) = layout_ellipsized_clip_label(
+                    &clipped_label_painter,
+                    clip_display_name(clip),
+                    FontId::monospace(14.0),
+                    label_color,
+                    max_label_w,
+                ) {
+                    let text_pos = Align2::LEFT_CENTER
+                        .anchor_size(pos2(sticky_x, visible_clip_rect.center().y), galley.size())
+                        .min;
+                    clipped_label_painter.galley(text_pos, galley, label_color);
+                }
+            }
 
             if left_resp.hovered() {
                 state.hover = TimelineHover::ClipLeftEdge(clip.id.clone());
@@ -2868,13 +3734,20 @@ fn paint_and_interact_tracks(
                 state.hover = TimelineHover::ClipBody(clip.id.clone());
             }
 
-            // Right-click clip -> Pro Clip context menu (Split, Copy, Duplicate, Pre-compose, Freeze, Reverse, Rename, Delete).
-            if body_resp.secondary_clicked()
+            if vscroll_consumed || state.vscrollbar_drag.is_some() {
+                continue;
+            }
+
+            // Right-click clip -> select immediately if unselected AND open Pro Clip context menu on same click.
+            let clip_right_clicked = body_resp.secondary_clicked()
                 || left_resp.secondary_clicked()
                 || right_resp.secondary_clicked()
-            {
+                || (secondary_pressed
+                    && pointer_latest.is_some_and(|p| visible_clip_rect.contains(p))
+                    && (body_resp.hovered() || left_resp.hovered() || right_resp.hovered()));
+            if clip_right_clicked {
                 interacted_clip = true;
-                state.focused = true;
+                claim_timeline_focus(ui, state, action);
                 if !is_selected {
                     let _ = session.selection.select_clip(&clip.id, None, false);
                 }
@@ -2882,6 +3755,7 @@ fn paint_and_interact_tracks(
                     .interact_pointer_pos()
                     .or_else(|| left_resp.interact_pointer_pos())
                     .or_else(|| right_resp.interact_pointer_pos())
+                    .or(pointer_latest)
                     .unwrap_or(clip_rect.center());
                 state.context_menu = Some(TimelineContextMenu::Clip {
                     pos: menu_pos,
@@ -2891,13 +3765,17 @@ fn paint_and_interact_tracks(
                     clip_length: clip.length,
                     locked: track.locked,
                 });
+                state.context_menu_opened_this_frame = true;
                 continue;
             }
 
-            // Left-edge trim drag start.
-            if left_resp.drag_started_by(PointerButton::Primary) && !track.locked {
+            // Prioritize left/right edge trim drag BEFORE body move-drag (including press_origin fallback).
+            let started_left_trim = left_resp.drag_started_by(PointerButton::Primary)
+                || (body_resp.drag_started_by(PointerButton::Primary)
+                    && pointer_press_origin.is_some_and(|p| left_edge_rect.contains(p)));
+            if started_left_trim && !track.locked {
                 interacted_clip = true;
-                state.focused = true;
+                claim_timeline_focus(ui, state, action);
                 if !is_selected {
                     let _ = session.selection.select_clip(&clip.id, None, false);
                 }
@@ -2914,10 +3792,12 @@ fn paint_and_interact_tracks(
                 continue;
             }
 
-            // Right-edge trim drag start.
-            if right_resp.drag_started_by(PointerButton::Primary) && !track.locked {
+            let started_right_trim = right_resp.drag_started_by(PointerButton::Primary)
+                || (body_resp.drag_started_by(PointerButton::Primary)
+                    && pointer_press_origin.is_some_and(|p| right_edge_rect.contains(p)));
+            if started_right_trim && !track.locked {
                 interacted_clip = true;
-                state.focused = true;
+                claim_timeline_focus(ui, state, action);
                 if !is_selected {
                     let _ = session.selection.select_clip(&clip.id, None, false);
                 }
@@ -2934,14 +3814,53 @@ fn paint_and_interact_tracks(
                 continue;
             }
 
+            // Double-clicking a Precomp video clip enters its child composition timeline.
+            let clip_double_clicked = body_resp.double_clicked_by(PointerButton::Primary)
+                || left_resp.double_clicked_by(PointerButton::Primary)
+                || right_resp.double_clicked_by(PointerButton::Primary);
+            if clip_double_clicked
+                && kind == TrackKind::Video
+                && let Some(target_comp_id) = precomp_target_composition_id(session, clip)
+            {
+                let comp_name = session
+                    .project
+                    .compositions
+                    .get(&target_comp_id)
+                    .map(|c| c.name.clone())
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| clip_display_name(clip).to_string());
+                if session
+                    .execute(Command::SetActiveComposition {
+                        comp_id: Some(target_comp_id),
+                    })
+                    .is_ok()
+                {
+                    state.scroll_x = 0.0;
+                    state.video_scroll_y = 0.0;
+                    state.audio_scroll_y = 0.0;
+                    state.keyframe_scroll_y = 0.0;
+                    state.drag_state = TimelineDragState::None;
+                    state.last_video_track_count = None;
+                    state.last_audio_track_count = None;
+                    state.last_active_composition_id = Some(Some(target_comp_id));
+                    state.set_status_toast(
+                        format!("Entered composition: {comp_name}"),
+                        ui.input(|i| i.time),
+                    );
+                    action.clips_modified = true;
+                }
+                return;
+            }
+
             // Clip selection click (handles Shift+Click toggle exactly once; never double-toggle
-            // across drag_started_by and clicked_by).
+            // across drag_started_by and clicked_by). Always surrenders stale TextEdit/popup focus
+            // and claims timeline focus even when clicking an already-selected clip.
             if body_resp.clicked_by(PointerButton::Primary)
                 || left_resp.clicked_by(PointerButton::Primary)
                 || right_resp.clicked_by(PointerButton::Primary)
             {
                 interacted_clip = true;
-                state.focused = true;
+                claim_timeline_focus(ui, state, action);
                 let _ = session
                     .selection
                     .select_clip(&clip.id, None, modifiers.shift);
@@ -2951,7 +3870,7 @@ fn paint_and_interact_tracks(
             {
                 // Clip body drag-move start.
                 interacted_clip = true;
-                state.focused = true;
+                claim_timeline_focus(ui, state, action);
                 if !modifiers.shift && !is_selected {
                     let _ = session.selection.select_clip(&clip.id, None, false);
                 }
@@ -2959,7 +3878,7 @@ fn paint_and_interact_tracks(
                     let pointer = ui
                         .input(|i| i.pointer.interact_pos())
                         .unwrap_or(clip_rect.min);
-                    let content_x = f64::from(pointer.x - lanes_rect.left()) + state.scroll_x;
+                    let content_x = f64::from(pointer.x - track_lanes_rect.left()) + state.scroll_x;
                     let clip_px = frame_to_px(clip.start, fps, state.zoom);
                     let dragged_clips = collect_selected_clips_of_kind(session, kind);
                     if !dragged_clips.is_empty() {
@@ -2983,14 +3902,21 @@ fn paint_and_interact_tracks(
         }
     }
 
-    // Empty track lane clicks / marquee / right-click track lane context menu.
+    // Empty track lane clicks / marquee / right-click track lane context menu (works on V1, V2, V3, A1...).
     if !interacted_clip {
-        if lane_bg_resp.secondary_clicked()
-            && let Some(pos) = lane_bg_resp.interact_pointer_pos()
+        let lane_right_clicked = lane_bg_resp.secondary_clicked()
+            || (secondary_pressed
+                && pointer_latest
+                    .is_some_and(|p| rect_contains_unoccluded_pointer(ui, interact_lanes_rect, p)));
+        if lane_right_clicked
+            && let Some(pos) = lane_bg_resp.interact_pointer_pos().or(pointer_latest)
         {
-            state.focused = true;
+            claim_timeline_focus(ui, state, action);
             state.context_menu = Some(TimelineContextMenu::Lane { pos, tracks_height });
+            state.context_menu_opened_this_frame = true;
+            state.context_menu_sys_clipboard = None;
         } else if lane_bg_resp.clicked_by(PointerButton::Primary) && !modifiers.shift {
+            claim_timeline_focus(ui, state, action);
             session.selection.clear_clips();
         } else if lane_bg_resp.drag_started_by(PointerButton::Primary)
             && matches!(state.drag_state, TimelineDragState::None)
@@ -3004,6 +3930,20 @@ fn paint_and_interact_tracks(
             };
         }
     }
+
+    // Draggable vertical scrollbar pinned strictly to `track_lanes_rect.right()` regardless of `scroll_x`.
+    if max_scroll > 0.5 && track_lanes_rect.height() >= 16.0 {
+        paint_vertical_scroll_indicator(
+            &lane_painter,
+            track_lanes_rect,
+            scroll_y,
+            max_scroll,
+            total_h,
+            kind == TrackKind::Video,
+            vscroll_hovered,
+            state.vscrollbar_drag.is_some_and(|(p, _)| p == vpane),
+        );
+    }
 }
 
 fn add_track_of_kind(
@@ -3014,21 +3954,80 @@ fn add_track_of_kind(
 ) {
     match kind {
         TrackKind::Video => {
-            let _ = session.execute(Command::AddVideoTrack { name: None });
-            let needed_h = session.document().video_tracks.len() as f32 * state.video_track_height;
-            let max_v = (tracks_height
-                - DIVIDER_HEIGHT
-                - state.audio_track_height.min(tracks_height * 0.35))
-            .max(state.video_track_height);
-            if state.video_audio_split_y < needed_h {
-                state.video_audio_split_y = needed_h
-                    .min(max_v)
-                    .clamp(0.0, (tracks_height - DIVIDER_HEIGHT).max(0.0));
-                state.video_audio_split_custom = true;
+            if session
+                .execute(Command::AddVideoTrack { name: None })
+                .is_err()
+            {
+                return;
             }
+            let v_count = session.document().video_tracks.len();
+            let a_count = session.document().audio_tracks.len();
+            let audio_has_clips = session
+                .document()
+                .audio_tracks
+                .iter()
+                .any(|t| !t.clips.is_empty());
+            if !state.video_audio_split_custom {
+                state.video_audio_split_y = compute_video_audio_split_y_for_activity(
+                    tracks_height,
+                    v_count,
+                    a_count,
+                    state.video_track_height,
+                    state.audio_track_height,
+                    audio_has_clips,
+                );
+            }
+            let strip_h = if state.video_audio_split_y >= TRACK_PANE_BAR_HEIGHT + 18.0 {
+                TRACK_PANE_BAR_HEIGHT
+            } else {
+                0.0
+            };
+            let v_viewport_h = (state.video_audio_split_y - strip_h).max(0.0);
+            let needed_h = v_count as f32 * state.video_track_height;
+            state.video_scroll_y = (needed_h - v_viewport_h).max(0.0);
+            state.last_video_track_count = Some(v_count);
         }
         TrackKind::Audio => {
-            let _ = session.execute(Command::AddAudioTrack { name: None });
+            if session
+                .execute(Command::AddAudioTrack { name: None })
+                .is_err()
+            {
+                return;
+            }
+            let v_count = session.document().video_tracks.len();
+            let a_count = session.document().audio_tracks.len();
+            let audio_has_clips = session
+                .document()
+                .audio_tracks
+                .iter()
+                .any(|t| !t.clips.is_empty());
+            if !state.video_audio_split_custom {
+                state.video_audio_split_y = compute_video_audio_split_y_for_activity(
+                    tracks_height,
+                    v_count,
+                    a_count,
+                    state.video_track_height,
+                    state.audio_track_height,
+                    audio_has_clips,
+                );
+            }
+            let audio_pane_h =
+                (tracks_height - DIVIDER_HEIGHT - state.video_audio_split_y).max(0.0);
+            let strip_h = if audio_pane_h >= TRACK_PANE_BAR_HEIGHT + 18.0 {
+                TRACK_PANE_BAR_HEIGHT
+            } else {
+                0.0
+            };
+            let a_viewport_h = (audio_pane_h - strip_h).max(0.0);
+            let effective_a_h = effective_track_row_height(
+                TrackKind::Audio,
+                &session.document().audio_tracks,
+                state.audio_track_height,
+                a_viewport_h,
+            );
+            let needed_h = a_count as f32 * effective_a_h;
+            state.audio_scroll_y = (needed_h - a_viewport_h).max(0.0);
+            state.last_audio_track_count = Some(a_count);
         }
     }
 }
@@ -3041,8 +4040,7 @@ fn paint_track_header(
     track: &SessionTrack,
     kind: TrackKind,
     can_delete: bool,
-    show_add_btn: bool,
-    tracks_height: f32,
+    pinned_add_rect: Option<Rect>,
     row_rect: Rect,
     clip_rect: Rect,
 ) {
@@ -3070,17 +4068,21 @@ fn paint_track_header(
         COLOR_TRACK_BORDER,
     );
 
-    let icon_size = vec2(18.0, 18.0);
-    let (inner_top, inner_bot) = clip_y_bounds(kind, row_rect.top(), row_rect.bottom());
-    let cy = (inner_top + inner_bot) * 0.5;
-    let icon_cy = cy.ceil();
+    let Some((cy, icon_side, name_font_px)) =
+        track_header_visible_layout(kind, row_rect, clip_rect)
+    else {
+        return;
+    };
+    let is_clipped = row_rect.intersect(clip_rect).height() < row_rect.height() - 0.5;
+    let icon_size = vec2(icon_side, icon_side);
+    let icon_cy = if is_clipped { cy.round() } else { cy.ceil() };
     let inner_right = row_rect.right() - 1.0;
 
     // 1. Delete track '×' icon (rightmost, center at inner_right - 15.0 -> x=571.0).
     let del_rect = Rect::from_center_size(pos2(inner_right - 15.0, icon_cy), icon_size);
     if paint_track_icon_button(
         ui,
-        del_rect.intersect(clip_rect),
+        del_rect,
         clip_rect,
         ("trk_del", &track.id),
         TrackIcon::Delete,
@@ -3097,7 +4099,7 @@ fn paint_track_header(
     let lock_rect = Rect::from_center_size(pos2(inner_right - 35.0, icon_cy), icon_size);
     if paint_track_icon_button(
         ui,
-        lock_rect.intersect(clip_rect),
+        lock_rect,
         clip_rect,
         ("trk_lock", &track.id),
         TrackIcon::Lock(track.locked),
@@ -3114,7 +4116,7 @@ fn paint_track_header(
     let solo_rect = Rect::from_center_size(pos2(inner_right - 55.0, icon_cy), icon_size);
     if paint_track_icon_button(
         ui,
-        solo_rect.intersect(clip_rect),
+        solo_rect,
         clip_rect,
         ("trk_solo", &track.id),
         TrackIcon::Solo(track.solo),
@@ -3135,7 +4137,7 @@ fn paint_track_header(
     };
     if paint_track_icon_button(
         ui,
-        en_rect.intersect(clip_rect),
+        en_rect,
         clip_rect,
         ("trk_en", &track.id),
         en_icon,
@@ -3151,7 +4153,8 @@ fn paint_track_header(
 
     // 5. Optional Camera+ '3D' badge (Video tracks only when camera-plus plugin is enabled).
     if kind == TrackKind::Video && session.plugins.is_enabled("camera-plus") {
-        let badge_size = vec2(22.0, 17.0);
+        let badge_h = icon_side.min(17.0);
+        let badge_size = vec2(22.0, badge_h);
         cursor_x -= badge_size.x;
         let r = Rect::from_center_size(pos2(cursor_x + badge_size.x * 0.5, cy), badge_size);
         let is_3d = track.is_3d;
@@ -3173,22 +4176,12 @@ fn paint_track_header(
         cursor_x -= 3.0;
     }
 
-    // 6. Subtle hover-only `+` track-add icon on first track row (keeps startup header clean).
-    if show_add_btn {
-        cursor_x -= icon_size.x;
-        let add_rect = Rect::from_center_size(pos2(cursor_x + icon_size.x * 0.5, cy), icon_size);
-        if paint_track_icon_button(
-            ui,
-            add_rect.intersect(clip_rect),
-            clip_rect,
-            ("trk_add_hover", kind_tag(kind)),
-            TrackIcon::Add,
-            false,
-            true,
-        ) {
-            add_track_of_kind(session, state, kind, tracks_height);
-        }
-        cursor_x -= 3.0;
+    // 6. Reserve horizontal space for the pinned `+` add-track button whenever this row overlaps it.
+    if let Some(add_rect) = pinned_add_rect
+        && row_rect.top() < add_rect.bottom()
+        && row_rect.bottom() > add_rect.top()
+    {
+        cursor_x = cursor_x.min(add_rect.left() - 3.0);
     }
 
     // Clip track name cleanly so long names never overlap icon toggles.
@@ -3202,7 +4195,7 @@ fn paint_track_header(
         pos2(row_rect.left() + 5.0, cy),
         Align2::LEFT_CENTER,
         &track.name,
-        FontId::monospace(15.0),
+        FontId::monospace(name_font_px),
         COLOR_TRACK_HEADER_TEXT,
     );
 }
@@ -3226,11 +4219,12 @@ fn paint_track_icon_button(
     active_red: bool,
     enabled: bool,
 ) -> bool {
-    if rect.width() < 2.0 || rect.height() < 2.0 {
+    let hit_rect = rect.intersect(clip_rect);
+    if hit_rect.width() < 2.0 || hit_rect.height() < 2.0 {
         return false;
     }
     let resp = ui.interact(
-        rect,
+        hit_rect,
         ui.scope_id().with(id_salt),
         if enabled {
             Sense::click()
@@ -3238,6 +4232,21 @@ fn paint_track_icon_button(
             Sense::hover()
         },
     );
+    let resp = if !enabled && matches!(icon, TrackIcon::Delete) {
+        resp.on_hover_text("Cannot delete the sole remaining track")
+    } else if enabled && matches!(icon, TrackIcon::Add) {
+        let tip = if id_salt.1 == "audio" {
+            "Add Audio Track"
+        } else {
+            "Add Video Track"
+        };
+        resp.on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(tip)
+    } else if enabled {
+        resp.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        resp
+    };
     let painter = ui.painter().with_clip_rect(clip_rect);
 
     let hovered_bg = enabled && resp.hovered();
@@ -3263,8 +4272,8 @@ fn paint_track_icon_button(
         Color32::from_rgb(0xd4, 0x48, 0x48)
     } else if hovered_bg {
         Color32::from_rgb(0xe4, 0xe4, 0xe4)
-    } else if !enabled && !matches!(icon, TrackIcon::Delete) {
-        Color32::from_rgb(0x50, 0x50, 0x50)
+    } else if !enabled {
+        Color32::from_rgb(0x4a, 0x4a, 0x4a)
     } else {
         idle_fg
     };
@@ -3640,7 +4649,7 @@ fn paint_and_interact_divider(
     rect: Rect,
     tracks_height: f32,
 ) {
-    let hit_rect = rect.expand2(vec2(0.0, 2.0));
+    let hit_rect = rect.expand2(vec2(0.0, 4.0));
     let resp = ui.interact(
         hit_rect,
         ui.scope_id().with("timeline_va_divider"),
@@ -3652,8 +4661,14 @@ fn paint_and_interact_divider(
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
 
-    if resp.drag_started_by(PointerButton::Primary)
-        && let Some(pos) = resp.interact_pointer_pos()
+    let start_drag = resp.drag_started_by(PointerButton::Primary)
+        || (resp.hovered()
+            && matches!(state.drag_state, TimelineDragState::None)
+            && ui.input(|i| i.pointer.primary_pressed()));
+    if start_drag
+        && let Some(pos) = resp
+            .interact_pointer_pos()
+            .or_else(|| ui.input(|i| i.pointer.latest_pos()))
     {
         state.drag_state = TimelineDragState::DraggingDivider {
             start_y: pos.y,
@@ -3813,8 +4828,9 @@ fn process_active_drag_state(
                         .map(|c| c.orig_track_index)
                         .max()
                         .unwrap_or(0) as isize;
-                    drag.preview_track_delta =
-                        raw_delta.clamp(-min_ti, (track_count as isize - 1) - max_ti);
+                    let lo = -min_ti;
+                    let hi = ((track_count as isize - 1) - max_ti).max(lo);
+                    drag.preview_track_delta = raw_delta.clamp(lo, hi);
                 }
             }
 
@@ -3840,11 +4856,24 @@ fn process_active_drag_state(
                         proxy_boxes.push((dest_ti, proposed_start, c.length));
                         continue;
                     }
-                    if let Some(valid_start) = resolve_non_overlapping_start(
+                    // When dragging vertically onto another track, only snap to a nearby
+                    // non-overlapping edge; broadly occupied target ranges are cleanly blocked
+                    // instead of teleporting off-screen or swallowing clips.
+                    let max_shift = if drag.preview_track_delta != 0 {
+                        Some(
+                            px_to_frame(24.0, fps, state.zoom)
+                                .max(12.0)
+                                .min(c.length * 0.5),
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(valid_start) = resolve_non_overlapping_start_within_range(
                         dest_track,
                         proposed_start,
                         c.length,
                         &exclude,
+                        max_shift,
                     ) {
                         let valid_end = valid_start + c.length;
                         let entry = placed_on_track.entry(dest_track.id.clone()).or_default();
@@ -3885,8 +4914,17 @@ fn process_active_drag_state(
             }
 
             if primary_down {
-                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                ui.ctx().set_cursor_icon(if drag.overlap_blocked {
+                    CursorIcon::NotAllowed
+                } else {
+                    CursorIcon::Grabbing
+                });
                 state.drag_state = TimelineDragState::DraggingClips(drag);
+            } else if drag.moved && drag.overlap_blocked {
+                state.set_status_toast(
+                    "Track occupied — drop on an open slot or empty track",
+                    ui.input(|i| i.time),
+                );
             } else if drag.moved
                 && (drag.preview_delta_frames.abs() > 1e-6 || drag.preview_track_delta != 0)
                 && all_valid
@@ -4400,6 +5438,85 @@ fn paint_and_interact_scrollbar(
         .rect_filled(thumb_rect, CornerRadius::same(2), thumb_color);
 }
 
+fn paste_timeline_at_playhead_with_text(
+    session: &mut Session,
+    state: &TimelineViewState,
+    sys_text: Option<&str>,
+    playhead: f64,
+) -> bool {
+    let selected_clip = session.selection.clip_ids.first().cloned();
+    let external_text = sys_text
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !crate::ui::clipboard::matches_last_internal_copy(t));
+
+    if let Some(text) = external_text {
+        if session
+            .execute(Command::PastePzJson {
+                json: text.to_owned(),
+                hint: Some("clips".to_owned()),
+                target_clip_id: selected_clip.clone(),
+                parent_object_id: None,
+                target_object_id: None,
+                target_property: None,
+                at_frame: Some(playhead),
+            })
+            .is_ok()
+        {
+            return true;
+        }
+        if session
+            .execute(Command::PastePzJson {
+                json: text.to_owned(),
+                hint: Some("any".to_owned()),
+                target_clip_id: selected_clip.clone(),
+                parent_object_id: None,
+                target_object_id: None,
+                target_property: None,
+                at_frame: Some(playhead),
+            })
+            .is_ok()
+        {
+            return true;
+        }
+    }
+
+    if !state.clip_clipboard.is_empty() {
+        return session
+            .execute(Command::PasteClips {
+                clips: state.clip_clipboard.clone(),
+                target_frame: playhead,
+            })
+            .is_ok();
+    }
+
+    if let Some(text) = sys_text.map(str::trim).filter(|t| !t.is_empty()) {
+        return session
+            .execute(Command::PastePzJson {
+                json: text.to_owned(),
+                hint: Some("clips".to_owned()),
+                target_clip_id: selected_clip.clone(),
+                parent_object_id: None,
+                target_object_id: None,
+                target_property: None,
+                at_frame: Some(playhead),
+            })
+            .is_ok()
+            || session
+                .execute(Command::PastePzJson {
+                    json: text.to_owned(),
+                    hint: Some("any".to_owned()),
+                    target_clip_id: selected_clip,
+                    parent_object_id: None,
+                    target_object_id: None,
+                    target_property: None,
+                    at_frame: Some(playhead),
+                })
+                .is_ok();
+    }
+
+    false
+}
+
 fn show_timeline_context_menu(
     ui: &mut Ui,
     session: &mut Session,
@@ -4408,10 +5525,12 @@ fn show_timeline_context_menu(
     action: &mut TimelineAction,
 ) {
     let Some(menu) = state.context_menu.clone() else {
+        state.context_menu_sys_clipboard = None;
         return;
     };
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         state.context_menu = None;
+        state.context_menu_sys_clipboard = None;
         return;
     }
 
@@ -4550,6 +5669,12 @@ fn show_timeline_context_menu(
                                 if let Ok(snaps) = session.copy_clips(&sel_uuids) {
                                     state.clip_clipboard = snaps;
                                 }
+                                if let Ok(pz_json) = session.copy_clips_as_pz_json(&sel_uuids) {
+                                    crate::ui::clipboard::write_system_clipboard(
+                                        ui.ctx(),
+                                        &pz_json,
+                                    );
+                                }
                                 close_menu = true;
                             }
 
@@ -4678,15 +5803,25 @@ fn show_timeline_context_menu(
                             }
                         }
                         TimelineContextMenu::Lane { tracks_height, .. } => {
-                            let can_paste = !state.clip_clipboard.is_empty();
+                            let sys_has_text = state
+                                .context_menu_sys_clipboard
+                                .get_or_insert_with(crate::ui::clipboard::read_system_clipboard)
+                                .is_some();
+                            let can_paste = !state.clip_clipboard.is_empty() || sys_has_text;
                             if menu_item(ui, "Paste at Playhead", can_paste, false) {
-                                if session
-                                    .execute(Command::PasteClips {
-                                        clips: state.clip_clipboard.clone(),
-                                        target_frame: playhead,
-                                    })
-                                    .is_ok()
-                                {
+                                let fresh_sys = crate::ui::clipboard::read_system_clipboard()
+                                    .or_else(|| {
+                                        state
+                                            .context_menu_sys_clipboard
+                                            .as_ref()
+                                            .and_then(|c| c.clone())
+                                    });
+                                if paste_timeline_at_playhead_with_text(
+                                    session,
+                                    state,
+                                    fresh_sys.as_deref(),
+                                    playhead,
+                                ) {
                                     action.clips_modified = true;
                                 }
                                 close_menu = true;
@@ -4829,14 +5964,16 @@ fn show_timeline_context_menu(
                 });
         });
 
-    let clicked_outside = ui.input(|i| {
-        (i.pointer.primary_pressed() || i.pointer.secondary_pressed())
-            && i.pointer
-                .interact_pos()
-                .is_some_and(|p| !area_resp.response.rect.contains(p))
-    });
+    let clicked_outside = !state.context_menu_opened_this_frame
+        && ui.input(|i| {
+            (i.pointer.primary_pressed() || i.pointer.secondary_pressed())
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|p| !area_resp.response.rect.contains(p))
+        });
     if close_menu || clicked_outside {
         state.context_menu = None;
+        state.context_menu_sys_clipboard = None;
     }
 }
 
@@ -4853,6 +5990,239 @@ fn default_video_audio_split_y(
     let desired_v =
         (tracks_height * (video_track_height / total_unit) - DIVIDER_HEIGHT * 0.5).floor();
     desired_v.clamp(0.0, (tracks_height - DIVIDER_HEIGHT).max(0.0))
+}
+
+fn claim_timeline_focus(ui: &Ui, state: &mut TimelineViewState, action: &mut TimelineAction) {
+    state.focused = true;
+    action.clicked_timeline = true;
+    if let Some(focused_id) = ui.ctx().memory(|m| m.focused()) {
+        ui.ctx().memory_mut(|m| m.surrender_focus(focused_id));
+    }
+}
+
+/// Computes the vertical header content layout `(center_y, icon_side, font_size)` for a track row
+/// inside `clip_rect`, returning `None` when the visible portion is too narrow (`< 18 px`) to
+/// paint labels and icons without mid-glyph horizontal slicing.
+fn track_header_visible_layout(
+    kind: TrackKind,
+    row_rect: Rect,
+    clip_rect: Rect,
+) -> Option<(f32, f32, f32)> {
+    let vis_rect = row_rect.intersect(clip_rect);
+    if vis_rect.height() < 18.0 {
+        return None;
+    }
+    let is_clipped = vis_rect.height() < row_rect.height() - 0.5;
+    let (inner_top, inner_bot) = if is_clipped {
+        clip_y_bounds(kind, vis_rect.top(), vis_rect.bottom())
+    } else {
+        clip_y_bounds(kind, row_rect.top(), row_rect.bottom())
+    };
+    let cy = (inner_top + inner_bot) * 0.5;
+    let icon_side = if is_clipped {
+        (vis_rect.height() - 2.0).clamp(14.0, 18.0)
+    } else {
+        18.0
+    };
+    let font_px = if is_clipped && vis_rect.height() < 22.0 {
+        13.5
+    } else {
+        15.0
+    };
+    Some((cy, icon_side, font_px))
+}
+
+/// Computes the minimum vertical scroll adjustment needed to keep `track_idx` visible inside a
+/// viewport of height `viewport_h`.
+fn scroll_y_to_keep_track_visible(
+    current_scroll_y: f32,
+    track_idx: usize,
+    track_h: f32,
+    viewport_h: f32,
+    max_scroll: f32,
+    bottom_up: bool,
+) -> f32 {
+    if track_h <= 0.0 || viewport_h <= 0.0 || max_scroll <= 0.0 {
+        return 0.0;
+    }
+    let min_scroll = ((track_idx + 1) as f32 * track_h - viewport_h).max(0.0);
+    let max_scroll_for_track = track_idx as f32 * track_h;
+    let target = if min_scroll > max_scroll_for_track {
+        if bottom_up {
+            min_scroll
+        } else {
+            max_scroll_for_track
+        }
+    } else if current_scroll_y < min_scroll {
+        min_scroll
+    } else if current_scroll_y > max_scroll_for_track {
+        max_scroll_for_track
+    } else {
+        current_scroll_y
+    };
+    clamp_scroll_y(target, max_scroll)
+}
+
+fn clamp_scroll_y(scroll_y: f32, max_scroll: f32) -> f32 {
+    if !scroll_y.is_finite() || !max_scroll.is_finite() || max_scroll <= 0.0 {
+        0.0
+    } else {
+        scroll_y.clamp(0.0, max_scroll)
+    }
+}
+
+/// Keeps a sole empty Audio track (`A1` with 0 clips) cleanly fitted to compact lane height
+/// when Video tracks take priority, avoiding clipped `A1` text/icons or a spurious scrollbar.
+fn effective_track_row_height(
+    kind: TrackKind,
+    tracks: &[SessionTrack],
+    base_track_h: f32,
+    lanes_height: f32,
+) -> f32 {
+    if kind == TrackKind::Audio
+        && tracks.len() == 1
+        && tracks[0].clips.is_empty()
+        && lanes_height >= 18.0
+        && lanes_height < base_track_h
+    {
+        lanes_height.floor()
+    } else {
+        base_track_h
+    }
+}
+
+/// Truncates `text` cleanly with a trailing `…` so the laid-out galley fits strictly within
+/// `max_width` using exact glyph widths from `painter`.
+fn layout_ellipsized_clip_label(
+    painter: &egui::Painter,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    if text.is_empty() || max_width <= 4.0 {
+        return None;
+    }
+    let full = painter.layout_no_wrap(text.to_owned(), font.clone(), color);
+    if full.size().x <= max_width {
+        return Some(full);
+    }
+    let ellipsis = painter.layout_no_wrap("…".to_owned(), font.clone(), color);
+    if ellipsis.size().x > max_width {
+        return None;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    let mut best = ellipsis;
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let prefix: String = chars[..mid].iter().collect();
+        let trimmed = prefix.trim_end();
+        let mut candidate = String::with_capacity(trimmed.len() + 3);
+        candidate.push_str(trimmed);
+        candidate.push('…');
+        let g = painter.layout_no_wrap(candidate, font.clone(), color);
+        if g.size().x <= max_width {
+            best = g;
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(best)
+}
+
+/// Allocates the Video / Audio vertical pane split proportionally to actual track counts and track
+/// heights (including the dedicated header strip when space allows), preventing huge empty gaps
+/// above `V1` while ensuring `A2`+ / `V4`+ are never starved.
+#[cfg(test)]
+fn compute_video_audio_split_y(
+    tracks_height: f32,
+    video_count: usize,
+    audio_count: usize,
+    video_track_height: f32,
+    audio_track_height: f32,
+) -> f32 {
+    compute_video_audio_split_y_for_activity(
+        tracks_height,
+        video_count,
+        audio_count,
+        video_track_height,
+        audio_track_height,
+        true,
+    )
+}
+
+/// Allocates the Video / Audio vertical pane split proportionally to track counts and heights,
+/// giving Video tracks priority over a single empty Audio track (`A1`, 0 clips) when
+/// `video_count >= 2` so `V1..V3` fit cleanly without clipping.
+fn compute_video_audio_split_y_for_activity(
+    tracks_height: f32,
+    video_count: usize,
+    audio_count: usize,
+    video_track_height: f32,
+    audio_track_height: f32,
+    audio_has_clips: bool,
+) -> f32 {
+    let avail = (tracks_height - DIVIDER_HEIGHT).max(0.0);
+    if avail <= 0.0 {
+        return 0.0;
+    }
+    let v_tracks = video_count.max(1) as f32;
+    let a_tracks = audio_count.max(1) as f32;
+    let strip_h = if avail >= 2.0 * (TRACK_PANE_BAR_HEIGHT + 18.0) {
+        TRACK_PANE_BAR_HEIGHT
+    } else {
+        0.0
+    };
+    let v_need = strip_h + v_tracks * video_track_height;
+    let a_need = strip_h + a_tracks * audio_track_height;
+
+    if audio_count == 1 && !audio_has_clips && video_count >= 2 {
+        let compact_a_row = video_track_height.min(audio_track_height);
+        let a_compact_need = strip_h + compact_a_row;
+        let min_v = (strip_h + video_track_height).min(avail * 0.62);
+        let min_a_empty = (strip_h + 24.0_f32.min(compact_a_row)).min(avail * 0.36);
+        let max_v = (avail - min_a_empty).max(min_v);
+
+        let desired_v = if v_need + a_need <= avail {
+            let slack = avail - (v_need + a_need);
+            (v_need + slack * 0.70).floor()
+        } else if v_need + a_compact_need <= avail || v_need + min_a_empty <= avail {
+            v_need.ceil()
+        } else {
+            (avail - min_a_empty).floor()
+        };
+        return desired_v.clamp(min_v.min(max_v), max_v);
+    }
+
+    let total_need = (v_need + a_need).max(1.0);
+
+    let min_v = (strip_h + video_track_height).min(avail * 0.45);
+    let min_a = (strip_h + audio_track_height).min(avail * 0.55);
+    let max_v = (avail - min_a).max(min_v);
+
+    let desired_v = if total_need <= avail {
+        let slack = avail - total_need;
+        let v_slack_weight = if video_count >= audio_count {
+            0.70
+        } else {
+            0.35
+        };
+        (v_need + slack * v_slack_weight).floor()
+    } else if v_need <= avail - min_a && a_need > avail - v_need {
+        // Video fits completely while Audio overflows: give Video what it needs plus minimal breathing room.
+        (v_need + 4.0).min(max_v).floor()
+    } else if a_need <= avail - min_v && v_need > avail - a_need {
+        // Audio fits completely while Video overflows: keep Audio exact so Video gets every remaining pixel.
+        (avail - a_need).max(min_v).floor()
+    } else {
+        // Both panes overflow: allocate strictly proportionally to actual track height needs.
+        (avail * (v_need / total_need)).floor()
+    };
+
+    desired_v.clamp(min_v.min(max_v), max_v)
 }
 
 fn paint_crisp_border_1px(painter: &egui::Painter, rect: Rect, color: Color32) {
@@ -5709,13 +7079,17 @@ mod tests {
 
         // 3. Cmd+Scroll over video track header adjusts track height smoothly.
         let h0 = state.video_track_height;
+        let dynamic_video_header_pos = pos2(
+            video_header_pos.x,
+            RULER_HEIGHT + state.video_audio_split_y * 0.5,
+        );
         step(
             &mut session,
             &mut state,
             0.050,
             egui::Modifiers::COMMAND,
             vec![
-                egui::Event::PointerMoved(video_header_pos),
+                egui::Event::PointerMoved(dynamic_video_header_pos),
                 egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Line,
                     delta: vec2(0.0, 1.0),
@@ -5813,5 +7187,1204 @@ mod tests {
             (state.video_scroll_y - vy_occ).abs() < 1e-6,
             "occluded timeline must ignore scroll Y"
         );
+    }
+
+    #[test]
+    fn empty_keyframe_area_collapses_and_effect_selection_filters_keyframe_lanes() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session
+            .selection
+            .select_clip(clip_id.clone(), Some("scene"), false);
+
+        // No keyframes on default scene -> keyframe rows empty.
+        assert!(collect_keyframe_rows(&session).is_empty());
+
+        // Add a 3D object keyframe AND an effect keyframe on the same clip.
+        let obj_id = session
+            .execute(Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                kind: "Cube".to_owned(),
+                name: Some("Box".to_owned()),
+                parent_id: None,
+            })
+            .unwrap()["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let _ = session.execute(Command::SetKeyframe {
+            target_id: obj_id.clone(),
+            property: "position".to_owned(),
+            frame: 0.0,
+            value: serde_json::json!([0.0, 0.0, 0.0]),
+            tween: None,
+        });
+        let fx_id = session
+            .execute(Command::AddEffect {
+                clip_id: clip_id.clone(),
+                kind: "bloom".to_owned(),
+                name: Some("Bloom".to_owned()),
+            })
+            .unwrap()["effect_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let _ = session.execute(Command::SetKeyframe {
+            target_id: fx_id.clone(),
+            property: "amount".to_owned(),
+            frame: 10.0,
+            value: serde_json::json!(0.8),
+            tween: None,
+        });
+
+        // Clip-only selection shows both 3D object & effect keyframes.
+        let rows_all = collect_keyframe_rows(&session);
+        assert!(rows_all.iter().any(|r| r.target_id == obj_id));
+        assert!(rows_all.iter().any(|r| r.target_id == fx_id));
+
+        // Selecting the Effect filters keyframe lanes exclusively to that Effect.
+        let _ = session
+            .selection
+            .select_effect(fx_id.clone(), "bloom", false);
+        let rows_fx = collect_keyframe_rows(&session);
+        assert!(rows_fx.iter().all(|r| r.target_id == fx_id));
+        assert_eq!(rows_fx.len(), 1);
+    }
+
+    #[test]
+    fn right_click_unselected_clip_and_empty_video_track_open_menus_immediately() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        // Start with clip UNSELECTED.
+        session.selection.clear_clips();
+
+        let mut state = TimelineViewState::new();
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 220.0));
+        let run = |session: &mut Session,
+                   state: &mut TimelineViewState,
+                   time: f64,
+                   events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let _ = show_timeline(ui, session, state, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+        };
+
+        // Prime layout: kf_height=0 -> tracks_top=35, tracks_height=185, video_split_y=97 -> video_rect.bottom=132, V1 sits at y=102..132.
+        run(&mut session, &mut state, 0.0, vec![]);
+        let clip_pos = pos2(240.0, 118.0);
+        // Right-click unselected clip on V1: must select clip AND keep Clip context menu open on the same click.
+        run(
+            &mut session,
+            &mut state,
+            0.02,
+            vec![
+                egui::Event::PointerMoved(clip_pos),
+                egui::Event::PointerButton {
+                    pos: clip_pos,
+                    button: PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        run(
+            &mut session,
+            &mut state,
+            0.04,
+            vec![
+                egui::Event::PointerMoved(clip_pos),
+                egui::Event::PointerButton {
+                    pos: clip_pos,
+                    button: PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            session.selection.clip_ids.contains(&clip_id),
+            "Right-clicking unselected clip must immediately select it"
+        );
+        assert!(
+            matches!(state.context_menu, Some(TimelineContextMenu::Clip { .. })),
+            "Right-clicking unselected clip must open Clip context menu on first right-click"
+        );
+
+        // Close menu, then right-click empty video space above V1 (y = 65.0).
+        state.context_menu = None;
+        let empty_v_pos = pos2(650.0, 65.0);
+        run(
+            &mut session,
+            &mut state,
+            0.06,
+            vec![
+                egui::Event::PointerMoved(empty_v_pos),
+                egui::Event::PointerButton {
+                    pos: empty_v_pos,
+                    button: PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        run(
+            &mut session,
+            &mut state,
+            0.08,
+            vec![
+                egui::Event::PointerMoved(empty_v_pos),
+                egui::Event::PointerButton {
+                    pos: empty_v_pos,
+                    button: PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            matches!(state.context_menu, Some(TimelineContextMenu::Lane { .. })),
+            "Right-clicking empty video track space must open Lane context menu"
+        );
+    }
+
+    #[test]
+    fn playhead_jump_auto_scrolls_and_ruler_wheel_zooms() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let mut state = TimelineViewState::new();
+        state.zoom = 1.5; // wide enough that end of sequence is off-screen
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(700.0, 220.0));
+
+        let run = |session: &mut Session,
+                   state: &mut TimelineViewState,
+                   time: f64,
+                   events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let _ = show_timeline(ui, session, state, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+        };
+
+        run(&mut session, &mut state, 0.0, vec![]);
+        assert_eq!(state.scroll_x, 0.0);
+
+        // Jump playhead near sequence end -> scroll_x must auto-scroll to keep playhead visible.
+        let end_f = (session.document().sequence_length - 1.0).max(0.0);
+        let _ = session.execute(Command::SetFrame { frame: end_f });
+        run(&mut session, &mut state, 0.02, vec![]);
+        assert!(
+            state.scroll_x > 0.0,
+            "Jumping playhead off-screen must auto-scroll scroll_x"
+        );
+
+        // Jump back to frame 0 -> scroll_x returns to 0.
+        let _ = session.execute(Command::SetFrame { frame: 0.0 });
+        run(&mut session, &mut state, 0.04, vec![]);
+        assert!(
+            state.scroll_x < 1.0,
+            "Jumping playhead back to frame 0 must scroll back to start"
+        );
+
+        // Wheel over ruler zooms timeline.
+        let z0 = state.zoom;
+        let ruler_pos = pos2(380.0, 16.0);
+        run(
+            &mut session,
+            &mut state,
+            0.06,
+            vec![
+                egui::Event::PointerMoved(ruler_pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(state.zoom > z0, "Mouse wheel over ruler must zoom timeline");
+    }
+
+    #[test]
+    fn video_vertical_scrollbar_is_draggable_without_grabbing_clips_and_stays_pinned_when_scrolled_x()
+     {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        // Add enough video tracks to overflow the video lane viewport.
+        for _ in 0..5 {
+            session
+                .execute(Command::AddVideoTrack { name: None })
+                .expect("add video track");
+        }
+        // Extend the V1 clip across the entire right edge so a clip bar sits directly underneath
+        // the scrollbar gutter at `lanes_rect.right()`.
+        let v1_clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let v1_orig_start = session.document().video_tracks[0].clips[0].start;
+        session
+            .execute(Command::TrimClipRight {
+                clip_id: v1_clip_id.clone(),
+                delta_frames: 240.0,
+                rate_stretch: false,
+            })
+            .expect("extend v1 clip");
+
+        let mut state = TimelineViewState::new();
+        // Also scroll horizontally (`scroll_x > 0`) to prove the vertical scrollbar remains pinned
+        // to `video_lanes_rect.right()` regardless of `scroll_x`.
+        state.scroll_x = 120.0;
+        state.video_scroll_y = 0.0;
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(760.0, 220.0));
+
+        let run = |session: &mut Session,
+                   state: &mut TimelineViewState,
+                   time: f64,
+                   events: Vec<egui::Event>|
+         -> egui::FullOutput {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let _ = show_timeline(ui, session, state, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            full
+        };
+
+        // Frame 0 establishes layout & paints the scrollbar at `scroll_x = 120.0`.
+        let out0 = run(&mut session, &mut state, 0.0, vec![]);
+        assert!(
+            state.scroll_x > 100.0,
+            "horizontal scroll_x must remain > 0 during test"
+        );
+        // Verify scrollbar track/thumb geometry is pinned near `screen_rect.right()` (x = 760).
+        let scrollbar_painted_at_right = out0.shapes.iter().any(|cs| match &cs.shape {
+            egui::Shape::Rect(rs) => {
+                rs.rect.right() >= screen_rect.right() - 3.5
+                    && rs.rect.right() <= screen_rect.right() - 1.0
+                    && rs.rect.width() >= 4.0
+                    && rs.rect.width() <= 8.0
+                    && rs.rect.top() >= RULER_HEIGHT
+                    && rs.rect.bottom() <= RULER_HEIGHT + state.video_audio_split_y + 1.0
+            }
+            _ => false,
+        });
+        assert!(
+            scrollbar_painted_at_right,
+            "Video vertical scrollbar must stay painted and pinned to lanes_rect.right() when scroll_x > 0"
+        );
+
+        // Press on the bottom of the vertical scrollbar (where V1 thumb sits at `video_scroll_y = 0`)
+        // and drag UPWARD to scroll to higher tracks (V2..V6).
+        let bar_x = screen_rect.right() - 5.0;
+        let thumb_start_y = RULER_HEIGHT + state.video_audio_split_y - 12.0;
+        let drag_target_y = RULER_HEIGHT + 12.0;
+        let p_start = pos2(bar_x, thumb_start_y);
+        let p_end = pos2(bar_x, drag_target_y);
+
+        run(
+            &mut session,
+            &mut state,
+            0.02,
+            vec![egui::Event::PointerMoved(p_start)],
+        );
+        run(
+            &mut session,
+            &mut state,
+            0.04,
+            vec![
+                egui::Event::PointerMoved(p_start),
+                egui::Event::PointerButton {
+                    pos: p_start,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        run(
+            &mut session,
+            &mut state,
+            0.06,
+            vec![egui::Event::PointerMoved(p_end)],
+        );
+        run(
+            &mut session,
+            &mut state,
+            0.08,
+            vec![
+                egui::Event::PointerMoved(p_end),
+                egui::Event::PointerButton {
+                    pos: p_end,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+
+        assert!(
+            state.video_scroll_y > 20.0,
+            "Dragging video vertical scrollbar upward must increase video_scroll_y, got {}",
+            state.video_scroll_y
+        );
+        assert!(
+            matches!(state.drag_state, TimelineDragState::None),
+            "Scrollbar drag must never initiate a clip drag or marquee select"
+        );
+        assert!(
+            (session.document().video_tracks[0].clips[0].start - v1_orig_start).abs() < 1e-6,
+            "Dragging vertical scrollbar must NOT move the clip underneath"
+        );
+
+        // Now V1 is scrolled off-screen; clicking the pinned `+` button in `video_header_rect`
+        // must STILL work and add a new video track!
+        let tracks_before = session.document().video_tracks.len();
+        let video_header_rect = Rect::from_min_max(
+            pos2(0.0, RULER_HEIGHT),
+            pos2(HEADER_WIDTH, RULER_HEIGHT + state.video_audio_split_y),
+        );
+        let add_pos = pinned_add_track_button_rect(
+            TrackKind::Video,
+            video_header_rect,
+            session.plugins.is_enabled("camera-plus"),
+        )
+        .center();
+        run(
+            &mut session,
+            &mut state,
+            0.10,
+            vec![egui::Event::PointerMoved(add_pos)],
+        );
+        run(
+            &mut session,
+            &mut state,
+            0.12,
+            vec![
+                egui::Event::PointerMoved(add_pos),
+                egui::Event::PointerButton {
+                    pos: add_pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        run(
+            &mut session,
+            &mut state,
+            0.14,
+            vec![
+                egui::Event::PointerMoved(add_pos),
+                egui::Event::PointerButton {
+                    pos: add_pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(
+            session.document().video_tracks.len(),
+            tracks_before + 1,
+            "Pinned `+` add-video-track button must remain clickable even when V1 is scrolled off-screen"
+        );
+    }
+
+    #[test]
+    fn timeline_context_menu_paste_supports_external_pz_clips_and_effect_fallback() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let clip_uuid = zc_project::Uuid::parse_str(&clip_id).expect("clip uuid");
+        let _ = session.selection.select_clip(clip_id.clone(), None, false);
+
+        // 1. Export a clip as PanZoid CM3 JSON and paste it at frame 45 via external clipboard text.
+        let clip_json = session
+            .copy_clips_as_pz_json(&[clip_uuid])
+            .expect("serialize clip as pz json");
+        let state = TimelineViewState::new();
+        assert!(paste_timeline_at_playhead_with_text(
+            &mut session,
+            &state,
+            Some(&clip_json),
+            45.0,
+        ));
+        let total_video_clips: usize = session
+            .document()
+            .video_tracks
+            .iter()
+            .map(|t| t.clips.len())
+            .sum();
+        assert_eq!(
+            total_video_clips, 2,
+            "Pasted PanZoid clip JSON must add a second clip"
+        );
+
+        // 2. Fallback to `hint: "any"` when external clipboard contains an effect JSON!
+        let _ = session.selection.select_clip(clip_id.clone(), None, false);
+        let fx_before = session.document().video_tracks[0].clips[0].effects.len();
+        let bloom_json = r#"{"type":"bloom","properties":{"name":"Bloom","amount":0.75}}"#;
+        assert!(paste_timeline_at_playhead_with_text(
+            &mut session,
+            &state,
+            Some(bloom_json),
+            0.0,
+        ));
+        assert_eq!(
+            session.document().video_tracks[0].clips[0].effects.len(),
+            fx_before + 1,
+            "Effect JSON on system clipboard must fall back to hint='any' and paste onto selected clip"
+        );
+    }
+
+    #[test]
+    fn vscrollbar_geometry_never_panics_across_extreme_heights() {
+        let heights = [0.0_f32, 4.0, 12.0, 15.9, 16.0, 17.0, 18.0, 24.0, 100.0];
+        for bottom_up in [false, true] {
+            for h in heights {
+                let rect = Rect::from_min_size(pos2(200.0, 50.0), vec2(400.0, h));
+                let total_h = 300.0_f32;
+                let max_scroll = (total_h - h).max(0.0);
+                let geom =
+                    vscrollbar_geometry(rect, max_scroll * 0.5, max_scroll, total_h, bottom_up);
+                if h < 16.0 {
+                    assert!(
+                        geom.is_none(),
+                        "expected None for height={h}, bottom_up={bottom_up}"
+                    );
+                } else {
+                    let (hit_rect, track_rect, thumb_rect) = geom.unwrap_or_else(|| {
+                        panic!("expected Some for height={h}, bottom_up={bottom_up}")
+                    });
+                    assert!(hit_rect.is_positive());
+                    assert!(track_rect.height() > 2.0);
+                    assert!(thumb_rect.height() > 0.0);
+                    assert!(thumb_rect.height() <= track_rect.height() + 1e-3);
+                    assert!(thumb_rect.top() >= track_rect.top() - 1e-3);
+                    assert!(thumb_rect.bottom() <= track_rect.bottom() + 1e-3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn video_audio_split_balances_track_counts_and_add_buttons_never_overlap_rows() {
+        let tracks_height = 175.0_f32; // Typical 1280x752 timeline track area height.
+        let avail = tracks_height - DIVIDER_HEIGHT;
+
+        // 1. (1V, 2A): Video does not waste 60px above V1; Audio gets room for A1+A2.
+        let split_1v_2a = compute_video_audio_split_y(
+            tracks_height,
+            1,
+            2,
+            DEFAULT_VIDEO_TRACK_HEIGHT,
+            DEFAULT_AUDIO_TRACK_HEIGHT,
+        );
+        let audio_1v_2a = avail - split_1v_2a;
+        assert!(
+            split_1v_2a <= TRACK_PANE_BAR_HEIGHT + DEFAULT_VIDEO_TRACK_HEIGHT + 16.0,
+            "1V/2A video pane must not leave huge empty gap above V1, got {split_1v_2a}"
+        );
+        assert!(
+            audio_1v_2a >= TRACK_PANE_BAR_HEIGHT + 2.0 * DEFAULT_AUDIO_TRACK_HEIGHT - 1.0,
+            "1V/2A audio pane must fit A1+A2 without clipping, got {audio_1v_2a}"
+        );
+
+        // 2. (4V, 1A): Video gets the lion's share while Audio still fits A1 cleanly.
+        let split_4v_1a = compute_video_audio_split_y(
+            tracks_height,
+            4,
+            1,
+            DEFAULT_VIDEO_TRACK_HEIGHT,
+            DEFAULT_AUDIO_TRACK_HEIGHT,
+        );
+        let audio_4v_1a = avail - split_4v_1a;
+        assert!(
+            split_4v_1a > audio_4v_1a,
+            "4V/1A must allocate more height to Video ({split_4v_1a}) than Audio ({audio_4v_1a})"
+        );
+        assert!(
+            audio_4v_1a >= TRACK_PANE_BAR_HEIGHT + DEFAULT_AUDIO_TRACK_HEIGHT,
+            "4V/1A must still fit A1 completely, got {audio_4v_1a}"
+        );
+
+        // 3. (4V, 3A): Both overflow; split allocates proportionally without starving either side.
+        let split_4v_3a = compute_video_audio_split_y(
+            tracks_height,
+            4,
+            3,
+            DEFAULT_VIDEO_TRACK_HEIGHT,
+            DEFAULT_AUDIO_TRACK_HEIGHT,
+        );
+        let audio_4v_3a = avail - split_4v_3a;
+        assert!(
+            split_4v_3a >= TRACK_PANE_BAR_HEIGHT + DEFAULT_VIDEO_TRACK_HEIGHT
+                && audio_4v_3a >= TRACK_PANE_BAR_HEIGHT + DEFAULT_AUDIO_TRACK_HEIGHT,
+            "4V/3A must preserve minimums for both Video ({split_4v_3a}) and Audio ({audio_4v_3a})"
+        );
+        assert!(
+            audio_4v_3a > split_4v_3a,
+            "4V (120px) vs 3A (150px) must allocate proportionally more room to Audio ({audio_4v_3a}) than Video ({split_4v_3a})"
+        );
+
+        // 4. Verify `+` button rects sit strictly inside each pane's dedicated top strip and
+        //    NEVER overlap ANY visible track row (with or without Camera+, keyframes, or breadcrumb).
+        for top_y in [RULER_HEIGHT, RULER_HEIGHT + BREADCRUMB_BAR_HEIGHT + 64.0] {
+            let v_header = Rect::from_min_size(pos2(0.0, top_y), vec2(HEADER_WIDTH, split_4v_3a));
+            let v_lanes = Rect::from_min_size(pos2(HEADER_WIDTH, top_y), vec2(800.0, split_4v_3a));
+            let (v_strip, v_rows_header, v_rows_lanes) = split_pane_header_strip(v_header, v_lanes);
+            assert!(v_strip.is_some());
+
+            let a_top = top_y + split_4v_3a + DIVIDER_HEIGHT;
+            let a_header = Rect::from_min_size(pos2(0.0, a_top), vec2(HEADER_WIDTH, audio_4v_3a));
+            let a_lanes = Rect::from_min_size(pos2(HEADER_WIDTH, a_top), vec2(800.0, audio_4v_3a));
+            let (a_strip, a_rows_header, a_rows_lanes) = split_pane_header_strip(a_header, a_lanes);
+            assert!(a_strip.is_some());
+
+            for cam_plus in [false, true] {
+                let v_add = pinned_add_track_button_rect(TrackKind::Video, v_header, cam_plus);
+                let a_add = pinned_add_track_button_rect(TrackKind::Audio, a_header, cam_plus);
+                assert!(
+                    !v_add.intersects(v_rows_header),
+                    "Video `+` button ({v_add:?}) must never intersect video track rows ({v_rows_header:?})"
+                );
+                assert!(
+                    !a_add.intersects(a_rows_header),
+                    "Audio `+` button ({a_add:?}) must never intersect audio track rows ({a_rows_header:?})"
+                );
+                for idx in 0..4 {
+                    let (y0, y1) = track_row_y_bounds(
+                        TrackKind::Video,
+                        idx,
+                        DEFAULT_VIDEO_TRACK_HEIGHT,
+                        v_rows_lanes,
+                        0.0,
+                    );
+                    let row_rect = Rect::from_min_max(
+                        pos2(v_rows_header.left(), y0),
+                        pos2(v_rows_header.right(), y1),
+                    )
+                    .intersect(v_rows_header);
+                    if row_rect.is_positive() {
+                        assert!(!v_add.intersects(row_rect));
+                    }
+                }
+                for idx in 0..3 {
+                    let (y0, y1) = track_row_y_bounds(
+                        TrackKind::Audio,
+                        idx,
+                        DEFAULT_AUDIO_TRACK_HEIGHT,
+                        a_rows_lanes,
+                        0.0,
+                    );
+                    let row_rect = Rect::from_min_max(
+                        pos2(a_rows_header.left(), y0),
+                        pos2(a_rows_header.right(), y1),
+                    )
+                    .intersect(a_rows_header);
+                    if row_rect.is_positive() {
+                        assert!(!a_add.intersects(row_rect));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn precomp_target_composition_id_extracts_from_precomp_clip_and_enters_comp() {
+        let mut session = Session::new();
+        let orig_clip = session.document().video_tracks[0].clips[0].clone();
+        assert_eq!(
+            precomp_target_composition_id(&session, &orig_clip),
+            None,
+            "Regular video clip must not report a precomp target composition ID"
+        );
+
+        let orig_uuid = zc_project::Uuid::parse_str(&orig_clip.id).expect("clip uuid");
+        session
+            .execute(Command::PrecomposeClips {
+                clip_ids: vec![orig_uuid],
+                name: "Nested FX".to_string(),
+            })
+            .expect("precompose clip");
+
+        let precomp_clip = session.document().video_tracks[0].clips[0].clone();
+        let target_comp_id = precomp_target_composition_id(&session, &precomp_clip)
+            .expect("Precomp clip must expose target composition UUID");
+        assert!(session.project.compositions.contains_key(&target_comp_id));
+
+        session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(target_comp_id),
+            })
+            .expect("enter precomp composition");
+        assert_eq!(
+            session.document().active_composition_id,
+            Some(target_comp_id)
+        );
+    }
+
+    #[test]
+    fn vertical_clip_drag_onto_occupied_track_snaps_nearby_edge_or_rejects_overlap() {
+        let track = SessionTrack {
+            id: "v1".to_string(),
+            kind: TrackKind::Video,
+            name: "V1".to_string(),
+            enabled: true,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![SessionClip {
+                id: "c1".to_string(),
+                kind: "scene_3d".to_string(),
+                name: "Scene 1".to_string(),
+                start: 0.0,
+                length: 300.0,
+                time_start: 0.0,
+                time_end: 0.0,
+                time_animated: false,
+                media_length: None,
+                source_clip_id: None,
+                properties: BTreeMap::new(),
+                objects_3d: Vec::new(),
+                effects: Vec::new(),
+            }],
+        };
+        let exclude = BTreeSet::new();
+
+        // 1. Open slot at [320, 380]: accepted immediately.
+        assert_eq!(
+            resolve_non_overlapping_start_within_range(&track, 320.0, 60.0, &exclude, Some(12.0)),
+            Some(320.0)
+        );
+
+        // 2. Minor edge overlap at [292, 352] (8 frames into [0, 300]): snaps cleanly flush to 300.0.
+        assert_eq!(
+            resolve_non_overlapping_start_within_range(&track, 292.0, 60.0, &exclude, Some(12.0)),
+            Some(300.0)
+        );
+
+        // 3. Broadly occupied drop ([0, 300] directly onto [0, 300]): rejected (`None`) instead of teleporting off-screen or overlapping.
+        assert_eq!(
+            resolve_non_overlapping_start_within_range(&track, 0.0, 300.0, &exclude, Some(12.0)),
+            None
+        );
+        assert_eq!(
+            resolve_non_overlapping_start_within_range(&track, 80.0, 60.0, &exclude, Some(12.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn video_scroll_clamps_cleanly_across_window_resizes_with_three_video_tracks() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        session
+            .execute(Command::AddVideoTrack { name: None })
+            .expect("add V2");
+        session
+            .execute(Command::AddVideoTrack { name: None })
+            .expect("add V3");
+        assert_eq!(session.document().video_tracks.len(), 3);
+
+        let mut state = TimelineViewState::new();
+        let mut t = 0.0_f64;
+        let mut run_at = |session: &mut Session, state: &mut TimelineViewState, w: f32, h: f32| {
+            // Timeline panel receives ~35% of window height (after 40 px top chrome).
+            let tl_h = ((h - 40.0) * 0.35).max(120.0);
+            let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(w, tl_h));
+            t += 0.02;
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(t),
+                focused: true,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let _ = show_timeline(ui, session, state, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            tl_h
+        };
+
+        // 1. Start compact (`800x540`), scroll up to V3 (or inject large stranded scroll).
+        let tl_h_800 = run_at(&mut session, &mut state, 800.0, 540.0);
+        state.video_scroll_y = 200.0;
+        let _ = run_at(&mut session, &mut state, 800.0, 540.0);
+        let strip_h_800 = if state.video_audio_split_y >= TRACK_PANE_BAR_HEIGHT + 18.0 {
+            TRACK_PANE_BAR_HEIGHT
+        } else {
+            0.0
+        };
+        let max_v_800 =
+            (3.0 * state.video_track_height - (state.video_audio_split_y - strip_h_800)).max(0.0);
+        assert!(
+            state.video_scroll_y <= max_v_800 + 1e-3 && state.video_scroll_y >= 0.0,
+            "800x540 (tl_h={tl_h_800}) must clamp video_scroll_y ({}) within [0, {max_v_800}]",
+            state.video_scroll_y
+        );
+
+        // 2. Resize taller (`1440x860`): all 3 video tracks fit -> video_scroll_y resets to 0.0!
+        let _ = run_at(&mut session, &mut state, 1440.0, 860.0);
+        assert!(
+            state.video_scroll_y.abs() < 1e-4,
+            "Resizing 800x540 -> 1440x860 must clear stranded video_scroll_y to 0.0, got {}",
+            state.video_scroll_y
+        );
+
+        // 3. Resize to `900x600`, inject stranded scroll, then resize to `1280x752`:
+        //    all 3 video tracks fit cleanly at 1280x752 with zero stranded scroll!
+        let _ = run_at(&mut session, &mut state, 900.0, 600.0);
+        state.video_scroll_y = 95.0;
+        let _ = run_at(&mut session, &mut state, 1280.0, 752.0);
+        assert!(
+            state.video_scroll_y.abs() < 1e-4,
+            "Resizing 900x600 -> 1280x752 with 3V/1A must clear video_scroll_y to 0.0, got {}",
+            state.video_scroll_y
+        );
+    }
+
+    #[test]
+    fn video_pane_prioritizes_three_video_tracks_over_single_empty_audio_and_shows_scrollbar_on_overflow()
+     {
+        // 1. Default 1280x752 timeline track area (~175 px) with (3V, 1A empty):
+        //    V1..V3 (90 px + 20 px header = 110 px) fit cleanly without clipping.
+        let tracks_h_default = 175.0_f32;
+        let split_default = compute_video_audio_split_y_for_activity(
+            tracks_h_default,
+            3,
+            1,
+            DEFAULT_VIDEO_TRACK_HEIGHT,
+            DEFAULT_AUDIO_TRACK_HEIGHT,
+            false,
+        );
+        let avail_default = tracks_h_default - DIVIDER_HEIGHT;
+        let audio_default = avail_default - split_default;
+        assert!(
+            split_default >= TRACK_PANE_BAR_HEIGHT + 3.0 * DEFAULT_VIDEO_TRACK_HEIGHT,
+            "3V/1A(empty) at 175px must fit V1..V3 cleanly (>=110px), got video={split_default}, audio={audio_default}"
+        );
+        assert!(
+            split_default > audio_default * 1.5,
+            "Video pane ({split_default}) must clearly take priority over empty A1 ({audio_default})"
+        );
+
+        // 2. With 1 keyframe lane (~27 px) or Precomp breadcrumb (~24 px) reducing tracks_height to 148 px:
+        //    Video still keeps >65% priority (empty A1 must NOT steal half the timeline height!),
+        //    and any vertical overflow (> 0.5 px) produces valid visible scrollbar geometry.
+        let tracks_h_reduced = 148.0_f32;
+        let split_reduced = compute_video_audio_split_y_for_activity(
+            tracks_h_reduced,
+            3,
+            1,
+            DEFAULT_VIDEO_TRACK_HEIGHT,
+            DEFAULT_AUDIO_TRACK_HEIGHT,
+            false,
+        );
+        let avail_reduced = tracks_h_reduced - DIVIDER_HEIGHT;
+        let audio_reduced = avail_reduced - split_reduced;
+        assert!(
+            split_reduced >= avail_reduced * 0.64,
+            "3V/1A(empty) with keyframe/breadcrumb bar must give Video >=64% priority, got video={split_reduced} / {avail_reduced} (audio={audio_reduced})"
+        );
+        assert!(
+            audio_reduced < avail_reduced * 0.40,
+            "Empty A1 must stay compact (<40% of timeline), got {audio_reduced} / {avail_reduced}"
+        );
+
+        // 3. Even a tiny 2 px vertical overflow (`max_video_scroll > 0.5`) yields valid persistent
+        //    scrollbar geometry with visible thumb travel gap.
+        let total_v_h = 3.0 * DEFAULT_VIDEO_TRACK_HEIGHT; // 90 px
+        let tight_lanes_rect = Rect::from_min_size(pos2(200.0, 55.0), vec2(800.0, total_v_h - 2.0));
+        let max_scroll = total_v_h - tight_lanes_rect.height();
+        assert!((max_scroll - 2.0).abs() < 1e-4);
+        let (hit_rect, track_rect, thumb_rect) =
+            vscrollbar_geometry(tight_lanes_rect, 0.0, max_scroll, total_v_h, true).expect(
+                "2px overflow must still produce valid persistent vertical scrollbar geometry",
+            );
+        assert!(hit_rect.is_positive());
+        assert!(track_rect.height() > thumb_rect.height() + 4.0);
+        assert!(
+            (thumb_rect.bottom() - track_rect.bottom()).abs() < 1e-3,
+            "bottom-up video scrollbar thumb must anchor at bottom when scroll_y == 0"
+        );
+    }
+
+    #[test]
+    fn clip_label_elision_appends_ellipsis_cleanly_when_narrower_than_full_label() {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 100.0))),
+            ..Default::default()
+        };
+        let mut full = ctx.run_ui(raw, |ui| {
+            let painter = ui.painter();
+            let font = FontId::monospace(14.0);
+            let color = Color32::WHITE;
+            let label = "Adjustment Layer";
+
+            let full_galley = painter.layout_no_wrap(label.to_owned(), font.clone(), color);
+            let full_w = full_galley.size().x;
+
+            // 1. Wide clip: full label fits intact without ellipsis.
+            let wide =
+                layout_ellipsized_clip_label(painter, label, font.clone(), color, full_w + 8.0)
+                    .expect("wide label galley");
+            assert_eq!(wide.text(), label);
+
+            // 2. Narrow trimmed clip (~60% width): truncates cleanly with trailing `…` inside max width.
+            let narrow_w = full_w * 0.60;
+            let narrow =
+                layout_ellipsized_clip_label(painter, label, font.clone(), color, narrow_w)
+                    .expect("narrow ellipsized galley");
+            assert!(
+                narrow.text().ends_with('…'),
+                "narrow clip label must end with ellipsis, got '{}'",
+                narrow.text()
+            );
+            assert!(
+                narrow.text().chars().count() < label.chars().count(),
+                "narrow clip label must be shorter than full label, got '{}'",
+                narrow.text()
+            );
+            assert!(
+                narrow.size().x <= narrow_w + 0.5,
+                "ellipsized label width ({}) must fit inside max_width ({narrow_w})",
+                narrow.size().x
+            );
+
+            // 3. Extremely narrow clip (< 4 px): returns None rather than painting a clipped sliver.
+            assert!(
+                layout_ellipsized_clip_label(painter, label, font, color, 3.0).is_none(),
+                "tiny clip width must suppress label cleanly"
+            );
+        });
+        full.textures_delta.clear();
+    }
+
+    #[test]
+    fn clicking_already_selected_clip_surrenders_text_edit_focus_and_claims_timeline_focus() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let track_id = session.document().video_tracks[0].id.clone();
+        session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "text".to_string(),
+                name: Some("Title".to_string()),
+                start: 0.0,
+                length: 120.0,
+            })
+            .expect("add text clip");
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session.selection.select_clip(&clip_id, None, false);
+
+        let mut state = TimelineViewState::new();
+        state.focused = false;
+        let mut font_search = String::from("Inter");
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 260.0));
+
+        let run = |session: &mut Session,
+                   state: &mut TimelineViewState,
+                   font_search: &mut String,
+                   time: f64,
+                   focus_text_edit: bool,
+                   events: Vec<egui::Event>|
+         -> (TimelineAction, Pos2) {
+            let mut action = TimelineAction::default();
+            let mut click_pos = pos2(0.0, 0.0);
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::Panel::top("mock_font_search")
+                    .exact_size(40.0)
+                    .show(ui, |ui| {
+                        let resp = ui.text_edit_singleline(font_search);
+                        if focus_text_edit {
+                            resp.request_focus();
+                        }
+                    });
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let avail = ui.available_rect_before_wrap();
+                        action = show_timeline(ui, session, state, &palette);
+                        // Compute V1 clip midpoint for subsequent click.
+                        let tracks_top = avail.top() + RULER_HEIGHT;
+                        let video_bottom = tracks_top + state.video_audio_split_y;
+                        click_pos = pos2(avail.left() + HEADER_WIDTH + 60.0, video_bottom - 15.0);
+                    });
+            });
+            full.textures_delta.clear();
+            (action, click_pos)
+        };
+
+        // 1. Focus the mock searchable Font dropdown TextEdit while clip is already selected.
+        let (_, clip_click_pos) = run(
+            &mut session,
+            &mut state,
+            &mut font_search,
+            0.0,
+            true,
+            vec![],
+        );
+        assert!(
+            ctx.egui_wants_keyboard_input(),
+            "setup: Font search TextEdit must hold keyboard focus before clicking timeline clip"
+        );
+        assert!(!state.focused);
+
+        // 2. Click the ALREADY-SELECTED clip on the timeline (press + release).
+        let (a_press, _) = run(
+            &mut session,
+            &mut state,
+            &mut font_search,
+            0.02,
+            false,
+            vec![
+                egui::Event::PointerMoved(clip_click_pos),
+                egui::Event::PointerButton {
+                    pos: clip_click_pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (a_release, _) = run(
+            &mut session,
+            &mut state,
+            &mut font_search,
+            0.04,
+            false,
+            vec![
+                egui::Event::PointerMoved(clip_click_pos),
+                egui::Event::PointerButton {
+                    pos: clip_click_pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+
+        assert!(
+            a_press.clicked_timeline || a_release.clicked_timeline,
+            "clicking an already-selected clip must report action.clicked_timeline = true"
+        );
+        assert!(state.focused, "timeline must regain focus on clip click");
+        assert!(
+            !ctx.egui_wants_keyboard_input(),
+            "clicking an already-selected clip must surrender stale TextEdit focus so Cmd+C works immediately"
+        );
+        assert_eq!(session.selection.clip_ids, vec![clip_id]);
+    }
+
+    #[test]
+    fn expanding_keyframe_lanes_scrolls_selected_video_track_into_view() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        session
+            .execute(Command::AddVideoTrack { name: None })
+            .expect("add V2");
+        session
+            .execute(Command::AddVideoTrack { name: None })
+            .expect("add V3");
+        let v3_id = session.document().video_tracks[2].id.clone();
+        session
+            .execute(Command::AddClip {
+                track_id: v3_id,
+                kind: "shape_layer".to_string(),
+                name: Some("TopClip".to_string()),
+                start: 0.0,
+                length: 120.0,
+            })
+            .expect("add clip on V3");
+        let clip_id = session.document().video_tracks[2].clips[0].id.clone();
+        let _ = session.selection.select_clip(&clip_id, None, false);
+
+        let mut state = TimelineViewState::new();
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 210.0));
+        let mut t = 0.0;
+        let mut run = |session: &mut Session, state: &mut TimelineViewState| {
+            t += 0.02;
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(t),
+                focused: true,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let _ = show_timeline(ui, session, state, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+        };
+
+        // 1. With no keyframes, all 3 video tracks fit -> video_scroll_y == 0.0.
+        run(&mut session, &mut state);
+        assert!(state.video_scroll_y.abs() < 1e-3);
+
+        // 2. Animate 3 properties on the selected V3 clip so keyframe lanes expand (~64 px),
+        //    shrinking the video pane height so 3 tracks overflow.
+        for prop in ["position", "scale", "opacity"] {
+            let val = if prop == "opacity" {
+                serde_json::json!(1.0)
+            } else {
+                serde_json::json!([0.0, 0.0])
+            };
+            let _ = session.execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: prop.to_string(),
+                frame: 0.0,
+                value: val,
+                tween: None,
+            });
+        }
+        run(&mut session, &mut state);
+
+        // Verify V3 (track index 2) is automatically scrolled into full view inside video_tracks_lanes_rect.
+        let kf_rows = collect_keyframe_rows(&session);
+        assert!(kf_rows.len() >= 3);
+        let kf_h = ((kf_rows.len() as f32 * KEYFRAME_ROW_HEIGHT) + 4.0)
+            .min(KEYFRAME_ROW_HEIGHT * 4.0 + 4.0);
+        let tracks_top = RULER_HEIGHT + kf_h + KEYFRAME_SPLITTER_HEIGHT;
+        let v_rect = Rect::from_min_size(
+            pos2(HEADER_WIDTH, tracks_top),
+            vec2(
+                screen_rect.width() - HEADER_WIDTH,
+                state.video_audio_split_y,
+            ),
+        );
+        let (_, _, v_lanes_rect) = split_pane_header_strip(
+            Rect::from_min_size(
+                pos2(0.0, tracks_top),
+                vec2(HEADER_WIDTH, state.video_audio_split_y),
+            ),
+            v_rect,
+        );
+        let (v3_y0, v3_y1) = track_row_y_bounds(
+            TrackKind::Video,
+            2,
+            state.video_track_height,
+            v_lanes_rect,
+            state.video_scroll_y,
+        );
+        assert!(
+            state.video_scroll_y > 0.5,
+            "expanding keyframe lanes must auto-scroll video_scroll_y > 0 to keep V3 visible, got {}",
+            state.video_scroll_y
+        );
+        assert!(
+            v3_y0 >= v_lanes_rect.top() - 0.5 && v3_y1 <= v_lanes_rect.bottom() + 0.5,
+            "selected V3 track [{v3_y0}, {v3_y1}] must remain fully visible inside [{}, {}]",
+            v_lanes_rect.top(),
+            v_lanes_rect.bottom()
+        );
+    }
+
+    #[test]
+    fn track_header_visible_layout_prevents_mid_glyph_slicing_and_keeps_scrollbar_on_overflow() {
+        let clip_rect = Rect::from_min_size(pos2(0.0, 55.0), vec2(HEADER_WIDTH, 70.0));
+
+        // 1. 12 px sliver peeking underneath `VIDEO +`: suppressed (`None`) so glyphs/icons are never sliced in half.
+        let sliver_row = Rect::from_min_size(pos2(0.0, 37.0), vec2(HEADER_WIDTH, 30.0));
+        assert_eq!(sliver_row.intersect(clip_rect).height(), 12.0);
+        assert!(
+            track_header_visible_layout(TrackKind::Video, sliver_row, clip_rect).is_none(),
+            "12 px partially-scrolled sliver under VIDEO + must not paint sliced text or icons"
+        );
+
+        // 2. 18 px partial row (e.g. V2 at 800x540): centers text & icons strictly inside the visible band.
+        let partial_row = Rect::from_min_size(pos2(0.0, 43.0), vec2(HEADER_WIDTH, 30.0));
+        let vis_partial = partial_row.intersect(clip_rect);
+        assert_eq!(vis_partial.height(), 18.0);
+        let (cy, icon_side, font_px) =
+            track_header_visible_layout(TrackKind::Video, partial_row, clip_rect)
+                .expect("18 px visible row fits compact unclipped layout");
+        assert!(
+            cy - icon_side * 0.5 >= vis_partial.top()
+                && cy + icon_side * 0.5 <= vis_partial.bottom(),
+            "icons centered at {cy} (size {icon_side}) must stay strictly inside [{}, {}]",
+            vis_partial.top(),
+            vis_partial.bottom()
+        );
+        assert!(
+            cy - font_px * 0.5 >= vis_partial.top() && cy + font_px * 0.5 <= vis_partial.bottom(),
+            "label centered at {cy} (font {font_px}) must stay strictly inside [{}, {}]",
+            vis_partial.top(),
+            vis_partial.bottom()
+        );
+
+        // 3. Full 30 px row: preserves exact standard 18 px icons & 15 px font.
+        let full_row = Rect::from_min_size(pos2(0.0, 95.0), vec2(HEADER_WIDTH, 30.0));
+        let (_, full_icon, full_font) =
+            track_header_visible_layout(TrackKind::Video, full_row, clip_rect)
+                .expect("full row layout");
+        assert_eq!(full_icon, 18.0);
+        assert_eq!(full_font, 15.0);
+
+        // 4. Overflowing 3-4 video tracks at 800x540 always yields valid persistent vertical scrollbar geometry.
+        let lanes_800 = Rect::from_min_size(pos2(HEADER_WIDTH, 55.0), vec2(600.0, 48.0));
+        for n_tracks in [2usize, 3, 4] {
+            let total_h = n_tracks as f32 * DEFAULT_VIDEO_TRACK_HEIGHT;
+            let max_scroll = total_h - lanes_800.height();
+            assert!(max_scroll > 0.5);
+            let geom = vscrollbar_geometry(lanes_800, 0.0, max_scroll, total_h, true);
+            assert!(
+                geom.is_some(),
+                "{n_tracks} overflowing video tracks at 800x540 must always show persistent vertical scrollbar"
+            );
+        }
     }
 }

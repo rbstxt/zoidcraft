@@ -1531,4 +1531,18 @@ mod tests {
             [0.3, 0.3, 0.8, 0.8]
         );
     }
+
+    #[test]
+    fn qa6_bit8_hold_256_consistent_with_custom_handles() {
+        assert_eq!(
+            InterpolationMode::from_cm3_tween_code(256),
+            (InterpolationMode::Discrete, EasingKind::Hold)
+        );
+        let mut kf = crate::property::Keyframe::bezier(0.0, 10.0, [-4.0, 1.5], [6.0, -2.5]);
+        kf.set_cm3_tween_code(256);
+        assert_eq!(kf.interpolation_mode(), InterpolationMode::Discrete);
+        assert_eq!(kf.easing, EasingKind::Hold);
+        assert_eq!(kf.in_tangent, Some([-4.0, 1.5]));
+        assert_eq!(kf.out_tangent, Some([6.0, -2.5]));
+    }
 }

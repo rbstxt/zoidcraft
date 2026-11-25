@@ -79,8 +79,11 @@ enum Commands {
         /// Optional `.zcraft` (or `.pz`) project file; defaults to the CM3 starter project.
         #[arg(long, short = 'p')]
         project: Option<PathBuf>,
-        /// Fractional frame number to render.
-        #[arg(long, short = 'f', default_value_t = 0.0)]
+        /// Optional child composition name (case-insensitive) or UUID to render instead of the root sequence.
+        #[arg(long)]
+        comp: Option<String>,
+        /// Fractional frame number to render (must be finite and >= 0).
+        #[arg(long, short = 'f', default_value_t = 0.0, allow_hyphen_values = true)]
         frame: f64,
         /// Output image file path (`.png`, `.jpg`/`.jpeg`, or `.webp`; defaults to PNG).
         #[arg(long, short = 'o')]
@@ -102,6 +105,9 @@ enum Commands {
         /// Optional `.zcraft` (or `.pz`) project file; defaults to the CM3 starter project.
         #[arg(long, short = 'p')]
         project: Option<PathBuf>,
+        /// Optional child composition name (case-insensitive) or UUID to export instead of the root sequence.
+        #[arg(long)]
+        comp: Option<String>,
         /// Output file path (or directory for `--format png`).
         #[arg(long, short = 'o')]
         out: PathBuf,
@@ -195,14 +201,24 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::ExportPz { input, output } => cmd_export_pz(&input, &output),
         Commands::Render {
             project,
+            comp,
             frame,
             out,
             width,
             height,
             transparent,
-        } => cmd_render(project.as_deref(), frame, &out, width, height, transparent),
+        } => cmd_render(
+            project.as_deref(),
+            comp.as_deref(),
+            frame,
+            &out,
+            width,
+            height,
+            transparent,
+        ),
         Commands::Export {
             project,
+            comp,
             out,
             format,
             video_codec,
@@ -220,6 +236,7 @@ fn run(cli: Cli) -> Result<(), String> {
             ffmpeg,
         } => cmd_export(ExportCliArgs {
             project: project.as_deref(),
+            comp: comp.as_deref(),
             out: &out,
             format: format.as_deref(),
             video_codec: video_codec.as_deref(),
@@ -434,20 +451,105 @@ fn cmd_export_pz(input: &Path, output: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn select_composition_for_render(project: &mut Project, comp_spec: &str) -> Result<(), String> {
+    let query = comp_spec.trim();
+    if query.is_empty() {
+        return Err("composition selector `--comp` cannot be empty".to_owned());
+    }
+
+    // 1. Exact UUID match against child compositions
+    let matched_id = Uuid::parse_str(query)
+        .ok()
+        .filter(|id| project.compositions.contains_key(id))
+        // 2. Legacy string ID match (`composition_ids`)
+        .or_else(|| {
+            project
+                .composition_ids
+                .iter()
+                .find(|(legacy_id, _)| legacy_id.eq_ignore_ascii_case(query))
+                .map(|(_, &uuid)| uuid)
+                .filter(|id| project.compositions.contains_key(id))
+        })
+        // 3. Case-insensitive composition name match
+        .or_else(|| {
+            project
+                .compositions
+                .iter()
+                .find(|(_, seq)| seq.name.eq_ignore_ascii_case(query))
+                .map(|(&id, _)| id)
+        });
+
+    if let Some(target_id) = matched_id {
+        let mut child = project
+            .compositions
+            .remove(&target_id)
+            .ok_or_else(|| format!("composition '{query}' not found"))?;
+        // Keep root sequence controls accessible to child expressions if not already overridden.
+        for root_ctl in &project.sequence.controls {
+            let exists = child
+                .controls
+                .iter()
+                .any(|c| c.id == root_ctl.id || c.name == root_ctl.name);
+            if !exists {
+                child.controls.push(root_ctl.clone());
+            }
+        }
+        project.sequence = child;
+        project
+            .plugin_requirements
+            .insert("precomp-plus".to_owned());
+        return Ok(());
+    }
+
+    // Allow selecting the root sequence explicitly by name, UUID, or `"root"`.
+    if query.eq_ignore_ascii_case("root")
+        || query.eq_ignore_ascii_case(&project.sequence.name)
+        || Uuid::parse_str(query).ok() == Some(project.sequence.id)
+    {
+        return Ok(());
+    }
+
+    let available: Vec<String> = project
+        .compositions
+        .iter()
+        .map(|(id, seq)| format!("'{}' ({id})", seq.name))
+        .collect();
+    if available.is_empty() {
+        Err(format!(
+            "composition '{query}' not found (project has no child compositions)"
+        ))
+    } else {
+        Err(format!(
+            "composition '{query}' not found (available: {})",
+            available.join(", ")
+        ))
+    }
+}
+
 fn cmd_render(
     project_path: Option<&Path>,
+    comp: Option<&str>,
     frame: f64,
     out: &Path,
     width_override: Option<u32>,
     height_override: Option<u32>,
     transparent: bool,
 ) -> Result<(), String> {
-    let (project, warnings) = match project_path {
+    if !frame.is_finite() || frame < 0.0 {
+        return Err(format!(
+            "invalid frame {frame}: frame must be a finite non-negative number"
+        ));
+    }
+
+    let (mut project, warnings) = match project_path {
         Some(path) => load_project_any(path)?,
         None => (Project::new_cm3_default(), Vec::new()),
     };
     for warning in &warnings {
         eprintln!("warning: {warning}");
+    }
+    if let Some(comp_spec) = comp {
+        select_composition_for_render(&mut project, comp_spec)?;
     }
 
     let width = width_override.unwrap_or(project.sequence.resolution[0]);
@@ -521,6 +623,7 @@ fn cmd_render(
 
 struct ExportCliArgs<'a> {
     project: Option<&'a Path>,
+    comp: Option<&'a str>,
     out: &'a Path,
     format: Option<&'a str>,
     video_codec: Option<&'a str>,
@@ -700,50 +803,114 @@ fn mix_project_audio(
     .map_err(|e| format!("failed to mix project audio: {e}"))
 }
 
+/// Standard NTSC rational frame rates (`N * 1000 / 1001`), matching `zc-export::ffmpeg::format_fps`.
+const NTSC_RATIONAL_FPS: &[f64] = &[
+    24_000.0 / 1001.0,
+    30_000.0 / 1001.0,
+    60_000.0 / 1001.0,
+    120_000.0 / 1001.0,
+];
+
+/// Snaps shorthand NTSC decimal frame rates (`23.976`, `29.97`, `59.94`, `119.88`) to their exact
+/// rational values (`24000/1001`, `30000/1001`, `60000/1001`, `120000/1001`) so frame sampling
+/// matches FFmpeg's `-r` flag with zero cumulative A/V drift.
+fn canonical_export_fps(fps: f64) -> f64 {
+    for &target in NTSC_RATIONAL_FPS {
+        if (fps - target).abs() < 5e-4 {
+            return target;
+        }
+    }
+    fps
+}
+
+/// Returns the effective frame rate of a sequence (`exact_fps` when set and valid, else `fps`),
+/// matching `zc-audio::mixer::sequence_effective_fps` and `zc-render::ProjectRenderEngine`.
+fn sequence_effective_fps(seq: &zc_project::Sequence) -> f64 {
+    seq.exact_fps
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or_else(|| f64::from(seq.fps.max(1)))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExportTiming {
+    src_fps: f64,
+    exact_export_fps: f64,
+    export_frame_count: u32,
+    audio_seq_frames: f64,
+}
+
+impl ExportTiming {
+    /// Computes the source sequence frame corresponding to output video frame `output_frame_idx`
+    /// so video frame `n` at PTS `n / exact_export_fps` samples exact project time `t = n / exact_export_fps`.
+    fn scene_frame_for_output(&self, start_seq_frame: u32, output_frame_idx: u32) -> f64 {
+        f64::from(start_seq_frame)
+            + (f64::from(output_frame_idx) / self.exact_export_fps) * self.src_fps
+    }
+}
+
+fn compute_export_timing(
+    seq: &zc_project::Sequence,
+    start_seq_frame: u32,
+    end_seq_frame: u32,
+    fps_override: Option<f64>,
+) -> Result<ExportTiming, String> {
+    if end_seq_frame <= start_seq_frame {
+        return Err(format!(
+            "end_frame ({end_seq_frame}) must be greater than start_frame ({start_seq_frame})"
+        ));
+    }
+    let src_fps = sequence_effective_fps(seq);
+    let raw_export_fps = fps_override.unwrap_or(src_fps);
+    if !raw_export_fps.is_finite() || raw_export_fps <= 0.0 {
+        return Err(format!("invalid export fps: {raw_export_fps}"));
+    }
+    let exact_export_fps = canonical_export_fps(raw_export_fps);
+    let duration_sec = f64::from(end_seq_frame - start_seq_frame) / src_fps;
+    let raw_export_frames = duration_sec * exact_export_fps;
+    if !raw_export_frames.is_finite() {
+        return Err(format!(
+            "export frame count out of range for duration {duration_sec}s at {exact_export_fps} fps"
+        ));
+    }
+    let export_frames_f64 = raw_export_frames.round().max(1.0);
+    if export_frames_f64 > f64::from(u32::MAX) {
+        return Err(format!(
+            "export frame count out of range for duration {duration_sec}s at {exact_export_fps} fps"
+        ));
+    }
+    let export_frame_count = export_frames_f64 as u32;
+    let audio_seq_frames = (f64::from(export_frame_count) / exact_export_fps) * src_fps;
+    Ok(ExportTiming {
+        src_fps,
+        exact_export_fps,
+        export_frame_count,
+        audio_seq_frames,
+    })
+}
+
 fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
-    let (project, warnings) = match args.project {
+    let (mut project, warnings) = match args.project {
         Some(path) => load_project_any(path)?,
         None => (Project::new_cm3_default(), Vec::new()),
     };
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
+    if let Some(comp_spec) = args.comp {
+        select_composition_for_render(&mut project, comp_spec)?;
+    }
 
     let width = args.width.unwrap_or(project.sequence.resolution[0]);
     let height = args.height.unwrap_or(project.sequence.resolution[1]);
-    let seq_fps = f64::from(project.sequence.fps.max(1));
-    let export_fps = args.fps.unwrap_or(seq_fps);
     // Match Zoidium export-math.js: `Math.ceil(length)` so fractional trailing frames are not dropped.
     let default_end = project.sequence.length_frames.ceil().max(1.0) as u32;
     let end_seq_frame = args.end_frame.unwrap_or(default_end);
-    if end_seq_frame <= args.start_frame {
-        return Err(format!(
-            "end_frame ({end_seq_frame}) must be greater than start_frame ({})",
-            args.start_frame
-        ));
-    }
-
-    // Spec 04 §4.1: frameAdvance = seqRate / exportRate so changing export FPS preserves
-    // real-time playback speed instead of speeding up or slowing down the scene.
-    if !export_fps.is_finite() || export_fps <= 0.0 {
-        return Err(format!("invalid export fps: {export_fps}"));
-    }
-    let duration_sec = f64::from(end_seq_frame - args.start_frame) / seq_fps;
-    let raw_export_frames = duration_sec * export_fps;
-    if !raw_export_frames.is_finite() {
-        return Err(format!(
-            "export frame count out of range for duration {duration_sec}s at {export_fps} fps"
-        ));
-    }
-    let export_frames_f64 = raw_export_frames.round().max(1.0);
-    if export_frames_f64 > f64::from(u32::MAX) {
-        return Err(format!(
-            "export frame count out of range for duration {duration_sec}s at {export_fps} fps"
-        ));
-    }
-    let export_frame_count = export_frames_f64 as u32;
-    let frame_advance = seq_fps / export_fps;
-    let audio_seq_frames = f64::from(export_frame_count) * frame_advance;
+    let timing =
+        compute_export_timing(&project.sequence, args.start_frame, end_seq_frame, args.fps)?;
+    let seq_fps = timing.src_fps;
+    let export_fps = timing.exact_export_fps;
+    let export_frame_count = timing.export_frame_count;
+    let audio_seq_frames = timing.audio_seq_frames;
 
     let container = parse_container(args.format, args.out)?;
     let video_codec = parse_video_codec(args.video_codec, container, args.transparent)?;
@@ -788,9 +955,7 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
     };
     // Validate ALL settings (dimensions, fps bounds, frame count, container/codec compatibility)
     // BEFORE decoding or allocating audio buffers.
-    settings
-        .validate()
-        .map_err(|e| format!("invalid export settings: {e}"))?;
+    settings.validate().map_err(|e| e.to_string())?;
 
     let mixed_audio = if matches!(
         container,
@@ -832,7 +997,7 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
     let mut engine = ProjectRenderEngine::new_headless()
         .map_err(|e| format!("failed to initialize headless GPU renderer: {e}"))?;
     engine.set_transparent_background(args.transparent);
-    let start_seq = f64::from(args.start_frame);
+    let start_seq_frame = args.start_frame;
     let transparent = args.transparent;
 
     let report = export_video_with_progress(
@@ -840,7 +1005,7 @@ fn cmd_export(args: ExportCliArgs<'_>) -> Result<(), String> {
         mixed_audio.as_deref(),
         &cancel,
         |output_frame_idx: u32, rgba_out: &mut Vec<u8>| {
-            let scene_frame = start_seq + f64::from(output_frame_idx) * frame_advance;
+            let scene_frame = timing.scene_frame_for_output(start_seq_frame, output_frame_idx);
             let premul = engine
                 .render_frame_rgba8(&project, &plugins, scene_frame, width, height)
                 .map_err(|e| ExportError::Render(e.to_string()))?;
@@ -1895,5 +2060,241 @@ mod tests {
         cmd_selftest_effects(64, 64).expect(
             "all 44 standard + 36 plugin effects + default 3D scene must pass GPU selftest",
         );
+    }
+
+    #[test]
+    fn cli_render_rejects_negative_nan_and_infinite_frames() {
+        let out = PathBuf::from("unused_frame.png");
+        for bad_frame in [-5.0_f64, -0.001, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = cmd_render(None, None, bad_frame, &out, Some(64), Some(64), false)
+                .expect_err("invalid frame must be rejected");
+            assert!(
+                err.contains("invalid frame"),
+                "expected clear invalid frame message, got: {err}"
+            );
+        }
+
+        // Verify clap accepts negative & non-finite frame flags so `run()` returns our clean Err.
+        for args in [
+            vec!["zoidcraft-cli", "render", "-f=-5", "-o", "out.png"],
+            vec!["zoidcraft-cli", "render", "--frame", "-5", "-o", "out.png"],
+            vec!["zoidcraft-cli", "render", "--frame", "NaN", "-o", "out.png"],
+            vec!["zoidcraft-cli", "render", "--frame", "inf", "-o", "out.png"],
+            vec![
+                "zoidcraft-cli",
+                "render",
+                "--frame",
+                "-inf",
+                "-o",
+                "out.png",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("clap should parse negative/special float");
+            let err = run(cli).expect_err("run() must reject invalid frame");
+            assert!(err.contains("invalid frame"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn cli_validate_rejects_truncated_gzip_zcraft() {
+        let tmp = std::env::temp_dir().join(format!("zc_cli_trunc_{}.zcraft", Uuid::new_v4()));
+        let proj = Project::new_cm3_default();
+        let bytes = zc_project::save_zcraft_to_bytes(&proj).expect("save zcraft bytes");
+        // Truncate inside the gzip trailer so TAR entries decompress, yet gzip stream is incomplete.
+        fs::write(&tmp, &bytes[..bytes.len().saturating_sub(4)]).expect("write truncated file");
+
+        let res = cmd_validate(&tmp);
+        let _ = fs::remove_file(&tmp);
+        assert!(
+            res.is_err(),
+            "validate must fail on truncated gzip .zcraft file"
+        );
+    }
+
+    #[test]
+    fn cli_comp_flag_parses_selects_and_renders_child_composition() {
+        let cli = Cli::try_parse_from([
+            "zoidcraft-cli",
+            "render",
+            "--comp",
+            "Precomp 1",
+            "--frame",
+            "0",
+            "--out",
+            "comp.png",
+            "--width",
+            "64",
+            "--height",
+            "64",
+        ])
+        .expect("render --comp must parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Render {
+                comp: Some(ref c),
+                ..
+            } if c == "Precomp 1"
+        ));
+
+        let exp = Cli::try_parse_from([
+            "zoidcraft-cli",
+            "export",
+            "--comp",
+            "Precomp 1",
+            "--out",
+            "comp.mp4",
+        ])
+        .expect("export --comp must parse");
+        assert!(matches!(
+            exp.command,
+            Commands::Export {
+                comp: Some(ref c),
+                ..
+            } if c == "Precomp 1"
+        ));
+
+        // Build a project with a black root sequence and a bright red child composition `Hero Comp`.
+        let mut proj = Project::new_cm3_default();
+        proj.sequence.resolution = [64, 64];
+        proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        proj.sequence.video_tracks.clear();
+
+        let child_id = Uuid::new_v4();
+        let child_seq = zc_project::Sequence {
+            id: child_id,
+            name: "Hero Comp".to_owned(),
+            resolution: [64, 64],
+            fps: 30,
+            length_frames: 30.0,
+            background_color: [1.0, 0.0, 0.0, 1.0],
+            ..Default::default()
+        };
+        proj.compositions.insert(child_id, child_seq);
+
+        // Selection by case-insensitive name & by UUID must promote child sequence.
+        let mut by_name = proj.clone();
+        select_composition_for_render(&mut by_name, "hero comp").expect("select by name");
+        assert_eq!(by_name.sequence.id, child_id);
+        assert_eq!(by_name.sequence.background_color, [1.0, 0.0, 0.0, 1.0]);
+
+        let mut by_uuid = proj.clone();
+        select_composition_for_render(&mut by_uuid, &child_id.to_string()).expect("select by uuid");
+        assert_eq!(by_uuid.sequence.id, child_id);
+
+        let mut missing = proj.clone();
+        assert!(select_composition_for_render(&mut missing, "DoesNotExist").is_err());
+
+        // End-to-end render test (when headless GPU is available).
+        if ProjectRenderEngine::new_headless().is_ok() {
+            let proj_path =
+                std::env::temp_dir().join(format!("zc_cli_comp_{}.zcraft", Uuid::new_v4()));
+            let out_path = std::env::temp_dir().join(format!("zc_cli_comp_{}.png", Uuid::new_v4()));
+            save_zcraft(&proj, &proj_path).expect("save project with child comp");
+
+            cmd_render(
+                Some(&proj_path),
+                Some("hero comp"),
+                0.0,
+                &out_path,
+                Some(64),
+                Some(64),
+                false,
+            )
+            .expect("render child composition via --comp");
+
+            let img = image::open(&out_path)
+                .expect("open rendered child PNG")
+                .to_rgba8();
+            let px = img.get_pixel(32, 32);
+            assert!(
+                px[0] > 200 && px[1] < 20 && px[2] < 20,
+                "expected red child composition background, got rgba={px:?}"
+            );
+            let _ = fs::remove_file(&proj_path);
+            let _ = fs::remove_file(&out_path);
+        }
+    }
+
+    #[test]
+    fn cli_export_invalid_settings_error_has_no_duplicate_prefix() {
+        let out = std::env::temp_dir().join(format!("zc_cli_bad_exp_{}.mp4", Uuid::new_v4()));
+        let err = cmd_export(ExportCliArgs {
+            project: None,
+            comp: None,
+            out: &out,
+            format: Some("mp4"),
+            video_codec: Some("h264"),
+            audio_codec: Some("none"),
+            crf: 18,
+            bitrate_kbps: None,
+            audio_bitrate_kbps: 192,
+            sample_rate: STANDARD_SAMPLE_RATE,
+            width: Some(0),
+            height: Some(64),
+            fps: Some(30.0),
+            start_frame: 0,
+            end_frame: Some(5),
+            transparent: false,
+            ffmpeg: None,
+        })
+        .expect_err("zero width export must fail validation");
+        assert!(
+            !err.contains("invalid export settings: invalid export settings:"),
+            "error message must not duplicate prefix: {err}"
+        );
+    }
+
+    #[test]
+    fn qa6_ntsc_fractional_fps_export_timing_zero_drift() {
+        // Case 1: 30fps source exported at --fps 29.97 and --fps 23.976
+        let seq_30 = zc_project::Sequence {
+            fps: 30,
+            exact_fps: None,
+            length_frames: 300.0, // 10.0s
+            ..zc_project::Sequence::default()
+        };
+        for (fps_arg, expected_rational, expected_frames) in [
+            (29.97, 30_000.0 / 1001.0, 300u32),
+            (23.976, 24_000.0 / 1001.0, 240u32),
+        ] {
+            let t = compute_export_timing(&seq_30, 0, 300, Some(fps_arg)).expect("timing");
+            assert!((t.exact_export_fps - expected_rational).abs() < 1e-12);
+            assert_eq!(t.export_frame_count, expected_frames);
+            // Video duration and audio duration must match identically (0.0ms drift)
+            let video_dur = f64::from(t.export_frame_count) / t.exact_export_fps;
+            let audio_dur = t.audio_seq_frames / t.src_fps;
+            assert!((video_dur - audio_dur).abs() < 1e-12);
+
+            // At 1.0s, 5.0s, 9.0s: sampled project time == video PTS with 0.0ms cumulative drift
+            for target_sec in [1.0, 5.0, 9.0] {
+                let n = (target_sec * t.exact_export_fps).round() as u32;
+                let video_pts = f64::from(n) / t.exact_export_fps;
+                let scene_frame = t.scene_frame_for_output(0, n);
+                let sampled_project_time = scene_frame / t.src_fps;
+                assert!(
+                    (video_pts - sampled_project_time).abs() < 1e-12,
+                    "fps={fps_arg} t={target_sec}s: drift={:.6}ms",
+                    (video_pts - sampled_project_time).abs() * 1000.0
+                );
+            }
+        }
+
+        // Case 2: Sequence with `exact_fps = Some(29.97)` exported without `--fps` or with `--fps 29.97`
+        let seq_ntsc = zc_project::Sequence {
+            fps: 30,
+            exact_fps: Some(30_000.0 / 1001.0),
+            length_frames: 300.0,
+            ..zc_project::Sequence::default()
+        };
+        for override_opt in [None, Some(29.97)] {
+            let t = compute_export_timing(&seq_ntsc, 0, 300, override_opt).expect("ntsc timing");
+            assert_eq!(t.export_frame_count, 300);
+            for target_sec in [1.0, 5.0, 9.0] {
+                let n = (target_sec * t.exact_export_fps).round() as u32;
+                let video_pts = f64::from(n) / t.exact_export_fps;
+                let sampled_time = t.scene_frame_for_output(0, n) / t.src_fps;
+                assert!((video_pts - sampled_time).abs() < 1e-12);
+            }
+        }
     }
 }

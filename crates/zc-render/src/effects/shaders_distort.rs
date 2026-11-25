@@ -78,7 +78,10 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let d = p - m;
     let r = length(d);
     let m_len = max(length(m), EPS);
-    let power = (PI / m_len) * u.p0.x / 100.0;
+    let raw_power = (PI / m_len) * u.p0.x / 100.0;
+    // Guard tan(r * power) against PI/2 asymptote singularities at extreme positive amounts (e.g. 500).
+    let max_pos_power = (0.48 * PI) / m_len;
+    let power = select(raw_power, min(raw_power, max_pos_power), raw_power > 0.0);
 
     var bind_r: f32;
     if (power > 0.0) {
@@ -92,7 +95,8 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     if (power > 1e-6) {
         let denom = tan(bind_r * power);
         let safe_d = select(denom, EPS, abs(denom) < EPS);
-        uv = m + dir * tan(r * power) * bind_r / safe_d;
+        let r_clamped = min(r, bind_r);
+        uv = m + dir * tan(r_clamped * power) * bind_r / safe_d;
     } else if (power < -1e-6) {
         let denom = atan(-power * bind_r * 10.0);
         let safe_d = select(denom, EPS, abs(denom) < EPS);
@@ -189,7 +193,11 @@ fn ps_load_aux(px: i32, py: i32, dims: vec2<i32>) -> vec4<f32> {
     return textureLoad(t_aux, vec2<i32>(cx, cy), 0);
 }
 
-fn ps_is_barrier(val: f32, thresh: f32, highlights: bool) -> bool {
+fn ps_is_barrier(texel: vec4<f32>, thresh: f32, highlights: bool) -> bool {
+    if (texel.a < 0.01) {
+        return true;
+    }
+    let val = luma601(texel.rgb);
     return select(thresh < val, val < thresh, highlights);
 }
 
@@ -233,10 +241,11 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     }
 
     let thresh = u.p0.x;
-    let val = luma601(ps_load_diffuse(px, py, dims).rgb);
+    let cur_tex = ps_load_diffuse(px, py, dims);
+    let val = luma601(cur_tex.rgb);
     var dest_pos = f32(pos_i);
 
-    if (!ps_is_barrier(val, thresh, highlights)) {
+    if (!ps_is_barrier(cur_tex, thresh, highlights)) {
         var rank: i32 = 0;
         var head: i32 = 0;
         var tail: i32 = wid - 1;
@@ -244,11 +253,12 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         for (var p: i32 = pos_i - 1; p >= 0; p = p - 1) {
             let gx = select(px, p, horiz);
             let gy = select(p, py, horiz);
-            let v = luma601(ps_load_diffuse(gx, gy, dims).rgb);
-            if (ps_is_barrier(v, thresh, highlights)) {
+            let nb = ps_load_diffuse(gx, gy, dims);
+            if (ps_is_barrier(nb, thresh, highlights)) {
                 head = p + 1;
                 break;
             }
+            let v = luma601(nb.rgb);
             if (v <= val) {
                 rank = rank + 1;
             }
@@ -257,11 +267,12 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         for (var p: i32 = pos_i + 1; p < wid; p = p + 1) {
             let gx = select(px, p, horiz);
             let gy = select(p, py, horiz);
-            let v = luma601(ps_load_diffuse(gx, gy, dims).rgb);
-            if (ps_is_barrier(v, thresh, highlights)) {
+            let nb = ps_load_diffuse(gx, gy, dims);
+            if (ps_is_barrier(nb, thresh, highlights)) {
                 tail = p - 1;
                 break;
             }
+            let v = luma601(nb.rgb);
             if (v < val) {
                 rank = rank + 1;
             }

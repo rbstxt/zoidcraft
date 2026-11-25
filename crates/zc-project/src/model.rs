@@ -1303,7 +1303,7 @@ impl Object3D {
     #[must_use]
     pub fn new_spot_light() -> Self {
         let mut obj = Self::new("Light", Object3DKind::Light(Box::new(LightData::spot())));
-        obj.position = PropertyTrack::vec3([0.0, 10.0, 0.0]);
+        obj.position = PropertyTrack::vec3([25.0, 35.0, 55.0]);
         obj
     }
 
@@ -1683,7 +1683,7 @@ impl LightData {
             distance: 0.0,
             cast_shadow: true,
             shadow_map_size: 1024,
-            shadow_bias: 0.0,
+            shadow_bias: 0.002,
         }
     }
 
@@ -2733,5 +2733,12 @@ mod tests {
         );
         assert_eq!(high_off.easing_index, 1);
         assert!(!high_off.is_bezier);
+    }
+
+    #[test]
+    fn camera_dof_default_uses_percent_blur_scale() {
+        let dof = CameraDofParams::default();
+        assert_eq!(dof.near_blur.value.as_f64(), Some(100.0));
+        assert_eq!(dof.far_blur.value.as_f64(), Some(100.0));
     }
 }

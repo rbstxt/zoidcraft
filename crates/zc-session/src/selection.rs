@@ -20,12 +20,23 @@ pub enum SelectionDomain {
     Keyframe,
 }
 
+impl SelectionDomain {
+    /// Clean human-readable plural label for user-facing error messages.
+    #[must_use]
+    pub const fn display_plural(self) -> &'static str {
+        match self {
+            Self::Clip => "clips",
+            Self::Object3D => "3D objects",
+            Self::Effect => "effects",
+            Self::Keyframe => "keyframes",
+        }
+    }
+}
+
 /// Errors produced by selection guards.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SelectionError {
-    #[error(
-        "cannot multi-select mixed types in {domain:?}: active type is '{expected}', clicked '{actual}'"
-    )]
+    #[error("Selected {} have different types", domain.display_plural())]
     MixedType {
         domain: SelectionDomain,
         expected: String,
@@ -354,6 +365,14 @@ impl SelectionState {
     }
 }
 
+fn default_last_speed() -> f64 {
+    1.0
+}
+
+fn is_default_last_speed(speed: &f64) -> bool {
+    (*speed - 1.0).abs() <= f64::EPSILON
+}
+
 /// CM3 playback transport and viewport toggle state (Spec 01 §1.6 & Spec 02 §5.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlaybackState {
@@ -366,6 +385,12 @@ pub struct PlaybackState {
     /// Monotonic audio/video synchronization epoch (Spec 02 §5.4).
     #[serde(default)]
     pub epoch_id: u64,
+    /// Last non-zero playback speed multiplier restored on resume (defaults to `1.0`).
+    #[serde(
+        default = "default_last_speed",
+        skip_serializing_if = "is_default_last_speed"
+    )]
+    pub last_speed: f64,
 }
 
 impl Default for PlaybackState {
@@ -378,6 +403,7 @@ impl Default for PlaybackState {
             editing_camera: true,
             transform_controls_2d: false,
             epoch_id: 0,
+            last_speed: 1.0,
         }
     }
 }
@@ -408,6 +434,9 @@ impl PlaybackState {
         } else {
             0.0
         };
+        if self.is_playing() {
+            self.last_speed = self.speed;
+        }
         self.speed = 0.0;
         self.current_frame = if frame.is_finite() {
             frame.clamp(0.0, max_frame)
@@ -423,12 +452,17 @@ impl PlaybackState {
         self.set_frame(target, total_frames);
     }
 
-    /// Toggles playback speed between `0.0` (paused) and `1.0` (normal forward).
+    /// Toggles playback speed between `0.0` (paused) and the last non-zero speed (default `1.0`).
     pub fn toggle_play(&mut self) {
         if self.is_playing() {
+            self.last_speed = self.speed;
             self.speed = 0.0;
         } else {
-            self.speed = 1.0;
+            self.speed = if self.last_speed.is_finite() && self.last_speed.abs() > f64::EPSILON {
+                self.last_speed
+            } else {
+                1.0
+            };
         }
         self.bump_epoch();
     }
@@ -436,6 +470,9 @@ impl PlaybackState {
     /// Sets playback speed multiplier (`0` = paused, `1` = 1x forward, `-1` = 1x reverse).
     pub fn set_speed(&mut self, speed: f64) {
         if speed.is_finite() {
+            if speed.abs() > f64::EPSILON {
+                self.last_speed = speed;
+            }
             self.speed = speed;
             self.bump_epoch();
         }
@@ -534,5 +571,24 @@ impl PlaybackState {
             }
             _ => format!("{}", frame.round() as i64),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_type_selection_error_uses_clean_human_readable_message() {
+        let mut sel = SelectionState::default();
+        sel.select_object_3d("obj-1", "box", false).unwrap();
+        let err = sel
+            .select_object_3d("obj-2", "sphere", true)
+            .expect_err("mixed 3D object types must fail");
+        let msg = err.to_string();
+        assert_eq!(msg, "Selected 3D objects have different types");
+        assert!(!msg.contains("Object3D"));
+        assert!(!msg.contains("'box'"));
+        assert!(!msg.contains("'sphere'"));
     }
 }

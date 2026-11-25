@@ -676,6 +676,19 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
         }
     }
 
+    // Drain the remaining compressed stream through `GzDecoder` to EOF so `flate2` verifies
+    // the gzip CRC32 & ISIZE trailer and rejects truncated or corrupted `.zcraft` archives.
+    let mut remainder = archive.into_inner();
+    let mut sink = io::sink();
+    io::copy(&mut remainder, &mut sink).map_err(|err| {
+        map_limit_err(
+            ProjectError::Io(err),
+            &exceeded,
+            &raw_exceeded,
+            max_uncompressed,
+        )
+    })?;
+
     let project_bytes = project_bytes.ok_or(ProjectError::MissingEntry("project.json"))?;
 
     if let Some(ref meta_doc) = meta
@@ -1442,5 +1455,29 @@ mod tests {
             ),
             Err(ProjectError::ArchiveTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_truncated_gzip_trailer_on_load() {
+        let proj = Project::new_cm3_default();
+        let bytes = save_zcraft_to_bytes(&proj).expect("save valid .zcraft");
+        // Strip the last 4 bytes (inside the 8-byte gzip CRC32/ISIZE trailer) so the TAR
+        // entries themselves decompress completely, but the gzip stream is truncated.
+        let truncated = &bytes[..bytes.len().saturating_sub(4)];
+        let err = load_zcraft_from_bytes(truncated).expect_err("truncated gzip must fail");
+        assert!(
+            matches!(err, ProjectError::Io(_)),
+            "expected Io error on truncated gzip trailer, got: {err:?}"
+        );
+
+        // Also reject a corrupted CRC byte in the gzip trailer.
+        let mut bad_crc = bytes.clone();
+        let idx = bad_crc.len() - 6;
+        bad_crc[idx] ^= 0xFF;
+        let err_crc = load_zcraft_from_bytes(&bad_crc).expect_err("corrupt gzip CRC must fail");
+        assert!(
+            matches!(err_crc, ProjectError::Io(_)),
+            "expected Io error on corrupt gzip CRC, got: {err_crc:?}"
+        );
     }
 }

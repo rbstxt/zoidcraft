@@ -1099,14 +1099,39 @@ enum SpriteField {
     FlareRipple,
     FlareSpectral,
     FlareGlint,
+    Spark,
 }
 
 impl SpriteField {
     fn from_canonical(id: &str) -> Option<(Self, bool)> {
         use std::f32::consts::{FRAC_PI_2, FRAC_PI_8};
-        let optical = id.starts_with("flare_");
+        let optical = id.starts_with("flare_")
+            || matches!(
+                id,
+                "circle_soft"
+                    | "soft_circle"
+                    | "soft_glow"
+                    | "glow"
+                    | "dot_soft"
+                    | "orb_soft"
+                    | "spark"
+                    | "sparks"
+                    | "star_glow"
+                    | "bokeh"
+                    | "bokeh_ring"
+                    | "streak"
+                    | "smoke"
+                    | "cloud"
+            );
         let field = match id {
-            "circle" => Self::Circle,
+            "circle" | "dot" => Self::Circle,
+            "circle_soft" | "soft_circle" | "soft_glow" | "glow" | "dot_soft" | "orb_soft" => {
+                Self::FlareOrbSoft
+            }
+            "spark" | "sparks" => Self::Spark,
+            "bokeh" | "bokeh_ring" | "ring" => Self::FlareGlowRing,
+            "streak" | "flare_streak" => Self::FlareStreakThin,
+            "smoke" | "cloud" => Self::FlareBlob,
             "square" => Self::Square,
             "triangle" => Self::Polygon(pp_regular_polygon_verts(3, 0.79, -FRAC_PI_2)),
             "pentagon" => Self::Polygon(pp_regular_polygon_verts(5, 0.75, -FRAC_PI_2)),
@@ -1155,6 +1180,10 @@ impl SpriteField {
             "lattice" => Self::Lattice,
             "concentric_rings" => Self::ConcentricRings,
             "broken_ring" => Self::BrokenRing,
+            "star_4" | "star4" | "star_4pt" | "star_four" => {
+                Self::Polygon(pp_star_verts(4, 0.86, 0.22, -FRAC_PI_2))
+            }
+            "star_glow" | "star" => Self::FlareGlint,
             "star_5" => Self::Polygon(pp_star_verts(5, 0.80, 0.35, -FRAC_PI_2)),
             "star_6" => Self::Polygon(pp_star_verts(6, 0.79, 0.39, 0.0)),
             "star_8" => Self::Polygon(pp_star_verts(8, 0.79, 0.47, FRAC_PI_8)),
@@ -1787,6 +1816,14 @@ impl SpriteField {
                         * pp_gaussian((x + y) * FRAC_1_SQRT_2, 0.25)
                         * 0.42,
                 ),
+            Self::Spark => {
+                // Crisp elongated spark: hot core + bright narrow horizontal streak + subtle vertical glint.
+                let core = (pp_gaussian(r, 0.11) * 1.15).clamp(0.0, 1.0);
+                let horiz = pp_gaussian(y, 0.045) * pp_gaussian(x, 0.56);
+                let vert = pp_gaussian(x, 0.032) * pp_gaussian(y, 0.24) * 0.65;
+                let tail = pp_gaussian(y, 0.09) * pp_gaussian(x, 0.72) * 0.32;
+                core.max(horiz).max(vert).max(tail).clamp(0.0, 1.0)
+            }
         }
     }
 }

@@ -10,8 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use zc_project::{
-    AudioClip, Layer, LayerKind, Project, PropertyTrack, PropertyValue, Sequence, StaticBehavior,
-    Uuid, VideoClip,
+    AudioClip, Layer, LayerKind, Project, PropertyTrack, PropertyValue, Sequence, Uuid, VideoClip,
 };
 
 use crate::AudioError;
@@ -197,6 +196,7 @@ where
         clips,
         buffers,
         eval_clip,
+        |_| false,
     ))
 }
 
@@ -218,20 +218,30 @@ where
     F: Fn(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
 {
     let total_samples = offline_total_samples(total_frames, fps, sample_rate);
-    mix_offline_stereo_animated_inner(total_samples, fps, sample_rate, clips, buffers, eval_clip)
+    mix_offline_stereo_animated_inner(
+        total_samples,
+        fps,
+        sample_rate,
+        clips,
+        buffers,
+        eval_clip,
+        |_| false,
+    )
 }
 
-fn mix_offline_stereo_animated_inner<B, F>(
+fn mix_offline_stereo_animated_inner<B, F, S>(
     total_samples: usize,
     fps: f64,
     sample_rate: u32,
     clips: &[AudioClipScheduleItem],
     buffers: &HashMap<String, B>,
     eval_clip: F,
+    silence_stationary: S,
 ) -> Vec<[f32; 2]>
 where
     B: Borrow<AudioBuffer>,
     F: Fn(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
+    S: Fn(usize) -> bool,
 {
     let mut output = vec![[0.0_f32; 2]; total_samples];
     if total_samples == 0 || clips.is_empty() {
@@ -303,6 +313,13 @@ where
                 None => base_rate_ratio,
             };
             prev_media_time = Some(params.media_time_sec);
+
+            // Freeze-frame / zero-velocity time curve holds a single timestamp with zero
+            // progression; silence cleanly rather than emitting a constant DC offset pop,
+            // while allowing explicit user `time` expressions to sample as written.
+            if local_ratio <= 1e-9 && silence_stationary(clip_idx) {
+                continue;
+            }
 
             let src_sample = if local_ratio > 1.02 {
                 sample_stereo_sinc(raw_buf, src_pos, local_ratio)
@@ -383,6 +400,12 @@ impl FlattenedAudioClip {
                 .parent_chain
                 .iter()
                 .any(|p| p.time_expr.is_some() || p.volume_expr.is_some() || p.pan_expr.is_some())
+    }
+
+    /// Returns `true` if this clip or any enclosing precomp clip drives `time` via an expression.
+    #[must_use]
+    pub fn has_time_expression(&self) -> bool {
+        self.props.time_expr.is_some() || self.parent_chain.iter().any(|p| p.time_expr.is_some())
     }
 
     /// Evaluates dynamic `media_time_sec`, combined `volume`, and combined `pan` at a
@@ -501,14 +524,16 @@ impl FlattenedAudioClip {
     #[must_use]
     pub fn to_schedule_item(&self, range_start_frame: f64, root_fps: f64) -> AudioClipScheduleItem {
         let p0 = self.evaluate_params(0.0);
-        let p1 = self.evaluate_params(self.root_length_frames);
-        let rate = if p0.media_time_sec >= 0.0 && p1.media_time_sec >= 0.0 {
-            effective_playback_rate(
-                p0.media_time_sec,
-                p1.media_time_sec,
-                self.root_length_frames,
-                root_fps,
-            )
+        let probe_span = (self.root_length_frames - 1e-6).max(0.0);
+        let p1 = if probe_span > 0.0 {
+            self.evaluate_params(probe_span)
+        } else {
+            p0
+        };
+        let rate = if p0.media_time_sec >= 0.0 && p1.media_time_sec >= 0.0 && probe_span > 0.0 {
+            effective_playback_rate(p0.media_time_sec, p1.media_time_sec, probe_span, root_fps)
+        } else if p0.media_time_sec >= 0.0 {
+            0.0
         } else {
             1.0
         };
@@ -601,8 +626,9 @@ pub fn mix_flattened_audio_clips<B: Borrow<AudioBuffer>>(
         .map(|_| RefCell::new(ExprSampleCache::new(block_frames)))
         .collect();
 
-    try_mix_offline_stereo_animated(
-        total_frames,
+    let total_samples = try_offline_total_samples(total_frames, root_fps, sample_rate)?;
+    Ok(mix_offline_stereo_animated_inner(
+        total_samples,
         root_fps,
         sample_rate,
         &scheduled,
@@ -638,7 +664,8 @@ pub fn mix_flattened_audio_clips<B: Borrow<AudioBuffer>>(
                 pan: cache.p0.pan + (cache.p1.pan - cache.p0.pan) * frac32,
             }
         },
-    )
+        |idx| !clips[idx].has_time_expression(),
+    ))
 }
 
 /// Returns `true` if `project` has at least one decodable active audio clip (including inside
@@ -959,10 +986,7 @@ impl ScalarTrack {
             .as_f64()
             .filter(|v| v.is_finite())
             .unwrap_or(default);
-        let use_keyframes = !track.keyframes.is_empty()
-            && (track.animated
-                || track.static_behavior == StaticBehavior::Linear
-                || track.keyframes.len() > 1);
+        let use_keyframes = !track.keyframes.is_empty();
         if !use_keyframes {
             return Self::constant(base);
         }
@@ -2652,6 +2676,90 @@ mod tests {
         assert!(
             mixed_disabled.is_none(),
             "PrecompRef audio must be silent (None) when precomp_enabled=false"
+        );
+    }
+
+    #[test]
+    fn freeze_frame_constant_single_keyframe_holds_time_and_silences_mix() {
+        let sr = STANDARD_SAMPLE_RATE;
+        let mut project = Project::new_cm3_default();
+        project.sequence.fps = 30;
+        project.sequence.length_frames = 30.0;
+
+        // 2-second 440 Hz sine wave
+        let sine_samples: Vec<[f32; 2]> = (0..(sr * 2) as usize)
+            .map(|i| {
+                let s =
+                    (std::f64::consts::TAU * 440.0 * (i as f64) / f64::from(sr)).sin() as f32 * 0.8;
+                [s, s]
+            })
+            .collect();
+        let wav = crate::decode::encode_wav_f32_stereo(&sine_samples, sr);
+        project
+            .assets
+            .insert("sine.wav".to_owned(), make_asset("sine.wav", wav));
+
+        // Freeze-frame time_curve produced by `timeline.freeze_clip_frame`:
+        // animated = false, static_behavior = Constant, 1 keyframe at frame 0 -> 0.5s.
+        let frozen_time = PropertyTrack {
+            animated: false,
+            expression: None,
+            static_behavior: zc_project::StaticBehavior::Constant,
+            value: PropertyValue::Number(0.5),
+            keyframes: vec![zc_project::PropertyKeyframe::linear(
+                0.0,
+                PropertyValue::Number(0.5),
+            )],
+            channels: Vec::new(),
+        };
+
+        let clip = make_audio_clip(
+            0.0,
+            30.0,
+            Some("sine.wav"),
+            frozen_time,
+            PropertyTrack::number(1.0),
+            PropertyTrack::number(0.0),
+            None,
+        );
+        project.sequence.audio_tracks = vec![make_audio_track(
+            "FrozenAudio",
+            true,
+            false,
+            false,
+            vec![clip],
+        )];
+
+        let flattened = collect_flattened_audio_clips(&project, 0.0, 30.0);
+        assert_eq!(flattened.len(), 1);
+        assert!(
+            (flattened[0].evaluate_params(0.0).media_time_sec - 0.5).abs() < 1e-9,
+            "frozen clip frame 0 must hold 0.5s"
+        );
+        assert!(
+            (flattened[0].evaluate_params(15.0).media_time_sec - 0.5).abs() < 1e-9,
+            "frozen clip mid-frame must hold 0.5s instead of advancing linearly"
+        );
+        assert!(
+            (flattened[0].evaluate_params(29.0).media_time_sec - 0.5).abs() < 1e-9,
+            "frozen clip end-frame must hold 0.5s"
+        );
+        let sched = flattened[0].to_schedule_item(0.0, 30.0);
+        assert!(
+            sched.playback_rate.abs() < 1e-9,
+            "frozen clip playback_rate must be 0.0, got {}",
+            sched.playback_rate
+        );
+
+        let mixed = mix_project_audio_with_precomps(&project, 0.0, 30.0, sr)
+            .expect("frozen mix must succeed")
+            .expect("frozen mix returns buffer");
+        let peak = mixed
+            .iter()
+            .fold(0.0_f32, |acc, s| acc.max(s[0].abs()).max(s[1].abs()));
+        assert!(
+            peak < 1e-6,
+            "frozen audio clip must silence instead of playing linearly or emitting DC, got peak={peak}"
         );
     }
 }

@@ -2,20 +2,22 @@
 //! Effects, Export, Restore, Plugins, Assets, About, Settings) wired directly to
 //! `zc_session::Session`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use egui::{
     Align2, Area, Color32, CornerRadius, CursorIcon, Frame, Id, Key, Mesh, Order, Painter, Pos2,
     Rect, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, Vec2,
+    scroll_area::ScrollBarVisibility,
 };
 use serde_json::{Value, json};
 use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
 use zc_color::{BlendMode, Hsv, Rgb, Rgba};
-use zc_plugin::PluginCategory;
+use zc_plugin::{PluginCategory, PluginDescriptor};
 use zc_project::{
-    AssetKind, EffectCategory, GradientStop, LayerKind, LayerMask, Marker, MaskMode,
-    PresetShapeKind, PropertyTrack, PropertyValue, SequenceControlKind, Uuid, create_effect_by_id,
+    AssetKind, CustomProperty, EffectCategory, EffectInstance, EffectKind, GradientStop, LayerKind,
+    LayerMask, Marker, MaskMode, MaterialSpec, Object3D, Object3DKind, PresetShapeKind,
+    PropertyTrack, PropertyValue, SequenceControlKind, Uuid, create_effect_by_id,
     standard_effect_catalog, zoidium_effect_catalog,
 };
 use zc_render::shape_plus::{
@@ -27,27 +29,31 @@ use zc_scene::all_particle_sprite_names;
 use zc_session::{Command, Session, SessionClip, SessionObject3D, SessionProperty};
 use zc_shader::{CompileOptions, fix_property_name, translate_glsl_es100_with_options};
 
+use super::clipboard::{read_system_clipboard, write_system_clipboard};
 use super::pro_editors::{
-    LooksEditorState, NodeGraphEditorState, NodeGraphTargetKind, show_pro_editor_windows,
+    LooksEditorState, NodeGraphEditorState, NodeGraphTargetKind, clamp_floating_window_in_screen,
+    compute_clamped_editor_window_rect, consume_escape_for_floating_editor,
+    mark_floating_editor_escape_consumed, show_pro_editor_windows,
 };
 
 use super::controls::{
     ButtonVariant, FloatingWindowManager, FloatingWindowSpec, FuzzyItem, FuzzyPickerEvent,
     FuzzyPickerState, KeyframeBarEvent, KeyframeBarState, PropertyColumnState, ScrubConfig,
     ScrubEvent, cm3_collapsible_section, cm3_collapsible_section_with_action,
-    cm3_column_adjust_splitter, cm3_dropdown, cm3_floating_window, cm3_fuzzy_picker,
-    cm3_gradient_bar, cm3_hsva_color_picker, cm3_icon_button, cm3_keyframe_bar, cm3_prop_button,
-    cm3_property_row, cm3_property_row_aligned, cm3_scrub_number, cm3_stopwatch_button,
-    cm3_vector2, cm3_vector2_with_sep, cm3_vector3, paint_cm3_tree_box,
+    cm3_column_adjust_splitter, cm3_dropdown, cm3_floating_window, cm3_gradient_bar,
+    cm3_hsva_color_picker, cm3_icon_button, cm3_keyframe_bar, cm3_prop_button, cm3_property_row,
+    cm3_property_row_aligned, cm3_scrub_number, cm3_stopwatch_button, cm3_vector2,
+    cm3_vector2_with_sep, cm3_vector3, fuzzy_score, paint_cm3_tree_box,
 };
 use super::layout::{SplitOrientation, SplitPanelState, begin_split_panel, show_split_pane};
 use super::theme::{
-    BG_BUTTON, BG_DROPDOWN_HOVER, BG_HOVER, BG_INPUT, BG_PANEL, BG_SUNKEN, BG_TITLE,
-    BORDER_CONTROL, BORDER_FILTER, BORDER_PANEL, BORDER_ROW_SOFT, Cm3Icon, Cm3Theme, DANGER_TEXT,
-    EditorFontChoice, FONT_BADGE, FONT_BANNER, FONT_BODY, FONT_COMPACT, FONT_EASING, FONT_SMALL,
-    FONT_TITLE, TEXT_BRIGHT, TEXT_DISABLED, TEXT_EMPTY, TEXT_FAINT, TEXT_MUTED, TEXT_OPTION_DESC,
-    TEXT_PRIMARY, TEXT_STRONG, TOOLBAR_ICON_INACTIVE, ThemeProfileChoice, WARNING_BAR,
-    WARNING_SURFACE, color32_with_alpha, paint_badge, paint_cm3_icon, rgb_to_color32,
+    BG_BUTTON, BG_DROPDOWN_HOVER, BG_HOVER, BG_INPUT, BG_OPTION_ACTIVE, BG_OPTION_HOVER, BG_PANEL,
+    BG_SUNKEN, BG_TITLE, BORDER_CONTROL, BORDER_FILTER, BORDER_OPTION_ACTIVE, BORDER_PANEL,
+    BORDER_ROW_SOFT, Cm3Icon, Cm3Theme, DANGER_TEXT, EditorFontChoice, FONT_BADGE, FONT_BANNER,
+    FONT_BODY, FONT_COMPACT, FONT_SMALL, FONT_TITLE, TEXT_BRIGHT, TEXT_DISABLED, TEXT_EMPTY,
+    TEXT_FAINT, TEXT_MUTED, TEXT_OPTION_DESC, TEXT_PRIMARY, TEXT_STRONG, TOOLBAR_ICON_INACTIVE,
+    ThemeProfileChoice, WARNING_BAR, WARNING_SURFACE, color32_with_alpha, paint_badge,
+    paint_cm3_icon, rgb_to_color32,
 };
 
 // ---------------------------------------------------------------------------
@@ -210,11 +216,11 @@ impl ExportVideoCodec {
         Self::Png,
     ];
     pub const LABELS: [&'static str; 6] = [
-        "H.264 (libx264)",
-        "H.265 / HEVC (libx265)",
-        "VP9 (libvpx-vp9)",
+        "H.264 / AVC",
+        "H.265 / HEVC",
+        "VP9",
         "VP8 (legacy)",
-        "AV1 (libsvtav1)",
+        "AV1",
         "PNG (lossless)",
     ];
 }
@@ -389,7 +395,7 @@ impl Default for AppSettings {
             preview_cache_mib: 512,
             undo_max_entries: 200,
             undo_max_mib: 64,
-            show_fps_overlay: false,
+            show_fps_overlay: true,
         }
     }
 }
@@ -475,6 +481,16 @@ struct ExprEditorTarget {
     error_message: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct StopwatchContextMenuState {
+    target_id: String,
+    property: String,
+    existing_expr: Option<String>,
+    local_frame: f64,
+    current_val: Value,
+    pos: Pos2,
+}
+
 /// Stateful UI context for all left-rail panels and inspector sub-windows.
 pub struct PanelsState {
     pub media_search: String,
@@ -506,6 +522,11 @@ pub struct PanelsState {
     rename_state: Option<InlineRenameState>,
     shader_editor: Option<ShaderEditorTarget>,
     expr_editor: Option<ExprEditorTarget>,
+    expr_editor_just_opened: bool,
+    stopwatch_ctx_menu: Option<StopwatchContextMenuState>,
+    collapsed_effect_groups: BTreeSet<String>,
+    history_log: VecDeque<(u64, String)>,
+    last_history_rev: u64,
     plugin_filter: String,
     assets_filter: String,
     shader_prop_kinds: BTreeMap<(String, String), usize>,
@@ -532,7 +553,6 @@ pub struct PanelsState {
     renaming_comp_buf: String,
     text2d_animator_tab: usize,
     objects_list_open: bool,
-    effects_list_open: bool,
     #[allow(dead_code)]
     objects_focus_bottom: bool,
     #[allow(dead_code)]
@@ -543,6 +563,10 @@ pub struct PanelsState {
     inspector_tx_label: Option<String>,
     inspector_tx_has_edits: bool,
     inspector_tx_owner_seen: bool,
+    picker_open_seq: u64,
+    font_picker_search: String,
+    shader_editor_just_opened: bool,
+    debug_copied_notice: Option<String>,
 }
 
 impl Default for PanelsState {
@@ -551,7 +575,7 @@ impl Default for PanelsState {
             media_search: String::new(),
             objects_split: SplitPanelState::new(0.40, SplitOrientation::Auto, 80.0, 100.0),
             effects_split: SplitPanelState::new(0.40, SplitOrientation::Auto, 80.0, 100.0),
-            prop_columns: PropertyColumnState::default(),
+            prop_columns: PropertyColumnState { label_ratio: 0.44 },
             add_object_open: false,
             add_object_picker: FuzzyPickerState::default(),
             add_effect_open: false,
@@ -566,7 +590,7 @@ impl Default for PanelsState {
             app_settings: AppSettings::default(),
             plugin_notice: None,
             floating_windows: FloatingWindowManager::default(),
-            new_seq_control_name: String::from("ctl_value"),
+            new_seq_control_name: String::from("ctl_slider_1"),
             new_shader_prop_name: String::from("Amount"),
             new_shader_prop_kind: 0,
             pending_project_actions: Vec::new(),
@@ -577,6 +601,11 @@ impl Default for PanelsState {
             rename_state: None,
             shader_editor: None,
             expr_editor: None,
+            expr_editor_just_opened: false,
+            stopwatch_ctx_menu: None,
+            collapsed_effect_groups: BTreeSet::new(),
+            history_log: VecDeque::new(),
+            last_history_rev: 0,
             plugin_filter: String::new(),
             assets_filter: String::new(),
             shader_prop_kinds: BTreeMap::new(),
@@ -603,7 +632,6 @@ impl Default for PanelsState {
             renaming_comp_buf: String::new(),
             text2d_animator_tab: 0,
             objects_list_open: true,
-            effects_list_open: true,
             objects_focus_bottom: false,
             effects_focus_bottom: false,
             expanded_vec_props: BTreeSet::new(),
@@ -612,6 +640,10 @@ impl Default for PanelsState {
             inspector_tx_label: None,
             inspector_tx_has_edits: false,
             inspector_tx_owner_seen: false,
+            picker_open_seq: 0,
+            font_picker_search: String::new(),
+            shader_editor_just_opened: false,
+            debug_copied_notice: None,
         }
     }
 }
@@ -720,6 +752,216 @@ fn touch_inspector_tx_owner(state: &mut PanelsState, target_id: &str, prop_key: 
     }
 }
 
+/// Executes `Command::PastePzJson` on `json` and emits clear toast feedback into `actions`.
+#[allow(clippy::too_many_arguments)]
+fn paste_pz_json_text(
+    session: &mut Session,
+    state: &mut PanelsState,
+    actions: &mut Vec<PanelAction>,
+    json: String,
+    hint: &str,
+    target_clip_id: Option<String>,
+    parent_object_id: Option<String>,
+    target_object_id: Option<String>,
+    target_property: Option<String>,
+) -> bool {
+    commit_inspector_tx_if_open(session, state);
+    // When pasting into the Layer Masks section, normalize mask objects that serialize with
+    // `"kind": "path"` so `zc-project`'s clipboard classifier doesn't mistake them for Shape+
+    // vector path items before running `parse_layer_masks`.
+    let json = if hint == "masks" {
+        fn strip_mask_path_kind(v: &mut Value) {
+            if let Some(obj) = v.as_object_mut() {
+                let is_mask_shape = obj.get("kind").and_then(Value::as_str) == Some("path")
+                    && (obj.contains_key("feather")
+                        || obj.contains_key("expansion")
+                        || obj.contains_key("invert")
+                        || obj.contains_key("outlineColor")
+                        || obj.contains_key("vertexIds")
+                        || obj.contains_key("mode"));
+                if is_mask_shape {
+                    obj.remove("kind");
+                }
+                for key in ["masks", "zoidiumMasks", "data"] {
+                    if let Some(child) = obj.get_mut(key) {
+                        strip_mask_path_kind(child);
+                    }
+                }
+            } else if let Some(arr) = v.as_array_mut() {
+                for elem in arr {
+                    strip_mask_path_kind(elem);
+                }
+            }
+        }
+        match serde_json::from_str::<Value>(&json) {
+            Ok(mut val) => {
+                strip_mask_path_kind(&mut val);
+                val.to_string()
+            }
+            Err(_) => json,
+        }
+    } else {
+        json
+    };
+    match session.execute(Command::PastePzJson {
+        json,
+        hint: Some(hint.to_owned()),
+        target_clip_id,
+        parent_object_id,
+        target_object_id,
+        target_property,
+        at_frame: None,
+    }) {
+        Ok(val) => {
+            let kind = val.get("kind").and_then(Value::as_str).unwrap_or(hint);
+            let default_count = if kind == "material" { 1 } else { 0 };
+            let count = val
+                .get("count")
+                .and_then(Value::as_u64)
+                .unwrap_or(default_count);
+            if count == 0 && kind != "material" {
+                let err_msg = match kind {
+                    "shape_plus" => "Paste failed: no valid Shape+ items found in JSON".to_owned(),
+                    "effects" => "Paste failed: no valid effects found in JSON".to_owned(),
+                    "objects3d" => "Paste failed: no valid 3D objects found in JSON".to_owned(),
+                    "masks" => "Paste failed: no valid layer masks found in JSON".to_owned(),
+                    "clips" => "Paste failed: no valid clips found in JSON".to_owned(),
+                    "keyframes" => "Paste failed: no valid keyframes found in JSON".to_owned(),
+                    other => format!("Paste failed: no valid {other} items found"),
+                };
+                actions.push(PanelAction::StatusMessage(err_msg));
+                return false;
+            }
+            let mut msg = match kind {
+                "effects" => format!("Pasted {count} effect{}", if count == 1 { "" } else { "s" }),
+                "objects3d" => {
+                    format!(
+                        "Pasted {count} 3D object{}",
+                        if count == 1 { "" } else { "s" }
+                    )
+                }
+                "material" => "Pasted 3D material".to_owned(),
+                "masks" => format!("Pasted {count} mask{}", if count == 1 { "" } else { "s" }),
+                "shape_plus" => {
+                    format!(
+                        "Pasted {count} Shape+ item{}",
+                        if count == 1 { "" } else { "s" }
+                    )
+                }
+                "clips" => format!("Pasted {count} clip{}", if count == 1 { "" } else { "s" }),
+                "keyframes" => {
+                    format!(
+                        "Pasted {count} keyframe{}",
+                        if count == 1 { "" } else { "s" }
+                    )
+                }
+                other => format!("Pasted {other}"),
+            };
+            if let Some(plugins) = val.get("enabled_plugins").and_then(Value::as_array) {
+                let names: Vec<&str> = plugins.iter().filter_map(Value::as_str).collect();
+                if !names.is_empty() {
+                    msg.push_str(&format!(" (enabled: {})", names.join(", ")));
+                }
+            }
+            actions.push(PanelAction::StatusMessage(msg));
+            true
+        }
+        Err(err) => {
+            actions.push(PanelAction::StatusMessage(format!("Paste failed: {err}")));
+            false
+        }
+    }
+}
+
+/// Reads the OS clipboard and executes `Command::PastePzJson` with clear toast feedback.
+#[allow(clippy::too_many_arguments)]
+fn paste_pz_json_from_clipboard(
+    session: &mut Session,
+    state: &mut PanelsState,
+    actions: &mut Vec<PanelAction>,
+    hint: &str,
+    target_clip_id: Option<String>,
+    parent_object_id: Option<String>,
+    target_object_id: Option<String>,
+    target_property: Option<String>,
+    empty_label: &str,
+) -> bool {
+    let Some(json) = read_system_clipboard() else {
+        actions.push(PanelAction::StatusMessage(format!(
+            "Clipboard is empty (no {empty_label})"
+        )));
+        return false;
+    };
+    paste_pz_json_text(
+        session,
+        state,
+        actions,
+        json,
+        hint,
+        target_clip_id,
+        parent_object_id,
+        target_object_id,
+        target_property,
+    )
+}
+
+/// Writes a serialized PZ JSON payload to the OS system clipboard and reports toast feedback.
+fn copy_pz_json_to_clipboard(
+    ctx: &egui::Context,
+    result: Result<String, zc_session::SessionError>,
+    success_msg: &str,
+    actions: &mut Vec<PanelAction>,
+) {
+    match result {
+        Ok(json) => {
+            write_system_clipboard(ctx, &json);
+            actions.push(PanelAction::StatusMessage(success_msg.to_owned()));
+        }
+        Err(err) => {
+            actions.push(PanelAction::StatusMessage(format!("Copy failed: {err}")));
+        }
+    }
+}
+
+/// Renders a crisp compact action button inside a 27-28px panel/section header bar.
+/// Returns `(clicked, hovered)`.
+fn header_compact_action_button(
+    ui: &mut Ui,
+    id: Id,
+    rect: Rect,
+    label: &str,
+    tooltip: &str,
+    theme: &Cm3Theme,
+) -> (bool, bool) {
+    let resp = ui
+        .interact(rect, id, Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(tooltip);
+    let hovered = resp.hovered();
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::ZERO,
+        if hovered { BG_HOVER } else { BG_BUTTON },
+    );
+    paint_crisp_panel_border(
+        ui.painter(),
+        rect,
+        if hovered {
+            theme.accent()
+        } else {
+            BORDER_CONTROL
+        },
+    );
+    ui.painter().with_clip_rect(rect).text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        theme.font(FONT_COMPACT),
+        if hovered { TEXT_BRIGHT } else { TEXT_PRIMARY },
+    );
+    (resp.clicked(), hovered)
+}
+
 /// Renders the currently active CM3 / Zoidium side panel inside `panel_rect`.
 #[allow(clippy::too_many_arguments)]
 pub fn show_side_panel(
@@ -736,6 +978,18 @@ pub fn show_side_panel(
     state.inspector_root_indent = false;
     if !session.history.is_in_transaction() {
         clear_inspector_tx_state(state);
+    }
+
+    // Track history revisions so the Restore / History tab displays a recent activity list.
+    let cur_rev = session.history.revision();
+    if cur_rev != state.last_history_rev {
+        state.last_history_rev = cur_rev;
+        if let Some(lbl) = session.history.peek_undo_label() {
+            state.history_log.push_front((cur_rev, lbl.to_owned()));
+            while state.history_log.len() > 32 {
+                state.history_log.pop_back();
+            }
+        }
     }
 
     match tab {
@@ -802,6 +1056,9 @@ pub fn show_side_panel(
 
     // Floating editors spawned from inspectors (Custom Shader GLSL editor, Expression editor)
     show_inspector_floating_windows(ui.ctx(), viewport_rect, session, theme, state);
+
+    // Right-click stopwatch context menu (Edit Expression / Clear Expression / Toggle Keyframe)
+    show_stopwatch_context_menu(ui.ctx(), viewport_rect, session, theme, state);
 }
 
 // ---------------------------------------------------------------------------
@@ -813,7 +1070,9 @@ enum MediaCardIcon {
     Scene3D,
     Adjustment,
     Text,
-    Shape,
+    PresetShape,
+    VectorShape,
+    ShapePlus,
     Composite,
     Camera,
     Precomp,
@@ -853,14 +1112,14 @@ const MEDIA_PRESETS: &[MediaPreset] = &[
         kind: "preset_shape",
         title: "Preset shape",
         subtitle: "Parametric 2D preset",
-        icon: MediaCardIcon::Shape,
+        icon: MediaCardIcon::PresetShape,
         required_plugin: None,
     },
     MediaPreset {
         kind: "shape",
         title: "Shape",
         subtitle: "Custom vector shape",
-        icon: MediaCardIcon::Shape,
+        icon: MediaCardIcon::VectorShape,
         required_plugin: None,
     },
     MediaPreset {
@@ -881,7 +1140,7 @@ const MEDIA_PRESETS: &[MediaPreset] = &[
         kind: "zoidium:shape-plus/shape-layer",
         title: "Shape+",
         subtitle: "Animated 2D vector layer",
-        icon: MediaCardIcon::Shape,
+        icon: MediaCardIcon::ShapePlus,
         required_plugin: Some("shape-plus"),
     },
     MediaPreset {
@@ -928,8 +1187,8 @@ fn paint_media_card_icon(
             painter.rect_filled(bar, CornerRadius::ZERO, color);
             painter.rect_filled(stem, CornerRadius::ZERO, color);
         }
-        MediaCardIcon::Shape => {
-            // Triangle overlapping a circle matching Zoidium Preset shape / Shape / Shape+ (45x38)
+        MediaCardIcon::PresetShape => {
+            // Geometric triangle overlapping a circle for parametric Preset shapes
             painter.circle_filled(pt(0.64, 0.64), side * 0.28, color);
             let cutout = vec![pt(0.36, 0.06), pt(0.75, 0.82), pt(-0.02, 0.82)];
             painter.add(Shape::convex_polygon(
@@ -939,6 +1198,74 @@ fn paint_media_card_icon(
             ));
             let tri = vec![pt(0.36, 0.12), pt(0.70, 0.78), pt(0.02, 0.78)];
             painter.add(Shape::convex_polygon(tri, color, Stroke::NONE));
+        }
+        MediaCardIcon::VectorShape => {
+            // Bezier path + anchor nodes + tangent handles for custom vector Shape
+            let sw = (side * 0.065).clamp(1.8, 3.2);
+            let mut curve_pts = Vec::with_capacity(17);
+            let p0 = pt(0.14, 0.78);
+            let p1 = pt(0.16, 0.18);
+            let p2 = pt(0.84, 0.82);
+            let p3 = pt(0.86, 0.22);
+            for i in 0..=16 {
+                let t = i as f32 / 16.0;
+                let u = 1.0 - t;
+                let x = u * u * u * p0.x
+                    + 3.0 * u * u * t * p1.x
+                    + 3.0 * u * t * t * p2.x
+                    + t * t * t * p3.x;
+                let y = u * u * u * p0.y
+                    + 3.0 * u * u * t * p1.y
+                    + 3.0 * u * t * t * p2.y
+                    + t * t * t * p3.y;
+                curve_pts.push(Pos2::new(x, y));
+            }
+            painter.add(Shape::line(curve_pts, Stroke::new(sw, color)));
+            // Tangent handles
+            let handle_stroke = Stroke::new((sw * 0.55).max(1.2), color32_with_alpha(color, 165));
+            painter.line_segment([p0, pt(0.18, 0.34)], handle_stroke);
+            painter.line_segment([p3, pt(0.82, 0.66)], handle_stroke);
+            painter.circle_filled(pt(0.18, 0.34), side * 0.055, color);
+            painter.circle_filled(pt(0.82, 0.66), side * 0.055, color);
+            // Square bezier anchor nodes
+            for anchor in [p0, pt(0.50, 0.50), p3] {
+                let box_r = Rect::from_center_size(anchor, Vec2::splat(side * 0.16));
+                painter.rect_filled(box_r, CornerRadius::ZERO, card_bg);
+                painter.rect_stroke(
+                    box_r,
+                    CornerRadius::ZERO,
+                    Stroke::new(sw * 0.8, color),
+                    StrokeKind::Inside,
+                );
+            }
+        }
+        MediaCardIcon::ShapePlus => {
+            // Stacked rounded vector shapes with a crisp '+' badge in top-right for Shape+
+            let sw = (side * 0.06).clamp(1.6, 3.0);
+            let back = Rect::from_min_max(pt(0.10, 0.24), pt(0.62, 0.76));
+            painter.rect_stroke(
+                back,
+                CornerRadius::same(4),
+                Stroke::new(sw, color32_with_alpha(color, 180)),
+                StrokeKind::Inside,
+            );
+            let front = Rect::from_min_max(pt(0.24, 0.38), pt(0.76, 0.90));
+            painter.rect_filled(front, CornerRadius::same(4), card_bg);
+            painter.rect_filled(front.shrink(sw * 0.6), CornerRadius::same(3), color);
+            // Crisp '+' badge at upper-right
+            let plus_c = pt(0.78, 0.22);
+            let arm = side * 0.14;
+            let thick = (side * 0.07).clamp(2.0, 3.5);
+            painter.rect_filled(
+                Rect::from_center_size(plus_c, Vec2::new(arm * 2.0, thick)),
+                CornerRadius::ZERO,
+                color,
+            );
+            painter.rect_filled(
+                Rect::from_center_size(plus_c, Vec2::new(thick, arm * 2.0)),
+                CornerRadius::ZERO,
+                color,
+            );
         }
         MediaCardIcon::Composite => {
             // 3 stacked isometric diamonds (54x48 px at card scale) matching Zoidium Composite card
@@ -961,6 +1288,90 @@ fn paint_media_card_icon(
             painter.add(Shape::line(bot, Stroke::new(sw, color)));
         }
     }
+}
+
+fn paint_audio_media_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let side = rect.width().min(rect.height()).max(1.0);
+    let r = Rect::from_center_size(rect.center(), Vec2::splat(side));
+    let pt = |nx: f32, ny: f32| Pos2::new(r.left() + r.width() * nx, r.top() + r.height() * ny);
+    let sw = (side * 0.065).clamp(1.6, 3.0);
+
+    // Speaker body + cone on the left
+    let body = Rect::from_min_max(pt(0.10, 0.36), pt(0.28, 0.64));
+    painter.rect_filled(body, CornerRadius::same(1), color);
+    let cone = vec![
+        pt(0.26, 0.36),
+        pt(0.50, 0.16),
+        pt(0.50, 0.84),
+        pt(0.26, 0.64),
+    ];
+    painter.add(Shape::convex_polygon(cone, color, Stroke::NONE));
+
+    // Crisp 3-bar soundwave / equalizer bars on the right
+    let bars = [(0.62, 0.34, 0.66), (0.74, 0.22, 0.78), (0.86, 0.30, 0.70)];
+    for (x, y0, y1) in bars {
+        painter.line_segment([pt(x, y0), pt(x, y1)], Stroke::new(sw, color));
+    }
+}
+
+/// Paints a crisp landscape photo-frame icon (outer border, sun, and twin mountain peaks)
+/// for imported image assets (`.png`/`.jpg`/`.webp`/etc.) in Project Media.
+fn paint_image_media_icon(painter: &Painter, rect: Rect, color: Color32, card_bg: Color32) {
+    let side = rect.width().min(rect.height()).max(1.0);
+    let r = Rect::from_center_size(rect.center(), Vec2::splat(side));
+    let pt = |nx: f32, ny: f32| Pos2::new(r.left() + r.width() * nx, r.top() + r.height() * ny);
+    let sw = (side * 0.06).clamp(1.6, 2.8);
+
+    // Outer landscape picture frame
+    let frame = Rect::from_min_max(pt(0.08, 0.16), pt(0.92, 0.84));
+    painter.rect_filled(frame, CornerRadius::same(2), card_bg);
+    painter.rect_stroke(
+        frame,
+        CornerRadius::same(2),
+        Stroke::new(sw, color),
+        StrokeKind::Inside,
+    );
+
+    // Sun disc in upper-left
+    painter.circle_filled(pt(0.30, 0.36), (side * 0.085).max(1.8), color);
+
+    // Back mountain peak (right-center)
+    let back_peak = vec![pt(0.42, 0.78), pt(0.67, 0.40), pt(0.87, 0.78)];
+    painter.add(Shape::convex_polygon(
+        back_peak,
+        color32_with_alpha(color, 185),
+        Stroke::NONE,
+    ));
+
+    // Front mountain peak (left-center)
+    let front_peak = vec![pt(0.13, 0.78), pt(0.39, 0.48), pt(0.62, 0.78)];
+    painter.add(Shape::convex_polygon(front_peak, color, Stroke::NONE));
+}
+
+fn layout_single_line_ellipsized(
+    painter: &Painter,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let full = painter.layout_no_wrap(text.to_owned(), font.clone(), color);
+    if full.size().x <= max_width || max_width <= 8.0 {
+        return full;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut len = chars.len();
+    let mut chosen = full;
+    while len > 0 {
+        len -= 1;
+        let cand = format!("{}…", chars[..len].iter().collect::<String>().trim_end());
+        let g = painter.layout_no_wrap(cand, font.clone(), color);
+        if g.size().x <= max_width || len == 0 {
+            chosen = g;
+            break;
+        }
+    }
+    chosen
 }
 
 fn clip_kind_for_asset(kind: AssetKind, filename: &str) -> &'static str {
@@ -1078,13 +1489,6 @@ fn show_media_tab(
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
             ui.painter()
                 .rect_filled(bar_rect, CornerRadius::ZERO, BG_TITLE);
-            ui.painter().text(
-                Pos2::new(bar_rect.left() + 5.0, bar_rect.center().y + 1.0),
-                Align2::LEFT_CENTER,
-                "Project media",
-                theme.font(FONT_BODY),
-                TEXT_PRIMARY,
-            );
             let import_galley = ui.painter().layout_no_wrap(
                 "Import".to_owned(),
                 theme.font(FONT_BODY),
@@ -1100,6 +1504,57 @@ fn show_media_tab(
                     bar_rect.top(),
                 ),
                 bar_rect.right_bottom(),
+            );
+            // Keep title cleanly clipped/shortened before "+ Import" so it never overlaps at 900x600
+            let title_left = bar_rect.left() + 5.0;
+            let title_max_w = (import_rect.left() - title_left - 6.0).max(16.0);
+            let full_title_galley = ui.painter().layout_no_wrap(
+                "Project media".to_owned(),
+                theme.font(FONT_BODY),
+                TEXT_PRIMARY,
+            );
+            let title_galley = if full_title_galley.size().x <= title_max_w {
+                full_title_galley
+            } else {
+                let short_galley = ui.painter().layout_no_wrap(
+                    "Media".to_owned(),
+                    theme.font(FONT_BODY),
+                    TEXT_PRIMARY,
+                );
+                if short_galley.size().x <= title_max_w {
+                    short_galley
+                } else {
+                    let chars: Vec<char> = "Media".chars().collect();
+                    let mut len = chars.len();
+                    let mut chosen = short_galley;
+                    while len > 0 {
+                        len -= 1;
+                        let cand = format!("{}…", chars[..len].iter().collect::<String>());
+                        let g =
+                            ui.painter()
+                                .layout_no_wrap(cand, theme.font(FONT_BODY), TEXT_PRIMARY);
+                        if g.size().x <= title_max_w || len == 0 {
+                            chosen = g;
+                            break;
+                        }
+                    }
+                    chosen
+                }
+            };
+            let title_clip = Rect::from_min_max(
+                Pos2::new(title_left, bar_rect.top()),
+                Pos2::new(
+                    (import_rect.left() - 4.0).max(title_left),
+                    bar_rect.bottom(),
+                ),
+            );
+            ui.painter().with_clip_rect(title_clip).galley(
+                Pos2::new(
+                    title_left,
+                    bar_rect.center().y + 1.0 - title_galley.size().y * 0.5,
+                ),
+                title_galley,
+                TEXT_PRIMARY,
             );
             let import_resp = ui
                 .interact(import_rect, Id::unique("media_import_btn"), Sense::click())
@@ -1237,20 +1692,32 @@ fn show_media_tab(
                                 };
                                 ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
 
+                                let narrow_card = card_w < 96.0;
                                 let icon_rect = Rect::from_center_size(
-                                    Pos2::new(rect.center().x, rect.top() + 45.5),
-                                    Vec2::splat(48.0),
+                                    Pos2::new(
+                                        rect.center().x,
+                                        rect.top() + if narrow_card { 42.0 } else { 45.5 },
+                                    ),
+                                    Vec2::splat(if narrow_card { 40.0 } else { 48.0 }),
                                 );
                                 let label_clip = Rect::from_min_max(
-                                    Pos2::new(rect.left() + 5.0, rect.bottom() - 28.0),
-                                    Pos2::new(rect.right() - 5.0, rect.bottom() - 2.0),
+                                    Pos2::new(
+                                        rect.left() + 5.0,
+                                        rect.bottom() - if narrow_card { 24.0 } else { 26.0 },
+                                    ),
+                                    Pos2::new(rect.right() - 5.0, rect.bottom() - 3.0),
                                 );
+                                let card_font =
+                                    theme.font(if narrow_card { FONT_COMPACT } else { FONT_BODY });
 
                                 match item {
                                     MediaGridItem::Preset(preset) => {
                                         let resp = resp
                                             .on_hover_cursor(CursorIcon::PointingHand)
-                                            .on_hover_text(preset.subtitle);
+                                            .on_hover_text(format!(
+                                                "{} — {}",
+                                                preset.title, preset.subtitle
+                                            ));
                                         paint_media_card_icon(
                                             ui.painter(),
                                             icon_rect,
@@ -1258,11 +1725,17 @@ fn show_media_tab(
                                             TEXT_PRIMARY,
                                             bg,
                                         );
-                                        ui.painter().with_clip_rect(label_clip).text(
-                                            Pos2::new(rect.left() + 5.0, rect.bottom() - 4.0),
-                                            Align2::LEFT_BOTTOM,
+                                        let galley = layout_single_line_ellipsized(
+                                            ui.painter(),
                                             preset.title,
-                                            theme.font(FONT_BODY),
+                                            card_font.clone(),
+                                            TEXT_PRIMARY,
+                                            label_clip.width().max(24.0),
+                                        );
+                                        let label_y = label_clip.center().y - galley.size().y * 0.5;
+                                        ui.painter().with_clip_rect(label_clip).galley(
+                                            Pos2::new(label_clip.left(), label_y),
+                                            galley,
                                             TEXT_PRIMARY,
                                         );
                                         if resp.clicked() {
@@ -1273,34 +1746,46 @@ fn show_media_tab(
                                         let resp = resp
                                             .on_hover_cursor(CursorIcon::PointingHand)
                                             .on_hover_text(format!(
-                                                "Click to add {} clip to timeline",
-                                                entry.clip_kind
+                                                "{} — click to add {} clip to timeline",
+                                                entry.name, entry.clip_kind
                                             ));
-                                        let icon = match entry.clip_kind {
-                                            "video" => Cm3Icon::Sequence,
-                                            "audio" => Cm3Icon::Edit2,
-                                            _ => Cm3Icon::Project,
+                                        let text_col = if entry.missing {
+                                            DANGER_TEXT
+                                        } else {
+                                            TEXT_PRIMARY
                                         };
-                                        paint_cm3_icon(
+                                        if entry.clip_kind == "audio" {
+                                            paint_audio_media_icon(
+                                                ui.painter(),
+                                                icon_rect,
+                                                text_col,
+                                            );
+                                        } else if entry.clip_kind == "image" {
+                                            paint_image_media_icon(
+                                                ui.painter(),
+                                                icon_rect,
+                                                text_col,
+                                                bg,
+                                            );
+                                        } else {
+                                            let icon = match entry.clip_kind {
+                                                "video" => Cm3Icon::Sequence,
+                                                _ => Cm3Icon::Project,
+                                            };
+                                            paint_cm3_icon(ui.painter(), icon_rect, icon, text_col);
+                                        }
+                                        let galley = layout_single_line_ellipsized(
                                             ui.painter(),
-                                            icon_rect,
-                                            icon,
-                                            if entry.missing {
-                                                DANGER_TEXT
-                                            } else {
-                                                TEXT_PRIMARY
-                                            },
-                                        );
-                                        ui.painter().with_clip_rect(label_clip).text(
-                                            Pos2::new(rect.left() + 5.0, rect.bottom() - 4.0),
-                                            Align2::LEFT_BOTTOM,
                                             &entry.name,
-                                            theme.font(FONT_BODY),
-                                            if entry.missing {
-                                                DANGER_TEXT
-                                            } else {
-                                                TEXT_PRIMARY
-                                            },
+                                            card_font.clone(),
+                                            text_col,
+                                            label_clip.width().max(24.0),
+                                        );
+                                        let label_y = label_clip.center().y - galley.size().y * 0.5;
+                                        ui.painter().with_clip_rect(label_clip).galley(
+                                            Pos2::new(label_clip.left(), label_y),
+                                            galley,
+                                            text_col,
                                         );
                                         if resp.clicked() {
                                             add_clip_with_asset(
@@ -1320,20 +1805,6 @@ fn show_media_tab(
         });
 }
 
-fn find_non_overlapping_start(clips: &[SessionClip], desired: f64, length: f64) -> f64 {
-    let mut start = desired.max(0.0).round();
-    loop {
-        if let Some(blocker) = clips
-            .iter()
-            .find(|c| c.start < start + length - 1e-6 && start < c.start + c.length - 1e-6)
-        {
-            start = (blocker.start + blocker.length).ceil();
-        } else {
-            return start;
-        }
-    }
-}
-
 fn add_preset_clip(session: &mut Session, kind: &str, title: &str) {
     add_clip_with_asset(session, kind, title, None);
 }
@@ -1341,36 +1812,35 @@ fn add_preset_clip(session: &mut Session, kind: &str, title: &str) {
 fn add_clip_with_asset(session: &mut Session, kind: &str, title: &str, asset_id: Option<&str>) {
     let is_audio = kind == "audio";
     let desired_start = session.playback.current_frame.max(0.0).round();
-    let length = 150.0;
+    let length = session.active_sequence().length_frames.clamp(1.0, 150.0);
 
-    // Pick a matching unlocked track with no overlap at playhead, or place at earliest
-    // non-overlapping start on the first unlocked track (never blindly overwriting Track 0).
-    let chosen: Option<(String, f64)> = {
+    // Place the new clip at the current playhead (`desired_start`) on the first unlocked
+    // matching track with no overlapping clip in `[desired_start, desired_start + length)`.
+    // If every existing unlocked track overlaps at `desired_start`, create a new track above
+    // via `Command::AddVideoTrack` / `Command::AddAudioTrack` so the clip is immediately
+    // visible in both the viewport and timeline instead of pushed off-screen!
+    let chosen_track_id: Option<String> = {
         let tracks = if is_audio {
             &session.document().audio_tracks
         } else {
             &session.document().video_tracks
         };
-        if let Some(free_track) = tracks.iter().find(|t| {
-            !t.locked
-                && !t.clips.iter().any(|c| {
-                    c.start < desired_start + length - 1e-6
-                        && desired_start < c.start + c.length - 1e-6
-                })
-        }) {
-            Some((free_track.id.clone(), desired_start))
-        } else {
-            tracks.iter().find(|t| !t.locked).map(|t| {
-                let start = find_non_overlapping_start(&t.clips, desired_start, length);
-                (t.id.clone(), start)
+        tracks
+            .iter()
+            .find(|t| {
+                !t.locked
+                    && !t.clips.iter().any(|c| {
+                        c.start < desired_start + length - 1e-6
+                            && desired_start < c.start + c.length - 1e-6
+                    })
             })
-        }
+            .map(|t| t.id.clone())
     };
 
     let started_tx = session.begin_transaction(format!("add {title}")).is_ok();
 
-    let (track_id, start) = if let Some(pair) = chosen {
-        pair
+    let (track_id, start) = if let Some(tid) = chosen_track_id {
+        (tid, desired_start)
     } else {
         let create_cmd = if is_audio {
             Command::AddAudioTrack { name: None }
@@ -1447,6 +1917,38 @@ fn add_clip_with_asset(session: &mut Session, kind: &str, title: &str, asset_id:
 // Tab 2: Sequence (sequence)
 // ---------------------------------------------------------------------------
 
+/// Applies an undoable update to the active sequence's RGBA `background_color` and bumps the
+/// playback/render cache epoch so the viewport (and checkerboard overlay) redraw immediately.
+fn set_sequence_background_color_undoable(session: &mut Session, bg_color: [f32; 4], label: &str) {
+    let started_tx = if !session.history.is_in_transaction() {
+        session.begin_transaction(label).is_ok()
+    } else {
+        false
+    };
+    session.active_sequence_mut().background_color = bg_color;
+    session.playback.bump_epoch();
+    if started_tx && session.history.is_in_transaction() {
+        let _ = session.commit_transaction(true);
+    }
+}
+
+/// Returns responsive motion-blur labels (`"Samples"`/`"Shutter"` normally, or distinct
+/// compact `"Samp."`/`"Shutt."` on narrow `800×540` panels) so they never collapse to `"S..."`.
+fn sequence_motion_blur_labels(panel_width: f32) -> (&'static str, &'static str) {
+    if panel_width < 245.0 {
+        ("Samp.", "Shutt.")
+    } else {
+        ("Samples", "Shutter")
+    }
+}
+
+/// Computes the Sequence header `label_ratio` so `"Sequence"` never clips against `↻`.
+fn sequence_header_label_ratio(avail_w: f32, base_ratio: f32) -> f32 {
+    let w = avail_w.max(120.0);
+    let min_ratio = (112.0 / w).min(0.86);
+    base_ratio.max(min_ratio)
+}
+
 fn show_sequence_tab(
     ui: &mut Ui,
     panel_rect: Rect,
@@ -1470,13 +1972,16 @@ fn show_sequence_tab(
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
 
+            let seq_avail_w = ui.available_width().max(120.0);
+            let seq_hdr_ratio =
+                sequence_header_label_ratio(seq_avail_w, state.prop_columns.label_ratio);
             let (reset_seq, _) = cm3_collapsible_section_with_action(
                 ui,
                 Id::unique("seq_general"),
                 "Sequence",
                 true,
                 false,
-                state.prop_columns.label_ratio,
+                seq_hdr_ratio,
                 Some((Cm3Icon::Reset, "Reset sequence")),
                 theme,
                 |ui| {
@@ -1641,6 +2146,140 @@ fn show_sequence_tab(
                         }
                     }
 
+                    // Background color (RGBA swatch/picker) + Transparent toggle (alpha 0.0 vs 1.0)
+                    touch_inspector_tx_owner(state, "sequence", "backgroundColor");
+                    let bg = session.active_sequence().background_color;
+                    let mut bg_rgba = Rgba::new(bg[0], bg[1], bg[2], bg[3]);
+                    let bg_ev = cm3_property_row_aligned(
+                        ui,
+                        "Background",
+                        true,
+                        state.prop_columns,
+                        theme,
+                        |_| {},
+                        |ui| {
+                            cm3_hsva_color_picker(
+                                ui,
+                                Id::unique("seq_background_color"),
+                                &mut bg_rgba,
+                                true,
+                                false,
+                                viewport_rect,
+                                theme,
+                            )
+                        },
+                    );
+                    let owns_bg_tx = owns_inspector_tx(state, "sequence", "backgroundColor");
+                    let new_bg = [bg_rgba.0[0], bg_rgba.0[1], bg_rgba.0[2], bg_rgba.0[3]];
+                    if bg_ev.cancelled {
+                        if owns_bg_tx {
+                            if session.history.is_in_transaction() {
+                                let _ = session.cancel_transaction();
+                            }
+                            clear_inspector_tx_state(state);
+                        }
+                    } else if bg_ev.started && bg_ev.committed {
+                        if owns_bg_tx {
+                            if bg_ev.changed {
+                                session.active_sequence_mut().background_color = new_bg;
+                                session.playback.bump_epoch();
+                                state.inspector_tx_has_edits = true;
+                            }
+                            if session.history.is_in_transaction() {
+                                let _ = session.commit_transaction(true);
+                            }
+                            clear_inspector_tx_state(state);
+                        } else {
+                            close_existing_tx_before_start(session, state);
+                            if bg_ev.changed {
+                                set_sequence_background_color_undoable(
+                                    session,
+                                    new_bg,
+                                    "set background color",
+                                );
+                            }
+                        }
+                        begin_inspector_tx(
+                            session,
+                            state,
+                            "sequence",
+                            "backgroundColor",
+                            "set background color",
+                        );
+                    } else {
+                        if bg_ev.started && !bg_ev.committed {
+                            close_existing_tx_before_start(session, state);
+                            begin_inspector_tx(
+                                session,
+                                state,
+                                "sequence",
+                                "backgroundColor",
+                                "set background color",
+                            );
+                        }
+                        let owns_bg_tx = owns_inspector_tx(state, "sequence", "backgroundColor");
+                        if bg_ev.changed && bg_ev.committed && !bg_ev.started && !owns_bg_tx {
+                            run_atomic_commit_outside_foreign_tx(session, state, |session| {
+                                set_sequence_background_color_undoable(
+                                    session,
+                                    new_bg,
+                                    "set background color",
+                                );
+                            });
+                        } else {
+                            if bg_ev.changed || (bg_ev.committed && owns_bg_tx) {
+                                session.active_sequence_mut().background_color = new_bg;
+                                session.playback.bump_epoch();
+                                if owns_bg_tx {
+                                    state.inspector_tx_has_edits = true;
+                                }
+                            }
+                            if bg_ev.committed && owns_bg_tx {
+                                if session.history.is_in_transaction() {
+                                    let _ = session.commit_transaction(true);
+                                }
+                                clear_inspector_tx_state(state);
+                            }
+                        }
+                    }
+
+                    let cur_bg = session.active_sequence().background_color;
+                    let mut transparent_idx = usize::from(cur_bg[3] <= 0.001);
+                    let transparent_changed = cm3_property_row_aligned(
+                        ui,
+                        "Transparent",
+                        true,
+                        state.prop_columns,
+                        theme,
+                        |_| {},
+                        |ui| {
+                            cm3_dropdown(
+                                ui,
+                                Id::unique("seq_bg_transparent"),
+                                &mut transparent_idx,
+                                &["off", "on"],
+                                false,
+                                viewport_rect,
+                                theme,
+                            )
+                        },
+                    );
+                    if transparent_changed {
+                        let next_alpha = if transparent_idx != 0 { 0.0 } else { 1.0 };
+                        let next_bg = [cur_bg[0], cur_bg[1], cur_bg[2], next_alpha];
+                        run_atomic_commit_outside_foreign_tx(session, state, |session| {
+                            set_sequence_background_color_undoable(
+                                session,
+                                next_bg,
+                                if transparent_idx != 0 {
+                                    "enable transparent background"
+                                } else {
+                                    "disable transparent background"
+                                },
+                            );
+                        });
+                    }
+
                     // Markers: < ◇ > navigator row (no divider directly below; 33px gap + divider before Motion blur)
                     let mut prev_marker_frame: Option<f64> = None;
                     let mut next_marker_frame: Option<f64> = None;
@@ -1664,22 +2303,36 @@ fn show_sequence_tab(
                     let total_w = ui.available_width().max(120.0);
                     let (markers_rect, _) =
                         ui.allocate_exact_size(Vec2::new(total_w, 27.0), Sense::hover());
+                    let narrow_markers = total_w < 210.0;
+                    let label_indent: f32 = if narrow_markers { 18.0 } else { 36.0 };
+                    let ctrl_reserve: f32 = if narrow_markers { 64.0 } else { 74.0 };
+                    let min_split = (label_indent + 58.0).min((total_w - ctrl_reserve).max(64.0));
+                    let max_split = (total_w - ctrl_reserve).max(min_split);
                     let split_x = (markers_rect.left()
-                        + (total_w * state.prop_columns.label_ratio)
-                            .clamp(72.0, (total_w - 60.0).max(72.0)))
+                        + (total_w * state.prop_columns.label_ratio).clamp(min_split, max_split))
                     .round();
+                    let label_max_w =
+                        (split_x - 5.0 - (markers_rect.left() + label_indent)).max(16.0);
                     let label_clip = Rect::from_min_max(
-                        Pos2::new(markers_rect.left() + 36.0, markers_rect.top()),
+                        Pos2::new(markers_rect.left() + label_indent, markers_rect.top()),
                         Pos2::new(
-                            (split_x - 5.0).max(markers_rect.left() + 36.0),
+                            (split_x - 5.0).max(markers_rect.left() + label_indent),
                             markers_rect.bottom(),
                         ),
                     );
-                    ui.painter().with_clip_rect(label_clip).text(
-                        Pos2::new(markers_rect.left() + 36.0, markers_rect.center().y),
-                        Align2::LEFT_CENTER,
+                    let markers_galley = layout_single_line_ellipsized(
+                        ui.painter(),
                         "Markers",
                         theme.font(FONT_BODY),
+                        TEXT_PRIMARY,
+                        label_max_w,
+                    );
+                    ui.painter().with_clip_rect(label_clip).galley(
+                        Pos2::new(
+                            markers_rect.left() + label_indent,
+                            markers_rect.center().y - markers_galley.size().y * 0.5,
+                        ),
+                        markers_galley,
                         TEXT_PRIMARY,
                     );
                     let mut go_prev = false;
@@ -1695,7 +2348,7 @@ fn show_sequence_tab(
                             .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     );
                     col2_ui.set_clip_rect(col2_ui.clip_rect().intersect(col2_rect));
-                    col2_ui.spacing_mut().item_spacing.x = 7.0;
+                    col2_ui.spacing_mut().item_spacing.x = if narrow_markers { 4.0 } else { 7.0 };
                     if cm3_icon_button(
                         &mut col2_ui,
                         Cm3Icon::PrevKf,
@@ -1760,8 +2413,7 @@ fn show_sequence_tab(
                         }
                     }
 
-                    // 33px blank gap + 1px #242424 divider directly above Multisample motion blur
-                    ui.add_space(33.0);
+                    // 1px #242424 divider directly between Markers and Multisample motion blur
                     let (gap_div, _) =
                         ui.allocate_exact_size(Vec2::new(total_w, 1.0), Sense::hover());
                     ui.painter()
@@ -1798,12 +2450,18 @@ fn show_sequence_tab(
                     }
 
                     // Samples (16, with stopwatch) & Shutter (0.50, with stopwatch)
+                    let (samples_lbl, shutter_lbl) = sequence_motion_blur_labels(seq_avail_w);
+                    let prev_seq_ratio = state.prop_columns.label_ratio;
+                    if seq_avail_w < 245.0 {
+                        state.prop_columns.label_ratio =
+                            prev_seq_ratio.max((106.0 / seq_avail_w).min(0.56));
+                    }
                     show_session_number_prop(
                         ui,
                         session,
                         "sequence",
                         "motionBlur.samples",
-                        "Samples",
+                        samples_lbl,
                         16.0,
                         ScrubConfig::new(1.0, 64.0, 1.0, 0),
                         frame,
@@ -1818,7 +2476,7 @@ fn show_sequence_tab(
                         session,
                         "sequence",
                         "motionBlur.shutter",
-                        "Shutter",
+                        shutter_lbl,
                         0.5,
                         ScrubConfig::new(0.0, 2.0, 0.05, 2),
                         frame,
@@ -1828,6 +2486,7 @@ fn show_sequence_tab(
                         theme,
                         actions,
                     );
+                    state.prop_columns.label_ratio = prev_seq_ratio;
 
                     // Controls nested section (Expressions+): full SequenceControlKind builder
                     // (Slider, Angle, Checkbox, Color, Point2D, Point3D) + legacy ctl_* compatibility.
@@ -1852,6 +2511,8 @@ fn show_sequence_tab(
                     height: 1080,
                 });
                 let _ = session.execute(Command::SetFps { fps: 30.0 });
+                session.active_sequence_mut().background_color = [0.0, 0.0, 0.0, 1.0];
+                session.playback.bump_epoch();
                 let _ = session.execute(Command::ResetPropertyList {
                     target_id: "sequence".to_owned(),
                 });
@@ -1907,10 +2568,44 @@ fn show_edit_tab(
     };
 
     ScrollArea::vertical()
-        .id_salt("edit_tab_scroll")
+        .id_salt(("edit_tab_scroll", &clip_id))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+
+            let selected_clip_count = session.selection.clip_ids.len();
+            if selected_clip_count > 1 {
+                let banner_resp = Frame::NONE
+                    .fill(BG_TITLE)
+                    .inner_margin(egui::Margin {
+                        left: 10,
+                        right: 8,
+                        top: 5,
+                        bottom: 5,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new(format!("{selected_clip_count} clips selected"))
+                                .font(theme.font(FONT_SMALL))
+                                .color(theme.value()),
+                        );
+                    });
+                let br = banner_resp.response.rect;
+                ui.painter().rect_filled(
+                    Rect::from_min_size(br.left_top(), Vec2::new(3.0, br.height())),
+                    CornerRadius::ZERO,
+                    theme.accent(),
+                );
+                ui.painter().rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(br.left(), (br.bottom() - 1.0).round()),
+                        Pos2::new(br.right(), br.bottom().round()),
+                    ),
+                    CornerRadius::ZERO,
+                    BORDER_ROW_SOFT,
+                );
+            }
 
             // Root collapsible #222222 bar titled with just the clip name (NO "Clip: " prefix)
             cm3_collapsible_section_with_action(
@@ -2075,6 +2770,7 @@ fn show_edit_tab(
                                 viewport_rect,
                                 state,
                                 theme,
+                                actions,
                             );
 
                             // Precomp+ Target Composition selector (when editing a Precomp clip)
@@ -2137,7 +2833,7 @@ fn show_edit_tab(
                                 let backdrop_before_y = ui.cursor().top();
                                 let cev = cm3_property_row_aligned(
                                     ui,
-                                    "Backdrop Color",
+                                    "Backdrop",
                                     true,
                                     state.prop_columns,
                                     theme,
@@ -2206,7 +2902,7 @@ fn show_edit_tab(
                                 );
                                 let op_ev = cm3_property_row_aligned(
                                     ui,
-                                    "Backdrop Opacity",
+                                    "Bg alpha",
                                     true,
                                     state.prop_columns,
                                     theme,
@@ -2274,16 +2970,28 @@ fn show_edit_tab(
                             // Kind-specific 2D text / shape properties
                             match clip_snapshot.kind.as_str() {
                                 "text" | "text_2d" => {
-                                    show_session_text_prop(
+                                    show_session_text_prop_ex(
                                         ui,
                                         session,
                                         &clip_id,
                                         "text",
                                         "Text",
                                         "text",
+                                        true,
                                         local_frame,
                                         state,
                                         theme,
+                                    );
+                                    show_font_selector_row(
+                                        ui,
+                                        session,
+                                        &clip_id,
+                                        "text2d_edit_font",
+                                        local_frame,
+                                        viewport_rect,
+                                        state,
+                                        theme,
+                                        actions,
                                     );
                                     show_session_number_prop(
                                         ui,
@@ -2355,17 +3063,47 @@ fn show_edit_tab(
                                         theme,
                                         actions,
                                     );
+                                    show_session_color_prop(
+                                        ui,
+                                        session,
+                                        &clip_id,
+                                        "strokeColor",
+                                        "Stroke color",
+                                        [1.0, 1.0, 1.0],
+                                        local_frame,
+                                        clip_start,
+                                        viewport_rect,
+                                        state,
+                                        theme,
+                                        actions,
+                                    );
                                 }
                                 _ => {}
                             }
 
-                            // Transform & Compositing rows (Position, Scale, Rotation, Opacity, Blending mode)
+                            // Transform & Compositing rows (Position, Anchor, Scale, Rotation, Opacity, Blending mode)
                             show_session_vec2_prop(
                                 ui,
                                 session,
                                 &clip_id,
                                 "position",
                                 "Position",
+                                [0.0, 0.0],
+                                ScrubConfig::new(-10_000.0, 10_000.0, 1.0, 2),
+                                false,
+                                local_frame,
+                                clip_start,
+                                viewport_rect,
+                                state,
+                                theme,
+                                actions,
+                            );
+                            show_session_vec2_prop(
+                                ui,
+                                session,
+                                &clip_id,
+                                "anchor",
+                                "Anchor",
                                 [0.0, 0.0],
                                 ScrubConfig::new(-10_000.0, 10_000.0, 1.0, 2),
                                 false,
@@ -2692,6 +3430,16 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
                 "Temporal ghost instancer",
             ),
             (
+                "zoidium:repeater/radial",
+                "Radial Repeater",
+                "Circular ring child instancer",
+            ),
+            (
+                "zoidium:repeater/grid",
+                "Grid Repeater",
+                "3D XYZ grid child instancer",
+            ),
+            (
                 "zoidium:repeater/twist",
                 "Twist Deformer",
                 "Axial twist mesh deformer",
@@ -2903,6 +3651,222 @@ fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
     items
 }
 
+/// Full-height inline fuzzy picker with wrapped descriptions and fresh scroll-to-top per open.
+fn show_panel_fuzzy_picker(
+    ui: &mut Ui,
+    panel_rect: Rect,
+    id: Id,
+    open_seq: u64,
+    items: &[FuzzyItem],
+    state: &mut FuzzyPickerState,
+    theme: &Cm3Theme,
+) -> FuzzyPickerEvent {
+    let mut event = FuzzyPickerEvent::None;
+    let inner = panel_rect.shrink(1.0);
+    ui.painter()
+        .rect_filled(panel_rect, CornerRadius::ZERO, BG_PANEL);
+
+    show_split_pane(ui, id.with("full_pane"), inner, |ui, _| {
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+
+        // 1. Full-width Cancel button
+        if cm3_prop_button(ui, "cancel", ButtonVariant::Normal, true, theme).clicked() {
+            event = FuzzyPickerEvent::Cancelled;
+            return;
+        }
+
+        // 2. Auto-focused filter box
+        let filter_id = id.with("filter_box");
+        let focused = ui.memory(|m| m.has_focus(filter_id));
+        Frame::NONE
+            .fill(BG_PANEL)
+            .stroke(Stroke::new(
+                2.0,
+                if focused {
+                    theme.accent()
+                } else {
+                    BORDER_FILTER
+                },
+            ))
+            .inner_margin(egui::Margin::symmetric(5, 4))
+            .show(ui, |ui| {
+                let resp = ui.add(
+                    TextEdit::singleline(&mut state.query)
+                        .id(filter_id)
+                        .frame(Frame::NONE)
+                        .hint_text("type to filter")
+                        .font(theme.font(FONT_BODY))
+                        .text_color(TEXT_PRIMARY)
+                        .desired_width(ui.available_width()),
+                );
+                if state.just_opened {
+                    resp.request_focus();
+                    state.just_opened = false;
+                }
+            });
+
+        let filtered: Vec<&FuzzyItem> = if state.query.trim().is_empty() {
+            items.iter().collect()
+        } else {
+            let mut scored: Vec<(f32, &FuzzyItem)> = items
+                .iter()
+                .filter_map(|it| {
+                    let s = fuzzy_score(&state.query, &it.name, &it.desc);
+                    (s >= 0.45).then_some((s, it))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            scored.into_iter().map(|(_, it)| it).collect()
+        };
+
+        if filtered.is_empty() || state.active_index >= filtered.len() {
+            state.active_index = 0;
+        }
+
+        let mut key_navigated = false;
+        let pointer_moved = ui.input(|i| i.pointer.delta() != Vec2::ZERO);
+        ui.input(|i| {
+            if i.key_pressed(Key::Escape) {
+                event = FuzzyPickerEvent::Cancelled;
+            } else if !filtered.is_empty() {
+                if i.key_pressed(Key::ArrowDown) {
+                    state.active_index = (state.active_index + 1) % filtered.len();
+                    key_navigated = true;
+                } else if i.key_pressed(Key::ArrowUp) {
+                    state.active_index = (state.active_index + filtered.len() - 1) % filtered.len();
+                    key_navigated = true;
+                } else if i.key_pressed(Key::Enter) {
+                    event = FuzzyPickerEvent::Selected(filtered[state.active_index].id.clone());
+                }
+            }
+        });
+        if event != FuzzyPickerEvent::None {
+            return;
+        }
+
+        // 3. Scrollable options list keyed on `open_seq` so reopening ALWAYS starts at top
+        ScrollArea::vertical()
+            .id_salt((id, "options_scroll", open_seq))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                if filtered.is_empty() {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("no matching items")
+                            .font(theme.font(FONT_SMALL))
+                            .color(TEXT_FAINT),
+                    );
+                    return;
+                }
+
+                let mut last_category: Option<&str> = None;
+                let show_categories = state.query.trim().is_empty();
+
+                for (idx, item) in filtered.iter().enumerate() {
+                    if show_categories && last_category != Some(item.category.as_str()) {
+                        last_category = Some(item.category.as_str());
+                        let (cat_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 24.0),
+                            Sense::hover(),
+                        );
+                        ui.painter()
+                            .rect_filled(cat_rect, CornerRadius::ZERO, BG_TITLE);
+                        ui.painter()
+                            .with_clip_rect(cat_rect.shrink2(Vec2::new(4.0, 0.0)))
+                            .text(
+                                Pos2::new(cat_rect.left() + 5.0, cat_rect.center().y),
+                                Align2::LEFT_CENTER,
+                                &item.category,
+                                theme.font(FONT_BANNER),
+                                TEXT_FAINT,
+                            );
+                    }
+
+                    let avail_w = ui.available_width();
+                    let text_wrap_w = (avail_w - 16.0).max(80.0);
+                    let has_desc = !item.desc.is_empty();
+                    let desc_galley = has_desc.then(|| {
+                        ui.painter().layout(
+                            item.desc.clone(),
+                            theme.font(FONT_SMALL),
+                            TEXT_OPTION_DESC,
+                            text_wrap_w,
+                        )
+                    });
+                    let row_h = if let Some(ref g) = desc_galley {
+                        (26.0 + g.size().y + 6.0).max(42.0)
+                    } else {
+                        28.0
+                    };
+                    let (row_rect, row_resp) =
+                        ui.allocate_exact_size(Vec2::new(avail_w, row_h), Sense::click());
+                    let row_resp = row_resp.on_hover_cursor(CursorIcon::PointingHand);
+                    let is_active = idx == state.active_index;
+                    if key_navigated && is_active {
+                        row_resp.scroll_to_me(None);
+                    }
+
+                    if is_active {
+                        ui.painter()
+                            .rect_filled(row_rect, CornerRadius::ZERO, BG_OPTION_ACTIVE);
+                        ui.painter().rect_stroke(
+                            row_rect,
+                            CornerRadius::ZERO,
+                            Stroke::new(1.0, BORDER_OPTION_ACTIVE),
+                            StrokeKind::Inside,
+                        );
+                    } else if row_resp.hovered() {
+                        ui.painter()
+                            .rect_filled(row_rect, CornerRadius::ZERO, BG_OPTION_HOVER);
+                    }
+
+                    ui.painter().line_segment(
+                        [
+                            Pos2::new(row_rect.left(), row_rect.bottom() - 0.5),
+                            Pos2::new(row_rect.right(), row_rect.bottom() - 0.5),
+                        ],
+                        Stroke::new(1.0, BORDER_ROW_SOFT),
+                    );
+
+                    let row_clip = ui
+                        .painter()
+                        .with_clip_rect(row_rect.shrink2(Vec2::new(4.0, 0.0)));
+                    row_clip.text(
+                        Pos2::new(
+                            row_rect.left() + 8.0,
+                            if has_desc {
+                                row_rect.top() + 13.0
+                            } else {
+                                row_rect.center().y
+                            },
+                        ),
+                        Align2::LEFT_CENTER,
+                        &item.name,
+                        theme.font(FONT_BODY),
+                        if is_active { TEXT_BRIGHT } else { TEXT_PRIMARY },
+                    );
+                    if let Some(g) = desc_galley {
+                        row_clip.galley(
+                            Pos2::new(row_rect.left() + 8.0, row_rect.top() + 24.0),
+                            g,
+                            TEXT_OPTION_DESC,
+                        );
+                    }
+
+                    if pointer_moved && row_resp.hovered() {
+                        state.active_index = idx;
+                    }
+                    if row_resp.clicked() {
+                        event = FuzzyPickerEvent::Selected(item.id.clone());
+                    }
+                }
+            });
+    });
+    paint_crisp_panel_border(ui.painter(), panel_rect, BORDER_PANEL);
+    event
+}
+
 fn show_objects_tab(
     ui: &mut Ui,
     panel_rect: Rect,
@@ -2913,11 +3877,13 @@ fn show_objects_tab(
     actions: &mut Vec<PanelAction>,
 ) {
     let Some(clip_id) = session.selection.clip_ids.first().cloned() else {
-        empty_panel_message(ui, "select a 3D scene clip", theme);
+        state.add_object_open = false;
+        empty_panel_message(ui, "Select a clip to edit its objects", theme);
         return;
     };
     let Some(clip) = find_clip_clone(session, &clip_id) else {
-        empty_panel_message(ui, "select a 3D scene clip", theme);
+        state.add_object_open = false;
+        empty_panel_message(ui, "Select a clip to edit its objects", theme);
         return;
     };
     if clip.kind != "scene" {
@@ -2934,6 +3900,46 @@ fn show_objects_tab(
             return;
         }
         empty_panel_message(ui, "select a 3D scene, Shape+, or Text clip", theme);
+        return;
+    }
+
+    // Expand the Add 3D Object picker over the FULL sidebar height when open
+    if state.add_object_open {
+        let items = build_object_picker_items(session);
+        match show_panel_fuzzy_picker(
+            ui,
+            panel_rect,
+            Id::unique("add_object_picker"),
+            state.picker_open_seq,
+            &items,
+            &mut state.add_object_picker,
+            theme,
+        ) {
+            FuzzyPickerEvent::Cancelled => {
+                state.add_object_open = false;
+            }
+            FuzzyPickerEvent::Selected(kind) => {
+                commit_inspector_tx_if_open(session, state);
+                let parent_id = session.selection.object_3d_ids.first().and_then(|sel| {
+                    clip.objects_3d
+                        .iter()
+                        .find(|o| o.id == *sel && is_container_object(&o.kind))
+                        .map(|o| o.id.clone())
+                });
+                let display = items.iter().find(|i| i.id == kind).map(|i| i.name.clone());
+                if let Ok(res) = session.execute(Command::AddObject3D {
+                    clip_id: clip_id.clone(),
+                    parent_id,
+                    kind: kind.clone(),
+                    name: display,
+                }) && let Some(oid) = res.get("object_id").and_then(Value::as_str)
+                {
+                    let _ = session.selection.select_object_3d(oid, &kind, false);
+                }
+                state.add_object_open = false;
+            }
+            FuzzyPickerEvent::None => {}
+        }
         return;
     }
 
@@ -2967,43 +3973,6 @@ fn show_objects_tab(
         top_inner,
         |ui, _top_rect| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
-            // Pane 0 (40%): Object Tree or Inline Fuzzy Add Picker
-            if state.add_object_open {
-                let items = build_object_picker_items(session);
-                match cm3_fuzzy_picker(
-                    ui,
-                    Id::unique("add_object_picker"),
-                    &items,
-                    &mut state.add_object_picker,
-                    theme,
-                ) {
-                    FuzzyPickerEvent::Cancelled => {
-                        state.add_object_open = false;
-                    }
-                    FuzzyPickerEvent::Selected(kind) => {
-                        commit_inspector_tx_if_open(session, state);
-                        let parent_id = session.selection.object_3d_ids.first().and_then(|sel| {
-                            clip.objects_3d
-                                .iter()
-                                .find(|o| o.id == *sel && is_container_object(&o.kind))
-                                .map(|o| o.id.clone())
-                        });
-                        let display = items.iter().find(|i| i.id == kind).map(|i| i.name.clone());
-                        if let Ok(res) = session.execute(Command::AddObject3D {
-                            clip_id: clip_id.clone(),
-                            parent_id,
-                            kind: kind.clone(),
-                            name: display,
-                        }) && let Some(oid) = res.get("object_id").and_then(Value::as_str)
-                        {
-                            let _ = session.selection.select_object_3d(oid, &kind, false);
-                        }
-                        state.add_object_open = false;
-                    }
-                    FuzzyPickerEvent::None => {}
-                }
-                return;
-            }
 
             // 28px #222222 header bar (27px body + 1px #242424 bottom border), 7x7 framed square glyph,
             // 16px #cccccc "3D Objects" title, and right-aligned `+`
@@ -3020,28 +3989,34 @@ fn show_objects_tab(
                 CornerRadius::ZERO,
                 BORDER_ROW_SOFT,
             );
-            paint_cm3_tree_box(
-                ui.painter(),
-                Pos2::new(hdr_rect.left() + 10.5, hdr_rect.center().y + 1.0),
-                state.objects_list_open,
-                if hdr_resp.hovered() {
-                    TEXT_BRIGHT
-                } else {
-                    TEXT_MUTED
-                },
-            );
-            ui.painter().text(
-                Pos2::new(hdr_rect.left() + 21.0, hdr_rect.center().y),
-                Align2::LEFT_CENTER,
-                "3D Objects",
-                theme.font(FONT_BODY),
-                TEXT_PRIMARY,
-            );
             let add_icon_rect = Rect::from_min_size(
                 Pos2::new(hdr_rect.right() - 24.0, (hdr_rect.center().y - 8.0).round()),
                 Vec2::splat(15.0),
             );
             let add_rect = add_icon_rect.expand(3.0);
+            let paste_w = (ui
+                .painter()
+                .layout_no_wrap("Paste".to_owned(), theme.font(FONT_COMPACT), TEXT_PRIMARY)
+                .size()
+                .x
+                .ceil()
+                + 12.0)
+                .max(44.0);
+            let paste_rect = Rect::from_min_size(
+                Pos2::new(
+                    (add_rect.left() - paste_w - 4.0).max(hdr_rect.left() + 80.0),
+                    (hdr_rect.center().y - 9.0).round(),
+                ),
+                Vec2::new(paste_w, 18.0),
+            );
+            let (paste_clicked, paste_hovered) = header_compact_action_button(
+                ui,
+                Id::unique("objects_paste_btn"),
+                paste_rect,
+                "Paste",
+                "Paste 3D Object JSON (Cmd+V)",
+                theme,
+            );
             let add_resp = ui
                 .interact(add_rect, Id::unique("objects_add_btn"), Sense::click())
                 .on_hover_cursor(CursorIcon::PointingHand)
@@ -3054,6 +4029,31 @@ fn show_objects_tab(
                     StrokeKind::Inside,
                 );
             }
+            paint_cm3_tree_box(
+                ui.painter(),
+                Pos2::new(hdr_rect.left() + 10.5, hdr_rect.center().y + 1.0),
+                state.objects_list_open,
+                if hdr_resp.hovered() && !add_resp.hovered() && !paste_hovered {
+                    TEXT_BRIGHT
+                } else {
+                    TEXT_MUTED
+                },
+            );
+            ui.painter()
+                .with_clip_rect(Rect::from_min_max(
+                    Pos2::new(hdr_rect.left() + 20.0, hdr_rect.top()),
+                    Pos2::new(
+                        (paste_rect.left() - 4.0).max(hdr_rect.left() + 24.0),
+                        hdr_rect.bottom(),
+                    ),
+                ))
+                .text(
+                    Pos2::new(hdr_rect.left() + 21.0, hdr_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    "3D Objects",
+                    theme.font(FONT_BODY),
+                    TEXT_PRIMARY,
+                );
             paint_cm3_icon(
                 ui.painter(),
                 add_icon_rect,
@@ -3065,11 +4065,31 @@ fn show_objects_tab(
                 },
             );
             if add_resp.clicked() {
+                state.picker_open_seq = state.picker_open_seq.wrapping_add(1);
                 state.add_object_open = true;
                 state.add_object_picker = FuzzyPickerState {
                     just_opened: true,
                     ..FuzzyPickerState::default()
                 };
+            } else if paste_clicked {
+                let selected_group_id = session
+                    .selection
+                    .object_3d_ids
+                    .first()
+                    .and_then(|sel_id| clip.objects_3d.iter().find(|o| o.id == *sel_id))
+                    .filter(|o| o.kind.eq_ignore_ascii_case("group"))
+                    .map(|o| o.id.clone());
+                paste_pz_json_from_clipboard(
+                    session,
+                    state,
+                    actions,
+                    "objects3d",
+                    Some(clip_id.clone()),
+                    selected_group_id,
+                    None,
+                    None,
+                    "3D object JSON",
+                );
             } else if hdr_resp.clicked() {
                 state.objects_list_open = !state.objects_list_open;
             }
@@ -3236,14 +4256,77 @@ fn show_objects_tab(
                             }
                         }
 
-                        // Right-click inline rename (Spec 01 §4.7)
-                        if row_resp.secondary_clicked() {
-                            state.rename_state = Some(InlineRenameState {
-                                target_id: obj.id.clone(),
-                                buffer: obj.name.clone(),
-                                just_started: true,
-                            });
-                        }
+                        // Right-click context menu (Rename, Copy/Paste PZ JSON, Duplicate, Remove)
+                        let ctx_obj_id = obj.id.clone();
+                        let ctx_obj_name = obj.name.clone();
+                        let ctx_parent_group_id = if obj.kind.eq_ignore_ascii_case("group") {
+                            Some(obj.id.clone())
+                        } else {
+                            obj.parent_id.clone().filter(|pid| {
+                                clip.objects_3d
+                                    .iter()
+                                    .any(|p| p.id == *pid && p.kind.eq_ignore_ascii_case("group"))
+                            })
+                        };
+                        row_resp.context_menu(|ui| {
+                            if ui.button("Rename").clicked() {
+                                state.rename_state = Some(InlineRenameState {
+                                    target_id: ctx_obj_id.clone(),
+                                    buffer: ctx_obj_name.clone(),
+                                    just_started: true,
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Copy JSON").clicked() {
+                                let ids = if selected && session.selection.object_3d_ids.len() > 1 {
+                                    session.selection.object_3d_ids.clone()
+                                } else {
+                                    vec![ctx_obj_id.clone()]
+                                };
+                                let count = ids.len();
+                                let res = session.copy_objects_3d_as_pz_json(&clip_id, &ids);
+                                copy_pz_json_to_clipboard(
+                                    ui.ctx(),
+                                    res,
+                                    &format!(
+                                        "Copied {count} 3D object{} JSON to clipboard",
+                                        if count == 1 { "" } else { "s" }
+                                    ),
+                                    actions,
+                                );
+                                ui.close();
+                            }
+                            if ui.button("Paste JSON").clicked() {
+                                paste_pz_json_from_clipboard(
+                                    session,
+                                    state,
+                                    actions,
+                                    "objects3d",
+                                    Some(clip_id.clone()),
+                                    ctx_parent_group_id.clone(),
+                                    None,
+                                    None,
+                                    "3D object JSON",
+                                );
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Duplicate").clicked() {
+                                let _ = session.execute(Command::DuplicateObject3D {
+                                    clip_id: clip_id.clone(),
+                                    object_id: ctx_obj_id.clone(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Remove").clicked() {
+                                commit_inspector_tx_if_open(session, state);
+                                let _ = session.execute(Command::DeleteObject3D {
+                                    clip_id: clip_id.clone(),
+                                    object_id: ctx_obj_id.clone(),
+                                });
+                                ui.close();
+                            }
+                        });
 
                         // 5 px vertical drag-to-reorder & nest-inside (Spec 01 §4.7)
                         if row_resp.drag_started()
@@ -3479,7 +4562,7 @@ fn show_object_inspector(
     let clip_start = clip.start;
 
     ScrollArea::vertical()
-        .id_salt("obj_inspector_scroll")
+        .id_salt(("obj_inspector_scroll", &obj.id))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -3490,6 +4573,34 @@ fn show_object_inspector(
                 state.prop_columns.label_ratio,
                 theme,
             );
+            if hdr_act.copy_json {
+                let res =
+                    session.copy_objects_3d_as_pz_json(&clip.id, std::slice::from_ref(&obj.id));
+                copy_pz_json_to_clipboard(
+                    ui.ctx(),
+                    res,
+                    "Copied 3D object JSON to clipboard",
+                    actions,
+                );
+            }
+            if hdr_act.paste_json {
+                let parent_group_id = if obj.kind.eq_ignore_ascii_case("group") {
+                    Some(obj.id.clone())
+                } else {
+                    None
+                };
+                paste_pz_json_from_clipboard(
+                    session,
+                    state,
+                    actions,
+                    "objects3d",
+                    Some(clip.id.clone()),
+                    parent_group_id,
+                    None,
+                    None,
+                    "3D object JSON",
+                );
+            }
             if hdr_act.reset {
                 let _ = session.execute(Command::ResetPropertyList {
                     target_id: obj.id.clone(),
@@ -3600,7 +4711,7 @@ fn show_object_inspector(
                     session,
                     &obj.id,
                     "shakeAmplitude",
-                    "Shake amount",
+                    "Shake amp",
                     0.0,
                     ScrubConfig::new(0.0, 1.0, 0.01, 3),
                     local_frame,
@@ -3615,7 +4726,7 @@ fn show_object_inspector(
                     session,
                     &obj.id,
                     "shakeSpeed",
-                    "Shake speed",
+                    "Shake freq",
                     30.0,
                     ScrubConfig::new(0.0, 1000.0, 0.5, 2),
                     local_frame,
@@ -4195,89 +5306,30 @@ fn show_object_inspector(
 
             if is_text {
                 // Non-animated 3D Text geometry properties matching CM3 Spec 03 §3.4
-                show_session_text_prop(
+                show_session_text_prop_ex(
                     ui,
                     session,
                     &obj.id,
                     "text",
                     "Text",
                     "text",
-                    local_frame,
-                    state,
-                    theme,
-                );
-                // Font selector (preset + project font assets + file picker)
-                let cur_font = eval_prop_str(
-                    lookup_session_prop(session, &obj.id, "font").as_ref(),
-                    local_frame,
-                    "/assets/fonts/2d/bebas.ttf",
-                );
-                let mut font_choices: Vec<(String, String)> = vec![
-                    (
-                        "/assets/fonts/2d/bebas.ttf".to_owned(),
-                        "Bebas Neue".to_owned(),
-                    ),
-                    ("Geist-Regular.ttf".to_owned(), "Geist".to_owned()),
-                ];
-                for asset in session.project.assets.values() {
-                    let lower = asset.filename.to_ascii_lowercase();
-                    if lower.ends_with(".ttf")
-                        || lower.ends_with(".otf")
-                        || lower.ends_with(".woff")
-                    {
-                        font_choices.push((asset.id.clone(), asset.filename.clone()));
-                    }
-                }
-                let font_labels: Vec<&str> =
-                    font_choices.iter().map(|(_, lbl)| lbl.as_str()).collect();
-                let mut font_idx = font_choices
-                    .iter()
-                    .position(|(val, _)| val == &cur_font)
-                    .unwrap_or(0);
-                let mut font_changed = false;
-                panel_property_row(
-                    ui,
-                    "Font",
                     true,
+                    local_frame,
                     state,
                     theme,
-                    |_| {},
-                    |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            font_changed = cm3_dropdown(
-                                ui,
-                                Id::unique((&obj.id, "text3d_font")),
-                                &mut font_idx,
-                                &font_labels,
-                                false,
-                                viewport_rect,
-                                theme,
-                            );
-                            if cm3_icon_button(
-                                ui,
-                                Cm3Icon::Load,
-                                17.0,
-                                TEXT_PRIMARY,
-                                "Choose custom font file...",
-                                theme,
-                            ) {
-                                actions.push(PanelAction::PickAssetForProperty {
-                                    target_id: obj.id.clone(),
-                                    property: "font".to_owned(),
-                                    is_lut: false,
-                                });
-                            }
-                        });
-                    },
                 );
-                if font_changed {
-                    let _ = session.execute(Command::SetPropertyValue {
-                        target_id: obj.id.clone(),
-                        property: "font".to_owned(),
-                        value: json!(font_choices[font_idx].0),
-                    });
-                }
+                // Font selector (bundled + project font assets + OS system fonts + file picker)
+                show_font_selector_row(
+                    ui,
+                    session,
+                    &obj.id,
+                    "text3d_font",
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
 
                 // Combined non-animated Size ([height, thickness], default [20, 3], 0 decimals)
                 touch_inspector_tx_owner(state, &obj.id, "text3d_size");
@@ -4355,7 +5407,8 @@ fn show_object_inspector(
                     state,
                 );
 
-                // Bevel (non-animated off/on, default 0)
+                // Bevel group (non-animated off/on, default 0). When enabled, all bevel
+                // sub-controls are grouped consecutively right below `Bevel`; when off, they hide.
                 show_session_option_prop_ex(
                     ui,
                     session,
@@ -4392,7 +5445,7 @@ fn show_object_inspector(
                     let mut bevel_vec = [bt, bs];
                     let bevel_ev = panel_property_row(
                         ui,
-                        "Bevel size",
+                        "Size",
                         true,
                         state,
                         theme,
@@ -4417,6 +5470,71 @@ fn show_object_inspector(
                         bevel_ev,
                         state,
                     );
+
+                    if session.plugins.is_enabled("text-plus") {
+                        show_session_option_prop_ex(
+                            ui,
+                            session,
+                            &obj.id,
+                            "bevelSide",
+                            "Side",
+                            &["Both", "Front", "Back"],
+                            0,
+                            false,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            &obj.id,
+                            "bevelDetail",
+                            "Detail",
+                            3.0,
+                            ScrubConfig::new(1.0, 32.0, 1.0, 0),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_option_prop_ex(
+                            ui,
+                            session,
+                            &obj.id,
+                            "bevelProfile",
+                            "Profile",
+                            &["Linear", "Convex", "Concave", "Step"],
+                            0,
+                            false,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            &obj.id,
+                            "bevelTension",
+                            "Tension",
+                            0.5,
+                            ScrubConfig::new(0.0, 1.0, 0.05, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    }
                 }
 
                 // Center point (positionMode)
@@ -4506,6 +5624,7 @@ fn show_object_inspector(
                 show_material_slot_inspector(
                     ui,
                     session,
+                    &clip.id,
                     &obj.id,
                     &obj.name,
                     "material",
@@ -4521,6 +5640,7 @@ fn show_object_inspector(
                     show_material_slot_inspector(
                         ui,
                         session,
+                        &clip.id,
                         &obj.id,
                         &format!("{} (Front)", obj.name),
                         "frontMaterial",
@@ -4535,6 +5655,7 @@ fn show_object_inspector(
                     show_material_slot_inspector(
                         ui,
                         session,
+                        &clip.id,
                         &obj.id,
                         &format!("{} (Side)", obj.name),
                         "sideMaterial",
@@ -4995,6 +6116,510 @@ fn apply_paired_scalar_scrub(
     }
 }
 
+/// Returns `true` when `ext` is a supported OS system font extension (`.ttf`, `.otf`, `.ttc`).
+fn is_supported_system_font_ext(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("ttf")
+        || ext.eq_ignore_ascii_case("otf")
+        || ext.eq_ignore_ascii_case("ttc")
+}
+
+/// Scans `dirs` for `.ttf` / `.otf` / `.ttc` fonts, deriving clean display names from file stems,
+/// deduplicating case-insensitively, and sorting alphabetically.
+fn discover_system_fonts_in_dirs(
+    dirs: Vec<std::path::PathBuf>,
+) -> Vec<(String, std::path::PathBuf)> {
+    use std::path::PathBuf;
+    // Keyed by lowercase display name -> (display_name, path) for case-insensitive deduplication.
+    let mut seen = BTreeMap::<String, (String, PathBuf)>::new();
+    let mut stack = dirs;
+    let mut visited_dirs = 0usize;
+    while let Some(dir) = stack.pop() {
+        visited_dirs += 1;
+        if visited_dirs > 256 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if stack.len() < 128 {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            if !is_supported_system_font_ext(ext) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let display = stem.trim();
+            if display.is_empty() || display.starts_with('.') {
+                continue;
+            }
+            let key = display.to_ascii_lowercase();
+            let is_ttc = ext.eq_ignore_ascii_case("ttc");
+            match seen.get_mut(&key) {
+                None => {
+                    seen.insert(key, (display.to_owned(), path));
+                }
+                Some((_, existing_path)) => {
+                    // Prefer standalone .ttf/.otf over .ttc when both share the exact same stem.
+                    let existing_is_ttc = existing_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("ttc"));
+                    if existing_is_ttc && !is_ttc {
+                        *existing_path = path;
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<(String, PathBuf)> = seen.into_values().collect();
+    out.sort_by(|a, b| {
+        a.0.to_ascii_lowercase()
+            .cmp(&b.0.to_ascii_lowercase())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Discovers installed `.ttf` / `.otf` / `.ttc` system fonts once per process (sorted, deduplicated).
+fn installed_system_fonts() -> &'static [(String, std::path::PathBuf)] {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        #[cfg(target_os = "macos")]
+        {
+            dirs.push(PathBuf::from("/System/Library/Fonts"));
+            dirs.push(PathBuf::from("/System/Library/Fonts/Supplemental"));
+            dirs.push(PathBuf::from("/Library/Fonts"));
+            if let Ok(home) = std::env::var("HOME") {
+                dirs.push(PathBuf::from(home).join("Library/Fonts"));
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(win) = std::env::var("WINDIR") {
+                dirs.push(PathBuf::from(win).join("Fonts"));
+            } else {
+                dirs.push(PathBuf::from(r"C:\Windows\Fonts"));
+            }
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                dirs.push(PathBuf::from(local).join(r"Microsoft\Windows\Fonts"));
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            dirs.push(PathBuf::from("/usr/share/fonts"));
+            dirs.push(PathBuf::from("/usr/local/share/fonts"));
+            if let Ok(home) = std::env::var("HOME") {
+                dirs.push(PathBuf::from(home).join(".local/share/fonts"));
+            }
+        }
+
+        discover_system_fonts_in_dirs(dirs)
+    })
+}
+
+enum FontChoice {
+    Builtin(String, String),
+    ProjectAsset(String, String),
+    SystemFont(String, std::path::PathBuf),
+}
+
+impl FontChoice {
+    fn label(&self) -> &str {
+        match self {
+            Self::Builtin(_, l) | Self::ProjectAsset(_, l) | Self::SystemFont(l, _) => l.as_str(),
+        }
+    }
+}
+
+/// Shared Font selector for both `Text3D` and `Text2D` (bundled OFL fonts + project font assets
+/// + installed OS `.ttf`/`.otf` system fonts + custom font file picker).
+#[allow(clippy::too_many_arguments)]
+fn show_font_selector_row(
+    ui: &mut Ui,
+    session: &mut Session,
+    target_id: &str,
+    id_salt: &str,
+    local_frame: f64,
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+    actions: &mut Vec<PanelAction>,
+) {
+    let cur_font = eval_prop_str(
+        lookup_session_prop(session, target_id, "font").as_ref(),
+        local_frame,
+        "Geist-Regular.ttf",
+    );
+
+    let mut choices: Vec<FontChoice> = vec![
+        FontChoice::Builtin("Geist-Regular.ttf".to_owned(), "Geist Regular".to_owned()),
+        FontChoice::Builtin("GeistMono-Regular.ttf".to_owned(), "Geist Mono".to_owned()),
+        FontChoice::Builtin(
+            "SourceCodePro-Regular.ttf".to_owned(),
+            "Source Code Pro".to_owned(),
+        ),
+    ];
+
+    let mut project_fonts: Vec<(String, String)> = session
+        .project
+        .assets
+        .values()
+        .filter(|asset| {
+            let lower = asset.filename.to_ascii_lowercase();
+            lower.ends_with(".ttf")
+                || lower.ends_with(".otf")
+                || lower.ends_with(".ttc")
+                || lower.ends_with(".woff")
+        })
+        .map(|asset| (asset.id.clone(), asset.filename.clone()))
+        .collect();
+    project_fonts.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let mut project_stems: BTreeSet<String> = BTreeSet::new();
+    for (aid, fname) in project_fonts {
+        let stem = std::path::Path::new(&fname)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&fname)
+            .to_owned();
+        project_stems.insert(stem.to_ascii_lowercase());
+        choices.push(FontChoice::ProjectAsset(aid, stem));
+    }
+
+    for (display, path) in installed_system_fonts() {
+        if !project_stems.contains(&display.to_ascii_lowercase()) {
+            choices.push(FontChoice::SystemFont(display.clone(), path.clone()));
+        }
+    }
+
+    let font_labels: Vec<&str> = choices.iter().map(FontChoice::label).collect();
+    let mut font_idx = choices
+        .iter()
+        .position(|c| match c {
+            FontChoice::Builtin(k, _) => k.eq_ignore_ascii_case(&cur_font),
+            FontChoice::ProjectAsset(aid, lbl) => {
+                aid == &cur_font || lbl.eq_ignore_ascii_case(&cur_font)
+            }
+            FontChoice::SystemFont(lbl, path) => {
+                lbl.eq_ignore_ascii_case(&cur_font) || path.to_str().is_some_and(|p| p == cur_font)
+            }
+        })
+        .unwrap_or(0);
+
+    let mut font_changed = false;
+    let popup_id = Id::unique((target_id, id_salt, "font_search_popup"));
+    let search_id = popup_id.with("search_input");
+    let mut popup_open = ui
+        .data_mut(|d| d.get_temp::<bool>(popup_id))
+        .unwrap_or(false);
+    let mut just_opened_popup = false;
+    let mut btn_rect_saved = Rect::NOTHING;
+
+    panel_property_row(
+        ui,
+        "Font",
+        true,
+        state,
+        theme,
+        |_| {},
+        |ui| {
+            let avail_w = ui.available_width();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let dd_w = (avail_w - 24.0).max(56.0);
+                let (raw_slot, _) = ui.allocate_exact_size(Vec2::new(dd_w, 23.0), Sense::hover());
+                let btn_rect = Rect::from_min_size(
+                    Pos2::new(raw_slot.left().round(), (raw_slot.top() + 1.0).round()),
+                    Vec2::new(dd_w.round(), 21.0),
+                );
+                btn_rect_saved = btn_rect;
+                let btn_resp = ui
+                    .interact(btn_rect, popup_id.with("btn"), Sense::click())
+                    .on_hover_cursor(CursorIcon::PointingHand);
+                ui.painter()
+                    .rect_filled(btn_rect, CornerRadius::ZERO, BG_INPUT);
+                paint_crisp_panel_border(
+                    ui.painter(),
+                    btn_rect,
+                    if popup_open || btn_resp.hovered() {
+                        theme.accent()
+                    } else {
+                        BORDER_CONTROL
+                    },
+                );
+                let current_label = font_labels
+                    .get(font_idx)
+                    .copied()
+                    .unwrap_or("Geist Regular");
+                let text_clip = Rect::from_min_max(
+                    btn_rect.left_top(),
+                    Pos2::new(
+                        (btn_rect.right() - 18.0).max(btn_rect.left()),
+                        btn_rect.bottom(),
+                    ),
+                );
+                ui.painter().with_clip_rect(text_clip).text(
+                    Pos2::new(btn_rect.left() + 5.0, btn_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    current_label,
+                    theme.font(FONT_SMALL),
+                    theme.value(),
+                );
+                let caret_rect = Rect::from_center_size(
+                    Pos2::new(btn_rect.right() - 8.5, btn_rect.center().y),
+                    Vec2::splat(12.0),
+                );
+                paint_cm3_icon(
+                    ui.painter(),
+                    caret_rect,
+                    Cm3Icon::ChevronDown,
+                    theme.value(),
+                );
+                if btn_resp.clicked() {
+                    popup_open = !popup_open;
+                    if popup_open {
+                        just_opened_popup = true;
+                    }
+                }
+                if cm3_icon_button(
+                    ui,
+                    Cm3Icon::Load,
+                    17.0,
+                    TEXT_PRIMARY,
+                    "Choose custom font file...",
+                    theme,
+                ) {
+                    actions.push(PanelAction::PickAssetForProperty {
+                        target_id: target_id.to_owned(),
+                        property: "font".to_owned(),
+                        is_lut: false,
+                    });
+                }
+            });
+        },
+    );
+
+    if just_opened_popup {
+        state.font_picker_search.clear();
+    }
+    if popup_open {
+        let popup_w = 290.0_f32
+            .max(btn_rect_saved.width())
+            .min((viewport_rect.width() - 16.0).max(180.0));
+        let popup_h = 316.0_f32.min((viewport_rect.height() - 16.0).max(140.0));
+        let x = btn_rect_saved.left().clamp(
+            viewport_rect.left() + 8.0,
+            (viewport_rect.right() - popup_w - 8.0).max(viewport_rect.left() + 8.0),
+        );
+        let below_y = btn_rect_saved.bottom() + 2.0;
+        let y = if below_y + popup_h <= viewport_rect.bottom() - 8.0 {
+            below_y
+        } else {
+            (btn_rect_saved.top() - popup_h - 2.0).clamp(
+                viewport_rect.top() + 8.0,
+                (viewport_rect.bottom() - popup_h - 8.0).max(viewport_rect.top() + 8.0),
+            )
+        };
+        let mut close_now = ui.input(|i| i.key_pressed(Key::Escape));
+        if close_now {
+            mark_floating_editor_escape_consumed(ui.ctx());
+        }
+
+        let list_h = (popup_h - 52.0).max(80.0);
+        let area_resp = Area::new(popup_id)
+            .order(Order::Foreground)
+            .fixed_pos(Pos2::new(x.round(), y.round()))
+            .interactable(true)
+            .movable(false)
+            .show(ui.ctx(), |ui| {
+                Frame::NONE
+                    .fill(BG_PANEL)
+                    .stroke(Stroke::new(1.0, theme.accent()))
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.set_min_width(popup_w - 12.0);
+                        ui.set_max_width(popup_w - 12.0);
+                        ui.set_max_height(popup_h - 12.0);
+                        let search_resp = ui.add(
+                            TextEdit::singleline(&mut state.font_picker_search)
+                                .id(search_id)
+                                .hint_text("Search fonts (e.g. Impact, Geist, Hiragino)...")
+                                .font(theme.font(FONT_SMALL))
+                                .desired_width(ui.available_width()),
+                        );
+                        if just_opened_popup {
+                            search_resp.request_focus();
+                        }
+                        ui.add_space(4.0);
+                        let q = state.font_picker_search.trim().to_ascii_lowercase();
+                        let mut first_match: Option<usize> = None;
+                        ScrollArea::vertical()
+                            .id_salt((popup_id, "list"))
+                            .min_scrolled_height(list_h)
+                            .max_height(list_h)
+                            .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                let mut any = false;
+                                for (idx, lbl) in font_labels.iter().enumerate() {
+                                    if !q.is_empty() && !lbl.to_ascii_lowercase().contains(&q) {
+                                        continue;
+                                    }
+                                    if first_match.is_none() {
+                                        first_match = Some(idx);
+                                    }
+                                    any = true;
+                                    let is_sel = idx == font_idx;
+                                    let (row_rect, row_resp) = ui.allocate_exact_size(
+                                        Vec2::new(ui.available_width(), 24.0),
+                                        Sense::click(),
+                                    );
+                                    let row_resp =
+                                        row_resp.on_hover_cursor(CursorIcon::PointingHand);
+                                    if is_sel {
+                                        ui.painter().rect_filled(
+                                            row_rect,
+                                            CornerRadius::ZERO,
+                                            theme.accent(),
+                                        );
+                                    } else if row_resp.hovered() {
+                                        ui.painter().rect_filled(
+                                            row_rect,
+                                            CornerRadius::ZERO,
+                                            BG_DROPDOWN_HOVER,
+                                        );
+                                    }
+                                    ui.painter()
+                                        .with_clip_rect(row_rect.shrink2(Vec2::new(4.0, 0.0)))
+                                        .text(
+                                            Pos2::new(row_rect.left() + 6.0, row_rect.center().y),
+                                            Align2::LEFT_CENTER,
+                                            *lbl,
+                                            theme.font(FONT_SMALL),
+                                            if is_sel { TEXT_BRIGHT } else { TEXT_PRIMARY },
+                                        );
+                                    if row_resp.clicked() {
+                                        font_idx = idx;
+                                        font_changed = true;
+                                        close_now = true;
+                                    }
+                                }
+                                if !any {
+                                    ui.label(
+                                        egui::RichText::new("No matching fonts")
+                                            .font(theme.font(FONT_SMALL))
+                                            .color(TEXT_FAINT),
+                                    );
+                                }
+                            });
+                        if ui.input(|i| i.key_pressed(Key::Enter))
+                            && let Some(idx) = first_match
+                        {
+                            font_idx = idx;
+                            font_changed = true;
+                            close_now = true;
+                        }
+                    });
+            });
+        if area_resp.response.rect.is_positive()
+            && ui.ctx().layer_id_at(area_resp.response.rect.center())
+                != Some(area_resp.response.layer_id)
+        {
+            ui.ctx().request_repaint();
+        }
+        // Prevent any mouse-wheel / trackpad scroll over the open font popup from leaking
+        // into the parent inspector ScrollArea behind it.
+        if ui.input(|i| {
+            i.pointer
+                .hover_pos()
+                .is_some_and(|p| area_resp.response.rect.contains(p))
+        }) {
+            ui.input_mut(|i| {
+                i.smooth_scroll_delta = Vec2::ZERO;
+            });
+        }
+        let clicked_outside = !just_opened_popup
+            && ui.input(|i| {
+                i.pointer.primary_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| {
+                        !area_resp.response.rect.contains(p) && !btn_rect_saved.contains(p)
+                    })
+            });
+        if close_now || clicked_outside {
+            popup_open = false;
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(popup_id, popup_open));
+
+    if font_changed && let Some(choice) = choices.get(font_idx) {
+        let resolved_value: Option<String> = match choice {
+            FontChoice::Builtin(key, _) => Some(key.clone()),
+            FontChoice::ProjectAsset(aid, _) => Some(aid.clone()),
+            FontChoice::SystemFont(display, path) => {
+                // Embed the selected OS system font into `session.project.assets` so the
+                // project renders cleanly and stays portable across `.zcraft` / `.pz` export.
+                match std::fs::read(path) {
+                    Ok(bytes) if !bytes.is_empty() && bytes.len() <= 32 * 1024 * 1024 => {
+                        let filename = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(display.as_str())
+                            .to_owned();
+                        let existing_id = session
+                            .project
+                            .assets
+                            .values()
+                            .find(|a| a.filename == filename && a.bytes.is_some())
+                            .map(|a| a.id.clone());
+                        let asset_id = existing_id.unwrap_or_else(|| {
+                            let id = session.project.insert_binary_asset(
+                                AssetKind::Font,
+                                filename.clone(),
+                                bytes,
+                            );
+                            session.project.media.push(zc_project::MediaItem {
+                                id: zc_project::Uuid::new_v4(),
+                                name: filename,
+                                asset_id: Some(id.clone()),
+                                kind: AssetKind::Font,
+                                preserved: BTreeMap::new(),
+                            });
+                            id
+                        });
+                        Some(asset_id)
+                    }
+                    // Large system font collections (e.g. >32 MiB CJK `.ttc`): reference by path
+                    // so `zc-render`'s direct `.ttc` loader renders immediately without bloating `.zcraft`.
+                    Ok(bytes) if !bytes.is_empty() => Some(path.to_string_lossy().into_owned()),
+                    _ => None,
+                }
+            }
+        };
+        if let Some(val) = resolved_value {
+            let _ = session.execute(Command::SetPropertyValue {
+                target_id: target_id.to_owned(),
+                property: "font".to_owned(),
+                value: json!(val),
+            });
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn show_session_asset_prop(
     ui: &mut Ui,
@@ -5185,6 +6810,51 @@ fn show_effects_tab(
         return;
     };
 
+    // Expand the Add Effect picker over the FULL sidebar height when open
+    if state.add_effect_open {
+        let items = build_effect_picker_items(session);
+        match show_panel_fuzzy_picker(
+            ui,
+            panel_rect,
+            Id::unique("add_effect_picker"),
+            state.picker_open_seq,
+            &items,
+            &mut state.add_effect_picker,
+            theme,
+        ) {
+            FuzzyPickerEvent::Cancelled => {
+                state.add_effect_open = false;
+            }
+            FuzzyPickerEvent::Selected(kind) => {
+                commit_inspector_tx_if_open(session, state);
+                let display = items.iter().find(|i| i.id == kind).map(|i| i.name.clone());
+                let started_tx = kind == "customshader"
+                    && session.begin_transaction("add custom shader").is_ok();
+                if let Ok(res) = session.execute(Command::AddEffect {
+                    clip_id: clip_id.clone(),
+                    kind: kind.clone(),
+                    name: display,
+                }) && let Some(fx_id) = res.get("effect_id").and_then(Value::as_str)
+                {
+                    if kind == "customshader" {
+                        let _ = session.execute(Command::SetPropertyValue {
+                            target_id: fx_id.to_owned(),
+                            property: "fragShader".to_owned(),
+                            value: json!(DEFAULT_CUSTOM_SHADER_GLSL),
+                        });
+                    }
+                    let _ = session.selection.select_effect(fx_id, &kind, false);
+                }
+                if started_tx && session.history.is_in_transaction() {
+                    let _ = session.commit_transaction(true);
+                }
+                state.add_effect_open = false;
+            }
+            FuzzyPickerEvent::None => {}
+        }
+        return;
+    }
+
     let (top_rect, bot_rect) = begin_split_panel(
         ui,
         Id::unique("effects_40_60_split"),
@@ -5215,54 +6885,12 @@ fn show_effects_tab(
         top_inner,
         |ui, _top_rect| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
-            // Pane 0 (40%): Effect Stack or Inline Fuzzy Add Effect Picker
-            if state.add_effect_open {
-                let items = build_effect_picker_items(session);
-                match cm3_fuzzy_picker(
-                    ui,
-                    Id::unique("add_effect_picker"),
-                    &items,
-                    &mut state.add_effect_picker,
-                    theme,
-                ) {
-                    FuzzyPickerEvent::Cancelled => {
-                        state.add_effect_open = false;
-                    }
-                    FuzzyPickerEvent::Selected(kind) => {
-                        commit_inspector_tx_if_open(session, state);
-                        let display = items.iter().find(|i| i.id == kind).map(|i| i.name.clone());
-                        let started_tx = kind == "customshader"
-                            && session.begin_transaction("add custom shader").is_ok();
-                        if let Ok(res) = session.execute(Command::AddEffect {
-                            clip_id: clip_id.clone(),
-                            kind: kind.clone(),
-                            name: display,
-                        }) && let Some(fx_id) = res.get("effect_id").and_then(Value::as_str)
-                        {
-                            // Initialize default Custom Shader source if adding Custom Shader
-                            if kind == "customshader" {
-                                let _ = session.execute(Command::SetPropertyValue {
-                                    target_id: fx_id.to_owned(),
-                                    property: "fragShader".to_owned(),
-                                    value: json!(DEFAULT_CUSTOM_SHADER_GLSL),
-                                });
-                            }
-                            let _ = session.selection.select_effect(fx_id, &kind, false);
-                        }
-                        if started_tx && session.history.is_in_transaction() {
-                            let _ = session.commit_transaction(true);
-                        }
-                        state.add_effect_open = false;
-                    }
-                    FuzzyPickerEvent::None => {}
-                }
-                return;
-            }
 
-            // 28px #222222 header bar (27px body + 1px #242424 bottom border), 7x7 framed square glyph,
-            // 16px #cccccc "Effects" title, and right-aligned `+`
-            let (hdr_rect, hdr_resp) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
+            // 28px #222222 non-collapsible header bar (27px body + 1px #242424 bottom border),
+            // 16px #cccccc "Effects" title, Paste button, and right-aligned `+`.
+            // Keeping the primary list non-collapsible prevents collapsing into a 240px blank split pane.
+            let (hdr_rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
             ui.painter()
                 .rect_filled(hdr_rect, CornerRadius::ZERO, BG_TITLE);
             let hdr_div_y = (hdr_rect.bottom() - 1.0).round();
@@ -5274,28 +6902,34 @@ fn show_effects_tab(
                 CornerRadius::ZERO,
                 BORDER_ROW_SOFT,
             );
-            paint_cm3_tree_box(
-                ui.painter(),
-                Pos2::new(hdr_rect.left() + 10.5, hdr_rect.center().y + 1.0),
-                state.effects_list_open,
-                if hdr_resp.hovered() {
-                    TEXT_BRIGHT
-                } else {
-                    TEXT_MUTED
-                },
-            );
-            ui.painter().text(
-                Pos2::new(hdr_rect.left() + 21.0, hdr_rect.center().y),
-                Align2::LEFT_CENTER,
-                "Effects",
-                theme.font(FONT_BODY),
-                TEXT_PRIMARY,
-            );
             let add_icon_rect = Rect::from_min_size(
                 Pos2::new(hdr_rect.right() - 24.0, (hdr_rect.center().y - 8.0).round()),
                 Vec2::splat(15.0),
             );
             let add_rect = add_icon_rect.expand(3.0);
+            let paste_w = (ui
+                .painter()
+                .layout_no_wrap("Paste".to_owned(), theme.font(FONT_COMPACT), TEXT_PRIMARY)
+                .size()
+                .x
+                .ceil()
+                + 12.0)
+                .max(44.0);
+            let paste_rect = Rect::from_min_size(
+                Pos2::new(
+                    (add_rect.left() - paste_w - 4.0).max(hdr_rect.left() + 68.0),
+                    (hdr_rect.center().y - 9.0).round(),
+                ),
+                Vec2::new(paste_w, 18.0),
+            );
+            let (paste_clicked, _paste_hovered) = header_compact_action_button(
+                ui,
+                Id::unique("effects_paste_btn"),
+                paste_rect,
+                "Paste",
+                "Paste Effect / Shader JSON or GLSL (Cmd+V)",
+                theme,
+            );
             let add_resp = ui
                 .interact(add_rect, Id::unique("effects_add_btn"), Sense::click())
                 .on_hover_cursor(CursorIcon::PointingHand)
@@ -5308,6 +6942,26 @@ fn show_effects_tab(
                     StrokeKind::Inside,
                 );
             }
+            let fx_title = if clip.effects.is_empty() {
+                "Effects".to_owned()
+            } else {
+                format!("Effects ({})", clip.effects.len())
+            };
+            ui.painter()
+                .with_clip_rect(Rect::from_min_max(
+                    Pos2::new(hdr_rect.left() + 8.0, hdr_rect.top()),
+                    Pos2::new(
+                        (paste_rect.left() - 4.0).max(hdr_rect.left() + 12.0),
+                        hdr_rect.bottom(),
+                    ),
+                ))
+                .text(
+                    Pos2::new(hdr_rect.left() + 10.0, hdr_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    fx_title,
+                    theme.font(FONT_BODY),
+                    TEXT_PRIMARY,
+                );
             paint_cm3_icon(
                 ui.painter(),
                 add_icon_rect,
@@ -5319,17 +6973,24 @@ fn show_effects_tab(
                 },
             );
             if add_resp.clicked() {
+                state.picker_open_seq = state.picker_open_seq.wrapping_add(1);
                 state.add_effect_open = true;
                 state.add_effect_picker = FuzzyPickerState {
                     just_opened: true,
                     ..FuzzyPickerState::default()
                 };
-            } else if hdr_resp.clicked() {
-                state.effects_list_open = !state.effects_list_open;
-            }
-
-            if !state.effects_list_open {
-                return;
+            } else if paste_clicked {
+                paste_pz_json_from_clipboard(
+                    session,
+                    state,
+                    actions,
+                    "effects",
+                    Some(clip_id.clone()),
+                    None,
+                    None,
+                    None,
+                    "effect JSON or GLSL",
+                );
             }
 
             // Effect stack rows
@@ -5370,6 +7031,52 @@ fn show_effects_tab(
                             ],
                             Stroke::new(1.0, BORDER_ROW_SOFT),
                         );
+
+                        // If this top-level effect is an EffectGroup with children, draw expand/collapse tree box.
+                        let group_children = if fx.kind == "group" {
+                            collect_effect_group_child_rows(
+                                session,
+                                &clip_id,
+                                &fx.id,
+                                &state.collapsed_effect_groups,
+                            )
+                        } else {
+                            Vec::new()
+                        };
+                        let has_group_children = !group_children.is_empty();
+                        let group_expanded =
+                            has_group_children && !state.collapsed_effect_groups.contains(&fx.id);
+                        let mut toggled_group_expand = false;
+                        if has_group_children {
+                            let tri_center =
+                                Pos2::new(row_rect.left() + 18.0, row_rect.center().y + 1.0);
+                            let tri_rect = Rect::from_center_size(tri_center, Vec2::splat(15.0));
+                            let tri_resp = ui
+                                .interact(
+                                    tri_rect,
+                                    Id::unique(("fx_grp_toggle", &fx.id)),
+                                    Sense::click(),
+                                )
+                                .on_hover_cursor(CursorIcon::PointingHand);
+                            paint_cm3_tree_box(
+                                ui.painter(),
+                                tri_center,
+                                group_expanded,
+                                if tri_resp.hovered() || selected {
+                                    TEXT_BRIGHT
+                                } else {
+                                    TEXT_MUTED
+                                },
+                            );
+                            if tri_resp.clicked() {
+                                toggled_group_expand = true;
+                                if group_expanded {
+                                    state.collapsed_effect_groups.insert(fx.id.clone());
+                                } else {
+                                    state.collapsed_effect_groups.remove(&fx.id);
+                                }
+                            }
+                        }
 
                         // Label or Inline Rename input (35px left indent; Reset/Dup/Remove live in Inspector header)
                         let label_left = row_rect.left() + 35.0;
@@ -5446,7 +7153,7 @@ fn show_effects_tab(
                             );
                         }
 
-                        if row_resp.clicked() {
+                        if row_resp.clicked() && !toggled_group_expand {
                             commit_inspector_tx_if_open(session, state);
                             let shift = ui.input(|i| i.modifiers.shift);
                             if let Err(err) =
@@ -5456,14 +7163,65 @@ fn show_effects_tab(
                             }
                         }
 
-                        // Right-click inline rename (Spec 01 §4.7)
-                        if row_resp.secondary_clicked() {
-                            state.rename_state = Some(InlineRenameState {
-                                target_id: fx.id.clone(),
-                                buffer: fx.name.clone(),
-                                just_started: true,
-                            });
-                        }
+                        // Right-click context menu (Rename, Copy/Paste PZ JSON, Duplicate, Remove)
+                        let ctx_fx_id = fx.id.clone();
+                        let ctx_fx_name = fx.name.clone();
+                        row_resp.context_menu(|ui| {
+                            if ui.button("Rename").clicked() {
+                                state.rename_state = Some(InlineRenameState {
+                                    target_id: ctx_fx_id.clone(),
+                                    buffer: ctx_fx_name.clone(),
+                                    just_started: true,
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Copy JSON").clicked() {
+                                let ids = if selected && session.selection.effect_ids.len() > 1 {
+                                    session.selection.effect_ids.clone()
+                                } else {
+                                    vec![ctx_fx_id.clone()]
+                                };
+                                let count = ids.len();
+                                let res = session.copy_effects_as_pz_json(&clip_id, &ids);
+                                copy_pz_json_to_clipboard(
+                                    ui.ctx(),
+                                    res,
+                                    &format!(
+                                        "Copied {count} effect{} JSON to clipboard",
+                                        if count == 1 { "" } else { "s" }
+                                    ),
+                                    actions,
+                                );
+                                ui.close();
+                            }
+                            if ui.button("Paste JSON").clicked() {
+                                paste_pz_json_from_clipboard(
+                                    session,
+                                    state,
+                                    actions,
+                                    "effects",
+                                    Some(clip_id.clone()),
+                                    None,
+                                    None,
+                                    None,
+                                    "effect JSON or GLSL",
+                                );
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Duplicate").clicked() {
+                                let _ = session.execute(Command::DuplicateEffect {
+                                    clip_id: clip_id.clone(),
+                                    effect_id: ctx_fx_id.clone(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Remove").clicked() {
+                                commit_inspector_tx_if_open(session, state);
+                                delete_effect_and_select_adjacent(session, &clip_id, &ctx_fx_id);
+                                ui.close();
+                            }
+                        });
 
                         // Drag-to-reorder effect stack (5px vertical threshold)
                         if row_resp.drag_started()
@@ -5500,6 +7258,189 @@ fn show_effects_tab(
                                     let target_idx = if before { idx } else { idx + 1 };
                                     reorder_req = Some((drag.dragging_id.clone(), target_idx));
                                 }
+                            }
+                        }
+
+                        // Render expanded EffectGroup nested child rows underneath parent
+                        if group_expanded {
+                            let mut pending_toggle_child: Option<String> = None;
+                            let mut pending_delete_child: Option<String> = None;
+                            for child in &group_children {
+                                let child_selected =
+                                    session.selection.effect_ids.contains(&child.id);
+                                let (c_rect, c_resp) = ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), 24.0),
+                                    Sense::click(),
+                                );
+                                let c_ptr_in = ui.input(|i| {
+                                    i.pointer.hover_pos().is_some_and(|p| c_rect.contains(p))
+                                });
+                                if child_selected {
+                                    ui.painter().rect_filled(
+                                        c_rect,
+                                        CornerRadius::ZERO,
+                                        theme.accent(),
+                                    );
+                                } else if c_resp.hovered() || c_ptr_in {
+                                    ui.painter()
+                                        .rect_filled(c_rect, CornerRadius::ZERO, BG_HOVER);
+                                }
+                                ui.painter().line_segment(
+                                    [
+                                        Pos2::new(c_rect.left(), c_rect.bottom() - 0.5),
+                                        Pos2::new(c_rect.right(), c_rect.bottom() - 0.5),
+                                    ],
+                                    Stroke::new(1.0, BORDER_ROW_SOFT),
+                                );
+
+                                // Right-aligned enable toggle button (eye icon)
+                                let eye_rect = Rect::from_min_size(
+                                    Pos2::new(
+                                        c_rect.right() - 24.0,
+                                        (c_rect.center().y - 9.0).round(),
+                                    ),
+                                    Vec2::splat(18.0),
+                                );
+                                let mut eye_ui =
+                                    ui.new_child(egui::UiBuilder::new().max_rect(eye_rect));
+                                let eye_clicked = paint_visibility_eye_button(
+                                    &mut eye_ui,
+                                    Id::unique(("fx_grp_child_en", &child.id)),
+                                    child.enabled,
+                                    theme,
+                                );
+                                if eye_clicked {
+                                    pending_toggle_child = Some(child.id.clone());
+                                }
+
+                                let indent = 35.0 + (child.depth as f32) * 14.0;
+                                let mut child_toggled_expand = false;
+                                if child.has_children {
+                                    let tri_c = Pos2::new(
+                                        c_rect.left() + indent - 12.0,
+                                        c_rect.center().y + 1.0,
+                                    );
+                                    let tri_r = Rect::from_center_size(tri_c, Vec2::splat(14.0));
+                                    let tri_resp = ui
+                                        .interact(
+                                            tri_r,
+                                            Id::unique(("fx_grp_sub_toggle", &child.id)),
+                                            Sense::click(),
+                                        )
+                                        .on_hover_cursor(CursorIcon::PointingHand);
+                                    paint_cm3_tree_box(
+                                        ui.painter(),
+                                        tri_c,
+                                        !state.collapsed_effect_groups.contains(&child.id),
+                                        if tri_resp.hovered() || child_selected {
+                                            TEXT_BRIGHT
+                                        } else {
+                                            TEXT_MUTED
+                                        },
+                                    );
+                                    if tri_resp.clicked() {
+                                        child_toggled_expand = true;
+                                        if state.collapsed_effect_groups.contains(&child.id) {
+                                            state.collapsed_effect_groups.remove(&child.id);
+                                        } else {
+                                            state.collapsed_effect_groups.insert(child.id.clone());
+                                        }
+                                    }
+                                }
+
+                                let branch = if child.is_last { "└─ " } else { "├─ " };
+                                let child_label = format!("{branch}{}", child.name);
+                                let c_label_left = c_rect.left() + indent;
+                                let c_label_right =
+                                    (eye_rect.left() - 4.0).max(c_label_left + 12.0);
+                                let c_label_rect = Rect::from_min_max(
+                                    Pos2::new(c_label_left, c_rect.top()),
+                                    Pos2::new(c_label_right, c_rect.bottom()),
+                                );
+                                let c_color = if !child.enabled {
+                                    TEXT_DISABLED
+                                } else if child_selected {
+                                    TEXT_BRIGHT
+                                } else {
+                                    TEXT_PRIMARY
+                                };
+                                let c_galley = layout_single_line_ellipsized(
+                                    ui.painter(),
+                                    &child_label,
+                                    theme.font(FONT_SMALL),
+                                    c_color,
+                                    c_label_rect.width(),
+                                );
+                                ui.painter().with_clip_rect(c_label_rect).galley(
+                                    Pos2::new(
+                                        c_label_rect.left(),
+                                        c_label_rect.center().y - c_galley.size().y * 0.5,
+                                    ),
+                                    c_galley,
+                                    c_color,
+                                );
+
+                                if c_resp.clicked() && !eye_clicked && !child_toggled_expand {
+                                    commit_inspector_tx_if_open(session, state);
+                                    let shift = ui.input(|i| i.modifiers.shift);
+                                    if let Err(err) = session.selection.select_effect(
+                                        &child.id,
+                                        &child.kind_id,
+                                        shift,
+                                    ) {
+                                        actions.push(PanelAction::StatusMessage(err.to_string()));
+                                    }
+                                }
+
+                                let ctx_cid = child.id.clone();
+                                let ctx_enabled = child.enabled;
+                                c_resp.context_menu(|ui| {
+                                    if ui
+                                        .button(if ctx_enabled { "Disable" } else { "Enable" })
+                                        .clicked()
+                                    {
+                                        pending_toggle_child = Some(ctx_cid.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("Copy JSON").clicked() {
+                                        let res = session.copy_effects_as_pz_json(
+                                            &clip_id,
+                                            std::slice::from_ref(&ctx_cid),
+                                        );
+                                        copy_pz_json_to_clipboard(
+                                            ui.ctx(),
+                                            res,
+                                            "Copied effect JSON to clipboard",
+                                            actions,
+                                        );
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button("Remove").clicked() {
+                                        pending_delete_child = Some(ctx_cid.clone());
+                                        ui.close();
+                                    }
+                                });
+                            }
+                            if let Some(cid) = pending_toggle_child {
+                                mutate_effect_group_child(
+                                    session,
+                                    &clip_id,
+                                    &cid,
+                                    "toggle grouped effect",
+                                    |eff| {
+                                        let cur = effect_track_bool(&eff.enabled, true);
+                                        let next = if cur { 0 } else { 1 };
+                                        eff.enabled.value = PropertyValue::Option(next);
+                                        if let Some(kf) = eff.enabled.keyframes.first_mut() {
+                                            kf.value = PropertyValue::Option(next);
+                                        }
+                                    },
+                                );
+                            }
+                            if let Some(cid) = pending_delete_child {
+                                commit_inspector_tx_if_open(session, state);
+                                delete_effect_group_child(session, &clip_id, &cid);
                             }
                         }
                     }
@@ -5559,6 +7500,1142 @@ void main() {
 }
 "#;
 
+#[derive(Debug, Clone)]
+struct EffectGroupChildRow {
+    id: String,
+    kind_id: String,
+    name: String,
+    enabled: bool,
+    depth: usize,
+    is_last: bool,
+    has_children: bool,
+}
+
+fn effect_instance_kind_id(kind: &EffectKind) -> String {
+    match kind {
+        EffectKind::Standard(id) => id.clone(),
+        EffectKind::CustomShader { .. } => "customshader".to_owned(),
+        EffectKind::EffectGroup { .. } => "group".to_owned(),
+        EffectKind::Plugin {
+            plugin_id,
+            effect_id,
+        } => format!("zoidium:{plugin_id}/{effect_id}"),
+    }
+}
+
+fn effect_track_bool(track: &PropertyTrack, default: bool) -> bool {
+    match &track.value {
+        PropertyValue::Bool(b) => *b,
+        PropertyValue::Option(o) => *o != 0,
+        PropertyValue::Number(n) => *n != 0.0,
+        _ => default,
+    }
+}
+
+fn collect_effect_group_child_rows(
+    session: &Session,
+    clip_id: &str,
+    group_effect_id: &str,
+    collapsed: &BTreeSet<String>,
+) -> Vec<EffectGroupChildRow> {
+    fn push_children(
+        children: &[EffectInstance],
+        depth: usize,
+        collapsed: &BTreeSet<String>,
+        out: &mut Vec<EffectGroupChildRow>,
+    ) {
+        let count = children.len();
+        for (i, child) in children.iter().enumerate() {
+            let cid = child.id.to_string();
+            let sub_children = match &child.kind {
+                EffectKind::EffectGroup { children, .. } => children.as_slice(),
+                _ => &[],
+            };
+            let has_children = !sub_children.is_empty();
+            out.push(EffectGroupChildRow {
+                id: cid.clone(),
+                kind_id: effect_instance_kind_id(&child.kind),
+                name: child.name.clone(),
+                enabled: effect_track_bool(&child.enabled, true),
+                depth,
+                is_last: i + 1 == count,
+                has_children,
+            });
+            if has_children && !collapsed.contains(&cid) {
+                push_children(sub_children, depth + 1, collapsed, out);
+            }
+        }
+    }
+
+    let Some(vc) = find_project_video_clip(session, clip_id) else {
+        return Vec::new();
+    };
+    let Some(group_fx) = vc
+        .layer
+        .effects
+        .iter()
+        .find(|e| e.id.to_string() == group_effect_id)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let EffectKind::EffectGroup { children, .. } = &group_fx.kind {
+        push_children(children, 1, collapsed, &mut out);
+    }
+    out
+}
+
+fn find_effect_group_child(
+    session: &Session,
+    clip_id: &str,
+    child_id: &str,
+) -> Option<EffectInstance> {
+    fn search(effects: &[EffectInstance], target: &str) -> Option<EffectInstance> {
+        for fx in effects {
+            if fx.id.to_string() == target {
+                return Some(fx.clone());
+            }
+            if let EffectKind::EffectGroup { children, .. } = &fx.kind
+                && let Some(found) = search(children, target)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let vc = find_project_video_clip(session, clip_id)?;
+    for fx in &vc.layer.effects {
+        if let EffectKind::EffectGroup { children, .. } = &fx.kind
+            && let Some(found) = search(children, child_id)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn mutate_effect_group_child(
+    session: &mut Session,
+    clip_id: &str,
+    child_id: &str,
+    label: &str,
+    f: impl FnOnce(&mut EffectInstance),
+) -> bool {
+    fn find_mut<'a>(
+        effects: &'a mut [EffectInstance],
+        target: &str,
+    ) -> Option<&'a mut EffectInstance> {
+        for fx in effects {
+            if fx.id.to_string() == target {
+                return Some(fx);
+            }
+            if let EffectKind::EffectGroup { children, .. } = &mut fx.kind
+                && let Some(found) = find_mut(children, target)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let Ok(clip_uuid) = Uuid::parse_str(clip_id) else {
+        return false;
+    };
+    let started_tx = if !session.history.is_in_transaction() {
+        session.begin_transaction(label).is_ok()
+    } else {
+        false
+    };
+    let mut mutated = false;
+    'outer: for track in &mut session.active_sequence_mut().video_tracks {
+        for vc in &mut track.clips {
+            if vc.id == clip_uuid {
+                for fx in &mut vc.layer.effects {
+                    if let EffectKind::EffectGroup { children, .. } = &mut fx.kind
+                        && let Some(target) = find_mut(children, child_id)
+                    {
+                        f(target);
+                        mutated = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    if started_tx {
+        let _ = session.commit_transaction(mutated);
+    }
+    mutated
+}
+
+/// Deletes a top-level effect on `clip_id`. When the deleted effect was selected and other
+/// effects remain on that clip, automatically selects the next (or previous) remaining effect
+/// instead of clearing selection to empty.
+fn delete_effect_and_select_adjacent(session: &mut Session, clip_id: &str, effect_id: &str) {
+    let was_selected = session
+        .selection
+        .effect_ids
+        .iter()
+        .any(|id| id == effect_id);
+    let adjacent = if was_selected {
+        session
+            .document()
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == clip_id)
+            .and_then(|c| {
+                let pos = c.effects.iter().position(|e| e.id == effect_id)?;
+                let next_fx = if pos + 1 < c.effects.len() {
+                    Some(&c.effects[pos + 1])
+                } else if pos > 0 {
+                    Some(&c.effects[pos - 1])
+                } else {
+                    None
+                }?;
+                Some((next_fx.id.clone(), next_fx.kind.clone()))
+            })
+    } else {
+        None
+    };
+
+    let _ = session.execute(Command::DeleteEffect {
+        clip_id: clip_id.to_owned(),
+        effect_id: effect_id.to_owned(),
+    });
+
+    if was_selected
+        && session.selection.effect_ids.is_empty()
+        && let Some((next_id, next_kind)) = adjacent
+    {
+        let _ = session.selection.select_effect(&next_id, &next_kind, false);
+    }
+}
+
+/// Reads the `custom_properties` of an `EffectGroup` (top-level or nested) from `session.project`.
+fn find_effect_group_custom_properties(
+    session: &Session,
+    clip_id: &str,
+    group_effect_id: &str,
+) -> Vec<CustomProperty> {
+    fn search(effects: &[EffectInstance], target: &str) -> Option<Vec<CustomProperty>> {
+        for fx in effects {
+            if fx.id.to_string() == target {
+                if let EffectKind::EffectGroup {
+                    custom_properties, ..
+                } = &fx.kind
+                {
+                    return Some(custom_properties.clone());
+                }
+                return None;
+            }
+            if let EffectKind::EffectGroup { children, .. } = &fx.kind
+                && let Some(found) = search(children, target)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let Some(vc) = find_project_video_clip(session, clip_id) else {
+        return Vec::new();
+    };
+    search(&vc.layer.effects, group_effect_id).unwrap_or_default()
+}
+
+/// Updates one `CustomProperty`'s value on an `EffectGroup` (top-level or nested) inside an undoable transaction.
+fn update_effect_group_custom_property(
+    session: &mut Session,
+    clip_id: &str,
+    group_effect_id: &str,
+    prop_name: &str,
+    new_val: PropertyValue,
+) -> bool {
+    fn find_mut<'a>(
+        effects: &'a mut [EffectInstance],
+        target: &str,
+    ) -> Option<&'a mut EffectInstance> {
+        for fx in effects {
+            if fx.id.to_string() == target {
+                return Some(fx);
+            }
+            if let EffectKind::EffectGroup { children, .. } = &mut fx.kind
+                && let Some(found) = find_mut(children, target)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let Ok(clip_uuid) = Uuid::parse_str(clip_id) else {
+        return false;
+    };
+    let started_tx = if !session.history.is_in_transaction() {
+        session
+            .begin_transaction("edit effect group custom property")
+            .is_ok()
+    } else {
+        false
+    };
+    let mut mutated = false;
+    'outer: for track in &mut session.active_sequence_mut().video_tracks {
+        for vc in &mut track.clips {
+            if vc.id == clip_uuid
+                && let Some(target) = find_mut(&mut vc.layer.effects, group_effect_id)
+                && let EffectKind::EffectGroup {
+                    custom_properties, ..
+                } = &mut target.kind
+                && let Some(cp) = custom_properties.iter_mut().find(|c| c.name == prop_name)
+            {
+                cp.track.value = new_val.clone();
+                if let Some(kf) = cp.track.keyframes.first_mut() {
+                    kf.value = new_val;
+                }
+                mutated = true;
+                break 'outer;
+            }
+        }
+    }
+    if mutated {
+        session.playback.bump_epoch();
+    }
+    if started_tx {
+        let _ = session.commit_transaction(mutated);
+    }
+    mutated
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_effect_group_custom_properties(
+    ui: &mut Ui,
+    session: &mut Session,
+    clip_id: &str,
+    group_effect_id: &str,
+    custom_props: &[CustomProperty],
+    viewport_rect: Rect,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+) {
+    let mut updates: Vec<(String, PropertyValue)> = Vec::new();
+    for cp in custom_props {
+        let lbl = humanize_prop_label(&cp.name);
+        match &cp.track.value {
+            PropertyValue::Number(v) => {
+                let mut cur = *v;
+                let ev = panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_scrub_number(
+                            ui,
+                            Id::unique(("fx_grp_cp_num", group_effect_id, &cp.name)),
+                            &mut cur,
+                            ScrubConfig::new(-100_000.0, 100_000.0, 0.05, 2),
+                            theme,
+                        )
+                    },
+                );
+                if ev.changed {
+                    updates.push((cp.name.clone(), PropertyValue::Number(cur)));
+                }
+            }
+            PropertyValue::Bool(b) => {
+                let mut idx = usize::from(*b);
+                let changed = panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_dropdown(
+                            ui,
+                            Id::unique(("fx_grp_cp_bool", group_effect_id, &cp.name)),
+                            &mut idx,
+                            &["off", "on"],
+                            false,
+                            viewport_rect,
+                            theme,
+                        )
+                    },
+                );
+                if changed {
+                    updates.push((cp.name.clone(), PropertyValue::Bool(idx != 0)));
+                }
+            }
+            PropertyValue::Option(o) => {
+                let mut cur = f64::from(*o);
+                let ev = panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_scrub_number(
+                            ui,
+                            Id::unique(("fx_grp_cp_opt", group_effect_id, &cp.name)),
+                            &mut cur,
+                            ScrubConfig::new(0.0, 64.0, 1.0, 0),
+                            theme,
+                        )
+                    },
+                );
+                if ev.changed {
+                    updates.push((cp.name.clone(), PropertyValue::Option(cur.round() as u32)));
+                }
+            }
+            PropertyValue::Vec2(v) => {
+                let mut cur = *v;
+                let ev = panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_vector2(
+                            ui,
+                            Id::unique(("fx_grp_cp_v2", group_effect_id, &cp.name)),
+                            &mut cur,
+                            ScrubConfig::new(-10_000.0, 10_000.0, 0.1, 2),
+                            false,
+                            theme,
+                        )
+                    },
+                );
+                if ev.changed {
+                    updates.push((cp.name.clone(), PropertyValue::Vec2(cur)));
+                }
+            }
+            PropertyValue::Vec3(v) => {
+                let mut cur = *v;
+                let ev = panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_vector3(
+                            ui,
+                            Id::unique(("fx_grp_cp_v3", group_effect_id, &cp.name)),
+                            &mut cur,
+                            ScrubConfig::new(-10_000.0, 10_000.0, 0.1, 2),
+                            false,
+                            theme,
+                        )
+                    },
+                );
+                if ev.changed {
+                    updates.push((cp.name.clone(), PropertyValue::Vec3(cur)));
+                }
+            }
+            PropertyValue::Color(c) => {
+                let mut rgba = Rgba::new(c[0] as f32, c[1] as f32, c[2] as f32, 1.0);
+                let cev = panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_hsva_color_picker(
+                            ui,
+                            Id::unique(("fx_grp_cp_col", group_effect_id, &cp.name)),
+                            &mut rgba,
+                            false,
+                            false,
+                            viewport_rect,
+                            theme,
+                        )
+                    },
+                );
+                if cev.changed {
+                    updates.push((
+                        cp.name.clone(),
+                        PropertyValue::Color([
+                            f64::from(rgba.0[0]),
+                            f64::from(rgba.0[1]),
+                            f64::from(rgba.0[2]),
+                        ]),
+                    ));
+                }
+            }
+            PropertyValue::ColorRgba(c) => {
+                let mut rgba = Rgba::new(c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32);
+                let cev = panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_hsva_color_picker(
+                            ui,
+                            Id::unique(("fx_grp_cp_rgba", group_effect_id, &cp.name)),
+                            &mut rgba,
+                            true,
+                            false,
+                            viewport_rect,
+                            theme,
+                        )
+                    },
+                );
+                if cev.changed {
+                    updates.push((
+                        cp.name.clone(),
+                        PropertyValue::ColorRgba([
+                            f64::from(rgba.0[0]),
+                            f64::from(rgba.0[1]),
+                            f64::from(rgba.0[2]),
+                            f64::from(rgba.0[3]),
+                        ]),
+                    ));
+                }
+            }
+            PropertyValue::Text(s) => {
+                let mut buf = s.clone();
+                let changed = panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        ui.add(
+                            TextEdit::singleline(&mut buf)
+                                .font(theme.font(FONT_SMALL))
+                                .desired_width(ui.available_width()),
+                        )
+                        .changed()
+                    },
+                );
+                if changed {
+                    updates.push((cp.name.clone(), PropertyValue::Text(buf)));
+                }
+            }
+            PropertyValue::Asset(opt_id) => {
+                let cur_id = opt_id.as_deref().unwrap_or("");
+                let (labels, ids, mut sel) = collect_shader_image_asset_choices(session, cur_id);
+                let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let changed = panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_dropdown(
+                            ui,
+                            Id::unique(("fx_grp_cp_asset", group_effect_id, &cp.name)),
+                            &mut sel,
+                            &label_refs,
+                            false,
+                            viewport_rect,
+                            theme,
+                        )
+                    },
+                );
+                if changed && let Some(chosen) = ids.get(sel) {
+                    let next = if chosen.is_empty() {
+                        None
+                    } else {
+                        Some(chosen.clone())
+                    };
+                    updates.push((cp.name.clone(), PropertyValue::Asset(next)));
+                }
+            }
+            PropertyValue::Gradient(stops) => {
+                panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Gradient ({} stops)", stops.len()))
+                                .font(theme.font(FONT_SMALL))
+                                .color(TEXT_MUTED),
+                        );
+                    },
+                );
+            }
+            PropertyValue::Json(v) | PropertyValue::Curve(v) => {
+                let summary = summarize_complex_json_value(v);
+                panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(summary)
+                                .font(theme.font(FONT_SMALL))
+                                .color(TEXT_MUTED),
+                        );
+                    },
+                );
+            }
+            PropertyValue::Vec4(c) => {
+                let mut rgba = Rgba::new(c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32);
+                let cev = panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_hsva_color_picker(
+                            ui,
+                            Id::unique(("fx_grp_cp_v4", group_effect_id, &cp.name)),
+                            &mut rgba,
+                            true,
+                            false,
+                            viewport_rect,
+                            theme,
+                        )
+                    },
+                );
+                if cev.changed {
+                    updates.push((
+                        cp.name.clone(),
+                        PropertyValue::Vec4([
+                            f64::from(rgba.0[0]),
+                            f64::from(rgba.0[1]),
+                            f64::from(rgba.0[2]),
+                            f64::from(rgba.0[3]),
+                        ]),
+                    ));
+                }
+            }
+            PropertyValue::List(s) | PropertyValue::Shader(s) => {
+                let preview = if s.len() > 36 {
+                    format!("{}…", s.chars().take(36).collect::<String>())
+                } else {
+                    s.clone()
+                };
+                panel_property_row(
+                    ui,
+                    &lbl,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(preview)
+                                .font(theme.font(FONT_SMALL))
+                                .color(TEXT_MUTED),
+                        );
+                    },
+                );
+            }
+        }
+    }
+    for (name, val) in updates {
+        update_effect_group_custom_property(session, clip_id, group_effect_id, &name, val);
+    }
+}
+
+fn delete_effect_group_child(session: &mut Session, clip_id: &str, child_id: &str) -> bool {
+    fn remove_rec(
+        effects: &mut Vec<EffectInstance>,
+        target: &str,
+        fallback_parent: Option<(String, String)>,
+    ) -> (bool, Option<(String, String)>) {
+        if let Some(pos) = effects.iter().position(|e| e.id.to_string() == target) {
+            effects.remove(pos);
+            let adj = if pos < effects.len() {
+                Some((
+                    effects[pos].id.to_string(),
+                    effect_instance_kind_id(&effects[pos].kind),
+                ))
+            } else if pos > 0 {
+                Some((
+                    effects[pos - 1].id.to_string(),
+                    effect_instance_kind_id(&effects[pos - 1].kind),
+                ))
+            } else {
+                fallback_parent
+            };
+            return (true, adj);
+        }
+        for fx in effects.iter_mut() {
+            let parent_info = Some((fx.id.to_string(), effect_instance_kind_id(&fx.kind)));
+            if let EffectKind::EffectGroup { children, .. } = &mut fx.kind {
+                let (removed, adj) = remove_rec(children, target, parent_info);
+                if removed {
+                    return (true, adj);
+                }
+            }
+        }
+        (false, None)
+    }
+
+    let Ok(clip_uuid) = Uuid::parse_str(clip_id) else {
+        return false;
+    };
+    let was_selected = session.selection.effect_ids.iter().any(|id| id == child_id);
+    let started_tx = if !session.history.is_in_transaction() {
+        session.begin_transaction("delete grouped effect").is_ok()
+    } else {
+        false
+    };
+    let mut removed = false;
+    let mut adjacent: Option<(String, String)> = None;
+    'outer: for track in &mut session.active_sequence_mut().video_tracks {
+        for vc in &mut track.clips {
+            if vc.id == clip_uuid {
+                for fx in &mut vc.layer.effects {
+                    let parent_info = Some((fx.id.to_string(), effect_instance_kind_id(&fx.kind)));
+                    if let EffectKind::EffectGroup { children, .. } = &mut fx.kind {
+                        let (did_remove, adj) = remove_rec(children, child_id, parent_info);
+                        if did_remove {
+                            removed = true;
+                            adjacent = adj;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if removed {
+        session.selection.prune_effect(child_id);
+        if was_selected
+            && session.selection.effect_ids.is_empty()
+            && let Some((adj_id, adj_kind)) = adjacent
+        {
+            let _ = session.selection.select_effect(&adj_id, &adj_kind, false);
+        }
+    }
+    if started_tx {
+        let _ = session.commit_transaction(removed);
+    }
+    removed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_nested_effect_group_child_inspector(
+    ui: &mut Ui,
+    inspector_rect: Rect,
+    viewport_rect: Rect,
+    clip: &SessionClip,
+    child_fx: &EffectInstance,
+    session: &mut Session,
+    theme: &Cm3Theme,
+    state: &mut PanelsState,
+    actions: &mut Vec<PanelAction>,
+) {
+    let child_id = child_fx.id.to_string();
+    cm3_column_adjust_splitter(
+        ui,
+        Id::unique("fx_child_inspector_col_splitter"),
+        inspector_rect,
+        &mut state.prop_columns,
+    );
+
+    ScrollArea::vertical()
+        .id_salt(("fx_child_inspector_scroll", &child_id))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let (root_open, hdr_act) = property_header_with_actions(
+                ui,
+                Id::unique(("fx_child_root_hdr", &child_id)),
+                &child_fx.name,
+                state.prop_columns.label_ratio,
+                theme,
+            );
+            if hdr_act.copy_json {
+                let res =
+                    session.copy_effects_as_pz_json(&clip.id, std::slice::from_ref(&child_id));
+                copy_pz_json_to_clipboard(
+                    ui.ctx(),
+                    res,
+                    "Copied grouped effect JSON to clipboard",
+                    actions,
+                );
+            }
+            if hdr_act.paste_json {
+                paste_pz_json_from_clipboard(
+                    session,
+                    state,
+                    actions,
+                    "effects",
+                    Some(clip.id.clone()),
+                    None,
+                    None,
+                    None,
+                    "effect JSON or GLSL",
+                );
+            }
+            if hdr_act.remove {
+                commit_inspector_tx_if_open(session, state);
+                delete_effect_group_child(session, &clip.id, &child_id);
+                return;
+            }
+            if !root_open {
+                return;
+            }
+            state.inspector_root_indent = true;
+
+            // Enabled toggle
+            let mut en_idx = usize::from(effect_track_bool(&child_fx.enabled, true));
+            let en_changed = panel_property_row(
+                ui,
+                "Enabled",
+                true,
+                state,
+                theme,
+                |_| {},
+                |ui| {
+                    cm3_dropdown(
+                        ui,
+                        Id::unique(("fx_child_enabled", &child_id)),
+                        &mut en_idx,
+                        &["off", "on"],
+                        false,
+                        viewport_rect,
+                        theme,
+                    )
+                },
+            );
+            if en_changed {
+                let next_val = en_idx as u32;
+                mutate_effect_group_child(
+                    session,
+                    &clip.id,
+                    &child_id,
+                    "toggle grouped effect",
+                    |eff| {
+                        eff.enabled.value = PropertyValue::Option(next_val);
+                        if let Some(kf) = eff.enabled.keyframes.first_mut() {
+                            kf.value = PropertyValue::Option(next_val);
+                        }
+                    },
+                );
+            }
+
+            if let EffectKind::EffectGroup {
+                children,
+                custom_properties,
+            } = &child_fx.kind
+            {
+                panel_property_row(
+                    ui,
+                    "Group type",
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Nested Group ({})", children.len()))
+                                .font(theme.font(FONT_BODY))
+                                .color(TEXT_MUTED),
+                        );
+                    },
+                );
+                if !custom_properties.is_empty() {
+                    render_effect_group_custom_properties(
+                        ui,
+                        session,
+                        &clip.id,
+                        &child_id,
+                        custom_properties,
+                        viewport_rect,
+                        state,
+                        theme,
+                    );
+                }
+            }
+
+            let mut param_updates: Vec<(String, PropertyValue)> = Vec::new();
+            for (key, track) in &child_fx.params {
+                if key == "enabled" {
+                    continue;
+                }
+                let lbl = humanize_prop_label(key);
+                match &track.value {
+                    PropertyValue::Number(v) => {
+                        let mut cur = *v;
+                        let ev = panel_property_row(
+                            ui,
+                            &lbl,
+                            true,
+                            state,
+                            theme,
+                            |_| {},
+                            |ui| {
+                                cm3_scrub_number(
+                                    ui,
+                                    Id::unique(("fx_child_num", &child_id, key)),
+                                    &mut cur,
+                                    ScrubConfig::new(-100_000.0, 100_000.0, 0.05, 2),
+                                    theme,
+                                )
+                            },
+                        );
+                        if ev.changed {
+                            param_updates.push((key.clone(), PropertyValue::Number(cur)));
+                        }
+                    }
+                    PropertyValue::Bool(b) => {
+                        let mut idx = usize::from(*b);
+                        let changed = panel_property_row(
+                            ui,
+                            &lbl,
+                            true,
+                            state,
+                            theme,
+                            |_| {},
+                            |ui| {
+                                cm3_dropdown(
+                                    ui,
+                                    Id::unique(("fx_child_bool", &child_id, key)),
+                                    &mut idx,
+                                    &["off", "on"],
+                                    false,
+                                    viewport_rect,
+                                    theme,
+                                )
+                            },
+                        );
+                        if changed {
+                            param_updates.push((key.clone(), PropertyValue::Bool(idx != 0)));
+                        }
+                    }
+                    PropertyValue::Option(o) => {
+                        let mut cur = f64::from(*o);
+                        let ev = panel_property_row(
+                            ui,
+                            &lbl,
+                            true,
+                            state,
+                            theme,
+                            |_| {},
+                            |ui| {
+                                cm3_scrub_number(
+                                    ui,
+                                    Id::unique(("fx_child_opt", &child_id, key)),
+                                    &mut cur,
+                                    ScrubConfig::new(0.0, 64.0, 1.0, 0),
+                                    theme,
+                                )
+                            },
+                        );
+                        if ev.changed {
+                            param_updates
+                                .push((key.clone(), PropertyValue::Option(cur.round() as u32)));
+                        }
+                    }
+                    PropertyValue::Vec2(v) => {
+                        let mut cur = *v;
+                        let ev = panel_property_row(
+                            ui,
+                            &lbl,
+                            true,
+                            state,
+                            theme,
+                            |_| {},
+                            |ui| {
+                                cm3_vector2(
+                                    ui,
+                                    Id::unique(("fx_child_v2", &child_id, key)),
+                                    &mut cur,
+                                    ScrubConfig::new(-10_000.0, 10_000.0, 0.1, 2),
+                                    false,
+                                    theme,
+                                )
+                            },
+                        );
+                        if ev.changed {
+                            param_updates.push((key.clone(), PropertyValue::Vec2(cur)));
+                        }
+                    }
+                    PropertyValue::Vec3(v) => {
+                        let mut cur = *v;
+                        let ev = panel_property_row(
+                            ui,
+                            &lbl,
+                            true,
+                            state,
+                            theme,
+                            |_| {},
+                            |ui| {
+                                cm3_vector3(
+                                    ui,
+                                    Id::unique(("fx_child_v3", &child_id, key)),
+                                    &mut cur,
+                                    ScrubConfig::new(-10_000.0, 10_000.0, 0.1, 2),
+                                    false,
+                                    theme,
+                                )
+                            },
+                        );
+                        if ev.changed {
+                            param_updates.push((key.clone(), PropertyValue::Vec3(cur)));
+                        }
+                    }
+                    PropertyValue::Color(c) => {
+                        let mut rgba = Rgba::new(c[0] as f32, c[1] as f32, c[2] as f32, 1.0);
+                        let cev = panel_property_row(
+                            ui,
+                            &lbl,
+                            true,
+                            state,
+                            theme,
+                            |_| {},
+                            |ui| {
+                                cm3_hsva_color_picker(
+                                    ui,
+                                    Id::unique(("fx_child_col", &child_id, key)),
+                                    &mut rgba,
+                                    false,
+                                    false,
+                                    viewport_rect,
+                                    theme,
+                                )
+                            },
+                        );
+                        if cev.changed {
+                            param_updates.push((
+                                key.clone(),
+                                PropertyValue::Color([
+                                    f64::from(rgba.0[0]),
+                                    f64::from(rgba.0[1]),
+                                    f64::from(rgba.0[2]),
+                                ]),
+                            ));
+                        }
+                    }
+                    PropertyValue::ColorRgba(c) => {
+                        let mut rgba =
+                            Rgba::new(c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32);
+                        let cev = panel_property_row(
+                            ui,
+                            &lbl,
+                            true,
+                            state,
+                            theme,
+                            |_| {},
+                            |ui| {
+                                cm3_hsva_color_picker(
+                                    ui,
+                                    Id::unique(("fx_child_rgba", &child_id, key)),
+                                    &mut rgba,
+                                    true,
+                                    false,
+                                    viewport_rect,
+                                    theme,
+                                )
+                            },
+                        );
+                        if cev.changed {
+                            param_updates.push((
+                                key.clone(),
+                                PropertyValue::ColorRgba([
+                                    f64::from(rgba.0[0]),
+                                    f64::from(rgba.0[1]),
+                                    f64::from(rgba.0[2]),
+                                    f64::from(rgba.0[3]),
+                                ]),
+                            ));
+                        }
+                    }
+                    PropertyValue::Text(s) => {
+                        if let Some(summary) = oversized_text_summary(s) {
+                            panel_property_row(
+                                ui,
+                                &lbl,
+                                true,
+                                state,
+                                theme,
+                                |_| {},
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&summary)
+                                                .font(theme.font(FONT_SMALL))
+                                                .color(TEXT_MUTED),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(
+                                        "Text exceeds 8,192 characters; inline editing disabled.",
+                                    );
+                                },
+                            );
+                        } else {
+                            let mut buf = s.clone();
+                            let changed = panel_property_row(
+                                ui,
+                                &lbl,
+                                true,
+                                state,
+                                theme,
+                                |_| {},
+                                |ui| {
+                                    ui.add(
+                                        TextEdit::singleline(&mut buf)
+                                            .font(theme.font(FONT_SMALL))
+                                            .desired_width(ui.available_width()),
+                                    )
+                                    .changed()
+                                },
+                            );
+                            if changed {
+                                param_updates.push((key.clone(), PropertyValue::Text(buf)));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !param_updates.is_empty() {
+                mutate_effect_group_child(
+                    session,
+                    &clip.id,
+                    &child_id,
+                    "edit grouped effect param",
+                    |eff| {
+                        for (k, val) in param_updates {
+                            if let Some(tr) = eff.params.get_mut(&k) {
+                                tr.value = val.clone();
+                                if !tr.animated
+                                    && let Some(kf) = tr.keyframes.first_mut()
+                                {
+                                    kf.value = val;
+                                }
+                            }
+                        }
+                    },
+                );
+            }
+        });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn show_effect_inspector(
     ui: &mut Ui,
@@ -5571,11 +8648,25 @@ fn show_effect_inspector(
     actions: &mut Vec<PanelAction>,
 ) {
     let Some(fx_id) = session.selection.effect_ids.first().cloned() else {
-        empty_panel_message(ui, "select an object", theme);
+        empty_panel_message(ui, "select an effect", theme);
         return;
     };
     let Some(fx) = clip.effects.iter().find(|e| e.id == fx_id).cloned() else {
-        empty_panel_message(ui, "select an object", theme);
+        if let Some(child_fx) = find_effect_group_child(session, &clip.id, &fx_id) {
+            show_nested_effect_group_child_inspector(
+                ui,
+                inspector_rect,
+                viewport_rect,
+                clip,
+                &child_fx,
+                session,
+                theme,
+                state,
+                actions,
+            );
+            return;
+        }
+        empty_panel_message(ui, "select an effect", theme);
         return;
     };
 
@@ -5590,7 +8681,7 @@ fn show_effect_inspector(
     let clip_start = clip.start;
 
     ScrollArea::vertical()
-        .id_salt("fx_inspector_scroll")
+        .id_salt(("fx_inspector_scroll", &fx.id))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -5601,6 +8692,28 @@ fn show_effect_inspector(
                 state.prop_columns.label_ratio,
                 theme,
             );
+            if hdr_act.copy_json {
+                let res = session.copy_effects_as_pz_json(&clip.id, std::slice::from_ref(&fx.id));
+                copy_pz_json_to_clipboard(
+                    ui.ctx(),
+                    res,
+                    "Copied effect JSON to clipboard",
+                    actions,
+                );
+            }
+            if hdr_act.paste_json {
+                paste_pz_json_from_clipboard(
+                    session,
+                    state,
+                    actions,
+                    "effects",
+                    Some(clip.id.clone()),
+                    None,
+                    None,
+                    None,
+                    "effect JSON or GLSL",
+                );
+            }
             if hdr_act.reset {
                 let _ = session.execute(Command::ResetPropertyList {
                     target_id: fx.id.clone(),
@@ -5614,10 +8727,7 @@ fn show_effect_inspector(
             }
             if hdr_act.remove {
                 commit_inspector_tx_if_open(session, state);
-                let _ = session.execute(Command::DeleteEffect {
-                    clip_id: clip.id.clone(),
-                    effect_id: fx.id.clone(),
-                });
+                delete_effect_and_select_adjacent(session, &clip.id, &fx.id);
                 return;
             }
             if !root_open {
@@ -5644,6 +8754,13 @@ fn show_effect_inspector(
 
             // Effect Group dedicated inspector
             if fx.kind == "group" {
+                let child_count = collect_effect_group_child_rows(
+                    session,
+                    &clip.id,
+                    &fx.id,
+                    &BTreeSet::new(),
+                )
+                .len();
                 panel_property_row(
                     ui,
                     "Group type",
@@ -5653,16 +8770,37 @@ fn show_effect_inspector(
                     |_| {},
                     |ui| {
                         ui.label(
-                            egui::RichText::new("Effect Group")
-                                .font(theme.font(FONT_BODY))
-                                .color(TEXT_MUTED),
+                            egui::RichText::new(format!(
+                                "Effect Group ({child_count} child{})",
+                                if child_count == 1 { "" } else { "ren" }
+                            ))
+                            .font(theme.font(FONT_BODY))
+                            .color(TEXT_MUTED),
                         );
                     },
                 );
+                let group_custom_props =
+                    find_effect_group_custom_properties(session, &clip.id, &fx.id);
+                let rendered_cp_names: BTreeSet<String> =
+                    group_custom_props.iter().map(|c| c.name.clone()).collect();
+                if !group_custom_props.is_empty() {
+                    render_effect_group_custom_properties(
+                        ui,
+                        session,
+                        &clip.id,
+                        &fx.id,
+                        &group_custom_props,
+                        viewport_rect,
+                        state,
+                        theme,
+                    );
+                }
                 let extra_keys: Vec<(String, Value)> = fx
                     .properties
                     .iter()
-                    .filter(|(k, _)| k.as_str() != "enabled")
+                    .filter(|(k, _)| {
+                        k.as_str() != "enabled" && !rendered_cp_names.contains(k.as_str())
+                    })
                     .filter_map(|(k, p)| {
                         let val = p
                             .keyframes
@@ -5742,6 +8880,7 @@ fn show_effect_inspector(
                         font_px: 14.0,
                         error_message: None,
                     });
+                    state.shader_editor_just_opened = true;
                     let spec = FloatingWindowSpec::new("shader_editor", "Shader Editor")
                         .with_subtitle(fx.name.clone())
                         .with_default_size(Vec2::new(560.0, 440.0));
@@ -6007,7 +9146,8 @@ fn template_option_labels(effect_kind: &str, key: &str) -> &'static [&'static st
         ("sglow", "show") => &["result", "glow only", "threshold"],
         ("sglow", "edgeMode") => &["transparent", "clamp", "reflect"],
         ("sglow", "opacity") => &["normal", "affect alpha"],
-        ("sglow", "blurEngine") => &["gaussian", "box", "dual kawase"],
+        ("sglow", "blurEngine" | "engine") => &["gaussian", "box", "dual kawase"],
+        ("sglow", "atmosphereModel") => &["perlin", "simplex", "fbm"],
         ("sglow", "timeMode") => &["sequence", "manual"],
         ("echo", "operator") => &[
             "add",
@@ -6018,10 +9158,28 @@ fn template_option_labels(effect_kind: &str, key: &str) -> &'static [&'static st
             "composite in back",
             "blend",
         ],
+        ("echo", "composite") => &["over", "behind", "add", "screen", "maximum"],
+        ("echo-legacy", "mode") => &["blend", "add", "screen", "maximum"],
         ("ascii", "colorMode") => &["band", "footage", "duotone", "mono", "invert"],
-        ("ascii", "fontFamily") => &["monospace", "sans", "serif"],
-        ("ascii", "charset") => &["standard", "blocks", "dense", "minimal"],
-        ("datamosh", "motionFamily") => &[
+        ("ascii", "fontFamily") => &["monospace", "sans", "serif", "condensed", "pixel"],
+        ("ascii", "charset") => &["standard", "dense", "blocks", "binary", "symbols"],
+        ("ascii", "noiseType") => &["value", "perlin", "simplex"],
+        ("datamosh", "algorithm") => &[
+            "classic block",
+            "horizontal tear",
+            "vertical tear",
+            "zoom smear",
+            "spin drift",
+            "wave warp",
+            "block swap",
+            "scatter",
+            "bloom push",
+            "melt",
+            "echo drift",
+            "glitch slice",
+            "auto motion",
+        ],
+        ("datamosh", "motionFamily" | "motion") => &[
             "block",
             "horizontal",
             "vertical",
@@ -6033,15 +9191,102 @@ fn template_option_labels(effect_kind: &str, key: &str) -> &'static [&'static st
         ],
         ("datamosh", "lookMode") => &["classic", "smear", "echo"],
         ("smartmotionblur", "view") => &["result", "motion vectors", "confidence"],
-        ("smartmotionblur", "analysisFrames") => &["prev & next", "prev", "next"],
-        ("smartmotionblur", "quality") => &["low", "medium", "high"],
+        ("smartmotionblur", "reconstruction") => &["optical flow", "shutter samples"],
+        ("smartmotionblur", "analysisFrames" | "analysis") => &["prev & next", "prev", "next"],
+        ("smartmotionblur" | "smart-motion-blur-lite", "quality") => &["low", "medium", "high"],
+        ("smart-motion-blur-lite", "trackFrame") => &["both", "prev", "next"],
+        ("cardwipe", "flipAxis") => &["X", "Y", "Random"],
+        ("cardwipe", "flipDirection") => &["Positive", "Negative", "Random"],
+        ("cardwipe", "flipOrder") => &[
+            "Left to Right",
+            "Right to Left",
+            "Top to Bottom",
+            "Bottom to Top",
+            "Top-Left to Bottom-Right",
+            "Top-Right to Bottom-Left",
+            "Bottom-Left to Top-Right",
+            "Bottom-Right to Top-Left",
+            "Gradient",
+        ],
+        ("cardwipe", "backLayer") => &["Color", "Transparent"],
+        ("timecode", "displayFormat") => &[
+            "SMPTE",
+            "Frames",
+            "Feet + Frames 35mm",
+            "Feet + Frames 16mm",
+        ],
+        ("timecode", "timeSource") => &["Sequence", "Clip", "Custom"],
+        ("ccpixelpolly", "object") => &[
+            "Triangles (flat)",
+            "Triangles (textured)",
+            "Squares (flat)",
+            "Squares (textured)",
+        ],
+        ("ccpageturn", "render") => &["front & back", "front only", "back only"],
+        ("ccpageturn", "backSource") => &["mirrored", "paper color"],
+        ("radialshadow", "render") => &["regular", "glass"],
+        ("timedifference", "alphaChannel") => &[
+            "source only",
+            "target only",
+            "average",
+            "max",
+            "full on",
+            "lightness",
+            "brightest",
+            "difference",
+            "difference (white)",
+        ],
+        ("colordiffkey", "view") => &[
+            "final",
+            "matte",
+            "source",
+            "partial A",
+            "partial B",
+            "matte corrected",
+        ],
+        ("colordiffkey", "colorMatchingAccuracy") => &["faster", "more accurate"],
+        ("advspill", "method") => &["standard", "ultra"],
+        ("linearcolorkey", "view") => &["final", "matte", "source"],
+        ("linearcolorkey", "matchColors") => &["RGB", "Hue", "Chroma"],
+        ("linearcolorkey", "keyOperation") => &["key out", "key in"],
+        ("radiowaves", "waveType") => &["polygon", "image contour", "mask"],
+        ("radiowaves", "profile") => &[
+            "flat",
+            "sawtooth down",
+            "sawtooth up",
+            "triangle",
+            "sine",
+            "half-in",
+            "half-out",
+        ],
+        ("numbers", "format") => &[
+            "number",
+            "number (leading zeroes)",
+            "timecode 30",
+            "timecode 24",
+            "timecode 25",
+            "time (HH:MM:SS)",
+            "short date",
+            "hexadecimal",
+        ],
+        ("numbers", "displayOptions") => {
+            &["fill", "stroke", "fill over stroke", "stroke over fill"]
+        }
+        ("tracery", "detectionQuality") => &["low", "medium", "high"],
+        ("tracery", "boxShape") => &["rectangle", "corners", "circle", "diamond"],
+        ("tracery", "boxFill") => &["none", "solid", "tint", "invert"],
+        ("tracery", "markerShape") => &["cross", "circle", "square", "diamond"],
+        ("tracery", "gridMode") => &["square", "crosshair", "dots"],
+        ("tracery", "lineType") => &["straight", "curved", "step", "bezier"],
+        ("tracery", "labelMode") => &["index", "coordinates", "both"],
         ("shutter", "mode") => &["linear", "double sided", "radial"],
         ("mask", "mode") => &["rectangle", "ellipse"],
         ("shake", "shake.mode") | ("shake", "mode") => &["rotate", "move"],
         ("overlay", "repeat") => &["off", "on"],
         ("duplicate", "repeat") => &["tile", "reflect"],
         ("timeoffset", "units") => &["frames", "seconds"],
-        ("timeremap", "frameBlending") => &["off", "mix", "optical flow"],
+        ("timeremap", "mode") => &["source time", "speed"],
+        ("timeremap", "frameBlending" | "blend") => &["off", "mix", "optical flow"],
         ("transform", "wrap") => &["tile", "reflect"],
         (_, "wrap") => &["clamp", "tile", "reflect"],
         (_, "mask") => &["result", "mask"],
@@ -6051,6 +9296,23 @@ fn template_option_labels(effect_kind: &str, key: &str) -> &'static [&'static st
         (_, "cameraType") => &["perspective", "orthographic"],
         _ => &["off", "on"],
     }
+}
+
+fn template_number_scrub_config_for_default(
+    effect_kind: &str,
+    key: &str,
+    default_val: f64,
+) -> ScrubConfig {
+    let mut cfg = template_number_scrub_config(effect_kind, key);
+    if default_val.is_finite() && cfg.max < default_val {
+        let hi = if default_val <= 100.0 {
+            100.0
+        } else {
+            default_val * 2.0
+        };
+        cfg = ScrubConfig::new(cfg.min.min(0.0), hi, 1.0, 1);
+    }
+    cfg
 }
 
 fn template_number_scrub_config(effect_kind: &str, key: &str) -> ScrubConfig {
@@ -6063,6 +9325,10 @@ fn template_number_scrub_config(effect_kind: &str, key: &str) -> ScrubConfig {
     }
 
     match (effect_kind, key) {
+        // Zoidium plugin effects whose opacity/threshold/percentage params are authored in 0..100
+        ("radiowaves" | "timecode" | "radialshadow", "opacity")
+        | ("ccpageturn", "backPageOpacity")
+        | ("tracery", "threshold") => ScrubConfig::new(0.0, 100.0, 1.0, 1),
         (
             _,
             "opacity"
@@ -6152,7 +9418,7 @@ fn render_template_param(
     let lbl = display_label.as_str();
     match default_val {
         PropertyValue::Number(def) => {
-            let cfg = template_number_scrub_config(effect_kind, key);
+            let cfg = template_number_scrub_config_for_default(effect_kind, key, *def);
             show_session_number_prop(
                 ui,
                 session,
@@ -6278,24 +9544,59 @@ fn render_template_param(
                     | "cameraType"
                     | "quality"
                     | "blurEngine"
+                    | "engine"
+                    | "atmosphereModel"
                     | "edgeMode"
                     | "shake.mode"
                     | "mode"
                     | "combine"
+                    | "composite"
                     | "show"
                     | "timeMode"
                     | "operator"
                     | "colorMode"
                     | "fontFamily"
                     | "charset"
+                    | "noiseType"
+                    | "algorithm"
                     | "motionFamily"
+                    | "motion"
                     | "lookMode"
                     | "view"
+                    | "reconstruction"
                     | "analysisFrames"
+                    | "analysis"
+                    | "trackFrame"
                     | "units"
                     | "frameBlending"
+                    | "blend"
                     | "direction"
                     | "affect"
+                    | "flipAxis"
+                    | "flipDirection"
+                    | "flipOrder"
+                    | "backLayer"
+                    | "displayFormat"
+                    | "timeSource"
+                    | "object"
+                    | "render"
+                    | "backSource"
+                    | "alphaChannel"
+                    | "colorMatchingAccuracy"
+                    | "method"
+                    | "matchColors"
+                    | "keyOperation"
+                    | "waveType"
+                    | "profile"
+                    | "format"
+                    | "displayOptions"
+                    | "detectionQuality"
+                    | "boxShape"
+                    | "boxFill"
+                    | "markerShape"
+                    | "gridMode"
+                    | "lineType"
+                    | "labelMode"
             );
             show_session_option_prop_ex(
                 ui,
@@ -6586,8 +9887,8 @@ fn render_template_param(
         }
         PropertyValue::Json(_) => {
             let btn_label = match effect_kind {
-                "nodeeffect" => "Open Node Editor",
-                "magiclooks" => "Open Color Looks Editor",
+                "nodeeffect" => "Edit Node Graph",
+                "magiclooks" => "Edit Color Looks",
                 _ => "Edit JSON",
             };
             let clicked = panel_property_row(
@@ -6597,7 +9898,7 @@ fn render_template_param(
                 state,
                 theme,
                 |_| {},
-                |ui| cm3_prop_button(ui, btn_label, ButtonVariant::Primary, false, theme).clicked(),
+                |ui| cm3_prop_button(ui, btn_label, ButtonVariant::Primary, true, theme).clicked(),
             );
             if clicked {
                 let cur_val = lookup_session_prop(session, target_id, key)
@@ -6611,9 +9912,11 @@ fn render_template_param(
                             "Node Effect",
                             cur_val.as_ref(),
                         );
+                        let (_, clamped_sz) =
+                            compute_clamped_editor_window_rect(viewport_rect, 860.0, 560.0);
                         let spec =
                             FloatingWindowSpec::new("pro_node_graph_editor", "Node Graph Editor")
-                                .with_default_size(Vec2::new(980.0, 620.0));
+                                .with_default_size(clamped_sz);
                         state.floating_windows.open_or_focus(&spec, viewport_rect);
                     }
                     "magiclooks" => {
@@ -6622,9 +9925,11 @@ fn render_template_param(
                             "Color Looks",
                             cur_val.as_ref(),
                         );
+                        let (_, clamped_sz) =
+                            compute_clamped_editor_window_rect(viewport_rect, 860.0, 560.0);
                         let spec =
                             FloatingWindowSpec::new("pro_color_looks_editor", "Color Looks Setup")
-                                .with_default_size(Vec2::new(920.0, 580.0));
+                                .with_default_size(clamped_sz);
                         state.floating_windows.open_or_focus(&spec, viewport_rect);
                     }
                     _ => {
@@ -6635,6 +9940,183 @@ fn render_template_param(
                 }
             }
         }
+    }
+}
+
+/// Maximum inline text length rendered in a live `egui::TextEdit` property widget.
+/// Values exceeding this threshold render a compact read-only summary label so multi-megabyte
+/// strings never stall layout or drop frame rate.
+const MAX_INLINE_TEXT_CHARS: usize = 8_192;
+
+/// Returns a compact `"<N KB text>"` summary when `text` exceeds [`MAX_INLINE_TEXT_CHARS`].
+fn oversized_text_summary(text: &str) -> Option<String> {
+    if text.len() > MAX_INLINE_TEXT_CHARS && text.chars().nth(MAX_INLINE_TEXT_CHARS).is_some() {
+        let kb = text.len().div_ceil(1024).max(1);
+        Some(format!("<{kb} KB text>"))
+    } else {
+        None
+    }
+}
+
+/// Detects the single-element default `GradientStop` placeholder produced when a CM3 `.pz`
+/// shader custom property with `type: 5` (`bool` in Shader+) is imported without gradient stops.
+fn is_type5_bool_placeholder_value(val: &Value) -> bool {
+    let Some(arr) = val.as_array() else {
+        return false;
+    };
+    if arr.len() != 1 {
+        return false;
+    }
+    let Some(obj) = arr[0].as_object() else {
+        return false;
+    };
+    let pos_zero = obj
+        .get("position")
+        .or_else(|| obj.get("pos"))
+        .and_then(Value::as_f64)
+        .is_some_and(|p| p.abs() < 1e-6);
+    let white_default = obj
+        .get("color")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("rgba(255,255,255,1.0)"));
+    pos_zero && white_default
+}
+
+/// Looks up the imported CM3 `CustomProperty::prop_type` for a custom shader effect or
+/// 3D custom shader material uniform.
+fn lookup_custom_shader_prop_type(session: &Session, target_id: &str, key: &str) -> Option<u32> {
+    fn find_in_objects(objects: &[Object3D], target_uuid: Uuid, key: &str) -> Option<u32> {
+        let stripped = key
+            .strip_prefix("material.")
+            .or_else(|| key.strip_prefix("frontMaterial."))
+            .or_else(|| key.strip_prefix("sideMaterial."))
+            .unwrap_or(key);
+        for obj in objects {
+            if obj.id == target_uuid
+                && let Some(MaterialSpec::CustomShader {
+                    custom_properties, ..
+                }) = obj.material.as_ref()
+                && let Some(cp) = custom_properties
+                    .iter()
+                    .find(|c| c.name == key || c.name == stripped)
+            {
+                return cp.prop_type;
+            }
+            if let Object3DKind::Group { children, .. } = &obj.kind
+                && let Some(found) = find_in_objects(children, target_uuid, key)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let target_uuid = Uuid::parse_str(target_id).ok()?;
+    for track in &session.active_sequence().video_tracks {
+        for clip in &track.clips {
+            for eff in &clip.layer.effects {
+                if eff.id == target_uuid
+                    && let EffectKind::CustomShader {
+                        custom_properties, ..
+                    } = &eff.kind
+                    && let Some(cp) = custom_properties.iter().find(|c| c.name == key)
+                {
+                    return cp.prop_type;
+                }
+            }
+            if let LayerKind::Scene3D { objects, .. } = &clip.layer.kind
+                && let Some(found) = find_in_objects(objects, target_uuid, key)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Builds `(display_labels, asset_ids, selected_idx)` for a `sampler2D` (`prop_type == 8`)
+/// shader uniform dropdown: `"None"` followed by all project image assets sorted by filename.
+fn collect_shader_image_asset_choices(
+    session: &Session,
+    current_asset_id: &str,
+) -> (Vec<String>, Vec<String>, usize) {
+    let mut images: Vec<(String, String)> = session
+        .project
+        .assets
+        .values()
+        .filter(|a| {
+            a.kind == AssetKind::Image || clip_kind_for_asset(a.kind, &a.filename) == "image"
+        })
+        .map(|a| (a.filename.clone(), a.id.clone()))
+        .collect();
+    images.sort_by_key(|a| a.0.to_ascii_lowercase());
+
+    let mut labels = Vec::with_capacity(images.len() + 2);
+    let mut ids = Vec::with_capacity(images.len() + 2);
+    labels.push("None".to_owned());
+    ids.push(String::new());
+    for (name, id) in images {
+        labels.push(name);
+        ids.push(id);
+    }
+
+    let trimmed = current_asset_id.trim();
+    let selected_idx = if trimmed.is_empty() {
+        0
+    } else if let Some(pos) = ids.iter().position(|id| id == trimmed) {
+        pos
+    } else {
+        let short: String = trimmed.chars().take(12).collect();
+        labels.push(format!("{short}… (unresolved)"));
+        ids.push(trimmed.to_owned());
+        ids.len() - 1
+    };
+
+    (labels, ids, selected_idx)
+}
+
+/// Returns the `ScrubConfig` for a numeric custom shader uniform.
+/// Only explicit angle properties (`kind_hint == Some(6)`) convert radians to degrees;
+/// raw PanZoid scalar uniforms (`type: 0`, e.g. `Rotation: 25.0`) stay at `scale_factor == 1.0`.
+fn custom_shader_number_scrub_config(label: &str, kind_hint: Option<usize>) -> ScrubConfig {
+    let lower = label.to_ascii_lowercase();
+    if kind_hint == Some(6) {
+        ScrubConfig::new(-36_000.0, 36_000.0, 1.0, 1)
+            .with_scale_factor(std::f64::consts::PI / 180.0)
+    } else if kind_hint == Some(7) || lower.contains("seed") {
+        ScrubConfig::new(0.0, 100_000.0, 1.0, 0)
+    } else {
+        ScrubConfig::new(-10_000.0, 10_000.0, 0.05, 3)
+    }
+}
+
+/// Formats a compact human-readable label for complex non-primitive JSON values (gradients,
+/// curves, palettes, objects) so custom/dynamic property rows never render blank.
+fn summarize_complex_json_value(val: &Value) -> String {
+    match val {
+        Value::Array(arr) => {
+            if arr.iter().all(|v| {
+                v.as_object().is_some_and(|o| {
+                    o.contains_key("color") && (o.contains_key("pos") || o.contains_key("position"))
+                })
+            }) && !arr.is_empty()
+            {
+                format!("Gradient ({} stops)", arr.len())
+            } else if arr.iter().all(|v| v.as_array().is_some()) && !arr.is_empty() {
+                format!("List ({} items)", arr.len())
+            } else {
+                format!("Array ({})", arr.len())
+            }
+        }
+        Value::Object(map) => {
+            if map.contains_key("master") || map.contains_key("rgb") {
+                "Curve".to_owned()
+            } else {
+                format!("Object ({} keys)", map.len())
+            }
+        }
+        Value::Null => "none".to_owned(),
+        _ => val.to_string(),
     }
 }
 
@@ -6656,92 +10138,109 @@ fn render_custom_shader_uniform(
 ) {
     let lower = label.to_ascii_lowercase();
     let mut delete_uniform = false;
+    let imported_prop_type = lookup_custom_shader_prop_type(session, target_id, key);
+    let is_sampler2d = imported_prop_type == Some(8);
+    let is_bool_toggle = matches!(val, Value::Bool(_))
+        || kind_hint == Some(5)
+        || (imported_prop_type == Some(5) && is_type5_bool_placeholder_value(val));
 
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
         ui.vertical(|ui| {
             ui.set_max_width((ui.available_width() - 24.0).max(80.0));
-            match val {
-                Value::Bool(b) => {
-                    show_session_option_prop(
-                        ui,
-                        session,
-                        target_id,
-                        key,
-                        label,
-                        &["off", "on"],
-                        u32::from(*b),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
+            if is_sampler2d {
+                let default_asset = val.as_str().unwrap_or("");
+                let prop = lookup_session_prop(session, target_id, key);
+                let cur_asset = eval_prop_str(prop.as_ref(), local_frame, default_asset);
+                let (asset_labels, asset_ids, mut sel_idx) =
+                    collect_shader_image_asset_choices(session, &cur_asset);
+                let label_refs: Vec<&str> = asset_labels.iter().map(String::as_str).collect();
+                let changed = panel_property_row(
+                    ui,
+                    label,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_dropdown(
+                            ui,
+                            Id::unique((target_id, key, "shader_sampler2d_asset")),
+                            &mut sel_idx,
+                            &label_refs,
+                            false,
+                            viewport_rect,
+                            theme,
+                        )
+                    },
+                );
+                if changed && let Some(chosen_id) = asset_ids.get(sel_idx) {
+                    let _ = session.execute(Command::SetPropertyValue {
+                        target_id: target_id.to_owned(),
+                        property: key.to_owned(),
+                        value: json!(chosen_id),
+                    });
                 }
-                Value::Number(n) => {
-                    let is_toggle = kind_hint == Some(5);
-                    let is_angle =
-                        kind_hint == Some(6) || lower.contains("angle") || lower.contains("rot");
-                    let is_seed = kind_hint == Some(7) || lower.contains("seed");
-                    if is_toggle {
-                        let def = u32::from(n.as_f64().unwrap_or(0.0) >= 0.5);
-                        show_session_option_prop(
+            } else if is_bool_toggle {
+                let default_bool = match val {
+                    Value::Bool(b) => *b,
+                    Value::Number(n) => n.as_f64().unwrap_or(0.0) >= 0.5,
+                    _ => false,
+                };
+                let prop = lookup_session_prop(session, target_id, key);
+                let cur_bool =
+                    eval_prop_value(prop.as_ref(), local_frame).map_or(default_bool, |v| {
+                        v.as_bool()
+                            .or_else(|| v.as_f64().map(|f| f >= 0.5))
+                            .unwrap_or(default_bool)
+                    });
+                let mut idx = usize::from(cur_bool);
+                let changed = panel_property_row(
+                    ui,
+                    label,
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_dropdown(
                             ui,
-                            session,
-                            target_id,
-                            key,
-                            label,
+                            Id::unique((target_id, key, "shader_bool_toggle")),
+                            &mut idx,
                             &["off", "on"],
-                            def,
-                            local_frame,
-                            clip_start,
+                            false,
                             viewport_rect,
-                            state,
                             theme,
-                            actions,
-                        );
-                    } else if is_angle {
+                        )
+                    },
+                );
+                if changed {
+                    state
+                        .shader_prop_kinds
+                        .insert((target_id.to_owned(), key.to_owned()), 5);
+                    let _ = session.execute(Command::SetPropertyValue {
+                        target_id: target_id.to_owned(),
+                        property: key.to_owned(),
+                        value: json!(idx != 0),
+                    });
+                }
+            } else {
+                match val {
+                    Value::Number(n) => {
+                        let scrub_cfg = custom_shader_number_scrub_config(label, kind_hint);
+                        let default_val = if kind_hint == Some(7) || lower.contains("seed") {
+                            n.as_f64().unwrap_or(1.0)
+                        } else {
+                            n.as_f64().unwrap_or(0.0)
+                        };
                         show_session_number_prop(
                             ui,
                             session,
                             target_id,
                             key,
                             label,
-                            n.as_f64().unwrap_or(0.0),
-                            ScrubConfig::new(-36_000.0, 36_000.0, 1.0, 1)
-                                .with_scale_factor(std::f64::consts::PI / 180.0),
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    } else if is_seed {
-                        show_session_number_prop(
-                            ui,
-                            session,
-                            target_id,
-                            key,
-                            label,
-                            n.as_f64().unwrap_or(1.0),
-                            ScrubConfig::new(0.0, 100_000.0, 1.0, 0),
-                            local_frame,
-                            clip_start,
-                            viewport_rect,
-                            state,
-                            theme,
-                            actions,
-                        );
-                    } else {
-                        show_session_number_prop(
-                            ui,
-                            session,
-                            target_id,
-                            key,
-                            label,
-                            n.as_f64().unwrap_or(0.0),
-                            ScrubConfig::new(-10_000.0, 10_000.0, 0.05, 3),
+                            default_val,
+                            scrub_cfg,
                             local_frame,
                             clip_start,
                             viewport_rect,
@@ -6750,67 +10249,69 @@ fn render_custom_shader_uniform(
                             actions,
                         );
                     }
-                }
-                Value::Array(arr) if arr.len() == 4 => {
-                    let def = [
-                        arr[0].as_f64().unwrap_or(1.0),
-                        arr[1].as_f64().unwrap_or(1.0),
-                        arr[2].as_f64().unwrap_or(1.0),
-                        arr[3].as_f64().unwrap_or(1.0),
-                    ];
-                    show_session_color_rgba_prop(
-                        ui,
-                        session,
-                        target_id,
-                        key,
-                        label,
-                        def,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                }
-                Value::Array(arr)
-                    if arr.len() == 3 && (kind_hint == Some(3) || lower.contains("color")) =>
-                {
-                    let def = [
-                        arr[0].as_f64().unwrap_or(1.0),
-                        arr[1].as_f64().unwrap_or(1.0),
-                        arr[2].as_f64().unwrap_or(1.0),
-                    ];
-                    show_session_color_prop(
-                        ui,
-                        session,
-                        target_id,
-                        key,
-                        label,
-                        def,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                }
-                _ => {
-                    render_dynamic_json_param(
-                        ui,
-                        session,
-                        target_id,
-                        key,
-                        label,
-                        val,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
+                    Value::Array(arr) if arr.len() == 4 && arr.iter().all(Value::is_number) => {
+                        let def = [
+                            arr[0].as_f64().unwrap_or(1.0),
+                            arr[1].as_f64().unwrap_or(1.0),
+                            arr[2].as_f64().unwrap_or(1.0),
+                            arr[3].as_f64().unwrap_or(1.0),
+                        ];
+                        show_session_color_rgba_prop(
+                            ui,
+                            session,
+                            target_id,
+                            key,
+                            label,
+                            def,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    }
+                    Value::Array(arr)
+                        if arr.len() == 3
+                            && arr.iter().all(Value::is_number)
+                            && (kind_hint == Some(3) || lower.contains("color")) =>
+                    {
+                        let def = [
+                            arr[0].as_f64().unwrap_or(1.0),
+                            arr[1].as_f64().unwrap_or(1.0),
+                            arr[2].as_f64().unwrap_or(1.0),
+                        ];
+                        show_session_color_prop(
+                            ui,
+                            session,
+                            target_id,
+                            key,
+                            label,
+                            def,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    }
+                    _ => {
+                        render_dynamic_json_param(
+                            ui,
+                            session,
+                            target_id,
+                            key,
+                            label,
+                            val,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    }
                 }
             }
         });
@@ -6888,7 +10389,7 @@ fn render_dynamic_json_param(
                 actions,
             );
         }
-        Value::Array(arr) if arr.len() == 2 => {
+        Value::Array(arr) if arr.len() == 2 && arr.iter().all(Value::is_number) => {
             let def = [
                 arr[0].as_f64().unwrap_or(0.0),
                 arr[1].as_f64().unwrap_or(0.0),
@@ -6910,7 +10411,7 @@ fn render_dynamic_json_param(
                 actions,
             );
         }
-        Value::Array(arr) if arr.len() == 3 => {
+        Value::Array(arr) if arr.len() == 3 && arr.iter().all(Value::is_number) => {
             let def = [
                 arr[0].as_f64().unwrap_or(0.0),
                 arr[1].as_f64().unwrap_or(0.0),
@@ -6950,7 +10451,7 @@ fn render_dynamic_json_param(
                 );
             }
         }
-        Value::Array(arr) if arr.len() == 4 => {
+        Value::Array(arr) if arr.len() == 4 && arr.iter().all(Value::is_number) => {
             let def = [
                 arr[0].as_f64().unwrap_or(0.0),
                 arr[1].as_f64().unwrap_or(0.0),
@@ -7003,7 +10504,27 @@ fn render_dynamic_json_param(
                 theme,
             );
         }
-        _ => {}
+        other => {
+            let summary = summarize_complex_json_value(other);
+            panel_property_row(
+                ui,
+                label,
+                true,
+                state,
+                theme,
+                |_| {},
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(summary)
+                                .font(theme.font(FONT_SMALL))
+                                .color(TEXT_MUTED),
+                        )
+                        .truncate(),
+                    );
+                },
+            );
+        }
     }
 }
 
@@ -7025,11 +10546,11 @@ fn container_label(c: ExportContainer) -> &'static str {
 
 fn video_codec_label(c: ExportVideoCodec) -> &'static str {
     match c {
-        ExportVideoCodec::H264 => "H.264 (libx264)",
-        ExportVideoCodec::H265 => "H.265 / HEVC (libx265)",
-        ExportVideoCodec::Vp9 => "VP9 (libvpx-vp9)",
+        ExportVideoCodec::H264 => "H.264 / AVC",
+        ExportVideoCodec::H265 => "H.265 / HEVC",
+        ExportVideoCodec::Vp9 => "VP9",
         ExportVideoCodec::Vp8 => "VP8 (legacy)",
-        ExportVideoCodec::Av1 => "AV1 (libsvtav1)",
+        ExportVideoCodec::Av1 => "AV1",
         ExportVideoCodec::Png => "PNG (lossless)",
     }
 }
@@ -7214,6 +10735,199 @@ fn paint_export_pz_icon(painter: &Painter, rect: Rect, color: Color32, cutout: C
     painter.add(Shape::convex_polygon(head, color, Stroke::NONE));
 }
 
+/// Full-column-width CM3-styled dropdown used by the Device Render panel so all export
+/// dropdowns (`Container`, `Video codec`, `Rate control`, `Preset`, `Audio codec`, `Sample rate`)
+/// share one unified width and align cleanly on the right edge.
+fn export_uniform_dropdown(
+    ui: &mut Ui,
+    id: Id,
+    selected_idx: &mut usize,
+    options: &[&str],
+    viewport_rect: Rect,
+    theme: &Cm3Theme,
+) -> bool {
+    if options.is_empty() {
+        return false;
+    }
+    if *selected_idx >= options.len() {
+        *selected_idx = 0;
+    }
+    let popup_id = id.with("export_dd_popup");
+    let mut open = ui
+        .data_mut(|d| d.get_temp::<bool>(popup_id))
+        .unwrap_or(false);
+    let mut changed = false;
+
+    let width = ui.available_width().max(64.0).round();
+    let (_, raw_slot) = ui.allocate_space(Vec2::new(width, 23.0));
+    let btn_rect = Rect::from_min_size(
+        Pos2::new(raw_slot.left().round(), (raw_slot.top() + 1.0).round()),
+        Vec2::new(width, 21.0),
+    );
+    let btn_resp = ui
+        .interact(btn_rect, id.with("btn"), Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
+    ui.painter()
+        .rect_filled(btn_rect, CornerRadius::ZERO, BG_INPUT);
+    paint_crisp_panel_border(
+        ui.painter(),
+        btn_rect,
+        if open || btn_resp.hovered() {
+            theme.accent()
+        } else {
+            BORDER_CONTROL
+        },
+    );
+    let font = theme.font(13.3);
+    let text_max_w = (btn_rect.width() - 24.0).max(16.0);
+    let lbl_galley = layout_single_line_ellipsized(
+        ui.painter(),
+        options[*selected_idx],
+        font.clone(),
+        theme.value(),
+        text_max_w,
+    );
+    let text_clip = Rect::from_min_max(
+        btn_rect.left_top(),
+        Pos2::new(
+            (btn_rect.right() - 18.0).max(btn_rect.left()),
+            btn_rect.bottom(),
+        ),
+    );
+    ui.painter().with_clip_rect(text_clip).galley(
+        Pos2::new(
+            btn_rect.left() + 5.0,
+            btn_rect.center().y - lbl_galley.size().y * 0.5,
+        ),
+        lbl_galley,
+        theme.value(),
+    );
+    let caret_rect = Rect::from_center_size(
+        Pos2::new(btn_rect.right() - 8.5, btn_rect.center().y),
+        Vec2::splat(12.0),
+    );
+    paint_cm3_icon(
+        ui.painter(),
+        caret_rect,
+        Cm3Icon::ChevronDown,
+        theme.value(),
+    );
+
+    let mut just_opened = false;
+    if btn_resp.clicked() {
+        open = !open;
+        if open {
+            just_opened = true;
+        }
+    }
+
+    if open {
+        let row_h = 22.0_f32;
+        let max_opt_w = options
+            .iter()
+            .map(|o| {
+                ui.painter()
+                    .layout_no_wrap((*o).to_owned(), font.clone(), theme.value())
+                    .size()
+                    .x
+            })
+            .fold(0.0_f32, f32::max);
+        let popup_w = (max_opt_w + 18.0)
+            .max(btn_rect.width())
+            .min((viewport_rect.width() - 16.0).max(96.0))
+            .round();
+        let popup_h = ((options.len() as f32) * row_h + 4.0)
+            .min((viewport_rect.height() - 16.0).max(60.0))
+            .round();
+        let x = btn_rect.left().clamp(
+            viewport_rect.left() + 8.0,
+            (viewport_rect.right() - popup_w - 8.0).max(viewport_rect.left() + 8.0),
+        );
+        let below_y = btn_rect.bottom() + 2.0;
+        let y = if below_y + popup_h <= viewport_rect.bottom() - 8.0 {
+            below_y
+        } else {
+            (btn_rect.top() - popup_h - 2.0).clamp(
+                viewport_rect.top() + 8.0,
+                (viewport_rect.bottom() - popup_h - 8.0).max(viewport_rect.top() + 8.0),
+            )
+        };
+        let mut close_now = ui.input(|i| i.key_pressed(Key::Escape));
+        if close_now {
+            mark_floating_editor_escape_consumed(ui.ctx());
+        }
+        let area_resp = Area::new(popup_id)
+            .order(Order::Foreground)
+            .fixed_pos(Pos2::new(x.round(), y.round()))
+            .interactable(true)
+            .movable(false)
+            .show(ui.ctx(), |ui| {
+                Frame::NONE
+                    .fill(BG_INPUT)
+                    .stroke(Stroke::new(1.0, theme.accent()))
+                    .inner_margin(egui::Margin::same(2))
+                    .show(ui, |ui| {
+                        let inner_w = (popup_w - 4.0).max(24.0);
+                        ui.set_min_width(inner_w);
+                        ui.set_max_width(inner_w);
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        let active_bg = theme.menu_active();
+                        let active_fg = theme.contrast_fg(active_bg);
+                        for (idx, opt) in options.iter().enumerate() {
+                            let (r_rect, r_resp) =
+                                ui.allocate_exact_size(Vec2::new(inner_w, row_h), Sense::click());
+                            let r_resp = r_resp.on_hover_cursor(CursorIcon::PointingHand);
+                            let is_sel = idx == *selected_idx;
+                            if r_resp.hovered() {
+                                ui.painter()
+                                    .rect_filled(r_rect, CornerRadius::ZERO, active_bg);
+                            } else if is_sel {
+                                ui.painter().rect_filled(
+                                    r_rect,
+                                    CornerRadius::ZERO,
+                                    BG_DROPDOWN_HOVER,
+                                );
+                            }
+                            ui.painter()
+                                .with_clip_rect(r_rect.shrink2(Vec2::new(4.0, 0.0)))
+                                .text(
+                                    Pos2::new(r_rect.left() + 5.0, r_rect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    *opt,
+                                    font.clone(),
+                                    if r_resp.hovered() {
+                                        active_fg
+                                    } else if is_sel {
+                                        TEXT_BRIGHT
+                                    } else {
+                                        TEXT_PRIMARY
+                                    },
+                                );
+                            if r_resp.clicked() {
+                                if *selected_idx != idx {
+                                    *selected_idx = idx;
+                                    changed = true;
+                                }
+                                close_now = true;
+                            }
+                        }
+                    });
+            });
+        let clicked_outside = !just_opened
+            && ui.input(|i| {
+                i.pointer.primary_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| {
+                        !area_resp.response.rect.contains(p) && !btn_rect.contains(p)
+                    })
+            });
+        if close_now || clicked_outside {
+            open = false;
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(popup_id, open));
+    changed
+}
+
 fn show_export_tab(
     ui: &mut Ui,
     viewport_rect: Rect,
@@ -7237,9 +10951,35 @@ fn show_export_tab(
             // Edge-to-edge 42px #222222 header bar ("Export project")
             panel_top_header(ui, "Export project", theme);
 
-            // Landing screen (default None): 2 full-width 77px clickable #2a2a2a rows (76px body + 1px divider)
+            // Landing screen (default None): full-width clickable #2a2a2a cards whose height
+            // dynamically grows to fit wrapped subtitle lines at narrow widths (e.g. 800x540).
             let Some(active_mode) = state.export_view_mode else {
-                for (mode, title, subtitle) in [
+                let compute_card_h = |ui: &Ui, title: &str, subtitle: &str| -> f32 {
+                    let avail_w = ui.available_width().max(120.0);
+                    let text_w = (avail_w - 88.0).max(40.0);
+                    let title_h = ui
+                        .painter()
+                        .layout(
+                            title.to_owned(),
+                            theme.font(FONT_BODY),
+                            TEXT_PRIMARY,
+                            text_w,
+                        )
+                        .size()
+                        .y;
+                    let sub_h = ui
+                        .painter()
+                        .layout(
+                            subtitle.to_owned(),
+                            theme.font(FONT_SMALL),
+                            TEXT_OPTION_DESC,
+                            text_w,
+                        )
+                        .size()
+                        .y;
+                    (9.0 + title_h + 3.0 + sub_h + 10.0).ceil().max(77.0)
+                };
+                for (card_idx, (mode, title, subtitle)) in [
                     (
                         ExportMode::Device,
                         "Device render",
@@ -7250,13 +10990,18 @@ fn show_export_tab(
                         "Single frame capture",
                         "Save a single frame as an image.",
                     ),
-                ] {
-                    let (row_rect, resp) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), 77.0),
-                        Sense::click(),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let card_h = compute_card_h(ui, title, subtitle);
+                    let (row_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), card_h),
+                        Sense::hover(),
                     );
-                    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-                    let fill = if resp.hovered() { BG_HOVER } else { BG_PANEL };
+                    let card_id = Id::unique(("export_landing_card", card_idx));
+                    let hovered = ui.rect_contains_pointer(row_rect);
+                    let fill = if hovered { BG_HOVER } else { BG_PANEL };
                     ui.painter().rect_filled(row_rect, CornerRadius::ZERO, fill);
                     let div_y = (row_rect.bottom() - 1.0).round();
                     ui.painter().rect_filled(
@@ -7268,16 +11013,16 @@ fn show_export_tab(
                         BORDER_ROW_SOFT,
                     );
 
-                    // Procedural vector icon on left: 54x40 at (+11, +18) (Device) or 52x42 at (+12, +17) (Frame)
+                    // Procedural vector icon centered vertically on the left
                     if mode == ExportMode::Device {
                         let icon_rect = Rect::from_min_size(
-                            Pos2::new(row_rect.left() + 11.0, (row_rect.top() + 18.0).round()),
+                            Pos2::new(row_rect.left() + 11.0, (row_rect.center().y - 20.0).round()),
                             Vec2::new(54.0, 40.0),
                         );
                         paint_export_desktop_icon(ui.painter(), icon_rect, TEXT_PRIMARY, fill);
                     } else {
                         let icon_rect = Rect::from_min_size(
-                            Pos2::new(row_rect.left() + 12.0, (row_rect.top() + 17.0).round()),
+                            Pos2::new(row_rect.left() + 12.0, (row_rect.center().y - 21.0).round()),
                             Vec2::new(52.0, 42.0),
                         );
                         paint_export_frame_icon(ui.painter(), icon_rect, TEXT_PRIMARY, fill);
@@ -7288,19 +11033,20 @@ fn show_export_tab(
                         Pos2::new(text_left, row_rect.top() + 9.0),
                         Pos2::new(
                             (row_rect.right() - 10.0).max(text_left + 20.0),
-                            row_rect.bottom() - 4.0,
+                            (row_rect.bottom() - 4.0).max(row_rect.top() + 24.0),
                         ),
                     );
                     let mut text_ui = ui.new_child(egui::UiBuilder::new().max_rect(text_rect));
+                    text_ui.set_clip_rect(text_ui.clip_rect().intersect(text_rect));
                     text_ui.spacing_mut().item_spacing.y = 3.0;
-                    text_ui.label(
-                        egui::RichText::new(title)
-                            .font(theme.font(FONT_BODY))
-                            .color(if resp.hovered() {
-                                TEXT_BRIGHT
-                            } else {
-                                TEXT_PRIMARY
-                            }),
+                    text_ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(title)
+                                .font(theme.font(FONT_BODY))
+                                .color(if hovered { TEXT_BRIGHT } else { TEXT_PRIMARY }),
+                        )
+                        .wrap()
+                        .selectable(false),
                     );
                     text_ui.add(
                         egui::Label::new(
@@ -7308,9 +11054,13 @@ fn show_export_tab(
                                 .font(theme.font(FONT_SMALL))
                                 .color(TEXT_OPTION_DESC),
                         )
-                        .wrap(),
+                        .wrap()
+                        .selectable(false),
                     );
 
+                    let resp = ui
+                        .interact(row_rect, card_id, Sense::click())
+                        .on_hover_cursor(CursorIcon::PointingHand);
                     if resp.clicked() {
                         state.export_settings.mode = mode;
                         state.export_view_mode = Some(mode);
@@ -7319,12 +11069,15 @@ fn show_export_tab(
 
                 // Portable `.pz` project archive export row
                 {
-                    let (row_rect, resp) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), 77.0),
-                        Sense::click(),
+                    let pz_title = "Export .pz...";
+                    let pz_sub = "Save the project as a portable .pz archive.";
+                    let card_h = compute_card_h(ui, pz_title, pz_sub);
+                    let (row_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), card_h),
+                        Sense::hover(),
                     );
-                    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-                    let fill = if resp.hovered() { BG_HOVER } else { BG_PANEL };
+                    let hovered = ui.rect_contains_pointer(row_rect);
+                    let fill = if hovered { BG_HOVER } else { BG_PANEL };
                     ui.painter().rect_filled(row_rect, CornerRadius::ZERO, fill);
                     let div_y = (row_rect.bottom() - 1.0).round();
                     ui.painter().rect_filled(
@@ -7337,7 +11090,7 @@ fn show_export_tab(
                     );
 
                     let icon_rect = Rect::from_min_size(
-                        Pos2::new(row_rect.left() + 12.0, (row_rect.top() + 17.0).round()),
+                        Pos2::new(row_rect.left() + 12.0, (row_rect.center().y - 21.0).round()),
                         Vec2::new(52.0, 42.0),
                     );
                     paint_export_pz_icon(ui.painter(), icon_rect, TEXT_PRIMARY, fill);
@@ -7347,29 +11100,34 @@ fn show_export_tab(
                         Pos2::new(text_left, row_rect.top() + 9.0),
                         Pos2::new(
                             (row_rect.right() - 10.0).max(text_left + 20.0),
-                            row_rect.bottom() - 4.0,
+                            (row_rect.bottom() - 4.0).max(row_rect.top() + 24.0),
                         ),
                     );
                     let mut text_ui = ui.new_child(egui::UiBuilder::new().max_rect(text_rect));
+                    text_ui.set_clip_rect(text_ui.clip_rect().intersect(text_rect));
                     text_ui.spacing_mut().item_spacing.y = 3.0;
-                    text_ui.label(
-                        egui::RichText::new("Export .pz...")
-                            .font(theme.font(FONT_BODY))
-                            .color(if resp.hovered() {
-                                TEXT_BRIGHT
-                            } else {
-                                TEXT_PRIMARY
-                            }),
+                    text_ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(pz_title)
+                                .font(theme.font(FONT_BODY))
+                                .color(if hovered { TEXT_BRIGHT } else { TEXT_PRIMARY }),
+                        )
+                        .wrap()
+                        .selectable(false),
                     );
                     text_ui.add(
                         egui::Label::new(
-                            egui::RichText::new("Save the project as a portable .pz archive.")
+                            egui::RichText::new(pz_sub)
                                 .font(theme.font(FONT_SMALL))
                                 .color(TEXT_OPTION_DESC),
                         )
-                        .wrap(),
+                        .wrap()
+                        .selectable(false),
                     );
 
+                    let resp = ui
+                        .interact(row_rect, Id::unique("export_landing_pz_card"), Sense::click())
+                        .on_hover_cursor(CursorIcon::PointingHand);
                     if resp.clicked() {
                         state.pending_project_actions.push(ProjectAction::ExportPz);
                     }
@@ -7451,6 +11209,8 @@ fn show_export_tab(
             let is_device = active_mode == ExportMode::Device;
             let is_audio_only = is_device && state.export_settings.container.is_audio_only();
             let needs_ffmpeg = is_device && state.export_settings.container.requires_ffmpeg();
+            let mut export_cols = state.prop_columns;
+            export_cols.label_ratio = export_cols.label_ratio.max(0.47);
 
             Frame::NONE
                 .inner_margin(egui::Margin::symmetric(8, 8))
@@ -7518,16 +11278,15 @@ fn show_export_tab(
                             ui,
                             "Container",
                             false,
-                            state.prop_columns,
+                            export_cols,
                             theme,
                             |_| {},
                             |ui| {
-                                cm3_dropdown(
+                                export_uniform_dropdown(
                                     ui,
                                     Id::unique("exp_container"),
                                     &mut c_idx,
                                     &container_labels,
-                                    false,
                                     viewport_rect,
                                     theme,
                                 )
@@ -7551,16 +11310,15 @@ fn show_export_tab(
                                 ui,
                                 "Video codec",
                                 false,
-                                state.prop_columns,
+                                export_cols,
                                 theme,
                                 |_| {},
                                 |ui| {
-                                    cm3_dropdown(
+                                    export_uniform_dropdown(
                                         ui,
                                         Id::unique("exp_vcodec"),
                                         &mut vc_idx,
                                         &v_labels,
-                                        false,
                                         viewport_rect,
                                         theme,
                                     )
@@ -7579,16 +11337,15 @@ fn show_export_tab(
                                 ui,
                                 "Rate control",
                                 false,
-                                state.prop_columns,
+                                export_cols,
                                 theme,
                                 |_| {},
                                 |ui| {
-                                    cm3_dropdown(
+                                    export_uniform_dropdown(
                                         ui,
                                         Id::unique("exp_rc"),
                                         &mut rc_idx,
                                         &ExportRateControl::LABELS,
-                                        false,
                                         viewport_rect,
                                         theme,
                                     )
@@ -7608,9 +11365,9 @@ fn show_export_tab(
                                         f64::from(state.export_settings.crf.min(cur_max_crf));
                                     let ev = cm3_property_row_aligned(
                                         ui,
-                                        "Quality (CRF)",
+                                        "CRF",
                                         false,
-                                        state.prop_columns,
+                                        export_cols,
                                         theme,
                                         |_| {},
                                         |ui| {
@@ -7637,9 +11394,9 @@ fn show_export_tab(
                                     let mut mbps = state.export_settings.bitrate_mbps;
                                     let ev = cm3_property_row_aligned(
                                         ui,
-                                        "Bitrate (Mbps)",
+                                        "Bitrate Mbps",
                                         false,
-                                        state.prop_columns,
+                                        export_cols,
                                         theme,
                                         |_| {},
                                         |ui| {
@@ -7665,16 +11422,15 @@ fn show_export_tab(
                                         ui,
                                         "Preset",
                                         false,
-                                        state.prop_columns,
+                                        export_cols,
                                         theme,
                                         |_| {},
                                         |ui| {
-                                            cm3_dropdown(
+                                            export_uniform_dropdown(
                                                 ui,
                                                 Id::unique("exp_cm3_preset"),
                                                 &mut p_idx,
                                                 &ExportCm3Preset::LABELS,
-                                                false,
                                                 viewport_rect,
                                                 theme,
                                             )
@@ -7696,18 +11452,17 @@ fn show_export_tab(
                             let mut alpha_idx = usize::from(state.export_settings.transparent_alpha);
                             if cm3_property_row_aligned(
                                 ui,
-                                "Transparent alpha",
+                                "Alpha channel",
                                 false,
-                                state.prop_columns,
+                                export_cols,
                                 theme,
                                 |_| {},
                                 |ui| {
-                                    cm3_dropdown(
+                                    export_uniform_dropdown(
                                         ui,
                                         Id::unique("exp_alpha"),
                                         &mut alpha_idx,
                                         &["off", "on"],
-                                        false,
                                         viewport_rect,
                                         theme,
                                     )
@@ -7730,16 +11485,15 @@ fn show_export_tab(
                                 ui,
                                 "Audio codec",
                                 false,
-                                state.prop_columns,
+                                export_cols,
                                 theme,
                                 |_| {},
                                 |ui| {
-                                    cm3_dropdown(
+                                    export_uniform_dropdown(
                                         ui,
                                         Id::unique("exp_acodec"),
                                         &mut ac_idx,
                                         &a_labels,
-                                        false,
                                         viewport_rect,
                                         theme,
                                     )
@@ -7755,9 +11509,9 @@ fn show_export_tab(
                                 let mut kbps = f64::from(state.export_settings.audio_bitrate_kbps);
                                 let ev = cm3_property_row_aligned(
                                     ui,
-                                    "Audio bitrate (kbps)",
+                                    "Audio kbps",
                                     false,
-                                    state.prop_columns,
+                                    export_cols,
                                     theme,
                                     |_| {},
                                     |ui| {
@@ -7788,16 +11542,15 @@ fn show_export_tab(
                                     ui,
                                     "Sample rate",
                                     false,
-                                    state.prop_columns,
+                                    export_cols,
                                     theme,
                                     |_| {},
                                     |ui| {
-                                        cm3_dropdown(
+                                        export_uniform_dropdown(
                                             ui,
                                             Id::unique("exp_sample_rate"),
                                             &mut sr_idx,
                                             &RATE_LABELS,
-                                            false,
                                             viewport_rect,
                                             theme,
                                         )
@@ -7819,7 +11572,7 @@ fn show_export_tab(
                             ui,
                             "Resolution",
                             false,
-                            state.prop_columns,
+                            export_cols,
                             theme,
                             |_| {},
                             |ui| {
@@ -7849,7 +11602,7 @@ fn show_export_tab(
                                 ui,
                                 "Frame rate",
                                 false,
-                                state.prop_columns,
+                                export_cols,
                                 theme,
                                 |_| {},
                                 |ui| {
@@ -7873,9 +11626,9 @@ fn show_export_tab(
                         ];
                         let ev = cm3_property_row_aligned(
                             ui,
-                            "Range (frames)",
+                            "Frame range",
                             false,
-                            state.prop_columns,
+                            export_cols,
                             theme,
                             |_| {},
                             |ui| {
@@ -8161,10 +11914,27 @@ fn show_export_queue_section(
                 ui.set_min_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 3.0;
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(&job.label)
-                            .font(theme.font(FONT_SMALL))
-                            .color(TEXT_PRIMARY),
+                    let badge_galley = ui.painter().layout_no_wrap(
+                        status_label.to_owned(),
+                        theme.font(FONT_COMPACT),
+                        status_color,
+                    );
+                    let badge_w = (badge_galley.size().x.ceil() + 8.0).max(52.0);
+                    let label_max_w = (ui.available_width() - badge_w - 6.0).max(36.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(label_max_w, 16.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&job.label)
+                                        .font(theme.font(FONT_SMALL))
+                                        .color(TEXT_PRIMARY),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&job.label);
+                        },
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
@@ -8174,10 +11944,13 @@ fn show_export_queue_section(
                         );
                     });
                 });
-                ui.label(
-                    egui::RichText::new(filename)
-                        .font(theme.font(FONT_COMPACT))
-                        .color(TEXT_MUTED),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(filename)
+                            .font(theme.font(FONT_COMPACT))
+                            .color(TEXT_MUTED),
+                    )
+                    .truncate(),
                 );
                 if let ExportJobStatus::Failed(err) = &job.status {
                     ui.label(
@@ -8234,6 +12007,81 @@ fn show_export_queue_section(
 // ---------------------------------------------------------------------------
 // Tab 7: Restore — Autosave & Project Snapshot Restore
 // ---------------------------------------------------------------------------
+
+/// Converts internal dot/snake command IDs (e.g. `"timeline.trim_clip_left"`, `"scene.add_object_3d"`)
+/// into clean human-readable Restore History labels (`"Trim clip left"`, `"Add 3D object"`).
+fn humanize_history_label(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "Edit".to_owned();
+    }
+    match trimmed {
+        "project.new" => return "New project".to_owned(),
+        "project.set_name" => return "Rename project".to_owned(),
+        "project.set_resolution" => return "Set resolution".to_owned(),
+        "project.set_fps" => return "Set frame rate".to_owned(),
+        "project.set_sequence_length" => return "Set sequence length".to_owned(),
+        "scene.add_object_3d" => return "Add 3D object".to_owned(),
+        "scene.delete_object_3d" => return "Delete 3D object".to_owned(),
+        "scene.duplicate_object_3d" => return "Duplicate 3D object".to_owned(),
+        "scene.reorder_object_3d" => return "Reorder 3D object".to_owned(),
+        "scene.split_text_3d_into_letters" => return "Split 3D text into letters".to_owned(),
+        "clipboard.paste_pz_json" => return "Paste .pz JSON".to_owned(),
+        "property.set_value" => return "Set property".to_owned(),
+        "property.toggle_animated" => return "Toggle keyframe animation".to_owned(),
+        "property.set_keyframe" => return "Set keyframe".to_owned(),
+        "property.delete_keyframe" => return "Delete keyframe".to_owned(),
+        "property.set_expression" => return "Set expression".to_owned(),
+        "property.remove" => return "Remove property".to_owned(),
+        "property.reset_list" => return "Reset properties".to_owned(),
+        _ => {}
+    }
+
+    // If raw looks like `namespace.snake_case`, strip the namespace prefix and humanize.
+    let body = if let Some((ns, rest)) = trimmed.split_once('.')
+        && !ns.contains(' ')
+        && !rest.is_empty()
+        && ns.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        rest
+    } else {
+        trimmed
+    };
+
+    let words: Vec<String> = body
+        .split(['_', ' '])
+        .filter(|w| !w.is_empty())
+        .enumerate()
+        .map(|(i, w)| {
+            let lower = w.to_ascii_lowercase();
+            match lower.as_str() {
+                "3d" => "3D".to_owned(),
+                "2d" => "2D".to_owned(),
+                "fps" => "FPS".to_owned(),
+                "pz" => ".pz".to_owned(),
+                "json" => "JSON".to_owned(),
+                "glsl" => "GLSL".to_owned(),
+                _ if i == 0 => {
+                    let mut chars = w.chars();
+                    match chars.next() {
+                        Some(first) => {
+                            let mut s = first.to_uppercase().to_string();
+                            s.push_str(chars.as_str());
+                            s
+                        }
+                        None => String::new(),
+                    }
+                }
+                _ => w.to_owned(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        trimmed.to_owned()
+    } else {
+        words.join(" ")
+    }
+}
 
 fn show_restore_tab(
     ui: &mut Ui,
@@ -8303,20 +12151,116 @@ fn show_restore_tab(
                             );
                         });
 
-                    if undo_len > 0
-                        && cm3_prop_button(
-                            ui,
-                            "Restore previous snapshot (Undo)",
-                            ButtonVariant::Normal,
-                            true,
-                            theme,
-                        )
-                        .clicked()
-                    {
-                        let _ = session.execute(Command::Undo);
-                        actions.push(PanelAction::StatusMessage(
-                            "Restored previous snapshot".to_owned(),
-                        ));
+                    let undo_tip = session
+                        .history
+                        .peek_undo_label()
+                        .map_or_else(
+                            || "Nothing to undo".to_owned(),
+                            |l| format!("Undo: {}", humanize_history_label(l)),
+                        );
+                    let redo_tip = session
+                        .history
+                        .peek_redo_label()
+                        .map_or_else(
+                            || "Nothing to redo".to_owned(),
+                            |l| format!("Redo: {}", humanize_history_label(l)),
+                        );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let half_w = ((ui.available_width() - 6.0) * 0.5).max(60.0);
+                        ui.add_enabled_ui(undo_len > 0, |ui| {
+                            if ui
+                                .add_sized(
+                                    Vec2::new(half_w, 24.0),
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("Undo ({undo_len})"))
+                                            .font(theme.font(FONT_SMALL))
+                                            .color(if undo_len > 0 {
+                                                TEXT_PRIMARY
+                                            } else {
+                                                TEXT_DISABLED
+                                            }),
+                                    )
+                                    .fill(BG_BUTTON)
+                                    .stroke(Stroke::new(1.0, BORDER_CONTROL)),
+                                )
+                                .on_hover_text(undo_tip)
+                                .clicked()
+                            {
+                                let _ = session.execute(Command::Undo);
+                                actions.push(PanelAction::StatusMessage(
+                                    "Restored previous snapshot".to_owned(),
+                                ));
+                            }
+                        });
+                        ui.add_enabled_ui(redo_len > 0, |ui| {
+                            if ui
+                                .add_sized(
+                                    Vec2::new(half_w, 24.0),
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("Redo ({redo_len})"))
+                                            .font(theme.font(FONT_SMALL))
+                                            .color(if redo_len > 0 {
+                                                TEXT_PRIMARY
+                                            } else {
+                                                TEXT_DISABLED
+                                            }),
+                                    )
+                                    .fill(BG_BUTTON)
+                                    .stroke(Stroke::new(1.0, BORDER_CONTROL)),
+                                )
+                                .on_hover_text(redo_tip)
+                                .clicked()
+                            {
+                                let _ = session.execute(Command::Redo);
+                                actions.push(PanelAction::StatusMessage(
+                                    "Reapplied next snapshot".to_owned(),
+                                ));
+                            }
+                        });
+                    });
+
+                    // Compact scrollable recent history activity list
+                    if !state.history_log.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Recent history")
+                                .font(theme.font(FONT_SMALL))
+                                .color(TEXT_STRONG),
+                        );
+                        Frame::NONE
+                            .fill(BG_SUNKEN)
+                            .stroke(Stroke::new(1.0, BORDER_ROW_SOFT))
+                            .inner_margin(egui::Margin::symmetric(6, 4))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ScrollArea::vertical()
+                                    .id_salt("restore_recent_history_scroll")
+                                    .max_height(110.0)
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        let active_rev = session.history.revision();
+                                        for (rev, label) in &state.history_log {
+                                            let is_cur = *rev == active_rev;
+                                            let prefix = if is_cur { "• " } else { "  " };
+                                            let pretty = humanize_history_label(label);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!(
+                                                        "{prefix}#{rev} {pretty}"
+                                                    ))
+                                                    .font(theme.font(FONT_COMPACT))
+                                                    .color(if is_cur {
+                                                        theme.value()
+                                                    } else {
+                                                        TEXT_MUTED
+                                                    }),
+                                                )
+                                                .truncate(),
+                                            );
+                                        }
+                                    });
+                            });
                     }
 
                     if cm3_prop_button(ui, "Export .pz...", ButtonVariant::Normal, true, theme)
@@ -8522,7 +12466,15 @@ fn show_assets_tab(
 
             let q = state.assets_filter.trim().to_ascii_lowercase();
 
-            // Project assets bar
+            let asset_usage = compute_asset_usage_counts(session);
+            let unused_asset_count = session
+                .project
+                .assets
+                .keys()
+                .filter(|id| asset_usage.get(*id).copied().unwrap_or(0) == 0)
+                .count();
+
+            // Project assets bar (responsive layout preventing title/button overlap at 800x540)
             let (bar_rect, _) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 27.0), Sense::hover());
             ui.painter()
@@ -8531,35 +12483,78 @@ fn show_assets_tab(
                 [bar_rect.left_bottom(), bar_rect.right_bottom()],
                 Stroke::new(1.0, BORDER_ROW_SOFT),
             );
-            ui.painter().text(
-                Pos2::new(bar_rect.left() + 10.0, bar_rect.center().y),
-                Align2::LEFT_CENTER,
-                "Project assets",
-                theme.font(FONT_SMALL),
-                TEXT_STRONG,
-            );
+            let narrow_assets_bar = bar_rect.width() < 235.0;
+            let import_lbl = "+ Import";
+            let purge_lbl = if narrow_assets_bar {
+                "Purge"
+            } else {
+                "Purge Unused"
+            };
+            let import_w = ui
+                .painter()
+                .layout_no_wrap(import_lbl.to_owned(), theme.font(FONT_SMALL), TEXT_PRIMARY)
+                .size()
+                .x
+                .ceil()
+                + 14.0;
+            let purge_w = ui
+                .painter()
+                .layout_no_wrap(purge_lbl.to_owned(), theme.font(FONT_COMPACT), TEXT_MUTED)
+                .size()
+                .x
+                .ceil()
+                + 10.0;
             let imp_rect = Rect::from_min_max(
                 Pos2::new(
-                    (bar_rect.right() - 78.0).max(bar_rect.left()),
+                    (bar_rect.right() - import_w).max(bar_rect.left() + 80.0),
                     bar_rect.top(),
                 ),
                 bar_rect.right_bottom(),
             );
             let purge_rect = Rect::from_min_max(
                 Pos2::new(
-                    (imp_rect.left() - 96.0).max(bar_rect.left() + 92.0),
+                    (imp_rect.left() - purge_w - 4.0).max(bar_rect.left() + 52.0),
                     bar_rect.top(),
                 ),
-                Pos2::new(imp_rect.left() - 4.0, bar_rect.bottom()),
+                Pos2::new(
+                    (imp_rect.left() - 4.0).max(bar_rect.left() + 56.0),
+                    bar_rect.bottom(),
+                ),
+            );
+            let title_left = bar_rect.left() + 8.0;
+            let title_max_w = (purge_rect.left() - title_left - 6.0).max(24.0);
+            let title_text = if bar_rect.width() < 210.0 {
+                "Assets"
+            } else {
+                "Project assets"
+            };
+            let title_galley = layout_single_line_ellipsized(
+                ui.painter(),
+                title_text,
+                theme.font(FONT_SMALL),
+                TEXT_STRONG,
+                title_max_w,
+            );
+            let title_clip = Rect::from_min_max(
+                Pos2::new(title_left, bar_rect.top()),
+                Pos2::new((purge_rect.left() - 4.0).max(title_left), bar_rect.bottom()),
+            );
+            ui.painter().with_clip_rect(title_clip).galley(
+                Pos2::new(
+                    title_left,
+                    bar_rect.center().y - title_galley.size().y * 0.5,
+                ),
+                title_galley,
+                TEXT_STRONG,
             );
             let purge_resp = ui
                 .interact(purge_rect, Id::unique("assets_purge_btn"), Sense::click())
                 .on_hover_cursor(CursorIcon::PointingHand)
                 .on_hover_text("Remove assets not referenced by any clip, object, or effect");
-            ui.painter().text(
+            ui.painter().with_clip_rect(purge_rect).text(
                 Pos2::new(purge_rect.right() - 4.0, bar_rect.center().y),
                 Align2::RIGHT_CENTER,
-                "Purge Unused",
+                purge_lbl,
                 theme.font(FONT_COMPACT),
                 if purge_resp.hovered() {
                     DANGER_TEXT
@@ -8567,24 +12562,28 @@ fn show_assets_tab(
                     TEXT_MUTED
                 },
             );
-            if purge_resp.clicked()
-                && let Ok(res) = session.execute(Command::PurgeUnusedAssets)
-            {
-                let removed = res
-                    .get("removed_count")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                actions.push(PanelAction::StatusMessage(format!(
-                    "Purged {removed} unused asset(s)"
-                )));
+            if purge_resp.clicked() {
+                if unused_asset_count == 0 {
+                    actions.push(PanelAction::StatusMessage(
+                        "No unused assets to purge".to_owned(),
+                    ));
+                } else if let Ok(res) = session.execute(Command::PurgeUnusedAssets) {
+                    let removed = res
+                        .get("removed_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    actions.push(PanelAction::StatusMessage(format!(
+                        "Purged {removed} unused asset(s)"
+                    )));
+                }
             }
             let imp_resp = ui
                 .interact(imp_rect, Id::unique("assets_import_btn"), Sense::click())
                 .on_hover_cursor(CursorIcon::PointingHand);
-            ui.painter().text(
-                Pos2::new(bar_rect.right() - 10.0, bar_rect.center().y),
+            ui.painter().with_clip_rect(imp_rect).text(
+                Pos2::new(bar_rect.right() - 8.0, bar_rect.center().y),
                 Align2::RIGHT_CENTER,
-                "+ Import",
+                import_lbl,
                 theme.font(FONT_SMALL),
                 if imp_resp.hovered() {
                     TEXT_BRIGHT
@@ -8596,7 +12595,6 @@ fn show_assets_tab(
                 actions.push(PanelAction::ImportMedia);
             }
 
-            let asset_usage = compute_asset_usage_counts(session);
             let project_assets: Vec<(String, String, &'static str, u64, bool, usize)> = session
                 .project
                 .assets
@@ -8653,19 +12651,47 @@ fn show_assets_tab(
                     } else {
                         format!("{clip_kind} · {usage_badge}")
                     };
-                    ui.painter().text(
-                        Pos2::new(row_rect.left() + 10.0, row_rect.top() + 13.0),
-                        Align2::LEFT_CENTER,
+                    let text_right = if missing {
+                        (row_rect.right() - 78.0).max(row_rect.left() + 30.0)
+                    } else {
+                        (row_rect.right() - 8.0).max(row_rect.left() + 30.0)
+                    };
+                    let text_max_w = (text_right - (row_rect.left() + 10.0)).max(20.0);
+                    let text_clip = Rect::from_min_max(
+                        Pos2::new(row_rect.left() + 10.0, row_rect.top()),
+                        Pos2::new(text_right, row_rect.bottom()),
+                    );
+                    let fname_col = if missing { DANGER_TEXT } else { TEXT_PRIMARY };
+                    let fname_galley = layout_single_line_ellipsized(
+                        ui.painter(),
                         &fname,
                         theme.font(FONT_SMALL),
-                        if missing { DANGER_TEXT } else { TEXT_PRIMARY },
+                        fname_col,
+                        text_max_w,
                     );
-                    ui.painter().text(
-                        Pos2::new(row_rect.left() + 10.0, row_rect.top() + 27.0),
-                        Align2::LEFT_CENTER,
-                        meta,
+                    ui.painter().with_clip_rect(text_clip).galley(
+                        Pos2::new(
+                            row_rect.left() + 10.0,
+                            row_rect.top() + 13.0 - fname_galley.size().y * 0.5,
+                        ),
+                        fname_galley,
+                        fname_col,
+                    );
+                    let meta_col = if missing { DANGER_TEXT } else { TEXT_MUTED };
+                    let meta_galley = layout_single_line_ellipsized(
+                        ui.painter(),
+                        &meta,
                         theme.font(FONT_COMPACT),
-                        if missing { DANGER_TEXT } else { TEXT_MUTED },
+                        meta_col,
+                        text_max_w,
+                    );
+                    ui.painter().with_clip_rect(text_clip).galley(
+                        Pos2::new(
+                            row_rect.left() + 10.0,
+                            row_rect.top() + 27.0 - meta_galley.size().y * 0.5,
+                        ),
+                        meta_galley,
+                        meta_col,
                     );
                     let mut relinked = false;
                     if missing {
@@ -8775,22 +12801,38 @@ fn show_assets_tab(
                 );
                 paint_media_card_icon(ui.painter(), icon_rect, preset.icon, TEXT_PRIMARY, row_bg);
                 let tx = icon_rect.right() + 10.0;
-                ui.painter().text(
-                    Pos2::new(tx, row_rect.top() + 14.0),
-                    Align2::LEFT_CENTER,
+                let max_text_w = (row_rect.right() - tx - 8.0).max(24.0);
+                let text_clip = Rect::from_min_max(
+                    Pos2::new(tx, row_rect.top()),
+                    Pos2::new((row_rect.right() - 6.0).max(tx), row_rect.bottom()),
+                );
+                let title_col = if resp.hovered() {
+                    TEXT_BRIGHT
+                } else {
+                    TEXT_PRIMARY
+                };
+                let title_galley = layout_single_line_ellipsized(
+                    ui.painter(),
                     preset.title,
                     theme.font(FONT_SMALL),
-                    if resp.hovered() {
-                        TEXT_BRIGHT
-                    } else {
-                        TEXT_PRIMARY
-                    },
+                    title_col,
+                    max_text_w,
                 );
-                ui.painter().text(
-                    Pos2::new(tx, row_rect.top() + 31.0),
-                    Align2::LEFT_CENTER,
+                ui.painter().with_clip_rect(text_clip).galley(
+                    Pos2::new(tx, row_rect.top() + 14.0 - title_galley.size().y * 0.5),
+                    title_galley,
+                    title_col,
+                );
+                let sub_galley = layout_single_line_ellipsized(
+                    ui.painter(),
                     preset.subtitle,
                     theme.font(FONT_COMPACT),
+                    TEXT_OPTION_DESC,
+                    max_text_w,
+                );
+                ui.painter().with_clip_rect(text_clip).galley(
+                    Pos2::new(tx, row_rect.top() + 31.0 - sub_galley.size().y * 0.5),
+                    sub_galley,
                     TEXT_OPTION_DESC,
                 );
                 if resp.clicked() {
@@ -8977,6 +13019,106 @@ fn paint_pill_toggle(
     resp
 }
 
+/// Match quality rank for the Plugins search box (lower is higher priority):
+/// 0 = exact title/id match, 1 = title prefix match, 2 = title substring match,
+/// 3 = plugin id substring match, 4 = summary/tagline description match.
+fn plugin_search_match_rank(
+    desc: &PluginDescriptor,
+    summary: &str,
+    query_lower: &str,
+) -> Option<u8> {
+    if query_lower.is_empty() {
+        return Some(0);
+    }
+    let name_low = desc.name.to_ascii_lowercase();
+    let id_low = desc.id.to_ascii_lowercase();
+    if name_low == query_lower || id_low == query_lower {
+        return Some(0);
+    }
+    if name_low.starts_with(query_lower) {
+        return Some(1);
+    }
+    if name_low.contains(query_lower) {
+        return Some(2);
+    }
+    if id_low.contains(query_lower) {
+        return Some(3);
+    }
+    if summary.to_ascii_lowercase().contains(query_lower)
+        || desc.tagline.to_ascii_lowercase().contains(query_lower)
+    {
+        return Some(4);
+    }
+    None
+}
+
+struct RankedPluginCategory {
+    best_rank: u8,
+    cat_ord: usize,
+    category: PluginCategory,
+    all_in_cat: Vec<PluginDescriptor>,
+    descriptors: Vec<PluginDescriptor>,
+}
+
+/// Filters and orders plugin categories + descriptors for the Plugins search box so
+/// exact/title matches (e.g. `"Native FX"` for `"native"`) always rank above
+/// internal description/tagline matches (`"MP4 Export"`, `"Node Effect"`).
+fn rank_filtered_plugin_categories(
+    session: &Session,
+    query_lower: &str,
+) -> Vec<(PluginCategory, Vec<PluginDescriptor>, Vec<PluginDescriptor>)> {
+    let mut ranked: Vec<RankedPluginCategory> = Vec::new();
+    for (cat_ord, category) in [
+        PluginCategory::Utilities,
+        PluginCategory::Scene,
+        PluginCategory::Adjustment,
+        PluginCategory::Experimental,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let all_in_cat: Vec<PluginDescriptor> = session
+            .plugins
+            .visible_in_category(category)
+            .into_iter()
+            .cloned()
+            .collect();
+        if all_in_cat.is_empty() {
+            continue;
+        }
+        let mut matched: Vec<(u8, usize, PluginDescriptor)> = all_in_cat
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                let summary = zoidium_plugin_summary(&d.id, &d.tagline);
+                plugin_search_match_rank(d, summary, query_lower).map(|rank| (rank, i, d.clone()))
+            })
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        if !query_lower.is_empty() {
+            matched.sort_by_key(|(rank, idx, _)| (*rank, *idx));
+        }
+        let best_rank = matched.first().map_or(u8::MAX, |(r, _, _)| *r);
+        let descriptors: Vec<PluginDescriptor> = matched.into_iter().map(|(_, _, d)| d).collect();
+        ranked.push(RankedPluginCategory {
+            best_rank,
+            cat_ord,
+            category,
+            all_in_cat,
+            descriptors,
+        });
+    }
+    if !query_lower.is_empty() {
+        ranked.sort_by_key(|entry| (entry.best_rank, entry.cat_ord));
+    }
+    ranked
+        .into_iter()
+        .map(|entry| (entry.category, entry.all_in_cat, entry.descriptors))
+        .collect()
+}
+
 fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state: &mut PanelsState) {
     let active_deps = session.active_plugin_dependencies();
 
@@ -9101,46 +13243,21 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
 
             let q = state.plugin_filter.trim().to_ascii_lowercase();
 
-            for category in [
-                PluginCategory::Utilities,
-                PluginCategory::Scene,
-                PluginCategory::Adjustment,
-                PluginCategory::Experimental,
-            ] {
-                let all_in_cat: Vec<_> = session
-                    .plugins
-                    .visible_in_category(category)
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                if all_in_cat.is_empty() {
-                    continue;
-                }
+            for (category, all_in_cat, descriptors) in rank_filtered_plugin_categories(session, &q)
+            {
                 let enabled_count = all_in_cat
                     .iter()
                     .filter(|d| session.plugins.is_enabled(&d.id))
                     .count();
-                let descriptors: Vec<_> = all_in_cat
-                    .iter()
-                    .filter(|d| {
-                        let summary = zoidium_plugin_summary(&d.id, &d.tagline);
-                        q.is_empty()
-                            || d.name.to_ascii_lowercase().contains(&q)
-                            || summary.to_ascii_lowercase().contains(&q)
-                            || d.tagline.to_ascii_lowercase().contains(&q)
-                            || d.id.to_ascii_lowercase().contains(&q)
-                    })
-                    .cloned()
-                    .collect();
-                if descriptors.is_empty() {
-                    continue;
-                }
 
                 let cat_id = Id::unique(("plugin_cat", category.display_name()));
                 let default_open = !category.collapsed_by_default();
-                let mut open = ui
-                    .data_mut(|d| d.get_temp::<bool>(cat_id))
-                    .unwrap_or(default_open);
+                let mut open = if !q.is_empty() {
+                    true
+                } else {
+                    ui.data_mut(|d| d.get_temp::<bool>(cat_id))
+                        .unwrap_or(default_open)
+                };
 
                 // Flat #2a2a2a 40px category header (1px #242424 bottom divider), #7e8fb9 chevron,
                 // category name (ellipsis-truncated), muted "X of Y on" counter, right-aligned 36x20 pill
@@ -9159,10 +13276,11 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                     BORDER_ROW_SOFT,
                 );
 
-                // Toggle click zone on right (36x20 pill aligned to x=329..365)
+                // Toggle click zone on right (36x20 pill with compact right padding so
+                // "Scene Extensions" displays cleanly without ellipsizing)
                 let cat_toggle_rect = Rect::from_min_size(
                     Pos2::new(
-                        (cat_rect.right() - 52.0).round(),
+                        (cat_rect.right() - 44.0).round(),
                         (cat_rect.center().y - 10.0).round(),
                     ),
                     Vec2::new(36.0, 20.0),
@@ -9170,7 +13288,7 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                 let cat_hdr_click_rect = Rect::from_min_max(
                     cat_rect.left_top(),
                     Pos2::new(
-                        (cat_toggle_rect.left() - 8.0).max(cat_rect.left()),
+                        (cat_toggle_rect.left() - 6.0).max(cat_rect.left()),
                         cat_rect.bottom(),
                     ),
                 );
@@ -9182,25 +13300,29 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                 }
                 ui.data_mut(|d| d.insert_temp(cat_id, open));
 
-                // #7e8fb9 chevron at left + 11.0, center.y + 0.5
+                // #7e8fb9 chevron at left + 10.0, center.y + 0.5
                 paint_small_chevron(
                     ui.painter(),
-                    Pos2::new(cat_rect.left() + 11.0, cat_rect.center().y + 0.5),
+                    Pos2::new(cat_rect.left() + 10.0, cat_rect.center().y + 0.5),
                     open,
                     theme.value(),
                 );
 
-                let count_text = format!("{} of {} on", enabled_count, all_in_cat.len());
+                let count_text = if cat_rect.width() < 260.0 {
+                    format!("{}/{}", enabled_count, all_in_cat.len())
+                } else {
+                    format!("{} of {} on", enabled_count, all_in_cat.len())
+                };
                 let count_galley = ui.painter().layout_no_wrap(
                     count_text,
-                    theme.font(FONT_SMALL),
+                    theme.font(FONT_COMPACT),
                     TEXT_MUTED,
                 );
-                let count_right = (cat_toggle_rect.left() - 18.0).max(cat_rect.left() + 80.0);
+                let count_right = (cat_toggle_rect.left() - 8.0).max(cat_rect.left() + 80.0);
                 let count_left = (count_right - count_galley.size().x).max(cat_rect.left() + 80.0);
 
-                let name_x = cat_rect.left() + 22.0;
-                let max_name_w = (count_left - 12.0 - name_x).max(24.0);
+                let name_x = cat_rect.left() + 20.0;
+                let max_name_w = (count_left - 6.0 - name_x).max(24.0);
                 let raw_name = category.display_name();
                 let mut name_galley = ui.painter().layout_no_wrap(
                     raw_name.to_owned(),
@@ -9301,9 +13423,46 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                         let cm3_compat = is_cm3_compatible_plugin(&desc.id);
                         let summary = zoidium_plugin_summary(&desc.id, &desc.tagline);
 
-                        // Full-bleed flat #2a2a2a row with exact Zoidium 55px (1-line) / 70px (2-line) cadence
+                        // Full-bleed flat #2a2a2a row with dynamic height so badges and
+                        // multi-line summaries (e.g. Shader FX Pack 4) never clip.
                         let row_w = ui.available_width();
                         let text_w = (row_w - 64.0).max(80.0);
+                        let badge_label = if cm3_compat { "Standard" } else { "Extended" };
+                        let badge_text_w = ui
+                            .painter()
+                            .layout_no_wrap(
+                                badge_label.to_owned(),
+                                theme.font(FONT_BADGE),
+                                TEXT_PRIMARY,
+                            )
+                            .size()
+                            .x
+                            + 12.0;
+                        let total_badges_w = badge_text_w + if in_use { 48.0 } else { 0.0 };
+                        let single_title_galley = ui.painter().layout_no_wrap(
+                            desc.name.clone(),
+                            theme.font(FONT_BODY),
+                            TEXT_PRIMARY,
+                        );
+                        let badges_inline =
+                            single_title_galley.size().x + 6.0 + total_badges_w <= text_w;
+                        let title_galley = if badges_inline {
+                            single_title_galley
+                        } else {
+                            ui.painter().layout(
+                                desc.name.clone(),
+                                theme.font(FONT_BODY),
+                                TEXT_PRIMARY,
+                                text_w,
+                            )
+                        };
+                        let title_h = title_galley.size().y;
+                        let header_h = if badges_inline {
+                            title_h.max(20.0)
+                        } else {
+                            title_h + 21.0
+                        };
+
                         let mut summary_job = egui::text::LayoutJob::default();
                         summary_job.wrap.max_width = text_w;
                         summary_job.append(
@@ -9317,8 +13476,14 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                             },
                         );
                         let summary_galley = ui.painter().layout_job(summary_job);
-                        let summary_lines = summary_galley.rows.len();
-                        let warn_galley = desc.warning.as_ref().map(|w| {
+                        let summary_h = summary_galley.size().y;
+
+                        // Suppress duplicate per-row EXPERIMENTAL_WARNING when category banner already shows it
+                        let row_warning = desc.warning.as_ref().filter(|w| {
+                            !(category == PluginCategory::Experimental
+                                && w.as_str() == zc_plugin::EXPERIMENTAL_WARNING)
+                        });
+                        let warn_galley = row_warning.map(|w| {
                             ui.painter().layout(
                                 w.clone(),
                                 theme.font(FONT_COMPACT),
@@ -9328,7 +13493,10 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                         });
                         let warn_extra_h =
                             warn_galley.as_ref().map_or(0.0, |g| g.size().y + 6.0);
-                        let row_h = if summary_lines <= 1 { 55.0 } else { 70.0 } + warn_extra_h;
+                        let top_pad = 7.0;
+                        let summary_offset = top_pad + header_h + 4.0;
+                        let row_h =
+                            (summary_offset + summary_h + 8.0 + warn_extra_h).max(55.0);
 
                         let (row_rect, _) =
                             ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
@@ -9344,7 +13512,7 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                             BORDER_ROW_SOFT,
                         );
 
-                        // Deterministic pixel-exact title, badge, and summary painting
+                        // Deterministic title, badge, and summary painting (never clipped)
                         let text_left = row_rect.left() + 5.0;
                         let text_clip = Rect::from_min_max(
                             Pos2::new(text_left, row_rect.top()),
@@ -9355,14 +13523,7 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                         );
                         let text_painter = ui.painter().with_clip_rect(text_clip);
 
-                        let title_y = row_rect.top() + if summary_lines <= 1 { 7.5 } else { 5.5 };
-                        let badge_y =
-                            row_rect.top() + if summary_lines <= 1 { 11.0 } else { 9.0 };
-                        let title_galley = text_painter.layout_no_wrap(
-                            desc.name.clone(),
-                            theme.font(FONT_BODY),
-                            TEXT_PRIMARY,
-                        );
+                        let title_y = row_rect.top() + top_pad;
                         let title_w = title_galley.size().x;
                         text_painter.galley(
                             Pos2::new(text_left, title_y),
@@ -9370,7 +13531,11 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                             TEXT_PRIMARY,
                         );
 
-                        let badge_x = text_left + title_w + 6.0;
+                        let (badge_x, badge_y) = if badges_inline {
+                            (text_left + title_w + 6.0, title_y + 2.5)
+                        } else {
+                            (text_left, title_y + title_h + 3.0)
+                        };
                         let badge_w = if cm3_compat {
                             paint_outlined_plugin_badge_at(
                                 &text_painter,
@@ -9406,9 +13571,7 @@ fn show_plugins_tab(ui: &mut Ui, session: &mut Session, theme: &Cm3Theme, state:
                             );
                         }
 
-                        let summary_y =
-                            row_rect.top() + if summary_lines <= 1 { 30.0 } else { 29.0 };
-                        let summary_h = summary_galley.size().y;
+                        let summary_y = row_rect.top() + summary_offset;
                         text_painter.galley(
                             Pos2::new(text_left, summary_y),
                             summary_galley,
@@ -9808,7 +13971,14 @@ fn settings_fixed_dropdown(
         .unwrap_or(false);
     let mut changed = false;
 
-    let width = fixed_w.min(ui.available_width().max(44.0)).round();
+    let current_label = options[*selected_idx];
+    let label_galley = ui.painter().layout_no_wrap(
+        current_label.to_owned(),
+        theme.font(FONT_SMALL),
+        theme.value(),
+    );
+    let desired_w = fixed_w.max(label_galley.size().x + 26.0);
+    let width = desired_w.min(ui.available_width().max(44.0)).round();
     let (raw_btn_rect, btn_resp) = ui.allocate_exact_size(Vec2::new(width, 21.0), Sense::click());
     let btn_rect = Rect::from_min_size(
         Pos2::new(raw_btn_rect.left().round(), raw_btn_rect.top().round()),
@@ -9828,16 +13998,10 @@ fn settings_fixed_dropdown(
         },
     );
 
-    let current_label = options[*selected_idx];
-    let label_galley = ui.painter().layout_no_wrap(
-        current_label.to_owned(),
-        theme.font(FONT_SMALL),
-        theme.value(),
-    );
     let clip_painter = ui.painter().with_clip_rect(Rect::from_min_max(
         btn_rect.left_top(),
         Pos2::new(
-            (btn_rect.right() - 16.0).max(btn_rect.left()),
+            (btn_rect.right() - 19.0).max(btn_rect.left()),
             btn_rect.bottom(),
         ),
     ));
@@ -9961,23 +14125,23 @@ fn show_settings_tab(
             // Edge-to-edge 43px #222222 header bar ("Settings")
             panel_top_header(ui, "Settings", theme);
 
-            // 1a. Editor layout control row (51px total; dropdown TOP-aligned at top_margin = 6px)
+            // 1a. Editor layout control row (single-line ellipsized label + guaranteed gap before dropdown)
             settings_flat_row_margin(
                 ui,
                 egui::Margin {
                     left: 6,
                     right: 5,
-                    top: 5,
+                    top: 6,
                     bottom: 6,
                 },
                 |ui| {
                     let total_w = ui.available_width();
-                    let dd_w = 222.0_f32.min((total_w - 66.0).max(90.0));
-                    let label_w = (total_w - dd_w - 6.0).max(52.0);
+                    let dd_w = 222.0_f32.min((total_w * 0.52).max(80.0));
+                    let label_w = (total_w - dd_w - 8.0).max(48.0);
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         ui.allocate_ui_with_layout(
-                            Vec2::new(label_w, 40.0),
+                            Vec2::new(label_w, 26.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.add(
@@ -9986,35 +14150,26 @@ fn show_settings_tab(
                                             .font(theme.font(FONT_BODY))
                                             .color(TEXT_PRIMARY),
                                     )
-                                    .wrap(),
+                                    .truncate(),
                                 );
                             },
                         );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                            Frame::NONE
-                                .inner_margin(egui::Margin {
-                                    left: 0,
-                                    right: 0,
-                                    top: 1,
-                                    bottom: 0,
-                                })
-                                .show(ui, |ui| {
-                                    settings_fixed_dropdown(
-                                        ui,
-                                        Id::unique("settings_editor_layout"),
-                                        &mut state.settings_editor_layout,
-                                        &["Classic"],
-                                        dd_w,
-                                        viewport_rect,
-                                        theme,
-                                    );
-                                });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            settings_fixed_dropdown(
+                                ui,
+                                Id::unique("settings_editor_layout"),
+                                &mut state.settings_editor_layout,
+                                &["Classic"],
+                                dd_w,
+                                viewport_rect,
+                                theme,
+                            );
                         });
                     });
                 },
             );
 
-            // 1b. Editor layout description row (71px total, 32-char wrap width)
+            // 1b. Editor layout description row
             settings_flat_row_margin(
                 ui,
                 egui::Margin {
@@ -10027,7 +14182,7 @@ fn show_settings_tab(
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(
-                                "Changing the editor layout takes effect after ZoidCraft is reloaded.",
+                                "Changing the editor layout takes effect after restarting ZoidCraft.",
                             )
                             .font(theme.font(FONT_BODY))
                             .color(TEXT_PRIMARY),
@@ -10052,14 +14207,25 @@ fn show_settings_tab(
                         state.settings_default_fps_buf = format!("{:.0}", session.document().fps);
                     }
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Default frame rate")
-                                .font(theme.font(FONT_BODY))
-                                .color(TEXT_PRIMARY),
+                        let avail_w = ui.available_width();
+                        let box_w = (avail_w * 0.34).clamp(52.0, 90.0);
+                        let label_w = (avail_w - box_w - 8.0).max(40.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(label_w, 21.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("Default frame rate")
+                                            .font(theme.font(FONT_BODY))
+                                            .color(TEXT_PRIMARY),
+                                    )
+                                    .truncate(),
+                                );
+                            },
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let focused = ui.memory(|m| m.has_focus(fps_id));
-                            let box_w = 90.0;
                             let resp = ui
                                 .allocate_ui_with_layout(
                                     Vec2::new(box_w, 21.0),
@@ -10117,7 +14283,7 @@ fn show_settings_tab(
                 },
             );
 
-            // 3a. Preview cache control row (33px total, left=9 indent, 10px gap before 14px #6d6d6d "MiB")
+            // 3a. Preview cache control row (single-line ellipsized label + guaranteed gap before value & "MiB")
             settings_flat_row_margin(
                 ui,
                 egui::Margin {
@@ -10130,10 +14296,22 @@ fn show_settings_tab(
                     let mut cache = f64::from(state.app_settings.preview_cache_mib);
                     let mut cache_ev = ScrubEvent::default();
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Preview cache")
-                                .font(theme.font(FONT_BODY))
-                                .color(TEXT_PRIMARY),
+                        let avail_w = ui.available_width();
+                        let right_reserve = 92.0_f32.min((avail_w * 0.48).max(70.0));
+                        let label_w = (avail_w - right_reserve - 8.0).max(48.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(label_w, 21.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("Preview cache")
+                                            .font(theme.font(FONT_BODY))
+                                            .color(TEXT_PRIMARY),
+                                    )
+                                    .truncate(),
+                                );
+                            },
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(4.0);
@@ -10142,7 +14320,7 @@ fn show_settings_tab(
                                     .font(theme.font(FONT_SMALL))
                                     .color(TEXT_FAINT),
                             );
-                            ui.add_space(10.0);
+                            ui.add_space(8.0);
                             cache_ev = cm3_scrub_number(
                                 ui,
                                 Id::unique("settings_cache"),
@@ -10177,9 +14355,21 @@ fn show_settings_tab(
                     bottom: 7,
                 },
                 |ui| {
+                    let used_bytes = ui.ctx().data(|d| {
+                        d.get_temp::<u64>(Id::unique("zc_preview_cache_used_bytes"))
+                            .unwrap_or(0)
+                    });
+                    let used_mib = used_bytes as f64 / (1024.0 * 1024.0);
+                    let used_label = if used_bytes == 0 {
+                        "0 MiB".to_owned()
+                    } else if used_mib < 10.0 {
+                        format!("{used_mib:.1} MiB")
+                    } else {
+                        format!("{used_mib:.0} MiB")
+                    };
                     let mut job = egui::text::LayoutJob::default();
                     job.append(
-                        &format!("Using 0 MiB · about {est_frames} frames at {rw}×{rh}"),
+                        &format!("Using {used_label} · about {est_frames} frames at {rw}×{rh}"),
                         0.0,
                         egui::TextFormat {
                             font_id: theme.font(FONT_BODY),
@@ -10332,19 +14522,25 @@ fn show_settings_tab(
 
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 5.0;
+                        let profile_label = if ui.available_width() < 270.0 {
+                            "Profile"
+                        } else {
+                            "Color profile"
+                        };
                         ui.label(
-                            egui::RichText::new("Color profile")
+                            egui::RichText::new(profile_label)
                                 .font(theme.font(FONT_BODY))
                                 .color(TEXT_PRIMARY),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 5.0;
-                            // Fixed 54x21 "Edit..." button
+                            // Compact 46x21 "Edit..." button so the Color profile dropdown keeps full width at 900x600
+                            let edit_w = 46.0;
                             let (raw_edit_rect, edit_resp) =
-                                ui.allocate_exact_size(Vec2::new(54.0, 21.0), Sense::click());
+                                ui.allocate_exact_size(Vec2::new(edit_w, 21.0), Sense::click());
                             let edit_rect = Rect::from_min_size(
                                 Pos2::new(raw_edit_rect.left().round(), raw_edit_rect.top().round()),
-                                Vec2::new(54.0, 21.0),
+                                Vec2::new(edit_w, 21.0),
                             );
                             let edit_resp = edit_resp.on_hover_cursor(CursorIcon::PointingHand);
                             ui.painter().rect_filled(
@@ -10393,12 +14589,14 @@ fn show_settings_tab(
 
                     // Inline custom color / hue / sat editor revealed ONLY when "Edit..." is toggled
                     if state.settings_edit_colors {
+                        let mut color_cols = state.prop_columns;
+                        color_cols.label_ratio = color_cols.label_ratio.max(0.45);
                         let mut main_rgb = theme.custom_main_rgb;
                         let color_changed = cm3_property_row_aligned(
                             ui,
                             "Main color",
                             false,
-                            state.prop_columns,
+                            color_cols,
                             theme,
                             |_| {},
                             |ui| {
@@ -10418,19 +14616,29 @@ fn show_settings_tab(
                         let mut hue = f64::from(theme.custom_hue_deg);
                         let hev = cm3_property_row_aligned(
                             ui,
-                            "Hue shift (deg)",
+                            "Hue shift",
                             false,
-                            state.prop_columns,
+                            color_cols,
                             theme,
                             |_| {},
                             |ui| {
-                                cm3_scrub_number(
-                                    ui,
-                                    Id::unique("settings_hue"),
-                                    &mut hue,
-                                    ScrubConfig::new(-180.0, 180.0, 1.0, 0),
-                                    theme,
-                                )
+                                let mut ev = ScrubEvent::default();
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ev = cm3_scrub_number(
+                                        ui,
+                                        Id::unique("settings_hue"),
+                                        &mut hue,
+                                        ScrubConfig::new(-180.0, 180.0, 1.0, 0),
+                                        theme,
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("deg")
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_FAINT),
+                                    );
+                                });
+                                ev
                             },
                         );
                         if hev.changed || hev.committed {
@@ -10440,19 +14648,29 @@ fn show_settings_tab(
                         let mut sat = f64::from(theme.custom_sat_percent);
                         let sev = cm3_property_row_aligned(
                             ui,
-                            "Saturation (%)",
+                            "Saturation",
                             false,
-                            state.prop_columns,
+                            color_cols,
                             theme,
                             |_| {},
                             |ui| {
-                                cm3_scrub_number(
-                                    ui,
-                                    Id::unique("settings_sat"),
-                                    &mut sat,
-                                    ScrubConfig::new(0.0, 200.0, 1.0, 0),
-                                    theme,
-                                )
+                                let mut ev = ScrubEvent::default();
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ev = cm3_scrub_number(
+                                        ui,
+                                        Id::unique("settings_sat"),
+                                        &mut sat,
+                                        ScrubConfig::new(0.0, 200.0, 1.0, 0),
+                                        theme,
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("%")
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_FAINT),
+                                    );
+                                });
+                                ev
                             },
                         );
                         if sev.changed || sev.committed {
@@ -10508,26 +14726,42 @@ fn show_settings_tab(
                 TEXT_FAINT,
             );
 
-            // 7a. Full 8-line 16px #cccccc debug description row (171px total, 32-char wrap width)
+            // 7a. Native desktop debug description + Copy Debug Info button
             settings_flat_row_margin(
                 ui,
                 egui::Margin {
                     left: 6,
-                    right: 4,
+                    right: 6,
                     top: 6,
-                    bottom: 5,
+                    bottom: 8,
                 },
                 |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(
-                                "Saves your OS, browser, enabled plugins, and recent crash evidence for a bug report. Crash data survives a reload. Project content is not included; review before sharing. Desktop users can use the Debug menu if this panel is unavailable.",
+                                "Copies your OS, ZoidCraft version, enabled plugins, and undo state for a bug report. Project content is not included; review before sharing.",
                             )
                             .font(theme.font(FONT_BODY))
                             .color(TEXT_PRIMARY),
                         )
                         .wrap(),
                     );
+                    if cm3_prop_button(ui, "Copy Debug Info", ButtonVariant::Normal, true, theme)
+                        .clicked()
+                    {
+                        let info = build_debug_info_report(session, &state.app_settings);
+                        write_system_clipboard(ui.ctx(), &info);
+                        state.debug_copied_notice =
+                            Some("Copied debug diagnostics to clipboard.".to_owned());
+                    }
+                    if let Some(msg) = &state.debug_copied_notice {
+                        ui.label(
+                            egui::RichText::new(msg)
+                                .font(theme.font(FONT_SMALL))
+                                .color(theme.value()),
+                        );
+                    }
                 },
             );
 
@@ -10675,20 +14909,43 @@ fn show_about_tab(ui: &mut Ui, session: &Session, theme: &Cm3Theme) {
                         .iter()
                         .filter(|id| id.as_str() != "core")
                         .count();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Active optional plugins: {enabled_opt}  |  Undo depth: {}/{}",
-                            session.history.undo_len(),
-                            session.history.max_entries()
-                        ))
-                        .font(theme.font(FONT_SMALL))
-                        .color(TEXT_MUTED),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("Active optional plugins: {enabled_opt}"))
+                                .font(theme.font(FONT_SMALL))
+                                .color(TEXT_MUTED),
+                        )
+                        .wrap(),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "Undo depth: {}/{}",
+                                session.history.undo_len(),
+                                session.history.max_entries()
+                            ))
+                            .font(theme.font(FONT_SMALL))
+                            .color(TEXT_MUTED),
+                        )
+                        .wrap(),
                     );
                     ui.add_space(8.0);
 
                     section_banner(ui, "Key Shortcuts", theme);
                     ui.add_space(4.0);
-                    for (key, desc) in [
+                    #[cfg(target_os = "macos")]
+                    let shortcuts: [(&str, &str); 8] = [
+                        ("Space", "Play / Pause"),
+                        ("Home / End", "Jump to start / end"),
+                        ("Left / Right", "Step -1 / +1 frame (Shift: +-5)"),
+                        ("J / K / L", "Shuttle reverse / stop / forward"),
+                        ("C / T", "Editing Camera / 2D Transform"),
+                        ("Cmd+Z / Cmd+Y", "Undo / Redo"),
+                        ("Cmd+G", "Open Graph Editor"),
+                        ("Backquote (`)", "Maximize / restore focused panel"),
+                    ];
+                    #[cfg(not(target_os = "macos"))]
+                    let shortcuts: [(&str, &str); 8] = [
                         ("Space", "Play / Pause"),
                         ("Home / End", "Jump to start / end"),
                         ("Left / Right", "Step -1 / +1 frame (Shift: +-5)"),
@@ -10697,22 +14954,286 @@ fn show_about_tab(ui: &mut Ui, session: &Session, theme: &Cm3Theme) {
                         ("Ctrl+Z / Ctrl+Y", "Undo / Redo"),
                         ("Ctrl+G", "Open Graph Editor"),
                         ("Backquote (`)", "Maximize / restore focused panel"),
-                    ] {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{key:<15}"))
-                                    .font(theme.font(FONT_SMALL))
-                                    .color(theme.value()),
+                    ];
+                    let avail_w = ui.available_width();
+                    let key_col_w = 112.0_f32.min((avail_w * 0.42).max(84.0));
+                    let desc_col_w = (avail_w - key_col_w - 8.0).max(80.0);
+                    for (key, desc) in shortcuts {
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(key_col_w, 0.0),
+                                egui::Layout::top_down(egui::Align::LEFT),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(key)
+                                                .font(theme.font(FONT_SMALL))
+                                                .color(theme.value()),
+                                        )
+                                        .wrap(),
+                                    );
+                                },
                             );
-                            ui.label(
-                                egui::RichText::new(desc)
-                                    .font(theme.font(FONT_SMALL))
-                                    .color(TEXT_PRIMARY),
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(desc_col_w, 0.0),
+                                egui::Layout::top_down(egui::Align::LEFT),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(desc)
+                                                .font(theme.font(FONT_SMALL))
+                                                .color(TEXT_PRIMARY),
+                                        )
+                                        .wrap(),
+                                    );
+                                },
                             );
                         });
+                        ui.add_space(2.0);
                     }
                 });
         });
+}
+
+fn build_debug_info_report(session: &Session, app_settings: &AppSettings) -> String {
+    let [rw, rh] = session.document().resolution;
+    let enabled_plugins: Vec<String> = session
+        .plugins
+        .enabled_ids()
+        .iter()
+        .filter(|id| id.as_str() != "core")
+        .cloned()
+        .collect();
+    format!(
+        "ZoidCraft {}\nOS: {} ({})\nSequence: {}x{} @ {:.0} fps\nEnabled plugins ({}): {}\nUndo history: {}/{} (limit {} MiB)\nPreview cache: {} MiB\nFPS overlay: {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        rw,
+        rh,
+        session.document().fps,
+        enabled_plugins.len(),
+        if enabled_plugins.is_empty() {
+            "(none)".to_owned()
+        } else {
+            enabled_plugins.join(", ")
+        },
+        session.history.undo_len(),
+        session.history.max_entries(),
+        app_settings.undo_max_mib,
+        app_settings.preview_cache_mib,
+        if app_settings.show_fps_overlay {
+            "on"
+        } else {
+            "off"
+        },
+    )
+}
+
+/// Computes Shader Editor `(pos, size)` clear of the left Inspector (`x >= 390.0`) and
+/// constrained completely inside `screen`.
+#[must_use]
+fn compute_shader_editor_window_rect(screen: Rect) -> (Pos2, Vec2) {
+    let min_left_clear = screen.left() + 390.0;
+    let max_right_avail = (screen.right() - min_left_clear - 16.0).max(320.0);
+    let w = max_right_avail
+        .min(560.0)
+        .min((screen.width() - 16.0).max(280.0));
+    let h = (screen.height() - 80.0)
+        .clamp(280.0, 460.0)
+        .min((screen.height() - 16.0).max(200.0));
+    let max_x = (screen.right() - w - 8.0).max(screen.left() + 8.0);
+    let max_y = (screen.bottom() - h - 8.0).max(screen.top() + 8.0);
+    let x = min_left_clear.clamp(screen.left() + 8.0, max_x);
+    let y = (screen.top() + 48.0).clamp(screen.top() + 8.0, max_y);
+    (
+        Pos2::new(x.round(), y.round()),
+        Vec2::new(w.round(), h.round()),
+    )
+}
+
+/// Strips raw Rust `Debug` noise (e.g., `Error { kind: ..., meta: Span { start: ..., end: ... } }`)
+/// from GLSL/Naga compiler errors into a concise human-readable message.
+#[must_use]
+fn format_shader_compile_error(raw: &str, source: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "Shader compile error: unknown syntax error.".to_owned();
+    }
+
+    // Parse Naga GLSL `Error { kind: ..., meta: Span { start: N, end: M } }` entries
+    if trimmed.contains("Error {") && trimmed.contains("kind:") {
+        let mut messages: Vec<String> = Vec::new();
+        let mut rest = trimmed;
+        while let Some(idx) = rest.find("Error {") {
+            rest = &rest[idx + "Error {".len()..];
+            let kind_str = if let Some(k_idx) = rest.find("kind:") {
+                let after_k = rest[k_idx + "kind:".len()..].trim_start();
+                let end_k = after_k
+                    .find(", meta:")
+                    .or_else(|| after_k.find('}'))
+                    .unwrap_or(after_k.len());
+                after_k[..end_k].trim()
+            } else {
+                ""
+            };
+            let cleaned_kind = clean_naga_error_kind(kind_str);
+            // Try to extract byte span to compute line/column when it maps into user source
+            let loc_hint = extract_span_start(rest).and_then(|start_byte| {
+                // Only map directly when the span lies within the user source length
+                if start_byte < source.len() {
+                    let prefix = &source[..start_byte];
+                    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+                    let col = prefix
+                        .rsplit('\n')
+                        .next()
+                        .map_or(1, |s| s.chars().count() + 1);
+                    Some(format!("line {line}, col {col}"))
+                } else {
+                    None
+                }
+            });
+            let entry = match loc_hint {
+                Some(loc) if !cleaned_kind.is_empty() => format!("{cleaned_kind} ({loc})"),
+                _ if !cleaned_kind.is_empty() => cleaned_kind,
+                _ => "Invalid GLSL syntax".to_owned(),
+            };
+            if !messages.contains(&entry) {
+                messages.push(entry);
+            }
+            if messages.len() >= 3 {
+                break;
+            }
+        }
+        if !messages.is_empty() {
+            return format!("Shader error: {}", messages.join("; "));
+        }
+    }
+
+    // Strip redundant leading prefixes & multi-line verbose noise
+    let clean = trimmed
+        .strip_prefix("GLSL 450 parse error:")
+        .or_else(|| trimmed.strip_prefix("Naga shader validation error:"))
+        .unwrap_or(trimmed)
+        .trim();
+    let first_line = clean
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(clean);
+    format!("Shader error: {first_line}")
+}
+
+fn extract_span_start(fragment: &str) -> Option<usize> {
+    let span_idx = fragment.find("Span {")?;
+    let after_span = &fragment[span_idx + "Span {".len()..];
+    let start_idx = after_span.find("start:")?;
+    let digits: String = after_span[start_idx + "start:".len()..]
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<usize>().ok()
+}
+
+fn clean_naga_error_kind(kind: &str) -> String {
+    let k = kind.trim();
+    if let Some(inner) = k
+        .strip_prefix("SemanticError(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        return inner.trim_matches('"').to_owned();
+    }
+    if let Some(inner) = k
+        .strip_prefix("UnknownVariable(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let name =
+            extract_quoted_token(inner).unwrap_or_else(|| inner.trim_matches('"').to_owned());
+        return format!("Unknown variable `{name}`");
+    }
+    if let Some(inner) = k
+        .strip_prefix("UnknownField(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let name =
+            extract_quoted_token(inner).unwrap_or_else(|| inner.trim_matches('"').to_owned());
+        return format!("Unknown field `{name}`");
+    }
+    if let Some(inner) = k
+        .strip_prefix("UnknownType(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let name =
+            extract_quoted_token(inner).unwrap_or_else(|| inner.trim_matches('"').to_owned());
+        return format!("Unknown type `{name}`");
+    }
+    if let Some(inner) = k
+        .strip_prefix("UnknownFunction(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let name =
+            extract_quoted_token(inner).unwrap_or_else(|| inner.trim_matches('"').to_owned());
+        return format!("Unknown function `{name}`");
+    }
+    if let Some(inner) = k
+        .strip_prefix("VariableAlreadyDeclared(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let name =
+            extract_quoted_token(inner).unwrap_or_else(|| inner.trim_matches('"').to_owned());
+        return format!("Variable `{name}` already declared");
+    }
+    if let Some(inner) = k
+        .strip_prefix("InvalidToken(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let tok = extract_quoted_token(inner).unwrap_or_else(|| inner.to_owned());
+        return format!("Unexpected token `{tok}`");
+    }
+    if let Some(inner) = k
+        .strip_prefix("ExpectedToken(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let cleaned = inner
+            .replace("Word(", "")
+            .replace(')', "")
+            .replace('"', "`");
+        return format!("Syntax error (expected {cleaned})");
+    }
+    if let Some(inner) = k
+        .strip_prefix("PreprocessorError(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        return format!("Preprocessor error: {}", inner.trim_matches('"'));
+    }
+    if k == "EndOfFile" {
+        return "Unexpected end of shader (check missing `;` or `}`)".to_owned();
+    }
+    // Generic balanced formatting for `VariantName("value")` or `VariantName(...)`
+    if let Some(open_idx) = k.find('(')
+        && let Some(inner) = k[open_idx + 1..].strip_suffix(')')
+    {
+        let variant = humanize_prop_label(&k[..open_idx]);
+        if let Some(tok) = extract_quoted_token(inner) {
+            return format!("{variant} `{tok}`");
+        }
+        let cleaned_inner = inner
+            .replace("Word(", "")
+            .replace(['(', ')'], "")
+            .replace('"', "`");
+        return format!("{variant}: {cleaned_inner}");
+    }
+    k.replace("Word(", "")
+        .replace(['(', ')'], "")
+        .replace('"', "`")
+}
+
+fn extract_quoted_token(s: &str) -> Option<String> {
+    let start = s.find('"')? + 1;
+    let end = s[start..].find('"')? + start;
+    Some(s[start..end].to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -10726,21 +15247,45 @@ fn show_inspector_floating_windows(
     theme: &Cm3Theme,
     state: &mut PanelsState,
 ) {
+    let ctx_screen = ctx.input(|i| i.viewport_rect());
+    let screen = if ctx_screen.width() > 100.0 && ctx_screen.height() > 100.0 {
+        ctx_screen
+    } else {
+        viewport_rect
+    };
+
     // 1. Custom Shader GLSL Editor (Spec 01 §4.6 Shader+ zoomable code editor)
     if let Some(mut editor) = state.shader_editor.take() {
         if !target_exists_in_session(session, &editor.effect_id) {
             state.floating_windows.close("shader_editor");
         } else {
+            let (shader_pos, shader_size) = compute_shader_editor_window_rect(screen);
             let spec = FloatingWindowSpec::new("shader_editor", "Shader Editor")
                 .with_subtitle(editor.effect_name.clone())
-                .with_default_size(Vec2::new(560.0, 440.0));
+                .with_default_size(shader_size);
+            if !state.floating_windows.is_open("shader_editor") {
+                state.floating_windows.open_or_focus(&spec, screen);
+                state.shader_editor_just_opened = true;
+            }
+            if let Some(win) = state.floating_windows.windows.get_mut("shader_editor")
+                && state.shader_editor_just_opened
+            {
+                win.pos = shader_pos;
+                win.size = shader_size;
+                win.restore_pos = shader_pos;
+                win.restore_size = shader_size;
+                win.collapsed = false;
+                win.maximized = false;
+                state.shader_editor_just_opened = false;
+            }
+            clamp_floating_window_in_screen(&mut state.floating_windows, &spec, screen);
             let is_focused = state.floating_windows.focused_id.as_deref() == Some("shader_editor");
             let mut apply_code = false;
             let ev = cm3_floating_window(
                 ctx,
                 &mut state.floating_windows,
                 &spec,
-                viewport_rect,
+                screen,
                 theme,
                 |ui| {
                     ui.horizontal(|ui| {
@@ -10769,14 +15314,13 @@ fn show_inspector_floating_windows(
                                 }
                             });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if cm3_prop_button(
-                                ui,
-                                "Apply (Ctrl+Enter)",
-                                ButtonVariant::Primary,
-                                false,
-                                theme,
-                            )
-                            .clicked()
+                            let apply_lbl = if cfg!(target_os = "macos") {
+                                "Apply (Cmd+Enter)"
+                            } else {
+                                "Apply (Ctrl+Enter)"
+                            };
+                            if cm3_prop_button(ui, apply_lbl, ButtonVariant::Primary, false, theme)
+                                .clicked()
                             {
                                 apply_code = true;
                             }
@@ -10847,11 +15391,22 @@ fn show_inspector_floating_windows(
                         }
                     }
                     Err(err) => {
-                        editor.error_message = Some(format!("Shader compile error: {err}"));
+                        editor.error_message =
+                            Some(format_shader_compile_error(&err.to_string(), &editor.code));
                     }
                 }
             }
-            if !ev.closed {
+            clamp_floating_window_in_screen(&mut state.floating_windows, &spec, screen);
+            let mut close_shader = ev.closed;
+            if ev.closed && ctx.input(|i| i.key_pressed(Key::Escape)) {
+                mark_floating_editor_escape_consumed(ctx);
+            } else if !ev.closed
+                && consume_escape_for_floating_editor(ctx, &state.floating_windows, "shader_editor")
+            {
+                state.floating_windows.close("shader_editor");
+                close_shader = true;
+            }
+            if !close_shader {
                 state.shader_editor = Some(editor);
             }
         }
@@ -10862,29 +15417,53 @@ fn show_inspector_floating_windows(
         if !target_exists_in_session(session, &expr.target_id) {
             state.floating_windows.close("expression_editor");
         } else {
-            let spec = FloatingWindowSpec::new("expression_editor", "Expression Editor")
+            let (default_pos, default_size) = compute_clamped_editor_window_rect(
+                screen,
+                EXPR_EDITOR_DEFAULT_SIZE.x,
+                EXPR_EDITOR_DEFAULT_SIZE.y,
+            );
+            let mut spec = FloatingWindowSpec::new("expression_editor", "Expression Editor")
                 .with_subtitle(expr.property.clone())
-                .with_default_size(Vec2::new(480.0, 310.0));
+                .with_default_size(default_size);
+            spec.min_size = Vec2::new(340.0, 260.0);
+            if !state.floating_windows.is_open("expression_editor") {
+                state.floating_windows.open_or_focus(&spec, screen);
+                state.expr_editor_just_opened = true;
+            }
+            if let Some(win) = state.floating_windows.windows.get_mut("expression_editor")
+                && state.expr_editor_just_opened
+            {
+                win.size = default_size;
+                win.pos = default_pos;
+                win.restore_size = default_size;
+                win.restore_pos = default_pos;
+                win.collapsed = false;
+                win.maximized = false;
+                state.expr_editor_just_opened = false;
+            }
+            clamp_floating_window_in_screen(&mut state.floating_windows, &spec, screen);
             let is_focused =
                 state.floating_windows.focused_id.as_deref() == Some("expression_editor");
             let mut commit_expr = false;
             let mut clear_expr = false;
+            let mut close_expr = false;
             let live_diag = evaluate_expression_live_preview(
                 session,
                 &expr.target_id,
                 &expr.property,
                 &expr.code,
             );
+            let has_syntax_err = live_diag.is_err();
             let ev = cm3_floating_window(
                 ctx,
                 &mut state.floating_windows,
                 &spec,
-                viewport_rect,
+                screen,
                 theme,
                 |ui| {
                     // Quick snippet insertion bar
                     ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.spacing_mut().item_spacing = Vec2::new(4.0, 3.0);
                         ui.label(
                             egui::RichText::new("Snippets:")
                                 .font(theme.font(FONT_COMPACT))
@@ -10895,7 +15474,7 @@ fn show_inspector_floating_windows(
                             ("wiggle", "wiggle(2, 15)"),
                             ("loopOut", "loopOut(\"cycle\")"),
                             ("smoothstep", "smooth(0, 2, time)"),
-                            ("control(...)", "control(\"Slider 1\")"),
+                            ("control(...)", "control(\"ctl_slider_1\")"),
                             ("audioLevel", "audioLevel(0, 1) * 100"),
                         ] {
                             if ui
@@ -10910,11 +15489,8 @@ fn show_inspector_floating_windows(
                                 )
                                 .clicked()
                             {
-                                if expr.code.trim().is_empty() {
-                                    expr.code = snippet.to_owned();
-                                } else {
-                                    expr.code.push_str(snippet);
-                                }
+                                expr.code = insert_expression_snippet(&expr.code, snippet);
+                                expr.error_message = None;
                             }
                         }
                     });
@@ -10924,14 +15500,23 @@ fn show_inspector_floating_windows(
                         warning_banner(ui, err, theme);
                         ui.add_space(4.0);
                     }
-                    ui.add(
-                        TextEdit::multiline(&mut expr.code)
-                            .font(egui::FontId::monospace(12.5))
-                            .text_color(theme.value())
-                            .desired_width(ui.available_width())
-                            .desired_rows(6)
-                            .code_editor(),
-                    );
+
+                    // Reserve fixed footer space so Live/Diagnostic + Apply/Clear/Close NEVER clip.
+                    let footer_h = 62.0;
+                    let editor_h = (ui.available_height() - footer_h - 6.0).max(56.0);
+                    ScrollArea::vertical()
+                        .id_salt("expr_editor_code_scroll")
+                        .max_height(editor_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add_sized(
+                                Vec2::new(ui.available_width(), editor_h.max(56.0)),
+                                TextEdit::multiline(&mut expr.code)
+                                    .font(egui::FontId::monospace(12.5))
+                                    .text_color(theme.value())
+                                    .code_editor(),
+                            );
+                        });
                     if is_focused
                         && ui.input(|i| {
                             (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(Key::Enter)
@@ -10939,32 +15524,48 @@ fn show_inspector_floating_windows(
                     {
                         commit_expr = true;
                     }
+
+                    // Fixed bottom footer (diagnostic + actions)
                     ui.add_space(4.0);
-                    // Live zc_expr syntax & runtime diagnostic readout
+                    ui.separator();
+                    ui.add_space(3.0);
                     match &live_diag {
                         Ok(val_str) => {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Live @ frame {:.1}: {val_str}",
-                                    session.playback.current_frame
-                                ))
-                                .font(theme.font(FONT_SMALL))
-                                .color(Color32::from_rgb(76, 198, 122)),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "Live @ frame {:.1}: {val_str}",
+                                        session.playback.current_frame
+                                    ))
+                                    .font(theme.font(FONT_SMALL))
+                                    .color(Color32::from_rgb(76, 198, 122)),
+                                )
+                                .truncate(),
                             );
                         }
                         Err(diag) => {
-                            ui.label(
-                                egui::RichText::new(format!("Diagnostic: {diag}"))
-                                    .font(theme.font(FONT_SMALL))
-                                    .color(DANGER_TEXT),
-                            );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("Diagnostic: {diag}"))
+                                        .font(theme.font(FONT_SMALL))
+                                        .color(DANGER_TEXT),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(diag);
                         }
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if cm3_prop_button(ui, "Apply", ButtonVariant::Primary, false, theme)
-                            .clicked()
-                        {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let apply_resp = ui
+                            .add_enabled_ui(!has_syntax_err, |ui| {
+                                cm3_prop_button(ui, "Apply", ButtonVariant::Primary, false, theme)
+                            })
+                            .inner;
+                        if has_syntax_err {
+                            apply_resp.on_disabled_hover_text("Fix syntax error before applying");
+                        } else if apply_resp.clicked() {
                             commit_expr = true;
                         }
                         if cm3_prop_button(
@@ -10978,27 +15579,48 @@ fn show_inspector_floating_windows(
                         {
                             clear_expr = true;
                         }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if cm3_prop_button(ui, "Close", ButtonVariant::Normal, false, theme)
+                                .clicked()
+                            {
+                                close_expr = true;
+                            }
+                        });
                     });
                 },
             );
+            clamp_floating_window_in_screen(&mut state.floating_windows, &spec, screen);
+            if ev.closed && ctx.input(|i| i.key_pressed(Key::Escape)) {
+                mark_floating_editor_escape_consumed(ctx);
+            } else if !ev.closed
+                && !close_expr
+                && consume_escape_for_floating_editor(
+                    ctx,
+                    &state.floating_windows,
+                    "expression_editor",
+                )
+            {
+                close_expr = true;
+            }
+
             if commit_expr {
-                match session.execute(Command::SetExpression {
-                    target_id: expr.target_id.clone(),
-                    property: expr.property.clone(),
-                    expression: Some(expr.code.clone()),
-                }) {
-                    Ok(_) => expr.error_message = None,
-                    Err(err) => {
-                        expr.error_message = Some(format!("Failed to apply expression: {err}"));
+                if let Err(diag) = &live_diag {
+                    expr.error_message = Some(format!("Fix syntax error before applying: {diag}"));
+                } else {
+                    match session.execute(Command::SetExpression {
+                        target_id: expr.target_id.clone(),
+                        property: expr.property.clone(),
+                        expression: Some(expr.code.clone()),
+                    }) {
+                        Ok(_) => expr.error_message = None,
+                        Err(err) => {
+                            expr.error_message = Some(format!("Failed to apply expression: {err}"));
+                        }
                     }
                 }
             } else if clear_expr {
-                match session.execute(Command::SetExpression {
-                    target_id: expr.target_id.clone(),
-                    property: expr.property.clone(),
-                    expression: None,
-                }) {
-                    Ok(_) => {
+                match clear_property_expression(session, &expr.target_id, &expr.property) {
+                    Ok(()) => {
                         state.floating_windows.close("expression_editor");
                     }
                     Err(err) => {
@@ -11006,8 +15628,10 @@ fn show_inspector_floating_windows(
                         clear_expr = false;
                     }
                 }
+            } else if close_expr {
+                state.floating_windows.close("expression_editor");
             }
-            if !ev.closed && !clear_expr {
+            if !ev.closed && !clear_expr && !close_expr {
                 state.expr_editor = Some(expr);
             }
         }
@@ -11694,33 +16318,87 @@ fn apply_color_picker_to_session(
 
 fn show_expression_inline_chip(
     ui: &mut Ui,
+    session: &Session,
     prop: Option<&SessionProperty>,
     theme: &Cm3Theme,
 ) -> bool {
     let mut open_expr = false;
     if let Some(expr) = prop.and_then(|p| p.expression.as_deref()) {
+        let mode = if session.plugins.is_enabled("expressions-plus") {
+            zc_expr::ExprMode::ExpressionsPlus
+        } else {
+            zc_expr::ExprMode::VanillaCm3
+        };
+        let compile_err = zc_expr::compile(expr.trim(), mode)
+            .err()
+            .map(|e| e.to_string());
+        let is_err = compile_err.is_some();
+        let icon_color = if is_err { DANGER_TEXT } else { theme.value() };
+        let label_color = if is_err { DANGER_TEXT } else { TEXT_MUTED };
+        let tip = match &compile_err {
+            Some(err) => format!("Expression error: {err} (click to edit)"),
+            None => "Edit expression".to_owned(),
+        };
         ui.horizontal(|ui| {
-            if cm3_icon_button(
-                ui,
-                Cm3Icon::Code,
-                17.0,
-                theme.value(),
-                "edit expression",
-                theme,
-            ) {
+            if cm3_icon_button(ui, Cm3Icon::Code, 17.0, icon_color, &tip, theme) {
                 open_expr = true;
             }
-            ui.add(
+            let lbl_resp = ui.add(
                 egui::Label::new(
                     egui::RichText::new(expr)
                         .font(theme.font(FONT_COMPACT))
-                        .color(TEXT_MUTED),
+                        .color(label_color),
                 )
                 .truncate(),
             );
+            if let Some(err) = &compile_err {
+                lbl_resp.on_hover_text(format!("Expression error: {err}"));
+            }
         });
     }
     open_expr
+}
+
+fn stopwatch_button_with_right_click(
+    ui: &mut Ui,
+    prop_key: &str,
+    animated: bool,
+    has_expr: bool,
+    theme: &Cm3Theme,
+) -> (super::controls::StopwatchEvent, Option<Pos2>) {
+    let sw_min = ui.cursor().min;
+    let ev = cm3_stopwatch_button(ui, prop_key, animated, has_expr, theme);
+    let sw_rect = Rect::from_min_size(sw_min, Vec2::splat(21.0));
+    let ctx_pos = ui.input(|i| {
+        if i.pointer.secondary_clicked() {
+            i.pointer.interact_pos().filter(|p| sw_rect.contains(*p))
+        } else {
+            None
+        }
+    });
+    (ev, ctx_pos)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_open_stopwatch_context_menu(
+    state: &mut PanelsState,
+    target_id: &str,
+    prop_key: &str,
+    existing_expr: Option<&str>,
+    local_frame: f64,
+    current_val: Value,
+    ctx_pos: Option<Pos2>,
+) {
+    if let Some(pos) = ctx_pos {
+        state.stopwatch_ctx_menu = Some(StopwatchContextMenuState {
+            target_id: target_id.to_owned(),
+            property: prop_key.to_owned(),
+            existing_expr: existing_expr.map(str::to_owned),
+            local_frame,
+            current_val,
+            pos,
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11745,7 +16423,7 @@ fn show_session_number_prop(
     let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
     let has_expr = existing_expr.is_some();
     // Clip `time` initializes as a non-animated 2-keyframe linear ramp [0 -> start, length -> end].
-    let mut val = if prop_key == "time"
+    let base_val = if prop_key == "time"
         && let Some(p) = prop.as_ref()
         && !p.animated
         && p.keyframes.len() == 2
@@ -11759,9 +16437,15 @@ fn show_session_number_prop(
     } else {
         eval_prop_f64(prop.as_ref(), local_frame, default_val)
     };
+    let mut val = if let Some(expr_code) = existing_expr.as_deref() {
+        eval_session_expr_f64(session, target_id, prop_key, expr_code, base_val).unwrap_or(base_val)
+    } else {
+        base_val
+    };
     let easing_plus = session.plugins.is_enabled("easing-plus");
 
     let mut sw_ev = Default::default();
+    let mut sw_ctx_pos = None;
     let mut kf_ev = KeyframeBarEvent::default();
     let mut open_expr = false;
 
@@ -11772,7 +16456,8 @@ fn show_session_number_prop(
         state,
         theme,
         |ui| {
-            sw_ev = cm3_stopwatch_button(ui, prop_key, animated, has_expr, theme);
+            (sw_ev, sw_ctx_pos) =
+                stopwatch_button_with_right_click(ui, prop_key, animated, has_expr, theme);
         },
         |ui| {
             if animated && !has_expr {
@@ -11797,11 +16482,21 @@ fn show_session_number_prop(
                 config.with_read_only(config.read_only || has_expr),
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
                 open_expr = true;
             }
             ev
         },
+    );
+
+    maybe_open_stopwatch_context_menu(
+        state,
+        target_id,
+        prop_key,
+        existing_expr.as_deref(),
+        local_frame,
+        json!(base_val),
+        sw_ctx_pos,
     );
 
     handle_stopwatch_event(
@@ -11869,12 +16564,19 @@ fn show_session_vec2_prop(
     let animated = prop.as_ref().is_some_and(|p| p.animated);
     let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
     let has_expr = existing_expr.is_some();
-    let mut val = eval_prop_vec2(prop.as_ref(), local_frame, default_val);
+    let base_val = eval_prop_vec2(prop.as_ref(), local_frame, default_val);
+    let mut val = if let Some(expr_code) = existing_expr.as_deref() {
+        eval_session_expr_vec2(session, target_id, prop_key, expr_code, base_val)
+            .unwrap_or(base_val)
+    } else {
+        base_val
+    };
     let easing_plus = session.plugins.is_enabled("easing-plus");
     let expand_key = (target_id.to_owned(), prop_key.to_owned());
     let mut expanded = state.expanded_vec_props.contains(&expand_key);
 
     let mut sw_ev = Default::default();
+    let mut sw_ctx_pos = None;
     let mut kf_ev = KeyframeBarEvent::default();
     let mut open_expr = false;
 
@@ -11908,7 +16610,8 @@ fn show_session_vec2_prop(
             if box_resp.clicked() {
                 expanded = !expanded;
             }
-            sw_ev = cm3_stopwatch_button(ui, prop_key, animated, has_expr, theme);
+            (sw_ev, sw_ctx_pos) =
+                stopwatch_button_with_right_click(ui, prop_key, animated, has_expr, theme);
         },
         |ui| {
             if animated && !has_expr {
@@ -11934,11 +16637,21 @@ fn show_session_vec2_prop(
                 link_ratio,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
                 open_expr = true;
             }
             ev
         },
+    );
+
+    maybe_open_stopwatch_context_menu(
+        state,
+        target_id,
+        prop_key,
+        existing_expr.as_deref(),
+        local_frame,
+        json!(base_val),
+        sw_ctx_pos,
     );
 
     if expanded {
@@ -12050,12 +16763,19 @@ fn show_session_vec3_prop(
     let animated = prop.as_ref().is_some_and(|p| p.animated);
     let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
     let has_expr = existing_expr.is_some();
-    let mut val = eval_prop_vec3(prop.as_ref(), local_frame, default_val);
+    let base_val = eval_prop_vec3(prop.as_ref(), local_frame, default_val);
+    let mut val = if let Some(expr_code) = existing_expr.as_deref() {
+        eval_session_expr_vec3(session, target_id, prop_key, expr_code, base_val)
+            .unwrap_or(base_val)
+    } else {
+        base_val
+    };
     let easing_plus = session.plugins.is_enabled("easing-plus");
     let expand_key = (target_id.to_owned(), prop_key.to_owned());
     let mut expanded = state.expanded_vec_props.contains(&expand_key);
 
     let mut sw_ev = Default::default();
+    let mut sw_ctx_pos = None;
     let mut kf_ev = KeyframeBarEvent::default();
     let mut open_expr = false;
 
@@ -12089,7 +16809,8 @@ fn show_session_vec3_prop(
             if box_resp.clicked() {
                 expanded = !expanded;
             }
-            sw_ev = cm3_stopwatch_button(ui, prop_key, animated, has_expr, theme);
+            (sw_ev, sw_ctx_pos) =
+                stopwatch_button_with_right_click(ui, prop_key, animated, has_expr, theme);
         },
         |ui| {
             if animated && !has_expr {
@@ -12115,11 +16836,21 @@ fn show_session_vec3_prop(
                 link_ratio,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
                 open_expr = true;
             }
             ev
         },
+    );
+
+    maybe_open_stopwatch_context_menu(
+        state,
+        target_id,
+        prop_key,
+        existing_expr.as_deref(),
+        local_frame,
+        json!(base_val),
+        sw_ctx_pos,
     );
 
     if expanded {
@@ -12265,10 +16996,17 @@ fn show_session_vec4_prop_ex(
     let animated = animatable && prop.as_ref().is_some_and(|p| p.animated);
     let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
     let has_expr = animatable && existing_expr.is_some();
-    let mut val = eval_prop_vec4(prop.as_ref(), local_frame, default_val);
+    let base_val = eval_prop_vec4(prop.as_ref(), local_frame, default_val);
+    let mut val = if has_expr && let Some(expr_code) = existing_expr.as_deref() {
+        eval_session_expr_vec4(session, target_id, prop_key, expr_code, base_val)
+            .unwrap_or(base_val)
+    } else {
+        base_val
+    };
     let easing_plus = session.plugins.is_enabled("easing-plus");
 
     let mut sw_ev = Default::default();
+    let mut sw_ctx_pos = None;
     let mut kf_ev = KeyframeBarEvent::default();
     let mut open_expr = false;
 
@@ -12280,7 +17018,8 @@ fn show_session_vec4_prop_ex(
         theme,
         |ui| {
             if animatable {
-                sw_ev = cm3_stopwatch_button(ui, prop_key, animated, has_expr, theme);
+                (sw_ev, sw_ctx_pos) =
+                    stopwatch_button_with_right_click(ui, prop_key, animated, has_expr, theme);
             }
         },
         |ui| {
@@ -12300,28 +17039,14 @@ fn show_session_vec4_prop_ex(
                 );
             }
             let cfg = config.with_read_only(config.read_only || has_expr);
-            let mut total = ScrubEvent::default();
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                for (axis, slot) in val.iter_mut().enumerate() {
-                    if axis > 0 {
-                        ui.label(
-                            egui::RichText::new(",")
-                                .font(theme.font(FONT_BODY))
-                                .color(TEXT_DISABLED),
-                        );
-                    }
-                    let ev = cm3_scrub_number(
-                        ui,
-                        Id::unique((target_id, prop_key, axis)),
-                        slot,
-                        cfg,
-                        theme,
-                    );
-                    total = total.merge(ev);
-                }
-            });
-            if has_expr && show_expression_inline_chip(ui, prop.as_ref(), theme) {
+            let total = super::controls::cm3_vector4(
+                ui,
+                Id::unique((target_id, prop_key, "vec4")),
+                &mut val,
+                cfg,
+                theme,
+            );
+            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
                 open_expr = true;
             }
             total
@@ -12329,6 +17054,15 @@ fn show_session_vec4_prop_ex(
     );
 
     if animatable {
+        maybe_open_stopwatch_context_menu(
+            state,
+            target_id,
+            prop_key,
+            existing_expr.as_deref(),
+            local_frame,
+            json!(base_val),
+            sw_ctx_pos,
+        );
         handle_stopwatch_event(
             session,
             target_id,
@@ -12393,11 +17127,18 @@ fn show_session_color_prop(
     let animated = prop.as_ref().is_some_and(|p| p.animated);
     let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
     let has_expr = existing_expr.is_some();
-    let rgb_f64 = eval_prop_vec3(prop.as_ref(), local_frame, default_rgb);
+    let base_rgb = eval_prop_vec3(prop.as_ref(), local_frame, default_rgb);
+    let rgb_f64 = if let Some(expr_code) = existing_expr.as_deref() {
+        eval_session_expr_vec3(session, target_id, prop_key, expr_code, base_rgb)
+            .unwrap_or(base_rgb)
+    } else {
+        base_rgb
+    };
     let mut rgba = Rgba::new(rgb_f64[0] as f32, rgb_f64[1] as f32, rgb_f64[2] as f32, 1.0);
     let easing_plus = session.plugins.is_enabled("easing-plus");
 
     let mut sw_ev = Default::default();
+    let mut sw_ctx_pos = None;
     let mut kf_ev = KeyframeBarEvent::default();
     let mut open_expr = false;
 
@@ -12408,7 +17149,8 @@ fn show_session_color_prop(
         state,
         theme,
         |ui| {
-            sw_ev = cm3_stopwatch_button(ui, prop_key, animated, has_expr, theme);
+            (sw_ev, sw_ctx_pos) =
+                stopwatch_button_with_right_click(ui, prop_key, animated, has_expr, theme);
         },
         |ui| {
             if animated && !has_expr {
@@ -12435,11 +17177,21 @@ fn show_session_color_prop(
                 viewport_rect,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
                 open_expr = true;
             }
             ev
         },
+    );
+
+    maybe_open_stopwatch_context_menu(
+        state,
+        target_id,
+        prop_key,
+        existing_expr.as_deref(),
+        local_frame,
+        json!(base_rgb),
+        sw_ctx_pos,
     );
 
     let out_val = json!([
@@ -12516,7 +17268,13 @@ fn show_session_color_rgba_prop(
     let animated = prop.as_ref().is_some_and(|p| p.animated);
     let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
     let has_expr = existing_expr.is_some();
-    let rgba_f64 = eval_prop_vec4(prop.as_ref(), local_frame, default_rgba);
+    let base_rgba = eval_prop_vec4(prop.as_ref(), local_frame, default_rgba);
+    let rgba_f64 = if let Some(expr_code) = existing_expr.as_deref() {
+        eval_session_expr_vec4(session, target_id, prop_key, expr_code, base_rgba)
+            .unwrap_or(base_rgba)
+    } else {
+        base_rgba
+    };
     let mut rgba = Rgba::new(
         rgba_f64[0] as f32,
         rgba_f64[1] as f32,
@@ -12526,6 +17284,7 @@ fn show_session_color_rgba_prop(
     let easing_plus = session.plugins.is_enabled("easing-plus");
 
     let mut sw_ev = Default::default();
+    let mut sw_ctx_pos = None;
     let mut kf_ev = KeyframeBarEvent::default();
     let mut open_expr = false;
 
@@ -12536,7 +17295,8 @@ fn show_session_color_rgba_prop(
         state,
         theme,
         |ui| {
-            sw_ev = cm3_stopwatch_button(ui, prop_key, animated, has_expr, theme);
+            (sw_ev, sw_ctx_pos) =
+                stopwatch_button_with_right_click(ui, prop_key, animated, has_expr, theme);
         },
         |ui| {
             if animated && !has_expr {
@@ -12563,11 +17323,21 @@ fn show_session_color_rgba_prop(
                 viewport_rect,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
                 open_expr = true;
             }
             ev
         },
+    );
+
+    maybe_open_stopwatch_context_menu(
+        state,
+        target_id,
+        prop_key,
+        existing_expr.as_deref(),
+        local_frame,
+        json!(base_rgba),
+        sw_ctx_pos,
     );
 
     let out_val = json!([
@@ -12680,8 +17450,19 @@ fn show_session_option_prop_ex(
     let animated = animatable && prop.as_ref().is_some_and(|p| p.animated);
     let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
     let has_expr = animatable && existing_expr.is_some();
-    let mut idx = eval_prop_u32(prop.as_ref(), local_frame, default_idx) as usize;
+    let base_idx = eval_prop_u32(prop.as_ref(), local_frame, default_idx) as usize;
+    let mut idx = if has_expr
+        && let Some(expr_code) = existing_expr.as_deref()
+        && let Some(live_n) =
+            eval_session_expr_f64(session, target_id, prop_key, expr_code, base_idx as f64)
+    {
+        let max_opt = options.len().saturating_sub(1);
+        (live_n.round().max(0.0) as usize).min(max_opt)
+    } else {
+        base_idx
+    };
     let mut sw_ev = Default::default();
+    let mut sw_ctx_pos = None;
     let mut kf_ev = KeyframeBarEvent::default();
     let mut open_expr = false;
 
@@ -12693,7 +17474,8 @@ fn show_session_option_prop_ex(
         theme,
         |ui| {
             if animatable {
-                sw_ev = cm3_stopwatch_button(ui, prop_key, animated, has_expr, theme);
+                (sw_ev, sw_ctx_pos) =
+                    stopwatch_button_with_right_click(ui, prop_key, animated, has_expr, theme);
             }
         },
         |ui| {
@@ -12716,7 +17498,7 @@ fn show_session_option_prop_ex(
                 viewport_rect,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
                 open_expr = true;
             }
             ch
@@ -12724,6 +17506,15 @@ fn show_session_option_prop_ex(
     );
 
     if animatable {
+        maybe_open_stopwatch_context_menu(
+            state,
+            target_id,
+            prop_key,
+            existing_expr.as_deref(),
+            local_frame,
+            json!(base_idx),
+            sw_ctx_pos,
+        );
         handle_stopwatch_event(
             session,
             target_id,
@@ -13101,6 +17892,7 @@ fn show_session_curve_prop(
 #[derive(Debug, Clone, Default)]
 struct TextPropEditState {
     buf: String,
+    initial: String,
     editing: bool,
 }
 
@@ -13116,9 +17908,64 @@ fn show_session_text_prop(
     state: &mut PanelsState,
     theme: &Cm3Theme,
 ) {
+    show_session_text_prop_ex(
+        ui,
+        session,
+        target_id,
+        prop_key,
+        label,
+        default_text,
+        false,
+        local_frame,
+        state,
+        theme,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_session_text_prop_ex(
+    ui: &mut Ui,
+    session: &mut Session,
+    target_id: &str,
+    prop_key: &str,
+    label: &str,
+    default_text: &str,
+    multiline: bool,
+    local_frame: f64,
+    state: &mut PanelsState,
+    theme: &Cm3Theme,
+) {
+    touch_inspector_tx_owner(state, target_id, prop_key);
     let prop = lookup_session_prop(session, target_id, prop_key);
     let animated = prop.as_ref().is_some_and(|p| p.animated);
     let current = eval_prop_str(prop.as_ref(), local_frame, default_text);
+
+    // Guard multi-megabyte fuzzer / pasted strings from stalling egui TextEdit layout every frame.
+    if let Some(summary) = oversized_text_summary(&current) {
+        panel_property_row(
+            ui,
+            label,
+            true,
+            state,
+            theme,
+            |_| {},
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&summary)
+                            .font(theme.font(FONT_SMALL))
+                            .color(TEXT_MUTED),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(
+                    "Text exceeds 8,192 characters; inline editing disabled to preserve responsiveness.",
+                );
+            },
+        );
+        return;
+    }
+
     let state_id = Id::unique((target_id, prop_key, "text_edit_state"));
     let edit_id = Id::unique((target_id, prop_key, "text_edit"));
 
@@ -13126,15 +17973,29 @@ fn show_session_text_prop(
         .data_mut(|d| d.get_temp::<TextPropEditState>(state_id))
         .unwrap_or_else(|| TextPropEditState {
             buf: current.clone(),
+            initial: current.clone(),
             editing: false,
         });
     // Only sync from session when NOT actively editing so focus-loss frame retains typed buffer.
     if !edit_st.editing {
         edit_st.buf = current.clone();
+        edit_st.initial = current.clone();
     }
 
-    let (esc_pressed, enter_pressed) =
-        ui.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::Enter)));
+    let (esc_pressed, enter_pressed, cmd_or_ctrl) = ui.input(|i| {
+        (
+            i.key_pressed(Key::Escape),
+            i.key_pressed(Key::Enter),
+            i.modifiers.ctrl || i.modifiers.command,
+        )
+    });
+    let commit_on_enter = if multiline {
+        cmd_or_ctrl && enter_pressed
+    } else {
+        enter_pressed
+    };
+    let mut gained_focus = false;
+    let mut text_changed = false;
     let mut commit = false;
     let mut cancel = false;
 
@@ -13147,6 +18008,7 @@ fn show_session_text_prop(
         |_| {},
         |ui| {
             let focused = ui.memory(|m| m.has_focus(edit_id));
+            let field_w = ui.available_width().min(200.0);
             let resp = Frame::NONE
                 .fill(BG_INPUT)
                 .stroke(Stroke::new(
@@ -13159,25 +18021,53 @@ fn show_session_text_prop(
                 ))
                 .inner_margin(egui::Margin::symmetric(4, 2))
                 .show(ui, |ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut edit_st.buf)
-                            .id(edit_id)
-                            .frame(Frame::NONE)
-                            .font(theme.font(FONT_BODY))
-                            .text_color(theme.value())
-                            .desired_width(ui.available_width().min(200.0)),
-                    )
+                    if multiline {
+                        ScrollArea::vertical()
+                            .id_salt((edit_id, "multiline_scroll"))
+                            .max_height(64.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    TextEdit::multiline(&mut edit_st.buf)
+                                        .id(edit_id)
+                                        .frame(Frame::NONE)
+                                        .font(theme.font(FONT_BODY))
+                                        .text_color(theme.value())
+                                        .desired_rows(2)
+                                        .desired_width(field_w),
+                                )
+                            })
+                            .inner
+                    } else {
+                        ui.add(
+                            TextEdit::singleline(&mut edit_st.buf)
+                                .id(edit_id)
+                                .frame(Frame::NONE)
+                                .font(theme.font(FONT_BODY))
+                                .text_color(theme.value())
+                                .desired_width(field_w),
+                        )
+                    }
                 })
                 .inner;
 
             if resp.gained_focus() {
+                gained_focus = true;
                 edit_st.editing = true;
+                edit_st.initial = current.clone();
+            }
+            if resp.changed() {
+                text_changed = true;
+                if !edit_st.editing {
+                    edit_st.editing = true;
+                    edit_st.initial = current.clone();
+                }
             }
             if edit_st.editing {
                 if esc_pressed {
                     cancel = true;
                     ui.memory_mut(|m| m.surrender_focus(edit_id));
-                } else if resp.lost_focus() || (resp.has_focus() && enter_pressed) {
+                } else if resp.lost_focus() || (resp.has_focus() && commit_on_enter) {
                     commit = true;
                     ui.memory_mut(|m| m.surrender_focus(edit_id));
                 }
@@ -13185,11 +18075,36 @@ fn show_session_text_prop(
         },
     );
 
+    if gained_focus && !cancel {
+        close_existing_tx_before_start(session, state);
+        let _ = begin_inspector_tx(
+            session,
+            state,
+            target_id,
+            prop_key,
+            format!("edit {prop_key}"),
+        );
+    }
+
     if cancel {
-        edit_st.buf = current;
+        if owns_inspector_tx(state, target_id, prop_key) && session.history.is_in_transaction() {
+            let _ = session.cancel_transaction();
+            clear_inspector_tx_state(state);
+        }
+        edit_st.buf = edit_st.initial.clone();
         edit_st.editing = false;
-    } else if commit {
-        if edit_st.buf != current {
+    } else {
+        if (text_changed || commit) && edit_st.buf != current {
+            if !owns_inspector_tx(state, target_id, prop_key) {
+                close_existing_tx_before_start(session, state);
+                let _ = begin_inspector_tx(
+                    session,
+                    state,
+                    target_id,
+                    prop_key,
+                    format!("edit {prop_key}"),
+                );
+            }
             let cmd = if animated {
                 Command::SetKeyframe {
                     target_id: target_id.to_owned(),
@@ -13205,9 +18120,16 @@ fn show_session_text_prop(
                     value: json!(edit_st.buf),
                 }
             };
-            let _ = session.execute(cmd);
+            if session.execute(cmd).is_ok() && owns_inspector_tx(state, target_id, prop_key) {
+                state.inspector_tx_has_edits = true;
+            }
         }
-        edit_st.editing = false;
+        if commit {
+            if owns_inspector_tx(state, target_id, prop_key) {
+                commit_inspector_tx_if_open(session, state);
+            }
+            edit_st.editing = false;
+        }
     }
 
     ui.data_mut(|d| d.insert_temp(state_id, edit_st));
@@ -13253,6 +18175,71 @@ fn handle_stopwatch_event(
     }
 }
 
+const EXPR_EDITOR_DEFAULT_SIZE: Vec2 = Vec2::new(460.0, 340.0);
+
+fn is_bare_constant_literal(code: &str) -> bool {
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if matches!(trimmed, "true" | "false" | "null") {
+        return true;
+    }
+    if trimmed.parse::<f64>().is_ok() {
+        return true;
+    }
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        return true;
+    }
+    if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(trimmed)
+        && arr.iter().all(Value::is_number)
+    {
+        return true;
+    }
+    false
+}
+
+fn insert_expression_snippet(current_code: &str, snippet: &str) -> String {
+    if is_bare_constant_literal(current_code) {
+        snippet.to_owned()
+    } else {
+        format!("{}\n{snippet}", current_code.trim_end())
+    }
+}
+
+fn clear_property_expression(
+    session: &mut Session,
+    target_id: &str,
+    property: &str,
+) -> Result<(), zc_session::SessionError> {
+    let should_reset_animated =
+        lookup_session_prop(session, target_id, property).is_some_and(|p| {
+            p.animated
+                && (p.keyframes.is_empty()
+                    || (p.keyframes.len() == 1 && p.keyframes[0].frame.abs() < 1e-6))
+        });
+    if should_reset_animated {
+        session
+            .execute(Command::TogglePropertyAnimated {
+                target_id: target_id.to_owned(),
+                property: property.to_owned(),
+                frame: 0.0,
+            })
+            .map(|_| ())
+    } else {
+        session
+            .execute(Command::SetExpression {
+                target_id: target_id.to_owned(),
+                property: property.to_owned(),
+                expression: None,
+            })
+            .map(|_| ())
+    }
+}
+
 fn open_expression_window(
     target_id: &str,
     prop_key: &str,
@@ -13266,10 +18253,167 @@ fn open_expression_window(
         code,
         error_message: None,
     });
-    let spec = FloatingWindowSpec::new("expression_editor", "Expression Editor")
+    state.expr_editor_just_opened = true;
+    let (_, clamped_size) = compute_clamped_editor_window_rect(
+        viewport_rect,
+        EXPR_EDITOR_DEFAULT_SIZE.x,
+        EXPR_EDITOR_DEFAULT_SIZE.y,
+    );
+    let mut spec = FloatingWindowSpec::new("expression_editor", "Expression Editor")
         .with_subtitle(prop_key.to_owned())
-        .with_default_size(Vec2::new(420.0, 240.0));
+        .with_default_size(clamped_size);
+    spec.min_size = Vec2::new(340.0, 260.0);
     state.floating_windows.open_or_focus(&spec, viewport_rect);
+    clamp_floating_window_in_screen(&mut state.floating_windows, &spec, viewport_rect);
+}
+
+fn show_stopwatch_context_menu(
+    ctx: &egui::Context,
+    viewport_rect: Rect,
+    session: &mut Session,
+    theme: &Cm3Theme,
+    state: &mut PanelsState,
+) {
+    let Some(menu) = state.stopwatch_ctx_menu.clone() else {
+        return;
+    };
+    let screen = {
+        let s = ctx.input(|i| i.viewport_rect());
+        if s.width() > 100.0 && s.height() > 100.0 {
+            s
+        } else {
+            viewport_rect
+        }
+    };
+    let menu_w = 156.0_f32;
+    let menu_h = if menu.existing_expr.is_some() {
+        84.0
+    } else {
+        58.0
+    };
+    let pos = Pos2::new(
+        menu.pos.x.clamp(
+            screen.left() + 4.0,
+            (screen.right() - menu_w - 4.0).max(screen.left() + 4.0),
+        ),
+        menu.pos.y.clamp(
+            screen.top() + 4.0,
+            (screen.bottom() - menu_h - 4.0).max(screen.top() + 4.0),
+        ),
+    );
+    let mut close_menu = ctx.input(|i| i.key_pressed(Key::Escape));
+    let mut action_edit_expr = false;
+    let mut action_clear_expr = false;
+    let mut action_toggle_kf = false;
+
+    let area_resp = Area::new(Id::unique("stopwatch_ctx_menu"))
+        .order(Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            Frame::NONE
+                .fill(BG_PANEL)
+                .stroke(Stroke::new(1.0, BORDER_CONTROL))
+                .inner_margin(egui::Margin::same(4))
+                .show(ui, |ui| {
+                    ui.set_min_width(menu_w - 8.0);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    if ui
+                        .add_sized(
+                            Vec2::new(menu_w - 8.0, 22.0),
+                            egui::Button::new(
+                                egui::RichText::new("Edit Expression...")
+                                    .font(theme.font(FONT_SMALL))
+                                    .color(TEXT_PRIMARY),
+                            )
+                            .fill(BG_BUTTON)
+                            .stroke(Stroke::NONE),
+                        )
+                        .clicked()
+                    {
+                        action_edit_expr = true;
+                        close_menu = true;
+                    }
+                    if menu.existing_expr.is_some()
+                        && ui
+                            .add_sized(
+                                Vec2::new(menu_w - 8.0, 22.0),
+                                egui::Button::new(
+                                    egui::RichText::new("Clear Expression")
+                                        .font(theme.font(FONT_SMALL))
+                                        .color(DANGER_TEXT),
+                                )
+                                .fill(BG_BUTTON)
+                                .stroke(Stroke::NONE),
+                            )
+                            .clicked()
+                    {
+                        action_clear_expr = true;
+                        close_menu = true;
+                    }
+                    if ui
+                        .add_sized(
+                            Vec2::new(menu_w - 8.0, 22.0),
+                            egui::Button::new(
+                                egui::RichText::new("Toggle Keyframe")
+                                    .font(theme.font(FONT_SMALL))
+                                    .color(TEXT_PRIMARY),
+                            )
+                            .fill(BG_BUTTON)
+                            .stroke(Stroke::NONE),
+                        )
+                        .clicked()
+                    {
+                        action_toggle_kf = true;
+                        close_menu = true;
+                    }
+                });
+        });
+
+    if !close_menu
+        && ctx.input(|i| {
+            i.pointer.primary_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|p| !area_resp.response.rect.contains(p))
+        })
+    {
+        close_menu = true;
+    }
+
+    if action_edit_expr {
+        let init_code = menu
+            .existing_expr
+            .clone()
+            .unwrap_or_else(|| menu.current_val.to_string());
+        if menu.existing_expr.is_none() {
+            let _ = session.execute(Command::SetExpression {
+                target_id: menu.target_id.clone(),
+                property: menu.property.clone(),
+                expression: Some(init_code.clone()),
+            });
+        }
+        open_expression_window(&menu.target_id, &menu.property, init_code, state, screen);
+    } else if action_clear_expr {
+        let _ = clear_property_expression(session, &menu.target_id, &menu.property);
+        if state
+            .expr_editor
+            .as_ref()
+            .is_some_and(|e| e.target_id == menu.target_id && e.property == menu.property)
+        {
+            state.expr_editor = None;
+            state.floating_windows.close("expression_editor");
+        }
+    } else if action_toggle_kf {
+        let _ = session.execute(Command::TogglePropertyAnimated {
+            target_id: menu.target_id.clone(),
+            property: menu.property.clone(),
+            frame: normalized_kf_frame(session, menu.local_frame),
+        });
+    }
+
+    if close_menu {
+        state.stopwatch_ctx_menu = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -13444,18 +18588,20 @@ fn humanize_prop_label(key: &str) -> String {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct PropertyHeaderActions {
+    copy_json: bool,
+    paste_json: bool,
     reset: bool,
     duplicate: bool,
     remove: bool,
 }
 
-/// Collapsible inspector root header with Column-2-aligned Reset (`↻`), Duplicate (`❐`),
-/// and Remove (`✕`) buttons matching Zoidium `11_objects_camera.png` (21px pitch).
+/// Collapsible inspector root header with right-aligned Copy/Paste JSON + Reset (`↺`),
+/// Duplicate (`⧉`), and Remove (`×`) buttons and clean title ellipsizing.
 fn property_header_with_actions(
     ui: &mut Ui,
     id: Id,
     title: &str,
-    col_ratio: f32,
+    _col_ratio: f32,
     theme: &Cm3Theme,
 ) -> (bool, PropertyHeaderActions) {
     let mut open = ui.data_mut(|d| d.get_temp::<bool>(id)).unwrap_or(true);
@@ -13473,13 +18619,56 @@ fn property_header_with_actions(
         Stroke::new(1.0, BORDER_ROW_SOFT),
     );
 
-    let col2_x = (hdr_rect.left()
-        + (hdr_rect.width() * col_ratio).clamp(72.0, (hdr_rect.width() - 68.0).max(72.0)))
-    .round();
+    // Reserve right-aligned action cluster first so title text never collides with buttons
     let icon_y = (hdr_rect.center().y - 7.5).round();
-    let reset_icon_rect = Rect::from_min_size(Pos2::new(col2_x, icon_y), Vec2::splat(15.0));
-    let dup_icon_rect = Rect::from_min_size(Pos2::new(col2_x + 21.0, icon_y), Vec2::splat(15.0));
-    let rm_icon_rect = Rect::from_min_size(Pos2::new(col2_x + 42.0, icon_y), Vec2::splat(15.0));
+    let rm_x = (hdr_rect.right() - 21.0).round();
+    let dup_x = rm_x - 21.0;
+    let reset_x = dup_x - 21.0;
+    let reset_icon_rect = Rect::from_min_size(Pos2::new(reset_x, icon_y), Vec2::splat(15.0));
+    let dup_icon_rect = Rect::from_min_size(Pos2::new(dup_x, icon_y), Vec2::splat(15.0));
+    let rm_icon_rect = Rect::from_min_size(Pos2::new(rm_x, icon_y), Vec2::splat(15.0));
+
+    // Auto-sized crisp "Copy" / "Paste" buttons (+10px horizontal padding, 4px gap) matching Material header
+    let copy_lbl = "Copy";
+    let paste_lbl = "Paste";
+    let copy_w = (ui
+        .painter()
+        .layout_no_wrap(copy_lbl.to_owned(), theme.font(FONT_COMPACT), TEXT_PRIMARY)
+        .size()
+        .x
+        .ceil()
+        + 10.0)
+        .max(36.0);
+    let paste_w = (ui
+        .painter()
+        .layout_no_wrap(paste_lbl.to_owned(), theme.font(FONT_COMPACT), TEXT_PRIMARY)
+        .size()
+        .x
+        .ceil()
+        + 10.0)
+        .max(40.0);
+    let btn_y = (hdr_rect.center().y - 9.0).round();
+    let paste_x = (reset_x - 5.0 - paste_w).round();
+    let copy_x = (paste_x - 4.0 - copy_w).round();
+    let copy_rect = Rect::from_min_size(Pos2::new(copy_x, btn_y), Vec2::new(copy_w, 18.0));
+    let paste_rect = Rect::from_min_size(Pos2::new(paste_x, btn_y), Vec2::new(paste_w, 18.0));
+
+    let (copy_clicked, copy_hovered) = header_compact_action_button(
+        ui,
+        id.with("copy_json"),
+        copy_rect,
+        copy_lbl,
+        "Copy JSON (Cmd+C)",
+        theme,
+    );
+    let (paste_clicked, paste_hovered) = header_compact_action_button(
+        ui,
+        id.with("paste_json"),
+        paste_rect,
+        paste_lbl,
+        "Paste JSON (Cmd+V)",
+        theme,
+    );
 
     let reset_resp = ui
         .interact(
@@ -13498,7 +18687,11 @@ fn property_header_with_actions(
         .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_text("Remove");
 
-    let any_btn_hovered = reset_resp.hovered() || dup_resp.hovered() || rm_resp.hovered();
+    let any_btn_hovered = copy_hovered
+        || paste_hovered
+        || reset_resp.hovered()
+        || dup_resp.hovered()
+        || rm_resp.hovered();
     paint_cm3_tree_box(
         ui.painter(),
         Pos2::new(hdr_rect.left() + 10.5, hdr_rect.center().y + 1.0),
@@ -13510,18 +18703,37 @@ fn property_header_with_actions(
         },
     );
 
+    let title_left = hdr_rect.left() + 21.0;
+    let title_right = (copy_x - 6.0).max(title_left + 16.0);
+    let max_title_w = (title_right - title_left).max(16.0);
+    let mut title_galley =
+        ui.painter()
+            .layout_no_wrap(title.to_owned(), theme.font(FONT_BODY), TEXT_PRIMARY);
+    if title_galley.size().x > max_title_w {
+        let chars: Vec<char> = title.chars().collect();
+        let mut len = chars.len();
+        while len > 0 {
+            len -= 1;
+            let candidate = format!("{}…", chars[..len].iter().collect::<String>().trim_end());
+            let g = ui
+                .painter()
+                .layout_no_wrap(candidate, theme.font(FONT_BODY), TEXT_PRIMARY);
+            if g.size().x <= max_title_w || len == 0 {
+                title_galley = g;
+                break;
+            }
+        }
+    }
     let title_clip = Rect::from_min_max(
-        Pos2::new(hdr_rect.left() + 20.0, hdr_rect.top()),
-        Pos2::new(
-            (col2_x - 4.0).max(hdr_rect.left() + 20.0),
-            hdr_rect.bottom(),
-        ),
+        Pos2::new(title_left - 1.0, hdr_rect.top()),
+        Pos2::new(title_right, hdr_rect.bottom()),
     );
-    ui.painter().with_clip_rect(title_clip).text(
-        Pos2::new(hdr_rect.left() + 21.0, hdr_rect.center().y),
-        Align2::LEFT_CENTER,
-        title,
-        theme.font(FONT_BODY),
+    ui.painter().with_clip_rect(title_clip).galley(
+        Pos2::new(
+            title_left,
+            hdr_rect.center().y - title_galley.size().y * 0.5,
+        ),
+        title_galley,
         TEXT_PRIMARY,
     );
 
@@ -13556,10 +18768,18 @@ fn property_header_with_actions(
         },
     );
 
+    act.copy_json = copy_clicked;
+    act.paste_json = paste_clicked;
     act.reset = reset_resp.clicked();
     act.duplicate = dup_resp.clicked();
     act.remove = rm_resp.clicked();
-    if hdr_resp.clicked() && !act.reset && !act.duplicate && !act.remove {
+    if hdr_resp.clicked()
+        && !act.copy_json
+        && !act.paste_json
+        && !act.reset
+        && !act.duplicate
+        && !act.remove
+    {
         open = !open;
     }
     ui.data_mut(|d| d.insert_temp(id, open));
@@ -13831,51 +19051,77 @@ fn show_compositions_manager_section(
                                     state.renaming_comp_id = None;
                                 }
                             } else {
-                                let lbl = format!("{cname} ({}×{} @ {cfps})", cres[0], cres[1]);
-                                if ui
-                                    .selectable_label(
-                                        is_active,
-                                        egui::RichText::new(lbl)
-                                            .font(theme.font(FONT_SMALL))
-                                            .color(if is_active {
-                                                TEXT_BRIGHT
-                                            } else {
-                                                TEXT_PRIMARY
-                                            }),
-                                    )
-                                    .clicked()
-                                {
-                                    let _ = session.execute(Command::SetActiveComposition {
-                                        comp_id: Some(*cid),
-                                    });
-                                }
+                                let lbl = format!("{cname} ({}×{} @ {cfps}fps)", cres[0], cres[1]);
+                                let actions_w = 58.0_f32;
+                                let label_w = (ui.available_width() - actions_w - 6.0).max(48.0);
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(label_w, 18.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        let resp = ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(&lbl)
+                                                        .font(theme.font(FONT_SMALL))
+                                                        .color(if is_active {
+                                                            TEXT_BRIGHT
+                                                        } else {
+                                                            TEXT_PRIMARY
+                                                        }),
+                                                )
+                                                .fill(if is_active {
+                                                    theme.accent()
+                                                } else {
+                                                    Color32::TRANSPARENT
+                                                })
+                                                .stroke(Stroke::NONE)
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(&lbl);
+                                        if resp.clicked() {
+                                            let _ =
+                                                session.execute(Command::SetActiveComposition {
+                                                    comp_id: Some(*cid),
+                                                });
+                                        }
+                                    },
+                                );
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui
-                                            .small_button("×")
-                                            .on_hover_text("Delete comp")
-                                            .clicked()
-                                        {
+                                        if cm3_icon_button(
+                                            ui,
+                                            Cm3Icon::Remove,
+                                            13.0,
+                                            TEXT_MUTED,
+                                            "Delete comp",
+                                            theme,
+                                        ) {
                                             let _ = session.execute(Command::DeleteComposition {
                                                 comp_id: *cid,
                                             });
                                         }
-                                        if ui
-                                            .small_button("D")
-                                            .on_hover_text("Duplicate comp")
-                                            .clicked()
-                                        {
+                                        if cm3_icon_button(
+                                            ui,
+                                            Cm3Icon::Duplicate,
+                                            13.0,
+                                            TEXT_MUTED,
+                                            "Duplicate comp",
+                                            theme,
+                                        ) {
                                             let _ =
                                                 session.execute(Command::DuplicateComposition {
                                                     comp_id: *cid,
                                                 });
                                         }
-                                        if ui
-                                            .small_button("✎")
-                                            .on_hover_text("Rename comp")
-                                            .clicked()
-                                        {
+                                        if cm3_icon_button(
+                                            ui,
+                                            Cm3Icon::Edit2,
+                                            13.0,
+                                            TEXT_MUTED,
+                                            "Rename comp",
+                                            theme,
+                                        ) {
                                             state.renaming_comp_id = Some(*cid);
                                             state.renaming_comp_buf = cname.clone();
                                         }
@@ -13906,6 +19152,36 @@ fn show_compositions_manager_section(
 // 2. Expressions+ Sequence Controls Builder (Sequence Tab)
 // ---------------------------------------------------------------------------
 
+/// Sanitizes a sequence control name into a clean JS-safe identifier (no spaces or punctuation),
+/// e.g. `"Slider 1"` -> `"slider_1"` or `"ctl_slider_1"` when empty/invalid.
+fn sanitize_control_identifier(raw: &str, fallback: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_underscore = false;
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_underscore = false;
+        } else if (ch == '_' || ch == '-' || ch.is_whitespace())
+            && !prev_underscore
+            && !out.is_empty()
+        {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        return fallback.to_owned();
+    }
+    if out.as_bytes()[0].is_ascii_digit() {
+        format!("ctl_{out}")
+    } else {
+        out
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn show_sequence_controls_section(
     ui: &mut Ui,
@@ -13917,6 +19193,7 @@ fn show_sequence_controls_section(
     actions: &mut Vec<PanelAction>,
 ) {
     const KIND_LABELS: &[&str] = &["Slider", "Angle", "Checkbox", "Color", "Point2D", "Point3D"];
+    const KIND_SLUGS: &[&str] = &["slider", "angle", "check", "color", "point2d", "point3d"];
     const KINDS: [SequenceControlKind; 6] = [
         SequenceControlKind::Slider,
         SequenceControlKind::Angle,
@@ -13926,116 +19203,200 @@ fn show_sequence_controls_section(
         SequenceControlKind::Point3D,
     ];
 
-    let (add_quick, _) = cm3_collapsible_section_with_action(
+    cm3_collapsible_section_with_action(
         ui,
         Id::unique("seq_expr_controls"),
         "Controls",
         true,
         true,
         state.prop_columns.label_ratio,
-        Some((Cm3Icon::Add, "Add sequence control")),
+        None,
         theme,
         |ui| {
-            // Builder row for all 6 SequenceControlKind types + min/max/step
+            // Responsive add-control builder for all 6 SequenceControlKind types + min/max/step.
+            // Stacks cleanly when panel width < 240px (e.g. 800x540) so `+` and `Step` never clip.
             Frame::NONE
                 .inner_margin(egui::Margin::symmetric(6, 4))
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
+                    let form_w = ui.available_width();
+                    let narrow_form = form_w < 240.0;
+                    let mut add_clicked = false;
+                    if narrow_form {
                         ui.add(
                             TextEdit::singleline(&mut state.new_seq_control_name)
-                                .hint_text("Control name")
+                                .hint_text("ctl_slider_1")
                                 .font(theme.font(FONT_SMALL))
-                                .desired_width(92.0),
+                                .desired_width(form_w.max(80.0)),
                         );
-                        cm3_dropdown(
-                            ui,
-                            Id::unique("seq_new_ctl_kind"),
-                            &mut state.new_seq_control_kind,
-                            KIND_LABELS,
-                            false,
-                            viewport_rect,
-                            theme,
-                        );
-                        if cm3_icon_button(
-                            ui,
-                            Cm3Icon::Add,
-                            16.0,
-                            TEXT_PRIMARY,
-                            "Add typed sequence control",
-                            theme,
-                        ) {
-                            let kind = KINDS[state.new_seq_control_kind.min(KINDS.len() - 1)];
-                            let name = if state.new_seq_control_name.trim().is_empty() {
-                                let n = format!(
-                                    "{} {}",
-                                    KIND_LABELS[state.new_seq_control_kind.min(5)],
-                                    state.seq_control_counter
-                                );
-                                state.seq_control_counter += 1;
-                                n
-                            } else {
-                                state.new_seq_control_name.trim().to_owned()
-                            };
-                            let default_val = match kind {
-                                SequenceControlKind::Slider | SequenceControlKind::Angle => {
-                                    PropertyValue::Number(0.0)
-                                }
-                                SequenceControlKind::Checkbox => PropertyValue::Bool(false),
-                                SequenceControlKind::Color => PropertyValue::Color([1.0, 1.0, 1.0]),
-                                SequenceControlKind::Point2D => PropertyValue::Vec2([0.0, 0.0]),
-                                SequenceControlKind::Point3D => {
-                                    PropertyValue::Vec3([0.0, 0.0, 0.0])
-                                }
-                            };
-                            let min = state.new_seq_control_min.trim().parse::<f64>().ok();
-                            let max = state.new_seq_control_max.trim().parse::<f64>().ok();
-                            let step = state.new_seq_control_step.trim().parse::<f64>().ok();
-                            let _ = session.execute(Command::AddSequenceControl {
-                                name,
-                                kind,
-                                value: default_val,
-                                min,
-                                max,
-                                step,
-                            });
-                        }
-                    });
-                    if state.new_seq_control_kind <= 1 {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.label(
-                                egui::RichText::new("Min")
-                                    .font(theme.font(FONT_COMPACT))
-                                    .color(TEXT_MUTED),
+                            cm3_dropdown(
+                                ui,
+                                Id::unique("seq_new_ctl_kind"),
+                                &mut state.new_seq_control_kind,
+                                KIND_LABELS,
+                                false,
+                                viewport_rect,
+                                theme,
                             );
-                            ui.add(
-                                TextEdit::singleline(&mut state.new_seq_control_min)
-                                    .font(theme.font(FONT_COMPACT))
-                                    .desired_width(40.0),
-                            );
-                            ui.label(
-                                egui::RichText::new("Max")
-                                    .font(theme.font(FONT_COMPACT))
-                                    .color(TEXT_MUTED),
-                            );
-                            ui.add(
-                                TextEdit::singleline(&mut state.new_seq_control_max)
-                                    .font(theme.font(FONT_COMPACT))
-                                    .desired_width(40.0),
-                            );
-                            ui.label(
-                                egui::RichText::new("Step")
-                                    .font(theme.font(FONT_COMPACT))
-                                    .color(TEXT_MUTED),
-                            );
-                            ui.add(
-                                TextEdit::singleline(&mut state.new_seq_control_step)
-                                    .font(theme.font(FONT_COMPACT))
-                                    .desired_width(36.0),
-                            );
+                            if cm3_icon_button(
+                                ui,
+                                Cm3Icon::Add,
+                                16.0,
+                                TEXT_PRIMARY,
+                                "Add sequence control",
+                                theme,
+                            ) {
+                                add_clicked = true;
+                            }
                         });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let name_w = (form_w - 118.0).clamp(72.0, 140.0);
+                            ui.add(
+                                TextEdit::singleline(&mut state.new_seq_control_name)
+                                    .hint_text("ctl_slider_1")
+                                    .font(theme.font(FONT_SMALL))
+                                    .desired_width(name_w),
+                            );
+                            cm3_dropdown(
+                                ui,
+                                Id::unique("seq_new_ctl_kind"),
+                                &mut state.new_seq_control_kind,
+                                KIND_LABELS,
+                                false,
+                                viewport_rect,
+                                theme,
+                            );
+                            if cm3_icon_button(
+                                ui,
+                                Cm3Icon::Add,
+                                16.0,
+                                TEXT_PRIMARY,
+                                "Add sequence control",
+                                theme,
+                            ) {
+                                add_clicked = true;
+                            }
+                        });
+                    }
+                    if add_clicked {
+                        let kind_idx = state.new_seq_control_kind.min(KINDS.len() - 1);
+                        let kind = KINDS[kind_idx];
+                        let fallback_name =
+                            format!("ctl_{}_{}", KIND_SLUGS[kind_idx], state.seq_control_counter);
+                        let name = sanitize_control_identifier(
+                            &state.new_seq_control_name,
+                            &fallback_name,
+                        );
+                        state.seq_control_counter += 1;
+                        state.new_seq_control_name =
+                            format!("ctl_{}_{}", KIND_SLUGS[kind_idx], state.seq_control_counter);
+                        let default_val = match kind {
+                            SequenceControlKind::Slider | SequenceControlKind::Angle => {
+                                PropertyValue::Number(0.0)
+                            }
+                            SequenceControlKind::Checkbox => PropertyValue::Bool(false),
+                            SequenceControlKind::Color => PropertyValue::Color([1.0, 1.0, 1.0]),
+                            SequenceControlKind::Point2D => PropertyValue::Vec2([0.0, 0.0]),
+                            SequenceControlKind::Point3D => PropertyValue::Vec3([0.0, 0.0, 0.0]),
+                        };
+                        let min = state.new_seq_control_min.trim().parse::<f64>().ok();
+                        let max = state.new_seq_control_max.trim().parse::<f64>().ok();
+                        let step = state.new_seq_control_step.trim().parse::<f64>().ok();
+                        let _ = session.execute(Command::AddSequenceControl {
+                            name,
+                            kind,
+                            value: default_val,
+                            min,
+                            max,
+                            step,
+                        });
+                    }
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("Use controls.<name> in expressions")
+                                .font(theme.font(FONT_COMPACT))
+                                .color(TEXT_MUTED),
+                        )
+                        .wrap(),
+                    );
+                    if state.new_seq_control_kind <= 1 {
+                        if narrow_form {
+                            let field_w = ((form_w - 64.0) * 0.5).clamp(32.0, 64.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.label(
+                                    egui::RichText::new("Min")
+                                        .font(theme.font(FONT_COMPACT))
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.add(
+                                    TextEdit::singleline(&mut state.new_seq_control_min)
+                                        .font(theme.font(FONT_COMPACT))
+                                        .desired_width(field_w),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Max")
+                                        .font(theme.font(FONT_COMPACT))
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.add(
+                                    TextEdit::singleline(&mut state.new_seq_control_max)
+                                        .font(theme.font(FONT_COMPACT))
+                                        .desired_width(field_w),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.label(
+                                    egui::RichText::new("Step")
+                                        .font(theme.font(FONT_COMPACT))
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.add(
+                                    TextEdit::singleline(&mut state.new_seq_control_step)
+                                        .font(theme.font(FONT_COMPACT))
+                                        .desired_width(field_w),
+                                );
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.label(
+                                    egui::RichText::new("Min")
+                                        .font(theme.font(FONT_COMPACT))
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.add(
+                                    TextEdit::singleline(&mut state.new_seq_control_min)
+                                        .font(theme.font(FONT_COMPACT))
+                                        .desired_width(40.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Max")
+                                        .font(theme.font(FONT_COMPACT))
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.add(
+                                    TextEdit::singleline(&mut state.new_seq_control_max)
+                                        .font(theme.font(FONT_COMPACT))
+                                        .desired_width(40.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Step")
+                                        .font(theme.font(FONT_COMPACT))
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.add(
+                                    TextEdit::singleline(&mut state.new_seq_control_step)
+                                        .font(theme.font(FONT_COMPACT))
+                                        .desired_width(36.0),
+                                );
+                            });
+                        }
                     }
                 });
 
@@ -14055,17 +19416,24 @@ fn show_sequence_controls_section(
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 3.0;
+                            let btn_count =
+                                1usize + usize::from(idx + 1 < count) + usize::from(idx > 0);
+                            let btns_reserve = btn_count as f32 * 24.0 + 4.0;
+                            let name_w = (ui.available_width() - btns_reserve).max(64.0);
                             if ui
                                 .add(
                                     TextEdit::singleline(&mut name_buf)
                                         .font(theme.font(FONT_SMALL))
-                                        .desired_width(96.0),
+                                        .desired_width(name_w),
                                 )
                                 .lost_focus()
-                                && name_buf.trim() != ctl.name
                                 && !name_buf.trim().is_empty()
                             {
-                                name_changed = true;
+                                let sanitized = sanitize_control_identifier(&name_buf, &ctl.name);
+                                if sanitized != ctl.name {
+                                    name_buf = sanitized;
+                                    name_changed = true;
+                                }
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -14100,31 +19468,35 @@ fn show_sequence_controls_section(
                         });
                         // Typed value editor
                         match ctl.kind {
-                            SequenceControlKind::Slider | SequenceControlKind::Angle => {
+                            SequenceControlKind::Slider => {
                                 let mut v = ctl.track.value.as_f64().unwrap_or(0.0);
-                                let lo =
-                                    min_v.unwrap_or(if ctl.kind == SequenceControlKind::Angle {
-                                        -360.0
-                                    } else {
-                                        -10_000.0
-                                    });
-                                let hi =
-                                    max_v.unwrap_or(if ctl.kind == SequenceControlKind::Angle {
-                                        360.0
-                                    } else {
-                                        10_000.0
-                                    });
-                                let st = step_v.unwrap_or(0.1);
+                                let lo = min_v.unwrap_or(0.0);
+                                let hi = max_v.unwrap_or(100.0).max(lo + 1e-3);
+                                let st = step_v.unwrap_or(0.1).max(0.001);
+                                ui.spacing_mut().slider_width =
+                                    (ui.available_width() - 68.0).max(64.0);
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut v, lo..=hi)
+                                            .step_by(st)
+                                            .clamping(egui::SliderClamping::Never),
+                                    )
+                                    .changed()
+                                {
+                                    updated_val = Some(PropertyValue::Number(v));
+                                }
+                            }
+                            SequenceControlKind::Angle => {
+                                let mut v = ctl.track.value.as_f64().unwrap_or(0.0);
+                                let lo = min_v.unwrap_or(-360.0);
+                                let hi = max_v.unwrap_or(360.0);
+                                let st = step_v.unwrap_or(0.5);
                                 if ui
                                     .add(
                                         egui::DragValue::new(&mut v)
                                             .range(lo..=hi)
                                             .speed(st)
-                                            .suffix(if ctl.kind == SequenceControlKind::Angle {
-                                                "°"
-                                            } else {
-                                                ""
-                                            }),
+                                            .suffix("°"),
                                     )
                                     .changed()
                                 {
@@ -14198,12 +19570,14 @@ fn show_sequence_controls_section(
                 }
             }
 
-            // Legacy ctl_* sequence_properties compatibility
+            // Legacy ctl_* sequence_properties compatibility (skip keys already backed by
+            // `active_sequence().controls` so typed SequenceControls never render twice!)
+            let mirrored_ctl_keys = collect_mirrored_sequence_control_keys(session);
             let ctl_keys: Vec<String> = session
                 .document()
                 .sequence_properties
                 .keys()
-                .filter(|k| k.starts_with("ctl_"))
+                .filter(|k| k.starts_with("ctl_") && !mirrored_ctl_keys.contains(k.as_str()))
                 .cloned()
                 .collect();
             for key in ctl_keys {
@@ -14227,29 +19601,51 @@ fn show_sequence_controls_section(
             }
         },
     );
+}
 
-    if add_quick {
-        let name = format!("Slider {}", state.seq_control_counter);
-        state.seq_control_counter += 1;
-        let _ = session.execute(Command::AddSequenceControl {
-            name,
-            kind: SequenceControlKind::Slider,
-            value: PropertyValue::Number(0.0),
-            min: Some(0.0),
-            max: Some(100.0),
-            step: Some(0.1),
-        });
+/// Returns the set of `sequence_properties` keys already backed by `active_sequence().controls`.
+fn collect_mirrored_sequence_control_keys(session: &Session) -> BTreeSet<String> {
+    let mut base_prefixes: Vec<(String, String)> = Vec::new();
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    for ctl in &session.active_sequence().controls {
+        let base = if ctl.name.starts_with("ctl_") {
+            ctl.name.clone()
+        } else {
+            format!("ctl_{}", ctl.name)
+        };
+        keys.insert(base.clone());
+        if !ctl.id.is_empty() {
+            keys.insert(format!("{base}__{}", ctl.id));
+        }
+        base_prefixes.push((format!("{base}__"), ctl.id.clone()));
     }
+    for prop_key in session.document().sequence_properties.keys() {
+        if base_prefixes
+            .iter()
+            .any(|(prefix, _)| prop_key.starts_with(prefix))
+        {
+            keys.insert(prop_key.clone());
+        }
+    }
+    keys
 }
 
 // ---------------------------------------------------------------------------
 // 3. Shape+ Layer Masks (`zoidiumMasks`) & Precomp+ Target Picker (Edit Tab)
 // ---------------------------------------------------------------------------
 
-fn default_layer_mask(index: usize) -> LayerMask {
+/// Creates a centered 50%×50% default rectangular mask in sequence pixel coordinates
+/// `(0..seq_w, 0..seq_h)` so all 4 vertices are clearly visible inside the viewport.
+fn default_layer_mask(index: usize, seq_w: u32, seq_h: u32) -> LayerMask {
+    let w = f64::from(seq_w.max(64));
+    let h = f64::from(seq_h.max(64));
+    let x0 = (w * 0.25).round();
+    let x1 = (w * 0.75).round();
+    let y0 = (h * 0.25).round();
+    let y1 = (h * 0.75).round();
     let default_rect_path = json!([
-        -200.0, -120.0, 0.0, 0.0, 0.0, 0.0, 200.0, -120.0, 0.0, 0.0, 0.0, 0.0, 200.0, 120.0, 0.0,
-        0.0, 0.0, 0.0, -200.0, 120.0, 0.0, 0.0, 0.0, 0.0
+        x0, y0, 0.0, 0.0, 0.0, 0.0, x1, y0, 0.0, 0.0, 0.0, 0.0, x1, y1, 0.0, 0.0, 0.0, 0.0, x0, y1,
+        0.0, 0.0, 0.0, 0.0
     ]);
     let palette = ["#58a6ff", "#f78166", "#56d364", "#d2a8ff", "#e3b341"];
     LayerMask {
@@ -14283,6 +19679,7 @@ fn show_edit_layer_masks_section(
     viewport_rect: Rect,
     state: &mut PanelsState,
     theme: &Cm3Theme,
+    actions: &mut Vec<PanelAction>,
 ) {
     let clip_uuid = Uuid::parse_str(clip_id).ok();
     let layer_id = find_project_video_clip(session, clip_id).map(|vc| vc.layer.id);
@@ -14300,24 +19697,34 @@ fn show_edit_layer_masks_section(
         TEXT_PRIMARY,
     );
 
-    let (add_mask_rect, add_mask_resp) =
-        ui.allocate_exact_size(Vec2::new(mask_w, 26.0), Sense::click());
-    let add_mask_resp = add_mask_resp.on_hover_cursor(CursorIcon::PointingHand);
-    ui.painter().text(
-        Pos2::new(add_mask_rect.left() + 25.0, add_mask_rect.center().y),
-        Align2::LEFT_CENTER,
-        "+ Add mask",
-        theme.font(FONT_EASING),
-        if add_mask_resp.hovered() {
-            TEXT_BRIGHT
-        } else {
-            theme.value()
-        },
-    );
-    if add_mask_resp.clicked()
-        && let Some(cid) = clip_uuid
-    {
-        let new_mask = default_layer_mask(masks.len() + 1);
+    let (add_clicked, copy_clicked, paste_clicked) = Frame::NONE
+        .inner_margin(egui::Margin {
+            left: 14,
+            right: 10,
+            top: 2,
+            bottom: 6,
+        })
+        .show(ui, |ui| {
+            let mut add = false;
+            let mut copy = false;
+            let mut paste = false;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                add = cm3_prop_button(ui, "+ Add mask", ButtonVariant::Normal, false, theme)
+                    .clicked();
+                copy = cm3_prop_button(ui, "Copy", ButtonVariant::Normal, false, theme)
+                    .on_hover_text("Copy layer masks JSON to clipboard (PZ compatible)")
+                    .clicked();
+                paste = cm3_prop_button(ui, "Paste", ButtonVariant::Normal, false, theme)
+                    .on_hover_text("Paste layer masks JSON from clipboard (PZ compatible)")
+                    .clicked();
+            });
+            (add, copy, paste)
+        })
+        .inner;
+    if add_clicked && let Some(cid) = clip_uuid {
+        let [seq_w, seq_h] = session.document().resolution;
+        let new_mask = default_layer_mask(masks.len() + 1, seq_w, seq_h);
         let new_id = new_mask.id.clone();
         if session
             .execute(Command::AddLayerMask {
@@ -14328,6 +19735,28 @@ fn show_edit_layer_masks_section(
         {
             state.expanded_masks.insert(new_id);
         }
+    }
+    if copy_clicked {
+        let res = session.copy_masks_as_pz_json(clip_id);
+        copy_pz_json_to_clipboard(
+            ui.ctx(),
+            res,
+            "Copied layer masks JSON to clipboard",
+            actions,
+        );
+    }
+    if paste_clicked {
+        paste_pz_json_from_clipboard(
+            session,
+            state,
+            actions,
+            "masks",
+            Some(clip_id.to_owned()),
+            None,
+            None,
+            None,
+            "layer masks JSON",
+        );
     }
 
     // Expandable mask cards
@@ -14342,11 +19771,26 @@ fn show_edit_layer_masks_section(
         Frame::NONE
             .fill(BG_SUNKEN)
             .stroke(Stroke::new(1.0, BORDER_ROW_SOFT))
-            .inner_margin(egui::Margin::symmetric(8, 4))
+            .inner_margin(egui::Margin::symmetric(8, 5))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    if ui.small_button(if expanded { "▾" } else { "▸" }).clicked() {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    if cm3_icon_button(
+                        ui,
+                        if expanded {
+                            Cm3Icon::ChevronDown
+                        } else {
+                            Cm3Icon::ChevronRight
+                        },
+                        14.0,
+                        TEXT_MUTED,
+                        if expanded {
+                            "Collapse mask"
+                        } else {
+                            "Expand mask"
+                        },
+                        theme,
+                    ) {
                         if expanded {
                             state.expanded_masks.remove(&mask.id);
                         } else {
@@ -14360,19 +19804,74 @@ fn show_edit_layer_masks_section(
                     {
                         changed = true;
                     }
-                    let mut name_buf = mask.name.clone();
-                    if ui
-                        .add(
-                            TextEdit::singleline(&mut name_buf)
-                                .font(theme.font(FONT_SMALL))
-                                .desired_width(84.0),
-                        )
-                        .lost_focus()
-                        && !name_buf.trim().is_empty()
-                        && name_buf.trim() != mask.name
-                    {
-                        mask.name = name_buf.trim().to_owned();
-                        changed = true;
+                    let btn_count = 2 + usize::from(idx + 1 < total) + usize::from(idx > 0);
+                    let buttons_w = btn_count as f32 * 24.0 + 4.0;
+                    let name_w = (ui.available_width() - buttons_w).max(32.0);
+                    let mask_rename_id = format!("mask_rename:{}", mask.id);
+                    let is_renaming = state
+                        .rename_state
+                        .as_ref()
+                        .is_some_and(|r| r.target_id == mask_rename_id);
+                    if is_renaming {
+                        if let Some(rename) = state.rename_state.as_mut() {
+                            let mut commit = false;
+                            let mut cancel = false;
+                            ui.input(|i| {
+                                if i.key_pressed(Key::Enter) {
+                                    commit = true;
+                                } else if i.key_pressed(Key::Escape) {
+                                    cancel = true;
+                                }
+                            });
+                            let resp = ui.add(
+                                TextEdit::singleline(&mut rename.buffer)
+                                    .font(theme.font(FONT_SMALL))
+                                    .desired_width(name_w),
+                            );
+                            if rename.just_started {
+                                resp.request_focus();
+                                rename.just_started = false;
+                            }
+                            if cancel {
+                                mark_floating_editor_escape_consumed(ui.ctx());
+                                state.rename_state = None;
+                            } else if commit || resp.lost_focus() {
+                                let trimmed = rename.buffer.trim();
+                                if !trimmed.is_empty() && trimmed != mask.name {
+                                    mask.name = trimmed.to_owned();
+                                    changed = true;
+                                }
+                                state.rename_state = None;
+                            }
+                        }
+                    } else {
+                        let (name_rect, name_resp) =
+                            ui.allocate_exact_size(Vec2::new(name_w, 20.0), Sense::click());
+                        let name_resp = name_resp
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text(format!("{} (double-click to rename)", mask.name));
+                        let name_galley = layout_single_line_ellipsized(
+                            ui.painter(),
+                            &mask.name,
+                            theme.font(FONT_SMALL),
+                            TEXT_PRIMARY,
+                            (name_w - 4.0).max(16.0),
+                        );
+                        ui.painter().with_clip_rect(name_rect).galley(
+                            Pos2::new(
+                                name_rect.left() + 2.0,
+                                name_rect.center().y - name_galley.size().y * 0.5,
+                            ),
+                            name_galley,
+                            TEXT_PRIMARY,
+                        );
+                        if name_resp.double_clicked() {
+                            state.rename_state = Some(InlineRenameState {
+                                target_id: mask_rename_id,
+                                buffer: mask.name.clone(),
+                                just_started: true,
+                            });
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("×").on_hover_text("Delete mask").clicked() {
@@ -14418,6 +19917,7 @@ fn show_edit_layer_masks_section(
                         MaskMode::Intersect => 2,
                     };
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         ui.label(
                             egui::RichText::new("Mode")
                                 .font(theme.font(FONT_COMPACT))
@@ -14439,13 +19939,16 @@ fn show_edit_layer_masks_section(
                             };
                             changed = true;
                         }
+                        ui.add_space(4.0);
                         if ui.checkbox(&mut mask.invert, "Invert").changed() {
                             changed = true;
                         }
+                        ui.add_space(4.0);
                         if ui.checkbox(&mut mask.locked, "Lock").changed() {
                             changed = true;
                         }
                     });
+                    ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("Feather")
@@ -14678,7 +20181,16 @@ fn show_non_scene_objects_tab(
             )
         });
     if is_shape_plus {
-        show_shape_plus_objects_tab(ui, panel_rect, viewport_rect, clip, session, theme, state);
+        show_shape_plus_objects_tab(
+            ui,
+            panel_rect,
+            viewport_rect,
+            clip,
+            session,
+            theme,
+            state,
+            actions,
+        );
         return true;
     }
 
@@ -14756,6 +20268,7 @@ fn show_non_scene_objects_tab(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_shape_plus_objects_tab(
     ui: &mut Ui,
     panel_rect: Rect,
@@ -14764,6 +20277,7 @@ fn show_shape_plus_objects_tab(
     session: &mut Session,
     theme: &Cm3Theme,
     state: &mut PanelsState,
+    actions: &mut Vec<PanelAction>,
 ) {
     let Some(cid) = Uuid::parse_str(&clip.id).ok() else {
         empty_panel_message(ui, "invalid Shape+ clip id", theme);
@@ -14789,43 +20303,67 @@ fn show_shape_plus_objects_tab(
 
     let mut payload_dirty = false;
 
-    // Top Pane: Contents Tree + Add (all 21 kinds) + Import SVG
+    // Top Pane: Clean "Shape+" header line + compact 2nd action row (Import SVG / Paste SVG / Paste JSON)
     show_split_pane(
         ui,
         Id::unique("shape_plus_split_p0"),
         top_rect.shrink(2.0),
         |ui, _| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(
-                    egui::RichText::new("Shape+ Contents")
-                        .font(theme.font(FONT_TITLE))
-                        .color(TEXT_STRONG),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Paste SVG").clicked() {
-                        state.shape_plus_svg_open = !state.shape_plus_svg_open;
-                    }
-                    if ui.small_button("Import SVG...").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("SVG Vector", &["svg"])
-                            .pick_file()
+            ui.label(
+                egui::RichText::new("Shape+")
+                    .font(theme.font(FONT_TITLE))
+                    .color(TEXT_STRONG),
+            );
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 3.0);
+                if ui.small_button("Import SVG...").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("SVG Vector", &["svg"])
+                        .pick_file()
+                {
+                    match std::fs::read_to_string(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|txt| import_svg_to_shape_plus(&txt))
                     {
-                        match std::fs::read_to_string(&path)
-                            .map_err(|e| e.to_string())
-                            .and_then(|txt| import_svg_to_shape_plus(&txt))
-                        {
-                            Ok(imported) => {
-                                payload = imported;
-                                payload_dirty = true;
-                                state.shape_plus_svg_error = None;
-                            }
-                            Err(err) => {
-                                state.shape_plus_svg_error = Some(err);
-                            }
+                        Ok(imported) => {
+                            payload = imported;
+                            payload_dirty = true;
+                            state.shape_plus_svg_error = None;
+                        }
+                        Err(err) => {
+                            state.shape_plus_svg_error = Some(err);
                         }
                     }
-                });
+                }
+                if ui.small_button("Paste SVG").clicked() {
+                    state.shape_plus_svg_open = !state.shape_plus_svg_open;
+                }
+                if ui
+                    .small_button("Paste JSON")
+                    .on_hover_text("Paste Shape+ JSON from clipboard (PZ compatible)")
+                    .clicked()
+                    && paste_pz_json_from_clipboard(
+                        session,
+                        state,
+                        actions,
+                        "shape_plus",
+                        Some(clip.id.clone()),
+                        None,
+                        None,
+                        None,
+                        "Shape+ JSON",
+                    )
+                    && let Some(updated) =
+                        find_project_video_clip(session, &clip.id).and_then(|vc| {
+                            match &vc.layer.kind {
+                                LayerKind::Plugin { payload, .. } => Some(payload.clone()),
+                                _ => None,
+                            }
+                        })
+                {
+                    payload = updated;
+                }
             });
 
             if state.shape_plus_svg_open {
@@ -14867,38 +20405,173 @@ fn show_shape_plus_objects_tab(
                 });
             }
 
-            // + Add Item (all 21 Shape+ kinds)
+            // + Add Item (all 21 Shape+ kinds) with clean integer-row scrollable popup
             ui.add_space(4.0);
             let kind_labels: Vec<&str> = ALL_SHAPE_PLUS_KINDS
                 .iter()
                 .map(|k| shape_plus_kind_title(k).unwrap_or(*k))
                 .collect();
+            let dd_popup_id = Id::unique("shape_plus_add_kind_popup");
+            let mut dd_open = ui
+                .data_mut(|d| d.get_temp::<bool>(dd_popup_id))
+                .unwrap_or(false);
+            let mut dd_btn_rect = Rect::NOTHING;
+            let mut dd_just_opened = false;
+
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                cm3_dropdown(
-                    ui,
-                    Id::unique("shape_plus_add_kind_dd"),
-                    &mut state.shape_plus_add_kind,
-                    &kind_labels,
-                    false,
-                    viewport_rect,
-                    theme,
+                let cur_idx = state
+                    .shape_plus_add_kind
+                    .min(kind_labels.len().saturating_sub(1));
+                let cur_label = kind_labels.get(cur_idx).copied().unwrap_or("Rectangle");
+                let dd_w = (ui.available_width() - 62.0).clamp(110.0, 200.0);
+                let (raw_slot, _) = ui.allocate_exact_size(Vec2::new(dd_w, 23.0), Sense::hover());
+                let btn_rect = Rect::from_min_size(
+                    Pos2::new(raw_slot.left().round(), (raw_slot.top() + 1.0).round()),
+                    Vec2::new(dd_w.round(), 21.0),
                 );
+                dd_btn_rect = btn_rect;
+                let btn_resp = ui
+                    .interact(btn_rect, dd_popup_id.with("btn"), Sense::click())
+                    .on_hover_cursor(CursorIcon::PointingHand);
+                ui.painter()
+                    .rect_filled(btn_rect, CornerRadius::ZERO, BG_INPUT);
+                paint_crisp_panel_border(
+                    ui.painter(),
+                    btn_rect,
+                    if dd_open || btn_resp.hovered() {
+                        theme.accent()
+                    } else {
+                        BORDER_CONTROL
+                    },
+                );
+                ui.painter()
+                    .with_clip_rect(Rect::from_min_max(
+                        btn_rect.left_top(),
+                        Pos2::new(
+                            (btn_rect.right() - 18.0).max(btn_rect.left()),
+                            btn_rect.bottom(),
+                        ),
+                    ))
+                    .text(
+                        Pos2::new(btn_rect.left() + 5.0, btn_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        cur_label,
+                        theme.font(FONT_SMALL),
+                        theme.value(),
+                    );
+                paint_cm3_icon(
+                    ui.painter(),
+                    Rect::from_center_size(
+                        Pos2::new(btn_rect.right() - 8.5, btn_rect.center().y),
+                        Vec2::splat(12.0),
+                    ),
+                    Cm3Icon::ChevronDown,
+                    theme.value(),
+                );
+                if btn_resp.clicked() {
+                    dd_open = !dd_open;
+                    dd_just_opened = dd_open;
+                }
                 if cm3_prop_button(ui, "+ Add", ButtonVariant::Primary, false, theme).clicked() {
                     let kind = ALL_SHAPE_PLUS_KINDS[state
                         .shape_plus_add_kind
                         .min(ALL_SHAPE_PLUS_KINDS.len() - 1)];
-                    let parent_group = state.shape_plus_selected.as_deref().and_then(|sid| {
-                        find_shape_item_kind(&payload, sid)
-                            .filter(|k| *k == "group")
-                            .map(|_| sid)
-                    });
-                    if let Ok(new_id) = add_shape_plus_item(&mut payload, parent_group, kind) {
+                    if let Ok(new_id) = add_shape_plus_item_smart(
+                        &mut payload,
+                        state.shape_plus_selected.as_deref(),
+                        kind,
+                    ) {
                         state.shape_plus_selected = Some(new_id);
                         payload_dirty = true;
                     }
                 }
             });
+
+            if dd_open {
+                let row_h = 24.0_f32;
+                let visible_rows = kind_labels.len().min(12);
+                let popup_h = visible_rows as f32 * row_h + 8.0;
+                let popup_w = dd_btn_rect.width().max(180.0);
+                let px = dd_btn_rect.left().clamp(
+                    viewport_rect.left() + 8.0,
+                    (viewport_rect.right() - popup_w - 8.0).max(viewport_rect.left() + 8.0),
+                );
+                let below_y = dd_btn_rect.bottom() + 2.0;
+                let py = if below_y + popup_h <= viewport_rect.bottom() - 8.0 {
+                    below_y
+                } else {
+                    (dd_btn_rect.top() - popup_h - 2.0).clamp(
+                        viewport_rect.top() + 8.0,
+                        (viewport_rect.bottom() - popup_h - 8.0).max(viewport_rect.top() + 8.0),
+                    )
+                };
+                let mut close_now = ui.input(|i| i.key_pressed(Key::Escape));
+                let area_resp = Area::new(dd_popup_id)
+                    .order(Order::Foreground)
+                    .fixed_pos(Pos2::new(px.round(), py.round()))
+                    .show(ui.ctx(), |ui| {
+                        Frame::NONE
+                            .fill(BG_PANEL)
+                            .stroke(Stroke::new(1.0, theme.accent()))
+                            .inner_margin(egui::Margin::same(4))
+                            .show(ui, |ui| {
+                                ui.set_width(popup_w - 8.0);
+                                ScrollArea::vertical()
+                                    .id_salt((dd_popup_id, "scroll"))
+                                    .max_height(visible_rows as f32 * row_h)
+                                    .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        for (idx, lbl) in kind_labels.iter().enumerate() {
+                                            let is_sel = idx == state.shape_plus_add_kind;
+                                            let (r, resp) = ui.allocate_exact_size(
+                                                Vec2::new(ui.available_width(), row_h),
+                                                Sense::click(),
+                                            );
+                                            let resp =
+                                                resp.on_hover_cursor(CursorIcon::PointingHand);
+                                            if is_sel {
+                                                ui.painter().rect_filled(
+                                                    r,
+                                                    CornerRadius::ZERO,
+                                                    theme.accent(),
+                                                );
+                                            } else if resp.hovered() {
+                                                ui.painter().rect_filled(
+                                                    r,
+                                                    CornerRadius::ZERO,
+                                                    BG_DROPDOWN_HOVER,
+                                                );
+                                            }
+                                            ui.painter().text(
+                                                Pos2::new(r.left() + 6.0, r.center().y),
+                                                Align2::LEFT_CENTER,
+                                                *lbl,
+                                                theme.font(FONT_SMALL),
+                                                if is_sel { TEXT_BRIGHT } else { TEXT_PRIMARY },
+                                            );
+                                            if resp.clicked() {
+                                                state.shape_plus_add_kind = idx;
+                                                close_now = true;
+                                            }
+                                        }
+                                    });
+                            });
+                    });
+                let clicked_outside = !dd_just_opened
+                    && ui.input(|i| {
+                        i.pointer.primary_pressed()
+                            && i.pointer.interact_pos().is_some_and(|p| {
+                                !area_resp.response.rect.contains(p) && !dd_btn_rect.contains(p)
+                            })
+                    });
+                if close_now || clicked_outside {
+                    dd_open = false;
+                }
+            }
+            ui.data_mut(|d| d.insert_temp(dd_popup_id, dd_open));
 
             ui.separator();
 
@@ -14934,66 +20607,176 @@ fn show_shape_plus_objects_tab(
                                 .unwrap_or_else(|| {
                                     shape_plus_kind_title(&item.kind).unwrap_or(&item.kind)
                                 });
-                            ui.horizontal(|ui| {
-                                ui.add_space((depth as f32) * 14.0);
-                                if item.kind == "group" {
-                                    let collapsed = state.shape_plus_collapsed.contains(&item.id);
-                                    if ui.small_button(if collapsed { "▸" } else { "▾" }).clicked()
-                                    {
-                                        if collapsed {
-                                            state.shape_plus_collapsed.remove(&item.id);
-                                        } else {
-                                            state.shape_plus_collapsed.insert(item.id.clone());
-                                        }
+                            let (row_rect, row_resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 24.0),
+                                Sense::click(),
+                            );
+                            let row_resp = row_resp.on_hover_cursor(CursorIcon::PointingHand);
+                            let pointer_in_row = ui.input(|i| {
+                                i.pointer.hover_pos().is_some_and(|p| row_rect.contains(p))
+                            });
+                            if is_sel {
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    CornerRadius::ZERO,
+                                    theme.accent(),
+                                );
+                            } else if row_resp.hovered() || pointer_in_row {
+                                ui.painter()
+                                    .rect_filled(row_rect, CornerRadius::ZERO, BG_HOVER);
+                            }
+                            ui.painter().line_segment(
+                                [
+                                    Pos2::new(row_rect.left(), row_rect.bottom() - 0.5),
+                                    Pos2::new(row_rect.right(), row_rect.bottom() - 0.5),
+                                ],
+                                Stroke::new(1.0, BORDER_ROW_SOFT),
+                            );
+
+                            let mut sub_clicked = false;
+                            let mut cursor_x = row_rect.left() + 4.0 + (depth as f32) * 14.0;
+                            if item.kind == "group" {
+                                let collapsed = state.shape_plus_collapsed.contains(&item.id);
+                                let tri_rect = Rect::from_min_size(
+                                    Pos2::new(cursor_x, (row_rect.center().y - 8.0).round()),
+                                    Vec2::splat(16.0),
+                                );
+                                let tri_resp = ui
+                                    .interact(
+                                        tri_rect,
+                                        Id::unique(("sp_grp_col", &item.id)),
+                                        Sense::click(),
+                                    )
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text(if collapsed {
+                                        "Expand group"
+                                    } else {
+                                        "Collapse group"
+                                    });
+                                paint_cm3_icon(
+                                    ui.painter(),
+                                    tri_rect.shrink(2.0),
+                                    if collapsed {
+                                        Cm3Icon::ChevronRight
+                                    } else {
+                                        Cm3Icon::ChevronDown
+                                    },
+                                    if is_sel { TEXT_BRIGHT } else { TEXT_MUTED },
+                                );
+                                if tri_resp.clicked() {
+                                    sub_clicked = true;
+                                    if collapsed {
+                                        state.shape_plus_collapsed.remove(&item.id);
+                                    } else {
+                                        state.shape_plus_collapsed.insert(item.id.clone());
                                     }
                                 }
-                                if ui
-                                    .small_button(if enabled { "👁" } else { "—" })
-                                    .on_hover_text("Toggle visibility")
-                                    .clicked()
-                                {
-                                    *action = Some((item.id.clone(), "toggle", idx));
-                                }
-                                if ui
-                                    .selectable_label(
-                                        is_sel,
-                                        egui::RichText::new(name)
-                                            .font(theme.font(FONT_SMALL))
-                                            .color(if !enabled {
-                                                TEXT_DISABLED
-                                            } else if is_sel {
-                                                TEXT_BRIGHT
-                                            } else {
-                                                TEXT_PRIMARY
-                                            }),
-                                    )
-                                    .clicked()
-                                {
-                                    state.shape_plus_selected = Some(item.id.clone());
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.small_button("×").on_hover_text("Delete").clicked() {
-                                            *action = Some((item.id.clone(), "del", idx));
-                                        }
-                                        if ui.small_button("D").on_hover_text("Duplicate").clicked()
-                                        {
-                                            *action = Some((item.id.clone(), "dup", idx));
-                                        }
-                                        if idx + 1 < count
-                                            && ui.small_button("↓").on_hover_text("Down").clicked()
-                                        {
-                                            *action = Some((item.id.clone(), "down", idx + 1));
-                                        }
-                                        if idx > 0
-                                            && ui.small_button("↑").on_hover_text("Up").clicked()
-                                        {
-                                            *action = Some((item.id.clone(), "up", idx - 1));
-                                        }
-                                    },
+                                cursor_x += 18.0;
+                            }
+
+                            let eye_rect = Rect::from_min_size(
+                                Pos2::new(cursor_x, (row_rect.center().y - 9.0).round()),
+                                Vec2::splat(18.0),
+                            );
+                            let mut eye_ui =
+                                ui.new_child(egui::UiBuilder::new().max_rect(eye_rect));
+                            if paint_visibility_eye_button(
+                                &mut eye_ui,
+                                Id::unique(("sp_vis", &item.id)),
+                                enabled,
+                                theme,
+                            ) {
+                                sub_clicked = true;
+                                *action = Some((item.id.clone(), "toggle", idx));
+                            }
+                            cursor_x += 22.0;
+
+                            // Right-aligned compact action buttons (×, D, ↓, ↑)
+                            let mut right_x = row_rect.right() - 4.0;
+                            let btn_y = (row_rect.center().y - 8.5).round();
+                            let draw_row_btn = |ui: &mut Ui,
+                                                right_x: &mut f32,
+                                                btn_id: Id,
+                                                lbl: &str,
+                                                tip: &str|
+                             -> bool {
+                                let w = 17.0;
+                                *right_x -= w;
+                                let r = Rect::from_min_size(
+                                    Pos2::new(*right_x, btn_y),
+                                    Vec2::new(w, 17.0),
                                 );
-                            });
+                                *right_x -= 2.0;
+                                let (clicked, _) =
+                                    header_compact_action_button(ui, btn_id, r, lbl, tip, theme);
+                                clicked
+                            };
+                            if draw_row_btn(
+                                ui,
+                                &mut right_x,
+                                Id::unique(("sp_del", &item.id)),
+                                "×",
+                                "Delete",
+                            ) {
+                                sub_clicked = true;
+                                *action = Some((item.id.clone(), "del", idx));
+                            }
+                            if draw_row_btn(
+                                ui,
+                                &mut right_x,
+                                Id::unique(("sp_dup", &item.id)),
+                                "D",
+                                "Duplicate",
+                            ) {
+                                sub_clicked = true;
+                                *action = Some((item.id.clone(), "dup", idx));
+                            }
+                            if idx + 1 < count
+                                && draw_row_btn(
+                                    ui,
+                                    &mut right_x,
+                                    Id::unique(("sp_dn", &item.id)),
+                                    "↓",
+                                    "Down",
+                                )
+                            {
+                                sub_clicked = true;
+                                *action = Some((item.id.clone(), "down", idx + 1));
+                            }
+                            if idx > 0
+                                && draw_row_btn(
+                                    ui,
+                                    &mut right_x,
+                                    Id::unique(("sp_up", &item.id)),
+                                    "↑",
+                                    "Up",
+                                )
+                            {
+                                sub_clicked = true;
+                                *action = Some((item.id.clone(), "up", idx - 1));
+                            }
+
+                            let label_rect = Rect::from_min_max(
+                                Pos2::new(cursor_x, row_rect.top()),
+                                Pos2::new((right_x - 4.0).max(cursor_x + 8.0), row_rect.bottom()),
+                            );
+                            ui.painter().with_clip_rect(label_rect).text(
+                                Pos2::new(label_rect.left(), label_rect.center().y),
+                                Align2::LEFT_CENTER,
+                                name,
+                                theme.font(FONT_SMALL),
+                                if !enabled {
+                                    TEXT_DISABLED
+                                } else if is_sel {
+                                    TEXT_BRIGHT
+                                } else {
+                                    TEXT_PRIMARY
+                                },
+                            );
+
+                            if row_resp.clicked() && !sub_clicked {
+                                state.shape_plus_selected = Some(item.id.clone());
+                            }
                             if item.kind == "group"
                                 && !state.shape_plus_collapsed.contains(&item.id)
                             {
@@ -15079,7 +20862,7 @@ fn show_shape_plus_objects_tab(
             ui.separator();
 
             ScrollArea::vertical()
-                .id_salt("shape_plus_item_inspector")
+                .id_salt(("shape_plus_item_inspector", &sel_id))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let Some(props) = item_obj
@@ -15088,7 +20871,12 @@ fn show_shape_plus_objects_tab(
                     else {
                         return;
                     };
-                    let keys: Vec<String> = props.keys().cloned().collect();
+                    let mut keys: Vec<String> = props.keys().cloned().collect();
+                    keys.sort_by(|a, b| {
+                        shape_plus_prop_sort_key(a)
+                            .cmp(&shape_plus_prop_sort_key(b))
+                            .then_with(|| a.cmp(b))
+                    });
                     for key in keys {
                         if key == "enabled" || key == "path" {
                             continue;
@@ -15099,24 +20887,72 @@ fn show_shape_plus_objects_tab(
                         let label = humanize_prop_label(&key);
                         match val {
                             Value::String(mut s) => {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(&label)
-                                            .font(theme.font(FONT_SMALL))
-                                            .color(TEXT_PRIMARY),
-                                    );
-                                    if ui
-                                        .add(
-                                            TextEdit::singleline(&mut s)
+                                if let Some(opts) = shape_plus_string_enum_options(&kind, &key) {
+                                    let mut idx = opts
+                                        .iter()
+                                        .position(|o| o.eq_ignore_ascii_case(&s))
+                                        .unwrap_or(0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.label(
+                                            egui::RichText::new(&label)
                                                 .font(theme.font(FONT_SMALL))
-                                                .desired_width(130.0),
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        if cm3_dropdown(
+                                            ui,
+                                            Id::unique(("sp_prop_dd", &sel_id, &key)),
+                                            &mut idx,
+                                            opts,
+                                            false,
+                                            viewport_rect,
+                                            theme,
+                                        ) {
+                                            props.insert(key, json!(opts[idx]));
+                                            payload_dirty = true;
+                                        }
+                                    });
+                                } else if let Some(summary) = oversized_text_summary(&s) {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.label(
+                                            egui::RichText::new(&label)
+                                                .font(theme.font(FONT_SMALL))
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&summary)
+                                                    .font(theme.font(FONT_SMALL))
+                                                    .color(TEXT_MUTED),
+                                            )
+                                            .truncate(),
                                         )
-                                        .changed()
-                                    {
-                                        props.insert(key, json!(s));
-                                        payload_dirty = true;
-                                    }
-                                });
+                                        .on_hover_text(
+                                            "Text exceeds 8,192 characters; inline editing disabled.",
+                                        );
+                                    });
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.label(
+                                            egui::RichText::new(&label)
+                                                .font(theme.font(FONT_SMALL))
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        if ui
+                                            .add(
+                                                TextEdit::singleline(&mut s)
+                                                    .font(theme.font(FONT_SMALL))
+                                                    .desired_width(130.0),
+                                            )
+                                            .changed()
+                                        {
+                                            props.insert(key, json!(s));
+                                            payload_dirty = true;
+                                        }
+                                    });
+                                }
                             }
                             Value::Number(n) => {
                                 let mut v = n.as_f64().unwrap_or(0.0);
@@ -15190,16 +21026,119 @@ fn show_shape_plus_objects_tab(
     }
 }
 
-fn find_shape_item_kind<'a>(payload: &'a Value, id: &str) -> Option<&'a str> {
-    fn rec<'a>(arr: &'a [Value], id: &str) -> Option<&'a str> {
+/// Paints a crisp vector visibility eye icon (never relying on missing emoji glyphs).
+fn paint_visibility_eye_button(ui: &mut Ui, id: Id, visible: bool, theme: &Cm3Theme) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::click());
+    let resp = resp
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(if visible { "Hide item" } else { "Show item" });
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(2), BG_HOVER);
+    }
+    let c = rect.center();
+    let col = if visible {
+        if resp.hovered() {
+            TEXT_BRIGHT
+        } else {
+            theme.value()
+        }
+    } else if resp.hovered() {
+        TEXT_PRIMARY
+    } else {
+        TEXT_DISABLED
+    };
+    let rx = 6.0_f32;
+    let ry = 3.6_f32;
+    let mut upper = Vec::with_capacity(9);
+    let mut lower = Vec::with_capacity(9);
+    for i in 0..=8 {
+        let t = (i as f32 / 8.0) * 2.0 - 1.0;
+        let x = c.x + t * rx;
+        let arch = (1.0 - t * t) * ry;
+        upper.push(Pos2::new(x, c.y - arch));
+        lower.push(Pos2::new(x, c.y + arch));
+    }
+    ui.painter().add(Shape::line(upper, Stroke::new(1.3, col)));
+    ui.painter().add(Shape::line(lower, Stroke::new(1.3, col)));
+    if visible {
+        ui.painter().circle_filled(c, 2.0, col);
+    } else {
+        ui.painter().line_segment(
+            [
+                Pos2::new(c.x - 5.5, c.y + 4.5),
+                Pos2::new(c.x + 5.5, c.y - 4.5),
+            ],
+            Stroke::new(1.4, col),
+        );
+    }
+    let _ = id;
+    resp.clicked()
+}
+
+fn shape_plus_prop_sort_key(key: &str) -> u8 {
+    match key {
+        "name" => 0,
+        "mode" => 1,
+        "position" => 2,
+        "size" => 3,
+        "points" => 4,
+        "outerRadius" => 5,
+        "innerRadius" => 6,
+        "roundness" | "outerRoundness" => 7,
+        "innerRoundness" => 8,
+        "scale" => 9,
+        "rotation" => 10,
+        "anchor" => 11,
+        "skew" => 12,
+        "skewAxis" => 13,
+        "color" => 14,
+        "strokeWidth" => 15,
+        "lineCap" | "cap" => 16,
+        "lineJoin" | "join" => 17,
+        "miterLimit" => 18,
+        "opacity" => 19,
+        "composite" => 20,
+        "fillRule" | "fill_rule" => 21,
+        _ => 100,
+    }
+}
+
+fn shape_plus_string_enum_options(kind: &str, key: &str) -> Option<&'static [&'static str]> {
+    match (kind, key) {
+        ("polystar", "mode") | (_, "polystarType" | "starType") => Some(&["star", "polygon"]),
+        ("trim", "mode") => Some(&["simultaneous", "individually"]),
+        ("mergePaths", "mode") => Some(&["add", "subtract", "intersect", "exclude"]),
+        ("zigZag" | "wigglePaths", "points") => Some(&["corner", "smooth"]),
+        (_, "composite") => Some(&["below", "above"]),
+        (_, "fillRule" | "fill_rule") => Some(&["nonzero", "evenodd"]),
+        (_, "lineCap" | "cap") => Some(&["butt", "round", "square"]),
+        (_, "lineJoin" | "join") => Some(&["miter", "round", "bevel"]),
+        _ => None,
+    }
+}
+
+fn find_enclosing_shape_group<'a>(payload: &'a Value, id: &str) -> Option<&'a str> {
+    fn rec<'a>(arr: &'a [Value], id: &str, parent_group: Option<&'a str>) -> Option<&'a str> {
         for item in arr {
-            if item.get("id").and_then(Value::as_str) == Some(id) {
-                return item.get("kind").and_then(Value::as_str);
+            let item_id = item.get("id").and_then(Value::as_str);
+            let item_kind = item.get("kind").and_then(Value::as_str);
+            if item_id == Some(id) {
+                return if item_kind == Some("group") {
+                    item_id
+                } else {
+                    parent_group
+                };
             }
-            if let Some(children) = item.get("contents").and_then(Value::as_array)
-                && let Some(found) = rec(children, id)
-            {
-                return Some(found);
+            if let Some(children) = item.get("contents").and_then(Value::as_array) {
+                let next_parent = if item_kind == Some("group") {
+                    item_id
+                } else {
+                    parent_group
+                };
+                if let Some(found) = rec(children, id, next_parent) {
+                    return Some(found);
+                }
             }
         }
         None
@@ -15207,7 +21146,29 @@ fn find_shape_item_kind<'a>(payload: &'a Value, id: &str) -> Option<&'a str> {
     payload
         .get("contents")
         .and_then(Value::as_array)
-        .and_then(|c| rec(c, id))
+        .and_then(|c| rec(c, id, None))
+}
+
+fn add_shape_plus_item_smart(
+    payload: &mut Value,
+    selected_id: Option<&str>,
+    kind: &str,
+) -> Result<String, String> {
+    let target_group: Option<String> = selected_id
+        .and_then(|sid| find_enclosing_shape_group(payload, sid))
+        .map(str::to_owned);
+    let is_geometry_shape = matches!(kind, "rectangle" | "ellipse" | "polystar" | "path");
+    if let Some(gid) = target_group {
+        add_shape_plus_item(payload, Some(&gid), kind)
+    } else if is_geometry_shape {
+        // Wrap root-inserted shapes inside a new Group with a default Fill so they render immediately
+        let group_id = add_shape_plus_item(payload, None, "group")?;
+        let shape_id = add_shape_plus_item(payload, Some(&group_id), kind)?;
+        let _ = add_shape_plus_item(payload, Some(&group_id), "fill");
+        Ok(shape_id)
+    } else {
+        add_shape_plus_item(payload, None, kind)
+    }
 }
 
 fn find_shape_item_mut<'a>(payload: &'a mut Value, id: &str) -> Option<&'a mut Value> {
@@ -15249,24 +21210,23 @@ fn show_text2d_objects_tab(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             panel_top_header(ui, &clip.name, theme);
-            show_session_text_prop(
+            show_session_text_prop_ex(
                 ui,
                 session,
                 &clip.id,
                 "text",
                 "Text",
                 "Text",
+                true,
                 local_frame,
                 state,
                 theme,
             );
-            show_session_asset_prop(
+            show_font_selector_row(
                 ui,
                 session,
                 &clip.id,
-                "font",
-                "Font",
-                false,
+                "text2d_obj_font",
                 local_frame,
                 viewport_rect,
                 state,
@@ -15360,21 +21320,18 @@ fn show_text2d_objects_tab(
                         let mut root = find_project_video_clip(session, &clip.id)
                             .and_then(|vc| vc.layer.preserved.get("zoidiumTextPlus2D").cloned())
                             .filter(Value::is_object)
-                            .unwrap_or_else(|| {
-                                json!({
-                                    "characterProperties": { "mode": 0 },
-                                    "extraCharacterProperties": [{ "mode": 0 }, { "mode": 0 }]
-                                })
-                            });
+                            .unwrap_or_else(default_text_plus_2d_root);
 
-                        // 3-Stack tabs: Character | Character 2 | Character 3
+                        // 3-Stack tabs: Char 1 | Char 2 | Char 3 (compact padding, zero right-edge clipping)
                         ui.horizontal(|ui| {
-                            for (idx, lbl) in ["Character", "Character 2", "Character 3"]
-                                .iter()
-                                .enumerate()
-                            {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.spacing_mut().button_padding = Vec2::new(6.0, 2.0);
+                            for (idx, lbl) in ["Char 1", "Char 2", "Char 3"].iter().enumerate() {
                                 if ui
-                                    .selectable_label(state.text2d_animator_tab == idx, *lbl)
+                                    .selectable_label(
+                                        state.text2d_animator_tab == idx,
+                                        egui::RichText::new(*lbl).font(theme.font(FONT_SMALL)),
+                                    )
                                     .clicked()
                                 {
                                     state.text2d_animator_tab = idx;
@@ -15383,26 +21340,11 @@ fn show_text2d_objects_tab(
                         });
                         ui.add_space(4.0);
 
-                        let slot_obj = match state.text2d_animator_tab {
-                            0 => root.as_object_mut().and_then(|o| {
-                                o.entry("characterProperties")
-                                    .or_insert_with(|| json!({ "mode": 0 }))
-                                    .as_object_mut()
-                            }),
-                            n => {
-                                let extra_idx = n - 1;
-                                root.as_object_mut().and_then(|o| {
-                                    let arr = o
-                                        .entry("extraCharacterProperties")
-                                        .or_insert_with(|| json!([{ "mode": 0 }, { "mode": 0 }]))
-                                        .as_array_mut()?;
-                                    while arr.len() <= extra_idx {
-                                        arr.push(json!({ "mode": 0 }));
-                                    }
-                                    arr[extra_idx].as_object_mut()
-                                })
-                            }
-                        };
+                        if let Some(obj) = root.as_object_mut() {
+                            obj.entry("schemaVersion").or_insert_with(|| json!(1));
+                        }
+
+                        let slot_obj = text_plus_2d_slot_mut(&mut root, state.text2d_animator_tab);
 
                         let mut dirty = false;
                         if let Some(slot) = slot_obj {
@@ -15415,9 +21357,8 @@ fn show_text2d_objects_tab(
                                 "Selected Shake",
                                 "Random Scatter",
                             ];
-                            let mut mode =
-                                slot.get("mode").and_then(Value::as_u64).unwrap_or(0).min(6)
-                                    as usize;
+                            const DELAY_ORDERS: &[&str] = &["Start", "End", "Middle", "Random"];
+                            let mut mode = tp2d_read_mode(slot);
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new("Mode")
@@ -15441,35 +21382,385 @@ fn show_text2d_objects_tab(
                                     dirty = true;
                                 }
                             });
-                            if mode > 0 {
-                                for (k, lbl, def, speed) in [
-                                    ("offsetX", "Offset X", 0.0, 1.0),
-                                    ("offsetY", "Offset Y", 0.0, 1.0),
-                                    ("scaleX", "Scale X", 1.0, 0.02),
-                                    ("scaleY", "Scale Y", 1.0, 0.02),
-                                    ("rotation", "Rotation", 0.0, 1.0),
-                                    ("opacity", "Opacity", 1.0, 0.01),
-                                    ("delay", "Char Delay", 0.0, 0.05),
-                                    ("amount", "Amount / Amp", 1.0, 0.05),
-                                    ("speed", "Frequency", 1.0, 0.05),
-                                    ("seed", "Seed", 1.0, 1.0),
-                                ] {
-                                    let mut v = slot.get(k).and_then(Value::as_f64).unwrap_or(def);
+
+                            // Character range / indices input for Selected Transform (4) & Selected Shake (5)
+                            if matches!(mode, 4 | 5) {
+                                let mut chars_str = tp2d_read_str(slot, "characterNumbers", "1");
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Characters")
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_MUTED),
+                                    );
+                                    if ui
+                                        .add(
+                                            TextEdit::singleline(&mut chars_str)
+                                                .hint_text("1, 3, 5")
+                                                .font(theme.font(FONT_COMPACT))
+                                                .desired_width(
+                                                    (ui.available_width() - 6.0).max(60.0),
+                                                ),
+                                        )
+                                        .on_hover_text("1-based character indices (e.g. 1, 2, 4)")
+                                        .changed()
+                                    {
+                                        slot.insert(
+                                            "characterNumbers".to_owned(),
+                                            json!(chars_str),
+                                        );
+                                        dirty = true;
+                                    }
+                                });
+                            }
+
+                            let drag_scalar = |ui: &mut Ui,
+                                               lbl: &str,
+                                               v: &mut f64,
+                                               speed: f64,
+                                               range: Option<(f64, f64)>|
+                             -> bool {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(lbl)
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_MUTED),
+                                    );
+                                    let mut dv = egui::DragValue::new(v).speed(speed);
+                                    if let Some((lo, hi)) = range {
+                                        dv = dv.range(lo..=hi);
+                                    }
+                                    ui.add(dv).changed()
+                                })
+                                .inner
+                            };
+
+                            let drag_vec2 = |ui: &mut Ui,
+                                             lbl: &str,
+                                             v: &mut [f64; 2],
+                                             speed: f64|
+                             -> bool {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ui.label(
+                                        egui::RichText::new(lbl)
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_MUTED),
+                                    );
+                                    let cx = ui.add(
+                                        egui::DragValue::new(&mut v[0]).speed(speed).prefix("X "),
+                                    );
+                                    let cy = ui.add(
+                                        egui::DragValue::new(&mut v[1]).speed(speed).prefix("Y "),
+                                    );
+                                    cx.changed() || cy.changed()
+                                })
+                                .inner
+                            };
+
+                            match mode {
+                                // Character Transform (1) & Selected Transform (4)
+                                1 | 4 => {
+                                    let mut pos = tp2d_read_vec2(
+                                        slot,
+                                        "charPosition",
+                                        ("offsetX", "offsetY"),
+                                        [0.0, 0.0],
+                                    );
+                                    if drag_vec2(ui, "Position", &mut pos, 1.0) {
+                                        tp2d_write_vec2(slot, "charPosition", pos);
+                                        dirty = true;
+                                    }
+                                    let mut scale = tp2d_read_vec2(
+                                        slot,
+                                        "charScale",
+                                        ("scaleX", "scaleY"),
+                                        [1.0, 1.0],
+                                    );
+                                    if drag_vec2(ui, "Scale", &mut scale, 0.02) {
+                                        tp2d_write_vec2(slot, "charScale", scale);
+                                        dirty = true;
+                                    }
+                                    let mut rot =
+                                        tp2d_read_f64(slot, "charRotation", &["rotation"], 0.0);
+                                    if drag_scalar(ui, "Rotation (rad)", &mut rot, 0.02, None) {
+                                        tp2d_write_f64(slot, "charRotation", rot);
+                                        dirty = true;
+                                    }
+                                    let mut opacity =
+                                        tp2d_read_f64(slot, "charOpacity", &["opacity"], 1.0);
+                                    if drag_scalar(
+                                        ui,
+                                        "Opacity",
+                                        &mut opacity,
+                                        0.01,
+                                        Some((0.0, 1.0)),
+                                    ) {
+                                        tp2d_write_f64(slot, "charOpacity", opacity);
+                                        dirty = true;
+                                    }
+                                    let mut delay =
+                                        tp2d_read_f64(slot, "delayPerCharacter", &["delay"], 0.0);
+                                    if drag_scalar(
+                                        ui,
+                                        "Char delay",
+                                        &mut delay,
+                                        0.25,
+                                        Some((0.0, 1000.0)),
+                                    ) {
+                                        tp2d_write_f64(slot, "delayPerCharacter", delay);
+                                        dirty = true;
+                                    }
+                                    let mut order = tp2d_read_order(slot, "delayOrder");
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            egui::RichText::new(lbl)
+                                            egui::RichText::new("Delay order")
                                                 .font(theme.font(FONT_COMPACT))
                                                 .color(TEXT_MUTED),
                                         );
-                                        if ui
-                                            .add(egui::DragValue::new(&mut v).speed(speed))
-                                            .changed()
-                                        {
-                                            slot.insert(k.to_owned(), json!(v));
+                                        if cm3_dropdown(
+                                            ui,
+                                            Id::unique((
+                                                "text2d_delay_order",
+                                                &clip.id,
+                                                state.text2d_animator_tab,
+                                            )),
+                                            &mut order,
+                                            DELAY_ORDERS,
+                                            false,
+                                            viewport_rect,
+                                            theme,
+                                        ) {
+                                            slot.insert("delayOrder".to_owned(), json!(order));
                                             dirty = true;
                                         }
                                     });
+                                    let mut seed =
+                                        tp2d_read_f64(slot, "randomSeed", &["seed"], 1.0);
+                                    if drag_scalar(ui, "Random seed", &mut seed, 1.0, None) {
+                                        tp2d_write_f64(slot, "randomSeed", seed);
+                                        dirty = true;
+                                    }
                                 }
+                                // Gradient Transform (2)
+                                2 => {
+                                    let mut p0 = tp2d_read_vec2(
+                                        slot,
+                                        "firstPosition",
+                                        ("offsetX", "offsetY"),
+                                        [0.0, 0.0],
+                                    );
+                                    if drag_vec2(ui, "First pos", &mut p0, 1.0) {
+                                        tp2d_write_vec2(slot, "firstPosition", p0);
+                                        dirty = true;
+                                    }
+                                    let mut p1 = tp2d_read_vec2(
+                                        slot,
+                                        "lastPosition",
+                                        ("offsetX", "offsetY"),
+                                        [0.0, 0.0],
+                                    );
+                                    if drag_vec2(ui, "Last pos", &mut p1, 1.0) {
+                                        tp2d_write_vec2(slot, "lastPosition", p1);
+                                        dirty = true;
+                                    }
+                                    let mut s0 = tp2d_read_vec2(
+                                        slot,
+                                        "firstScale",
+                                        ("scaleX", "scaleY"),
+                                        [1.0, 1.0],
+                                    );
+                                    if drag_vec2(ui, "First scale", &mut s0, 0.02) {
+                                        tp2d_write_vec2(slot, "firstScale", s0);
+                                        dirty = true;
+                                    }
+                                    let mut s1 = tp2d_read_vec2(
+                                        slot,
+                                        "lastScale",
+                                        ("scaleX", "scaleY"),
+                                        [1.0, 1.0],
+                                    );
+                                    if drag_vec2(ui, "Last scale", &mut s1, 0.02) {
+                                        tp2d_write_vec2(slot, "lastScale", s1);
+                                        dirty = true;
+                                    }
+                                    let mut r0 = tp2d_read_f64(slot, "firstRotation", &[], 0.0);
+                                    if drag_scalar(ui, "First rot (rad)", &mut r0, 0.02, None) {
+                                        tp2d_write_f64(slot, "firstRotation", r0);
+                                        dirty = true;
+                                    }
+                                    let mut r1 =
+                                        tp2d_read_f64(slot, "lastRotation", &["rotation"], 0.0);
+                                    if drag_scalar(ui, "Last rot (rad)", &mut r1, 0.02, None) {
+                                        tp2d_write_f64(slot, "lastRotation", r1);
+                                        dirty = true;
+                                    }
+                                    let mut o0 = tp2d_read_f64(slot, "firstOpacity", &[], 1.0);
+                                    if drag_scalar(
+                                        ui,
+                                        "First opacity",
+                                        &mut o0,
+                                        0.01,
+                                        Some((0.0, 1.0)),
+                                    ) {
+                                        tp2d_write_f64(slot, "firstOpacity", o0);
+                                        dirty = true;
+                                    }
+                                    let mut o1 =
+                                        tp2d_read_f64(slot, "lastOpacity", &["opacity"], 1.0);
+                                    if drag_scalar(
+                                        ui,
+                                        "Last opacity",
+                                        &mut o1,
+                                        0.01,
+                                        Some((0.0, 1.0)),
+                                    ) {
+                                        tp2d_write_f64(slot, "lastOpacity", o1);
+                                        dirty = true;
+                                    }
+                                }
+                                // Character Shake (3) & Selected Shake (5)
+                                3 | 5 => {
+                                    let mut amp =
+                                        tp2d_read_f64(slot, "shakeAmplitude", &["amount"], 0.25);
+                                    if drag_scalar(ui, "Amplitude (rad)", &mut amp, 0.02, None) {
+                                        tp2d_write_f64(slot, "shakeAmplitude", amp);
+                                        dirty = true;
+                                    }
+                                    let mut period =
+                                        tp2d_read_f64(slot, "shakePeriod", &["speed"], 24.0);
+                                    if drag_scalar(
+                                        ui,
+                                        "Period (frames)",
+                                        &mut period,
+                                        0.5,
+                                        Some((0.1, 10_000.0)),
+                                    ) {
+                                        tp2d_write_f64(slot, "shakePeriod", period);
+                                        dirty = true;
+                                    }
+                                    let mut phase = tp2d_read_f64(slot, "shakePhase", &[], 0.0);
+                                    if drag_scalar(ui, "Phase", &mut phase, 0.25, None) {
+                                        tp2d_write_f64(slot, "shakePhase", phase);
+                                        dirty = true;
+                                    }
+                                    let mut delay = tp2d_read_f64(
+                                        slot,
+                                        "shakeDelayPerCharacter",
+                                        &["delay"],
+                                        0.0,
+                                    );
+                                    if drag_scalar(
+                                        ui,
+                                        "Char delay",
+                                        &mut delay,
+                                        0.25,
+                                        Some((0.0, 1000.0)),
+                                    ) {
+                                        tp2d_write_f64(slot, "shakeDelayPerCharacter", delay);
+                                        dirty = true;
+                                    }
+                                    let mut order = tp2d_read_order(slot, "shakeDelayOrder");
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Delay order")
+                                                .font(theme.font(FONT_COMPACT))
+                                                .color(TEXT_MUTED),
+                                        );
+                                        if cm3_dropdown(
+                                            ui,
+                                            Id::unique((
+                                                "text2d_shake_delay_order",
+                                                &clip.id,
+                                                state.text2d_animator_tab,
+                                            )),
+                                            &mut order,
+                                            DELAY_ORDERS,
+                                            false,
+                                            viewport_rect,
+                                            theme,
+                                        ) {
+                                            slot.insert("shakeDelayOrder".to_owned(), json!(order));
+                                            dirty = true;
+                                        }
+                                    });
+                                    let mut seed =
+                                        tp2d_read_f64(slot, "shakeRandomSeed", &["seed"], 1.0);
+                                    if drag_scalar(ui, "Random seed", &mut seed, 1.0, None) {
+                                        tp2d_write_f64(slot, "shakeRandomSeed", seed);
+                                        dirty = true;
+                                    }
+                                }
+                                // Random Scatter (6)
+                                6 => {
+                                    let mut amount = tp2d_read_f64(slot, "amount", &[], 1.0);
+                                    if drag_scalar(
+                                        ui,
+                                        "Amount",
+                                        &mut amount,
+                                        0.02,
+                                        Some((0.0, 100.0)),
+                                    ) {
+                                        tp2d_write_f64(slot, "amount", amount);
+                                        dirty = true;
+                                    }
+                                    let mut pmin = tp2d_read_vec2(
+                                        slot,
+                                        "positionMin",
+                                        ("offsetX", "offsetY"),
+                                        [-10.0, -10.0],
+                                    );
+                                    if drag_vec2(ui, "Pos min", &mut pmin, 1.0) {
+                                        tp2d_write_vec2(slot, "positionMin", pmin);
+                                        dirty = true;
+                                    }
+                                    let mut pmax = tp2d_read_vec2(
+                                        slot,
+                                        "positionMax",
+                                        ("offsetX", "offsetY"),
+                                        [10.0, 10.0],
+                                    );
+                                    if drag_vec2(ui, "Pos max", &mut pmax, 1.0) {
+                                        tp2d_write_vec2(slot, "positionMax", pmax);
+                                        dirty = true;
+                                    }
+                                    let mut rmin = tp2d_read_f64(slot, "rotationMin", &[], 0.0);
+                                    if drag_scalar(ui, "Rot min (rad)", &mut rmin, 0.02, None) {
+                                        tp2d_write_f64(slot, "rotationMin", rmin);
+                                        dirty = true;
+                                    }
+                                    let mut rmax =
+                                        tp2d_read_f64(slot, "rotationMax", &["rotation"], 0.0);
+                                    if drag_scalar(ui, "Rot max (rad)", &mut rmax, 0.02, None) {
+                                        tp2d_write_f64(slot, "rotationMax", rmax);
+                                        dirty = true;
+                                    }
+                                    let mut smin = tp2d_read_vec2(
+                                        slot,
+                                        "scaleMin",
+                                        ("scaleX", "scaleY"),
+                                        [1.0, 1.0],
+                                    );
+                                    if drag_vec2(ui, "Scale min", &mut smin, 0.02) {
+                                        tp2d_write_vec2(slot, "scaleMin", smin);
+                                        dirty = true;
+                                    }
+                                    let mut smax = tp2d_read_vec2(
+                                        slot,
+                                        "scaleMax",
+                                        ("scaleX", "scaleY"),
+                                        [1.0, 1.0],
+                                    );
+                                    if drag_vec2(ui, "Scale max", &mut smax, 0.02) {
+                                        tp2d_write_vec2(slot, "scaleMax", smax);
+                                        dirty = true;
+                                    }
+                                    let mut seed = tp2d_read_f64(slot, "seed", &[], 1.0);
+                                    if drag_scalar(ui, "Seed", &mut seed, 1.0, None) {
+                                        tp2d_write_f64(slot, "seed", seed);
+                                        dirty = true;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
 
@@ -15484,6 +21775,181 @@ fn show_text2d_objects_tab(
                 );
             }
         });
+}
+
+fn default_text_plus_2d_root() -> Value {
+    json!({
+        "schemaVersion": 1,
+        "characterProperties": { "mode": 0 },
+        "extraCharacterProperties": [{ "mode": 0 }, { "mode": 0 }]
+    })
+}
+
+fn text_plus_2d_slot_mut(
+    root: &mut Value,
+    tab_idx: usize,
+) -> Option<&mut serde_json::Map<String, Value>> {
+    match tab_idx {
+        0 => root.as_object_mut().and_then(|o| {
+            o.entry("characterProperties")
+                .or_insert_with(|| json!({ "mode": 0 }))
+                .as_object_mut()
+        }),
+        n => {
+            let extra_idx = n - 1;
+            root.as_object_mut().and_then(|o| {
+                let arr = o
+                    .entry("extraCharacterProperties")
+                    .or_insert_with(|| json!([{ "mode": 0 }, { "mode": 0 }]))
+                    .as_array_mut()?;
+                while arr.len() <= extra_idx {
+                    arr.push(json!({ "mode": 0 }));
+                }
+                arr[extra_idx].as_object_mut()
+            })
+        }
+    }
+}
+
+fn tp2d_unwrap_scalar_f64(v: &Value) -> Option<f64> {
+    if let Some(n) = v.as_f64() {
+        return n.is_finite().then_some(n);
+    }
+    if let Some(inner) = v.get("value") {
+        return tp2d_unwrap_scalar_f64(inner);
+    }
+    if let Some(arr) = v.as_array()
+        && let Some(first) = arr.first()
+    {
+        return tp2d_unwrap_scalar_f64(first);
+    }
+    None
+}
+
+fn tp2d_read_mode(slot: &serde_json::Map<String, Value>) -> usize {
+    let Some(v) = slot.get("mode") else {
+        return 0;
+    };
+    if let Some(s) = v
+        .as_str()
+        .or_else(|| v.get("value").and_then(Value::as_str))
+    {
+        return match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "character-transform" | "character transform" => 1,
+            "2" | "gradient-transform" | "gradient transform" => 2,
+            "3" | "character-shake" | "character shake" => 3,
+            "4" | "selected-transform" | "selected character transform" => 4,
+            "5" | "selected-shake" | "selected character shake" => 5,
+            "6" | "random-scatter" | "random scatter" => 6,
+            _ => 0,
+        };
+    }
+    (tp2d_unwrap_scalar_f64(v).unwrap_or(0.0).round() as i64).clamp(0, 6) as usize
+}
+
+fn tp2d_read_order(slot: &serde_json::Map<String, Value>, key: &str) -> usize {
+    let Some(v) = slot.get(key) else {
+        return 0;
+    };
+    if let Some(s) = v
+        .as_str()
+        .or_else(|| v.get("value").and_then(Value::as_str))
+    {
+        return match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "end" | "reverse" => 1,
+            "2" | "middle" | "center out" | "center-out" => 2,
+            "3" | "random" => 3,
+            _ => 0,
+        };
+    }
+    (tp2d_unwrap_scalar_f64(v).unwrap_or(0.0).round() as i64).clamp(0, 3) as usize
+}
+
+fn tp2d_read_str(slot: &serde_json::Map<String, Value>, key: &str, default: &str) -> String {
+    let Some(v) = slot.get(key) else {
+        return default.to_owned();
+    };
+    if let Some(s) = v.as_str() {
+        return s.to_owned();
+    }
+    if let Some(s) = v.get("value").and_then(Value::as_str) {
+        return s.to_owned();
+    }
+    default.to_owned()
+}
+
+fn tp2d_read_f64(
+    slot: &serde_json::Map<String, Value>,
+    canonical_key: &str,
+    legacy_keys: &[&str],
+    default: f64,
+) -> f64 {
+    if let Some(n) = slot.get(canonical_key).and_then(tp2d_unwrap_scalar_f64) {
+        return n;
+    }
+    for &lk in legacy_keys {
+        if let Some(n) = slot.get(lk).and_then(tp2d_unwrap_scalar_f64) {
+            return n;
+        }
+    }
+    default
+}
+
+fn tp2d_write_f64(slot: &mut serde_json::Map<String, Value>, canonical_key: &str, val: f64) {
+    slot.insert(canonical_key.to_owned(), json!(val));
+}
+
+fn tp2d_unwrap_vec2(v: &Value, default: [f64; 2]) -> Option<[f64; 2]> {
+    if let Some(arr) = v.as_array()
+        && arr.len() >= 2
+    {
+        return Some([
+            arr[0]
+                .as_f64()
+                .filter(|x| x.is_finite())
+                .unwrap_or(default[0]),
+            arr[1]
+                .as_f64()
+                .filter(|x| x.is_finite())
+                .unwrap_or(default[1]),
+        ]);
+    }
+    if let Some(objs) = v.get("objects").and_then(Value::as_array)
+        && objs.len() >= 2
+    {
+        return Some([
+            tp2d_unwrap_scalar_f64(&objs[0]).unwrap_or(default[0]),
+            tp2d_unwrap_scalar_f64(&objs[1]).unwrap_or(default[1]),
+        ]);
+    }
+    if let Some(inner) = v.get("value") {
+        return tp2d_unwrap_vec2(inner, default);
+    }
+    None
+}
+
+fn tp2d_read_vec2(
+    slot: &serde_json::Map<String, Value>,
+    canonical_key: &str,
+    legacy_xy: (&str, &str),
+    default: [f64; 2],
+) -> [f64; 2] {
+    if let Some(v) = slot
+        .get(canonical_key)
+        .and_then(|val| tp2d_unwrap_vec2(val, default))
+    {
+        return v;
+    }
+    let lx = slot.get(legacy_xy.0).and_then(tp2d_unwrap_scalar_f64);
+    let ly = slot.get(legacy_xy.1).and_then(tp2d_unwrap_scalar_f64);
+    if lx.is_some() || ly.is_some() {
+        return [lx.unwrap_or(default[0]), ly.unwrap_or(default[1])];
+    }
+    default
+}
+
+fn tp2d_write_vec2(slot: &mut serde_json::Map<String, Value>, canonical_key: &str, val: [f64; 2]) {
+    slot.insert(canonical_key.to_owned(), json!([val[0], val[1]]));
 }
 
 // ---------------------------------------------------------------------------
@@ -15583,7 +22049,7 @@ fn show_camera_plus_controls(
         .map_or(0, |(i, _)| i);
     let gate_changed = panel_property_row(
         ui,
-        "Film gate preset",
+        "Gate preset",
         true,
         state,
         theme,
@@ -15612,7 +22078,7 @@ fn show_camera_plus_controls(
         session,
         obj_id,
         "filmGate",
-        "Film gate (mm)",
+        "Film gate",
         36.0,
         ScrubConfig::new(2.0, 120.0, 0.1, 2),
         local_frame,
@@ -15627,7 +22093,7 @@ fn show_camera_plus_controls(
         session,
         obj_id,
         "filmOffsetX",
-        "Film offset X",
+        "Offset X",
         0.0,
         ScrubConfig::new(-100.0, 100.0, 0.1, 2),
         local_frame,
@@ -15642,7 +22108,7 @@ fn show_camera_plus_controls(
         session,
         obj_id,
         "filmOffsetY",
-        "Film offset Y",
+        "Offset Y",
         0.0,
         ScrubConfig::new(-100.0, 100.0, 0.1, 2),
         local_frame,
@@ -15659,7 +22125,7 @@ fn show_camera_plus_controls(
         session,
         obj_id,
         "motionBlur.enabled",
-        "Camera motion blur",
+        "Camera MB",
         &["off", "on"],
         0,
         false,
@@ -15723,7 +22189,7 @@ fn show_camera_plus_controls(
         session,
         obj_id,
         "dofFocusDistance",
-        "DOF focus dist",
+        "Focus dist",
         80.0,
         ScrubConfig::new(0.1, 10_000.0, 1.0, 1),
         local_frame,
@@ -15794,7 +22260,7 @@ fn show_camera_plus_controls(
         session,
         obj_id,
         "dofAperture",
-        "DOF aperture",
+        "Aperture",
         2.8,
         ScrubConfig::new(0.0, 40.0, 0.1, 2),
         local_frame,
@@ -15809,7 +22275,7 @@ fn show_camera_plus_controls(
         session,
         obj_id,
         "dofFocusAreaWidth",
-        "Focus band width",
+        "Focus area",
         10.0,
         ScrubConfig::new(0.0, 2000.0, 0.5, 1),
         local_frame,
@@ -15825,8 +22291,8 @@ fn show_camera_plus_controls(
         obj_id,
         "dofNearBlur",
         "Near blur",
-        1.0,
-        ScrubConfig::new(0.0, 10.0, 0.05, 2),
+        100.0,
+        ScrubConfig::new(0.0, 400.0, 1.0, 1),
         local_frame,
         clip_start,
         viewport_rect,
@@ -15840,8 +22306,8 @@ fn show_camera_plus_controls(
         obj_id,
         "dofFarBlur",
         "Far blur",
-        1.0,
-        ScrubConfig::new(0.0, 10.0, 0.05, 2),
+        100.0,
+        ScrubConfig::new(0.0, 400.0, 1.0, 1),
         local_frame,
         clip_start,
         viewport_rect,
@@ -16052,68 +22518,7 @@ fn show_text3d_plus_controls(
     theme: &Cm3Theme,
     actions: &mut Vec<PanelAction>,
 ) {
-    show_session_number_prop(
-        ui,
-        session,
-        obj_id,
-        "bevelTension",
-        "Bevel tension",
-        0.5,
-        ScrubConfig::new(0.0, 1.0, 0.05, 2),
-        local_frame,
-        clip_start,
-        viewport_rect,
-        state,
-        theme,
-        actions,
-    );
-    show_session_option_prop_ex(
-        ui,
-        session,
-        obj_id,
-        "bevelSide",
-        "Bevel side",
-        &["Both", "Front", "Back"],
-        0,
-        false,
-        local_frame,
-        clip_start,
-        viewport_rect,
-        state,
-        theme,
-        actions,
-    );
-    show_session_number_prop(
-        ui,
-        session,
-        obj_id,
-        "bevelDetail",
-        "Bevel detail",
-        3.0,
-        ScrubConfig::new(1.0, 32.0, 1.0, 0),
-        local_frame,
-        clip_start,
-        viewport_rect,
-        state,
-        theme,
-        actions,
-    );
-    show_session_option_prop_ex(
-        ui,
-        session,
-        obj_id,
-        "bevelProfile",
-        "Bevel profile",
-        &["Linear", "Convex", "Concave", "Step"],
-        0,
-        false,
-        local_frame,
-        clip_start,
-        viewport_rect,
-        state,
-        theme,
-        actions,
-    );
+    // Non-bevel Text+ controls (Bevel sub-controls are grouped consecutively right under `Bevel`)
     show_session_number_prop(
         ui,
         session,
@@ -16166,7 +22571,7 @@ fn show_text3d_plus_controls(
         session,
         obj_id,
         "characterIndexOffset",
-        "Char index offset",
+        "Char offset",
         0.0,
         ScrubConfig::new(-1000.0, 1000.0, 1.0, 0),
         local_frame,
@@ -16181,7 +22586,7 @@ fn show_text3d_plus_controls(
         session,
         obj_id,
         "characterCountOverride",
-        "Char count override",
+        "Char count",
         0.0,
         ScrubConfig::new(0.0, 1000.0, 1.0, 0),
         local_frame,
@@ -16200,14 +22605,7 @@ fn show_text3d_plus_controls(
         theme,
         |_| {},
         |ui| {
-            if cm3_prop_button(
-                ui,
-                "Split into Letters",
-                ButtonVariant::Normal,
-                false,
-                theme,
-            )
-            .clicked()
+            if cm3_prop_button(ui, "Split Letters", ButtonVariant::Normal, true, theme).clicked()
                 && let (Ok(cid), Ok(oid)) = (Uuid::parse_str(clip_id), Uuid::parse_str(obj_id))
             {
                 let _ = session.execute(Command::SplitText3DIntoLetters {
@@ -16589,19 +22987,40 @@ fn show_particles_3d_inspector(
                 actions,
             );
 
-            // Searchable 54-sprite picker from zc_scene::all_particle_sprite_names()
+            // Searchable 54-sprite picker (Particles+ plugin, collapsed by default so
+            // Color over Life and Size over Life are immediately visible without scrolling)
+            let particles_plus_enabled = session.plugins.is_enabled("particles-plus");
             let cur_sprite = eval_prop_str(
                 lookup_session_prop(session, obj_id, "particles.spritePreset").as_ref(),
                 local_frame,
                 "soft_glow",
             );
+            let sprite_hdr_rect =
+                Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), 27.0));
             cm3_collapsible_section(
                 ui,
                 Id::unique((obj_id, "particles_sprite_picker")),
                 &format!("Built-in Sprites ({})", all_particle_sprite_names().len()),
-                true,
+                false,
                 theme,
                 |ui| {
+                    if !particles_plus_enabled {
+                        Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(8, 6))
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(
+                                            "Enable the Particles+ plugin in Plugins to browse all 54 procedural sprites.",
+                                        )
+                                        .font(theme.font(FONT_SMALL))
+                                        .color(TEXT_MUTED),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        return;
+                    }
                     Frame::NONE
                         .inner_margin(egui::Margin::symmetric(6, 4))
                         .show(ui, |ui| {
@@ -16648,6 +23067,12 @@ fn show_particles_3d_inspector(
                         });
                 },
             );
+            ui.interact(
+                sprite_hdr_rect,
+                Id::unique((obj_id, "particles_sprite_picker_tip")),
+                Sense::hover(),
+            )
+            .on_hover_text("Browse 54 procedural sprites (Particles+)");
 
             // Color-over-Life stop editor (`particles.color` JSON)
             show_particle_color_over_life_editor(ui, session, obj_id, local_frame, theme);
@@ -17152,7 +23577,7 @@ fn show_extended_3d_object_props(
                 &obj.id,
                 "box_size",
                 "Size",
-                [10.0, 10.0, 10.0],
+                [40.0, 24.0, 6.0],
                 ScrubConfig::new(0.01, 10_000.0, 0.5, 2),
                 false,
                 local_frame,
@@ -17166,9 +23591,9 @@ fn show_extended_3d_object_props(
                 ui,
                 session,
                 &obj.id,
-                "bevelRadius",
-                "Bevel radius",
-                1.5,
+                "roundedBox.cornerRadius",
+                "Corner radius",
+                3.0,
                 ScrubConfig::new(0.0, 500.0, 0.1, 2),
                 local_frame,
                 clip_start,
@@ -17181,10 +23606,56 @@ fn show_extended_3d_object_props(
                 ui,
                 session,
                 &obj.id,
-                "segments",
-                "Bevel segments",
-                4.0,
+                "roundedBox.cornerSegments",
+                "Corner segments",
+                6.0,
                 ScrubConfig::new(1.0, 32.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "roundedBox.bevelSize",
+                "Bevel size",
+                0.6,
+                ScrubConfig::new(0.0, 500.0, 0.05, 2),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_number_prop(
+                ui,
+                session,
+                &obj.id,
+                "roundedBox.bevelSegments",
+                "Bevel segments",
+                2.0,
+                ScrubConfig::new(0.0, 32.0, 1.0, 0),
+                local_frame,
+                clip_start,
+                viewport_rect,
+                state,
+                theme,
+                actions,
+            );
+            show_session_option_prop_ex(
+                ui,
+                session,
+                &obj.id,
+                "roundedBox.shading",
+                "Shading",
+                &["Smooth", "Flat"],
+                0,
+                false,
                 local_frame,
                 clip_start,
                 viewport_rect,
@@ -17683,6 +24154,163 @@ fn show_extended_3d_object_props(
         k if k.starts_with("zoidium:repeater/") || k.starts_with("zoidcraft:repeater/") => {
             let sub = k.rsplit('/').next().unwrap_or("");
             match sub {
+                "radial" | "radial-repeater" => {
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "count",
+                        "Copies",
+                        8.0,
+                        ScrubConfig::new(1.0, 500.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "radius",
+                        "Radius",
+                        28.0,
+                        ScrubConfig::new(0.0, 10_000.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "startAngle",
+                        "Start angle",
+                        0.0,
+                        ScrubConfig::new(-3600.0, 3600.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "endAngle",
+                        "End angle",
+                        360.0,
+                        ScrubConfig::new(-3600.0, 3600.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "alignToCircle",
+                        "Align ring",
+                        &["off", "on"],
+                        1,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "axis",
+                        "Axis",
+                        &["X", "Y", "Z"],
+                        2,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "grid" | "grid-repeater" => {
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "countX",
+                        "Count X",
+                        3.0,
+                        ScrubConfig::new(1.0, 64.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "countY",
+                        "Count Y",
+                        3.0,
+                        ScrubConfig::new(1.0, 64.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "countZ",
+                        "Count Z",
+                        1.0,
+                        ScrubConfig::new(1.0, 64.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "spacing",
+                        "Spacing",
+                        [16.0, 16.0, 16.0],
+                        ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
                 "repeater" | "linear-repeater" | "random-repeater" | "echo-repeater" => {
                     show_session_number_prop(
                         ui,
@@ -17848,6 +24476,36 @@ fn show_extended_3d_object_props(
                         ui,
                         session,
                         &obj.id,
+                        "offset",
+                        "Offset",
+                        0.0,
+                        ScrubConfig::new(-1000.0, 1000.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "subdivision",
+                        "Subdivision",
+                        1.0,
+                        ScrubConfig::new(1.0, 16.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
                         "strength",
                         "Strength",
                         1.0,
@@ -17877,6 +24535,22 @@ fn show_extended_3d_object_props(
                         theme,
                         actions,
                     );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "axis",
+                        "Axis",
+                        &["Into Y", "Into Z"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
                     show_session_number_prop(
                         ui,
                         session,
@@ -17885,6 +24559,36 @@ fn show_extended_3d_object_props(
                         "Strength",
                         1.0,
                         ScrubConfig::new(-10.0, 10.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "offset",
+                        "Offset",
+                        0.0,
+                        ScrubConfig::new(-1000.0, 1000.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "subdivision",
+                        "Subdivision",
+                        1.0,
+                        ScrubConfig::new(1.0, 16.0, 1.0, 0),
                         local_frame,
                         clip_start,
                         viewport_rect,
@@ -18360,8 +25064,995 @@ fn show_extended_3d_object_props(
                 );
             }
         }
-        // --- Text+ & ExpressText+ Modifier Containers ---
-        k if k.contains("text-plus") || k.contains("expresstext-plus") => {
+        // --- ExpressText+ Modifier Containers & Effectors (exact `zc-expr::expresstext` keys) ---
+        k if k.contains("expresstext-plus") => {
+            let sub = k.rsplit('/').next().unwrap_or("expresstext");
+            // `lettersMode` dropdown: ["Per Letter", "Per Word", "Per Text"]
+            let lm_prop = lookup_session_prop(session, &obj.id, "lettersMode");
+            let mut lm_idx = eval_prop_value(lm_prop.as_ref(), local_frame).map_or(0usize, |v| {
+                if let Some(n) = v.as_f64() {
+                    (n.round().clamp(0.0, 2.0)) as usize
+                } else if let Some(s) = v.as_str() {
+                    match s.trim().to_ascii_lowercase().as_str() {
+                        "per_word" | "per word" | "word" | "1" => 1,
+                        "per_text" | "per text" | "across_texts" | "text" | "2" => 2,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                }
+            });
+            if panel_property_row(
+                ui,
+                "Letters mode",
+                true,
+                state,
+                theme,
+                |_| {},
+                |ui| {
+                    cm3_dropdown(
+                        ui,
+                        Id::unique((&obj.id, "expresstext_letters_mode")),
+                        &mut lm_idx,
+                        &["Per Letter", "Per Word", "Per Text"],
+                        false,
+                        viewport_rect,
+                        theme,
+                    )
+                },
+            ) {
+                let _ = session.execute(Command::SetPropertyValue {
+                    target_id: obj.id.clone(),
+                    property: "lettersMode".to_owned(),
+                    value: json!(lm_idx),
+                });
+            }
+
+            if sub != "expresstext" {
+                let enable_key = format!("{sub}Enable");
+                let strength_key = format!("{sub}Strength");
+                let delay_key = format!("{sub}Delay");
+                show_session_option_prop_ex(
+                    ui,
+                    session,
+                    &obj.id,
+                    &enable_key,
+                    "Enable",
+                    &["off", "on"],
+                    1,
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    &obj.id,
+                    &strength_key,
+                    "Strength",
+                    100.0,
+                    ScrubConfig::new(0.0, 100.0, 1.0, 1),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    &obj.id,
+                    &delay_key,
+                    "Delay",
+                    0.0,
+                    ScrubConfig::new(-120.0, 120.0, 0.25, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            }
+
+            match sub {
+                "shake" => {
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "shakePosition",
+                        "Position",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "shakeRotation",
+                        "Rotation",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-3600.0, 3600.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "shakeScale",
+                        "Scale",
+                        [1.0, 1.0, 1.0],
+                        ScrubConfig::new(-10.0, 10.0, 0.02, 2),
+                        true,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "shakeFrequency",
+                        "Frequency",
+                        1.0,
+                        ScrubConfig::new(0.0, 50.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "shakeOffset",
+                        "Offset",
+                        0.0,
+                        ScrubConfig::new(-100.0, 100.0, 0.1, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "shakeMode",
+                        "Mode",
+                        &["Sine", "Noise"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "shakeSeed",
+                        "Seed",
+                        1.0,
+                        ScrubConfig::new(0.0, 100_000.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "plain" => {
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "plainPosition",
+                        "Position",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "plainRotation",
+                        "Rotation",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-3600.0, 3600.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "plainScale",
+                        "Scale",
+                        [1.0, 1.0, 1.0],
+                        ScrubConfig::new(-10.0, 10.0, 0.02, 2),
+                        true,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "plainInvertOdd",
+                        "Invert odd",
+                        &["off", "on"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "random" => {
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "randomMode",
+                        "Mode",
+                        &["Uniform", "Gaussian", "Noise", "Turbulence", "Sorted"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "randomPositionMin",
+                        "Pos min",
+                        [-10.0, -10.0, -10.0],
+                        ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "randomPositionMax",
+                        "Pos max",
+                        [10.0, 10.0, 10.0],
+                        ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "randomRotationMin",
+                        "Rot min",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-3600.0, 3600.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "randomRotationMax",
+                        "Rot max",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-3600.0, 3600.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "randomAnimationSpeed",
+                        "Anim speed",
+                        0.0,
+                        ScrubConfig::new(0.0, 500.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "randomNoiseScale",
+                        "Noise scale",
+                        100.0,
+                        ScrubConfig::new(0.0, 1000.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "randomSeed",
+                        "Seed",
+                        1.0,
+                        ScrubConfig::new(0.0, 100_000.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "formula" => {
+                    show_session_text_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "formulaExpression",
+                        "Expression",
+                        "sin(u*360*f+t*90)",
+                        local_frame,
+                        state,
+                        theme,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "formulaPosition",
+                        "Position",
+                        [0.0, 10.0, 0.0],
+                        ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "formulaRotation",
+                        "Rotation",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-3600.0, 3600.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "formulaScale",
+                        "Scale",
+                        [1.0, 1.0, 1.0],
+                        ScrubConfig::new(-10.0, 10.0, 0.02, 2),
+                        true,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "formulaFrequency",
+                        "Frequency",
+                        1.0,
+                        ScrubConfig::new(0.0, 50.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "formulaTime",
+                        "Time scale",
+                        1.0,
+                        ScrubConfig::new(-50.0, 50.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "delay" => {
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "delayMode",
+                        "Mode",
+                        &["Even", "Blend", "Spring"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "delayPosition",
+                        "Affect pos",
+                        &["off", "on"],
+                        1,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "delayRotation",
+                        "Affect rot",
+                        &["off", "on"],
+                        1,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "delayScale",
+                        "Affect scale",
+                        &["off", "on"],
+                        1,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "spline" => {
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "splinePath",
+                        "Path",
+                        &["Line", "Circle", "Helix"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "splineLength",
+                        "Length",
+                        100.0,
+                        ScrubConfig::new(0.0, 10_000.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "splineRadius",
+                        "Radius",
+                        50.0,
+                        ScrubConfig::new(0.0, 10_000.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "splineHeight",
+                        "Height",
+                        100.0,
+                        ScrubConfig::new(0.0, 10_000.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "splineTurns",
+                        "Turns",
+                        1.0,
+                        ScrubConfig::new(-20.0, 20.0, 0.1, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "splineOffset",
+                        "Offset %",
+                        0.0,
+                        ScrubConfig::new(-500.0, 500.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "orbit" => {
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "orbitAngle",
+                        "Orbit angle",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-3600.0, 3600.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "orbitRadius",
+                        "Radius %",
+                        100.0,
+                        ScrubConfig::new(0.0, 1000.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "repeater" => {
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "repeaterMode",
+                        "Mode",
+                        &["Linear", "Random", "Echo"],
+                        0,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "repeaterCopies",
+                        "Copies",
+                        3.0,
+                        ScrubConfig::new(0.0, 64.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "repeaterOffset",
+                        "Offset",
+                        [0.0, 0.0, -5.0],
+                        ScrubConfig::new(-10_000.0, 10_000.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "repeaterRotation",
+                        "Rotation",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-3600.0, 3600.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "repeaterScale",
+                        "Scale",
+                        [1.0, 1.0, 1.0],
+                        ScrubConfig::new(0.01, 10.0, 0.02, 2),
+                        true,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "repeaterFade",
+                        "Fade %",
+                        0.0,
+                        ScrubConfig::new(0.0, 100.0, 1.0, 1),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "repeaterLag",
+                        "Echo lag",
+                        2.0,
+                        ScrubConfig::new(0.0, 60.0, 0.25, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "twist" => {
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "twistAngle",
+                        "Twist angle",
+                        0.0,
+                        ScrubConfig::new(-3600.0, 3600.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "twistAxis",
+                        "Axis",
+                        &["X", "Y", "Z"],
+                        2,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "wrap" => {
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "wrapAmplitude",
+                        "Amplitude",
+                        0.0,
+                        ScrubConfig::new(-500.0, 500.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "wrapFrequency",
+                        "Frequency",
+                        1.0,
+                        ScrubConfig::new(0.0, 50.0, 0.05, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "wrapPhase",
+                        "Phase",
+                        0.0,
+                        ScrubConfig::new(-360.0, 360.0, 0.1, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_option_prop_ex(
+                        ui,
+                        session,
+                        &obj.id,
+                        "wrapDirection",
+                        "Direction",
+                        &["X", "Y", "Z"],
+                        1,
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                "voronoi" => {
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "voronoiChunks",
+                        "Chunks",
+                        8.0,
+                        ScrubConfig::new(1.0, 64.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "voronoiDistance",
+                        "Distance",
+                        0.0,
+                        ScrubConfig::new(-500.0, 500.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_vec3_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "voronoiSpin",
+                        "Spin",
+                        [0.0, 0.0, 0.0],
+                        ScrubConfig::new(-3600.0, 3600.0, 0.5, 2),
+                        false,
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "voronoiScatter",
+                        "Scatter",
+                        0.0,
+                        ScrubConfig::new(0.0, 500.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "voronoiGravity",
+                        "Gravity",
+                        0.0,
+                        ScrubConfig::new(-500.0, 500.0, 0.5, 2),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                    show_session_number_prop(
+                        ui,
+                        session,
+                        &obj.id,
+                        "voronoiSeed",
+                        "Seed",
+                        1.0,
+                        ScrubConfig::new(0.0, 100_000.0, 1.0, 0),
+                        local_frame,
+                        clip_start,
+                        viewport_rect,
+                        state,
+                        theme,
+                        actions,
+                    );
+                }
+                _ => {}
+            }
+        }
+        // --- Text+ Modifier Containers ---
+        k if k.contains("text-plus") => {
             show_session_number_prop(
                 ui,
                 session,
@@ -18645,6 +26336,7 @@ fn show_falloff_field_section(
 fn show_material_slot_inspector(
     ui: &mut Ui,
     session: &mut Session,
+    clip_id: &str,
     obj_id: &str,
     obj_name: &str,
     prefix: &str,
@@ -18657,1278 +26349,1479 @@ fn show_material_slot_inspector(
     actions: &mut Vec<PanelAction>,
 ) {
     let k = |sub: &str| format!("{prefix}.{sub}");
-    cm3_collapsible_section_with_action(
-        ui,
-        Id::unique(("obj_mat_slot", obj_id, prefix)),
-        section_title,
-        prefix == "material",
-        true,
-        state.prop_columns.label_ratio,
-        None,
-        theme,
-        |ui| {
-            let mat_options: Vec<&str> = if session.plugins.is_enabled("material-plus") {
-                vec![
-                    "single color",
-                    "texture",
-                    "video",
-                    "custom PBR",
-                    "custom shader",
-                    "PBR+ (Material+)",
-                    "Matcap (Material+)",
-                    "Image+ (Material+)",
-                    "Node Material",
-                ]
-            } else {
-                vec![
-                    "single color",
-                    "texture",
-                    "video",
-                    "custom PBR",
-                    "custom shader",
-                ]
-            };
-            let type_key = k("type");
-            show_session_option_prop_ex(
-                ui,
-                session,
-                obj_id,
-                &type_key,
-                "Material",
-                &mat_options,
-                0,
-                false,
-                local_frame,
-                clip_start,
-                viewport_rect,
-                state,
-                theme,
-                actions,
-            );
-            let mat_type = eval_prop_u32(
-                lookup_session_prop(session, obj_id, &type_key).as_ref(),
-                local_frame,
-                0,
-            );
-            match mat_type {
-                0 => {
-                    show_session_color_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("color"),
-                        "Color",
-                        [1.0, 1.0, 1.0],
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_option_prop_ex(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("side"),
-                        "Render side",
-                        &["front", "back", "double"],
-                        0,
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                }
-                1 => {
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("texture"),
-                        "Image",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_option_prop_ex(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("side"),
-                        "Render side",
-                        &["front", "back", "double"],
-                        0,
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                }
-                2 => {
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("texture"),
-                        "Video",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_color_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("color"),
-                        "Color",
-                        [1.0, 1.0, 1.0],
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("opacity"),
-                        "Opacity",
-                        1.0,
-                        ScrubConfig::new(0.0, 1.0, 0.05, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                }
-                3 => {
-                    // Custom PBR + UV Normalized / Wrap / Repeat / Offset / NormalMap / Reflection
-                    show_session_color_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("color"),
-                        "Color",
-                        [1.0, 1.0, 1.0],
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_color_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("emissive"),
-                        "Emissive",
-                        [0.0, 0.0, 0.0],
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("roughness"),
-                        "Roughness",
-                        0.5,
-                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("metalness"),
-                        "Metalness",
-                        0.5,
-                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("texture"),
-                        "Albedo map",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("normalMap"),
-                        "Normal map",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_vec2_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("normalScale"),
-                        "Normal scale",
-                        [1.0, 1.0],
-                        ScrubConfig::new(-10.0, 10.0, 0.05, 2),
-                        true,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_option_prop_ex(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("uvNormalized"),
-                        "UV normalized",
-                        &["off", "on"],
-                        1,
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_option_prop_ex(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("wrap"),
-                        "UV wrap",
-                        &["Clamp", "Repeat", "Mirrored"],
-                        1,
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_vec2_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("repeat"),
-                        "UV repeat",
-                        [1.0, 1.0],
-                        ScrubConfig::new(-100.0, 100.0, 0.05, 2),
-                        true,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_vec2_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("offset"),
-                        "UV offset",
-                        [0.0, 0.0],
-                        ScrubConfig::new(-100.0, 100.0, 0.02, 2),
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("rotation"),
-                        "UV rotation",
-                        0.0,
-                        ScrubConfig::new(-360.0, 360.0, 1.0, 1),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("reflection"),
-                        "Reflection",
-                        0.0,
-                        ScrubConfig::new(0.0, 2.0, 0.05, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("opacity"),
-                        "Opacity",
-                        1.0,
-                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_option_prop_ex(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("side"),
-                        "Render side",
-                        &["front", "back", "double"],
-                        0,
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                }
-                4 => {
-                    let frag_key = k("fragShader");
-                    let cur_code = eval_prop_str(
-                        lookup_session_prop(session, obj_id, &frag_key).as_ref(),
-                        local_frame,
-                        DEFAULT_CUSTOM_SHADER_GLSL,
-                    );
-                    cm3_property_row_aligned(
-                        ui,
-                        "Fragment shader",
-                        true,
-                        state.prop_columns,
-                        theme,
-                        |_| {},
-                        |ui| {
-                            if cm3_prop_button(
-                                ui,
-                                "Edit shader",
-                                ButtonVariant::Normal,
-                                false,
-                                theme,
-                            )
-                            .clicked()
-                            {
-                                state.shader_editor = Some(ShaderEditorTarget {
-                                    effect_id: obj_id.to_owned(),
-                                    property: frag_key.clone(),
-                                    effect_name: obj_name.to_owned(),
-                                    code: cur_code.clone(),
-                                    font_px: 14.0,
-                                    error_message: None,
-                                });
-                                let spec =
-                                    FloatingWindowSpec::new("shader_editor", "Shader Editor")
-                                        .with_subtitle(obj_name.to_owned())
-                                        .with_default_size(Vec2::new(560.0, 440.0));
-                                state.floating_windows.open_or_focus(&spec, viewport_rect);
-                            }
-                        },
-                    );
-                }
-                5 => {
-                    // PBR+ (Material+): All Maps + AO + All 7 Surface Sections
-                    show_session_color_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("color"),
-                        "Base color",
-                        [1.0, 1.0, 1.0],
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("texture"),
-                        "Base color map",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_color_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("emissive"),
-                        "Emissive",
-                        [0.0, 0.0, 0.0],
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("emissiveIntensity"),
-                        "Emissive int",
-                        1.0,
-                        ScrubConfig::new(0.0, 20.0, 0.05, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("emissiveMap"),
-                        "Emissive map",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("roughness"),
-                        "Roughness",
-                        0.5,
-                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("roughnessMap"),
-                        "Roughness map",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("metalness"),
-                        "Metalness",
-                        0.0,
-                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("metalnessMap"),
-                        "Metalness map",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("normalMap"),
-                        "Normal map",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("alphaMap"),
-                        "Alpha map",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("alphaTest"),
-                        "Alpha cutoff",
-                        0.0,
-                        ScrubConfig::new(0.0, 1.0, 0.01, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("opacity"),
-                        "Opacity",
-                        1.0,
-                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_option_prop_ex(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("side"),
-                        "Render side",
-                        &["front", "back", "double"],
-                        0,
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
+    let sec_id = Id::unique(("obj_mat_slot", obj_id, prefix));
+    let mut open = ui
+        .data_mut(|d| d.get_temp::<bool>(sec_id))
+        .unwrap_or(prefix == "material");
 
-                    // 7 PBR+ Surface Sections
-                    cm3_collapsible_section(
-                        ui,
-                        Id::unique((obj_id, prefix, "surf_ao")),
-                        "Surface: Ambient Occlusion",
-                        false,
-                        theme,
-                        |ui| {
-                            show_session_asset_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("aoTexture"),
-                                "AO map",
-                                false,
-                                local_frame,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_number_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("aoIntensity"),
-                                "AO intensity",
-                                1.0,
-                                ScrubConfig::new(0.0, 4.0, 0.05, 2),
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                        },
-                    );
-                    cm3_collapsible_section(
-                        ui,
-                        Id::unique((obj_id, prefix, "surf_cel")),
-                        "Surface: Cel Shading",
-                        false,
-                        theme,
-                        |ui| {
-                            show_session_option_prop_ex(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("celEnabled"),
-                                "Enable cel",
-                                &["off", "on"],
-                                0,
-                                false,
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_number_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("celBands"),
-                                "Bands",
-                                3.0,
-                                ScrubConfig::new(2.0, 16.0, 1.0, 0),
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_number_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("celSmoothness"),
-                                "Smoothness",
-                                0.05,
-                                ScrubConfig::new(0.0, 1.0, 0.01, 2),
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                        },
-                    );
-                    cm3_collapsible_section(
-                        ui,
-                        Id::unique((obj_id, prefix, "surf_fresnel")),
-                        "Surface: Fresnel Rim",
-                        false,
-                        theme,
-                        |ui| {
-                            show_session_option_prop_ex(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("fresnelEnabled"),
-                                "Enable fresnel",
-                                &["off", "on"],
-                                0,
-                                false,
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_color_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("fresnelColor"),
-                                "Rim color",
-                                [1.0, 1.0, 1.0],
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_number_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("fresnelPower"),
-                                "Power",
-                                3.0,
-                                ScrubConfig::new(0.2, 16.0, 0.1, 2),
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_number_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("fresnelIntensity"),
-                                "Intensity",
-                                1.0,
-                                ScrubConfig::new(0.0, 5.0, 0.05, 2),
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                        },
-                    );
-                    cm3_collapsible_section(
-                        ui,
-                        Id::unique((obj_id, prefix, "surf_ramp")),
-                        "Surface: Color Ramp",
-                        false,
-                        theme,
-                        |ui| {
-                            show_session_option_prop_ex(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("rampEnabled"),
-                                "Enable ramp",
-                                &["off", "on"],
-                                0,
-                                false,
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_color_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("rampColorA"),
-                                "Low color",
-                                [0.1, 0.15, 0.25],
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_color_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("rampColorB"),
-                                "High color",
-                                [1.0, 0.9, 0.7],
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_number_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("rampMix"),
-                                "Mix",
-                                0.5,
-                                ScrubConfig::new(0.0, 1.0, 0.02, 2),
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                        },
-                    );
-                    cm3_collapsible_section(
-                        ui,
-                        Id::unique((obj_id, prefix, "surf_bump")),
-                        "Surface: 3D Bump Noise",
-                        false,
-                        theme,
-                        |ui| {
-                            show_session_option_prop_ex(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("bumpNoiseEnabled"),
-                                "Enable bump",
-                                &["off", "on"],
-                                0,
-                                false,
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_number_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("bumpNoiseScale"),
-                                "Scale",
-                                4.0,
-                                ScrubConfig::new(0.1, 100.0, 0.2, 2),
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_number_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("bumpNoiseStrength"),
-                                "Strength",
-                                0.3,
-                                ScrubConfig::new(0.0, 4.0, 0.05, 2),
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                        },
-                    );
-                    cm3_collapsible_section(
-                        ui,
-                        Id::unique((obj_id, prefix, "surf_uv")),
-                        "Surface: UV Projection",
-                        false,
-                        theme,
-                        |ui| {
-                            show_session_option_prop_ex(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("uvProjection"),
-                                "Projection",
-                                &["UV", "Triplanar", "Box", "Spherical"],
-                                0,
-                                false,
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_vec2_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("repeat"),
-                                "UV repeat",
-                                [1.0, 1.0],
-                                ScrubConfig::new(-100.0, 100.0, 0.05, 2),
-                                true,
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_vec2_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("offset"),
-                                "UV offset",
-                                [0.0, 0.0],
-                                ScrubConfig::new(-100.0, 100.0, 0.02, 2),
-                                false,
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                        },
-                    );
-                    cm3_collapsible_section(
-                        ui,
-                        Id::unique((obj_id, prefix, "surf_env")),
-                        "Surface: Env Reflection",
-                        false,
-                        theme,
-                        |ui| {
-                            show_session_number_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("reflection"),
-                                "Env intensity",
-                                0.0,
-                                ScrubConfig::new(0.0, 4.0, 0.05, 2),
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                            show_session_number_prop(
-                                ui,
-                                session,
-                                obj_id,
-                                &k("reflectionIntensity"),
-                                "Reflectivity",
-                                1.0,
-                                ScrubConfig::new(0.0, 4.0, 0.05, 2),
-                                local_frame,
-                                clip_start,
-                                viewport_rect,
-                                state,
-                                theme,
-                                actions,
-                            );
-                        },
-                    );
-                }
-                6 => {
-                    // Matcap
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("texture"),
-                        "Matcap image",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_color_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("color"),
-                        "Tint color",
-                        [1.0, 1.0, 1.0],
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("brightness"),
-                        "Brightness",
-                        1.0,
-                        ScrubConfig::new(0.0, 4.0, 0.05, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("opacity"),
-                        "Opacity",
-                        1.0,
-                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_option_prop_ex(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("side"),
-                        "Render side",
-                        &["front", "back", "double"],
-                        0,
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                }
-                7 => {
-                    // Image+
-                    show_session_asset_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("texture"),
-                        "Image",
-                        false,
-                        local_frame,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_option_prop_ex(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("wrap"),
-                        "UV wrap",
-                        &["Clamp", "Repeat", "Mirrored"],
-                        0,
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_vec2_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("repeat"),
-                        "Repeat",
-                        [1.0, 1.0],
-                        ScrubConfig::new(-100.0, 100.0, 0.05, 2),
-                        true,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_vec2_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("offset"),
-                        "Offset",
-                        [0.0, 0.0],
-                        ScrubConfig::new(-100.0, 100.0, 0.02, 2),
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("rotation"),
-                        "Rotation",
-                        0.0,
-                        ScrubConfig::new(-360.0, 360.0, 1.0, 1),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_number_prop(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("opacity"),
-                        "Opacity",
-                        1.0,
-                        ScrubConfig::new(0.0, 1.0, 0.02, 2),
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                    show_session_option_prop_ex(
-                        ui,
-                        session,
-                        obj_id,
-                        &k("side"),
-                        "Render side",
-                        &["front", "back", "double"],
-                        0,
-                        false,
-                        local_frame,
-                        clip_start,
-                        viewport_rect,
-                        state,
-                        theme,
-                        actions,
-                    );
-                }
-                8 => {
-                    // NodeMaterial -> Opens real interactive Node Graph Editor!
-                    let res_key = k("bakeResolution");
-                    let cur_res = eval_prop_u32(
-                        lookup_session_prop(session, obj_id, &res_key).as_ref(),
-                        local_frame,
-                        512,
-                    );
-                    let res_opts = [256u32, 512, 1024, 2048];
-                    let mut res_idx = res_opts.iter().position(|&r| r == cur_res).unwrap_or(1);
-                    if panel_property_row(
-                        ui,
-                        "Bake resolution",
-                        true,
-                        state,
-                        theme,
-                        |_| {},
-                        |ui| {
-                            cm3_dropdown(
-                                ui,
-                                Id::unique((obj_id, prefix, "node_mat_res")),
-                                &mut res_idx,
-                                &["256×256", "512×512", "1024×1024", "2048×2048"],
-                                false,
-                                viewport_rect,
-                                theme,
-                            )
-                        },
-                    ) {
-                        let _ = session.execute(Command::SetPropertyValue {
-                            target_id: obj_id.to_owned(),
-                            property: res_key,
-                            value: json!(res_opts[res_idx]),
-                        });
-                    }
-                    let graph_key = k("graph");
-                    let open_node_mat = panel_property_row(
-                        ui,
-                        "Node graph",
-                        true,
-                        state,
-                        theme,
-                        |_| {},
-                        |ui| {
-                            cm3_prop_button(
-                                ui,
-                                "Open Node Material Editor",
-                                ButtonVariant::Primary,
-                                false,
-                                theme,
-                            )
-                            .clicked()
-                        },
-                    );
-                    if open_node_mat {
-                        let cur_graph = lookup_session_prop(session, obj_id, &graph_key)
-                            .and_then(|p| eval_prop_value(Some(&p), local_frame));
-                        state.node_graph_editor.open_for_target(
-                            NodeGraphTargetKind::NodeMaterial,
-                            obj_id,
-                            &graph_key,
-                            obj_name,
-                            cur_graph.as_ref(),
-                        );
-                        let spec =
-                            FloatingWindowSpec::new("pro_node_graph_editor", "Node Graph Editor")
-                                .with_default_size(Vec2::new(980.0, 620.0));
-                        state.floating_windows.open_or_focus(&spec, viewport_rect);
-                    }
-                }
-                _ => {}
-            }
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let indent_px = 15.0_f32;
+    let (hdr_rect, hdr_resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
+    let hdr_resp = hdr_resp.on_hover_cursor(CursorIcon::PointingHand);
+    ui.painter()
+        .rect_filled(hdr_rect, CornerRadius::ZERO, BG_PANEL);
+    let div_y = (hdr_rect.bottom() - 1.0).round();
+    ui.painter().rect_filled(
+        Rect::from_min_max(
+            Pos2::new(hdr_rect.left(), div_y),
+            Pos2::new(hdr_rect.right(), div_y + 1.0),
+        ),
+        CornerRadius::ZERO,
+        BORDER_ROW_SOFT,
+    );
+
+    let mut action_clicked = false;
+    let mut action_hovered = false;
+    let mut title_right = hdr_rect.right() - 4.0;
+    if prefix == "material" {
+        let btn_y = (hdr_rect.center().y - 9.0).round();
+        let copy_w = (ui
+            .painter()
+            .layout_no_wrap("Copy".to_owned(), theme.font(FONT_COMPACT), TEXT_PRIMARY)
+            .size()
+            .x
+            .ceil()
+            + 10.0)
+            .max(36.0);
+        let paste_w = (ui
+            .painter()
+            .layout_no_wrap("Paste".to_owned(), theme.font(FONT_COMPACT), TEXT_PRIMARY)
+            .size()
+            .x
+            .ceil()
+            + 10.0)
+            .max(40.0);
+        let paste_rect = Rect::from_min_size(
+            Pos2::new((hdr_rect.right() - paste_w - 6.0).round(), btn_y),
+            Vec2::new(paste_w, 18.0),
+        );
+        let copy_rect = Rect::from_min_size(
+            Pos2::new((paste_rect.left() - copy_w - 4.0).round(), btn_y),
+            Vec2::new(copy_w, 18.0),
+        );
+        let (copy_clicked, copy_hov) = header_compact_action_button(
+            ui,
+            sec_id.with("copy_mat"),
+            copy_rect,
+            "Copy",
+            "Copy Material JSON (Cmd+C)",
+            theme,
+        );
+        let (paste_clicked, paste_hov) = header_compact_action_button(
+            ui,
+            sec_id.with("paste_mat"),
+            paste_rect,
+            "Paste",
+            "Paste Material or Node Material JSON (Cmd+V)",
+            theme,
+        );
+        action_hovered = copy_hov || paste_hov;
+        title_right = copy_rect.left() - 4.0;
+        if copy_clicked {
+            action_clicked = true;
+            let res = session.copy_material_as_pz_json(clip_id, obj_id);
+            copy_pz_json_to_clipboard(ui.ctx(), res, "Copied Material JSON to clipboard", actions);
+        } else if paste_clicked {
+            action_clicked = true;
+            paste_pz_json_from_clipboard(
+                session,
+                state,
+                actions,
+                "material",
+                Some(clip_id.to_owned()),
+                None,
+                Some(obj_id.to_owned()),
+                None,
+                "Material JSON",
+            );
+        }
+    }
+
+    paint_cm3_tree_box(
+        ui.painter(),
+        Pos2::new(
+            hdr_rect.left() + 10.5 + indent_px,
+            hdr_rect.center().y + 0.5,
+        ),
+        open,
+        if hdr_resp.hovered() && !action_hovered {
+            TEXT_BRIGHT
+        } else {
+            TEXT_MUTED
         },
     );
+    let title_x = hdr_rect.left() + 21.0 + indent_px;
+    let title_clip = Rect::from_min_max(
+        Pos2::new(title_x - 1.0, hdr_rect.top()),
+        Pos2::new(title_right.max(title_x), hdr_rect.bottom()),
+    );
+    ui.painter().with_clip_rect(title_clip).text(
+        Pos2::new(title_x, hdr_rect.center().y),
+        Align2::LEFT_CENTER,
+        section_title,
+        theme.font(FONT_BODY),
+        TEXT_PRIMARY,
+    );
+
+    if hdr_resp.clicked() && !action_clicked {
+        open = !open;
+    }
+    ui.data_mut(|d| d.insert_temp(sec_id, open));
+
+    if !open {
+        return;
+    }
+
+    let prev_indent = state.inspector_root_indent;
+    state.inspector_root_indent = true;
+    {
+        let mat_options: Vec<&str> = if session.plugins.is_enabled("material-plus") {
+            vec![
+                "single color",
+                "texture",
+                "video",
+                "custom PBR",
+                "custom shader",
+                "PBR+ (Material+)",
+                "Matcap (Material+)",
+                "Image+ (Material+)",
+                "Node Material",
+            ]
+        } else {
+            vec![
+                "single color",
+                "texture",
+                "video",
+                "custom PBR",
+                "custom shader",
+            ]
+        };
+        let type_key = k("type");
+        let prev_mat_type = eval_prop_u32(
+            lookup_session_prop(session, obj_id, &type_key).as_ref(),
+            local_frame,
+            0,
+        );
+        show_session_option_prop_ex(
+            ui,
+            session,
+            obj_id,
+            &type_key,
+            "Material",
+            &mat_options,
+            0,
+            false,
+            local_frame,
+            clip_start,
+            viewport_rect,
+            state,
+            theme,
+            actions,
+        );
+        let mat_type = eval_prop_u32(
+            lookup_session_prop(session, obj_id, &type_key).as_ref(),
+            local_frame,
+            0,
+        );
+        if mat_type == 8 {
+            let needs_graph_init = !node_material_has_populated_graph(session, obj_id, prefix);
+            if prev_mat_type != 8 || needs_graph_init {
+                initialize_node_material_defaults(session, obj_id, prefix, prev_mat_type != 8);
+            }
+        }
+        match mat_type {
+            0 => {
+                show_session_color_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("color"),
+                    "Color",
+                    [1.0, 1.0, 1.0],
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_option_prop_ex(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("side"),
+                    "Render side",
+                    &["front", "back", "double"],
+                    0,
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            }
+            1 => {
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("texture"),
+                    "Image",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_option_prop_ex(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("side"),
+                    "Render side",
+                    &["front", "back", "double"],
+                    0,
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            }
+            2 => {
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("texture"),
+                    "Video",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_color_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("color"),
+                    "Color",
+                    [1.0, 1.0, 1.0],
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("opacity"),
+                    "Opacity",
+                    1.0,
+                    ScrubConfig::new(0.0, 1.0, 0.05, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            }
+            3 => {
+                // Custom PBR + UV Normalized / Wrap / Repeat / Offset / NormalMap / Reflection
+                show_session_color_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("color"),
+                    "Color",
+                    [1.0, 1.0, 1.0],
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_color_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("emissive"),
+                    "Emissive",
+                    [0.0, 0.0, 0.0],
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("roughness"),
+                    "Roughness",
+                    0.5,
+                    ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("metalness"),
+                    "Metalness",
+                    0.5,
+                    ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("texture"),
+                    "Albedo map",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("normalMap"),
+                    "Normal map",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_vec2_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("normalScale"),
+                    "Normal scale",
+                    [1.0, 1.0],
+                    ScrubConfig::new(-10.0, 10.0, 0.05, 2),
+                    true,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_option_prop_ex(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("uvNormalized"),
+                    "UV normalized",
+                    &["off", "on"],
+                    1,
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_option_prop_ex(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("wrap"),
+                    "UV wrap",
+                    &["Clamp", "Repeat", "Mirrored"],
+                    1,
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_vec2_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("repeat"),
+                    "UV repeat",
+                    [1.0, 1.0],
+                    ScrubConfig::new(-100.0, 100.0, 0.05, 2),
+                    true,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_vec2_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("offset"),
+                    "UV offset",
+                    [0.0, 0.0],
+                    ScrubConfig::new(-100.0, 100.0, 0.02, 2),
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("rotation"),
+                    "UV rotation",
+                    0.0,
+                    ScrubConfig::new(-360.0, 360.0, 1.0, 1),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("reflection"),
+                    "Reflection",
+                    0.0,
+                    ScrubConfig::new(0.0, 2.0, 0.05, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("opacity"),
+                    "Opacity",
+                    1.0,
+                    ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_option_prop_ex(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("side"),
+                    "Render side",
+                    &["front", "back", "double"],
+                    0,
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            }
+            4 => {
+                let frag_key = k("fragShader");
+                let cur_code = eval_prop_str(
+                    lookup_session_prop(session, obj_id, &frag_key).as_ref(),
+                    local_frame,
+                    DEFAULT_CUSTOM_SHADER_GLSL,
+                );
+                cm3_property_row_aligned(
+                    ui,
+                    "Fragment shader",
+                    true,
+                    state.prop_columns,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        if cm3_prop_button(ui, "Edit shader", ButtonVariant::Normal, false, theme)
+                            .clicked()
+                        {
+                            state.shader_editor = Some(ShaderEditorTarget {
+                                effect_id: obj_id.to_owned(),
+                                property: frag_key.clone(),
+                                effect_name: obj_name.to_owned(),
+                                code: cur_code.clone(),
+                                font_px: 14.0,
+                                error_message: None,
+                            });
+                            state.shader_editor_just_opened = true;
+                            let spec = FloatingWindowSpec::new("shader_editor", "Shader Editor")
+                                .with_subtitle(obj_name.to_owned())
+                                .with_default_size(Vec2::new(560.0, 440.0));
+                            state.floating_windows.open_or_focus(&spec, viewport_rect);
+                        }
+                    },
+                );
+            }
+            5 => {
+                // PBR+ (Material+): All Maps + AO + All 7 Surface Sections
+                show_session_color_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("color"),
+                    "Base color",
+                    [1.0, 1.0, 1.0],
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("texture"),
+                    "Base color map",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_color_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("emissive"),
+                    "Emissive",
+                    [0.0, 0.0, 0.0],
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("emissiveIntensity"),
+                    "Emissive int",
+                    1.0,
+                    ScrubConfig::new(0.0, 20.0, 0.05, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("emissiveMap"),
+                    "Emissive map",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("roughness"),
+                    "Roughness",
+                    0.5,
+                    ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("roughnessMap"),
+                    "Roughness map",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("metalness"),
+                    "Metalness",
+                    0.0,
+                    ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("metalnessMap"),
+                    "Metalness map",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("normalMap"),
+                    "Normal map",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("alphaMap"),
+                    "Alpha map",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("alphaTest"),
+                    "Alpha cutoff",
+                    0.0,
+                    ScrubConfig::new(0.0, 1.0, 0.01, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("opacity"),
+                    "Opacity",
+                    1.0,
+                    ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_option_prop_ex(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("side"),
+                    "Render side",
+                    &["front", "back", "double"],
+                    0,
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+
+                // 7 PBR+ Surface Sections
+                cm3_collapsible_section(
+                    ui,
+                    Id::unique((obj_id, prefix, "surf_ao")),
+                    "Surface: Ambient Occlusion",
+                    false,
+                    theme,
+                    |ui| {
+                        show_session_asset_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("aoTexture"),
+                            "AO map",
+                            false,
+                            local_frame,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("aoIntensity"),
+                            "AO intensity",
+                            1.0,
+                            ScrubConfig::new(0.0, 4.0, 0.05, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    },
+                );
+                cm3_collapsible_section(
+                    ui,
+                    Id::unique((obj_id, prefix, "surf_cel")),
+                    "Surface: Cel Shading",
+                    false,
+                    theme,
+                    |ui| {
+                        show_session_option_prop_ex(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("celEnabled"),
+                            "Enable cel",
+                            &["off", "on"],
+                            0,
+                            false,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("celBands"),
+                            "Bands",
+                            3.0,
+                            ScrubConfig::new(2.0, 16.0, 1.0, 0),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("celSmoothness"),
+                            "Smoothness",
+                            0.05,
+                            ScrubConfig::new(0.0, 1.0, 0.01, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    },
+                );
+                cm3_collapsible_section(
+                    ui,
+                    Id::unique((obj_id, prefix, "surf_fresnel")),
+                    "Surface: Fresnel Rim",
+                    false,
+                    theme,
+                    |ui| {
+                        show_session_option_prop_ex(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("fresnelEnabled"),
+                            "Enable fresnel",
+                            &["off", "on"],
+                            0,
+                            false,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_color_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("fresnelColor"),
+                            "Rim color",
+                            [1.0, 1.0, 1.0],
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("fresnelPower"),
+                            "Power",
+                            3.0,
+                            ScrubConfig::new(0.2, 16.0, 0.1, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("fresnelIntensity"),
+                            "Intensity",
+                            1.0,
+                            ScrubConfig::new(0.0, 5.0, 0.05, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    },
+                );
+                cm3_collapsible_section(
+                    ui,
+                    Id::unique((obj_id, prefix, "surf_ramp")),
+                    "Surface: Color Ramp",
+                    false,
+                    theme,
+                    |ui| {
+                        show_session_option_prop_ex(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("rampEnabled"),
+                            "Enable ramp",
+                            &["off", "on"],
+                            0,
+                            false,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_color_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("rampColorA"),
+                            "Low color",
+                            [0.1, 0.15, 0.25],
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_color_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("rampColorB"),
+                            "High color",
+                            [1.0, 0.9, 0.7],
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("rampMix"),
+                            "Mix",
+                            0.5,
+                            ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    },
+                );
+                cm3_collapsible_section(
+                    ui,
+                    Id::unique((obj_id, prefix, "surf_bump")),
+                    "Surface: 3D Bump Noise",
+                    false,
+                    theme,
+                    |ui| {
+                        show_session_option_prop_ex(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("bumpNoiseEnabled"),
+                            "Enable bump",
+                            &["off", "on"],
+                            0,
+                            false,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("bumpNoiseScale"),
+                            "Scale",
+                            4.0,
+                            ScrubConfig::new(0.1, 100.0, 0.2, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("bumpNoiseStrength"),
+                            "Strength",
+                            0.3,
+                            ScrubConfig::new(0.0, 4.0, 0.05, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    },
+                );
+                cm3_collapsible_section(
+                    ui,
+                    Id::unique((obj_id, prefix, "surf_uv")),
+                    "Surface: UV Projection",
+                    false,
+                    theme,
+                    |ui| {
+                        show_session_option_prop_ex(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("uvProjection"),
+                            "Projection",
+                            &["UV", "Triplanar", "Box", "Spherical"],
+                            0,
+                            false,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_vec2_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("repeat"),
+                            "UV repeat",
+                            [1.0, 1.0],
+                            ScrubConfig::new(-100.0, 100.0, 0.05, 2),
+                            true,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_vec2_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("offset"),
+                            "UV offset",
+                            [0.0, 0.0],
+                            ScrubConfig::new(-100.0, 100.0, 0.02, 2),
+                            false,
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    },
+                );
+                cm3_collapsible_section(
+                    ui,
+                    Id::unique((obj_id, prefix, "surf_env")),
+                    "Surface: Env Reflection",
+                    false,
+                    theme,
+                    |ui| {
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("reflection"),
+                            "Env intensity",
+                            0.0,
+                            ScrubConfig::new(0.0, 4.0, 0.05, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                        show_session_number_prop(
+                            ui,
+                            session,
+                            obj_id,
+                            &k("reflectionIntensity"),
+                            "Reflectivity",
+                            1.0,
+                            ScrubConfig::new(0.0, 4.0, 0.05, 2),
+                            local_frame,
+                            clip_start,
+                            viewport_rect,
+                            state,
+                            theme,
+                            actions,
+                        );
+                    },
+                );
+            }
+            6 => {
+                // Matcap
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("texture"),
+                    "Matcap image",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_color_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("color"),
+                    "Tint color",
+                    [1.0, 1.0, 1.0],
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("brightness"),
+                    "Brightness",
+                    1.0,
+                    ScrubConfig::new(0.0, 4.0, 0.05, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("opacity"),
+                    "Opacity",
+                    1.0,
+                    ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_option_prop_ex(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("side"),
+                    "Render side",
+                    &["front", "back", "double"],
+                    0,
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            }
+            7 => {
+                // Image+
+                show_session_asset_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("texture"),
+                    "Image",
+                    false,
+                    local_frame,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_option_prop_ex(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("wrap"),
+                    "UV wrap",
+                    &["Clamp", "Repeat", "Mirrored"],
+                    0,
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_vec2_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("repeat"),
+                    "Repeat",
+                    [1.0, 1.0],
+                    ScrubConfig::new(-100.0, 100.0, 0.05, 2),
+                    true,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_vec2_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("offset"),
+                    "Offset",
+                    [0.0, 0.0],
+                    ScrubConfig::new(-100.0, 100.0, 0.02, 2),
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("rotation"),
+                    "Rotation",
+                    0.0,
+                    ScrubConfig::new(-360.0, 360.0, 1.0, 1),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_number_prop(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("opacity"),
+                    "Opacity",
+                    1.0,
+                    ScrubConfig::new(0.0, 1.0, 0.02, 2),
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+                show_session_option_prop_ex(
+                    ui,
+                    session,
+                    obj_id,
+                    &k("side"),
+                    "Render side",
+                    &["front", "back", "double"],
+                    0,
+                    false,
+                    local_frame,
+                    clip_start,
+                    viewport_rect,
+                    state,
+                    theme,
+                    actions,
+                );
+            }
+            8 => {
+                // NodeMaterial -> Opens real interactive Node Graph Editor!
+                let res_key = k("bakeResolution");
+                let cur_res_raw = eval_prop_u32(
+                    lookup_session_prop(session, obj_id, &res_key).as_ref(),
+                    local_frame,
+                    512,
+                );
+                let cur_res = match cur_res_raw {
+                    0 => 128,
+                    1 => 256,
+                    2 => 512,
+                    3 => 1024,
+                    4 => 2048,
+                    other => other,
+                };
+                let res_opts = [256u32, 512, 1024, 2048];
+                let mut res_idx = res_opts.iter().position(|&r| r == cur_res).unwrap_or(1);
+                if panel_property_row(
+                    ui,
+                    "Bake resolution",
+                    true,
+                    state,
+                    theme,
+                    |_| {},
+                    |ui| {
+                        cm3_dropdown(
+                            ui,
+                            Id::unique((obj_id, prefix, "node_mat_res")),
+                            &mut res_idx,
+                            &["256×256", "512×512", "1024×1024", "2048×2048"],
+                            false,
+                            viewport_rect,
+                            theme,
+                        )
+                    },
+                ) {
+                    let _ = session.execute(Command::SetPropertyValue {
+                        target_id: obj_id.to_owned(),
+                        property: res_key,
+                        value: json!(res_opts[res_idx]),
+                    });
+                }
+                let graph_key = k("graph");
+                let open_node_mat = Frame::NONE
+                    .inner_margin(egui::Margin {
+                        left: 21,
+                        right: 12,
+                        top: 5,
+                        bottom: 5,
+                    })
+                    .show(ui, |ui| {
+                        cm3_prop_button(
+                            ui,
+                            "Edit Node Material",
+                            ButtonVariant::Primary,
+                            true,
+                            theme,
+                        )
+                        .clicked()
+                    })
+                    .inner;
+                if open_node_mat {
+                    let cur_graph = lookup_session_prop(session, obj_id, &graph_key)
+                        .and_then(|p| eval_prop_value(Some(&p), local_frame));
+                    state.node_graph_editor.open_for_target(
+                        NodeGraphTargetKind::NodeMaterial,
+                        obj_id,
+                        &graph_key,
+                        obj_name,
+                        cur_graph.as_ref(),
+                    );
+                    let (_, clamped_sz) =
+                        compute_clamped_editor_window_rect(viewport_rect, 860.0, 560.0);
+                    let spec =
+                        FloatingWindowSpec::new("pro_node_graph_editor", "Node Graph Editor")
+                            .with_default_size(clamped_sz);
+                    state.floating_windows.open_or_focus(&spec, viewport_rect);
+                }
+            }
+            _ => {}
+        }
+    }
+    state.inspector_root_indent = prev_indent;
+}
+
+/// Formats a canonical material property key (`"material.graph"`, `"frontMaterial.bakeResolution"`),
+/// normalizing callers that pass either `"material"` or `"material."`.
+fn node_material_prop_key(prefix: &str, suffix: &str) -> String {
+    let base = prefix.trim_end_matches('.');
+    format!("{base}.{suffix}")
+}
+
+/// Returns `true` when the `NodeMaterial` at `(obj_id, prefix)` already has a non-empty `nodes` graph.
+fn node_material_has_populated_graph(session: &Session, obj_id: &str, prefix: &str) -> bool {
+    let graph_key = node_material_prop_key(prefix, "graph");
+    lookup_session_prop(session, obj_id, &graph_key)
+        .and_then(|p| eval_prop_value(Some(&p), 0.0))
+        .and_then(|v| {
+            if let Some(s) = v.as_str() {
+                serde_json::from_str::<Value>(s).ok()
+            } else {
+                Some(v)
+            }
+        })
+        .and_then(|v| {
+            v.get("nodes")
+                .and_then(Value::as_array)
+                .map(|a| !a.is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// Initializes a 3D object's `Node Material` with the default procedural graph
+/// (`Perlin Noise -> Color Ramp -> Material Output`) and `resolution: 512` (`bakeResolution: 2`)
+/// so it renders and exports/copies cleanly immediately on material switch.
+fn initialize_node_material_defaults(
+    session: &mut Session,
+    obj_id: &str,
+    prefix: &str,
+    just_switched: bool,
+) {
+    let res_key = node_material_prop_key(prefix, "bakeResolution");
+    let graph_key = node_material_prop_key(prefix, "graph");
+    let needs_res = just_switched || lookup_session_prop(session, obj_id, &res_key).is_none();
+    let needs_graph = !node_material_has_populated_graph(session, obj_id, prefix);
+    if !needs_res && !needs_graph {
+        return;
+    }
+    let started_tx = if !session.history.is_in_transaction() {
+        session
+            .begin_transaction("initialize node material")
+            .is_ok()
+    } else {
+        false
+    };
+    if needs_res {
+        let _ = session.execute(Command::SetPropertyValue {
+            target_id: obj_id.to_owned(),
+            property: res_key,
+            value: json!(512),
+        });
+    }
+    if needs_graph {
+        let _ = session.execute(Command::SetPropertyValue {
+            target_id: obj_id.to_owned(),
+            property: graph_key,
+            value: NodeGraphEditorState::default_node_material_graph_json(),
+        });
+    }
+    if started_tx && session.history.is_in_transaction() {
+        let _ = session.commit_transaction(true);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -20002,12 +27895,13 @@ fn compute_asset_usage_counts(session: &Session) -> BTreeMap<String, usize> {
     counts
 }
 
-fn evaluate_expression_live_preview(
+fn evaluate_session_expression_raw(
     session: &Session,
     target_id: &str,
     property: &str,
     code: &str,
-) -> Result<String, String> {
+    base_val_override: Option<Value>,
+) -> Result<zc_expr::Value, String> {
     let trimmed = code.trim();
     if trimmed.is_empty() {
         return Err("Expression is empty".to_owned());
@@ -20020,8 +27914,11 @@ fn evaluate_expression_live_preview(
     let compiled = zc_expr::compile(trimmed, mode).map_err(|e| e.to_string())?;
     let fps = session.document().fps.max(1.0);
     let frame = session.playback.current_frame;
-    let cur_val = lookup_session_prop(session, target_id, property)
-        .and_then(|p| eval_prop_value(Some(&p), frame))
+    let cur_val = base_val_override
+        .or_else(|| {
+            lookup_session_prop(session, target_id, property)
+                .and_then(|p| eval_prop_value(Some(&p), frame))
+        })
         .map(|v| json_to_expr_value(&v))
         .unwrap_or(zc_expr::Value::Number(0.0));
     let mut ctx = zc_expr::BasicContext {
@@ -20032,9 +27929,30 @@ fn evaluate_expression_live_preview(
         properties: BTreeMap::new(),
     };
     for ctl in &session.active_sequence().controls {
-        if let Some(n) = ctl.track.value.as_f64() {
-            ctx.properties
-                .insert(ctl.name.clone(), zc_expr::Value::Number(n));
+        let ev = match &ctl.track.value {
+            PropertyValue::Number(n) => Some(zc_expr::Value::Number(*n)),
+            PropertyValue::Bool(b) => Some(zc_expr::Value::Bool(*b)),
+            PropertyValue::Vec2(v) => Some(zc_expr::Value::Array(vec![
+                zc_expr::Value::Number(v[0]),
+                zc_expr::Value::Number(v[1]),
+            ])),
+            PropertyValue::Vec3(v) | PropertyValue::Color(v) => Some(zc_expr::Value::Array(vec![
+                zc_expr::Value::Number(v[0]),
+                zc_expr::Value::Number(v[1]),
+                zc_expr::Value::Number(v[2]),
+            ])),
+            PropertyValue::ColorRgba(v) => Some(zc_expr::Value::Array(vec![
+                zc_expr::Value::Number(v[0]),
+                zc_expr::Value::Number(v[1]),
+                zc_expr::Value::Number(v[2]),
+                zc_expr::Value::Number(v[3]),
+            ])),
+            _ => None,
+        };
+        if let Some(val) = ev {
+            ctx.properties.insert(ctl.name.clone(), val.clone());
+            let clean = sanitize_control_identifier(&ctl.name, &ctl.name);
+            ctx.properties.entry(clean).or_insert(val);
         }
     }
     let cfg = zc_expr::EvalConfig {
@@ -20042,7 +27960,98 @@ fn evaluate_expression_live_preview(
         max_steps: 200_000,
         max_recursion: 64,
     };
-    let out = compiled.evaluate(&ctx, &cfg).map_err(|e| e.to_string())?;
+    compiled.evaluate(&ctx, &cfg).map_err(|e| e.to_string())
+}
+
+fn expr_value_to_f64(v: &zc_expr::Value) -> Option<f64> {
+    match v {
+        zc_expr::Value::Number(n) if n.is_finite() => Some(*n),
+        zc_expr::Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        zc_expr::Value::Array(arr) => arr.first().and_then(expr_value_to_f64),
+        _ => None,
+    }
+}
+
+fn eval_session_expr_f64(
+    session: &Session,
+    target_id: &str,
+    property: &str,
+    code: &str,
+    base: f64,
+) -> Option<f64> {
+    let out =
+        evaluate_session_expression_raw(session, target_id, property, code, Some(json!(base)))
+            .ok()?;
+    expr_value_to_f64(&out)
+}
+
+fn eval_session_expr_vec2(
+    session: &Session,
+    target_id: &str,
+    property: &str,
+    code: &str,
+    base: [f64; 2],
+) -> Option<[f64; 2]> {
+    let out =
+        evaluate_session_expression_raw(session, target_id, property, code, Some(json!(base)))
+            .ok()?;
+    match &out {
+        zc_expr::Value::Array(arr) => Some([
+            arr.first().and_then(expr_value_to_f64).unwrap_or(base[0]),
+            arr.get(1).and_then(expr_value_to_f64).unwrap_or(base[1]),
+        ]),
+        _ => expr_value_to_f64(&out).map(|s| [s, s]),
+    }
+}
+
+fn eval_session_expr_vec3(
+    session: &Session,
+    target_id: &str,
+    property: &str,
+    code: &str,
+    base: [f64; 3],
+) -> Option<[f64; 3]> {
+    let out =
+        evaluate_session_expression_raw(session, target_id, property, code, Some(json!(base)))
+            .ok()?;
+    match &out {
+        zc_expr::Value::Array(arr) => Some([
+            arr.first().and_then(expr_value_to_f64).unwrap_or(base[0]),
+            arr.get(1).and_then(expr_value_to_f64).unwrap_or(base[1]),
+            arr.get(2).and_then(expr_value_to_f64).unwrap_or(base[2]),
+        ]),
+        _ => expr_value_to_f64(&out).map(|s| [s, s, s]),
+    }
+}
+
+fn eval_session_expr_vec4(
+    session: &Session,
+    target_id: &str,
+    property: &str,
+    code: &str,
+    base: [f64; 4],
+) -> Option<[f64; 4]> {
+    let out =
+        evaluate_session_expression_raw(session, target_id, property, code, Some(json!(base)))
+            .ok()?;
+    match &out {
+        zc_expr::Value::Array(arr) => Some([
+            arr.first().and_then(expr_value_to_f64).unwrap_or(base[0]),
+            arr.get(1).and_then(expr_value_to_f64).unwrap_or(base[1]),
+            arr.get(2).and_then(expr_value_to_f64).unwrap_or(base[2]),
+            arr.get(3).and_then(expr_value_to_f64).unwrap_or(base[3]),
+        ]),
+        _ => expr_value_to_f64(&out).map(|s| [s, s, s, s]),
+    }
+}
+
+fn evaluate_expression_live_preview(
+    session: &Session,
+    target_id: &str,
+    property: &str,
+    code: &str,
+) -> Result<String, String> {
+    let out = evaluate_session_expression_raw(session, target_id, property, code, None)?;
     Ok(format_expr_value(&out))
 }
 
@@ -21045,5 +29054,1262 @@ mod tests {
         state.pending_project_actions.push(ProjectAction::ExportPz);
         assert_eq!(state.take_project_actions(), vec![ProjectAction::ExportPz]);
         assert!(state.take_project_actions().is_empty());
+    }
+
+    #[test]
+    fn add_preset_clip_places_at_playhead_and_creates_new_track_on_overlap() {
+        let mut session = Session::new();
+        session.playback.current_frame = 24.0;
+        let initial_tracks = session.document().video_tracks.len();
+        add_preset_clip(&mut session, "text_2d", "Text");
+
+        let selected_id = session
+            .selection
+            .clip_ids
+            .first()
+            .expect("newly added clip must be immediately selected")
+            .clone();
+        let added = find_clip_clone(&session, &selected_id).expect("find newly added clip");
+        assert!(
+            (added.start - 24.0).abs() < 1e-6,
+            "new clip must start at playhead (24), not off-screen; got {}",
+            added.start
+        );
+        // Default V1 has a clip covering [0, 180), so adding at frame 24 creates a new track above
+        assert!(
+            session.document().video_tracks.len() > initial_tracks,
+            "overlapping playhead must create a new video track instead of pushing clip to frame 180+"
+        );
+    }
+
+    #[test]
+    fn default_layer_mask_is_centered_in_sequence_pixels() {
+        let mask = default_layer_mask(1, 1920, 1080);
+        let PropertyValue::Json(Value::Array(arr)) = &mask.path.value else {
+            panic!("expected JSON array path");
+        };
+        assert_eq!(arr.len(), 24);
+        let xs = [
+            arr[0].as_f64().unwrap(),
+            arr[6].as_f64().unwrap(),
+            arr[12].as_f64().unwrap(),
+            arr[18].as_f64().unwrap(),
+        ];
+        let ys = [
+            arr[1].as_f64().unwrap(),
+            arr[7].as_f64().unwrap(),
+            arr[13].as_f64().unwrap(),
+            arr[19].as_f64().unwrap(),
+        ];
+        assert_eq!(xs, [480.0, 1440.0, 1440.0, 480.0]);
+        assert_eq!(ys, [270.0, 270.0, 810.0, 810.0]);
+    }
+
+    #[test]
+    fn format_shader_compile_error_strips_naga_debug_noise() {
+        let raw = r#"GLSL 450 parse error: [Error { kind: InvalidToken(Word("bogus")), meta: Span { start: 18, end: 23 } }]"#;
+        let src = "void main() {\n    bogus;\n}\n";
+        let formatted = format_shader_compile_error(raw, src);
+        assert!(
+            !formatted.contains("Error {"),
+            "raw Debug leaked: {formatted}"
+        );
+        assert!(
+            !formatted.contains("Span {"),
+            "Span Debug leaked: {formatted}"
+        );
+        assert!(
+            formatted.contains("Unexpected token `bogus`"),
+            "missing readable message: {formatted}"
+        );
+        assert!(
+            formatted.contains("line 2"),
+            "missing line hint: {formatted}"
+        );
+    }
+
+    #[test]
+    fn shader_editor_window_clears_left_inspector_and_stays_in_screen() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 752.0));
+        let (pos, size) = compute_shader_editor_window_rect(screen);
+        assert!(
+            pos.x >= 390.0,
+            "shader editor must clear left inspector (x >= 390): got {}",
+            pos.x
+        );
+        assert!(pos.x + size.x <= screen.right() - 8.0);
+        assert!(pos.y + size.y <= screen.bottom() - 8.0);
+    }
+
+    #[test]
+    fn shape_plus_smart_add_and_property_ordering() {
+        assert!(shape_plus_prop_sort_key("name") < shape_plus_prop_sort_key("position"));
+        assert!(shape_plus_prop_sort_key("position") < shape_plus_prop_sort_key("scale"));
+        assert_eq!(
+            shape_plus_string_enum_options("repeater", "composite"),
+            Some(&["below", "above"][..])
+        );
+        assert_eq!(
+            shape_plus_string_enum_options("fill", "fillRule"),
+            Some(&["nonzero", "evenodd"][..])
+        );
+        assert_eq!(
+            shape_plus_string_enum_options("polystar", "mode"),
+            Some(&["star", "polygon"][..])
+        );
+        assert_eq!(
+            shape_plus_string_enum_options("trim", "mode"),
+            Some(&["simultaneous", "individually"][..])
+        );
+        assert_eq!(
+            shape_plus_string_enum_options("mergePaths", "mode"),
+            Some(&["add", "subtract", "intersect", "exclude"][..])
+        );
+
+        // Adding a shape at root wraps it in a Group with a default Fill so it is visible
+        let mut payload = json!({ "version": 1, "contents": [] });
+        let rect_id = add_shape_plus_item_smart(&mut payload, None, "rectangle")
+            .expect("smart add rectangle at root");
+        let root_contents = payload["contents"].as_array().expect("root contents");
+        assert_eq!(root_contents.len(), 1);
+        assert_eq!(root_contents[0]["kind"], "group");
+        let group_children = root_contents[0]["contents"]
+            .as_array()
+            .expect("group children");
+        assert!(group_children.iter().any(|c| c["id"] == rect_id));
+        assert!(group_children.iter().any(|c| c["kind"] == "fill"));
+
+        // Selecting a child inside a group inserts the next shape inside that same enclosing group
+        let ell_id = add_shape_plus_item_smart(&mut payload, Some(&rect_id), "ellipse")
+            .expect("smart add ellipse inside enclosing group");
+        let group_children2 = payload["contents"][0]["contents"]
+            .as_array()
+            .expect("group children");
+        assert!(group_children2.iter().any(|c| c["id"] == ell_id));
+        assert_eq!(payload["contents"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn format_shader_compile_error_formats_unknown_variable_cleanly_with_balanced_parens() {
+        let raw = r#"GLSL 450 parse error: [Error { kind: UnknownVariable("gl_FragColo"), meta: Span { start: 18, end: 29 } }]"#;
+        let src = "void main() {\n    gl_FragColo = vec4(1.0);\n}\n";
+        let formatted = format_shader_compile_error(raw, src);
+        assert!(
+            formatted.contains("Unknown variable `gl_FragColo`"),
+            "unexpected formatting: {formatted}"
+        );
+        let opens = formatted.chars().filter(|&c| c == '(').count();
+        let closes = formatted.chars().filter(|&c| c == ')').count();
+        assert_eq!(
+            opens, closes,
+            "unbalanced parentheses in formatted error: {formatted}"
+        );
+    }
+
+    #[test]
+    fn pz_clipboard_paste_helper_dispatches_effects_objects_material_masks_and_toasts() {
+        let mut session = Session::new();
+        let mut state = PanelsState::default();
+        let mut actions = Vec::new();
+
+        // Create a 3D scene clip with a Cube object
+        let track_id = session.document().video_tracks[0].id.clone();
+        let clip_res = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "scene".to_owned(),
+                name: Some("Scene".to_owned()),
+                start: 0.0,
+                length: 120.0,
+            })
+            .expect("add scene clip");
+        let clip_id = clip_res["clip_id"].as_str().unwrap().to_owned();
+        let obj_res = session
+            .execute(Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                kind: "shape".to_owned(),
+                name: Some("Cube".to_owned()),
+                parent_id: None,
+            })
+            .expect("add cube");
+        let obj_id = obj_res["object_id"].as_str().unwrap().to_owned();
+
+        // 1. Paste Effect JSON
+        let ok = paste_pz_json_text(
+            &mut session,
+            &mut state,
+            &mut actions,
+            r#"{"type":"bloom","properties":{"name":"Glow"}}"#.to_owned(),
+            "effects",
+            Some(clip_id.clone()),
+            None,
+            None,
+            None,
+        );
+        assert!(ok);
+        assert!(matches!(
+            actions.last(),
+            Some(PanelAction::StatusMessage(m)) if m.contains("Pasted 1 effect")
+        ));
+
+        // 2. Copy & paste 3D Object JSON
+        let obj_json = session
+            .copy_objects_3d_as_pz_json(&clip_id, std::slice::from_ref(&obj_id))
+            .expect("copy 3D object");
+        let ok_obj = paste_pz_json_text(
+            &mut session,
+            &mut state,
+            &mut actions,
+            obj_json,
+            "objects3d",
+            Some(clip_id.clone()),
+            None,
+            None,
+            None,
+        );
+        assert!(ok_obj);
+        assert!(matches!(
+            actions.last(),
+            Some(PanelAction::StatusMessage(m)) if m.contains("Pasted 1 3D object")
+        ));
+
+        // 3. Copy & paste Material JSON
+        let mat_json = session
+            .copy_material_as_pz_json(&clip_id, &obj_id)
+            .expect("copy material");
+        let ok_mat = paste_pz_json_text(
+            &mut session,
+            &mut state,
+            &mut actions,
+            mat_json,
+            "material",
+            Some(clip_id.clone()),
+            None,
+            Some(obj_id.clone()),
+            None,
+        );
+        assert!(ok_mat);
+        assert!(matches!(
+            actions.last(),
+            Some(PanelAction::StatusMessage(m)) if m.contains("Pasted 3D material")
+        ));
+
+        // 4. Add a mask, copy & paste masks JSON
+        let cid_uuid = Uuid::parse_str(&clip_id).unwrap();
+        let mask = default_layer_mask(1, 1920, 1080);
+        session
+            .execute(Command::AddLayerMask {
+                clip_id: cid_uuid,
+                mask,
+            })
+            .expect("add mask");
+        let masks_json = session.copy_masks_as_pz_json(&clip_id).expect("copy masks");
+        let ok_masks = paste_pz_json_text(
+            &mut session,
+            &mut state,
+            &mut actions,
+            masks_json.clone(),
+            "masks",
+            Some(clip_id.clone()),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            ok_masks,
+            "masks paste failed: {:?}\njson={masks_json}",
+            actions.last()
+        );
+        assert!(matches!(
+            actions.last(),
+            Some(PanelAction::StatusMessage(m)) if m.contains("Pasted 1 mask")
+        ));
+
+        // 5. Invalid JSON surfaces a clear Paste failed toast without panicking
+        let ok_bad = paste_pz_json_text(
+            &mut session,
+            &mut state,
+            &mut actions,
+            "not valid json".to_owned(),
+            "objects3d",
+            Some(clip_id),
+            None,
+            None,
+            None,
+        );
+        assert!(!ok_bad);
+        assert!(matches!(
+            actions.last(),
+            Some(PanelAction::StatusMessage(m)) if m.starts_with("Paste failed:")
+        ));
+    }
+
+    #[test]
+    fn live_2d_text_edit_commits_per_keystroke_and_coalesces_undo_transaction() {
+        let mut session = Session::new();
+        let track_id = session.document().video_tracks[0].id.clone();
+        let clip_res = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "text".to_owned(),
+                name: Some("Text".to_owned()),
+                start: 0.0,
+                length: 120.0,
+            })
+            .expect("add 2d text clip");
+        let clip_id = clip_res["clip_id"].as_str().unwrap().to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: clip_id.clone(),
+                property: "text".to_owned(),
+                value: json!("text"),
+            })
+            .expect("seed initial text");
+        let undo_before = session.history.undo_len();
+
+        let ctx = egui::Context::default();
+        let theme = Cm3Theme::default();
+        let mut state = PanelsState::default();
+        let edit_id = Id::unique((clip_id.as_str(), "text", "text_edit"));
+
+        // Frame 1: render once & focus the text input
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 200.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.memory_mut(|m| m.request_focus(edit_id));
+                show_session_text_prop(
+                    ui,
+                    &mut session,
+                    &clip_id,
+                    "text",
+                    "Text",
+                    "text",
+                    0.0,
+                    &mut state,
+                    &theme,
+                );
+            },
+        );
+        out.textures_delta.clear();
+
+        // Frame 2: type "!" while still focused -> session must update IMMEDIATELY (live preview)
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 200.0))),
+                events: vec![egui::Event::Text("!".to_owned())],
+                ..Default::default()
+            },
+            |ui| {
+                show_session_text_prop(
+                    ui,
+                    &mut session,
+                    &clip_id,
+                    "text",
+                    "Text",
+                    "text",
+                    0.0,
+                    &mut state,
+                    &theme,
+                );
+            },
+        );
+        out.textures_delta.clear();
+        let live_val = eval_prop_str(
+            lookup_session_prop(&session, &clip_id, "text").as_ref(),
+            0.0,
+            "",
+        );
+        assert!(
+            live_val.contains('!'),
+            "2D text must update live on keystroke while focused, got `{live_val}`"
+        );
+        assert!(session.history.is_in_transaction());
+
+        // Frame 3: type "?" then press Enter -> commits into ONE coalesced undo entry
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 200.0))),
+                events: vec![
+                    egui::Event::Text("?".to_owned()),
+                    egui::Event::Key {
+                        key: Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                show_session_text_prop(
+                    ui,
+                    &mut session,
+                    &clip_id,
+                    "text",
+                    "Text",
+                    "text",
+                    0.0,
+                    &mut state,
+                    &theme,
+                );
+            },
+        );
+        out.textures_delta.clear();
+        assert!(!session.history.is_in_transaction());
+        assert_eq!(
+            session.history.undo_len(),
+            undo_before + 1,
+            "multiple live keystrokes must coalesce into a single undo step"
+        );
+    }
+
+    #[test]
+    fn settings_defaults_debug_report_and_sequence_control_dedup() {
+        assert!(AppSettings::default().show_fps_overlay);
+
+        let mut session = Session::new();
+        let report = build_debug_info_report(&session, &AppSettings::default());
+        assert!(report.contains("ZoidCraft"));
+        assert!(report.contains("OS:"));
+        assert!(!report.to_ascii_lowercase().contains("browser"));
+        assert!(!report.to_ascii_lowercase().contains("reload"));
+
+        session
+            .execute(Command::AddSequenceControl {
+                name: "ctl_value".to_owned(),
+                kind: SequenceControlKind::Slider,
+                value: PropertyValue::Number(0.0),
+                min: Some(0.0),
+                max: Some(100.0),
+                step: Some(0.1),
+            })
+            .expect("add sequence control");
+        let mirrored = collect_mirrored_sequence_control_keys(&session);
+        assert!(
+            mirrored.contains("ctl_value"),
+            "mirrored ctl_value must be deduplicated from legacy ctl_* rows"
+        );
+    }
+
+    #[test]
+    fn text_plus_2d_canonical_keys_evaluate_in_renderer_with_legacy_fallback() {
+        // 1. Canonical Character Transform & Selected Transform serialize exact zc-render keys
+        let mut root = default_text_plus_2d_root();
+        let slot0 = text_plus_2d_slot_mut(&mut root, 0).expect("slot 0");
+        slot0.insert("mode".to_owned(), json!(1));
+        tp2d_write_vec2(slot0, "charPosition", [24.0, -12.0]);
+        tp2d_write_vec2(slot0, "charScale", [1.5, 0.8]);
+        tp2d_write_f64(slot0, "charRotation", 0.35);
+        tp2d_write_f64(slot0, "charOpacity", 0.75);
+        tp2d_write_f64(slot0, "delayPerCharacter", 2.0);
+
+        let slot1 = text_plus_2d_slot_mut(&mut root, 1).expect("slot 1");
+        slot1.insert("mode".to_owned(), json!(4));
+        slot1.insert("characterNumbers".to_owned(), json!("2"));
+        tp2d_write_vec2(slot1, "charPosition", [0.0, 50.0]);
+
+        let evaluated =
+            zc_render::text_plus_2d::evaluate_text_plus_2d_chars(&root, 3, 10.0, 30.0, None);
+        assert_eq!(evaluated.len(), 3);
+        assert!(
+            !evaluated[0].is_neutral(),
+            "Character Transform must produce non-neutral output in zc-render"
+        );
+        assert!((evaluated[0].offset[0] - 24.0).abs() < 1e-4);
+        assert!((evaluated[0].scale[0] - 1.5).abs() < 1e-4);
+        assert!((evaluated[0].rotation_rad - 0.35).abs() < 1e-4);
+        assert!((evaluated[0].opacity - 0.75).abs() < 1e-4);
+        // Second character also receives Selected Transform Y offset
+        assert!(
+            (evaluated[1].offset[1] - 38.0).abs() < 1e-3,
+            "Selected Transform must apply to character 2, got {:?}",
+            evaluated[1].offset
+        );
+
+        // 2. Selected Shake serializes exact shakeAmplitude / shakePeriod / shakePhase / characterNumbers
+        let mut shake_root = default_text_plus_2d_root();
+        let s0 = text_plus_2d_slot_mut(&mut shake_root, 0).expect("shake slot");
+        s0.insert("mode".to_owned(), json!(5));
+        s0.insert("characterNumbers".to_owned(), json!("1, 3"));
+        tp2d_write_f64(s0, "shakeAmplitude", 0.5);
+        tp2d_write_f64(s0, "shakePeriod", 24.0);
+        tp2d_write_f64(s0, "shakePhase", 6.0);
+        let shake_out =
+            zc_render::text_plus_2d::evaluate_text_plus_2d_chars(&shake_root, 3, 0.0, 30.0, None);
+        assert!((shake_out[0].rotation_rad - 0.5).abs() < 1e-4);
+        assert!(shake_out[1].is_neutral());
+        assert!((shake_out[2].rotation_rad - 0.5).abs() < 1e-4);
+
+        // 3. Backward-compatible legacy read fallback
+        let legacy = json!({
+            "mode": 1,
+            "offsetX": 15.0,
+            "offsetY": -5.0,
+            "scaleX": 2.0,
+            "scaleY": 0.5,
+            "rotation": 0.25,
+            "opacity": 0.6,
+            "delay": 3.0,
+        });
+        let legacy_map = legacy.as_object().unwrap();
+        assert_eq!(
+            tp2d_read_vec2(
+                legacy_map,
+                "charPosition",
+                ("offsetX", "offsetY"),
+                [0.0, 0.0]
+            ),
+            [15.0, -5.0]
+        );
+        assert_eq!(
+            tp2d_read_vec2(legacy_map, "charScale", ("scaleX", "scaleY"), [1.0, 1.0]),
+            [2.0, 0.5]
+        );
+        assert!(
+            (tp2d_read_f64(legacy_map, "charRotation", &["rotation"], 0.0) - 0.25).abs() < 1e-9
+        );
+        assert!((tp2d_read_f64(legacy_map, "charOpacity", &["opacity"], 1.0) - 0.6).abs() < 1e-9);
+        assert!(
+            (tp2d_read_f64(legacy_map, "delayPerCharacter", &["delay"], 0.0) - 3.0).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn expression_editor_snippets_default_size_and_clear_resets_animated() {
+        // Default window size must be at least 460x340 so Live/Diagnostic + buttons never clip
+        assert_eq!(EXPR_EDITOR_DEFAULT_SIZE, Vec2::new(460.0, 340.0));
+
+        // Bare constant literals and vector placeholders are cleanly REPLACED (never concatenated)
+        assert_eq!(
+            insert_expression_snippet("", "wiggle(2, 15)"),
+            "wiggle(2, 15)"
+        );
+        assert_eq!(
+            insert_expression_snippet("0.0", "Math.sin(time * 2.0) * 0.5 + 0.5"),
+            "Math.sin(time * 2.0) * 0.5 + 0.5"
+        );
+        assert_eq!(
+            insert_expression_snippet("[0.0,0.0,0.0]", "Math.sin(time * 2.0) * 0.5 + 0.5"),
+            "Math.sin(time * 2.0) * 0.5 + 0.5"
+        );
+        assert_eq!(
+            insert_expression_snippet("[1.0, 1.0, 1.0]", "wiggle(2, 15)"),
+            "wiggle(2, 15)"
+        );
+        // Existing non-trivial expressions append on a fresh line instead of smashing together
+        assert_eq!(
+            insert_expression_snippet("const a = 1;", "a + time"),
+            "const a = 1;\na + time"
+        );
+
+        // Clear Expression on an unanimated property resets `animated = false`
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        session
+            .execute(Command::SetExpression {
+                target_id: clip_id.clone(),
+                property: "opacity".to_owned(),
+                expression: Some("0.5".to_owned()),
+            })
+            .expect("set expression");
+        let prop_before = lookup_session_prop(&session, &clip_id, "opacity").unwrap();
+        assert!(prop_before.animated);
+        assert!(prop_before.expression.is_some());
+
+        clear_property_expression(&mut session, &clip_id, "opacity").expect("clear expression");
+        let prop_after = lookup_session_prop(&session, &clip_id, "opacity").unwrap();
+        assert!(prop_after.expression.is_none());
+        assert!(
+            !prop_after.animated,
+            "clearing expression with no real keyframes must clear animated = false"
+        );
+    }
+
+    #[test]
+    fn radial_and_grid_repeaters_appear_in_3d_object_picker() {
+        let mut session = Session::new();
+        session
+            .execute(Command::EnablePlugin {
+                plugin_id: "repeater".to_owned(),
+            })
+            .expect("enable repeater plugin");
+        let items = build_object_picker_items(&session);
+        assert!(
+            items
+                .iter()
+                .any(|i| i.id == "zoidium:repeater/radial" && i.name == "Radial Repeater"),
+            "Radial Repeater must be listed in 3D Objects picker"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.id == "zoidium:repeater/grid" && i.name == "Grid Repeater"),
+            "Grid Repeater must be listed in 3D Objects picker"
+        );
+    }
+
+    #[test]
+    fn sequence_control_identifier_sanitizes_spaces_and_leading_digits() {
+        assert_eq!(
+            sanitize_control_identifier("Slider 1", "ctl_slider_1"),
+            "slider_1"
+        );
+        assert_eq!(
+            sanitize_control_identifier("   ", "ctl_slider_1"),
+            "ctl_slider_1"
+        );
+        assert_eq!(
+            sanitize_control_identifier("123 boost!", "ctl_slider_1"),
+            "ctl_123_boost"
+        );
+    }
+
+    #[test]
+    fn system_font_discovery_includes_ttc_and_deduplicates_cleanly() {
+        assert!(is_supported_system_font_ext("ttf"));
+        assert!(is_supported_system_font_ext("OTF"));
+        assert!(is_supported_system_font_ext("ttc"));
+        assert!(is_supported_system_font_ext("TTC"));
+        assert!(!is_supported_system_font_ext("woff2"));
+
+        let tmp = std::env::temp_dir().join(format!("zc_ttc_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp font dir");
+        std::fs::write(tmp.join("Helvetica.ttc"), b"ttc").expect("write Helvetica.ttc");
+        std::fs::write(tmp.join("Hiragino Sans GB.ttc"), b"ttc").expect("write Hiragino.ttc");
+        std::fs::write(tmp.join("Menlo.ttc"), b"ttc").expect("write Menlo.ttc");
+        std::fs::write(tmp.join("Avenir.ttf"), b"ttf").expect("write Avenir.ttf");
+        std::fs::write(tmp.join("avenir.ttc"), b"ttc").expect("write avenir.ttc");
+        std::fs::write(tmp.join(".SFNS.ttc"), b"hidden").expect("write hidden font");
+
+        let found = discover_system_fonts_in_dirs(vec![tmp.clone()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"Helvetica"), "missing Helvetica: {names:?}");
+        assert!(
+            names.contains(&"Hiragino Sans GB"),
+            "missing Hiragino Sans GB: {names:?}"
+        );
+        assert!(names.contains(&"Menlo"), "missing Menlo: {names:?}");
+        assert!(!names.iter().any(|n| n.starts_with('.')));
+        // Case-insensitive dedup should keep only one Avenir entry (preferring .ttf over .ttc)
+        let avenir_entries: Vec<_> = found
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("avenir"))
+            .collect();
+        assert_eq!(avenir_entries.len(), 1);
+        assert_eq!(
+            avenir_entries[0]
+                .1
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase),
+            Some("ttf".to_owned())
+        );
+    }
+
+    #[test]
+    fn zoidium_plugin_option_labels_and_opacity_0_100_range() {
+        assert_eq!(
+            template_option_labels("cardwipe", "flipAxis"),
+            &["X", "Y", "Random"]
+        );
+        assert_eq!(
+            template_option_labels("cardwipe", "flipDirection"),
+            &["Positive", "Negative", "Random"]
+        );
+        assert_eq!(template_option_labels("cardwipe", "flipOrder").len(), 9);
+        assert_eq!(
+            template_option_labels("cardwipe", "backLayer"),
+            &["Color", "Transparent"]
+        );
+        assert_eq!(
+            template_option_labels("timecode", "displayFormat"),
+            &[
+                "SMPTE",
+                "Frames",
+                "Feet + Frames 35mm",
+                "Feet + Frames 16mm",
+            ]
+        );
+        assert_eq!(
+            template_option_labels("timecode", "timeSource"),
+            &["Sequence", "Clip", "Custom"]
+        );
+        assert_eq!(
+            template_option_labels("ccpixelpolly", "object"),
+            &[
+                "Triangles (flat)",
+                "Triangles (textured)",
+                "Squares (flat)",
+                "Squares (textured)",
+            ]
+        );
+        assert_eq!(
+            template_option_labels("echo", "composite"),
+            &["over", "behind", "add", "screen", "maximum"]
+        );
+        assert_eq!(template_option_labels("datamosh", "algorithm").len(), 13);
+
+        // 0..100 opacity / percentage params must NOT clamp to 1.0
+        for (fx, key, def) in [
+            ("radiowaves", "opacity", 100.0),
+            ("timecode", "opacity", 100.0),
+            ("radialshadow", "opacity", 50.0),
+            ("ccpageturn", "backPageOpacity", 75.0),
+            ("tracery", "threshold", 50.0),
+        ] {
+            let cfg = template_number_scrub_config_for_default(fx, key, def);
+            assert!(
+                cfg.max >= 100.0,
+                "{fx}.{key} (default {def}) must allow 0..100 range, got max={}",
+                cfg.max
+            );
+        }
+        // Standard 0..1 opacity stays 0..1
+        let std_op = template_number_scrub_config_for_default("dropshadow", "opacity", 0.5);
+        assert!((std_op.max - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn node_material_default_initialization_sets_512_and_procedural_graph() {
+        let mut session = Session::new();
+        session
+            .execute(Command::EnablePlugin {
+                plugin_id: "material-plus".to_owned(),
+            })
+            .expect("enable material-plus");
+        let track_id = session.document().video_tracks[0].id.clone();
+        let clip_res = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "scene".to_owned(),
+                name: Some("Scene".to_owned()),
+                start: 0.0,
+                length: 60.0,
+            })
+            .expect("add scene clip");
+        let clip_id = clip_res["clip_id"].as_str().unwrap().to_owned();
+        let obj_res = session
+            .execute(Command::AddObject3D {
+                clip_id,
+                parent_id: None,
+                kind: "box".to_owned(),
+                name: Some("Cube".to_owned()),
+            })
+            .expect("add box");
+        let obj_id = obj_res["object_id"].as_str().unwrap().to_owned();
+
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: obj_id.clone(),
+                property: "material.type".to_owned(),
+                value: json!(8),
+            })
+            .expect("switch to Node Material");
+        initialize_node_material_defaults(&mut session, &obj_id, "material.", true);
+
+        let proj = session.to_project();
+        let cube = proj.sequence.video_tracks[0]
+            .clips
+            .iter()
+            .flat_map(|c| match &c.layer.kind {
+                zc_project::LayerKind::Scene3D { objects, .. } => {
+                    objects.iter().collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+            .find(|o| o.id.to_string() == obj_id)
+            .expect("cube in synced project");
+        match cube.material.as_ref().expect("material") {
+            zc_project::MaterialSpec::NodeMaterial {
+                resolution, graph, ..
+            } => {
+                assert_eq!(
+                    *resolution, 512,
+                    "expected resolution 512 (bakeResolution: 2)"
+                );
+                let nodes = graph["nodes"].as_array().expect("default graph nodes");
+                assert_eq!(nodes.len(), 3);
+                assert_eq!(nodes[0]["type"], "noise");
+                assert_eq!(nodes[1]["type"], "colorRamp");
+                assert_eq!(nodes[2]["type"], "output");
+            }
+            other => panic!("expected MaterialSpec::NodeMaterial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sequence_transparent_background_is_undoable_and_media_clips_clamp_to_sequence_length() {
+        let mut session = Session::new();
+        assert_eq!(
+            session.active_sequence().background_color,
+            [0.0, 0.0, 0.0, 1.0]
+        );
+        set_sequence_background_color_undoable(
+            &mut session,
+            [0.2, 0.4, 0.6, 0.0],
+            "enable transparent background",
+        );
+        assert_eq!(
+            session.active_sequence().background_color,
+            [0.2, 0.4, 0.6, 0.0]
+        );
+        session.execute(Command::Undo).expect("undo background");
+        assert_eq!(
+            session.active_sequence().background_color,
+            [0.0, 0.0, 0.0, 1.0]
+        );
+
+        // Short sequence: adding Preset shape / Composite must clamp to sequence length
+        session
+            .execute(Command::SetSequenceLength { frames: 60.0 })
+            .expect("set short sequence length");
+        add_preset_clip(&mut session, "preset_shape", "Preset shape");
+        let added = session
+            .document()
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.kind == "preset_shape")
+            .expect("preset_shape clip");
+        assert!((added.length - 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn oversized_text_guard_shader_type5_placeholder_and_history_humanizer() {
+        assert_eq!(oversized_text_summary("hello"), None);
+        let big = "a".repeat(MAX_INLINE_TEXT_CHARS + 2048);
+        assert_eq!(
+            oversized_text_summary(&big),
+            Some("<10 KB text>".to_owned())
+        );
+
+        let placeholder = json!([{"position": 0.0, "color": "rgba(255,255,255,1.0)"}]);
+        assert!(is_type5_bool_placeholder_value(&placeholder));
+        let real_grad = json!([
+            {"position": 0.0, "color": "rgba(0,0,0,1.0)"},
+            {"position": 1.0, "color": "rgba(255,255,255,1.0)"}
+        ]);
+        assert!(!is_type5_bool_placeholder_value(&real_grad));
+
+        assert_eq!(
+            humanize_history_label("timeline.trim_clip_left"),
+            "Trim clip left"
+        );
+        assert_eq!(
+            humanize_history_label("scene.add_object_3d"),
+            "Add 3D object"
+        );
+    }
+
+    #[test]
+    fn custom_shader_rotation_scalar_uniform_uses_unit_scale_factor() {
+        let rot_imported = custom_shader_number_scrub_config("Rotation", None);
+        assert!(
+            (rot_imported.scale_factor - 1.0).abs() < 1e-12,
+            "PanZoid scalar Rotation uniform (type: 0) must NOT be multiplied by 180/pi, got {}",
+            rot_imported.scale_factor
+        );
+        let rot_scalar = custom_shader_number_scrub_config("Rotation", Some(0));
+        assert!((rot_scalar.scale_factor - 1.0).abs() < 1e-12);
+
+        let angle_scalar = custom_shader_number_scrub_config("Angle", None);
+        assert!((angle_scalar.scale_factor - 1.0).abs() < 1e-12);
+
+        let explicit_angle = custom_shader_number_scrub_config("Angle", Some(6));
+        assert!(
+            (explicit_angle.scale_factor - std::f64::consts::PI / 180.0).abs() < 1e-12,
+            "explicit angle kind (6) must still convert radians <-> degrees"
+        );
+    }
+
+    #[test]
+    fn switching_sphere_to_node_material_with_real_prefix_seeds_and_copies_full_pz_json() {
+        let mut session = Session::new();
+        let track_id = session.document().video_tracks[0].id.clone();
+        let clip_res = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "scene".to_owned(),
+                name: Some("Scene".to_owned()),
+                start: 0.0,
+                length: 60.0,
+            })
+            .expect("add scene clip");
+        let clip_id = clip_res["clip_id"].as_str().unwrap().to_owned();
+        let obj_res = session
+            .execute(Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                parent_id: None,
+                kind: "sphere".to_owned(),
+                name: Some("Sphere".to_owned()),
+            })
+            .expect("add sphere");
+        let obj_id = obj_res["object_id"].as_str().unwrap().to_owned();
+
+        // Simulate selecting "Node Material" (index 8) in `show_material_slot_inspector`,
+        // which passes `prefix = "material"` (without a trailing dot).
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: obj_id.clone(),
+                property: "material.type".to_owned(),
+                value: json!(8),
+            })
+            .expect("switch to Node Material");
+        assert!(!node_material_has_populated_graph(
+            &session, &obj_id, "material"
+        ));
+        initialize_node_material_defaults(&mut session, &obj_id, "material", true);
+        assert!(node_material_has_populated_graph(
+            &session, &obj_id, "material"
+        ));
+
+        let copied = session
+            .copy_material_as_pz_json(&clip_id, &obj_id)
+            .expect("copy_material_as_pz_json");
+        let parsed: Value = serde_json::from_str(&copied).expect("valid pz material json");
+        assert_eq!(parsed["type"], "nodes");
+        assert_eq!(parsed["properties"]["bakeResolution"], 2);
+        let graph_obj: Value = if parsed.get("nodes").is_some() {
+            parsed.clone()
+        } else if let Some(raw_str) = parsed["properties"]["graph"].as_str() {
+            serde_json::from_str(raw_str).expect("properties.graph JSON string")
+        } else {
+            parsed["properties"]["graph"].clone()
+        };
+        let nodes = graph_obj["nodes"]
+            .as_array()
+            .expect("copied NodeMaterial JSON must include nodes array");
+        let links = graph_obj["links"]
+            .as_array()
+            .expect("copied NodeMaterial JSON must include links array");
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(links.len(), 2);
+    }
+
+    #[test]
+    fn sampler2d_shader_uniform_lists_project_image_assets() {
+        let mut session = Session::new();
+        session.project.assets.insert(
+            "hash_img_a".to_owned(),
+            zc_project::AssetRecord {
+                id: "hash_img_a".to_owned(),
+                kind: AssetKind::Image,
+                source: zc_project::AssetSource::default(),
+                filename: "nebula.png".to_owned(),
+                url: None,
+                external: false,
+                bytes: None,
+                missing: false,
+                sha256: String::new(),
+                size: 1024,
+                preserved: BTreeMap::new(),
+            },
+        );
+        session.project.assets.insert(
+            "hash_audio_b".to_owned(),
+            zc_project::AssetRecord {
+                id: "hash_audio_b".to_owned(),
+                kind: AssetKind::Av,
+                source: zc_project::AssetSource::default(),
+                filename: "beat.wav".to_owned(),
+                url: None,
+                external: false,
+                bytes: None,
+                missing: false,
+                sha256: String::new(),
+                size: 2048,
+                preserved: BTreeMap::new(),
+            },
+        );
+        let (labels, ids, sel) = collect_shader_image_asset_choices(&session, "hash_img_a");
+        assert_eq!(labels, vec!["None".to_owned(), "nebula.png".to_owned()]);
+        assert_eq!(ids, vec![String::new(), "hash_img_a".to_owned()]);
+        assert_eq!(sel, 1);
+
+        let (_, _, none_sel) = collect_shader_image_asset_choices(&session, "");
+        assert_eq!(none_sel, 0);
+    }
+
+    #[test]
+    fn delete_selected_effect_auto_selects_adjacent_remaining_effect() {
+        let mut session = Session::new();
+        let track_id = session.document().video_tracks[0].id.clone();
+        let clip_res = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "text".to_owned(),
+                name: Some("Title".to_owned()),
+                start: 0.0,
+                length: 60.0,
+            })
+            .expect("add clip");
+        let clip_id = clip_res["clip_id"].as_str().unwrap().to_owned();
+
+        let fx1 = session
+            .execute(Command::AddEffect {
+                clip_id: clip_id.clone(),
+                kind: "boxblur".to_owned(),
+                name: Some("Blur".to_owned()),
+            })
+            .unwrap()["effect_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let fx2 = session
+            .execute(Command::AddEffect {
+                clip_id: clip_id.clone(),
+                kind: "bloom".to_owned(),
+                name: Some("Bloom".to_owned()),
+            })
+            .unwrap()["effect_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let fx3 = session
+            .execute(Command::AddEffect {
+                clip_id: clip_id.clone(),
+                kind: "vignette".to_owned(),
+                name: Some("Vignette".to_owned()),
+            })
+            .unwrap()["effect_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Select middle effect (fx2) and delete it -> selects next remaining effect (fx3).
+        session
+            .selection
+            .select_effect(&fx2, "bloom", false)
+            .unwrap();
+        delete_effect_and_select_adjacent(&mut session, &clip_id, &fx2);
+        assert_eq!(session.selection.effect_ids, vec![fx3.clone()]);
+
+        // Delete last remaining selected effect (fx3) -> falls back to previous effect (fx1).
+        delete_effect_and_select_adjacent(&mut session, &clip_id, &fx3);
+        assert_eq!(session.selection.effect_ids, vec![fx1.clone()]);
+
+        // Delete the sole remaining effect (fx1) -> selection becomes empty cleanly.
+        delete_effect_and_select_adjacent(&mut session, &clip_id, &fx1);
+        assert!(session.selection.effect_ids.is_empty());
+    }
+
+    #[test]
+    fn plugins_search_ranks_title_matches_before_tagline_matches() {
+        let session = Session::new();
+        let ranked = rank_filtered_plugin_categories(&session, "native");
+        let ordered_names: Vec<String> = ranked
+            .into_iter()
+            .flat_map(|(_, _, descs)| descs.into_iter().map(|d| d.name))
+            .collect();
+        assert!(
+            !ordered_names.is_empty(),
+            "expected at least one match for 'native'"
+        );
+        assert_eq!(
+            ordered_names[0], "Native FX",
+            "expected title match 'Native FX' first, got: {ordered_names:?}"
+        );
+    }
+
+    #[test]
+    fn sequence_narrow_layout_labels_and_header_ratio_stay_distinct() {
+        let (s_narrow, sh_narrow) = sequence_motion_blur_labels(195.0);
+        assert_ne!(s_narrow, sh_narrow);
+        assert_eq!((s_narrow, sh_narrow), ("Samp.", "Shutt."));
+        assert_eq!(sequence_motion_blur_labels(280.0), ("Samples", "Shutter"));
+
+        let ratio = sequence_header_label_ratio(195.0, 0.40);
+        assert!(
+            ratio * 195.0 >= 110.0,
+            "expected enough header room for 'Sequence' before reset icon, got {}px",
+            ratio * 195.0
+        );
+    }
+
+    #[test]
+    fn effect_group_custom_properties_can_be_found_and_updated() {
+        let mut session = Session::new();
+        let track_id = session.document().video_tracks[0].id.clone();
+        let clip_res = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "text".to_owned(),
+                name: Some("Title".to_owned()),
+                start: 0.0,
+                length: 60.0,
+            })
+            .expect("add clip");
+        let clip_id = clip_res["clip_id"].as_str().unwrap().to_owned();
+        let clip_uuid = Uuid::parse_str(&clip_id).unwrap();
+        let group_uuid = Uuid::new_v4();
+
+        for track in &mut session.active_sequence_mut().video_tracks {
+            for vc in &mut track.clips {
+                if vc.id == clip_uuid {
+                    vc.layer.effects.push(EffectInstance {
+                        id: group_uuid,
+                        name: "Macro Group".to_owned(),
+                        enabled: PropertyTrack::constant(PropertyValue::Option(1)),
+                        kind: EffectKind::EffectGroup {
+                            custom_properties: vec![CustomProperty {
+                                name: "u_intensity".to_owned(),
+                                prop_type: Some(0),
+                                track: PropertyTrack::constant(PropertyValue::Number(0.5)),
+                                metadata: BTreeMap::new(),
+                            }],
+                            children: Vec::new(),
+                        },
+                        params: BTreeMap::new(),
+                        preserved: BTreeMap::new(),
+                    });
+                }
+            }
+        }
+
+        let group_id = group_uuid.to_string();
+        let props = find_effect_group_custom_properties(&session, &clip_id, &group_id);
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].name, "u_intensity");
+        assert_eq!(props[0].track.value, PropertyValue::Number(0.5));
+
+        assert!(update_effect_group_custom_property(
+            &mut session,
+            &clip_id,
+            &group_id,
+            "u_intensity",
+            PropertyValue::Number(2.25),
+        ));
+        let updated = find_effect_group_custom_properties(&session, &clip_id, &group_id);
+        assert_eq!(updated[0].track.value, PropertyValue::Number(2.25));
+    }
+
+    #[test]
+    fn font_dropdown_popup_mouse_wheel_scrolls_list_without_scrolling_parent() {
+        let ctx = egui::Context::default();
+        let popup_id = Id::unique("test_font_popup_scroll");
+        let mut parent_offset_y = 0.0_f32;
+        let mut popup_offset_y = 0.0_f32;
+        let mut popup_center = Pos2::new(150.0, 180.0);
+
+        let run_frame = |input: egui::RawInput,
+                         parent_out: &mut f32,
+                         popup_out: &mut f32,
+                         center_out: &mut Pos2| {
+            let mut full_out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.set_max_width(280.0);
+                    ui.set_max_height(260.0);
+                    let parent_scroll = ScrollArea::vertical()
+                        .id_salt("test_parent_scroll")
+                        .max_height(240.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for i in 0..40 {
+                                ui.label(format!("Inspector row {i}"));
+                            }
+                            let area_resp = Area::new(popup_id)
+                                .order(Order::Foreground)
+                                .fixed_pos(Pos2::new(20.0, 60.0))
+                                .interactable(true)
+                                .movable(false)
+                                .show(ui.ctx(), |ui| {
+                                    Frame::NONE.inner_margin(egui::Margin::same(6)).show(
+                                        ui,
+                                        |ui| {
+                                            ui.set_min_width(240.0);
+                                            ui.set_max_width(240.0);
+                                            let list_scroll = ScrollArea::vertical()
+                                                .id_salt((popup_id, "list"))
+                                                .min_scrolled_height(180.0)
+                                                .max_height(180.0)
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    for idx in 0..40 {
+                                                        let _ = ui.allocate_exact_size(
+                                                            Vec2::new(220.0, 24.0),
+                                                            Sense::click(),
+                                                        );
+                                                        let _ = idx;
+                                                    }
+                                                });
+                                            *popup_out = list_scroll.state.clamped_offset().y;
+                                        },
+                                    );
+                                });
+                            *center_out = area_resp.response.rect.center();
+                            if ui.input(|i| {
+                                i.pointer
+                                    .hover_pos()
+                                    .is_some_and(|p| area_resp.response.rect.contains(p))
+                            }) {
+                                ui.input_mut(|i| {
+                                    i.smooth_scroll_delta = Vec2::ZERO;
+                                });
+                            }
+                        });
+                    *parent_out = parent_scroll.state.clamped_offset().y;
+                });
+            });
+            full_out.textures_delta.clear();
+        };
+
+        // Frame 1: initial sizing pass; Frame 2: visible pass registering interactable layer.
+        run_frame(
+            egui::RawInput {
+                time: Some(0.0),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                ..Default::default()
+            },
+            &mut parent_offset_y,
+            &mut popup_offset_y,
+            &mut popup_center,
+        );
+        run_frame(
+            egui::RawInput {
+                time: Some(0.016),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                ..Default::default()
+            },
+            &mut parent_offset_y,
+            &mut popup_offset_y,
+            &mut popup_center,
+        );
+
+        // Frame 3: hover inside the font popup and wheel-scroll down.
+        run_frame(
+            egui::RawInput {
+                time: Some(0.048),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events: vec![
+                    egui::Event::PointerMoved(popup_center),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, -120.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
+                    },
+                ],
+                ..Default::default()
+            },
+            &mut parent_offset_y,
+            &mut popup_offset_y,
+            &mut popup_center,
+        );
+
+        assert!(
+            popup_offset_y > 10.0,
+            "expected font dropdown list to scroll on mouse wheel, got offset={popup_offset_y}, parent={parent_offset_y}, popup_center={popup_center:?}"
+        );
+        assert!(
+            parent_offset_y.abs() < 1e-3,
+            "expected parent inspector ScrollArea NOT to scroll while wheeling over font popup, got {parent_offset_y}"
+        );
     }
 }

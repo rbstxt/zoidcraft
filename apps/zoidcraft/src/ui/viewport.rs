@@ -1066,11 +1066,62 @@ pub enum ViewportDragState {
     QuickShapeDraw(QuickShapeDrag),
 }
 
+/// Individual Safe Guides overlay toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SafeGuideOptions {
+    pub action_safe: bool,
+    pub title_safe: bool,
+    pub rule_of_thirds: bool,
+    pub center_crosshair: bool,
+}
+
+impl SafeGuideOptions {
+    #[must_use]
+    pub const fn all_off() -> Self {
+        Self {
+            action_safe: false,
+            title_safe: false,
+            rule_of_thirds: false,
+            center_crosshair: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn all_on() -> Self {
+        Self {
+            action_safe: true,
+            title_safe: true,
+            rule_of_thirds: true,
+            center_crosshair: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn any_enabled(&self) -> bool {
+        self.action_safe || self.title_safe || self.rule_of_thirds || self.center_crosshair
+    }
+
+    #[must_use]
+    pub const fn all_enabled(&self) -> bool {
+        self.action_safe && self.title_safe && self.rule_of_thirds && self.center_crosshair
+    }
+
+    pub const fn set_all(&mut self, enabled: bool) {
+        self.action_safe = enabled;
+        self.title_safe = enabled;
+        self.rule_of_thirds = enabled;
+        self.center_crosshair = enabled;
+    }
+}
+
 /// Actions emitted by [`show_viewport`] back to the host shell.
 #[derive(Debug, Clone, Default)]
 pub struct ViewportAction {
     pub camera_changed: bool,
     pub transform_modified: bool,
+    /// Requests a single viewport GPU refresh even when render-pause mode is active
+    /// (e.g., camera navigation, Editing Camera toggle, or transform/mask edit).
+    pub force_refresh: bool,
     pub canvas_rect: Option<Rect>,
     pub panel_rect: Option<Rect>,
 }
@@ -1099,7 +1150,11 @@ pub struct ViewportState {
     pub active_draw_tool: Option<u8>,
     /// Safe guides overlay toggle (Action Safe 90%, Title Safe 80%, Center Crosshair, Rule of Thirds).
     pub show_safe_guides: bool,
-    /// Live viewport FPS & frame time HUD badge toggle.
+    /// Individual Safe Guides toggles shown in the `Guides ▾` menu.
+    pub safe_guides: SafeGuideOptions,
+    /// Single canonical FPS overlay visibility toggle (synced with App Settings).
+    pub show_fps_overlay: bool,
+    /// Legacy live viewport FPS & frame time HUD badge toggle (kept for compatibility).
     pub show_fps_meter: bool,
     /// Rolling frame-time ring buffer in milliseconds for the live FPS meter.
     pub last_frame_times: VecDeque<f32>,
@@ -1113,6 +1168,14 @@ pub struct ViewportState {
     last_frame_time_sec: Option<f64>,
     /// Active 2D snapping guide lines (in sequence coordinates) shown during Body drag.
     active_snap_guides: Option<(Option<f32>, Option<f32>)>,
+    /// Previous-frame Editing Camera state used to trigger a refresh when toggled while paused.
+    last_editing_camera_active: Option<bool>,
+    /// Previous-frame active camera override used to trigger a refresh when switched while paused.
+    last_active_camera_id: Option<Option<String>>,
+    /// Previous-frame active draw tool for mutual exclusivity with 2D transform controls.
+    last_active_draw_tool: Option<u8>,
+    /// Previous-frame 2D transform controls state for mutual exclusivity with draw tools.
+    last_transform_controls_2d: bool,
 }
 
 impl Default for ViewportState {
@@ -1138,6 +1201,8 @@ impl ViewportState {
             active_camera_id: None,
             active_draw_tool: None,
             show_safe_guides: false,
+            safe_guides: SafeGuideOptions::all_off(),
+            show_fps_overlay: true,
             show_fps_meter: true,
             last_frame_times: VecDeque::new(),
             selected_path_vertex: None,
@@ -1145,6 +1210,10 @@ impl ViewportState {
             quick_shape_kind: QuickShapeKind::Freehand,
             last_frame_time_sec: None,
             active_snap_guides: None,
+            last_editing_camera_active: None,
+            last_active_camera_id: None,
+            last_active_draw_tool: None,
+            last_transform_controls_2d: false,
         }
     }
 
@@ -1419,12 +1488,13 @@ fn reconcile_active_drag_pre(ui: &Ui, session: &mut Session, state: &mut Viewpor
 /// committed/cleared and cannot leak an open transaction to the next frame.
 fn reconcile_active_drag_post(ui: &Ui, session: &mut Session, state: &mut ViewportState) {
     let wants_kb = ui.ctx().egui_wants_keyboard_input();
-    let (primary_down, secondary_down, middle_down, space_down) = ui.input(|i| {
+    let (primary_down, secondary_down, middle_down, space_down, shift_down) = ui.input(|i| {
         (
             i.pointer.primary_down(),
             i.pointer.secondary_down(),
             i.pointer.middle_down(),
             !wants_kb && i.key_down(egui::Key::Space),
+            i.modifiers.shift,
         )
     });
 
@@ -1465,7 +1535,7 @@ fn reconcile_active_drag_post(ui: &Ui, session: &mut Session, state: &mut Viewpo
             state.drag_state = ViewportDragState::None;
         }
         ViewportDragState::CameraPan
-            if !(secondary_down || middle_down || (space_down && primary_down)) =>
+            if !(secondary_down || middle_down || ((space_down || shift_down) && primary_down)) =>
         {
             state.drag_state = ViewportDragState::None;
         }
@@ -1597,18 +1667,32 @@ pub fn show_viewport(
     }
 
     // 2b. Optional Safe Guides Overlay (Action Safe 90%, Title Safe 80%, Center Crosshair, Rule of Thirds).
-    if state.show_safe_guides && visible_canvas.is_positive() {
-        paint_safe_guides(&ui.painter().with_clip_rect(visible_canvas), canvas_rect);
+    if state.show_safe_guides && !state.safe_guides.any_enabled() {
+        state.safe_guides = SafeGuideOptions::all_on();
+    }
+    let effective_guides = if state.show_safe_guides {
+        state.safe_guides
+    } else {
+        SafeGuideOptions::all_off()
+    };
+    if effective_guides.any_enabled() && visible_canvas.is_positive() {
+        paint_safe_guides(
+            &ui.painter().with_clip_rect(visible_canvas),
+            canvas_rect,
+            effective_guides,
+        );
     }
 
     // Compute HUD guard strip at top of viewport so clicks on HUD pills never leak into overlays.
-    let hud_reserved_rects = compute_viewport_hud_guard_rects(panel_rect, selected_scene_3d, state);
+    let hud_reserved_rects =
+        compute_viewport_hud_guard_rects(panel_rect, editing_camera_active, state);
     let pointer_in_hud = ui
         .input(|i| i.pointer.latest_pos())
         .is_some_and(|p| hud_reserved_rects.iter().any(|r| r.contains(p)));
 
-    // 2c. 3D Helper Wireframes (Lights, Cameras, Effector+ Falloff Fields, Constraints).
-    if selected_scene_3d && visible_canvas.is_positive() {
+    // 2c. 3D Helper Wireframes (Lights, Cameras, Effector+ Falloff Fields, Constraints)
+    //     ONLY in Editing Camera mode (`C`), never over the clean final preview.
+    if editing_camera_active && visible_canvas.is_positive() {
         paint_3d_helper_wireframes(
             ui,
             session,
@@ -1621,6 +1705,22 @@ pub fn show_viewport(
     }
 
     let mut overlay_consumed_pointer = pointer_in_hud;
+
+    // Keep 2D transform controls and canvas draw tools mutually exclusive so two tool buttons
+    // are never simultaneously highlighted red in the viewport toolbar.
+    let draw_tool_changed = state.active_draw_tool != state.last_active_draw_tool;
+    let tf2d_just_enabled =
+        session.playback.transform_controls_2d && !state.last_transform_controls_2d;
+    if draw_tool_changed && state.active_draw_tool.is_some() {
+        session.playback.transform_controls_2d = false;
+    } else if tf2d_just_enabled && state.active_draw_tool.is_some() {
+        state.active_draw_tool = None;
+        ui.ctx().request_repaint();
+    } else if state.active_draw_tool.is_some() && session.playback.transform_controls_2d {
+        session.playback.transform_controls_2d = false;
+    }
+    state.last_active_draw_tool = state.active_draw_tool;
+    state.last_transform_controls_2d = session.playback.transform_controls_2d;
 
     // 3. Interactive Shape+ & LayerMask Canvas Authoring (Pen / Vertex Edit / Freehand & Quick Shape).
     match state.active_draw_tool {
@@ -1695,8 +1795,8 @@ pub fn show_viewport(
         );
     }
 
-    // 3c. 3D Transform Gizmos (when a 3D scene clip & 3D object are selected and no draw tool active).
-    if selected_scene_3d && state.active_draw_tool.is_none() {
+    // 3c. 3D Transform Gizmos ONLY when Editing Camera (`C`) is active and no draw tool is active.
+    if editing_camera_active && state.active_draw_tool.is_none() {
         overlay_consumed_pointer |= handle_and_paint_gizmo_3d(
             ui,
             session,
@@ -1745,7 +1845,7 @@ pub fn show_viewport(
         && visible_canvas.contains(click_pos)
     {
         let shift = ui.input(|i| i.modifiers.shift);
-        if selected_scene_3d {
+        if editing_camera_active {
             if let Some((obj_id, obj_kind)) = raycast_pick_3d_object(
                 session,
                 state,
@@ -1791,17 +1891,38 @@ pub fn show_viewport(
         handle_2d_viewport_controls(ui, state, panel_rect, fit_rect, &panel_resp);
     }
 
-    // 6. Floating Viewport HUD Pills (3D Gizmo mode/space, Camera Switcher, Safe Guides, FPS Meter).
+    // 6. Floating Viewport HUD Pills (3D Gizmo mode/space & Camera Switcher ONLY in Editing Camera mode).
     paint_and_interact_viewport_hud(
         ui,
         session,
         state,
         panel_rect,
-        selected_scene_3d,
+        editing_camera_active,
         &mut action,
     );
 
     reconcile_active_drag_post(ui, session, state);
+
+    // 7. Trigger single-frame refresh whenever Editing Camera or active camera toggles,
+    //    or camera navigation / transform / path edits occurred so render-paused mode
+    //    never detaches 3D gizmos or leaks stale Editing Camera frames into Preview mode.
+    let editing_cam_now = is_editing_camera_active(session) && state.active_camera_id.is_none();
+    let editing_cam_toggled = state
+        .last_editing_camera_active
+        .is_some_and(|prev| prev != editing_cam_now);
+    let active_cam_toggled = state
+        .last_active_camera_id
+        .as_ref()
+        .is_some_and(|prev| *prev != state.active_camera_id);
+    state.last_editing_camera_active = Some(editing_cam_now);
+    state.last_active_camera_id = Some(state.active_camera_id.clone());
+    if editing_cam_toggled
+        || active_cam_toggled
+        || action.camera_changed
+        || action.transform_modified
+    {
+        action.force_refresh = true;
+    }
 
     action
 }
@@ -1953,7 +2074,9 @@ fn handle_2d_viewport_controls(
             state.zoom_2d_at(panel_rect, pos, g.pinch_zoom.clamp(0.5, 2.0));
             state.clamp_pan_2d(panel_rect, fit_rect);
         } else if g.has_mod_wheel_zoom() {
-            state.zoom_2d_at(panel_rect, pos, g.mod_wheel_zoom.clamp(0.5, 2.0));
+            // Dampen discrete Ctrl/Cmd+wheel zoom so 1 wheel tick is ~1.15x-1.20x instead of ~1.65x.
+            let factor = g.mod_wheel_zoom.powf(0.35).clamp(0.82, 1.22);
+            state.zoom_2d_at(panel_rect, pos, factor);
             state.clamp_pan_2d(panel_rect, fit_rect);
         } else if g.device == ScrollDevice::Trackpad && g.has_scroll() {
             state.pan_2d_by(g.scroll_delta, panel_rect, fit_rect);
@@ -1962,7 +2085,8 @@ fn handle_2d_viewport_controls(
                 let dx = g.scroll_delta.x + g.scroll_delta.y;
                 state.pan_2d_by(vec2(dx, 0.0), panel_rect, fit_rect);
             } else if g.scroll_delta.y.abs() > 0.01 {
-                let factor = (g.scroll_delta.y * 0.0025).clamp(-0.4, 0.4).exp();
+                // Keep discrete wheel zoom responsive (~1.15x-1.20x per notch, never ~1.65x+).
+                let factor = (g.scroll_delta.y * 0.0014).clamp(-0.18, 0.18).exp();
                 state.zoom_2d_at(panel_rect, pos, factor);
                 state.clamp_pan_2d(panel_rect, fit_rect);
             }
@@ -2089,35 +2213,43 @@ fn handle_editing_camera_controls(
                 state.camera.orbit(g.scroll_delta.x, g.scroll_delta.y, 1.0);
                 action.camera_changed = true;
             }
-        } else if g.has_mod_wheel_zoom() {
-            // Ctrl/Cmd + discrete wheel -> 0.25x precision dolly.
-            let dy = g.mod_wheel_zoom.ln() / 0.005;
-            state.camera.dolly(-dy, 0.25);
-            action.camera_changed = true;
-        } else if g.modifiers.shift
-            && (g.scroll_delta.x.abs() > 0.01 || g.scroll_delta.y.abs() > 0.01)
-        {
-            // Shift + discrete wheel -> 2.5x fast dolly (egui folds vertical wheel into X on Shift).
-            let dy = if g.scroll_delta.y.abs() > 0.01 {
-                g.scroll_delta.y
-            } else {
-                g.scroll_delta.x
-            };
-            state.camera.dolly(-dy, 2.5);
-            action.camera_changed = true;
-        } else if g.scroll_delta.y.abs() > 0.01 {
-            state.camera.dolly(-g.scroll_delta.y, 1.0);
-            action.camera_changed = true;
+        } else {
+            // Soften discrete mouse-wheel ticks so 15+ notches dolly smoothly & controllably
+            // without collapsing the 3D scene/grid into a tiny speck.
+            const DISCRETE_WHEEL_DOLLY_SCALE: f32 = 0.35;
+            if g.has_mod_wheel_zoom() {
+                // Ctrl/Cmd + discrete wheel -> 0.25x precision dolly.
+                let dy = g.mod_wheel_zoom.ln() / 0.005;
+                state.camera.dolly(-dy, 0.25 * DISCRETE_WHEEL_DOLLY_SCALE);
+                action.camera_changed = true;
+            } else if g.modifiers.shift
+                && (g.scroll_delta.x.abs() > 0.01 || g.scroll_delta.y.abs() > 0.01)
+            {
+                // Shift + discrete wheel -> 2.5x fast dolly (egui folds vertical wheel into X on Shift).
+                let dy = if g.scroll_delta.y.abs() > 0.01 {
+                    g.scroll_delta.y
+                } else {
+                    g.scroll_delta.x
+                };
+                state.camera.dolly(-dy, 2.5 * DISCRETE_WHEEL_DOLLY_SCALE);
+                action.camera_changed = true;
+            } else if g.scroll_delta.y.abs() > 0.01 {
+                state
+                    .camera
+                    .dolly(-g.scroll_delta.y, DISCRETE_WHEEL_DOLLY_SCALE);
+                action.camera_changed = true;
+            }
         }
     }
 
-    // Left-drag -> orbit; Right-drag, Middle-drag, or Space+Left-drag -> pan.
+    // Left-drag -> orbit; Right-drag, Middle-drag, Shift+Left-drag, Shift+Middle-drag, or Space+Left-drag -> pan.
     if matches!(state.drag_state, ViewportDragState::None)
         && interact_pos.is_some_and(|p| pointer_hits_viewport(ui, p, panel_rect))
     {
         if panel_resp.drag_started_by(PointerButton::Secondary)
             || panel_resp.drag_started_by(PointerButton::Middle)
-            || (space_down && panel_resp.drag_started_by(PointerButton::Primary))
+            || ((space_down || g.modifiers.shift)
+                && panel_resp.drag_started_by(PointerButton::Primary))
         {
             state.drag_state = ViewportDragState::CameraPan;
         } else if panel_resp.drag_started_by(PointerButton::Primary) {
@@ -2140,13 +2272,21 @@ fn handle_editing_camera_controls(
             }
         }
         ViewportDragState::CameraPan => {
-            if secondary_down || middle_down || (space_down && primary_down) {
+            if secondary_down || middle_down || ((space_down || g.modifiers.shift) && primary_down)
+            {
                 if pointer_delta.length_sq() > 0.0 {
+                    // When Shift acts as the pan modifier (Shift+Left or Shift+Middle),
+                    // preserve 1:1 cursor-to-world pan speed instead of multiplying by 2.5x.
+                    let pan_speed = if g.modifiers.shift && (primary_down || middle_down) {
+                        1.0
+                    } else {
+                        speed_mult
+                    };
                     state.camera.pan_viewport(
                         pointer_delta.x,
                         pointer_delta.y,
                         canvas_rect.height(),
-                        speed_mult,
+                        pan_speed,
                     );
                     action.camera_changed = true;
                 }
@@ -2215,46 +2355,85 @@ fn handle_and_paint_transform_2d(
     let bot_mid = local_to_screen(u_cx, u_max_y);
     let left_mid = local_to_screen(u_min_x, u_cy);
 
-    // Keep the top rotation handle visible & strictly clipped inside the visible canvas
-    // (flip stem inward when the outer handle would fall outside `visible_canvas`).
     let visible_canvas = canvas_rect.intersect(panel_rect);
-    let rot_outer = local_to_screen(u_cx, u_min_y - ROTATION_STEM_PX);
-    let rot_inner = local_to_screen(u_cx, u_min_y + ROTATION_STEM_PX);
     let safe_pad = HANDLE_SIZE_PX * 0.5 + 2.0;
-    let safe_rect =
-        if visible_canvas.width() > safe_pad * 2.0 && visible_canvas.height() > safe_pad * 2.0 {
-            visible_canvas.shrink(safe_pad)
+    let panel_safe_rect =
+        if panel_rect.width() > safe_pad * 2.0 && panel_rect.height() > safe_pad * 2.0 {
+            panel_rect.shrink(safe_pad)
         } else {
-            visible_canvas
+            panel_rect
         };
-    let rot_pos = if safe_rect.contains(rot_outer) {
+    let safe_min_x = panel_safe_rect.left().min(panel_safe_rect.right());
+    let safe_max_x = panel_safe_rect.left().max(panel_safe_rect.right());
+    let safe_min_y = panel_safe_rect.top().min(panel_safe_rect.bottom());
+    let safe_max_y = panel_safe_rect.top().max(panel_safe_rect.bottom());
+    // Keep handles that lie right on/near the viewport panel edge cleanly inside `panel_safe_rect`
+    // so corner and edge handles are never half-clipped off-screen at 100% scale.
+    let clamp_edge_handle = |pt: Pos2| -> Pos2 {
+        if panel_rect.expand(safe_pad + 4.0).contains(pt) {
+            pos2(
+                pt.x.clamp(safe_min_x, safe_max_x),
+                pt.y.clamp(safe_min_y, safe_max_y),
+            )
+        } else {
+            pt
+        }
+    };
+
+    let tl_h = clamp_edge_handle(tl);
+    let tr_h = clamp_edge_handle(tr);
+    let br_h = clamp_edge_handle(br);
+    let bl_h = clamp_edge_handle(bl);
+    let top_mid_h = clamp_edge_handle(top_mid);
+    let right_mid_h = clamp_edge_handle(right_mid);
+    let bot_mid_h = clamp_edge_handle(bot_mid);
+    let left_mid_h = clamp_edge_handle(left_mid);
+
+    // Keep the top rotation handle stem pointing outward whenever space exists inside `panel_rect`
+    // (including letterbox margin). Only shorten outward or place a compact inset handle if flush
+    // against the very top edge of `panel_rect`.
+    let rot_outer = local_to_screen(u_cx, u_min_y - ROTATION_STEM_PX);
+    let rot_pos = if panel_safe_rect.contains(rot_outer) {
         rot_outer
-    } else if safe_rect.contains(rot_inner) {
-        rot_inner
-    } else if visible_canvas.expand(2.0).contains(top_mid) {
-        pos2(
-            rot_inner.x.clamp(safe_rect.left(), safe_rect.right()),
-            rot_inner.y.clamp(safe_rect.top(), safe_rect.bottom()),
-        )
     } else {
-        rot_outer
+        // Compute outward unit vector in screen space (local -Y direction).
+        let out_dir = (rot_outer - top_mid).normalized();
+        let clamped_outer = pos2(
+            rot_outer.x.clamp(safe_min_x, safe_max_x),
+            rot_outer.y.clamp(safe_min_y, safe_max_y),
+        );
+        let outward_clearance = (clamped_outer - top_mid_h).dot(out_dir);
+        if outward_clearance >= 10.0 {
+            // Still cleanly outward, just shortened to stay inside `panel_safe_rect`.
+            top_mid_h + out_dir * outward_clearance.min(ROTATION_STEM_PX)
+        } else if panel_rect.expand(4.0).contains(top_mid) {
+            // Flush against the panel edge: keep a compact tidy inset handle below `top_mid_h`.
+            let inset_pt = top_mid_h - out_dir * 14.0;
+            pos2(
+                inset_pt.x.clamp(safe_min_x, safe_max_x),
+                inset_pt.y.clamp(safe_min_y, safe_max_y),
+            )
+        } else {
+            rot_outer
+        }
     };
 
     let handles = [
         (Transform2DHandle::Rotate, rot_pos),
-        (Transform2DHandle::TopLeft, tl),
-        (Transform2DHandle::Top, top_mid),
-        (Transform2DHandle::TopRight, tr),
-        (Transform2DHandle::Right, right_mid),
-        (Transform2DHandle::BottomRight, br),
-        (Transform2DHandle::Bottom, bot_mid),
-        (Transform2DHandle::BottomLeft, bl),
-        (Transform2DHandle::Left, left_mid),
+        (Transform2DHandle::TopLeft, tl_h),
+        (Transform2DHandle::Top, top_mid_h),
+        (Transform2DHandle::TopRight, tr_h),
+        (Transform2DHandle::Right, right_mid_h),
+        (Transform2DHandle::BottomRight, br_h),
+        (Transform2DHandle::Bottom, bot_mid_h),
+        (Transform2DHandle::BottomLeft, bl_h),
+        (Transform2DHandle::Left, left_mid_h),
     ];
 
     // Paint bounding box (1px #666666 outer box expanded by 1px + 1px #cccccc inner box),
-    // rotation stem, handles & pivot crosshair. Clipped strictly to `visible_canvas`.
-    let painter = ui.painter().with_clip_rect(visible_canvas);
+    // rotation stem, handles & pivot crosshair. Clipped to `panel_rect` so edge handles and
+    // outward rotation stems in letterbox space are never clipped off.
+    let painter = ui.painter().with_clip_rect(panel_rect);
     let tl_out = local_to_screen(u_min_x - 1.0, u_min_y - 1.0);
     let tr_out = local_to_screen(u_max_x + 1.0, u_min_y - 1.0);
     let br_out = local_to_screen(u_max_x + 1.0, u_max_y + 1.0);
@@ -2267,7 +2446,7 @@ fn handle_and_paint_transform_2d(
         vec![tl, tr, br, bl],
         Stroke::new(1.0, COLOR_BOX_INNER),
     ));
-    painter.line_segment([top_mid, rot_pos], Stroke::new(1.0, COLOR_BOX_INNER));
+    painter.line_segment([top_mid_h, rot_pos], Stroke::new(1.0, COLOR_BOX_INNER));
 
     // Pivot crosshair at `position` (which corresponds to local `anchor`), interactive!
     let anchor_hovered = matches!(state.drag_state, ViewportDragState::Transform2D(ref d) if d.handle == Transform2DHandle::Anchor)
@@ -2365,15 +2544,25 @@ fn handle_and_paint_transform_2d(
 
     // Pointer hit-testing & live drag state machine.
     let wants_kb = ui.ctx().egui_wants_keyboard_input();
-    let (pointer_pos, primary_pressed, primary_down, modifiers, space_down) = ui.input(|i| {
-        (
-            i.pointer.latest_pos(),
-            i.pointer.primary_pressed(),
-            i.pointer.primary_down(),
-            i.modifiers,
-            !wants_kb && i.key_down(egui::Key::Space),
-        )
-    });
+    let (pointer_pos, press_origin, primary_pressed, primary_down, modifiers, space_down) = ui
+        .input(|i| {
+            (
+                i.pointer.latest_pos(),
+                i.pointer.press_origin(),
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.modifiers,
+                !wants_kb && i.key_down(egui::Key::Space),
+            )
+        });
+    // On `primary_pressed`, hit-test `press_origin` before `latest_pos` so brisk click-drag flicks
+    // (> 8.5 px movement in the press frame) still grab the corner/edge/rotation handle instead of
+    // falling through to `Transform2DHandle::Body`.
+    let hit_pos = if primary_pressed {
+        press_origin.or(pointer_pos)
+    } else {
+        pointer_pos
+    };
 
     // Hover cursor feedback & drag start (skipped on locked tracks, Space-pan, or when covered by another layer).
     // Passive hover intentionally returns `false` so scroll, right/middle pan, and double-click
@@ -2381,9 +2570,9 @@ fn handle_and_paint_transform_2d(
     if !clip_tf.locked
         && !space_down
         && matches!(state.drag_state, ViewportDragState::None)
-        && let Some(pos) = pointer_pos
+        && let Some(pos) = hit_pos
         && pointer_hits_viewport(ui, pos, panel_rect)
-        && visible_canvas.expand(HANDLE_SIZE_PX * 0.5).contains(pos)
+        && panel_rect.expand(HANDLE_SIZE_PX * 0.5).contains(pos)
         && let Some(h) = hit_test_2d_handles(
             &handles,
             pos,
@@ -2393,7 +2582,7 @@ fn handle_and_paint_transform_2d(
             u_min_y,
             u_max_y,
             clip_tf.rotation,
-            visible_canvas,
+            panel_rect,
         )
     {
         ui.ctx().set_cursor_icon(handle_cursor_icon(h));
@@ -2418,9 +2607,11 @@ fn handle_and_paint_transform_2d(
                 accum_rotation: 0.0,
                 changed: false,
             });
-            return true;
+            // Fall through into the drag-update pass below so coalesced press+move flicks apply
+            // their delta from `press_origin` -> `latest_pos` immediately with zero frame lag.
+        } else {
+            return false;
         }
-        return false;
     }
 
     let current = std::mem::take(&mut state.drag_state);
@@ -2822,14 +3013,20 @@ fn handle_and_paint_motion_path(
     }
 
     let wants_kb = ui.ctx().egui_wants_keyboard_input();
-    let (pointer_pos, primary_pressed, primary_down, space_down) = ui.input(|i| {
+    let (pointer_pos, press_origin, primary_pressed, primary_down, space_down) = ui.input(|i| {
         (
             i.pointer.latest_pos(),
+            i.pointer.press_origin(),
             i.pointer.primary_pressed(),
             i.pointer.primary_down(),
             !wants_kb && i.key_down(egui::Key::Space),
         )
     });
+    let hit_pos = if primary_pressed {
+        press_origin.or(pointer_pos)
+    } else {
+        pointer_pos
+    };
 
     // Draw draggable keyframe dots along the motion path.
     let mut started_drag = false;
@@ -2850,7 +3047,7 @@ fn handle_and_paint_motion_path(
             && !target.locked
             && !space_down
             && matches!(state.drag_state, ViewportDragState::None)
-            && let Some(ptr) = pointer_pos
+            && let Some(ptr) = hit_pos
             && pointer_hits_viewport(ui, ptr, panel_rect)
             && visible_canvas.contains(ptr)
             && ptr.distance(sp) <= 9.0
@@ -3448,7 +3645,7 @@ pub fn compute_safe_guides(canvas_rect: Rect) -> SafeGuidesGeometry {
     }
 }
 
-fn paint_safe_guides(painter: &egui::Painter, canvas_rect: Rect) {
+fn paint_safe_guides(painter: &egui::Painter, canvas_rect: Rect, guides: SafeGuideOptions) {
     let g = compute_safe_guides(canvas_rect);
     let thirds_stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x88, 0xc0, 0xd0, 90));
     let action_stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xe5, 0xe9, 0xf0, 115));
@@ -3456,67 +3653,78 @@ fn paint_safe_guides(painter: &egui::Painter, canvas_rect: Rect) {
     let cross_stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xe5, 0xe9, 0xf0, 150));
 
     // Rule of Thirds grid.
-    for x in g.thirds_x {
-        painter.line_segment(
-            [pos2(x, canvas_rect.top()), pos2(x, canvas_rect.bottom())],
-            thirds_stroke,
-        );
-    }
-    for y in g.thirds_y {
-        painter.line_segment(
-            [pos2(canvas_rect.left(), y), pos2(canvas_rect.right(), y)],
-            thirds_stroke,
-        );
+    if guides.rule_of_thirds {
+        for x in g.thirds_x {
+            painter.line_segment(
+                [pos2(x, canvas_rect.top()), pos2(x, canvas_rect.bottom())],
+                thirds_stroke,
+            );
+        }
+        for y in g.thirds_y {
+            painter.line_segment(
+                [pos2(canvas_rect.left(), y), pos2(canvas_rect.right(), y)],
+                thirds_stroke,
+            );
+        }
     }
 
-    // Action Safe (90%) and Title Safe (80%) rectangles.
-    painter.rect_stroke(
-        g.action_safe,
-        CornerRadius::ZERO,
-        action_stroke,
-        StrokeKind::Inside,
-    );
-    painter.rect_stroke(
-        g.title_safe,
-        CornerRadius::ZERO,
-        title_stroke,
-        StrokeKind::Inside,
-    );
+    // Action Safe (90%) rectangle — label placed at bottom-left clear of the top-left HUD bar.
+    if guides.action_safe {
+        painter.rect_stroke(
+            g.action_safe,
+            CornerRadius::ZERO,
+            action_stroke,
+            StrokeKind::Inside,
+        );
+        if canvas_rect.width() >= 220.0 && canvas_rect.height() >= 120.0 {
+            painter.text(
+                pos2(g.action_safe.left() + 4.0, g.action_safe.bottom() - 2.0),
+                Align2::LEFT_BOTTOM,
+                "90%",
+                FontId::monospace(9.5),
+                Color32::from_rgba_unmultiplied(0xe5, 0xe9, 0xf0, 165),
+            );
+        }
+    }
 
-    if canvas_rect.width() >= 220.0 && canvas_rect.height() >= 120.0 {
-        painter.text(
-            pos2(g.action_safe.left() + 4.0, g.action_safe.top() + 2.0),
-            Align2::LEFT_TOP,
-            "90%",
-            FontId::monospace(9.5),
-            Color32::from_rgba_unmultiplied(0xe5, 0xe9, 0xf0, 150),
+    // Title Safe (80%) rectangle — label placed at bottom-left clear of the top-left HUD bar.
+    if guides.title_safe {
+        painter.rect_stroke(
+            g.title_safe,
+            CornerRadius::ZERO,
+            title_stroke,
+            StrokeKind::Inside,
         );
-        painter.text(
-            pos2(g.title_safe.left() + 4.0, g.title_safe.top() + 2.0),
-            Align2::LEFT_TOP,
-            "80%",
-            FontId::monospace(9.5),
-            Color32::from_rgba_unmultiplied(0xeb, 0xcb, 0x8b, 165),
-        );
+        if canvas_rect.width() >= 220.0 && canvas_rect.height() >= 120.0 {
+            painter.text(
+                pos2(g.title_safe.left() + 4.0, g.title_safe.bottom() - 2.0),
+                Align2::LEFT_BOTTOM,
+                "80%",
+                FontId::monospace(9.5),
+                Color32::from_rgba_unmultiplied(0xeb, 0xcb, 0x8b, 175),
+            );
+        }
     }
 
     // Center crosshair.
-    let cr = 10.0;
-    painter.line_segment(
-        [
-            pos2(g.center.x - cr, g.center.y),
-            pos2(g.center.x + cr, g.center.y),
-        ],
-        cross_stroke,
-    );
-    painter.line_segment(
-        [
-            pos2(g.center.x, g.center.y - cr),
-            pos2(g.center.x, g.center.y + cr),
-        ],
-        cross_stroke,
-    );
-    painter.circle_stroke(g.center, 3.0, cross_stroke);
+    if guides.center_crosshair {
+        let cr = 10.0;
+        painter.line_segment(
+            [
+                pos2(g.center.x - cr, g.center.y),
+                pos2(g.center.x + cr, g.center.y),
+            ],
+            cross_stroke,
+        );
+        painter.line_segment(
+            [
+                pos2(g.center.x, g.center.y - cr),
+                pos2(g.center.x, g.center.y + cr),
+            ],
+            cross_stroke,
+        );
+        painter.circle_stroke(g.center, 3.0, cross_stroke);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3539,7 +3747,7 @@ fn compute_viewport_hud_guard_rects(
     } else if state.active_draw_tool == Some(2) {
         210.0_f32
     } else {
-        76.0_f32
+        84.0_f32
     }
     .min((panel_rect.width() - margin * 2.0).max(0.0));
     if left_w > 0.0 {
@@ -3548,7 +3756,7 @@ fn compute_viewport_hud_guard_rects(
             vec2(left_w, pill_h),
         ));
     }
-    if state.show_fps_meter && panel_rect.width() >= 280.0 {
+    if state.show_fps_overlay && panel_rect.width() >= 280.0 {
         let fps_w = 128.0_f32;
         rects.push(Rect::from_min_size(
             pos2(
@@ -3601,6 +3809,95 @@ fn hud_pill_button(
     resp.clicked_by(PointerButton::Primary)
 }
 
+fn paint_and_interact_guides_menu_button(
+    ui: &mut Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    id_salt: &str,
+    popup_salt: &str,
+    state: &mut ViewportState,
+) {
+    let any_active = state.show_safe_guides && state.safe_guides.any_enabled();
+    let resp = ui
+        .interact(rect, ui.scope_id().with(id_salt), Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(
+            "Safe Guides menu (Action Safe 90%, Title Safe 80%, Rule of Thirds, Center Crosshair)",
+        );
+    let bg = if any_active {
+        Color32::from_rgb(0x3a, 0x55, 0x7a)
+    } else if resp.hovered() {
+        Color32::from_rgb(0x33, 0x33, 0x33)
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        painter.rect_filled(rect.shrink(1.0), CornerRadius::same(2), bg);
+    }
+    let fg = if any_active {
+        Color32::WHITE
+    } else if resp.hovered() {
+        Color32::from_rgb(0xe8, 0xe8, 0xe8)
+    } else {
+        Color32::from_rgb(0xb4, 0xb4, 0xb4)
+    };
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "Guides ▾",
+        FontId::monospace(10.0),
+        fg,
+    );
+
+    let popup_id = ui.make_persistent_id(popup_salt);
+    // Do NOT manually call `Popup::toggle_id` — `Popup::menu(&resp)` already toggles on click.
+    egui::Popup::menu(&resp)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_min_width(172.0);
+            let mut changed = false;
+            if ui
+                .checkbox(&mut state.safe_guides.action_safe, "Action Safe (90%)")
+                .changed()
+            {
+                changed = true;
+            }
+            if ui
+                .checkbox(&mut state.safe_guides.title_safe, "Title Safe (80%)")
+                .changed()
+            {
+                changed = true;
+            }
+            if ui
+                .checkbox(&mut state.safe_guides.rule_of_thirds, "Rule of Thirds")
+                .changed()
+            {
+                changed = true;
+            }
+            if ui
+                .checkbox(&mut state.safe_guides.center_crosshair, "Center Crosshair")
+                .changed()
+            {
+                changed = true;
+            }
+            ui.separator();
+            let toggle_all_label = if state.safe_guides.all_enabled() {
+                "Hide All Guides"
+            } else {
+                "Toggle All"
+            };
+            if ui.button(toggle_all_label).clicked() {
+                let next = !state.safe_guides.all_enabled();
+                state.safe_guides.set_all(next);
+                changed = true;
+            }
+            if changed {
+                state.show_safe_guides = state.safe_guides.any_enabled();
+            }
+        });
+}
+
 fn paint_and_interact_viewport_hud(
     ui: &mut Ui,
     session: &mut Session,
@@ -3624,7 +3921,7 @@ fn paint_and_interact_viewport_hud(
     let y = panel_rect.top() + margin;
 
     if selected_scene_3d {
-        // W / E / R | World/Local | Camera Switcher | Guides
+        // W / E / R | World/Local | Camera Switcher | Guides ▾
         let scene_cameras: Vec<(String, String)> = active_scene_3d_clip(session)
             .map(|(clip, _, _)| {
                 clip.objects_3d
@@ -3652,7 +3949,7 @@ fn paint_and_interact_viewport_hud(
         let mode_w = 24.0;
         let space_w = 46.0;
         let cam_w = 114.0;
-        let guides_w = 52.0;
+        let guides_w = 64.0;
         let total_w = mode_w * 3.0 + space_w + cam_w + guides_w + 4.0;
         let pill_rect = Rect::from_min_size(pos2(x, y), vec2(total_w, pill_h));
         painter.rect(
@@ -3772,10 +4069,9 @@ fn paint_and_interact_viewport_hud(
             FontId::monospace(10.0),
             Color32::from_rgb(0xd4, 0xd4, 0xd4),
         );
+        // `Popup::menu(&cam_resp)` already toggles open/closed on primary click;
+        // do NOT call `Popup::toggle_id` manually (which double-toggles in the same frame!).
         let popup_id = ui.make_persistent_id("vp_hud_cam_switcher_popup");
-        if cam_resp.clicked_by(PointerButton::Primary) {
-            egui::Popup::toggle_id(ui.ctx(), popup_id);
-        }
         egui::Popup::menu(&cam_resp).id(popup_id).show(|ui| {
             ui.set_min_width(150.0);
             let is_editor = session.playback.editing_camera && state.active_camera_id.is_none();
@@ -3817,19 +4113,16 @@ fn paint_and_interact_viewport_hud(
         );
         x += 1.0;
 
-        if hud_pill_button(
+        paint_and_interact_guides_menu_button(
             ui,
             &painter,
             Rect::from_min_size(pos2(x, y), vec2(guides_w, pill_h)),
             "vp_hud_guides_3d",
-            "Guides",
-            state.show_safe_guides,
-            "Toggle Safe Guides (90% Action, 80% Title, Rule of Thirds)",
-        ) {
-            state.show_safe_guides = !state.show_safe_guides;
-        }
+            "vp_hud_guides_3d_popup",
+            state,
+        );
     } else {
-        let guides_w = 54.0;
+        let guides_w = 64.0;
         let extra_w = if state.active_draw_tool == Some(2) {
             122.0
         } else {
@@ -3844,17 +4137,14 @@ fn paint_and_interact_viewport_hud(
             pill_stroke,
             StrokeKind::Inside,
         );
-        if hud_pill_button(
+        paint_and_interact_guides_menu_button(
             ui,
             &painter,
             Rect::from_min_size(pos2(x, y), vec2(guides_w, pill_h)),
             "vp_hud_guides_2d",
-            "Guides",
-            state.show_safe_guides,
-            "Toggle Safe Guides (90% Action, 80% Title, Rule of Thirds)",
-        ) {
-            state.show_safe_guides = !state.show_safe_guides;
-        }
+            "vp_hud_guides_2d_popup",
+            state,
+        );
         x += guides_w;
 
         if state.active_draw_tool == Some(2) {
@@ -3902,8 +4192,8 @@ fn paint_and_interact_viewport_hud(
         }
     }
 
-    // Top-right FPS Meter badge.
-    if state.show_fps_meter && panel_rect.width() >= 280.0 {
+    // Top-right FPS Meter badge (single canonical overlay gated on `state.show_fps_overlay`).
+    if state.show_fps_overlay && panel_rect.width() >= 280.0 {
         let (avg_ms, fps) = average_frame_ms_and_fps(&state.last_frame_times);
         let label = format!("{fps:.1} fps · {avg_ms:.1} ms");
         let fps_w = (label.len() as f32 * 6.4 + 14.0).max(114.0);
@@ -3940,6 +4230,7 @@ fn paint_and_interact_viewport_hud(
             fps_color,
         );
         if fps_resp.clicked_by(PointerButton::Primary) {
+            state.show_fps_overlay = false;
             state.show_fps_meter = false;
         }
     }
@@ -4769,7 +5060,12 @@ fn write_object_3d_vec3(
         .and_then(|o| o.properties.get(property))
         .is_some_and(|p| p.animated);
 
-    let json_val = json!([f64::from(value.x), f64::from(value.y), f64::from(value.z)]);
+    let clean_zero = |v: f32| if v == 0.0 { 0.0_f64 } else { f64::from(v) };
+    let json_val = json!([
+        clean_zero(value.x),
+        clean_zero(value.y),
+        clean_zero(value.z)
+    ]);
     if is_animated {
         let _ = session.execute(Command::SetKeyframe {
             target_id: object_id.to_owned(),
@@ -4981,7 +5277,9 @@ fn compute_gizmo_3d_rotate(
             Quat::from_axis_angle(parent_local_axis, signed_angle) * init_q
         }
     };
-    zc_geom::quat_to_euler(new_q.normalize(), euler_order)
+    let raw = zc_geom::quat_to_euler(new_q.normalize(), euler_order);
+    let clean = |v: f32| if v.abs() < 1e-5 { 0.0 } else { v };
+    Vec3::new(clean(raw.x), clean(raw.y), clean(raw.z))
 }
 
 /// Computes updated local 3D scale for a Scale gizmo drag.
@@ -5105,15 +5403,24 @@ fn handle_and_paint_gizmo_3d(
     let visible_canvas = canvas_rect.intersect(panel_rect);
 
     let wants_kb = ui.ctx().egui_wants_keyboard_input();
-    let (pointer_pos, primary_pressed, primary_down, modifiers, space_down) = ui.input(|i| {
-        (
-            i.pointer.latest_pos(),
-            i.pointer.primary_pressed(),
-            i.pointer.primary_down(),
-            i.modifiers,
-            !wants_kb && i.key_down(egui::Key::Space),
-        )
-    });
+    let (pointer_pos, press_origin, primary_pressed, primary_down, modifiers, space_down) = ui
+        .input(|i| {
+            (
+                i.pointer.latest_pos(),
+                i.pointer.press_origin(),
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.modifiers,
+                !wants_kb && i.key_down(egui::Key::Space),
+            )
+        });
+    // On `primary_pressed`, hit-test `press_origin` before `latest_pos` so brisk flick-drags on
+    // 3D gizmo axes/rings still grab the handle even if the pointer already moved away in the press frame.
+    let hit_pos = if primary_pressed {
+        press_origin.or(pointer_pos)
+    } else {
+        pointer_pos
+    };
 
     // Hit-test active mode handles.
     let mode = state.gizmo_3d_mode;
@@ -5181,7 +5488,7 @@ fn handle_and_paint_gizmo_3d(
 
     let hovered_handle = if !pointer_in_hud
         && !space_down
-        && let Some(pos) = pointer_pos
+        && let Some(pos) = hit_pos
         && pointer_hits_viewport(ui, pos, panel_rect)
         && visible_canvas.contains(pos)
     {
@@ -5384,7 +5691,7 @@ fn handle_and_paint_gizmo_3d(
         && !space_down
         && matches!(state.drag_state, ViewportDragState::None)
         && let Some(h) = hovered_handle
-        && let Some(pos) = pointer_pos
+        && let Some(pos) = hit_pos
     {
         ui.ctx().set_cursor_icon(match mode {
             Gizmo3DMode::Translate => CursorIcon::Move,
@@ -5431,9 +5738,11 @@ fn handle_and_paint_gizmo_3d(
                 init_plane_hit,
                 changed: false,
             });
-            return true;
+            // Fall through into the active drag update below so coalesced press+move flicks apply
+            // immediately from `press_origin` -> `latest_pos`.
+        } else {
+            return false;
         }
-        return false;
     }
 
     // Active gizmo drag update.
@@ -6496,6 +6805,7 @@ fn commit_contour_edit(
                         .sort_by(|a, b| a.frame.total_cmp(&b.frame));
                 }
             } else {
+                mask.path.keyframes.clear();
                 mask.path.value = PropertyValue::Json(flat_json);
             }
             session
@@ -6822,92 +7132,19 @@ fn snap_angle_45_deg(v: [f64; 2]) -> [f64; 2] {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_and_paint_bezier_paths(
-    ui: &mut Ui,
-    session: &mut Session,
-    state: &mut ViewportState,
-    panel_rect: Rect,
+fn paint_editable_contours(
+    painter: &egui::Painter,
+    clip_tf: &ActiveVideoClipTransform,
+    contours: &[EditableBezierContour],
+    selected_vertex: Option<&SelectedPathVertex>,
     canvas_rect: Rect,
     seq_w: f32,
     seq_h: f32,
     force_edit: bool,
-    pointer_in_hud: bool,
-    action: &mut ViewportAction,
-) -> bool {
-    let Some(clip_tf) = active_single_video_clip_transform(session) else {
-        return false;
-    };
-    let local_frame = session.playback.current_frame - clip_tf.clip_start;
-    let contours = collect_editable_contours_for_clip(session, &clip_tf.clip_id, local_frame);
-    if contours.is_empty() {
-        return false;
-    }
-
-    let visible_canvas = canvas_rect.intersect(panel_rect);
-    let painter = ui.painter().with_clip_rect(visible_canvas);
-
-    let wants_kb = ui.ctx().egui_wants_keyboard_input();
-    let (
-        pointer_pos,
-        primary_pressed,
-        primary_down,
-        double_clicked,
-        modifiers,
-        space_down,
-        delete_pressed,
-    ) = ui.input(|i| {
-        (
-            i.pointer.latest_pos(),
-            i.pointer.primary_pressed(),
-            i.pointer.primary_down(),
-            i.pointer.button_double_clicked(PointerButton::Primary),
-            i.modifiers,
-            !wants_kb && i.key_down(egui::Key::Space),
-            !wants_kb && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)),
-        )
-    });
-
-    // Handle Delete / Backspace to remove selected vertex.
-    if delete_pressed
-        && !clip_tf.locked
-        && let Some(sel) = state.selected_path_vertex.clone()
-        && sel.clip_id == clip_tf.clip_id
-        && let Some(contour) = contours
-            .iter()
-            .find(|c| c.source == sel.source && !c.locked)
-        && contour.vertices.len() > 2
-        && sel.vertex_index < contour.vertices.len()
-    {
-        let mut verts = contour.vertices.clone();
-        let mut vids = contour.vertex_ids.clone();
-        let mut modes = contour.vertex_modes.clone();
-        verts.remove(sel.vertex_index);
-        vids.remove(sel.vertex_index);
-        modes.remove(sel.vertex_index);
-        if commit_contour_edit(
-            session,
-            &clip_tf.clip_id,
-            &contour.source,
-            &verts,
-            &vids,
-            &modes,
-            contour.closed,
-            local_frame,
-        ) {
-            state.selected_path_vertex = Some(SelectedPathVertex {
-                clip_id: clip_tf.clip_id.clone(),
-                source: contour.source.clone(),
-                vertex_index: sel.vertex_index.min(verts.len().saturating_sub(1)),
-            });
-            action.transform_modified = true;
-            return true;
-        }
-    }
-
-    // Paint all visible Bezier contours, tangent handles & anchor points.
-    for contour in &contours {
+) {
+    for contour in contours {
         let mapper = CanvasPathMapper::from_clip(
-            &clip_tf,
+            clip_tf,
             seq_w,
             seq_h,
             canvas_rect,
@@ -6915,7 +7152,7 @@ fn handle_and_paint_bezier_paths(
             contour.group_affine,
         );
         let segs = sample_contour_screen_segments(&contour.vertices, contour.closed, &mapper, 20);
-        let stroke = Stroke::new(if force_edit { 1.8 } else { 1.4 }, contour.color);
+        let stroke = Stroke::new(if force_edit { 1.8 } else { 1.5 }, contour.color);
         for (_, pts) in segs {
             if pts.len() >= 2 {
                 painter.add(Shape::line(pts, stroke));
@@ -6924,14 +7161,14 @@ fn handle_and_paint_bezier_paths(
 
         for (v_idx, v) in contour.vertices.iter().enumerate() {
             let anchor_s = mapper.source_to_screen(v.point);
-            let is_selected = state.selected_path_vertex.as_ref().is_some_and(|s| {
+            let is_selected = selected_vertex.is_some_and(|s| {
                 s.clip_id == clip_tf.clip_id
                     && s.source == contour.source
                     && s.vertex_index == v_idx
             });
             let show_handles = force_edit
                 || is_selected
-                || state.selected_path_vertex.as_ref().is_some_and(|s| {
+                || selected_vertex.is_some_and(|s| {
                     s.clip_id == clip_tf.clip_id
                         && s.source == contour.source
                         && (s.vertex_index.abs_diff(v_idx) == 1
@@ -6993,103 +7230,244 @@ fn handle_and_paint_bezier_paths(
             }
         }
     }
+}
 
-    // Active Bezier edit drag update.
+#[allow(clippy::too_many_arguments)]
+fn apply_bezier_drag_step(
+    session: &mut Session,
+    clip_tf: &ActiveVideoClipTransform,
+    contour: &EditableBezierContour,
+    drag: &mut BezierEditDrag,
+    pos: Pos2,
+    modifiers: egui::Modifiers,
+    canvas_rect: Rect,
+    seq_w: f32,
+    seq_h: f32,
+    local_frame: f64,
+    action: &mut ViewportAction,
+) -> bool {
+    let mapper = CanvasPathMapper::from_clip(
+        clip_tf,
+        seq_w,
+        seq_h,
+        canvas_rect,
+        contour.space,
+        contour.group_affine,
+    );
+    let cur_src = mapper.screen_to_source(pos);
+    let dx = cur_src[0] - drag.start_source_pos[0];
+    let dy = cur_src[1] - drag.start_source_pos[1];
+    let start_screen = mapper.source_to_screen(drag.start_source_pos);
+    if !drag.changed && (dx.hypot(dy) > 0.1 || pos.distance(start_screen) > 0.5) {
+        drag.changed = true;
+    }
+    if !drag.changed {
+        return false;
+    }
+    let mut verts = drag.init_vertices.clone();
+    let mut modes = drag.init_modes.clone();
+    match drag.part {
+        BezierDragPart::Anchor(idx) if idx < verts.len() => {
+            verts[idx].point[0] += dx;
+            verts[idx].point[1] += dy;
+        }
+        BezierDragPart::InHandle(idx) if idx < verts.len() => {
+            let mut new_in = [
+                cur_src[0] - verts[idx].point[0],
+                cur_src[1] - verts[idx].point[1],
+            ];
+            if modifiers.shift {
+                new_in = snap_angle_45_deg(new_in);
+            }
+            verts[idx].in_h = new_in;
+            if modifiers.alt {
+                modes[idx] = "broken".to_owned();
+            } else if modes[idx] == "smooth" {
+                let in_len = new_in[0].hypot(new_in[1]);
+                let out_len = verts[idx].out_h[0].hypot(verts[idx].out_h[1]);
+                if in_len > 1e-6 {
+                    let target_len = if out_len > 1e-4 { out_len } else { in_len };
+                    verts[idx].out_h = [
+                        -new_in[0] / in_len * target_len,
+                        -new_in[1] / in_len * target_len,
+                    ];
+                }
+            }
+        }
+        BezierDragPart::OutHandle(idx) if idx < verts.len() => {
+            let mut new_out = [
+                cur_src[0] - verts[idx].point[0],
+                cur_src[1] - verts[idx].point[1],
+            ];
+            if modifiers.shift {
+                new_out = snap_angle_45_deg(new_out);
+            }
+            verts[idx].out_h = new_out;
+            if modifiers.alt {
+                modes[idx] = "broken".to_owned();
+            } else if modes[idx] == "smooth" {
+                let out_len = new_out[0].hypot(new_out[1]);
+                let in_len = verts[idx].in_h[0].hypot(verts[idx].in_h[1]);
+                if out_len > 1e-6 {
+                    let target_len = if in_len > 1e-4 { in_len } else { out_len };
+                    verts[idx].in_h = [
+                        -new_out[0] / out_len * target_len,
+                        -new_out[1] / out_len * target_len,
+                    ];
+                }
+            }
+        }
+        BezierDragPart::WholeContour => {
+            for v in &mut verts {
+                v.point[0] += dx;
+                v.point[1] += dy;
+            }
+        }
+        _ => {}
+    }
+    if commit_contour_edit(
+        session,
+        &drag.clip_id,
+        &drag.source,
+        &verts,
+        &drag.init_vertex_ids,
+        &modes,
+        drag.closed,
+        local_frame,
+    ) {
+        action.transform_modified = true;
+        true
+    } else {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_and_paint_bezier_paths(
+    ui: &mut Ui,
+    session: &mut Session,
+    state: &mut ViewportState,
+    panel_rect: Rect,
+    canvas_rect: Rect,
+    seq_w: f32,
+    seq_h: f32,
+    force_edit: bool,
+    pointer_in_hud: bool,
+    action: &mut ViewportAction,
+) -> bool {
+    let Some(clip_tf) = active_single_video_clip_transform(session) else {
+        return false;
+    };
+    let local_frame = session.playback.current_frame - clip_tf.clip_start;
+    let mut contours = collect_editable_contours_for_clip(session, &clip_tf.clip_id, local_frame);
+    if contours.is_empty() {
+        return false;
+    }
+
+    let painter = ui.painter().with_clip_rect(panel_rect);
+
+    let wants_kb = ui.ctx().egui_wants_keyboard_input();
+    let (
+        pointer_pos,
+        press_origin,
+        primary_pressed,
+        primary_down,
+        double_clicked,
+        modifiers,
+        space_down,
+        delete_pressed,
+    ) = ui.input(|i| {
+        (
+            i.pointer.latest_pos(),
+            i.pointer.press_origin(),
+            i.pointer.primary_pressed(),
+            i.pointer.primary_down(),
+            i.pointer.button_double_clicked(PointerButton::Primary),
+            i.modifiers,
+            !wants_kb && i.key_down(egui::Key::Space),
+            !wants_kb && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)),
+        )
+    });
+
+    // Handle Delete / Backspace to remove selected vertex.
+    if delete_pressed
+        && !clip_tf.locked
+        && let Some(sel) = state.selected_path_vertex.clone()
+        && sel.clip_id == clip_tf.clip_id
+        && let Some(contour) = contours
+            .iter()
+            .find(|c| c.source == sel.source && !c.locked)
+        && contour.vertices.len() > 2
+        && sel.vertex_index < contour.vertices.len()
+    {
+        let mut verts = contour.vertices.clone();
+        let mut vids = contour.vertex_ids.clone();
+        let mut modes = contour.vertex_modes.clone();
+        verts.remove(sel.vertex_index);
+        vids.remove(sel.vertex_index);
+        modes.remove(sel.vertex_index);
+        if commit_contour_edit(
+            session,
+            &clip_tf.clip_id,
+            &contour.source,
+            &verts,
+            &vids,
+            &modes,
+            contour.closed,
+            local_frame,
+        ) {
+            state.selected_path_vertex = Some(SelectedPathVertex {
+                clip_id: clip_tf.clip_id.clone(),
+                source: contour.source.clone(),
+                vertex_index: sel.vertex_index.min(verts.len().saturating_sub(1)),
+            });
+            action.transform_modified = true;
+            contours = collect_editable_contours_for_clip(session, &clip_tf.clip_id, local_frame);
+            paint_editable_contours(
+                &painter,
+                &clip_tf,
+                &contours,
+                state.selected_path_vertex.as_ref(),
+                canvas_rect,
+                seq_w,
+                seq_h,
+                force_edit,
+            );
+            return true;
+        }
+    }
+
+    // Active Bezier edit drag update BEFORE painting so dragged vertices track with zero frame lag.
     let current_drag = std::mem::take(&mut state.drag_state);
     if let ViewportDragState::BezierEdit(mut drag) = current_drag {
         if let Some(contour) = contours.iter().find(|c| c.source == drag.source)
             && let Some(pos) = pointer_pos
-        {
-            let mapper = CanvasPathMapper::from_clip(
+            && apply_bezier_drag_step(
+                session,
                 &clip_tf,
+                contour,
+                &mut drag,
+                pos,
+                modifiers,
+                canvas_rect,
                 seq_w,
                 seq_h,
-                canvas_rect,
-                contour.space,
-                contour.group_affine,
-            );
-            let cur_src = mapper.screen_to_source(pos);
-            let dx = cur_src[0] - drag.start_source_pos[0];
-            let dy = cur_src[1] - drag.start_source_pos[1];
-            if !drag.changed && dx.hypot(dy) > 0.25 {
-                drag.changed = true;
-            }
-            if drag.changed {
-                let mut verts = drag.init_vertices.clone();
-                let mut modes = drag.init_modes.clone();
-                match drag.part {
-                    BezierDragPart::Anchor(idx) if idx < verts.len() => {
-                        verts[idx].point[0] += dx;
-                        verts[idx].point[1] += dy;
-                    }
-                    BezierDragPart::InHandle(idx) if idx < verts.len() => {
-                        let mut new_in = [
-                            cur_src[0] - verts[idx].point[0],
-                            cur_src[1] - verts[idx].point[1],
-                        ];
-                        if modifiers.shift {
-                            new_in = snap_angle_45_deg(new_in);
-                        }
-                        verts[idx].in_h = new_in;
-                        if modifiers.alt {
-                            modes[idx] = "broken".to_owned();
-                        } else if modes[idx] == "smooth" {
-                            let in_len = new_in[0].hypot(new_in[1]);
-                            let out_len = verts[idx].out_h[0].hypot(verts[idx].out_h[1]);
-                            if in_len > 1e-6 {
-                                let target_len = if out_len > 1e-4 { out_len } else { in_len };
-                                verts[idx].out_h = [
-                                    -new_in[0] / in_len * target_len,
-                                    -new_in[1] / in_len * target_len,
-                                ];
-                            }
-                        }
-                    }
-                    BezierDragPart::OutHandle(idx) if idx < verts.len() => {
-                        let mut new_out = [
-                            cur_src[0] - verts[idx].point[0],
-                            cur_src[1] - verts[idx].point[1],
-                        ];
-                        if modifiers.shift {
-                            new_out = snap_angle_45_deg(new_out);
-                        }
-                        verts[idx].out_h = new_out;
-                        if modifiers.alt {
-                            modes[idx] = "broken".to_owned();
-                        } else if modes[idx] == "smooth" {
-                            let out_len = new_out[0].hypot(new_out[1]);
-                            let in_len = verts[idx].in_h[0].hypot(verts[idx].in_h[1]);
-                            if out_len > 1e-6 {
-                                let target_len = if in_len > 1e-4 { in_len } else { out_len };
-                                verts[idx].in_h = [
-                                    -new_out[0] / out_len * target_len,
-                                    -new_out[1] / out_len * target_len,
-                                ];
-                            }
-                        }
-                    }
-                    BezierDragPart::WholeContour => {
-                        for v in &mut verts {
-                            v.point[0] += dx;
-                            v.point[1] += dy;
-                        }
-                    }
-                    _ => {}
-                }
-                if commit_contour_edit(
-                    session,
-                    &drag.clip_id,
-                    &drag.source,
-                    &verts,
-                    &drag.init_vertex_ids,
-                    &modes,
-                    drag.closed,
-                    local_frame,
-                ) {
-                    action.transform_modified = true;
-                }
-            }
+                local_frame,
+                action,
+            )
+        {
+            contours = collect_editable_contours_for_clip(session, &clip_tf.clip_id, local_frame);
         }
+        paint_editable_contours(
+            &painter,
+            &clip_tf,
+            &contours,
+            state.selected_path_vertex.as_ref(),
+            canvas_rect,
+            seq_w,
+            seq_h,
+            force_edit,
+        );
         if primary_down {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
             state.drag_state = ViewportDragState::BezierEdit(drag);
@@ -7102,7 +7480,19 @@ fn handle_and_paint_bezier_paths(
     }
     state.drag_state = current_drag;
 
-    // Hit-test tangent handles, anchor vertices, and Bezier segments for new interactions.
+    // Paint all visible Bezier contours, tangent handles & anchor points.
+    paint_editable_contours(
+        &painter,
+        &clip_tf,
+        &contours,
+        state.selected_path_vertex.as_ref(),
+        canvas_rect,
+        seq_w,
+        seq_h,
+        force_edit,
+    );
+
+    // Hit-test anchor points, tangent handles, and Bezier segments for new interactions.
     if clip_tf.locked
         || space_down
         || pointer_in_hud
@@ -7113,11 +7503,19 @@ fn handle_and_paint_bezier_paths(
     let Some(pos) = pointer_pos else {
         return false;
     };
-    if !pointer_hits_viewport(ui, pos, panel_rect) || !visible_canvas.contains(pos) {
+    // Use `press_origin` when `primary_pressed` so fast coalesced press+move drags still hit the vertex.
+    let hit_pos = if primary_pressed {
+        press_origin.unwrap_or(pos)
+    } else {
+        pos
+    };
+    if !pointer_hits_viewport(ui, hit_pos, panel_rect) {
         return false;
     }
 
-    // 1. Check tangent handles first (highest precision).
+    // 1. Check tangent handles first ONLY when they are clearly separated from their anchor (>6px)
+    //    and strictly closer to the pointer than the anchor itself, so clicking a highlighted anchor
+    //    with short handles never gets hijacked by a nearby tangent handle.
     for contour in &contours {
         if contour.locked {
             continue;
@@ -7131,11 +7529,23 @@ fn handle_and_paint_bezier_paths(
             contour.group_affine,
         );
         for (v_idx, v) in contour.vertices.iter().enumerate() {
+            let anchor_s = mapper.source_to_screen(v.point);
+            let anchor_dist = hit_pos.distance(anchor_s);
             let in_s = mapper.source_to_screen([v.point[0] + v.in_h[0], v.point[1] + v.in_h[1]]);
             let out_s = mapper.source_to_screen([v.point[0] + v.out_h[0], v.point[1] + v.out_h[1]]);
-            let hit_part = if v.in_h[0].hypot(v.in_h[1]) > 1e-3 && pos.distance(in_s) <= 8.0 {
+            let in_dist = hit_pos.distance(in_s);
+            let out_dist = hit_pos.distance(out_s);
+            let hit_part = if v.in_h[0].hypot(v.in_h[1]) > 1e-3
+                && anchor_s.distance(in_s) > 6.0
+                && in_dist <= 8.5
+                && in_dist < anchor_dist
+            {
                 Some(BezierDragPart::InHandle(v_idx))
-            } else if v.out_h[0].hypot(v.out_h[1]) > 1e-3 && pos.distance(out_s) <= 8.0 {
+            } else if v.out_h[0].hypot(v.out_h[1]) > 1e-3
+                && anchor_s.distance(out_s) > 6.0
+                && out_dist <= 8.5
+                && out_dist < anchor_dist
+            {
                 Some(BezierDragPart::OutHandle(v_idx))
             } else {
                 None
@@ -7148,17 +7558,33 @@ fn handle_and_paint_bezier_paths(
                         source: contour.source.clone(),
                         vertex_index: v_idx,
                     });
-                    state.drag_state = ViewportDragState::BezierEdit(BezierEditDrag {
+                    let mut drag = BezierEditDrag {
                         clip_id: clip_tf.clip_id.clone(),
                         source: contour.source.clone(),
                         part,
-                        start_source_pos: mapper.screen_to_source(pos),
+                        start_source_pos: mapper.screen_to_source(hit_pos),
                         init_vertices: contour.vertices.clone(),
                         init_modes: contour.vertex_modes.clone(),
                         init_vertex_ids: contour.vertex_ids.clone(),
                         closed: contour.closed,
                         changed: false,
-                    });
+                    };
+                    if pos.distance(hit_pos) > 0.5 {
+                        let _ = apply_bezier_drag_step(
+                            session,
+                            &clip_tf,
+                            contour,
+                            &mut drag,
+                            pos,
+                            modifiers,
+                            canvas_rect,
+                            seq_w,
+                            seq_h,
+                            local_frame,
+                            action,
+                        );
+                    }
+                    state.drag_state = ViewportDragState::BezierEdit(drag);
                     return true;
                 }
                 return false;
@@ -7181,7 +7607,7 @@ fn handle_and_paint_bezier_paths(
         );
         for (v_idx, v) in contour.vertices.iter().enumerate() {
             let anchor_s = mapper.source_to_screen(v.point);
-            if pos.distance(anchor_s) <= 8.5 {
+            if hit_pos.distance(anchor_s) <= 10.0 {
                 ui.ctx().set_cursor_icon(CursorIcon::Move);
                 if double_clicked {
                     let mut verts = contour.vertices.clone();
@@ -7221,17 +7647,33 @@ fn handle_and_paint_bezier_paths(
                         source: contour.source.clone(),
                         vertex_index: v_idx,
                     });
-                    state.drag_state = ViewportDragState::BezierEdit(BezierEditDrag {
+                    let mut drag = BezierEditDrag {
                         clip_id: clip_tf.clip_id.clone(),
                         source: contour.source.clone(),
                         part: BezierDragPart::Anchor(v_idx),
-                        start_source_pos: mapper.screen_to_source(pos),
+                        start_source_pos: mapper.screen_to_source(hit_pos),
                         init_vertices: contour.vertices.clone(),
                         init_modes: contour.vertex_modes.clone(),
                         init_vertex_ids: contour.vertex_ids.clone(),
                         closed: contour.closed,
                         changed: false,
-                    });
+                    };
+                    if pos.distance(hit_pos) > 0.5 {
+                        let _ = apply_bezier_drag_step(
+                            session,
+                            &clip_tf,
+                            contour,
+                            &mut drag,
+                            pos,
+                            modifiers,
+                            canvas_rect,
+                            seq_w,
+                            seq_h,
+                            local_frame,
+                            action,
+                        );
+                    }
+                    state.drag_state = ViewportDragState::BezierEdit(drag);
                     return true;
                 }
                 return false;
@@ -7254,7 +7696,7 @@ fn handle_and_paint_bezier_paths(
                 contour.group_affine,
             );
             if let Some((seg_idx, t, _)) =
-                hit_test_contour_segment(pos, &contour.vertices, contour.closed, &mapper, 7.0)
+                hit_test_contour_segment(hit_pos, &contour.vertices, contour.closed, &mapper, 7.0)
             {
                 if modifiers.shift {
                     ui.ctx().set_cursor_icon(CursorIcon::Move);
@@ -7263,7 +7705,7 @@ fn handle_and_paint_bezier_paths(
                             clip_id: clip_tf.clip_id.clone(),
                             source: contour.source.clone(),
                             part: BezierDragPart::WholeContour,
-                            start_source_pos: mapper.screen_to_source(pos),
+                            start_source_pos: mapper.screen_to_source(hit_pos),
                             init_vertices: contour.vertices.clone(),
                             init_modes: contour.vertex_modes.clone(),
                             init_vertex_ids: contour.vertex_ids.clone(),
@@ -7343,6 +7785,7 @@ fn handle_and_paint_pen_tool(
     if clip_tf.locked {
         return false;
     }
+    let local_frame = session.playback.current_frame - clip_tf.clip_start;
     let is_sp = is_clip_shape_plus(session, &clip_tf.clip_id);
     let space = if is_sp {
         PathCoordSpace::ShapePlusLocal
@@ -7352,6 +7795,23 @@ fn handle_and_paint_pen_tool(
     let mapper =
         CanvasPathMapper::from_clip(&clip_tf, seq_w, seq_h, canvas_rect, space, AFFINE_IDENTITY);
     let visible_canvas = canvas_rect.intersect(panel_rect);
+
+    // Keep already-committed Shape+ / LayerMask outlines clearly visible while Pen tool is active.
+    let existing_contours =
+        collect_editable_contours_for_clip(session, &clip_tf.clip_id, local_frame);
+    if !existing_contours.is_empty() {
+        let painter = ui.painter().with_clip_rect(panel_rect);
+        paint_editable_contours(
+            &painter,
+            &clip_tf,
+            &existing_contours,
+            state.selected_path_vertex.as_ref(),
+            canvas_rect,
+            seq_w,
+            seq_h,
+            false,
+        );
+    }
 
     let wants_kb = ui.ctx().egui_wants_keyboard_input();
     let (pointer_pos, primary_pressed, primary_down, modifiers, enter_or_esc) = ui.input(|i| {
@@ -7372,8 +7832,10 @@ fn handle_and_paint_pen_tool(
         ui.ctx().set_cursor_icon(CursorIcon::Cell);
     }
 
-    // Enter / Escape finishes an open contour (or cancels if < 2 points).
+    // Enter / Escape finishes a contour (automatically closing non-Shape+ layer masks with >= 3 points
+    // so they form a valid filled mask region rather than a zero-area open stroke).
     if enter_or_esc && let Some(draft) = state.pen_draft.take() {
+        let close_mask = !draft.is_shape_plus && draft.vertices.len() >= 3;
         if draft.vertices.len() >= 2
             && let Some(src) = commit_new_contour(
                 session,
@@ -7381,7 +7843,7 @@ fn handle_and_paint_pen_tool(
                 draft.is_shape_plus,
                 &draft.vertices,
                 &draft.vertex_modes,
-                false,
+                close_mask,
             )
         {
             state.selected_path_vertex = Some(SelectedPathVertex {
@@ -7475,11 +7937,11 @@ fn handle_and_paint_pen_tool(
 
     // Paint live Pen draft contour & rubber-band guide.
     if let Some(draft) = &state.pen_draft {
-        let painter = ui.painter().with_clip_rect(visible_canvas);
+        let painter = ui.painter().with_clip_rect(panel_rect);
         let col = if draft.is_shape_plus {
             COLOR_SHAPE_PATH
         } else {
-            mask_palette_color(0)
+            mask_palette_color(existing_contours.len())
         };
         let segs = sample_contour_screen_segments(&draft.vertices, false, &mapper, 20);
         for (_, pts) in segs {
@@ -7556,6 +8018,7 @@ fn handle_and_paint_quick_shape_tool(
     if clip_tf.locked {
         return false;
     }
+    let local_frame = session.playback.current_frame - clip_tf.clip_start;
     let is_sp = is_clip_shape_plus(session, &clip_tf.clip_id);
     let space = if is_sp {
         PathCoordSpace::ShapePlusLocal
@@ -7565,6 +8028,24 @@ fn handle_and_paint_quick_shape_tool(
     let mapper =
         CanvasPathMapper::from_clip(&clip_tf, seq_w, seq_h, canvas_rect, space, AFFINE_IDENTITY);
     let visible_canvas = canvas_rect.intersect(panel_rect);
+
+    // Paint already-committed Shape+ / LayerMask outlines so masks remain clearly visible
+    // without lighting up Bezier-edit vertex handles while Freehand/QuickShape is active.
+    let existing_contours =
+        collect_editable_contours_for_clip(session, &clip_tf.clip_id, local_frame);
+    if !existing_contours.is_empty() {
+        let painter = ui.painter().with_clip_rect(panel_rect);
+        paint_editable_contours(
+            &painter,
+            &clip_tf,
+            &existing_contours,
+            None,
+            canvas_rect,
+            seq_w,
+            seq_h,
+            false,
+        );
+    }
 
     let (pointer_pos, primary_pressed, primary_down, modifiers) = ui.input(|i| {
         (
@@ -7622,11 +8103,11 @@ fn handle_and_paint_quick_shape_tool(
         }
 
         // Paint live preview.
-        let painter = ui.painter().with_clip_rect(visible_canvas);
+        let painter = ui.painter().with_clip_rect(panel_rect);
         let col = if drag.is_shape_plus {
             COLOR_SHAPE_PATH
         } else {
-            mask_palette_color(0)
+            mask_palette_color(existing_contours.len())
         };
         let stroke = Stroke::new(1.8, col);
         match drag.kind {
@@ -7637,7 +8118,17 @@ fn handle_and_paint_quick_shape_tool(
                     .map(|&p| mapper.source_to_screen(p))
                     .collect();
                 if pts.len() >= 2 {
-                    painter.add(Shape::line(pts, stroke));
+                    painter.add(Shape::line(pts.clone(), stroke));
+                    // For layer masks (auto-closed on commit), preview the closing edge back to start.
+                    if !drag.is_shape_plus && pts.len() >= 3 {
+                        painter.line_segment(
+                            [*pts.last().unwrap(), pts[0]],
+                            Stroke::new(
+                                1.2,
+                                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 150),
+                            ),
+                        );
+                    }
                 }
             }
             QuickShapeKind::Rectangle => {
@@ -7667,9 +8158,12 @@ fn handle_and_paint_quick_shape_tool(
                 }
                 let first_s = mapper.source_to_screen(drag.raw_points[0]);
                 let last_s = mapper.source_to_screen(*drag.raw_points.last().unwrap());
-                let closed = drag.raw_points.len() >= 4 && first_s.distance(last_s) <= 14.0;
+                // Layer masks must close on commit so they form a valid filled mask region
+                // instead of a zero-area open stroke that blanks the layer.
+                let near_start = drag.raw_points.len() >= 4 && first_s.distance(last_s) <= 14.0;
+                let closed = !drag.is_shape_plus || near_start;
                 let mut simplified = rdp_simplify(&drag.raw_points, 2.5);
-                if closed && simplified.len() > 3 {
+                if near_start && simplified.len() > 3 {
                     simplified.pop();
                 }
                 let (v, m) = fit_smooth_bezier_vertices(&simplified, closed);
@@ -7704,7 +8198,29 @@ fn handle_and_paint_quick_shape_tool(
         )
         .is_some()
         {
+            // Stay cleanly on Freehand/QuickShape (`Some(2)`) as the single active tool:
+            // never leave Bezier-edit vertex handles or 2D transform controls dual-highlighted.
+            state.selected_path_vertex = None;
+            state.active_draw_tool = Some(2);
+            session.playback.transform_controls_2d = false;
             action.transform_modified = true;
+            ui.ctx().request_repaint();
+            // Paint the newly committed contour immediately on this frame so it never flashes away.
+            let updated_contours =
+                collect_editable_contours_for_clip(session, &clip_tf.clip_id, local_frame);
+            if !updated_contours.is_empty() {
+                let painter = ui.painter().with_clip_rect(panel_rect);
+                paint_editable_contours(
+                    &painter,
+                    &clip_tf,
+                    &updated_contours,
+                    None,
+                    canvas_rect,
+                    seq_w,
+                    seq_h,
+                    false,
+                );
+            }
         }
         return true;
     }
@@ -9090,5 +9606,958 @@ mod tests {
         assert!((g.thirds_x[1] - (100.0 + 640.0)).abs() < 1e-3);
         assert!((g.thirds_y[0] - (50.0 + 180.0)).abs() < 1e-3);
         assert!((g.thirds_y[1] - (50.0 + 360.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn gizmo_3d_and_wireframes_hidden_when_editing_camera_is_off() {
+        let mut session = Session::new();
+        let vtrack = session.document().video_tracks[0].id.clone();
+        let clip_id = session
+            .execute(Command::AddClip {
+                track_id: vtrack,
+                kind: "scene".to_owned(),
+                name: Some("Scene".to_owned()),
+                start: 0.0,
+                length: 120.0,
+            })
+            .unwrap()["clip_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let text_id = session
+            .execute(Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                kind: "Text3D".to_owned(),
+                name: Some("Text".to_owned()),
+                parent_id: None,
+            })
+            .unwrap()["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let _ = session.selection.select_clip(clip_id, Some("scene"), false);
+        let _ = session
+            .selection
+            .select_object_3d(text_id.clone(), "Text3D", false);
+
+        // Editing Camera OFF (clean final preview mode): 3D gizmos must NOT appear or respond to drag.
+        session.playback.editing_camera = false;
+        let ctx = egui::Context::default();
+        let mut vp = ViewportState::new();
+        let palette = ThemePalette::default();
+        let panel_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 450.0));
+        let mut raw = egui::RawInput {
+            screen_rect: Some(panel_rect),
+            ..Default::default()
+        };
+        let mut out_off = ctx.run_ui(raw.clone(), |ui| {
+            let _ = show_viewport(ui, &mut session, &mut vp, None, &palette);
+        });
+        out_off.textures_delta.clear();
+        let has_gizmo_axis_label_off = out_off.shapes.iter().any(|cs| {
+            matches!(&cs.shape, Shape::Text(ts) if matches!(ts.galley.text(), "X" | "Y" | "Z" | "W" | "World"))
+        });
+        assert!(
+            !has_gizmo_axis_label_off,
+            "3D gizmo arrows and W/World HUD must NOT render when Editing Camera is OFF"
+        );
+
+        // Editing Camera ON: 3D gizmo arrows and W/World HUD MUST render.
+        session.playback.editing_camera = true;
+        raw.time = Some(0.1);
+        let mut out_on = ctx.run_ui(raw, |ui| {
+            let _ = show_viewport(ui, &mut session, &mut vp, None, &palette);
+        });
+        out_on.textures_delta.clear();
+        let has_gizmo_axis_label_on = out_on.shapes.iter().any(|cs| {
+            matches!(&cs.shape, Shape::Text(ts) if matches!(ts.galley.text(), "X" | "Y" | "Z" | "W"))
+        });
+        assert!(
+            has_gizmo_axis_label_on,
+            "3D gizmo arrows and W HUD must render when Editing Camera is ON"
+        );
+    }
+
+    #[test]
+    fn editor_cam_dropdown_opens_on_primary_click_without_double_toggle() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session.selection.select_clip(clip_id, Some("scene"), false);
+        session.playback.editing_camera = true;
+
+        let mut state = ViewportState::new();
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 450.0));
+        // Camera Switcher button sits at x = 8 + 72 + 1 + 46 + 1 = 128..242, y = 8..30.
+        let cam_btn = pos2(180.0, 19.0);
+
+        let run = |session: &mut Session,
+                   state: &mut ViewportState,
+                   time: f64,
+                   events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let _ = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            full.shapes
+        };
+
+        let _ = run(
+            &mut session,
+            &mut state,
+            0.0,
+            vec![egui::Event::PointerMoved(cam_btn)],
+        );
+        let _ = run(
+            &mut session,
+            &mut state,
+            0.02,
+            vec![
+                egui::Event::PointerMoved(cam_btn),
+                egui::Event::PointerButton {
+                    pos: cam_btn,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = run(
+            &mut session,
+            &mut state,
+            0.04,
+            vec![
+                egui::Event::PointerMoved(cam_btn),
+                egui::Event::PointerButton {
+                    pos: cam_btn,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        // egui::Popup runs an invisible sizing pass on the opening frame and paints visibly on the next frame.
+        let shapes = run(
+            &mut session,
+            &mut state,
+            0.06,
+            vec![egui::Event::PointerMoved(cam_btn)],
+        );
+        let has_menu_item = shapes.iter().any(|cs| {
+            matches!(&cs.shape, Shape::Text(ts) if ts.galley.text().contains("Active Scene Camera"))
+        });
+        assert!(
+            has_menu_item,
+            "Clicking Editor Cam dropdown must open Camera Switcher menu"
+        );
+    }
+
+    #[test]
+    fn force_refresh_and_fps_overlay_and_safe_guides_individual_toggles() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session.selection.select_clip(clip_id, Some("scene"), false);
+        session.playback.editing_camera = true;
+
+        let mut state = ViewportState::new();
+        assert!(state.show_fps_overlay, "show_fps_overlay defaults true");
+
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 450.0));
+        let run = |session: &mut Session, state: &mut ViewportState, time: f64| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                focused: true,
+                ..Default::default()
+            };
+            let mut action = ViewportAction::default();
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        action = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            (action, full.shapes)
+        };
+
+        let (_, shapes_fps_on) = run(&mut session, &mut state, 0.0);
+        assert!(
+            shapes_fps_on
+                .iter()
+                .any(|cs| matches!(&cs.shape, Shape::Text(ts) if ts.galley.text().contains("fps"))),
+            "FPS badge renders when show_fps_overlay is true"
+        );
+
+        // Toggle Editing Camera OFF and hide FPS overlay.
+        session.playback.editing_camera = false;
+        state.show_fps_overlay = false;
+        let (act_toggle, shapes_fps_off) = run(&mut session, &mut state, 0.05);
+        assert!(
+            act_toggle.force_refresh,
+            "Toggling Editing Camera must set action.force_refresh = true"
+        );
+        assert!(
+            !shapes_fps_off
+                .iter()
+                .any(|cs| matches!(&cs.shape, Shape::Text(ts) if ts.galley.text().contains("fps"))),
+            "FPS badge must hide when show_fps_overlay is false"
+        );
+
+        // Individual Action Safe (90%) guide renders without Title Safe (80%) and label sits at bottom-left.
+        state.show_safe_guides = true;
+        state.safe_guides = SafeGuideOptions {
+            action_safe: true,
+            title_safe: false,
+            rule_of_thirds: false,
+            center_crosshair: false,
+        };
+        let (_, shapes_guides) = run(&mut session, &mut state, 0.10);
+        let mut found_90 = false;
+        let mut found_80 = false;
+        for cs in &shapes_guides {
+            if let Shape::Text(ts) = &cs.shape {
+                if ts.galley.text() == "90%" {
+                    found_90 = true;
+                    assert!(
+                        ts.pos.y > 100.0,
+                        "90% Action Safe label must sit clear of the top-left HUD bar (y={})",
+                        ts.pos.y
+                    );
+                }
+                if ts.galley.text() == "80%" {
+                    found_80 = true;
+                }
+            }
+        }
+        assert!(
+            found_90,
+            "Action Safe 90% guide label must render when enabled"
+        );
+        assert!(
+            !found_80,
+            "Title Safe 80% guide label must stay hidden when individually disabled"
+        );
+    }
+
+    #[test]
+    fn freehand_mask_auto_closes_and_coalesced_vertex_drag_updates_mask() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session
+            .selection
+            .select_clip(clip_id.clone(), Some("scene"), false);
+        session.playback.editing_camera = false;
+
+        let mut state = ViewportState::new();
+        state.active_draw_tool = Some(2); // Freehand / Quick Shape tool
+        state.quick_shape_kind = QuickShapeKind::Freehand;
+
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 360.0));
+        let step = |session: &mut Session,
+                    state: &mut ViewportState,
+                    time: f64,
+                    events: Vec<egui::Event>|
+         -> ViewportAction {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut action = ViewportAction::default();
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        action = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            action
+        };
+
+        // Draw an OPEN freehand stroke on a non-Shape+ layer (endpoints far apart).
+        let p0 = pos2(150.0, 120.0);
+        let p1 = pos2(260.0, 120.0);
+        let p2 = pos2(260.0, 220.0);
+        step(
+            &mut session,
+            &mut state,
+            0.0,
+            vec![egui::Event::PointerMoved(p0)],
+        );
+        step(
+            &mut session,
+            &mut state,
+            0.02,
+            vec![
+                egui::Event::PointerMoved(p0),
+                egui::Event::PointerButton {
+                    pos: p0,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        step(
+            &mut session,
+            &mut state,
+            0.04,
+            vec![egui::Event::PointerMoved(p1)],
+        );
+        step(
+            &mut session,
+            &mut state,
+            0.06,
+            vec![egui::Event::PointerMoved(p2)],
+        );
+        let commit_act = step(
+            &mut session,
+            &mut state,
+            0.08,
+            vec![
+                egui::Event::PointerMoved(p2),
+                egui::Event::PointerButton {
+                    pos: p2,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(commit_act.transform_modified);
+        let contours = collect_editable_contours_for_clip(&session, &clip_id, 0.0);
+        assert_eq!(contours.len(), 1);
+        assert!(
+            contours[0].closed,
+            "Freehand Layer Mask must auto-close on commit so it forms a valid filled mask"
+        );
+
+        // Switch to Bezier vertex edit tool and perform a coalesced press+move drag on vertex 0.
+        state.active_draw_tool = Some(1);
+        let v0_before = contours[0].vertices[0].point;
+        let v0_screen = pos2((v0_before[0] / 3.0) as f32, (v0_before[1] / 3.0) as f32);
+        let drag_to = pos2(v0_screen.x + 30.0, v0_screen.y + 18.0);
+        step(
+            &mut session,
+            &mut state,
+            0.10,
+            vec![egui::Event::PointerMoved(v0_screen)],
+        );
+        let coalesced_act = step(
+            &mut session,
+            &mut state,
+            0.12,
+            vec![
+                egui::Event::PointerButton {
+                    pos: v0_screen,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(drag_to),
+            ],
+        );
+        step(
+            &mut session,
+            &mut state,
+            0.14,
+            vec![egui::Event::PointerButton {
+                pos: drag_to,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(coalesced_act.transform_modified);
+        let after = collect_editable_contours_for_clip(&session, &clip_id, 0.0);
+        let v0_after = after[0].vertices[0].point;
+        assert!(
+            (v0_after[0] - v0_before[0] - 90.0).abs() < 4.0
+                && (v0_after[1] - v0_before[1] - 54.0).abs() < 4.0,
+            "Layer mask vertex must move cleanly on coalesced press+drag (before={v0_before:?}, after={v0_after:?})"
+        );
+    }
+
+    #[test]
+    fn discrete_wheel_2d_zoom_step_is_gentle() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        session.playback.editing_camera = false;
+        let mut state = ViewportState::new();
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 450.0));
+        let hover = pos2(400.0, 225.0);
+
+        let step = |session: &mut Session,
+                    state: &mut ViewportState,
+                    time: f64,
+                    events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let _ = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+        };
+
+        step(
+            &mut session,
+            &mut state,
+            0.0,
+            vec![egui::Event::PointerMoved(hover)],
+        );
+        step(
+            &mut session,
+            &mut state,
+            0.02,
+            vec![
+                egui::Event::PointerMoved(hover),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            state.zoom_2d > 1.02 && state.zoom_2d <= 1.25,
+            "Single discrete wheel tick must zoom gently (~1.05x-1.22x), got {:.3}x",
+            state.zoom_2d
+        );
+    }
+
+    #[test]
+    fn freehand_mask_commit_preserves_single_active_tool_without_dual_highlight() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session
+            .selection
+            .select_clip(clip_id.clone(), Some("scene"), false);
+        session.playback.editing_camera = false;
+        // Start with 2D transform controls enabled to ensure entering/committing Freehand
+        // never leaves both 2D Transform and Freehand highlighted simultaneously.
+        session.playback.transform_controls_2d = true;
+
+        let mut state = ViewportState::new();
+        state.active_draw_tool = Some(2);
+        state.quick_shape_kind = QuickShapeKind::Freehand;
+
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 360.0));
+        let step = |session: &mut Session,
+                    state: &mut ViewportState,
+                    time: f64,
+                    events: Vec<egui::Event>|
+         -> ViewportAction {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut action = ViewportAction::default();
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        action = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            action
+        };
+
+        let p0 = pos2(160.0, 120.0);
+        let p1 = pos2(260.0, 140.0);
+        let p2 = pos2(220.0, 220.0);
+        step(
+            &mut session,
+            &mut state,
+            0.0,
+            vec![egui::Event::PointerMoved(p0)],
+        );
+        step(
+            &mut session,
+            &mut state,
+            0.02,
+            vec![
+                egui::Event::PointerMoved(p0),
+                egui::Event::PointerButton {
+                    pos: p0,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        step(
+            &mut session,
+            &mut state,
+            0.04,
+            vec![egui::Event::PointerMoved(p1)],
+        );
+        let act = step(
+            &mut session,
+            &mut state,
+            0.06,
+            vec![
+                egui::Event::PointerMoved(p2),
+                egui::Event::PointerButton {
+                    pos: p2,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(act.transform_modified);
+        assert_eq!(
+            state.active_draw_tool,
+            Some(2),
+            "Freehand commit must stay cleanly on Freehand tool (`Some(2)`)"
+        );
+        assert!(
+            !session.playback.transform_controls_2d,
+            "2D transform controls must not stay dual-highlighted alongside active Freehand tool"
+        );
+        assert!(
+            state.selected_path_vertex.is_none(),
+            "Freehand commit must not leave Bezier-edit vertex handles active while in Freehand mode"
+        );
+
+        // Re-enabling 2D transform controls must cleanly exit the draw tool (mutually exclusive).
+        session.playback.transform_controls_2d = true;
+        step(&mut session, &mut state, 0.08, vec![]);
+        assert_eq!(state.active_draw_tool, None);
+        assert!(session.playback.transform_controls_2d);
+    }
+
+    #[test]
+    fn fast_flick_on_2d_corner_handle_uses_press_origin_and_scales_instead_of_body_move() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let track_id = session.document().video_tracks[0].id.clone();
+        session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "shape_layer".to_string(),
+                name: Some("FlickRect".to_string()),
+                start: 0.0,
+                length: 120.0,
+            })
+            .expect("add 2D video clip");
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session.selection.select_clip(&clip_id, None, false);
+        session.playback.transform_controls_2d = true;
+        session.playback.editing_camera = false;
+
+        let panel = Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 540.0));
+        let mut state = ViewportState::new();
+        let step = |session: &mut Session,
+                    state: &mut ViewportState,
+                    time: f64,
+                    events: Vec<egui::Event>|
+         -> ViewportAction {
+            let mut action = ViewportAction::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(panel),
+                time: Some(time),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        action = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            action
+        };
+
+        // Scale the clip to 0.5x so its TopLeft corner handle sits strictly inside the canvas.
+        let _ = session.execute(Command::SetPropertyValue {
+            target_id: clip_id.clone(),
+            property: "scale".to_string(),
+            value: json!([0.5, 0.5]),
+        });
+        let _ = step(&mut session, &mut state, 0.0, vec![]);
+
+        let seq_w = session.document().resolution[0].max(1) as f32;
+        let seq_h = session.document().resolution[1].max(1) as f32;
+        let canvas = compute_canvas_rect(panel, seq_w as u32, seq_h as u32);
+        let ratio = canvas.width() / seq_w;
+        // TopLeft corner of a 0.5x scale centered layer is at center - (0.25 * seq_w, 0.25 * seq_h) * ratio.
+        let tl_corner = pos2(
+            canvas.center().x - 0.25 * seq_w * ratio,
+            canvas.center().y - 0.25 * seq_h * ratio,
+        );
+        // Simulate a fast click-drag flick: press_origin is right on TopLeft handle,
+        // and pointer moves 22 px diagonally inward (> 8.5 px handle hit radius) in the SAME press frame!
+        let flick_end = pos2(tl_corner.x + 22.0, tl_corner.y + 22.0);
+        let act = step(
+            &mut session,
+            &mut state,
+            0.02,
+            vec![
+                egui::Event::PointerMoved(tl_corner),
+                egui::Event::PointerButton {
+                    pos: tl_corner,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(flick_end),
+            ],
+        );
+
+        assert!(
+            matches!(
+                &state.drag_state,
+                ViewportDragState::Transform2D(d) if d.handle == Transform2DHandle::TopLeft
+            ),
+            "fast flick starting on TopLeft handle must grab Transform2DHandle::TopLeft (not Body), got {:?}",
+            state.drag_state
+        );
+        assert!(act.transform_modified);
+
+        // Position must remain unchanged (no Body fall-through), while scale shrinks from 0.5.
+        let tf = active_single_video_clip_transform(&session).expect("active transform");
+        assert!(
+            tf.pos_2d.x.abs() < 1e-3 && tf.pos_2d.y.abs() < 1e-3,
+            "corner handle flick must not move position: {:?}",
+            tf.pos_2d
+        );
+        assert!(
+            tf.scale_2d.x < 0.48 && tf.scale_2d.y < 0.48,
+            "inward TopLeft flick must scale layer down, got {:?}",
+            tf.scale_2d
+        );
+    }
+
+    #[test]
+    fn fast_flick_on_3d_gizmo_axis_uses_press_origin() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        session
+            .execute(Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                kind: "box".to_string(),
+                name: Some("Box".to_string()),
+                parent_id: None,
+            })
+            .expect("add 3D box");
+        let obj_id = session.document().video_tracks[0].clips[0]
+            .objects_3d
+            .last()
+            .expect("box object")
+            .id
+            .clone();
+        let _ = session
+            .selection
+            .select_clip(&clip_id, Some("scene"), false);
+        let _ = session.selection.select_object_3d(&obj_id, "box", false);
+        session.playback.editing_camera = true;
+
+        let panel = Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 540.0));
+        let mut state = ViewportState::new();
+        state.gizmo_3d_mode = Gizmo3DMode::Translate;
+
+        let step = |session: &mut Session,
+                    state: &mut ViewportState,
+                    time: f64,
+                    events: Vec<egui::Event>|
+         -> ViewportAction {
+            let mut action = ViewportAction::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(panel),
+                time: Some(time),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        action = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            action
+        };
+        let _ = step(&mut session, &mut state, 0.0, vec![]);
+
+        let canvas = compute_canvas_rect(panel, 1920, 1080);
+        let origin_s = state
+            .camera
+            .project_world_point(Vec3::ZERO, canvas)
+            .expect("origin projects");
+        let aspect = canvas.width() / canvas.height().max(1.0);
+        let world_len = (GIZMO_SCREEN_LEN_PX
+            * ResolvedCamera3D::from_editor_camera(&state.camera, aspect)
+                .world_units_per_px(Vec3::ZERO, canvas))
+        .max(0.05);
+        let tip_x = state
+            .camera
+            .project_world_point(Vec3::X * world_len, canvas)
+            .expect("tip_x projects");
+        let press_pt = pos2(
+            origin_s.x + (tip_x.x - origin_s.x) * 0.75,
+            origin_s.y + (tip_x.y - origin_s.y) * 0.75,
+        );
+        // Coalesced fast flick 24 px off the X axis shaft in the press frame.
+        let flick_pt = pos2(press_pt.x + 24.0, press_pt.y - 24.0);
+        let act = step(
+            &mut session,
+            &mut state,
+            0.02,
+            vec![
+                egui::Event::PointerMoved(press_pt),
+                egui::Event::PointerButton {
+                    pos: press_pt,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(flick_pt),
+            ],
+        );
+
+        assert!(
+            matches!(
+                &state.drag_state,
+                ViewportDragState::Gizmo3D(d) if d.handle == Gizmo3DHandle::AxisX
+            ),
+            "fast flick starting on 3D AxisX handle must grab Gizmo3DHandle::AxisX, got {:?}",
+            state.drag_state
+        );
+        assert!(act.transform_modified);
+    }
+
+    #[test]
+    fn editing_camera_shift_left_drag_pans_and_discrete_wheel_dollies_gently() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session
+            .selection
+            .select_clip(&clip_id, Some("scene"), false);
+        session.playback.editing_camera = true;
+
+        let panel = Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 540.0));
+        let mut state = ViewportState::new();
+        let step = |session: &mut Session,
+                    state: &mut ViewportState,
+                    time: f64,
+                    modifiers: egui::Modifiers,
+                    mut events: Vec<egui::Event>|
+         -> ViewportAction {
+            let mut action = ViewportAction::default();
+            events.insert(0, egui::Event::ModifiersChanged(modifiers));
+            let raw = egui::RawInput {
+                screen_rect: Some(panel),
+                time: Some(time),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        action = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            action
+        };
+
+        let p0 = pos2(480.0, 270.0);
+        let p1 = pos2(540.0, 240.0);
+        let _ = step(
+            &mut session,
+            &mut state,
+            0.0,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(p0)],
+        );
+
+        // 1. Shift+Left-Drag must pan (shifting target & position together while preserving distance).
+        let target_before = state.camera.target;
+        let dist_before = state.camera.distance();
+        let _ = step(
+            &mut session,
+            &mut state,
+            0.02,
+            egui::Modifiers::SHIFT,
+            vec![
+                egui::Event::PointerMoved(p0),
+                egui::Event::PointerButton {
+                    pos: p0,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+            ],
+        );
+        let act_pan = step(
+            &mut session,
+            &mut state,
+            0.04,
+            egui::Modifiers::SHIFT,
+            vec![egui::Event::PointerMoved(p1)],
+        );
+        assert!(act_pan.camera_changed);
+        assert!(
+            matches!(state.drag_state, ViewportDragState::CameraPan),
+            "Shift+Left-Drag must enter CameraPan, got {:?}",
+            state.drag_state
+        );
+        assert!(
+            (state.camera.target - target_before).length() > 1e-2,
+            "Shift+Left-Drag must translate camera target"
+        );
+        assert!(
+            (state.camera.distance() - dist_before).abs() < 1e-3,
+            "Shift+Left-Drag pan must preserve camera distance"
+        );
+        let _ = step(
+            &mut session,
+            &mut state,
+            0.06,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerButton {
+                pos: p1,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(matches!(state.drag_state, ViewportDragState::None));
+
+        // 2. 15 discrete mouse wheel zoom-out ticks (3 lines each) must dolly smoothly & controllably
+        //    (e.g. ~2.5x–3.0x distance rather than shrinking the entire 3D grid to a 15x+ speck).
+        state.camera.reset();
+        let d0 = state.camera.distance();
+        let mut t = 0.2;
+        for _ in 0..15 {
+            t += 0.05;
+            let _ = step(
+                &mut session,
+                &mut state,
+                t,
+                egui::Modifiers::NONE,
+                vec![
+                    egui::Event::PointerMoved(p0),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: vec2(0.0, -3.0),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        // Flush any egui wheel smoothing tail.
+        for _ in 0..8 {
+            t += 0.05;
+            let _ = step(
+                &mut session,
+                &mut state,
+                t,
+                egui::Modifiers::NONE,
+                vec![egui::Event::PointerMoved(p0)],
+            );
+        }
+        let ratio = state.camera.distance() / d0;
+        assert!(
+            ratio > 1.3 && ratio < 4.0,
+            "15 discrete wheel ticks must dolly smoothly within (1.3x, 4.0x), got {ratio:.2}x"
+        );
+    }
+
+    #[test]
+    fn gizmo_3d_rotate_normalizes_tiny_or_negative_zero_euler_components() {
+        let out = compute_gizmo_3d_rotate(
+            Gizmo3DHandle::AxisY,
+            Gizmo3DSpace::World,
+            -Vec3::Z,
+            Vec3::X,
+            Vec3::Y,
+            Vec3::Z,
+            Mat4::IDENTITY,
+            Vec3::new(-0.0, 0.0, -0.0),
+            GeomEulerOrder::XYZ,
+            0.5,
+            false,
+        );
+        assert!(out.y.abs() > 0.4);
+        assert_eq!(out.x, 0.0);
+        assert_eq!(out.z, 0.0);
+        assert!(
+            out.x.is_sign_positive() && out.z.is_sign_positive(),
+            "3D rotation gizmo Euler output must never emit -0.0: {out:?}"
+        );
+
+        // Rotating by a tiny sub-epsilon angle must also normalize cleanly to +0.0.
+        let tiny = compute_gizmo_3d_rotate(
+            Gizmo3DHandle::AxisX,
+            Gizmo3DSpace::Local,
+            -Vec3::Z,
+            Vec3::X,
+            Vec3::Y,
+            Vec3::Z,
+            Mat4::IDENTITY,
+            Vec3::ZERO,
+            GeomEulerOrder::XYZ,
+            -1e-6,
+            false,
+        );
+        assert_eq!(tiny, Vec3::ZERO);
+        assert!(
+            tiny.x.is_sign_positive() && tiny.y.is_sign_positive() && tiny.z.is_sign_positive()
+        );
     }
 }

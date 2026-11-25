@@ -3,6 +3,7 @@
 //! ClipMaker 3 & Zoidium UI modules for the ZoidCraft desktop shell.
 #![allow(dead_code)]
 
+pub mod clipboard;
 pub mod controls;
 pub mod gestures;
 pub mod graph_editor;

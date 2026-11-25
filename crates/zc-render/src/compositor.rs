@@ -1012,10 +1012,19 @@ fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
             blended = vec4<f32>(rgb, dst.a);
         }
         case 38u: {
-            // CM3 BLEND_CONTRAST (blend.glsl:259-264)
+            // CM3 BLEND_CONTRAST (blend.glsl:259-264), alpha-weighted so src.a == 0 preserves dst.
             let half_d = vec3<f32>(dst.a * 0.5);
             let half_s = vec3<f32>(src.a * 0.5);
-            let rgb = clamp(half_d + 2.0 * (dst.rgb - half_d) * (src.rgb - half_s), vec3<f32>(0.0), vec3<f32>(dst.a));
+            let contrast_rgb = clamp(
+                half_d + 2.0 * (dst.rgb - half_d) * (src.rgb - half_s),
+                vec3<f32>(0.0),
+                vec3<f32>(dst.a),
+            );
+            let rgb = clamp(
+                mix(dst.rgb, contrast_rgb, clamp(src.a, 0.0, 1.0)),
+                vec3<f32>(0.0),
+                vec3<f32>(dst.a),
+            );
             blended = vec4<f32>(rgb, dst.a);
         }
         case 39u: {
@@ -1024,18 +1033,18 @@ fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
             blended = vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(a)), a);
         }
         case 40u: {
-            // CM3 BLEND_RED (blend.glsl:279): replace R channel, preserve destination alpha & premult invariant.
-            let r = clamp(src.r, 0.0, dst.a);
+            // CM3 BLEND_RED (blend.glsl:279): premultiplied R channel replace, preserving dst when src.a == 0.
+            let r = clamp(src.r + dst.r * (1.0 - clamp(src.a, 0.0, 1.0)), 0.0, dst.a);
             blended = vec4<f32>(r, dst.g, dst.b, dst.a);
         }
         case 41u: {
             // CM3 BLEND_GREEN (blend.glsl:282)
-            let g = clamp(src.g, 0.0, dst.a);
+            let g = clamp(src.g + dst.g * (1.0 - clamp(src.a, 0.0, 1.0)), 0.0, dst.a);
             blended = vec4<f32>(dst.r, g, dst.b, dst.a);
         }
         case 42u: {
             // CM3 BLEND_BLUE (blend.glsl:285)
-            let b_val = clamp(src.b, 0.0, dst.a);
+            let b_val = clamp(src.b + dst.b * (1.0 - clamp(src.a, 0.0, 1.0)), 0.0, dst.a);
             blended = vec4<f32>(dst.r, dst.g, b_val, dst.a);
         }
         default: { blended = src + dst * (1.0 - src.a); }
@@ -1289,5 +1298,184 @@ mod tests {
             "BLEND_INVERT_RGB over opaque bg mismatch, got {:?}",
             &px[..4]
         );
+    }
+
+    #[test]
+    fn compositor_contrast_and_rgb_channel_blend_preserve_transparent_and_half_alpha() {
+        let ctx = match GpuContext::new_headless() {
+            Ok(ctx) => ctx,
+            Err(RenderError::NoAdapter(_)) if !crate::require_gpu_in_tests() => return,
+            Err(err) => panic!("failed to init GpuContext: {err}"),
+        };
+        let mut comp = Compositor2D::new(&ctx);
+
+        let bg =
+            RenderTarget::new(&ctx, 8, 8, wgpu::TextureFormat::Rgba8Unorm, Some("bg")).expect("bg");
+        let layer = RenderTarget::new(&ctx, 8, 8, wgpu::TextureFormat::Rgba8Unorm, Some("layer"))
+            .expect("layer");
+        let dst = RenderTarget::new(&ctx, 8, 8, wgpu::TextureFormat::Rgba8Unorm, Some("dst"))
+            .expect("dst");
+
+        // Opaque sky-blue backdrop: (0.2, 0.4, 0.8, 1.0) -> (51, 102, 204, 255)
+        comp.clear_target(
+            &ctx,
+            &bg,
+            wgpu::Color {
+                r: 0.2,
+                g: 0.4,
+                b: 0.8,
+                a: 1.0,
+            },
+        );
+        let mut px = Vec::new();
+
+        // 1. Transparent source pixels (src.a == 0.0) must leave backdrop 100% untouched.
+        comp.clear_target(&ctx, &layer, wgpu::Color::TRANSPARENT);
+        for mode in [
+            BlendMode::Contrast,
+            BlendMode::Red,
+            BlendMode::Green,
+            BlendMode::Blue,
+        ] {
+            comp.composite_layer(
+                &ctx,
+                &bg,
+                &layer,
+                &dst,
+                LayerTransform2D::default(),
+                1.0,
+                mode,
+            );
+            crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback transparent");
+            assert!(
+                (i32::from(px[0]) - 51).abs() <= 2
+                    && (i32::from(px[1]) - 102).abs() <= 2
+                    && (i32::from(px[2]) - 204).abs() <= 2
+                    && px[3] == 255,
+                "{mode:?} with src.a == 0.0 must preserve backdrop (51,102,204,255), got {:?}",
+                &px[..4]
+            );
+        }
+
+        // 2. Opaque bright source (1.0, 0.9, 0.1, 1.0) tested at opacity 0.0, 0.5, 1.0.
+        comp.clear_target(
+            &ctx,
+            &layer,
+            wgpu::Color {
+                r: 1.0,
+                g: 0.9,
+                b: 0.1,
+                a: 1.0,
+            },
+        );
+
+        // opacity == 0.0 must also preserve backdrop 100% untouched.
+        for mode in [
+            BlendMode::Contrast,
+            BlendMode::Red,
+            BlendMode::Green,
+            BlendMode::Blue,
+        ] {
+            comp.composite_layer(
+                &ctx,
+                &bg,
+                &layer,
+                &dst,
+                LayerTransform2D::default(),
+                0.0,
+                mode,
+            );
+            crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback op=0");
+            assert!(
+                (i32::from(px[0]) - 51).abs() <= 2
+                    && (i32::from(px[1]) - 102).abs() <= 2
+                    && (i32::from(px[2]) - 204).abs() <= 2
+                    && px[3] == 255,
+                "{mode:?} with opacity == 0.0 must preserve backdrop, got {:?}",
+                &px[..4]
+            );
+        }
+
+        // BLEND_CONTRAST at src.a == 1.0:
+        // half_d = 0.5, half_s = 0.5
+        // dst=(0.2, 0.4, 0.8), src=(1.0, 0.9, 0.1)
+        // r = 0.5 + 2*(-0.3)*(0.5) = 0.20 -> 51
+        // g = 0.5 + 2*(-0.1)*(0.4) = 0.42 -> 107
+        // b = 0.5 + 2*(+0.3)*(-0.4) = 0.26 -> 66
+        comp.composite_layer(
+            &ctx,
+            &bg,
+            &layer,
+            &dst,
+            LayerTransform2D::default(),
+            1.0,
+            BlendMode::Contrast,
+        );
+        crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback contrast op=1");
+        assert!(
+            (i32::from(px[0]) - 51).abs() <= 3
+                && (i32::from(px[1]) - 107).abs() <= 3
+                && (i32::from(px[2]) - 66).abs() <= 3
+                && px[3] == 255,
+            "BLEND_CONTRAST at src.a == 1.0 mismatch, got {:?}",
+            &px[..4]
+        );
+
+        // BLEND_CONTRAST at src.a == 0.5:
+        // premult src = (0.5, 0.45, 0.05, 0.5), half_s = 0.25
+        // contrast_rgb: r = 0.5 + 2*(-0.3)*(0.25) = 0.35, g = 0.5 + 2*(-0.1)*(0.20) = 0.46, b = 0.5 + 2*(0.3)*(-0.20) = 0.38
+        // mix(dst, contrast_rgb, 0.5): r = 0.275 -> 70, g = 0.43 -> 110, b = 0.59 -> 150
+        comp.composite_layer(
+            &ctx,
+            &bg,
+            &layer,
+            &dst,
+            LayerTransform2D::default(),
+            0.5,
+            BlendMode::Contrast,
+        );
+        crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback contrast op=0.5");
+        assert!(
+            (i32::from(px[0]) - 70).abs() <= 3
+                && (i32::from(px[1]) - 110).abs() <= 3
+                && (i32::from(px[2]) - 150).abs() <= 3
+                && px[3] == 255,
+            "BLEND_CONTRAST at src.a == 0.5 mismatch, got {:?}",
+            &px[..4]
+        );
+
+        // BLEND_RED / GREEN / BLUE at src.a == 0.5 and src.a == 1.0:
+        // dst = (0.2, 0.4, 0.8), src_full = (1.0, 0.9, 0.1)
+        // RED   op=1.0 -> (255, 102, 204, 255); op=0.5 -> r = 0.5 + 0.2*0.5 = 0.6 -> (153, 102, 204, 255)
+        // GREEN op=1.0 -> (51, 230, 204, 255);  op=0.5 -> g = 0.45 + 0.4*0.5 = 0.65 -> (51, 166, 204, 255)
+        // BLUE  op=1.0 -> (51, 102, 26, 255);   op=0.5 -> b = 0.05 + 0.8*0.5 = 0.45 -> (51, 102, 115, 255)
+        let channel_cases: &[(BlendMode, f32, [i32; 4])] = &[
+            (BlendMode::Red, 1.0, [255, 102, 204, 255]),
+            (BlendMode::Red, 0.5, [153, 102, 204, 255]),
+            (BlendMode::Green, 1.0, [51, 230, 204, 255]),
+            (BlendMode::Green, 0.5, [51, 166, 204, 255]),
+            (BlendMode::Blue, 1.0, [51, 102, 26, 255]),
+            (BlendMode::Blue, 0.5, [51, 102, 115, 255]),
+        ];
+        for &(mode, opacity, expected) in channel_cases {
+            comp.composite_layer(
+                &ctx,
+                &bg,
+                &layer,
+                &dst,
+                LayerTransform2D::default(),
+                opacity,
+                mode,
+            );
+            crate::readback_rgba8(&ctx, &dst, &mut px).expect("readback channel blend");
+            assert!(
+                (i32::from(px[0]) - expected[0]).abs() <= 3
+                    && (i32::from(px[1]) - expected[1]).abs() <= 3
+                    && (i32::from(px[2]) - expected[2]).abs() <= 3
+                    && (i32::from(px[3]) - expected[3]).abs() <= 3,
+                "{mode:?} at opacity {opacity} expected ~{expected:?}, got {:?}",
+                &px[..4]
+            );
+        }
     }
 }
