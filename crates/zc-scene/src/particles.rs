@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::f32::consts::{PI, TAU};
 
 use zc_geom::Vec3;
@@ -80,25 +81,32 @@ fn sample_sorted_gradient(stops: &[GradientStop], t: f32) -> [f32; 4] {
     last.color
 }
 
-/// Samples a slice of gradient stops (sorted or unsorted) at `t in [0, 1]`.
-#[must_use]
-pub fn sample_gradient(stops: &[GradientStop], t: f32) -> [f32; 4] {
+fn ensure_sorted_stops(stops: &[GradientStop]) -> Cow<'_, [GradientStop]> {
     if stops.len() > 1 && !stops.windows(2).all(|w| w[0].position <= w[1].position) {
         let mut sorted = stops.to_vec();
         sorted.sort_by(|a, b| a.position.total_cmp(&b.position));
-        return sample_sorted_gradient(&sorted, t);
+        Cow::Owned(sorted)
+    } else {
+        Cow::Borrowed(stops)
     }
-    sample_sorted_gradient(stops, t)
+}
+
+/// Samples a slice of gradient stops (sorted or unsorted) at `t in [0, 1]`.
+#[must_use]
+pub fn sample_gradient(stops: &[GradientStop], t: f32) -> [f32; 4] {
+    let sorted = ensure_sorted_stops(stops);
+    sample_sorted_gradient(&sorted, t)
 }
 
 /// Bakes gradient stops into a fixed-length 1D RGBA LUT (default 256 samples).
 #[must_use]
 pub fn bake_gradient_lut(stops: &[GradientStop], resolution: usize) -> Vec<[f32; 4]> {
     let n = resolution.max(2);
+    let sorted = ensure_sorted_stops(stops);
     let mut lut = Vec::with_capacity(n);
     let denom = (n - 1) as f32;
     for i in 0..n {
-        lut.push(sample_gradient(stops, i as f32 / denom));
+        lut.push(sample_sorted_gradient(&sorted, i as f32 / denom));
     }
     lut
 }
@@ -116,8 +124,7 @@ pub fn bake_cm3_gradient_lut_rgba8(
     if stops.is_empty() {
         return [[255, 255, 255, 255]; CM3_GRADIENT_LUT_SIZE];
     }
-    let mut sorted = stops.to_vec();
-    sorted.sort_by(|a, b| a.position.total_cmp(&b.position));
+    let sorted = ensure_sorted_stops(stops);
     for (i, slot) in lut.iter_mut().enumerate() {
         let t = (i as f32) / (CM3_GRADIENT_LUT_SIZE as f32);
         let c = sample_sorted_gradient(&sorted, t);
@@ -386,12 +393,13 @@ fn evaluate_particle_kinematics(
     Some((pos, angle, u, alive))
 }
 
-/// Evaluates a single particle `pid` (`0..count-1`) at simulation clock `time` (seconds).
-///
-/// Returns straight (unpremultiplied) RGBA in `color` and CM3 vertex-shader `vAngle` (radians)
-/// in `angle` (use [`cm3_quad_rotation_rad`] when rotating billboard quad vertices).
-#[must_use]
-pub fn evaluate_particle(pid: u32, time: f32, params: &ParticleSystemParams) -> ParticleInstance {
+fn evaluate_particle_with_sorted_gradients(
+    pid: u32,
+    time: f32,
+    params: &ParticleSystemParams,
+    color_stops: &[GradientStop],
+    size_stops: &[GradientStop],
+) -> ParticleInstance {
     let Some((pos, angle, u, alive)) = evaluate_particle_kinematics(pid, time, params) else {
         return ParticleInstance {
             position: params.origin.to_array(),
@@ -402,20 +410,33 @@ pub fn evaluate_particle(pid: u32, time: f32, params: &ParticleSystemParams) -> 
         };
     };
 
-    let size = sample_gradient(&params.size_gradient, u)[0];
-    let color = if alive {
-        sample_gradient(&params.color_gradient, u)
+    let (size, color) = if alive {
+        (
+            sample_sorted_gradient(size_stops, u)[0],
+            sample_sorted_gradient(color_stops, u),
+        )
     } else {
-        [0.0, 0.0, 0.0, 0.0]
+        (0.0, [0.0, 0.0, 0.0, 0.0])
     };
 
     ParticleInstance {
         position: pos.to_array(),
-        size: if alive { size } else { 0.0 },
+        size,
         color,
         angle,
         alive,
     }
+}
+
+/// Evaluates a single particle `pid` (`0..count-1`) at simulation clock `time` (seconds).
+///
+/// Returns straight (unpremultiplied) RGBA in `color` and CM3 vertex-shader `vAngle` (radians)
+/// in `angle` (use [`cm3_quad_rotation_rad`] when rotating billboard quad vertices).
+#[must_use]
+pub fn evaluate_particle(pid: u32, time: f32, params: &ParticleSystemParams) -> ParticleInstance {
+    let color_stops = ensure_sorted_stops(&params.color_gradient);
+    let size_stops = ensure_sorted_stops(&params.size_gradient);
+    evaluate_particle_with_sorted_gradients(pid, time, params, &color_stops, &size_stops)
 }
 
 /// Evaluates a single particle `pid` using exact CM3 32-texel RGBA8 `DataTexture` gradient LUT
@@ -475,8 +496,12 @@ pub fn evaluate_particles_cm3_lut(
 /// Evaluates all `params.count` particles deterministically at `time` (seconds).
 #[must_use]
 pub fn evaluate_particles(time: f32, params: &ParticleSystemParams) -> Vec<ParticleInstance> {
+    let color_stops = ensure_sorted_stops(&params.color_gradient);
+    let size_stops = ensure_sorted_stops(&params.size_gradient);
     (0..params.count)
-        .map(|pid| evaluate_particle(pid, time, params))
+        .map(|pid| {
+            evaluate_particle_with_sorted_gradients(pid, time, params, &color_stops, &size_stops)
+        })
         .collect()
 }
 

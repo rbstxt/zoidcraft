@@ -526,7 +526,11 @@ pub struct TimelineViewState {
     last_video_lanes_height: Option<f32>,
     last_audio_lanes_height: Option<f32>,
     status_toast: Option<(String, f64)>,
+    /// Cached keyframe rows keyed by `(session.revision(), selection_hash)`.
+    cached_kf_rows: Option<CachedKeyframeRows>,
 }
+
+type CachedKeyframeRows = ((u64, u64), std::sync::Arc<[KeyframeLaneRow]>);
 
 impl Default for TimelineViewState {
     fn default() -> Self {
@@ -577,11 +581,24 @@ impl TimelineViewState {
             last_video_lanes_height: None,
             last_audio_lanes_height: None,
             status_toast: None,
+            cached_kf_rows: None,
         }
     }
 
     fn set_status_toast(&mut self, msg: impl Into<String>, now_sec: f64) {
         self.status_toast = Some((msg.into(), now_sec + 2.6));
+    }
+
+    fn keyframe_rows_cached(&mut self, session: &Session) -> std::sync::Arc<[KeyframeLaneRow]> {
+        let key = (session.revision(), keyframe_selection_hash(session));
+        if let Some((cached_key, rows)) = &self.cached_kf_rows
+            && *cached_key == key
+        {
+            return std::sync::Arc::clone(rows);
+        }
+        let rows: std::sync::Arc<[KeyframeLaneRow]> = collect_keyframe_rows(session).into();
+        self.cached_kf_rows = Some((key, std::sync::Arc::clone(&rows)));
+        rows
     }
 
     /// Multiplies `zoom` by `factor`, preserving the horizontal frame under `anchor_x`.
@@ -644,6 +661,7 @@ impl TimelineViewState {
 // Keyframe Lane Model Collection
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 struct KeyframeLaneItem {
     local_frame: f64,
     value: Value,
@@ -652,6 +670,7 @@ struct KeyframeLaneItem {
     continuous_tangent: bool,
 }
 
+#[derive(Debug, Clone)]
 struct KeyframeLaneRow {
     target_id: String,
     property: String,
@@ -659,6 +678,32 @@ struct KeyframeLaneRow {
     frame_offset: f64,
     locked: bool,
     keyframes: Vec<KeyframeLaneItem>,
+}
+
+fn keyframe_selection_hash(session: &Session) -> u64 {
+    fn mix_str(hash: &mut u64, s: &str) {
+        for &b in s.as_bytes() {
+            *hash ^= u64::from(b);
+            *hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        *hash ^= 0xff;
+        *hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    if let Some(first_clip) = session.selection.clip_ids.first() {
+        mix_str(&mut hash, first_clip);
+    }
+    hash ^= 0x11;
+    hash = hash.wrapping_mul(0x0100_0000_01b3);
+    for id in &session.selection.object_3d_ids {
+        mix_str(&mut hash, id);
+    }
+    hash ^= 0x22;
+    hash = hash.wrapping_mul(0x0100_0000_01b3);
+    for id in &session.selection.effect_ids {
+        mix_str(&mut hash, id);
+    }
+    hash
 }
 
 fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
@@ -1234,8 +1279,8 @@ pub fn show_timeline(
         vec2(content_width, RULER_HEIGHT),
     );
 
-    // Collect keyframe lanes once; collapse empty keyframe area to 0 px so video tracks get full space.
-    let kf_rows = collect_keyframe_rows(session);
+    // Collect keyframe lanes (cached by revision + selection); collapse empty keyframe area to 0 px so video tracks get full space.
+    let kf_rows = state.keyframe_rows_cached(session);
     let kf_top = ruler_rect.bottom();
     let max_kf_h = (body_rect.height() - RULER_HEIGHT - KEYFRAME_SPLITTER_HEIGHT - 36.0).max(0.0);
     let (kf_height, kf_splitter_h) = if kf_rows.is_empty() {
@@ -3327,6 +3372,60 @@ fn collect_selected_keyframe_infos(
     infos
 }
 
+/// Lightweight per-frame clip painting snapshot (avoids cloning `properties`, `objects_3d`,
+/// `effects`, and `keyframes` on every 60Hz timeline frame).
+struct ClipPaintInfo {
+    id: String,
+    display_name: String,
+    start: f64,
+    length: f64,
+    time_start: f64,
+    time_end: f64,
+    time_animated: bool,
+    has_time_keyframes: bool,
+}
+
+/// Lightweight per-frame track painting snapshot (avoids deep-cloning `Vec<SessionTrack>`).
+struct TrackPaintRow {
+    id: String,
+    name: String,
+    enabled: bool,
+    solo: bool,
+    locked: bool,
+    is_3d: bool,
+    clips: Vec<ClipPaintInfo>,
+}
+
+fn snapshot_track_paint_rows(src: &[SessionTrack]) -> Vec<TrackPaintRow> {
+    src.iter()
+        .map(|track| TrackPaintRow {
+            id: track.id.clone(),
+            name: track.name.clone(),
+            enabled: track.enabled,
+            solo: track.solo,
+            locked: track.locked,
+            is_3d: track.is_3d,
+            clips: track
+                .clips
+                .iter()
+                .map(|clip| ClipPaintInfo {
+                    id: clip.id.clone(),
+                    display_name: clip_display_name(clip).to_owned(),
+                    start: clip.start,
+                    length: clip.length,
+                    time_start: clip.time_start,
+                    time_end: clip.time_end,
+                    time_animated: clip.time_animated,
+                    has_time_keyframes: clip
+                        .properties
+                        .get("time")
+                        .is_some_and(|p| !p.keyframes.is_empty()),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_and_interact_tracks(
     ui: &mut Ui,
@@ -3345,17 +3444,23 @@ fn paint_and_interact_tracks(
         TrackKind::Audio => state.audio_track_height,
     };
 
-    // Snapshot immutable track metadata for painting while allowing commands on click.
-    let tracks: Vec<SessionTrack> = match kind {
-        TrackKind::Video => session.document().video_tracks.clone(),
-        TrackKind::Audio => session.document().audio_tracks.clone(),
+    // Extract lightweight read-only track/clip paint metadata without cloning properties,
+    // 3D object graphs, effects, or keyframes.
+    let tracks: Vec<TrackPaintRow> = match kind {
+        TrackKind::Video => snapshot_track_paint_rows(&session.document().video_tracks),
+        TrackKind::Audio => snapshot_track_paint_rows(&session.document().audio_tracks),
     };
 
     let (strip_rects, track_header_rect, track_lanes_rect) =
         split_pane_header_strip(header_rect, lanes_rect);
 
-    let effective_track_h =
-        effective_track_row_height(kind, &tracks, track_h, track_lanes_rect.height());
+    let effective_track_h = effective_track_row_height_counts(
+        kind,
+        tracks.len(),
+        tracks.first().is_some_and(|t| t.clips.is_empty()),
+        track_h,
+        track_lanes_rect.height(),
+    );
     let total_h = tracks.len() as f32 * effective_track_h;
     let max_scroll = (total_h - track_lanes_rect.height()).max(0.0);
     match kind {
@@ -3588,14 +3693,28 @@ fn paint_and_interact_tracks(
             lane_painter.rect_filled(clip_rect, CornerRadius::ZERO, bg_color);
 
             // Audio clip waveform peak bars (#242d42).
-            if kind == TrackKind::Audio {
+            if kind == TrackKind::Audio
+                && let Some(peaks) = state.audio_peaks.get(&clip.id)
+            {
+                let time_prop = if clip.time_animated && clip.has_time_keyframes {
+                    session
+                        .document()
+                        .audio_tracks
+                        .iter()
+                        .find(|t| t.id == track.id)
+                        .and_then(|t| t.clips.iter().find(|c| c.id == clip.id))
+                        .and_then(|c| c.properties.get("time"))
+                } else {
+                    None
+                };
                 paint_audio_clip_waveform(
                     &lane_painter,
                     clip_rect,
                     visible_clip_rect,
                     clip,
+                    time_prop,
                     fps,
-                    state.audio_peaks.get(&clip.id),
+                    Some(peaks),
                 );
             }
 
@@ -3712,7 +3831,7 @@ fn paint_and_interact_tracks(
                 let max_label_w = (visible_clip_rect.right() - 4.0 - sticky_x).max(0.0);
                 if let Some(galley) = layout_ellipsized_clip_label(
                     &clipped_label_painter,
-                    clip_display_name(clip),
+                    &clip.display_name,
                     FontId::monospace(14.0),
                     label_color,
                     max_label_w,
@@ -3760,7 +3879,7 @@ fn paint_and_interact_tracks(
                 state.context_menu = Some(TimelineContextMenu::Clip {
                     pos: menu_pos,
                     clip_id: clip.id.clone(),
-                    clip_name: clip_display_name(clip).to_string(),
+                    clip_name: clip.display_name.clone(),
                     clip_start: clip.start,
                     clip_length: clip.length,
                     locked: track.locked,
@@ -3820,7 +3939,13 @@ fn paint_and_interact_tracks(
                 || right_resp.double_clicked_by(PointerButton::Primary);
             if clip_double_clicked
                 && kind == TrackKind::Video
-                && let Some(target_comp_id) = precomp_target_composition_id(session, clip)
+                && let Some(target_comp_id) = session
+                    .document()
+                    .video_tracks
+                    .iter()
+                    .find(|t| t.id == track.id)
+                    .and_then(|t| t.clips.iter().find(|c| c.id == clip.id))
+                    .and_then(|full_clip| precomp_target_composition_id(session, full_clip))
             {
                 let comp_name = session
                     .project
@@ -3828,7 +3953,7 @@ fn paint_and_interact_tracks(
                     .get(&target_comp_id)
                     .map(|c| c.name.clone())
                     .filter(|n| !n.trim().is_empty())
-                    .unwrap_or_else(|| clip_display_name(clip).to_string());
+                    .unwrap_or_else(|| clip.display_name.clone());
                 if session
                     .execute(Command::SetActiveComposition {
                         comp_id: Some(target_comp_id),
@@ -4037,7 +4162,7 @@ fn paint_track_header(
     ui: &mut Ui,
     session: &mut Session,
     state: &mut TimelineViewState,
-    track: &SessionTrack,
+    track: &TrackPaintRow,
     kind: TrackKind,
     can_delete: bool,
     pinned_add_rect: Option<Rect>,
@@ -4462,34 +4587,94 @@ fn eval_time_property_at(prop: &SessionProperty, local_frame: f64, fallback: f64
     }
 }
 
-fn eval_clip_media_time(clip: &SessionClip, u: f64, fps: f64) -> f64 {
-    if clip.time_animated
-        && let Some(prop) = clip.properties.get("time")
+#[allow(clippy::too_many_arguments)]
+fn eval_clip_media_time_with_prop(
+    length: f64,
+    time_start: f64,
+    time_end: f64,
+    time_animated: bool,
+    has_time_keyframes: bool,
+    time_prop: Option<&zc_session::SessionProperty>,
+    u: f64,
+    fps: f64,
+) -> f64 {
+    if time_animated
+        && let Some(prop) = time_prop
         && !prop.keyframes.is_empty()
     {
-        let local_frame = u.clamp(0.0, 1.0) * clip.length.max(0.0);
-        return eval_time_property_at(prop, local_frame, clip.time_start).max(0.0);
+        let local_frame = u.clamp(0.0, 1.0) * length.max(0.0);
+        return eval_time_property_at(prop, local_frame, time_start).max(0.0);
     }
-    if (clip.time_end - clip.time_start).abs() > 1e-9 {
-        let start = clip.time_start.max(0.0);
-        let end = clip.time_end.max(0.0);
+    if (time_end - time_start).abs() > 1e-9 {
+        let start = time_start.max(0.0);
+        let end = time_end.max(0.0);
         return (start + (end - start) * u).max(0.0);
     }
     // Explicit freeze-frame (`time_start == time_end` with non-zero time or an explicit `time` track):
     // sample the frozen instant rather than stretching across `clip.length / fps`.
-    if clip.time_start > 0.0
-        || clip.time_animated
-        || clip
-            .properties
-            .get("time")
-            .is_some_and(|p| !p.keyframes.is_empty())
-    {
-        return clip.time_start.max(0.0);
+    if time_start > 0.0 || time_animated || has_time_keyframes {
+        return time_start.max(0.0);
     }
     // Uninitialized legacy clip (`0..0` with no `time` keyframes): play 1x from 0.
-    (u * (clip.length / fps.max(1.0)).max(0.0)).max(0.0)
+    (u * (length / fps.max(1.0)).max(0.0)).max(0.0)
 }
 
+#[cfg(test)]
+fn eval_clip_media_time(clip: &SessionClip, u: f64, fps: f64) -> f64 {
+    let time_prop = clip.properties.get("time");
+    let has_time_keyframes = time_prop.is_some_and(|p| !p.keyframes.is_empty());
+    eval_clip_media_time_with_prop(
+        clip.length,
+        clip.time_start,
+        clip.time_end,
+        clip.time_animated,
+        has_time_keyframes,
+        time_prop,
+        u,
+        fps,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn waveform_peak_slice_for_column_fast(
+    clip: &ClipPaintInfo,
+    time_prop: Option<&zc_session::SessionProperty>,
+    fps: f64,
+    points_per_sec: f64,
+    x: i32,
+    width: i32,
+) -> (usize, usize) {
+    let w_f = f64::from(width.max(1));
+    let u0 = f64::from(x.max(0)) / w_f;
+    let u1 = f64::from(x.max(0) + 1) / w_f;
+    let a = eval_clip_media_time_with_prop(
+        clip.length,
+        clip.time_start,
+        clip.time_end,
+        clip.time_animated,
+        clip.has_time_keyframes,
+        time_prop,
+        u0,
+        fps,
+    );
+    let b = eval_clip_media_time_with_prop(
+        clip.length,
+        clip.time_start,
+        clip.time_end,
+        clip.time_animated,
+        clip.has_time_keyframes,
+        time_prop,
+        u1,
+        fps,
+    );
+    let (t_lo, t_hi) = if a <= b { (a, b) } else { (b, a) };
+    let idx0 = (t_lo * points_per_sec).floor().max(0.0) as usize;
+    let idx1 = (t_hi * points_per_sec).ceil().max(0.0) as usize;
+    let count = idx1.saturating_sub(idx0).max(1);
+    (idx0, count)
+}
+
+#[cfg(test)]
 fn waveform_peak_slice_for_column(
     clip: &SessionClip,
     fps: f64,
@@ -4538,7 +4723,8 @@ fn paint_audio_clip_waveform(
     painter: &egui::Painter,
     clip_rect: Rect,
     visible_rect: Rect,
-    clip: &SessionClip,
+    clip: &ClipPaintInfo,
+    time_prop: Option<&zc_session::SessionProperty>,
     fps: f64,
     peaks: Option<&AudioWaveformPeaks>,
 ) {
@@ -4555,28 +4741,44 @@ fn paint_audio_clip_waveform(
     let inner_left = clip_rect.left() + 1.0;
     let x_start = ((visible_rect.left() - inner_left).floor() as i32).clamp(0, w);
     let x_end = ((visible_rect.right() - inner_left).ceil() as i32).clamp(0, w);
+    if x_end <= x_start {
+        return;
+    }
     let inner_top = clip_rect.top() + 1.0;
     let inner_h = (clip_rect.height() - 2.0).max(1.0);
 
+    // Batch all waveform columns for this clip into a single unfeathered Mesh (4 verts, 2 tris per column).
+    let col_count = (x_end - x_start) as usize;
+    let mut mesh = egui::Mesh::default();
+    mesh.vertices.reserve(col_count * 4);
+    mesh.indices.reserve(col_count * 6);
+
     for x in x_start..x_end {
-        let (idx, count) = waveform_peak_slice_for_column(clip, fps, pk.points_per_sec, x, w);
+        let (idx, count) =
+            waveform_peak_slice_for_column_fast(clip, time_prop, fps, pk.points_per_sec, x, w);
         let mut hi = 0_i16;
         let mut lo = 0_i16;
-        for p in 0..count {
-            if let Some(&mx) = pk.max_buf.get(idx + p) {
-                hi = hi.max(i16::from(mx));
-            }
-            if let Some(&mn) = pk.min_buf.get(idx + p) {
-                lo = lo.min(i16::from(mn));
+        let end = (idx + count).min(pk.max_buf.len());
+        if idx < end {
+            for p in idx..end {
+                hi = hi.max(i16::from(pk.max_buf[p]));
+                lo = lo.min(i16::from(pk.min_buf[p]));
             }
         }
         if let Some((y_top, y_bot)) = compute_waveform_column_y(hi, lo, inner_top, inner_h) {
-            let sx = inner_left + x as f32 + 0.5;
-            painter.line_segment(
-                [pos2(sx, y_top), pos2(sx, y_bot)],
-                Stroke::new(1.0, COLOR_WAVEFORM),
-            );
+            let x0 = inner_left + x as f32;
+            let x1 = x0 + 1.0;
+            let base = mesh.vertices.len() as u32;
+            mesh.colored_vertex(pos2(x0, y_top), COLOR_WAVEFORM);
+            mesh.colored_vertex(pos2(x1, y_top), COLOR_WAVEFORM);
+            mesh.colored_vertex(pos2(x1, y_bot), COLOR_WAVEFORM);
+            mesh.colored_vertex(pos2(x0, y_bot), COLOR_WAVEFORM);
+            mesh.add_triangle(base, base + 1, base + 2);
+            mesh.add_triangle(base, base + 2, base + 3);
         }
+    }
+    if !mesh.indices.is_empty() {
+        painter.add(Shape::mesh(mesh));
     }
 }
 
@@ -6073,15 +6275,16 @@ fn clamp_scroll_y(scroll_y: f32, max_scroll: f32) -> f32 {
 
 /// Keeps a sole empty Audio track (`A1` with 0 clips) cleanly fitted to compact lane height
 /// when Video tracks take priority, avoiding clipped `A1` text/icons or a spurious scrollbar.
-fn effective_track_row_height(
+fn effective_track_row_height_counts(
     kind: TrackKind,
-    tracks: &[SessionTrack],
+    track_count: usize,
+    first_track_empty: bool,
     base_track_h: f32,
     lanes_height: f32,
 ) -> f32 {
     if kind == TrackKind::Audio
-        && tracks.len() == 1
-        && tracks[0].clips.is_empty()
+        && track_count == 1
+        && first_track_empty
         && lanes_height >= 18.0
         && lanes_height < base_track_h
     {
@@ -6091,8 +6294,48 @@ fn effective_track_row_height(
     }
 }
 
+fn effective_track_row_height(
+    kind: TrackKind,
+    tracks: &[SessionTrack],
+    base_track_h: f32,
+    lanes_height: f32,
+) -> f32 {
+    effective_track_row_height_counts(
+        kind,
+        tracks.len(),
+        tracks.first().is_some_and(|t| t.clips.is_empty()),
+        base_track_h,
+        lanes_height,
+    )
+}
+
+fn cached_timeline_mono_glyph_widths(painter: &egui::Painter, font: &FontId) -> (f32, f32) {
+    let ctx = painter.ctx();
+    let cache_id = egui::Id::unique((
+        "zc_tl_clip_label_metrics",
+        font.size.to_bits(),
+        ctx.pixels_per_point().to_bits(),
+    ));
+    if let Some(metrics) = ctx.data(|d| d.get_temp::<(f32, f32)>(cache_id)) {
+        return metrics;
+    }
+    let char_w = painter
+        .layout_no_wrap("M".to_owned(), font.clone(), Color32::WHITE)
+        .size()
+        .x
+        .max(1.0);
+    let ellipsis_w = painter
+        .layout_no_wrap("…".to_owned(), font.clone(), Color32::WHITE)
+        .size()
+        .x
+        .max(1.0);
+    let metrics = (char_w, ellipsis_w);
+    ctx.data_mut(|d| d.insert_temp(cache_id, metrics));
+    metrics
+}
+
 /// Truncates `text` cleanly with a trailing `…` so the laid-out galley fits strictly within
-/// `max_width` using exact glyph widths from `painter`.
+/// `max_width` using fast monospace char-width estimation + single-check verification.
 fn layout_ellipsized_clip_label(
     painter: &egui::Painter,
     text: &str,
@@ -6103,31 +6346,55 @@ fn layout_ellipsized_clip_label(
     if text.is_empty() || max_width <= 4.0 {
         return None;
     }
-    let full = painter.layout_no_wrap(text.to_owned(), font.clone(), color);
-    if full.size().x <= max_width {
-        return Some(full);
-    }
-    let ellipsis = painter.layout_no_wrap("…".to_owned(), font.clone(), color);
-    if ellipsis.size().x > max_width {
+    let (char_w, ellipsis_w) = cached_timeline_mono_glyph_widths(painter, &font);
+    if ellipsis_w > max_width {
         return None;
     }
-    let chars: Vec<char> = text.chars().collect();
-    let mut lo = 0usize;
-    let mut hi = chars.len();
-    let mut best = ellipsis;
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        let prefix: String = chars[..mid].iter().collect();
-        let trimmed = prefix.trim_end();
-        let mut candidate = String::with_capacity(trimmed.len() + 3);
-        candidate.push_str(trimmed);
-        candidate.push('…');
-        let g = painter.layout_no_wrap(candidate, font.clone(), color);
-        if g.size().x <= max_width {
-            best = g;
-            lo = mid;
+    let char_count = text.chars().count();
+    let est_full_w = char_count as f32 * char_w;
+    if est_full_w <= max_width + char_w * 0.5 {
+        let full = painter.layout_no_wrap(text.to_owned(), font.clone(), color);
+        if full.size().x <= max_width {
+            return Some(full);
+        }
+    }
+
+    // Estimate max prefix character count directly from monospace advance width.
+    let mut prefix_chars = ((max_width - ellipsis_w) / char_w).floor().max(0.0) as usize;
+    prefix_chars = prefix_chars.min(char_count.saturating_sub(1));
+
+    let make_candidate = |n: usize| -> String {
+        let byte_end = text
+            .char_indices()
+            .nth(n)
+            .map_or(text.len(), |(idx, _)| idx);
+        let trimmed = text[..byte_end].trim_end();
+        let mut s = String::with_capacity(trimmed.len() + 3);
+        s.push_str(trimmed);
+        s.push('…');
+        s
+    };
+
+    let mut best = painter.layout_no_wrap(make_candidate(prefix_chars), font.clone(), color);
+    if best.size().x > max_width {
+        while prefix_chars > 0 && best.size().x > max_width {
+            prefix_chars -= 1;
+            best = painter.layout_no_wrap(make_candidate(prefix_chars), font.clone(), color);
+        }
+        if best.size().x > max_width {
+            return None;
+        }
+        return Some(best);
+    }
+
+    // If proportional/narrow glyphs left room for more chars, step forward cleanly.
+    while prefix_chars + 1 < char_count && best.size().x + char_w * 0.5 <= max_width {
+        let next = painter.layout_no_wrap(make_candidate(prefix_chars + 1), font.clone(), color);
+        if next.size().x <= max_width {
+            best = next;
+            prefix_chars += 1;
         } else {
-            hi = mid - 1;
+            break;
         }
     }
     Some(best)
@@ -8386,5 +8653,101 @@ mod tests {
                 "{n_tracks} overflowing video tracks at 800x540 must always show persistent vertical scrollbar"
             );
         }
+    }
+
+    #[test]
+    fn keyframe_rows_cache_reuses_arc_until_revision_or_selection_changes() {
+        let mut session = Session::new();
+        let track_id = session.document().video_tracks[0].id.clone();
+        let res = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "shape".to_owned(),
+                start: 0.0,
+                length: 60.0,
+                name: Some("Box".to_owned()),
+            })
+            .unwrap();
+        let clip_id = res["clip_id"].as_str().unwrap().to_owned();
+        let _ = session.selection.select_clip(&clip_id, None, false);
+
+        let mut state = TimelineViewState::new();
+        let first = state.keyframe_rows_cached(&session);
+        let second = state.keyframe_rows_cached(&session);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "keyframe rows cache must reuse the same Arc when revision and selection are unchanged"
+        );
+
+        session
+            .execute(Command::TogglePropertyAnimated {
+                target_id: clip_id.clone(),
+                property: "opacity".to_owned(),
+                frame: 0.0,
+            })
+            .unwrap();
+        let after_rev = state.keyframe_rows_cached(&session);
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &after_rev),
+            "keyframe rows cache must invalidate when session revision changes"
+        );
+        assert!(!after_rev.is_empty());
+
+        session.selection.clear_clips();
+        let after_sel = state.keyframe_rows_cached(&session);
+        assert!(
+            !std::sync::Arc::ptr_eq(&after_rev, &after_sel),
+            "keyframe rows cache must invalidate when selection changes"
+        );
+    }
+
+    #[test]
+    fn audio_waveform_batches_all_columns_into_single_mesh() {
+        let ctx = egui::Context::default();
+        let clip = ClipPaintInfo {
+            id: "aud_clip_1".to_owned(),
+            display_name: "Audio".to_owned(),
+            start: 0.0,
+            length: 60.0,
+            time_start: 0.0,
+            time_end: 2.0,
+            time_animated: false,
+            has_time_keyframes: false,
+        };
+        let peaks = AudioWaveformPeaks {
+            points_per_sec: 100.0,
+            max_buf: vec![96_i8; 256],
+            min_buf: vec![-96_i8; 256],
+        };
+        let clip_rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(102.0, 48.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 120.0))),
+            ..Default::default()
+        };
+        let mut full = ctx.run_ui(raw, |ui| {
+            paint_audio_clip_waveform(
+                ui.painter(),
+                clip_rect,
+                clip_rect,
+                &clip,
+                None,
+                30.0,
+                Some(&peaks),
+            );
+        });
+        let mut mesh_count = 0usize;
+        let mut total_verts = 0usize;
+        for clipped in &full.shapes {
+            if let Shape::Mesh(mesh) = &clipped.shape {
+                mesh_count += 1;
+                total_verts += mesh.vertices.len();
+            }
+        }
+        full.textures_delta.clear();
+        assert_eq!(
+            mesh_count, 1,
+            "all 100 waveform columns must batch into a single egui::Mesh"
+        );
+        assert_eq!(total_verts, 100 * 4);
     }
 }

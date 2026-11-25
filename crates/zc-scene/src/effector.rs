@@ -2001,26 +2001,51 @@ impl ClipVert {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ClipOutcome {
+    AllIn,
+    AllOut,
+    Clipped,
+}
+
 /// Clips a convex polygon against half-space `(p - origin).dot(inward_normal) >= 0`.
-/// If the plane cuts the polygon, pushes the boundary intersection segment `(start, end)`.
+/// If the plane cuts the polygon, pushes the boundary intersection segment `(start, end)`
+/// and populates `out` (reusing caller-owned scratch buffers `dists` and `out`).
 fn clip_polygon_halfspace(
     poly: &[ClipVert],
     plane_origin: Vec3,
     inward_normal: Vec3,
+    dists: &mut Vec<f32>,
+    out: &mut Vec<ClipVert>,
     cut_segments: &mut Vec<(Vec3, Vec3)>,
-) -> Vec<ClipVert> {
+) -> ClipOutcome {
     let n = poly.len();
     if n < 3 {
-        return Vec::new();
+        return ClipOutcome::AllOut;
     }
 
     let eps = 1e-5_f32;
-    let dists: Vec<f32> = poly
-        .iter()
-        .map(|v| (v.pos - plane_origin).dot(inward_normal))
-        .collect();
+    dists.clear();
+    let mut all_in = true;
+    let mut all_out = true;
+    for v in poly {
+        let d = (v.pos - plane_origin).dot(inward_normal);
+        if d < -eps {
+            all_in = false;
+        } else {
+            all_out = false;
+        }
+        dists.push(d);
+    }
 
-    let mut out: Vec<ClipVert> = Vec::with_capacity(n + 1);
+    if all_out {
+        return ClipOutcome::AllOut;
+    }
+    if all_in {
+        return ClipOutcome::AllIn;
+    }
+
+    out.clear();
     let mut cross_pts = [Vec3::ZERO; 2];
     let mut cross_count = 0_usize;
 
@@ -2043,7 +2068,7 @@ fn clip_polygon_halfspace(
         let in_j = dj >= -eps;
 
         if in_i {
-            push_dedup(&mut out, vi);
+            push_dedup(out, vi);
         }
         if in_i != in_j {
             let denom = di - dj;
@@ -2053,7 +2078,7 @@ fn clip_polygon_halfspace(
                 0.5
             };
             let hit = ClipVert::lerp(vi, vj, t);
-            push_dedup(&mut out, hit);
+            push_dedup(out, hit);
             if cross_count < 2 {
                 cross_pts[cross_count] = hit.pos;
                 cross_count += 1;
@@ -2069,12 +2094,27 @@ fn clip_polygon_halfspace(
         cut_segments.push((cross_pts[0], cross_pts[1]));
     }
 
-    if out.len() >= 3 { out } else { Vec::new() }
+    if out.len() >= 3 {
+        ClipOutcome::Clipped
+    } else {
+        ClipOutcome::AllOut
+    }
+}
+
+#[inline]
+fn cap_grid_key(p: Vec2, inv_cell: f32) -> (i64, i64) {
+    (
+        (p.x * inv_cell).floor() as i64,
+        (p.y * inv_cell).floor() as i64,
+    )
 }
 
 fn extend_cap_chain(
     chain: &mut Vec<Vec2>,
-    remaining: &mut Vec<(Vec2, Vec2)>,
+    segments_2d: &[(Vec2, Vec2)],
+    used: &mut [bool],
+    endpoint_grid: &HashMap<(i64, i64), Vec<usize>>,
+    inv_cell: f32,
     snap_eps2: f32,
 ) -> bool {
     loop {
@@ -2084,19 +2124,30 @@ fn extend_cap_chain(
             chain.pop();
             return true;
         }
+        let (gx, gy) = cap_grid_key(tail, inv_cell);
         let mut best: Option<(usize, Vec2, f32)> = None;
-        for (idx, &(a, b)) in remaining.iter().enumerate() {
-            let da = a.distance_squared(tail);
-            if da <= snap_eps2 && best.is_none_or(|(_, _, bd)| da < bd) {
-                best = Some((idx, b, da));
-            }
-            let db = b.distance_squared(tail);
-            if db <= snap_eps2 && best.is_none_or(|(_, _, bd)| db < bd) {
-                best = Some((idx, a, db));
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(bucket) = endpoint_grid.get(&(gx + dx, gy + dy)) {
+                    for &idx in bucket {
+                        if used[idx] {
+                            continue;
+                        }
+                        let (a, b) = segments_2d[idx];
+                        let da = a.distance_squared(tail);
+                        if da <= snap_eps2 && best.is_none_or(|(_, _, bd)| da < bd) {
+                            best = Some((idx, b, da));
+                        }
+                        let db = b.distance_squared(tail);
+                        if db <= snap_eps2 && best.is_none_or(|(_, _, bd)| db < bd) {
+                            best = Some((idx, a, db));
+                        }
+                    }
+                }
             }
         }
         if let Some((idx, pt, _)) = best {
-            remaining.swap_remove(idx);
+            used[idx] = true;
             if pt.distance_squared(tail) > 1e-10 {
                 chain.push(pt);
             }
@@ -2117,6 +2168,8 @@ fn build_planar_cap_polys(
     plane_origin: Vec3,
     inward_normal: Vec3,
     cell_polys: &mut Vec<Vec<ClipVert>>,
+    tessellator: &mut FillTessellator,
+    cap_geo: &mut VertexBuffers<[f32; 2], u32>,
 ) {
     if segments.len() < 3 {
         return;
@@ -2131,7 +2184,7 @@ fn build_planar_cap_polys(
     let tangent_u = cap_normal.cross(ref_axis).normalize_or_zero();
     let tangent_v = cap_normal.cross(tangent_u).normalize_or_zero();
 
-    let mut remaining: Vec<(Vec2, Vec2)> = segments
+    let segments_2d: Vec<(Vec2, Vec2)> = segments
         .iter()
         .take(MAX_CAP_CONTOUR_VERTS)
         .filter_map(|&(a, b)| {
@@ -2139,18 +2192,59 @@ fn build_planar_cap_polys(
             let db = b - plane_origin;
             let p0 = Vec2::new(da.dot(tangent_u), da.dot(tangent_v));
             let p1 = Vec2::new(db.dot(tangent_u), db.dot(tangent_v));
-            (p0.distance_squared(p1) > 1e-10).then_some((p0, p1))
+            (p0.x.is_finite()
+                && p0.y.is_finite()
+                && p1.x.is_finite()
+                && p1.y.is_finite()
+                && p0.distance_squared(p1) > 1e-10)
+                .then_some((p0, p1))
         })
         .collect();
 
+    if segments_2d.len() < 3 {
+        return;
+    }
+
     let snap_eps2 = 1e-4_f32;
+    let inv_cell = 1.0 / snap_eps2.sqrt();
+    let mut endpoint_grid: HashMap<(i64, i64), Vec<usize>> =
+        HashMap::with_capacity(segments_2d.len() * 2);
+    for (idx, &(a, b)) in segments_2d.iter().enumerate() {
+        let ka = cap_grid_key(a, inv_cell);
+        let kb = cap_grid_key(b, inv_cell);
+        endpoint_grid.entry(ka).or_default().push(idx);
+        if kb != ka {
+            endpoint_grid.entry(kb).or_default().push(idx);
+        }
+    }
+
+    let mut used = vec![false; segments_2d.len()];
     let mut loops: Vec<Vec<Vec2>> = Vec::new();
 
-    while let Some((start, next)) = remaining.pop() {
+    for start_idx in (0..segments_2d.len()).rev() {
+        if used[start_idx] {
+            continue;
+        }
+        used[start_idx] = true;
+        let (start, next) = segments_2d[start_idx];
         let mut chain = vec![start, next];
-        if !extend_cap_chain(&mut chain, &mut remaining, snap_eps2) {
+        if !extend_cap_chain(
+            &mut chain,
+            &segments_2d,
+            &mut used,
+            &endpoint_grid,
+            inv_cell,
+            snap_eps2,
+        ) {
             chain.reverse();
-            extend_cap_chain(&mut chain, &mut remaining, snap_eps2);
+            extend_cap_chain(
+                &mut chain,
+                &segments_2d,
+                &mut used,
+                &endpoint_grid,
+                inv_cell,
+                snap_eps2,
+            );
         }
         if chain.len() >= 3 && polygon_area_2d(&chain).abs() > 1e-7 {
             loops.push(chain);
@@ -2173,8 +2267,8 @@ fn build_planar_cap_polys(
     }
     let path = path_builder.build();
 
-    let mut cap_geo: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
-    let mut tessellator = FillTessellator::new();
+    cap_geo.vertices.clear();
+    cap_geo.indices.clear();
     let options = FillOptions::default()
         .with_fill_rule(FillRule::EvenOdd)
         .with_tolerance(0.01);
@@ -2182,7 +2276,7 @@ fn build_planar_cap_polys(
         .tessellate_path(
             &path,
             &options,
-            &mut BuffersBuilder::new(&mut cap_geo, |v: FillVertex| {
+            &mut BuffersBuilder::new(cap_geo, |v: FillVertex| {
                 let p = v.position();
                 [p.x, p.y]
             }),
@@ -2441,20 +2535,69 @@ pub fn apply_voronoi_fracture_with_params(
     let gravity = finite_or(f64::from(params.gravity), 0.0);
     let randomness = clamp_unit(finite_or(f64::from(params.randomness), 0.0) / 100.0);
 
+    let mut source_min = Vec3::splat(f32::INFINITY);
+    let mut source_max = Vec3::splat(f32::NEG_INFINITY);
+    for poly in &source_tris {
+        for v in poly {
+            source_min = source_min.min(v.pos);
+            source_max = source_max.max(v.pos);
+        }
+    }
+    let max_metric_sqrt = metric[0].max(metric[1]).max(metric[2]).sqrt();
+    let compute_break_threshold = |c_min: Vec3, c_max: Vec3, site: Vec3| -> f64 {
+        let dx = f64::from((c_min.x - site.x).abs().max((c_max.x - site.x).abs()));
+        let dy = f64::from((c_min.y - site.y).abs().max((c_max.y - site.y).abs()));
+        let dz = f64::from((c_min.z - site.z).abs().max((c_max.z - site.z).abs()));
+        let max_r_m = (dx * dx * metric[0] + dy * dy * metric[1] + dz * dz * metric[2]).sqrt();
+        let r_safe = max_r_m + 1e-3 * max_metric_sqrt;
+        4.0 * r_safe * r_safe * 1.0001
+    };
+
     let mut out_verts: Vec<Vertex3D> = Vec::new();
     let mut out_indices: Vec<u32> = Vec::new();
     let mut out_colors: Vec<[f32; 4]> = Vec::new();
+
+    // Hoisted reusable scratch buffers across all Voronoi cells & half-space planes.
+    let mut tessellator = FillTessellator::new();
+    let mut cap_geo: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
+    let mut dists_scratch: Vec<f32> = Vec::with_capacity(16);
+    let mut out_scratch: Vec<ClipVert> = Vec::with_capacity(16);
+    let mut cut_segs: Vec<(Vec3, Vec3)> = Vec::new();
+    let mut next_polys: Vec<Vec<ClipVert>> = Vec::with_capacity(source_tris.len());
+    let mut neighbors: Vec<(usize, f64)> = Vec::with_capacity(sites.len());
 
     for (ci, &site_c) in sites.iter().enumerate() {
         if out_indices.len() / 3 >= MAX_VORONOI_OUTPUT_TRIS {
             break;
         }
         let mut cell_polys = source_tris.clone();
+        if cell_polys.is_empty() {
+            continue;
+        }
+        let mut cell_min = source_min;
+        let mut cell_max = source_max;
+        let mut break_threshold = compute_break_threshold(cell_min, cell_max, site_c);
 
+        // Sort neighbor sites by ascending metric-squared distance from `site_c` so the closest
+        // clipping planes shrink the cell AABB immediately and distant sites early-out.
+        neighbors.clear();
         for (cj, &site_j) in sites.iter().enumerate() {
-            if ci == cj || cell_polys.is_empty() {
+            if ci == cj {
                 continue;
             }
+            let dx = f64::from(site_c.x - site_j.x);
+            let dy = f64::from(site_c.y - site_j.y);
+            let dz = f64::from(site_c.z - site_j.z);
+            let dist_m_sq = dx * dx * metric[0] + dy * dy * metric[1] + dz * dz * metric[2];
+            neighbors.push((cj, dist_m_sq));
+        }
+        neighbors.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+
+        for &(cj, dist_m_sq) in &neighbors {
+            if cell_polys.is_empty() || dist_m_sq > break_threshold {
+                break;
+            }
+            let site_j = sites[cj];
             // Anisotropic bisector plane matching `effector-fracture.js:173-181`.
             let diff_m = [
                 f64::from(site_c.x - site_j.x) * metric[0],
@@ -2473,18 +2616,104 @@ pub fn apply_voronoi_fracture_with_params(
             );
             let mid = (site_c + site_j) * 0.5;
 
-            let mut cut_segs = Vec::new();
-            let mut next_polys = Vec::with_capacity(cell_polys.len());
-            for poly in &cell_polys {
-                let clipped = clip_polygon_halfspace(poly, mid, inward_n, &mut cut_segs);
-                if clipped.len() >= 3 {
-                    next_polys.push(clipped);
+            // Fast O(1) AABB half-space projection tests:
+            // `worst` minimizes `(p - mid).dot(inward_n)` over the cell AABB;
+            // `best` maximizes `(p - mid).dot(inward_n)` over the cell AABB.
+            let worst = Vec3::new(
+                if inward_n.x >= 0.0 {
+                    cell_min.x
+                } else {
+                    cell_max.x
+                },
+                if inward_n.y >= 0.0 {
+                    cell_min.y
+                } else {
+                    cell_max.y
+                },
+                if inward_n.z >= 0.0 {
+                    cell_min.z
+                } else {
+                    cell_max.z
+                },
+            );
+            if (worst - mid).dot(inward_n) > 1e-4 {
+                continue;
+            }
+            let best = Vec3::new(
+                if inward_n.x >= 0.0 {
+                    cell_max.x
+                } else {
+                    cell_min.x
+                },
+                if inward_n.y >= 0.0 {
+                    cell_max.y
+                } else {
+                    cell_min.y
+                },
+                if inward_n.z >= 0.0 {
+                    cell_max.z
+                } else {
+                    cell_min.z
+                },
+            );
+            if (best - mid).dot(inward_n) < -1e-4 {
+                cell_polys.clear();
+                break;
+            }
+
+            cut_segs.clear();
+            next_polys.clear();
+            let mut any_changed = false;
+            for mut poly in cell_polys.drain(..) {
+                match clip_polygon_halfspace(
+                    &poly,
+                    mid,
+                    inward_n,
+                    &mut dists_scratch,
+                    &mut out_scratch,
+                    &mut cut_segs,
+                ) {
+                    ClipOutcome::AllIn => {
+                        next_polys.push(poly);
+                    }
+                    ClipOutcome::AllOut => {
+                        any_changed = true;
+                    }
+                    ClipOutcome::Clipped => {
+                        any_changed = true;
+                        poly.clear();
+                        poly.extend_from_slice(&out_scratch);
+                        next_polys.push(poly);
+                    }
                 }
             }
-            cell_polys = next_polys;
+            std::mem::swap(&mut cell_polys, &mut next_polys);
 
-            if params.closed && !cell_polys.is_empty() && !cut_segs.is_empty() {
-                build_planar_cap_polys(&cut_segs, mid, inward_n, &mut cell_polys);
+            if any_changed {
+                if params.closed && !cell_polys.is_empty() && !cut_segs.is_empty() {
+                    build_planar_cap_polys(
+                        &cut_segs,
+                        mid,
+                        inward_n,
+                        &mut cell_polys,
+                        &mut tessellator,
+                        &mut cap_geo,
+                    );
+                }
+                if cell_polys.is_empty() {
+                    break;
+                }
+                let mut next_min = Vec3::splat(f32::INFINITY);
+                let mut next_max = Vec3::splat(f32::NEG_INFINITY);
+                for poly in &cell_polys {
+                    for v in poly {
+                        next_min = next_min.min(v.pos);
+                        next_max = next_max.max(v.pos);
+                    }
+                }
+                cell_min = next_min;
+                cell_max = next_max;
+                break_threshold = compute_break_threshold(cell_min, cell_max, site_c);
             }
         }
 

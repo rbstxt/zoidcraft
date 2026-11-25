@@ -2,7 +2,6 @@
 //! gain and equal-power pan law (Spec 03 §1.4 & Spec 04 §4.2).
 
 use std::borrow::Borrow;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::FRAC_PI_2;
 use std::f64::consts::{FRAC_PI_2 as FRAC_PI_2_F64, PI as PI_F64, TAU as TAU_F64};
@@ -15,10 +14,13 @@ use zc_project::{
 
 use crate::AudioError;
 use crate::decode::{
-    AudioBuffer, MAX_AUDIO_SAMPLE_RATE, MIN_AUDIO_SAMPLE_RATE, decode_audio_bytes,
-    downmix_frame_to_stereo, sample_stereo_sinc,
+    AudioBuffer, MAX_AUDIO_SAMPLE_RATE, MIN_AUDIO_SAMPLE_RATE, SincResampleKernel, clean_sample,
+    decode_audio_bytes, downmix_frame_to_stereo, sample_stereo_sinc,
 };
-use crate::expr::{AudioExprContext, eval_audio_expression_or_fallback};
+use crate::expr::{
+    AudioExprContext, CompiledAudioExpr, compile_audio_expression,
+    eval_compiled_audio_expression_or_fallback,
+};
 
 /// Maximum stereo sample frames produced in one offline mix buffer (32M frames = 256 MiB).
 pub const MAX_OFFLINE_MIX_SAMPLES: usize = 32 * 1024 * 1024;
@@ -74,6 +76,38 @@ pub fn effective_playback_rate(
     ((time_at_length_sec - time_at_zero_sec) / clip_length_frames) * fps
 }
 
+/// Precomputes the exact 2×2 stereo gain + equal-power pan matrix `[g_ll, g_lr, g_rl, g_rr]`
+/// such that `L_out = g_ll * L + g_lr * R` and `R_out = g_rl * L + g_rr * R`.
+#[must_use]
+#[inline]
+fn gain_pan_matrix(volume: f32, pan: f32) -> [f32; 4] {
+    let gain = if volume.is_finite() {
+        volume.max(0.0)
+    } else {
+        0.0
+    };
+    if gain == 0.0 {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    let p = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    if p == 0.0 {
+        return [gain, 0.0, 0.0, gain];
+    }
+    if p < 0.0 {
+        let theta = (p + 1.0) * FRAC_PI_2;
+        let (sin_t, cos_t) = theta.sin_cos();
+        [gain, gain * cos_t, 0.0, gain * sin_t]
+    } else {
+        let theta = p * FRAC_PI_2;
+        let (sin_t, cos_t) = theta.sin_cos();
+        [gain * cos_t, 0.0, gain * sin_t, gain]
+    }
+}
+
 /// Applies the exact CM3 / W3C Web Audio `StereoPannerNode` offline stereo gain and
 /// equal-power pan law (Spec 03 §1.4):
 ///
@@ -89,6 +123,9 @@ pub fn apply_gain_and_pan(sample: [f32; 2], volume: f32, pan: f32) -> [f32; 2] {
     } else {
         0.0
     };
+    if gain == 0.0 {
+        return [0.0, 0.0];
+    }
     let p = if pan.is_finite() {
         pan.clamp(-1.0, 1.0)
     } else {
@@ -97,16 +134,21 @@ pub fn apply_gain_and_pan(sample: [f32; 2], volume: f32, pan: f32) -> [f32; 2] {
 
     let l1 = sample[0] * gain;
     let r1 = sample[1] * gain;
+    if p == 0.0 {
+        return [l1, r1];
+    }
 
-    if p <= 0.0 {
+    if p < 0.0 {
         let theta = (p + 1.0) * FRAC_PI_2;
-        let l_out = l1 + r1 * theta.cos();
-        let r_out = r1 * theta.sin();
+        let (sin_t, cos_t) = theta.sin_cos();
+        let l_out = l1 + r1 * cos_t;
+        let r_out = r1 * sin_t;
         [l_out, r_out]
     } else {
-        let theta = p.abs() * FRAC_PI_2;
-        let l_out = l1 * theta.cos();
-        let r_out = r1 + l1 * theta.sin();
+        let theta = p * FRAC_PI_2;
+        let (sin_t, cos_t) = theta.sin_cos();
+        let l_out = l1 * cos_t;
+        let r_out = r1 + l1 * sin_t;
         [l_out, r_out]
     }
 }
@@ -235,12 +277,12 @@ fn mix_offline_stereo_animated_inner<B, F, S>(
     sample_rate: u32,
     clips: &[AudioClipScheduleItem],
     buffers: &HashMap<String, B>,
-    eval_clip: F,
+    mut eval_clip: F,
     silence_stationary: S,
 ) -> Vec<[f32; 2]>
 where
     B: Borrow<AudioBuffer>,
-    F: Fn(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
+    F: FnMut(usize, &AudioClipScheduleItem, f64) -> ClipAudioSampleParams,
     S: Fn(usize) -> bool,
 {
     let mut output = vec![[0.0_f32; 2]; total_samples];
@@ -248,88 +290,21 @@ where
         return output;
     }
 
-    let sr_f64 = f64::from(sample_rate);
-    let total_sec = total_samples as f64 / sr_f64;
-
     for (clip_idx, clip) in clips.iter().enumerate() {
-        if !clip.clip_start_frame.is_finite()
-            || !clip.clip_length_frames.is_finite()
-            || clip.clip_length_frames <= 0.0
-        {
-            continue;
-        }
-
-        let start_sec = clip.clip_start_frame / fps;
-        let end_sec = (clip.clip_start_frame + clip.clip_length_frames) / fps;
-        if end_sec <= 0.0 || start_sec >= total_sec {
-            continue;
-        }
-
         let Some(raw_entry) = buffers.get(&clip.buffer_id) else {
             continue;
         };
         let raw_buf: &AudioBuffer = raw_entry.borrow();
-        if raw_buf.frame_count() == 0 || raw_buf.sample_rate == 0 || raw_buf.channels == 0 {
-            continue;
-        }
-
-        let start_sample = (start_sec * sr_f64).floor().max(0.0) as usize;
-        let end_sample = ((end_sec * sr_f64).ceil().max(0.0) as usize).min(total_samples);
-        if start_sample >= end_sample {
-            continue;
-        }
-
-        // Sample directly from `raw_buf` at its native sample rate with zero extra
-        // resampled buffer copies so long clips at any sample rate (e.g. 44.1 kHz)
-        // never hit a secondary resampling cap or get silently muted.
-        let src_sr_f64 = f64::from(raw_buf.sample_rate);
-        let base_rate_ratio = clip.playback_rate.abs() * (src_sr_f64 / sr_f64);
-        let mut prev_media_time: Option<f64> = None;
-
-        for (sample_idx, out_frame) in output
-            .iter_mut()
-            .enumerate()
-            .take(end_sample)
-            .skip(start_sample)
-        {
-            let timeline_sec = sample_idx as f64 / sr_f64;
-            let timeline_frame = timeline_sec * fps;
-            let local_frame = timeline_frame - clip.clip_start_frame;
-
-            if local_frame < 0.0 || local_frame >= clip.clip_length_frames {
-                prev_media_time = None;
-                continue;
-            }
-
-            let params = eval_clip(clip_idx, clip, local_frame);
-            if !params.media_time_sec.is_finite() || params.media_time_sec < 0.0 {
-                prev_media_time = None;
-                continue;
-            }
-
-            let src_pos = params.media_time_sec * src_sr_f64;
-            let local_ratio = match prev_media_time {
-                Some(prev) => (params.media_time_sec - prev).abs() * src_sr_f64,
-                None => base_rate_ratio,
-            };
-            prev_media_time = Some(params.media_time_sec);
-
-            // Freeze-frame / zero-velocity time curve holds a single timestamp with zero
-            // progression; silence cleanly rather than emitting a constant DC offset pop,
-            // while allowing explicit user `time` expressions to sample as written.
-            if local_ratio <= 1e-9 && silence_stationary(clip_idx) {
-                continue;
-            }
-
-            let src_sample = if local_ratio > 1.02 {
-                sample_stereo_sinc(raw_buf, src_pos, local_ratio)
-            } else {
-                sample_audio_buffer_stereo_linear(raw_buf, src_pos)
-            };
-            let mixed = apply_gain_and_pan(src_sample, params.volume, params.pan);
-            out_frame[0] += mixed[0];
-            out_frame[1] += mixed[1];
-        }
+        let silence_stat = silence_stationary(clip_idx);
+        mix_single_clip_animated(
+            &mut output,
+            fps,
+            sample_rate,
+            clip,
+            raw_buf,
+            |local_frame| eval_clip(clip_idx, clip, local_frame),
+            silence_stat,
+        );
     }
 
     for frame in &mut output {
@@ -338,6 +313,374 @@ where
     }
 
     output
+}
+
+fn mix_single_clip_animated<F>(
+    output: &mut [[f32; 2]],
+    fps: f64,
+    sample_rate: u32,
+    clip: &AudioClipScheduleItem,
+    raw_buf: &AudioBuffer,
+    mut eval_clip: F,
+    silence_stationary: bool,
+) where
+    F: FnMut(f64) -> ClipAudioSampleParams,
+{
+    if !clip.clip_start_frame.is_finite()
+        || !clip.clip_length_frames.is_finite()
+        || clip.clip_length_frames <= 0.0
+    {
+        return;
+    }
+    if raw_buf.frame_count() == 0 || raw_buf.sample_rate == 0 || raw_buf.channels == 0 {
+        return;
+    }
+
+    let sr_f64 = f64::from(sample_rate);
+    let total_samples = output.len();
+    let total_sec = total_samples as f64 / sr_f64;
+
+    let start_sec = clip.clip_start_frame / fps;
+    let end_sec = (clip.clip_start_frame + clip.clip_length_frames) / fps;
+    if end_sec <= 0.0 || start_sec >= total_sec {
+        return;
+    }
+
+    let start_sample = (start_sec * sr_f64).floor().max(0.0) as usize;
+    let end_sample = ((end_sec * sr_f64).ceil().max(0.0) as usize).min(total_samples);
+    if start_sample >= end_sample {
+        return;
+    }
+
+    // Sample directly from `raw_buf` at its native sample rate with zero extra
+    // resampled buffer copies so long clips at any sample rate (e.g. 44.1 kHz)
+    // never hit a secondary resampling cap or get silently muted.
+    let src_sr_f64 = f64::from(raw_buf.sample_rate);
+    let base_rate_ratio = clip.playback_rate.abs() * (src_sr_f64 / sr_f64);
+    let mut prev_media_time: Option<f64> = None;
+
+    for (sample_idx, out_frame) in output
+        .iter_mut()
+        .enumerate()
+        .take(end_sample)
+        .skip(start_sample)
+    {
+        let timeline_sec = sample_idx as f64 / sr_f64;
+        let timeline_frame = timeline_sec * fps;
+        let local_frame = timeline_frame - clip.clip_start_frame;
+
+        if local_frame < 0.0 || local_frame >= clip.clip_length_frames {
+            prev_media_time = None;
+            continue;
+        }
+
+        let params = eval_clip(local_frame);
+        if !params.media_time_sec.is_finite() || params.media_time_sec < 0.0 {
+            prev_media_time = None;
+            continue;
+        }
+
+        if !params.volume.is_finite() || params.volume <= 0.0 {
+            prev_media_time = Some(params.media_time_sec);
+            continue;
+        }
+
+        let src_pos = params.media_time_sec * src_sr_f64;
+        let local_ratio = match prev_media_time {
+            Some(prev) => (params.media_time_sec - prev).abs() * src_sr_f64,
+            None => base_rate_ratio,
+        };
+        prev_media_time = Some(params.media_time_sec);
+
+        // Freeze-frame / zero-velocity time curve holds a single timestamp with zero
+        // progression; silence cleanly rather than emitting a constant DC offset pop,
+        // while allowing explicit user `time` expressions to sample as written.
+        if local_ratio <= 1e-9 && silence_stationary {
+            continue;
+        }
+
+        let src_sample = if local_ratio > 1.02 {
+            sample_stereo_sinc(raw_buf, src_pos, local_ratio)
+        } else {
+            sample_audio_buffer_stereo_linear(raw_buf, src_pos)
+        };
+        let mixed = apply_gain_and_pan(src_sample, params.volume, params.pan);
+        out_frame[0] += mixed[0];
+        out_frame[1] += mixed[1];
+    }
+}
+
+/// Precomputed constant-parameter schedule for a root-level non-expression clip with
+/// constant volume/pan and linear time progression.
+#[derive(Debug, Clone, Copy)]
+struct StaticLinearClipParams {
+    clip_start_frame: f64,
+    clip_length_frames: f64,
+    media_start_sec: f64,
+    playback_rate: f64,
+    volume: f32,
+    pan: f32,
+}
+
+#[allow(clippy::too_many_lines)]
+fn mix_static_linear_clip(
+    output: &mut [[f32; 2]],
+    fps: f64,
+    sample_rate: u32,
+    params: StaticLinearClipParams,
+    raw_buf: &AudioBuffer,
+) {
+    if !params.clip_start_frame.is_finite()
+        || !params.clip_length_frames.is_finite()
+        || params.clip_length_frames <= 0.0
+        || !params.media_start_sec.is_finite()
+        || !params.playback_rate.is_finite()
+        || params.playback_rate.abs() <= 1e-9
+    {
+        return;
+    }
+    if !params.volume.is_finite() || params.volume <= 0.0 {
+        return;
+    }
+    let frames = raw_buf.frame_count();
+    if frames == 0 || raw_buf.sample_rate == 0 || raw_buf.channels == 0 {
+        return;
+    }
+
+    let sr_f64 = f64::from(sample_rate);
+    let total_samples = output.len();
+    let total_sec = total_samples as f64 / sr_f64;
+
+    let start_sec = params.clip_start_frame / fps;
+    let end_sec = (params.clip_start_frame + params.clip_length_frames) / fps;
+    if end_sec <= 0.0 || start_sec >= total_sec {
+        return;
+    }
+
+    let start_sample = (start_sec * sr_f64).floor().max(0.0) as usize;
+    let end_sample = ((end_sec * sr_f64).ceil().max(0.0) as usize).min(total_samples);
+    if start_sample >= end_sample {
+        return;
+    }
+
+    // Tighten to the exact sample range where `0.0 <= local_frame < clip_length_frames`.
+    let mut loop_start = start_sample;
+    while loop_start < end_sample {
+        let local_frame = (loop_start as f64 / sr_f64) * fps - params.clip_start_frame;
+        if local_frame >= 0.0 {
+            break;
+        }
+        loop_start += 1;
+    }
+    let mut loop_end = end_sample;
+    while loop_end > loop_start {
+        let local_frame = ((loop_end - 1) as f64 / sr_f64) * fps - params.clip_start_frame;
+        if local_frame < params.clip_length_frames {
+            break;
+        }
+        loop_end -= 1;
+    }
+    if loop_start >= loop_end {
+        return;
+    }
+
+    let src_sr_f64 = f64::from(raw_buf.sample_rate);
+    let src_pos_step = params.playback_rate * (src_sr_f64 / sr_f64);
+    let local_ratio = src_pos_step.abs();
+    let max_pos = frames as f64;
+    let src_pos_at = |sample_idx: usize| -> f64 {
+        let local_frame = (sample_idx as f64 / sr_f64) * fps - params.clip_start_frame;
+        let media_time_sec = params.media_start_sec + (local_frame / fps) * params.playback_rate;
+        media_time_sec * src_sr_f64
+    };
+
+    // Tighten to the exact sample range where `0.0 <= src_pos < frames`.
+    if src_pos_step > 0.0 {
+        let pos0 = src_pos_at(loop_start);
+        if pos0 < 0.0 {
+            let skip = ((-pos0) / src_pos_step).floor().max(0.0) as usize;
+            loop_start = loop_start.saturating_add(skip).min(loop_end);
+            while loop_start < loop_end && src_pos_at(loop_start) < 0.0 {
+                loop_start += 1;
+            }
+        }
+        if loop_start < loop_end {
+            let pos_last = src_pos_at(loop_end - 1);
+            if pos_last >= max_pos {
+                let excess = ((pos_last - max_pos) / src_pos_step).floor().max(0.0) as usize;
+                loop_end = loop_end.saturating_sub(excess).max(loop_start);
+                while loop_end > loop_start && src_pos_at(loop_end - 1) >= max_pos {
+                    loop_end -= 1;
+                }
+            }
+        }
+    } else {
+        let pos0 = src_pos_at(loop_start);
+        if pos0 >= max_pos {
+            let skip = ((pos0 - max_pos) / (-src_pos_step)).floor().max(0.0) as usize;
+            loop_start = loop_start.saturating_add(skip).min(loop_end);
+            while loop_start < loop_end && src_pos_at(loop_start) >= max_pos {
+                loop_start += 1;
+            }
+        }
+        if loop_start < loop_end {
+            let pos_last = src_pos_at(loop_end - 1);
+            if pos_last < 0.0 {
+                let excess = ((-pos_last) / (-src_pos_step)).floor().max(0.0) as usize;
+                loop_end = loop_end.saturating_sub(excess).max(loop_start);
+                while loop_end > loop_start && src_pos_at(loop_end - 1) < 0.0 {
+                    loop_end -= 1;
+                }
+            }
+        }
+    }
+
+    if loop_start >= loop_end {
+        return;
+    }
+
+    let [g_ll, g_lr, g_rl, g_rr] = gain_pan_matrix(params.volume, params.pan);
+    let count = loop_end - loop_start;
+    let src_pos_base = src_pos_at(loop_start);
+    let out_slice = &mut output[loop_start..loop_end];
+    let samples = &raw_buf.samples_interleaved_f32;
+    let ch = raw_buf.channels;
+
+    // Fast path 1: direct 1:1 accumulate loop when source and output sample rates match,
+    // playback rate is unity, and source positions are integer-aligned with negligible drift.
+    if raw_buf.sample_rate == sample_rate && (params.playback_rate - 1.0).abs() < 1e-9 {
+        let rounded_start = src_pos_base.round();
+        if rounded_start >= 0.0 && (src_pos_base - rounded_start).abs() < 1e-6 {
+            let src_start_idx = rounded_start as usize;
+            let end_drift = ((src_pos_base + (count as f64) * src_pos_step)
+                - (src_start_idx + count) as f64)
+                .abs();
+            if src_start_idx + count <= frames && end_drift < 1e-4 {
+                match ch {
+                    1 => {
+                        let ml = g_ll + g_lr;
+                        let mr = g_rl + g_rr;
+                        for (out_frame, &raw_m) in out_slice
+                            .iter_mut()
+                            .zip(&samples[src_start_idx..src_start_idx + count])
+                        {
+                            let m = clean_sample(raw_m);
+                            out_frame[0] += m * ml;
+                            out_frame[1] += m * mr;
+                        }
+                    }
+                    2 => {
+                        let src_pairs = samples[src_start_idx * 2..(src_start_idx + count) * 2]
+                            .as_chunks::<2>()
+                            .0;
+                        if g_lr == 0.0 && g_rl == 0.0 {
+                            for (out_frame, &[p0, p1]) in out_slice.iter_mut().zip(src_pairs) {
+                                out_frame[0] += clean_sample(p0) * g_ll;
+                                out_frame[1] += clean_sample(p1) * g_rr;
+                            }
+                        } else {
+                            for (out_frame, &[p0, p1]) in out_slice.iter_mut().zip(src_pairs) {
+                                let l = clean_sample(p0);
+                                let r = clean_sample(p1);
+                                out_frame[0] += l * g_ll + r * g_lr;
+                                out_frame[1] += l * g_rl + r * g_rr;
+                            }
+                        }
+                    }
+                    _ => {
+                        for (k, out_frame) in out_slice.iter_mut().enumerate() {
+                            let s = downmix_frame_to_stereo(raw_buf, src_start_idx + k);
+                            out_frame[0] += s[0] * g_ll + s[1] * g_lr;
+                            out_frame[1] += s[0] * g_rl + s[1] * g_rr;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    // Fast path 2: hoisted linear interpolation with precomputed 2×2 pan/gain matrix.
+    if local_ratio <= 1.02 {
+        let last_frame = frames - 1;
+        match ch {
+            1 => {
+                let ml = g_ll + g_lr;
+                let mr = g_rl + g_rr;
+                for (k, out_frame) in out_slice.iter_mut().enumerate() {
+                    let src_pos = src_pos_base + (k as f64) * src_pos_step;
+                    if src_pos < 0.0 {
+                        continue;
+                    }
+                    let idx0 = src_pos.floor() as usize;
+                    if idx0 >= frames {
+                        continue;
+                    }
+                    let idx1 = (idx0 + 1).min(last_frame);
+                    let frac = (src_pos - idx0 as f64).clamp(0.0, 1.0) as f32;
+                    let a = clean_sample(samples[idx0]);
+                    let b = clean_sample(samples[idx1]);
+                    let m = a + (b - a) * frac;
+                    out_frame[0] += m * ml;
+                    out_frame[1] += m * mr;
+                }
+            }
+            2 => {
+                for (k, out_frame) in out_slice.iter_mut().enumerate() {
+                    let src_pos = src_pos_base + (k as f64) * src_pos_step;
+                    if src_pos < 0.0 {
+                        continue;
+                    }
+                    let idx0 = src_pos.floor() as usize;
+                    if idx0 >= frames {
+                        continue;
+                    }
+                    let idx1 = (idx0 + 1).min(last_frame);
+                    let frac = (src_pos - idx0 as f64).clamp(0.0, 1.0) as f32;
+                    let b0 = idx0 * 2;
+                    let b1 = idx1 * 2;
+                    let a0 = clean_sample(samples[b0]);
+                    let a1 = clean_sample(samples[b0 + 1]);
+                    let c0 = clean_sample(samples[b1]);
+                    let c1 = clean_sample(samples[b1 + 1]);
+                    let l = a0 + (c0 - a0) * frac;
+                    let r = a1 + (c1 - a1) * frac;
+                    out_frame[0] += l * g_ll + r * g_lr;
+                    out_frame[1] += l * g_rl + r * g_rr;
+                }
+            }
+            _ => {
+                for (k, out_frame) in out_slice.iter_mut().enumerate() {
+                    let src_pos = src_pos_base + (k as f64) * src_pos_step;
+                    if src_pos < 0.0 {
+                        continue;
+                    }
+                    let idx0 = src_pos.floor() as usize;
+                    if idx0 >= frames {
+                        continue;
+                    }
+                    let idx1 = (idx0 + 1).min(last_frame);
+                    let frac = (src_pos - idx0 as f64).clamp(0.0, 1.0) as f32;
+                    let a = downmix_frame_to_stereo(raw_buf, idx0);
+                    let b = downmix_frame_to_stereo(raw_buf, idx1);
+                    let l = a[0] + (b[0] - a[0]) * frac;
+                    let r = a[1] + (b[1] - a[1]) * frac;
+                    out_frame[0] += l * g_ll + r * g_lr;
+                    out_frame[1] += l * g_rl + r * g_rr;
+                }
+            }
+        }
+        return;
+    }
+
+    // Fast path 3: downsampling with precomputed Hann-windowed sinc oscillator steps & 2×2 matrix.
+    let sinc_kernel = SincResampleKernel::new(local_ratio);
+    for (k, out_frame) in out_slice.iter_mut().enumerate() {
+        let src_pos = src_pos_base + (k as f64) * src_pos_step;
+        let s = sinc_kernel.sample_stereo(raw_buf, src_pos);
+        out_frame[0] += s[0] * g_ll + s[1] * g_lr;
+        out_frame[1] += s[0] * g_rl + s[1] * g_rr;
+    }
 }
 
 #[inline]
@@ -520,6 +863,76 @@ impl FlattenedAudioClip {
         }
     }
 
+    /// Returns static linear playback parameters if this clip has no enclosing precomps,
+    /// no expressions, constant volume & pan, and a simple non-stationary linear `time_curve`.
+    #[must_use]
+    fn static_linear_params(
+        &self,
+        range_start_frame: f64,
+        root_fps: f64,
+    ) -> Option<StaticLinearClipParams> {
+        if !self.parent_chain.is_empty() || self.has_expressions() {
+            return None;
+        }
+        if !self.root_start_frame.is_finite()
+            || !self.root_length_frames.is_finite()
+            || self.root_length_frames <= 0.0
+            || !self.own_length_frames.is_finite()
+            || (self.own_length_frames - self.root_length_frames).abs() > 1e-9
+            || !root_fps.is_finite()
+            || (self.own_fps - root_fps).abs() > 1e-9
+            || !self.media_offset_sec.is_finite()
+        {
+            return None;
+        }
+        let p = &self.props;
+        if p.volume.is_keyframed && p.volume.keyframes.len() > 1 {
+            return None;
+        }
+        if p.pan.is_keyframed && p.pan.keyframes.len() > 1 {
+            return None;
+        }
+
+        let (media_start_sec, playback_rate) = if !p.has_time_keyframes {
+            (p.time.evaluate(0.0) + self.media_offset_sec, 1.0)
+        } else if p.time.keyframes.len() == 2 {
+            let k0 = &p.time.keyframes[0];
+            let k1 = &p.time.keyframes[1];
+            let span = k1.frame - k0.frame;
+            if k1.is_bezier
+                || k1.ease_index != 1
+                || !span.is_finite()
+                || span <= 0.0
+                || k0.frame > 0.0
+                || k1.frame < self.own_length_frames
+            {
+                return None;
+            }
+            let slope = (k1.value - k0.value) / span;
+            let rate = slope * self.own_fps;
+            let start_sec = k0.value - slope * k0.frame + self.media_offset_sec;
+            (start_sec, rate)
+        } else {
+            return None;
+        };
+
+        if !media_start_sec.is_finite() || !playback_rate.is_finite() || playback_rate.abs() <= 1e-9
+        {
+            return None;
+        }
+
+        let volume = sanitize_gain_f64(p.volume.evaluate(0.0)) as f32;
+        let pan = sanitize_pan_f64(p.pan.evaluate(0.0)) as f32;
+        Some(StaticLinearClipParams {
+            clip_start_frame: self.root_start_frame - range_start_frame,
+            clip_length_frames: self.root_length_frames,
+            media_start_sec,
+            playback_rate,
+            volume,
+            pan,
+        })
+    }
+
     /// Builds an [`AudioClipScheduleItem`] relative to `range_start_frame` at `root_fps`.
     #[must_use]
     pub fn to_schedule_item(&self, range_start_frame: f64, root_fps: f64) -> AudioClipScheduleItem {
@@ -605,8 +1018,9 @@ pub fn collect_flattened_audio_clips_with_precomp(
 /// Mixes pre-collected [`FlattenedAudioClip`] items against a decoded buffer map into a
 /// deterministic 48 kHz (or custom `sample_rate`) stereo buffer.
 ///
-/// Uses a 32-sample control-rate block cache for expression-driven clips while falling back
-/// to exact per-sample evaluation across clip/precomp boundaries.
+/// Uses a hoisted static-clip fast path for constant-parameter linear clips and a 32-sample
+/// control-rate block cache (reusing adjacent block endpoints) for expression-driven clips,
+/// while falling back to exact per-sample evaluation across clip/precomp boundaries.
 pub fn mix_flattened_audio_clips<B: Borrow<AudioBuffer>>(
     clips: &[FlattenedAudioClip],
     range_start_frame: f64,
@@ -615,57 +1029,94 @@ pub fn mix_flattened_audio_clips<B: Borrow<AudioBuffer>>(
     sample_rate: u32,
     buffers: &HashMap<String, B>,
 ) -> Result<Vec<[f32; 2]>, AudioError> {
-    let scheduled: Vec<AudioClipScheduleItem> = clips
-        .iter()
-        .map(|clip| clip.to_schedule_item(range_start_frame, root_fps))
-        .collect();
+    let total_samples = try_offline_total_samples(total_frames, root_fps, sample_rate)?;
+    let mut output = vec![[0.0_f32; 2]; total_samples];
+    if total_samples == 0 || clips.is_empty() {
+        return Ok(output);
+    }
 
     let block_frames = (32.0 / f64::from(sample_rate.max(1))) * root_fps.max(1.0);
-    let caches: Vec<RefCell<ExprSampleCache>> = clips
-        .iter()
-        .map(|_| RefCell::new(ExprSampleCache::new(block_frames)))
-        .collect();
 
-    let total_samples = try_offline_total_samples(total_frames, root_fps, sample_rate)?;
-    Ok(mix_offline_stereo_animated_inner(
-        total_samples,
-        root_fps,
-        sample_rate,
-        &scheduled,
-        buffers,
-        |idx, _item, local_frame| {
-            let clip = &clips[idx];
-            if !clip.has_expressions() {
-                return clip.evaluate_params(local_frame);
-            }
-            let mut cache = caches[idx].borrow_mut();
-            if !cache.valid
-                || local_frame < cache.block_origin_frame
-                || local_frame > cache.block_end_frame
-            {
-                let b0 = local_frame;
-                let b1 = (local_frame + cache.block_step_frames).min(clip.root_length_frames);
-                cache.block_origin_frame = b0;
-                cache.block_end_frame = b1;
-                cache.p0 = clip.evaluate_params(b0);
-                cache.p1 = clip.evaluate_params(b1);
-                cache.valid = true;
-            }
-            if cache.p0.media_time_sec < 0.0 || cache.p1.media_time_sec < 0.0 {
-                return clip.evaluate_params(local_frame);
-            }
-            let span = (cache.block_end_frame - cache.block_origin_frame).max(1e-9);
-            let frac = ((local_frame - cache.block_origin_frame) / span).clamp(0.0, 1.0);
-            let frac32 = frac as f32;
-            ClipAudioSampleParams {
-                media_time_sec: cache.p0.media_time_sec
-                    + (cache.p1.media_time_sec - cache.p0.media_time_sec) * frac,
-                volume: cache.p0.volume + (cache.p1.volume - cache.p0.volume) * frac32,
-                pan: cache.p0.pan + (cache.p1.pan - cache.p0.pan) * frac32,
-            }
-        },
-        |idx| !clips[idx].has_time_expression(),
-    ))
+    for clip in clips {
+        let Some(raw_entry) = buffers.get(&clip.asset_id) else {
+            continue;
+        };
+        let raw_buf: &AudioBuffer = raw_entry.borrow();
+
+        if let Some(static_params) = clip.static_linear_params(range_start_frame, root_fps) {
+            mix_static_linear_clip(&mut output, root_fps, sample_rate, static_params, raw_buf);
+            continue;
+        }
+
+        let scheduled_item = clip.to_schedule_item(range_start_frame, root_fps);
+        let silence_stationary = !clip.has_time_expression();
+        if !clip.has_expressions() {
+            mix_single_clip_animated(
+                &mut output,
+                root_fps,
+                sample_rate,
+                &scheduled_item,
+                raw_buf,
+                |local_frame| clip.evaluate_params(local_frame),
+                silence_stationary,
+            );
+        } else {
+            let mut cache = ExprSampleCache::new(block_frames);
+            let boundary_eps = (cache.block_step_frames * 1e-4).min(1e-6);
+            mix_single_clip_animated(
+                &mut output,
+                root_fps,
+                sample_rate,
+                &scheduled_item,
+                raw_buf,
+                |local_frame| {
+                    let at_or_past_end = local_frame > cache.block_end_frame
+                        || (cache.block_end_frame < clip.root_length_frames
+                            && local_frame >= cache.block_end_frame - boundary_eps);
+                    if !cache.valid || local_frame < cache.block_origin_frame || at_or_past_end {
+                        let contiguous = cache.valid
+                            && (local_frame - cache.block_end_frame).abs() <= 1e-6
+                            && cache.p1.media_time_sec >= 0.0;
+                        let b0 = if contiguous {
+                            cache.block_end_frame
+                        } else {
+                            local_frame
+                        };
+                        let b1 = (b0 + cache.block_step_frames).min(clip.root_length_frames);
+                        cache.p0 = if contiguous {
+                            cache.p1
+                        } else {
+                            clip.evaluate_params(b0)
+                        };
+                        cache.block_origin_frame = b0;
+                        cache.block_end_frame = b1;
+                        cache.p1 = clip.evaluate_params(b1);
+                        cache.valid = true;
+                    }
+                    if cache.p0.media_time_sec < 0.0 || cache.p1.media_time_sec < 0.0 {
+                        return clip.evaluate_params(local_frame);
+                    }
+                    let span = (cache.block_end_frame - cache.block_origin_frame).max(1e-9);
+                    let frac = ((local_frame - cache.block_origin_frame) / span).clamp(0.0, 1.0);
+                    let frac32 = frac as f32;
+                    ClipAudioSampleParams {
+                        media_time_sec: cache.p0.media_time_sec
+                            + (cache.p1.media_time_sec - cache.p0.media_time_sec) * frac,
+                        volume: cache.p0.volume + (cache.p1.volume - cache.p0.volume) * frac32,
+                        pan: cache.p0.pan + (cache.p1.pan - cache.p0.pan) * frac32,
+                    }
+                },
+                silence_stationary,
+            );
+        }
+    }
+
+    for frame in &mut output {
+        frame[0] = sanitize_and_clamp(frame[0]);
+        frame[1] = sanitize_and_clamp(frame[1]);
+    }
+
+    Ok(output)
 }
 
 /// Returns `true` if `project` has at least one decodable active audio clip (including inside
@@ -842,11 +1293,11 @@ struct ParentCompMap {
     precomp_offset_frames: f64,
     has_time_keyframes: bool,
     time_prop: ScalarTrack,
-    time_expr: Option<String>,
+    time_expr: Option<Arc<CompiledAudioExpr>>,
     volume_prop: ScalarTrack,
-    volume_expr: Option<String>,
+    volume_expr: Option<Arc<CompiledAudioExpr>>,
     pan_prop: ScalarTrack,
-    pan_expr: Option<String>,
+    pan_expr: Option<Arc<CompiledAudioExpr>>,
     controls: Arc<CompiledControls>,
 }
 
@@ -854,11 +1305,11 @@ struct ParentCompMap {
 struct CompiledAudioClipProps {
     has_time_keyframes: bool,
     time: ScalarTrack,
-    time_expr: Option<String>,
+    time_expr: Option<Arc<CompiledAudioExpr>>,
     volume: ScalarTrack,
-    volume_expr: Option<String>,
+    volume_expr: Option<Arc<CompiledAudioExpr>>,
     pan: ScalarTrack,
-    pan_expr: Option<String>,
+    pan_expr: Option<Arc<CompiledAudioExpr>>,
     controls: Arc<CompiledControls>,
 }
 
@@ -1389,11 +1840,16 @@ fn sequence_effective_fps(seq: &Sequence) -> f64 {
         .unwrap_or_else(|| f64::from(seq.fps.max(1)))
 }
 
-fn non_empty_expr(expr: &Option<String>) -> Option<String> {
-    expr.as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+fn compile_non_empty_expr(expr: &Option<String>) -> Option<Arc<CompiledAudioExpr>> {
+    let src = expr.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+    match compile_audio_expression(src) {
+        Ok(compiled) if !compiled.is_empty() => Some(Arc::new(compiled)),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::debug!("audio expression compile fallback ({err}): {src}");
+            None
+        }
+    }
 }
 
 #[inline]
@@ -1413,7 +1869,7 @@ fn sanitize_pan_f64(v: f64) -> f64 {
 fn eval_time_track(
     has_keyframes: bool,
     prop: &ScalarTrack,
-    expr: Option<&str>,
+    expr: Option<&CompiledAudioExpr>,
     local_frame: f64,
     seq_frame: f64,
     fps: f64,
@@ -1425,7 +1881,7 @@ fn eval_time_track(
         prop.evaluate(0.0) + local_frame / fps
     };
     match expr {
-        Some(src) => controls.with_resolved(seq_frame, |by_name, by_id| {
+        Some(compiled) => controls.with_resolved(seq_frame, |by_name, by_id| {
             let ctx = AudioExprContext {
                 frame: local_frame,
                 time: raw_time,
@@ -1434,7 +1890,7 @@ fn eval_time_track(
                 controls_by_name: by_name,
                 controls_by_id: by_id,
             };
-            eval_audio_expression_or_fallback(src, &ctx)
+            eval_compiled_audio_expression_or_fallback(compiled, &ctx)
         }),
         None => raw_time,
     }
@@ -1442,7 +1898,7 @@ fn eval_time_track(
 
 fn eval_scalar_expr_track(
     prop: &ScalarTrack,
-    expr: Option<&str>,
+    expr: Option<&CompiledAudioExpr>,
     local_frame: f64,
     media_time_sec: f64,
     seq_frame: f64,
@@ -1451,7 +1907,7 @@ fn eval_scalar_expr_track(
 ) -> f64 {
     let base = prop.evaluate(local_frame);
     match expr {
-        Some(src) => controls.with_resolved(seq_frame, |by_name, by_id| {
+        Some(compiled) => controls.with_resolved(seq_frame, |by_name, by_id| {
             let ctx = AudioExprContext {
                 frame: local_frame,
                 time: media_time_sec,
@@ -1460,7 +1916,7 @@ fn eval_scalar_expr_track(
                 controls_by_name: by_name,
                 controls_by_id: by_id,
             };
-            eval_audio_expression_or_fallback(src, &ctx)
+            eval_compiled_audio_expression_or_fallback(compiled, &ctx)
         }),
         None => base,
     }
@@ -1617,11 +2073,11 @@ fn collect_sequence_audio_clips(
                 props: CompiledAudioClipProps {
                     has_time_keyframes: time.is_keyframed,
                     time,
-                    time_expr: non_empty_expr(&clip.time_curve.expression),
+                    time_expr: compile_non_empty_expr(&clip.time_curve.expression),
                     volume,
-                    volume_expr: non_empty_expr(&clip.audio.volume.expression),
+                    volume_expr: compile_non_empty_expr(&clip.audio.volume.expression),
                     pan,
-                    pan_expr: non_empty_expr(&clip.audio.pan.expression),
+                    pan_expr: compile_non_empty_expr(&clip.audio.pan.expression),
                     controls: Arc::clone(&controls),
                 },
             });
@@ -1681,9 +2137,9 @@ fn collect_sequence_audio_clips(
                     let (volume_prop, volume_expr, pan_prop, pan_expr) = match linked_audio {
                         LinkedPrecompAudio::Active(aclip) => (
                             ScalarTrack::from_property_track(&aclip.audio.volume, 1.0),
-                            non_empty_expr(&aclip.audio.volume.expression),
+                            compile_non_empty_expr(&aclip.audio.volume.expression),
                             ScalarTrack::from_property_track(&aclip.audio.pan, 0.0),
-                            non_empty_expr(&aclip.audio.pan.expression),
+                            compile_non_empty_expr(&aclip.audio.pan.expression),
                         ),
                         LinkedPrecompAudio::None | LinkedPrecompAudio::Muted => (
                             ScalarTrack::constant(preserved_number_or(vclip, layer, "volume", 1.0)),
@@ -1703,7 +2159,7 @@ fn collect_sequence_audio_clips(
                         precomp_offset_frames: resolve_precomp_offset(seq, layer),
                         has_time_keyframes: time_prop.is_keyframed,
                         time_prop,
-                        time_expr: non_empty_expr(&vclip.time_curve.expression),
+                        time_expr: compile_non_empty_expr(&vclip.time_curve.expression),
                         volume_prop,
                         volume_expr,
                         pan_prop,
@@ -2761,5 +3217,210 @@ mod tests {
             peak < 1e-6,
             "frozen audio clip must silence instead of playing linearly or emitting DC, got peak={peak}"
         );
+    }
+
+    #[test]
+    fn static_clip_fast_path_matches_animated_mixer_across_rates_channels_and_pans() {
+        let out_sr = STANDARD_SAMPLE_RATE;
+        let fps = 30.0_f64;
+        let total_frames = 15.0_f64;
+
+        let make_wave_buf = |sr: u32, ch: u16, frames: usize| -> AudioBuffer {
+            let mut samples = Vec::with_capacity(frames * usize::from(ch));
+            for i in 0..frames {
+                let t = i as f64 / f64::from(sr);
+                for c in 0..ch {
+                    let freq = 330.0 + f64::from(c) * 210.0;
+                    samples.push((TAU_F64 * freq * t + f64::from(c) * 0.4).sin() as f32 * 0.5);
+                }
+            }
+            AudioBuffer {
+                sample_rate: sr,
+                channels: ch,
+                samples_interleaved_f32: samples,
+            }
+        };
+
+        let mut buffers = HashMap::new();
+        buffers.insert("mono_48k".to_owned(), make_wave_buf(48_000, 1, 48_000));
+        buffers.insert("stereo_48k".to_owned(), make_wave_buf(48_000, 2, 48_000));
+        buffers.insert("surr_48k".to_owned(), make_wave_buf(48_000, 6, 48_000));
+        buffers.insert("stereo_44k".to_owned(), make_wave_buf(44_100, 2, 44_100));
+        buffers.insert("mono_96k".to_owned(), make_wave_buf(96_000, 1, 96_000));
+
+        type StaticCase = (&'static str, f64, f64, f64, Option<f64>, f64, f64);
+        // Cases: (asset_id, start_frame, len_frames, media_start, end_time_opt, volume, pan)
+        let cases: &[StaticCase] = &[
+            // 1:1 48kHz mono, stereo center, stereo panned left/right, surround
+            ("mono_48k", 0.0, 12.0, 0.0, None, 0.8, -0.35),
+            ("stereo_48k", 2.0, 10.0, 0.05, None, 0.7, 0.0),
+            ("stereo_48k", 1.0, 10.0, 0.02, None, 0.6, 0.65),
+            ("surr_48k", 0.0, 10.0, 0.0, None, 0.5, -0.5),
+            // Linear resampling: 44.1kHz -> 48kHz, slow-mo 0.5x, reverse -1.0x
+            ("stereo_44k", 0.5, 11.0, 0.03, None, 0.9, 0.25),
+            ("stereo_48k", 0.0, 12.0, 0.0, Some(0.2), 0.75, -0.2),
+            ("stereo_48k", 0.0, 12.0, 0.4, Some(0.0), 0.75, 0.3),
+            // Sinc downsampling: 96kHz -> 48kHz and 2.5x speed
+            ("mono_96k", 0.0, 12.0, 0.0, None, 0.85, 0.4),
+            (
+                "stereo_48k",
+                0.0,
+                10.0,
+                0.0,
+                Some(0.833_333_333),
+                0.65,
+                -0.6,
+            ),
+            // Zero-volume skip
+            ("stereo_48k", 0.0, 12.0, 0.0, None, 0.0, 0.0),
+        ];
+
+        for &(asset, start, len, media_start, end_time_opt, vol, pan) in cases {
+            let mut project = Project::new_cm3_default();
+            project.sequence.fps = 30;
+            project.sequence.exact_fps = Some(fps);
+            project.sequence.length_frames = 60.0;
+
+            let time_curve = if let Some(end_time) = end_time_opt {
+                PropertyTrack {
+                    animated: true,
+                    expression: None,
+                    static_behavior: zc_project::StaticBehavior::Constant,
+                    value: PropertyValue::Number(media_start),
+                    keyframes: vec![
+                        zc_project::PropertyKeyframe::linear(
+                            0.0,
+                            PropertyValue::Number(media_start),
+                        ),
+                        zc_project::PropertyKeyframe::linear(len, PropertyValue::Number(end_time)),
+                    ],
+                    channels: Vec::new(),
+                }
+            } else {
+                PropertyTrack::number(media_start)
+            };
+            let aclip = make_audio_clip(
+                start,
+                len,
+                Some(asset),
+                time_curve,
+                PropertyTrack::number(vol),
+                PropertyTrack::number(pan),
+                None,
+            );
+            project.sequence.audio_tracks =
+                vec![make_audio_track("Track", true, false, false, vec![aclip])];
+
+            let flattened = collect_flattened_audio_clips(&project, 0.0, total_frames);
+            assert_eq!(flattened.len(), 1);
+            assert!(
+                flattened[0].static_linear_params(0.0, fps).is_some(),
+                "expected static fast path for case {asset} start={start} end_time={end_time_opt:?}"
+            );
+
+            let fast_mix =
+                mix_flattened_audio_clips(&flattened, 0.0, total_frames, fps, out_sr, &buffers)
+                    .expect("fast mix succeeds");
+
+            // Reference: force generic animated path via `mix_offline_stereo_animated`.
+            let sched = vec![flattened[0].to_schedule_item(0.0, fps)];
+            let ref_mix = mix_offline_stereo_animated(
+                total_frames,
+                fps,
+                out_sr,
+                &sched,
+                &buffers,
+                |_idx, _item, local_frame| flattened[0].evaluate_params(local_frame),
+            );
+
+            assert_eq!(fast_mix.len(), ref_mix.len());
+            let mut max_diff = 0.0_f32;
+            for (i, (&f, &r)) in fast_mix.iter().zip(&ref_mix).enumerate() {
+                let d = (f[0] - r[0]).abs().max((f[1] - r[1]).abs());
+                if d > max_diff {
+                    max_diff = d;
+                }
+                assert!(
+                    d < 1e-5,
+                    "parity mismatch for {asset} (pan={pan}, end_time={end_time_opt:?}) at sample {i}: fast={f:?}, ref={r:?}, diff={d}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expression_block_cache_contiguous_reuse_matches_per_sample_eval() {
+        let sr = STANDARD_SAMPLE_RATE;
+        let fps = 30.0_f64;
+        let total_frames = 10.0_f64;
+
+        let mut samples = Vec::with_capacity(sr as usize * 2);
+        for i in 0..sr as usize {
+            let t = i as f64 / f64::from(sr);
+            let s = (TAU_F64 * 440.0 * t).sin() as f32 * 0.6;
+            samples.push(s);
+            samples.push(s * 0.8);
+        }
+        let mut buffers = HashMap::new();
+        buffers.insert(
+            "tone".to_owned(),
+            AudioBuffer {
+                sample_rate: sr,
+                channels: 2,
+                samples_interleaved_f32: samples,
+            },
+        );
+
+        let mut project = Project::new_cm3_default();
+        project.sequence.fps = 30;
+        project.sequence.exact_fps = Some(fps);
+        project.sequence.length_frames = 30.0;
+        let mut vol_track = PropertyTrack::number(1.0);
+        vol_track.expression = Some("linear(frame, 0, 10, 0.2, 1.0)".to_owned());
+        let mut pan_track = PropertyTrack::number(0.0);
+        pan_track.expression = Some("linear(frame, 0, 10, -0.8, 0.8)".to_owned());
+        let aclip = make_audio_clip(
+            0.0,
+            10.0,
+            Some("tone"),
+            PropertyTrack::number(0.0),
+            vol_track,
+            pan_track,
+            None,
+        );
+        project.sequence.audio_tracks = vec![make_audio_track(
+            "ExprTrack",
+            true,
+            false,
+            false,
+            vec![aclip],
+        )];
+
+        let flattened = collect_flattened_audio_clips(&project, 0.0, total_frames);
+        assert_eq!(flattened.len(), 1);
+        assert!(flattened[0].has_expressions());
+
+        let cached_mix =
+            mix_flattened_audio_clips(&flattened, 0.0, total_frames, fps, sr, &buffers)
+                .expect("cached expression mix succeeds");
+        let sched = vec![flattened[0].to_schedule_item(0.0, fps)];
+        let exact_mix = mix_offline_stereo_animated(
+            total_frames,
+            fps,
+            sr,
+            &sched,
+            &buffers,
+            |_idx, _item, local_frame| flattened[0].evaluate_params(local_frame),
+        );
+
+        assert_eq!(cached_mix.len(), exact_mix.len());
+        for (i, (&c, &e)) in cached_mix.iter().zip(&exact_mix).enumerate() {
+            let d = (c[0] - e[0]).abs().max((c[1] - e[1]).abs());
+            // Linear volume/pan expressions are interpolated exactly across 32-sample blocks!
+            assert!(
+                d < 1e-4,
+                "expression block cache mismatch at sample {i}: cached={c:?}, exact={e:?}, diff={d}"
+            );
+        }
     }
 }

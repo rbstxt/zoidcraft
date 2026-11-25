@@ -23,6 +23,48 @@ pub enum PluginError {
     AlreadyRegistered { id: String },
 }
 
+/// Maps every built-in plugin ID to a unique single-bit mask in `u64` for O(1) `is_enabled`.
+const fn builtin_plugin_bit(id: &str) -> Option<u64> {
+    let shift: u32 = match id.as_bytes() {
+        b"core" => 0,
+        b"easing-plus" => 1,
+        b"expressions-plus" => 2,
+        b"shader-plus" => 3,
+        b"player-plus" => 4,
+        b"asset-manager" => 5,
+        b"precomp-plus" => 6,
+        b"gif-support" => 7,
+        b"graph-plus" => 8,
+        b"motion-path" => 9,
+        b"mp4-export" => 10,
+        b"light-plus" => 11,
+        b"geometry-plus" => 12,
+        b"repeater" => 13,
+        b"effector-plus" => 14,
+        b"material-plus" => 15,
+        b"text-plus" => 16,
+        b"expresstext-plus" => 17,
+        b"particles-plus" => 18,
+        b"trapcode-suite" => 19,
+        b"optical-flares" => 20,
+        b"camera-plus" => 21,
+        b"shape-plus" => 22,
+        b"constraints" => 23,
+        b"native-fx" => 24,
+        b"openzoid-legacy" => 25,
+        b"magic-looks" => 26,
+        b"node-effect" => 27,
+        b"smart-motion-blur-lite" => 28,
+        b"sglow-hq-v2-preview" => 29,
+        b"afterclip" => 30,
+        b"alipfx-shader-pack-4" => 31,
+        b"ccfx-shader-pack" => 32,
+        b"layer-input" => 33,
+        _ => return None,
+    };
+    Some(1u64 << shift)
+}
+
 /// Runtime registry managing built-in and user-installed plugins, live enable/disable
 /// toggling, in-use project dependency locks, and Vanilla CM3 mode detection.
 #[derive(Debug, Clone)]
@@ -30,6 +72,8 @@ pub struct PluginRegistry {
     order: Vec<String>,
     descriptors: BTreeMap<String, PluginDescriptor>,
     enabled: BTreeSet<String>,
+    enabled_builtins: u64,
+    optional_enabled_count: usize,
     configs: BTreeMap<String, Value>,
 }
 
@@ -56,7 +100,32 @@ impl PluginRegistry {
             order: Vec::new(),
             descriptors: BTreeMap::new(),
             enabled: BTreeSet::new(),
+            enabled_builtins: 0,
+            optional_enabled_count: 0,
             configs: BTreeMap::new(),
+        }
+    }
+
+    fn insert_enabled(&mut self, id: String, always_enabled: bool) {
+        let bit = builtin_plugin_bit(&id);
+        if self.enabled.insert(id) {
+            if let Some(mask) = bit {
+                self.enabled_builtins |= mask;
+            }
+            if !always_enabled {
+                self.optional_enabled_count += 1;
+            }
+        }
+    }
+
+    fn remove_enabled(&mut self, id: &str, always_enabled: bool) {
+        if self.enabled.remove(id) {
+            if let Some(mask) = builtin_plugin_bit(id) {
+                self.enabled_builtins &= !mask;
+            }
+            if !always_enabled {
+                self.optional_enabled_count = self.optional_enabled_count.saturating_sub(1);
+            }
         }
     }
 
@@ -66,11 +135,13 @@ impl PluginRegistry {
             return Err(PluginError::AlreadyRegistered { id: descriptor.id });
         }
         let id = descriptor.id.clone();
-        if descriptor.default_enabled || descriptor.always_enabled {
-            self.enabled.insert(id.clone());
-        }
+        let should_enable = descriptor.default_enabled || descriptor.always_enabled;
+        let always_enabled = descriptor.always_enabled;
         self.order.push(id.clone());
-        self.descriptors.insert(id, descriptor);
+        self.descriptors.insert(id.clone(), descriptor);
+        if should_enable {
+            self.insert_enabled(id, always_enabled);
+        }
         Ok(())
     }
 
@@ -102,7 +173,11 @@ impl PluginRegistry {
     }
 
     /// Returns `true` if the plugin is registered and currently enabled.
+    #[inline]
     pub fn is_enabled(&self, id: &str) -> bool {
+        if let Some(mask) = builtin_plugin_bit(id) {
+            return (self.enabled_builtins & mask) != 0;
+        }
         self.enabled.contains(id)
     }
 
@@ -113,10 +188,11 @@ impl PluginRegistry {
 
     /// Enables a registered plugin live without restart.
     pub fn enable(&mut self, id: &str) -> Result<(), PluginError> {
-        if !self.descriptors.contains_key(id) {
+        let Some(desc) = self.descriptors.get(id) else {
             return Err(PluginError::NotFound { id: id.to_owned() });
-        }
-        self.enabled.insert(id.to_owned());
+        };
+        let always_enabled = desc.always_enabled;
+        self.insert_enabled(id.to_owned(), always_enabled);
         Ok(())
     }
 
@@ -138,18 +214,26 @@ impl PluginRegistry {
         if active_project_deps.contains(id) {
             return Err(PluginError::InUse { id: id.to_owned() });
         }
-        self.enabled.remove(id);
+        self.remove_enabled(id, false);
         Ok(())
     }
 
     /// Disables every optional plugin (leaving only `always_enabled` plugins such as `core`),
     /// putting ZoidCraft into pure Vanilla CM3 mode.
     pub fn disable_all_optional(&mut self) {
+        let mut next_builtins = 0u64;
         self.enabled.retain(|id| {
-            self.descriptors
+            let keep = self
+                .descriptors
                 .get(id)
-                .is_some_and(|desc| desc.always_enabled)
+                .is_some_and(|desc| desc.always_enabled);
+            if keep && let Some(mask) = builtin_plugin_bit(id) {
+                next_builtins |= mask;
+            }
+            keep
         });
+        self.enabled_builtins = next_builtins;
+        self.optional_enabled_count = 0;
     }
 
     /// Disables every optional plugin only if none of them are referenced by `active_project_deps`.
@@ -172,21 +256,24 @@ impl PluginRegistry {
     /// Restores all plugins to their `default_enabled || always_enabled` state.
     pub fn reset_to_defaults(&mut self) {
         self.enabled.clear();
-        for desc in self.descriptors.values() {
-            if desc.default_enabled || desc.always_enabled {
-                self.enabled.insert(desc.id.clone());
-            }
+        self.enabled_builtins = 0;
+        self.optional_enabled_count = 0;
+        let to_enable: Vec<(String, bool)> = self
+            .descriptors
+            .values()
+            .filter(|desc| desc.default_enabled || desc.always_enabled)
+            .map(|desc| (desc.id.clone(), desc.always_enabled))
+            .collect();
+        for (id, always_enabled) in to_enable {
+            self.insert_enabled(id, always_enabled);
         }
     }
 
     /// Returns `true` when zero optional plugins are enabled (only `always_enabled` plugins
     /// such as hidden `core` remain active), guaranteeing 100% Vanilla CM3 behavior.
+    #[inline]
     pub fn is_vanilla_cm3_mode(&self) -> bool {
-        self.enabled.iter().all(|id| {
-            self.descriptors
-                .get(id)
-                .is_some_and(|desc| desc.always_enabled)
-        })
+        self.optional_enabled_count == 0
     }
 
     /// Lists plugin IDs required by a loaded project that are not currently enabled.
@@ -236,10 +323,16 @@ impl PluginRegistry {
     /// and ignoring unknown plugin IDs gracefully.
     pub fn apply_settings(&mut self, settings: &PluginSettingsState) {
         self.enabled.clear();
-        for desc in self.descriptors.values() {
-            if desc.always_enabled || settings.enabled_plugins.contains(&desc.id) {
-                self.enabled.insert(desc.id.clone());
-            }
+        self.enabled_builtins = 0;
+        self.optional_enabled_count = 0;
+        let to_enable: Vec<(String, bool)> = self
+            .descriptors
+            .values()
+            .filter(|desc| desc.always_enabled || settings.enabled_plugins.contains(&desc.id))
+            .map(|desc| (desc.id.clone(), desc.always_enabled))
+            .collect();
+        for (id, always_enabled) in to_enable {
+            self.insert_enabled(id, always_enabled);
         }
         self.configs = settings
             .plugin_configs
@@ -455,5 +548,89 @@ mod tests {
             round_tripped.get("thirdparty:custom-shader-pack"),
             Some(&json!({ "version": 3, "rawBlob": "preserve-verbatim" }))
         );
+    }
+
+    #[test]
+    fn bitmask_and_optional_count_stay_in_sync_with_enabled_set() {
+        let builtins = builtin_plugins();
+        let mut seen_bits = 0u64;
+        for desc in &builtins {
+            let bit = builtin_plugin_bit(&desc.id)
+                .unwrap_or_else(|| panic!("builtin plugin '{}' missing from bitmask", desc.id));
+            assert_eq!(bit.count_ones(), 1);
+            assert_eq!(
+                seen_bits & bit,
+                0,
+                "duplicate bitmask entry for '{}'",
+                desc.id
+            );
+            seen_bits |= bit;
+        }
+
+        let assert_invariants = |reg: &PluginRegistry| {
+            for desc in reg.all() {
+                assert_eq!(
+                    reg.is_enabled(&desc.id),
+                    reg.enabled_ids().contains(&desc.id),
+                    "is_enabled mismatch for '{}'",
+                    desc.id
+                );
+            }
+            let expected_vanilla = reg
+                .enabled_ids()
+                .iter()
+                .all(|id| reg.get(id).is_some_and(|desc| desc.always_enabled));
+            assert_eq!(reg.is_vanilla_cm3_mode(), expected_vanilla);
+        };
+
+        let mut reg = PluginRegistry::new();
+        assert_invariants(&reg);
+
+        // Register a non-builtin user plugin enabled by default.
+        let custom = PluginDescriptor {
+            id: "custom-user-pack".to_owned(),
+            name: "Custom User Pack".to_owned(),
+            author: "User".to_owned(),
+            version: "1.0.0".to_owned(),
+            category: PluginCategory::Adjustment,
+            kind: PluginKind::ShaderPack,
+            tagline: "Custom".to_owned(),
+            description: "Custom".to_owned(),
+            default_enabled: true,
+            always_enabled: false,
+            visible: true,
+            warning: None,
+            accent_color: [0, 0, 0],
+            features: Vec::new(),
+        };
+        reg.register(custom).expect("register custom");
+        assert!(reg.is_enabled("custom-user-pack"));
+        assert_invariants(&reg);
+
+        // Idempotent enable & disable must not drift optional_enabled_count.
+        let no_deps = BTreeSet::new();
+        reg.enable("expressions-plus").unwrap();
+        reg.enable("expressions-plus").unwrap();
+        assert_invariants(&reg);
+        reg.disable("expressions-plus", &no_deps).unwrap();
+        reg.disable("expressions-plus", &no_deps).unwrap();
+        assert_invariants(&reg);
+
+        reg.disable_all_optional();
+        assert!(reg.is_vanilla_cm3_mode());
+        assert!(!reg.is_enabled("custom-user-pack"));
+        assert_invariants(&reg);
+
+        reg.enable("custom-user-pack").unwrap();
+        assert!(!reg.is_vanilla_cm3_mode());
+        assert_invariants(&reg);
+
+        reg.disable("custom-user-pack", &no_deps).unwrap();
+        assert!(reg.is_vanilla_cm3_mode());
+        assert_invariants(&reg);
+
+        reg.reset_to_defaults();
+        assert!(!reg.is_vanilla_cm3_mode());
+        assert_invariants(&reg);
     }
 }

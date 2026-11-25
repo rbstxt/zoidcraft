@@ -1,9 +1,9 @@
 //! Pure-Rust FIPS 180-4 SHA-256 digest implementation (zero `unsafe`, O(1) stack workspace).
 
-use std::fmt::Write as _;
-
 /// Maximum prefix length (256 MiB) hashed by CM3 when deriving 32-hex asset keys.
 pub const CM3_ASSET_HASH_PREFIX_BYTES: usize = 256 * 1024 * 1024;
+
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 
 const INIT_H: [u32; 8] = [
     0x6a09_e667,
@@ -83,43 +83,91 @@ const K: [u32; 64] = [
     0xc671_78f2,
 ];
 
-fn compress(state: &mut [u32; 8], block: &[u8]) {
-    let mut w = [0u32; 64];
-    for (i, word) in block.as_chunks::<4>().0.iter().take(16).enumerate() {
-        w[i] = u32::from_be_bytes(*word);
-    }
-    for i in 16..64 {
-        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16]
+macro_rules! sha256_round {
+    ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident, $k:expr, $w:expr) => {{
+        let s1 = $e.rotate_right(6) ^ $e.rotate_right(11) ^ $e.rotate_right(25);
+        let ch = ($e & $f) ^ ((!$e) & $g);
+        let temp1 = $h
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add($k)
+            .wrapping_add($w);
+        let s0 = $a.rotate_right(2) ^ $a.rotate_right(13) ^ $a.rotate_right(22);
+        let maj = ($a & $b) ^ ($a & $c) ^ ($b & $c);
+        let temp2 = s0.wrapping_add(maj);
+        $d = $d.wrapping_add(temp1);
+        $h = temp1.wrapping_add(temp2);
+    }};
+}
+
+macro_rules! schedule_word {
+    ($w:ident, $i:expr) => {{
+        let w15 = $w[($i + 1) & 15];
+        let w2 = $w[($i + 14) & 15];
+        let s0 = w15.rotate_right(7) ^ w15.rotate_right(18) ^ (w15 >> 3);
+        let s1 = w2.rotate_right(17) ^ w2.rotate_right(19) ^ (w2 >> 10);
+        let next = $w[$i]
             .wrapping_add(s0)
-            .wrapping_add(w[i - 7])
+            .wrapping_add($w[($i + 9) & 15])
             .wrapping_add(s1);
+        $w[$i] = next;
+        next
+    }};
+}
+
+macro_rules! sha256_rounds_initial_8 {
+    ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident, $w:ident, $base:expr) => {{
+        sha256_round!($a, $b, $c, $d, $e, $f, $g, $h, K[$base], $w[$base]);
+        sha256_round!($h, $a, $b, $c, $d, $e, $f, $g, K[$base + 1], $w[$base + 1]);
+        sha256_round!($g, $h, $a, $b, $c, $d, $e, $f, K[$base + 2], $w[$base + 2]);
+        sha256_round!($f, $g, $h, $a, $b, $c, $d, $e, K[$base + 3], $w[$base + 3]);
+        sha256_round!($e, $f, $g, $h, $a, $b, $c, $d, K[$base + 4], $w[$base + 4]);
+        sha256_round!($d, $e, $f, $g, $h, $a, $b, $c, K[$base + 5], $w[$base + 5]);
+        sha256_round!($c, $d, $e, $f, $g, $h, $a, $b, K[$base + 6], $w[$base + 6]);
+        sha256_round!($b, $c, $d, $e, $f, $g, $h, $a, K[$base + 7], $w[$base + 7]);
+    }};
+}
+
+macro_rules! sha256_rounds_scheduled_8 {
+    ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident, $w:ident, $k_base:expr, $w_base:expr) => {{
+        let w0 = schedule_word!($w, $w_base);
+        sha256_round!($a, $b, $c, $d, $e, $f, $g, $h, K[$k_base], w0);
+        let w1 = schedule_word!($w, $w_base + 1);
+        sha256_round!($h, $a, $b, $c, $d, $e, $f, $g, K[$k_base + 1], w1);
+        let w2 = schedule_word!($w, $w_base + 2);
+        sha256_round!($g, $h, $a, $b, $c, $d, $e, $f, K[$k_base + 2], w2);
+        let w3 = schedule_word!($w, $w_base + 3);
+        sha256_round!($f, $g, $h, $a, $b, $c, $d, $e, K[$k_base + 3], w3);
+        let w4 = schedule_word!($w, $w_base + 4);
+        sha256_round!($e, $f, $g, $h, $a, $b, $c, $d, K[$k_base + 4], w4);
+        let w5 = schedule_word!($w, $w_base + 5);
+        sha256_round!($d, $e, $f, $g, $h, $a, $b, $c, K[$k_base + 5], w5);
+        let w6 = schedule_word!($w, $w_base + 6);
+        sha256_round!($c, $d, $e, $f, $g, $h, $a, $b, K[$k_base + 6], w6);
+        let w7 = schedule_word!($w, $w_base + 7);
+        sha256_round!($b, $c, $d, $e, $f, $g, $h, $a, K[$k_base + 7], w7);
+    }};
+}
+
+#[inline(always)]
+#[allow(unused_assignments)]
+fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 16];
+    let (words, _) = block.as_chunks::<4>();
+    for (dst, word) in w.iter_mut().zip(words.iter()) {
+        *dst = u32::from_be_bytes(*word);
     }
 
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
 
-    for i in 0..64 {
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let ch = (e & f) ^ ((!e) & g);
-        let temp1 = h
-            .wrapping_add(s1)
-            .wrapping_add(ch)
-            .wrapping_add(K[i])
-            .wrapping_add(w[i]);
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let temp2 = s0.wrapping_add(maj);
-
-        h = g;
-        g = f;
-        f = e;
-        e = d.wrapping_add(temp1);
-        d = c;
-        c = b;
-        b = a;
-        a = temp1.wrapping_add(temp2);
-    }
+    sha256_rounds_initial_8!(a, b, c, d, e, f, g, h, w, 0);
+    sha256_rounds_initial_8!(a, b, c, d, e, f, g, h, w, 8);
+    sha256_rounds_scheduled_8!(a, b, c, d, e, f, g, h, w, 16, 0);
+    sha256_rounds_scheduled_8!(a, b, c, d, e, f, g, h, w, 24, 8);
+    sha256_rounds_scheduled_8!(a, b, c, d, e, f, g, h, w, 32, 0);
+    sha256_rounds_scheduled_8!(a, b, c, d, e, f, g, h, w, 40, 8);
+    sha256_rounds_scheduled_8!(a, b, c, d, e, f, g, h, w, 48, 0);
+    sha256_rounds_scheduled_8!(a, b, c, d, e, f, g, h, w, 56, 8);
 
     state[0] = state[0].wrapping_add(a);
     state[1] = state[1].wrapping_add(b);
@@ -140,19 +188,22 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
         compress(&mut state, block);
     }
 
-    let mut tail = [0u8; 128];
     let rem_len = remainder.len();
-    tail[..rem_len].copy_from_slice(remainder);
-    tail[rem_len] = 0x80;
-
     let bit_len = (data.len() as u64).wrapping_mul(8).to_be_bytes();
     if rem_len < 56 {
-        tail[56..64].copy_from_slice(&bit_len);
-        compress(&mut state, &tail[..64]);
+        let mut block = [0u8; 64];
+        block[..rem_len].copy_from_slice(remainder);
+        block[rem_len] = 0x80;
+        block[56..64].copy_from_slice(&bit_len);
+        compress(&mut state, &block);
     } else {
-        tail[120..128].copy_from_slice(&bit_len);
-        compress(&mut state, &tail[..64]);
-        compress(&mut state, &tail[64..128]);
+        let mut block1 = [0u8; 64];
+        block1[..rem_len].copy_from_slice(remainder);
+        block1[rem_len] = 0x80;
+        compress(&mut state, &block1);
+        let mut block2 = [0u8; 64];
+        block2[56..64].copy_from_slice(&bit_len);
+        compress(&mut state, &block2);
     }
 
     let mut out = [0u8; 32];
@@ -162,33 +213,49 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Formats a 32-byte SHA-256 digest as a 64-character lowercase hexadecimal string.
+#[must_use]
+pub fn sha256_hex_from_bytes(digest: &[u8; 32]) -> String {
+    let mut out = Vec::with_capacity(64);
+    for &byte in digest {
+        out.push(HEX_LOWER[(byte >> 4) as usize]);
+        out.push(HEX_LOWER[(byte & 0x0f) as usize]);
+    }
+    String::from_utf8(out).expect("HEX_LOWER contains only ASCII")
+}
+
 /// Computes the 64-character lowercase hexadecimal SHA-256 digest of `data`.
 #[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
     let digest = sha256_bytes(data);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
+    sha256_hex_from_bytes(&digest)
 }
 
-/// Derives a CM3-compatible 32-character lowercase hex asset key from the first
-/// 256 MiB of `data`.
+/// Derives a CM3-compatible 32-character lowercase hex asset key from a precomputed
+/// 32-byte SHA-256 digest.
 ///
 /// CM3 (`PZ.asset.hash`) interprets the SHA-256 digest buffer as a little-endian
 /// `Uint32Array` and formats the first 4 `u32` words as 8 lowercase hex characters
 /// each (32 hex chars total).
 #[must_use]
+pub fn cm3_asset_key_from_bytes(digest: &[u8; 32]) -> String {
+    let mut out = Vec::with_capacity(32);
+    for chunk in digest[..16].as_chunks::<4>().0 {
+        for &byte in chunk.iter().rev() {
+            out.push(HEX_LOWER[(byte >> 4) as usize]);
+            out.push(HEX_LOWER[(byte & 0x0f) as usize]);
+        }
+    }
+    String::from_utf8(out).expect("HEX_LOWER contains only ASCII")
+}
+
+/// Derives a CM3-compatible 32-character lowercase hex asset key from the first
+/// 256 MiB of `data`.
+#[must_use]
 pub fn cm3_asset_key(data: &[u8]) -> String {
     let prefix_len = data.len().min(CM3_ASSET_HASH_PREFIX_BYTES);
     let digest = sha256_bytes(&data[..prefix_len]);
-    let mut out = String::with_capacity(32);
-    for chunk in digest[..16].as_chunks::<4>().0 {
-        let word = u32::from_le_bytes(*chunk);
-        let _ = write!(&mut out, "{word:08x}");
-    }
-    out
+    cm3_asset_key_from_bytes(&digest)
 }
 
 #[cfg(test)]
@@ -197,6 +264,7 @@ mod tests {
 
     #[test]
     fn nist_vectors_match() {
+        // FIPS 180-4 / NIST CAVP short & multi-block test vectors.
         assert_eq!(
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -205,9 +273,32 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        // 448-bit (56 bytes — exact 2-block padding boundary)
         assert_eq!(
             sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        // 896-bit (112 bytes — 2 full blocks + padding)
+        assert_eq!(
+            sha256_hex(
+                b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
+            ),
+            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"
+        );
+        // 1,000,000 repetitions of 'a' (NIST long vector)
+        let one_million_a = vec![b'a'; 1_000_000];
+        assert_eq!(
+            sha256_hex(&one_million_a),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        // 55 bytes (single-block boundary) vs 64 bytes (exact block)
+        assert_eq!(
+            sha256_hex(&[b'a'; 55]),
+            "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"
+        );
+        assert_eq!(
+            sha256_hex(&[b'a'; 64]),
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
         );
     }
 
@@ -218,6 +309,9 @@ mod tests {
         let key = cm3_asset_key(b"abc");
         assert_eq!(key.len(), 32);
         assert_eq!(key, "bf1678baeacf018fde4041412322ae5d");
+        let digest = sha256_bytes(b"abc");
+        assert_eq!(cm3_asset_key_from_bytes(&digest), key);
+        assert_eq!(sha256_hex_from_bytes(&digest), sha256_hex(b"abc"));
 
         // SHA-256("") first 16 bytes: e3b0c442 98fc1c14 9afbf4c8 996fb924
         // Little-endian Uint32Array words: 42c4b0e3 141cfc98 c8f4fb9a 24b96f99

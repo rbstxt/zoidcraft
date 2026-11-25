@@ -9,6 +9,7 @@
 //! - Node hierarchy traversal (`matrix` and `translation` / `rotation` / `scale` TRS composition).
 //! - Multi-primitive `material_slot` preservation.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
@@ -617,7 +618,7 @@ struct AccessorSlice<'a> {
 
 struct GltfDocument<'a> {
     root: JsonValue,
-    buffers: Vec<Vec<u8>>,
+    buffers: Vec<Cow<'a, [u8]>>,
     external_buffers: &'a [&'a [u8]],
     buffer_views: Vec<BufferViewInfo>,
     accessors: Vec<AccessorInfo>,
@@ -628,7 +629,7 @@ impl<'a> GltfDocument<'a> {
         if let Some(buf) = self.buffers.get(index)
             && !buf.is_empty()
         {
-            return Ok(buf.as_slice());
+            return Ok(buf.as_ref());
         }
         if let Some(ext) = self.external_buffers.get(index) {
             return Ok(ext);
@@ -928,7 +929,7 @@ impl<'a> GltfDocument<'a> {
                 None
             };
 
-            let raw_indices: Vec<u32> =
+            let mut raw_indices: Vec<u32> =
                 if let Some(i_acc) = prim.get("indices").and_then(JsonValue::as_usize) {
                     self.read_indices(i_acc)?
                 } else {
@@ -944,41 +945,43 @@ impl<'a> GltfDocument<'a> {
                 }
             }
 
-            let mut tri_indices = Vec::new();
-            match mode {
+            let tri_indices = match mode {
                 MODE_TRIANGLES => {
                     let usable = (raw_indices.len() / 3) * 3;
-                    tri_indices.extend_from_slice(&raw_indices[..usable]);
+                    raw_indices.truncate(usable);
+                    raw_indices
                 }
                 MODE_TRIANGLE_STRIP => {
+                    let tri_cap = raw_indices.len().saturating_sub(2).saturating_mul(3);
+                    let mut out_idx = Vec::with_capacity(tri_cap);
                     for k in 0..raw_indices.len().saturating_sub(2) {
                         if k % 2 == 0 {
-                            tri_indices.extend_from_slice(&[
+                            out_idx.extend_from_slice(&[
                                 raw_indices[k],
                                 raw_indices[k + 1],
                                 raw_indices[k + 2],
                             ]);
                         } else {
-                            tri_indices.extend_from_slice(&[
+                            out_idx.extend_from_slice(&[
                                 raw_indices[k],
                                 raw_indices[k + 2],
                                 raw_indices[k + 1],
                             ]);
                         }
                     }
+                    out_idx
                 }
                 MODE_TRIANGLE_FAN if raw_indices.len() >= 3 => {
+                    let tri_cap = raw_indices.len().saturating_sub(2).saturating_mul(3);
+                    let mut out_idx = Vec::with_capacity(tri_cap);
                     let root_i = raw_indices[0];
                     for k in 1..(raw_indices.len() - 1) {
-                        tri_indices.extend_from_slice(&[
-                            root_i,
-                            raw_indices[k],
-                            raw_indices[k + 1],
-                        ]);
+                        out_idx.extend_from_slice(&[root_i, raw_indices[k], raw_indices[k + 1]]);
                     }
+                    out_idx
                 }
-                _ => {}
-            }
+                _ => Vec::new(),
+            };
 
             if tri_indices.len() < 3 {
                 continue;
@@ -1009,7 +1012,11 @@ impl<'a> GltfDocument<'a> {
             if normals.is_none() {
                 prim_mesh.compute_smooth_normals();
             }
-            combined.merge(&prim_mesh);
+            if combined.vertices.is_empty() {
+                combined = prim_mesh;
+            } else {
+                combined.merge(&prim_mesh);
+            }
         }
 
         Ok(combined)
@@ -1235,7 +1242,11 @@ impl<'a> GltfDocument<'a> {
                                 if world != Mat4::IDENTITY {
                                     m.apply_matrix(world);
                                 }
-                                out.merge(&m);
+                                if out.vertices.is_empty() {
+                                    out = m;
+                                } else {
+                                    out.merge(&m);
+                                }
                             }
                         }
 
@@ -1284,7 +1295,11 @@ impl<'a> GltfDocument<'a> {
                     })?;
                 total_vertices = next_verts;
                 total_indices = next_idxs;
-                out.merge(&m);
+                if out.vertices.is_empty() {
+                    out = m;
+                } else {
+                    out.merge(&m);
+                }
             }
         }
 
@@ -1302,27 +1317,29 @@ fn parse_document(
 ) -> Result<MeshData, GltfLoadError> {
     let root = JsonParser::new(json_str).parse_root()?;
 
-    let mut buffers = Vec::new();
+    let mut buffers: Vec<Cow<'_, [u8]>> = Vec::new();
     if let Some(buf_arr) = root.get("buffers").and_then(JsonValue::as_array) {
+        buffers.reserve(buf_arr.len());
         for (i, buf_val) in buf_arr.iter().enumerate() {
             if let Some(uri) = buf_val.get("uri").and_then(JsonValue::as_str) {
                 if uri.starts_with("data:") {
-                    buffers.push(decode_data_uri(uri)?);
+                    buffers.push(Cow::Owned(decode_data_uri(uri)?));
                 } else {
-                    buffers.push(Vec::new()); // Resolved via external_buffers[i]
+                    buffers.push(Cow::Borrowed(&[])); // Resolved via external_buffers[i]
                 }
             } else if i == 0
                 && let Some(bin) = glb_bin_chunk
             {
-                buffers.push(bin.to_vec());
+                buffers.push(Cow::Borrowed(bin));
             } else {
-                buffers.push(Vec::new());
+                buffers.push(Cow::Borrowed(&[]));
             }
         }
     }
 
     let mut buffer_views = Vec::new();
     if let Some(bv_arr) = root.get("bufferViews").and_then(JsonValue::as_array) {
+        buffer_views.reserve(bv_arr.len());
         for bv in bv_arr {
             let buffer = bv
                 .get("buffer")
@@ -1352,6 +1369,7 @@ fn parse_document(
 
     let mut accessors = Vec::new();
     if let Some(acc_arr) = root.get("accessors").and_then(JsonValue::as_array) {
+        accessors.reserve(acc_arr.len());
         for acc in acc_arr {
             let buffer_view = acc
                 .get("bufferView")

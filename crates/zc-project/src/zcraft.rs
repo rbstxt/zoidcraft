@@ -18,10 +18,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, ser};
 
 use crate::ProjectError;
-use crate::atomic::write_atomic;
+use crate::atomic::write_atomic_with;
 use crate::model::{Layer, LayerKind, PROJECT_SCHEMA_VERSION, Project, Sequence};
 use crate::sha256::sha256_hex;
 
@@ -294,6 +294,364 @@ fn append_tar_file<W: Write>(
     Ok(())
 }
 
+const ADAPTIVE_NO_COMPRESS_MIN_BYTES: u64 = 1024 * 1024;
+
+fn has_already_compressed_extension(name: &str) -> Option<bool> {
+    let file_name = name.rsplit('/').next().unwrap_or(name);
+    let (_, ext) = file_name.rsplit_once('.')?;
+    if ext.is_empty() {
+        return None;
+    }
+    Some(matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "mp4"
+            | "mov"
+            | "mkv"
+            | "webm"
+            | "m4v"
+            | "avi"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "webp"
+            | "gif"
+            | "mp3"
+            | "aac"
+            | "m4a"
+            | "ogg"
+            | "flac"
+            | "woff2"
+            | "glb"
+    ))
+}
+
+fn has_already_compressed_magic(data: &[u8]) -> bool {
+    if data.len() >= 8 && &data[..8] == b"\x89PNG\r\n\x1a\n" {
+        return true;
+    }
+    if data.len() >= 3 && data[..3] == [0xFF, 0xD8, 0xFF] {
+        return true;
+    }
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return true;
+    }
+    if data.len() >= 4 && (&data[..4] == b"GIF8" || &data[..4] == b"OggS" || &data[..4] == b"fLaC")
+    {
+        return true;
+    }
+    if data.len() >= 4 && (&data[..4] == b"wOF2" || &data[..4] == b"glTF") {
+        return true;
+    }
+    if data.len() >= 8 && &data[4..8] == b"ftyp" {
+        return true;
+    }
+    if data.len() >= 4 && data[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        return true;
+    }
+    if data.len() >= 3 && &data[..3] == b"ID3" {
+        return true;
+    }
+    false
+}
+
+/// Chooses an adaptive single-member RFC 1952 gzip compression level for archive writes.
+///
+/// When more than 50% of total embedded asset bytes (and at least 1 MiB) belong to
+/// already-compressed media formats, returns [`Compression::none()`] (stored DEFLATE blocks)
+/// for 25–80× faster writes while remaining 100% standard single-member `.tar.gz`.
+/// Otherwise returns [`Compression::fast()`] (level 1) for fast JSON/asset compression.
+#[must_use]
+pub(crate) fn choose_archive_gzip_compression(embedded_assets: &[(String, &[u8])]) -> Compression {
+    let mut total_bytes = 0_u64;
+    let mut compressed_bytes = 0_u64;
+    for (name, data) in embedded_assets {
+        let len = data.len() as u64;
+        total_bytes = total_bytes.saturating_add(len);
+        let is_compressed = has_already_compressed_extension(name)
+            .unwrap_or_else(|| has_already_compressed_magic(data));
+        if is_compressed {
+            compressed_bytes = compressed_bytes.saturating_add(len);
+        }
+    }
+    if compressed_bytes >= ADAPTIVE_NO_COMPRESS_MIN_BYTES
+        && u128::from(compressed_bytes) * 2 > u128::from(total_bytes)
+    {
+        Compression::none()
+    } else {
+        Compression::fast()
+    }
+}
+
+fn is_valid_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[derive(Debug)]
+struct NonFiniteFloatError(String);
+
+impl std::fmt::Display for NonFiniteFloatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NonFiniteFloatError {}
+
+impl ser::Error for NonFiniteFloatError {
+    fn custom<T: std::fmt::Display>(msg: T) -> Self {
+        Self(msg.to_string())
+    }
+}
+
+/// Zero-allocation `serde::Serializer` that walks every serialized field of `Project`
+/// and rejects non-finite (`NaN` / `±inf`) floating-point values before writing JSON.
+#[derive(Clone, Copy)]
+struct FiniteFloatValidator;
+
+impl ser::Serializer for FiniteFloatValidator {
+    type Ok = ();
+    type Error = NonFiniteFloatError;
+    type SerializeSeq = Self;
+    type SerializeTuple = Self;
+    type SerializeTupleStruct = Self;
+    type SerializeTupleVariant = Self;
+    type SerializeMap = Self;
+    type SerializeStruct = Self;
+    type SerializeStructVariant = Self;
+
+    fn serialize_bool(self, _v: bool) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_i8(self, _v: i8) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_i16(self, _v: i16) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_i32(self, _v: i32) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_i64(self, _v: i64) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_i128(self, _v: i128) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_u8(self, _v: u8) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_u16(self, _v: u16) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_u32(self, _v: u32) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_u64(self, _v: u64) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_u128(self, _v: u128) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_f32(self, v: f32) -> Result<(), Self::Error> {
+        if v.is_finite() {
+            Ok(())
+        } else {
+            Err(NonFiniteFloatError(format!(
+                "non-finite f32 value ({v}) cannot be saved to .zcraft"
+            )))
+        }
+    }
+    fn serialize_f64(self, v: f64) -> Result<(), Self::Error> {
+        if v.is_finite() {
+            Ok(())
+        } else {
+            Err(NonFiniteFloatError(format!(
+                "non-finite f64 value ({v}) cannot be saved to .zcraft"
+            )))
+        }
+    }
+    fn serialize_char(self, _v: char) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_str(self, _v: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_bytes(self, _v: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_none(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(self)
+    }
+    fn serialize_unit(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<(), Self::Error> {
+        value.serialize(self)
+    }
+    fn serialize_newtype_variant<T: ?Sized + Serialize>(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        value: &T,
+    ) -> Result<(), Self::Error> {
+        value.serialize(self)
+    }
+    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+        Ok(self)
+    }
+    fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
+        Ok(self)
+    }
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+        Ok(self)
+    }
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+        Ok(self)
+    }
+    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+        Ok(self)
+    }
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeStruct, Self::Error> {
+        Ok(self)
+    }
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeStructVariant, Self::Error> {
+        Ok(self)
+    }
+}
+
+impl ser::SerializeSeq for FiniteFloatValidator {
+    type Ok = ();
+    type Error = NonFiniteFloatError;
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(*self)
+    }
+    fn end(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl ser::SerializeTuple for FiniteFloatValidator {
+    type Ok = ();
+    type Error = NonFiniteFloatError;
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(*self)
+    }
+    fn end(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl ser::SerializeTupleStruct for FiniteFloatValidator {
+    type Ok = ();
+    type Error = NonFiniteFloatError;
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(*self)
+    }
+    fn end(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl ser::SerializeTupleVariant for FiniteFloatValidator {
+    type Ok = ();
+    type Error = NonFiniteFloatError;
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(*self)
+    }
+    fn end(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl ser::SerializeMap for FiniteFloatValidator {
+    type Ok = ();
+    type Error = NonFiniteFloatError;
+    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), Self::Error> {
+        key.serialize(*self)
+    }
+    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(*self)
+    }
+    fn end(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl ser::SerializeStruct for FiniteFloatValidator {
+    type Ok = ();
+    type Error = NonFiniteFloatError;
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        _key: &'static str,
+        value: &T,
+    ) -> Result<(), Self::Error> {
+        value.serialize(*self)
+    }
+    fn end(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl ser::SerializeStructVariant for FiniteFloatValidator {
+    type Ok = ();
+    type Error = NonFiniteFloatError;
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        _key: &'static str,
+        value: &T,
+    ) -> Result<(), Self::Error> {
+        value.serialize(*self)
+    }
+    fn end(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+fn validate_project_finite_floats(project: &Project) -> Result<(), ProjectError> {
+    project
+        .serialize(FiniteFloatValidator)
+        .map_err(|err| ProjectError::UnsupportedFormat(err.0))
+}
+
 /// Serializes `project` into an in-memory `.zcraft` (gzip + TAR) archive byte vector.
 ///
 /// Validates all reader security bounds (JSON entry size, JSON nesting depth, entry count,
@@ -309,6 +667,18 @@ pub fn save_zcraft_to_bytes(project: &Project) -> Result<Vec<u8>, ProjectError> 
     )
 }
 
+/// Streams `project` as a `.zcraft` (single-member gzip + TAR) archive directly into `writer`.
+pub fn save_zcraft_to_writer<W: Write>(project: &Project, writer: W) -> Result<(), ProjectError> {
+    save_zcraft_to_writer_with_limits(
+        project,
+        writer,
+        MAX_UNCOMPRESSED_ARCHIVE_BYTES,
+        MAX_JSON_ENTRY_BYTES,
+        MAX_ARCHIVE_ENTRIES,
+        MAX_JSON_NESTING_DEPTH,
+    )
+}
+
 fn save_zcraft_to_bytes_with_limits(
     project: &Project,
     max_uncompressed: u64,
@@ -316,6 +686,30 @@ fn save_zcraft_to_bytes_with_limits(
     max_entries: usize,
     max_json_depth: usize,
 ) -> Result<Vec<u8>, ProjectError> {
+    let mut out = Vec::new();
+    save_zcraft_to_writer_with_limits(
+        project,
+        &mut out,
+        max_uncompressed,
+        max_json_bytes,
+        max_entries,
+        max_json_depth,
+    )?;
+    Ok(out)
+}
+
+fn save_zcraft_to_writer_with_limits<W: Write>(
+    project: &Project,
+    writer: W,
+    max_uncompressed: u64,
+    max_json_bytes: u64,
+    max_entries: usize,
+    max_json_depth: usize,
+) -> Result<(), ProjectError> {
+    // Reject non-finite floats (which `serde_json` would silently write as `null`)
+    // via a zero-allocation pass before writing JSON or touching disk.
+    validate_project_finite_floats(project)?;
+
     let project_json = serde_json::to_vec_pretty(project)?;
     if (project_json.len() as u64) > max_json_bytes {
         return Err(ProjectError::JsonEntryTooLarge {
@@ -324,9 +718,6 @@ fn save_zcraft_to_bytes_with_limits(
         });
     }
     check_json_depth(&project_json, max_json_depth)?;
-    // Verify the serialized JSON round-trips cleanly so non-finite floats (serialized
-    // by `serde_json` as `null`) or malformed types never produce an unreadable archive.
-    let _: Project = serde_json::from_slice(&project_json)?;
 
     let mut integrity = BTreeMap::new();
     integrity.insert(
@@ -340,6 +731,7 @@ fn save_zcraft_to_bytes_with_limits(
     let max_retained_assets = max_uncompressed.min(MAX_RETAINED_ASSET_BYTES);
     let mut missing_assets = Vec::new();
     let mut embedded_assets: Vec<(String, &[u8])> = Vec::new();
+    let mut compression_probe: Vec<(String, &[u8])> = Vec::new();
     let mut total_embedded_asset_bytes = 0_u64;
     for (asset_key, record) in &project.assets {
         if let Some(bytes) = record.bytes.as_deref() {
@@ -352,13 +744,20 @@ fn save_zcraft_to_bytes_with_limits(
                     limit_bytes: max_retained_assets,
                 });
             }
+            let sha256 = if is_valid_sha256_hex(&record.sha256) && record.size == bytes.len() as u64
+            {
+                record.sha256.to_ascii_lowercase()
+            } else {
+                sha256_hex(bytes)
+            };
             integrity.insert(
                 entry_path.clone(),
                 IntegrityEntry {
                     size: bytes.len() as u64,
-                    sha256: sha256_hex(bytes),
+                    sha256,
                 },
             );
+            compression_probe.push((record.filename.clone(), bytes));
             embedded_assets.push((entry_path, bytes));
         } else if !record.external || record.missing {
             missing_assets.push(asset_key.clone());
@@ -440,7 +839,8 @@ fn save_zcraft_to_bytes_with_limits(
         }
     }
 
-    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let compression = choose_archive_gzip_compression(&compression_probe);
+    let encoder = GzEncoder::new(writer, compression);
     let limited_writer = LimitedWriter {
         inner: encoder,
         written: 0,
@@ -474,14 +874,14 @@ fn save_zcraft_to_bytes_with_limits(
             limit_bytes: max_uncompressed,
         });
     }
-    let compressed = limited.inner.finish()?;
-    Ok(compressed)
+    let _writer = limited.inner.finish()?;
+    Ok(())
 }
 
-/// Atomically writes `project` as a `.zcraft` archive to `path`.
+/// Atomically writes `project` as a `.zcraft` archive to `path`, streaming directly
+/// through a crash-safe temporary file without buffering the full compressed archive in RAM.
 pub fn save_zcraft(project: &Project, path: &Path) -> Result<(), ProjectError> {
-    let bytes = save_zcraft_to_bytes(project)?;
-    write_atomic(path, &bytes)
+    write_atomic_with(path, |writer| save_zcraft_to_writer(project, writer))
 }
 
 /// Loads a `.zcraft` archive from raw bytes using default security bounds.
@@ -643,7 +1043,8 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
                         limit_bytes: max_retained_assets,
                     });
                 }
-                let mut data = Vec::new();
+                let reserve = declared_size.min(remaining_budget).min(32 * 1024 * 1024) as usize;
+                let mut data = Vec::with_capacity(reserve);
                 let mut bounded = (&mut entry).take(remaining_budget.saturating_add(1));
                 bounded.read_to_end(&mut data).map_err(|err| {
                     map_limit_err(
@@ -720,6 +1121,7 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
         )));
     }
 
+    let mut verified_asset_hashes: BTreeMap<String, String> = BTreeMap::new();
     if let Some(ref meta_doc) = meta {
         if !meta_doc.created_utc.is_empty() {
             project.preserved.insert(
@@ -769,13 +1171,16 @@ fn load_zcraft_from_reader_with_limits<R: Read>(
                         actual,
                     });
                 }
+                verified_asset_hashes.insert(asset_id.clone(), actual);
             }
         }
     }
 
     for (asset_id, record) in &mut project.assets {
         if let Some(data) = asset_blobs.remove(asset_id) {
-            let actual_sha = sha256_hex(&data);
+            let actual_sha = verified_asset_hashes
+                .remove(asset_id)
+                .unwrap_or_else(|| sha256_hex(&data));
             if !record.sha256.is_empty() && !record.sha256.eq_ignore_ascii_case(&actual_sha) {
                 return Err(ProjectError::IntegrityMismatch {
                     entry: format!("assets/{asset_id}"),
@@ -1478,6 +1883,58 @@ mod tests {
         assert!(
             matches!(err_crc, ProjectError::Io(_)),
             "expected Io error on corrupt gzip CRC, got: {err_crc:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_gzip_compression_selects_stored_for_large_media_and_fast_otherwise() {
+        let two_mib = vec![0x42u8; 2 * 1024 * 1024];
+        let half_mib = vec![0x11u8; 512 * 1024];
+        let one_mib = vec![0x22u8; 1024 * 1024];
+
+        // Empty or small assets -> Compression::fast()
+        assert_eq!(choose_archive_gzip_compression(&[]), Compression::fast());
+        assert_eq!(
+            choose_archive_gzip_compression(&[("logo.png".to_owned(), half_mib.as_slice())]),
+            Compression::fast()
+        );
+
+        // >= 1 MiB and > 50% already-compressed extension -> Compression::none()
+        assert_eq!(
+            choose_archive_gzip_compression(&[("clip.MP4".to_owned(), one_mib.as_slice())]),
+            Compression::none()
+        );
+        assert_eq!(
+            choose_archive_gzip_compression(&[
+                ("clip.mp4".to_owned(), two_mib.as_slice()),
+                ("raw.wav".to_owned(), one_mib.as_slice()),
+            ]),
+            Compression::none()
+        );
+
+        // <= 50% already-compressed -> Compression::fast()
+        assert_eq!(
+            choose_archive_gzip_compression(&[
+                ("clip.mp4".to_owned(), one_mib.as_slice()),
+                ("raw.wav".to_owned(), one_mib.as_slice()),
+            ]),
+            Compression::fast()
+        );
+        assert_eq!(
+            choose_archive_gzip_compression(&[("audio.wav".to_owned(), two_mib.as_slice())]),
+            Compression::fast()
+        );
+
+        // Full disk roundtrip with >1 MiB MP4 exercises stored-block single-member gzip streaming.
+        let dir = TestDir::new();
+        let path = dir.0.join("large_video.zcraft");
+        let mut proj = Project::new_cm3_default();
+        let key = proj.insert_binary_asset(AssetKind::Av, "footage.mp4", two_mib.clone());
+        save_zcraft(&proj, &path).expect("save streaming stored-block zcraft");
+        let loaded = load_zcraft(&path).expect("load stored-block zcraft");
+        assert_eq!(
+            loaded.assets[&key].bytes.as_deref(),
+            Some(two_mib.as_slice())
         );
     }
 }

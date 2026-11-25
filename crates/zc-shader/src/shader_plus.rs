@@ -1294,7 +1294,7 @@ fn sanitize_curve_points(raw: &[SanitizedCurvePoint]) -> Vec<SanitizedCurvePoint
     unique
 }
 
-struct PreparedCurve {
+pub(crate) struct PreparedCurve {
     points: Vec<SanitizedCurvePoint>,
     widths: Vec<f32>,
     slopes: Vec<f32>,
@@ -1357,7 +1357,7 @@ impl PreparedCurve {
         Self::from_sanitized(sanitize_curve_points(&converted))
     }
 
-    fn from_zoidium(raw_points: &[ZoidiumCurvePoint]) -> Self {
+    pub(crate) fn from_zoidium(raw_points: &[ZoidiumCurvePoint]) -> Self {
         let converted: Vec<SanitizedCurvePoint> = raw_points
             .iter()
             .map(|p| SanitizedCurvePoint {
@@ -1372,7 +1372,7 @@ impl PreparedCurve {
         Self::from_sanitized(sanitize_curve_points(&converted))
     }
 
-    fn evaluate(&self, raw_x: f32) -> f32 {
+    pub(crate) fn evaluate(&self, raw_x: f32) -> f32 {
         let x = clamp01_f32(raw_x);
         let n = self.points.len();
         if n == 0 {
@@ -1425,9 +1425,15 @@ impl PreparedCurve {
 }
 
 #[inline]
-fn cubic_bezier_1d(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+fn cubic_bezier_1d_f64(a: f64, b: f64, c: f64, d: f64, t: f64) -> f64 {
     let mt = 1.0 - t;
     mt * mt * mt * a + 3.0 * mt * mt * t * b + 3.0 * mt * t * t * c + t * t * t * d
+}
+
+#[inline]
+fn cubic_bezier_1d_deriv_f64(a: f64, b: f64, c: f64, d: f64, t: f64) -> f64 {
+    let mt = 1.0 - t;
+    3.0 * mt * mt * (b - a) + 6.0 * mt * t * (c - b) + 3.0 * t * t * (d - c)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1442,17 +1448,80 @@ fn eval_cubic_bezier_at_x(
     y3: f32,
     target_x: f32,
 ) -> f32 {
-    let mut lo = 0.0f32;
-    let mut hi = 1.0f32;
-    for _ in 0..32 {
-        let t = 0.5 * (lo + hi);
-        if cubic_bezier_1d(x0, x1, x2, x3, t) < target_x {
+    let x0 = f64::from(x0);
+    let y0 = f64::from(y0);
+    let x1 = f64::from(x1);
+    let y1 = f64::from(y1);
+    let x2 = f64::from(x2);
+    let y2 = f64::from(y2);
+    let x3 = f64::from(x3);
+    let y3 = f64::from(y3);
+    let target_x = f64::from(target_x);
+
+    let dx = x3 - x0;
+    if dx <= 1e-7 || target_x <= x0 {
+        return clamp01_f32(y0 as f32);
+    }
+    if target_x >= x3 {
+        return clamp01_f32(y3 as f32);
+    }
+    let u_lin = ((target_x - x0) / dx).clamp(0.0, 1.0);
+    let dy = y3 - y0;
+    let nx1 = (x1 - x0) / dx;
+    let nx2 = (x2 - x0) / dx;
+    if (y1 - (y0 + dy * nx1)).abs() <= 1e-6 && (y2 - (y0 + dy * nx2)).abs() <= 1e-6 {
+        return clamp01_f32((y0 + dy * u_lin) as f32);
+    }
+
+    const TOL: f64 = 1e-6;
+    let mut lo = 0.0_f64;
+    let mut hi = 1.0_f64;
+    let mut t = u_lin;
+    for _ in 0..6 {
+        let err = cubic_bezier_1d_f64(x0, x1, x2, x3, t) - target_x;
+        if err == 0.0 {
+            return clamp01_f32(cubic_bezier_1d_f64(y0, y1, y2, y3, t) as f32);
+        }
+        if err < 0.0 {
             lo = t;
         } else {
             hi = t;
         }
+        let slope = cubic_bezier_1d_deriv_f64(x0, x1, x2, x3, t);
+        if slope > 1e-9 {
+            let step = err / slope;
+            if step.abs() <= TOL && err.abs() <= TOL {
+                let final_t = (t - step).clamp(lo, hi);
+                return clamp01_f32(cubic_bezier_1d_f64(y0, y1, y2, y3, final_t) as f32);
+            }
+            let next = t - step;
+            if next > lo && next < hi {
+                t = next;
+            } else {
+                t = 0.5 * (lo + hi);
+            }
+        } else {
+            t = 0.5 * (lo + hi);
+        }
+        if (hi - lo) <= TOL {
+            return clamp01_f32(cubic_bezier_1d_f64(y0, y1, y2, y3, 0.5 * (lo + hi)) as f32);
+        }
     }
-    clamp01_f32(cubic_bezier_1d(y0, y1, y2, y3, 0.5 * (lo + hi)))
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        if (hi - lo) <= TOL {
+            t = mid;
+            break;
+        }
+        let err = cubic_bezier_1d_f64(x0, x1, x2, x3, mid) - target_x;
+        if err < 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        t = mid;
+    }
+    clamp01_f32(cubic_bezier_1d_f64(y0, y1, y2, y3, t) as f32)
 }
 
 /// Complete Shader+ curve specification baked to a `1024 x 1` RGBA8 or RGBA16F LUT.
@@ -1649,5 +1718,70 @@ impl PaletteSpec {
             ),
             (format!("{norm}_count"), UniformValue::Int(count)),
         ]
+    }
+}
+
+#[cfg(test)]
+mod bezier_opt_tests {
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn reference_bisection(
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        x3: f32,
+        y3: f32,
+        target_x: f32,
+    ) -> f32 {
+        let bez64 = |a: f32, b: f32, c: f32, d: f32, t: f64| -> f64 {
+            let mt = 1.0 - t;
+            mt * mt * mt * f64::from(a)
+                + 3.0 * mt * mt * t * f64::from(b)
+                + 3.0 * mt * t * t * f64::from(c)
+                + t * t * t * f64::from(d)
+        };
+        let mut lo = 0.0f64;
+        let mut hi = 1.0f64;
+        let tx = f64::from(target_x);
+        for _ in 0..64 {
+            let t = 0.5 * (lo + hi);
+            if bez64(x0, x1, x2, x3, t) < tx {
+                lo = t;
+            } else {
+                hi = t;
+            }
+        }
+        clamp01_f32(bez64(y0, y1, y2, y3, 0.5 * (lo + hi)) as f32)
+    }
+
+    #[test]
+    fn eval_cubic_bezier_at_x_matches_reference_across_regimes() {
+        let cases = [
+            // Linear fast-path
+            (0.0, 0.0, 0.33, 0.33, 0.67, 0.67, 1.0, 1.0),
+            // Smooth S-curve
+            (0.0, 0.0, 0.42, 0.0, 0.58, 1.0, 1.0, 1.0),
+            // Steep zero-derivative inflection
+            (0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0),
+            // Crossing independent handles (x1 > x2, flat derivative at t=0.5)
+            (0.1, 0.2, 0.9, 0.1, 0.1, 0.9, 0.9, 0.8),
+            // Sub-segment with overshoot Y
+            (0.2, 0.3, 0.4, 1.2, 0.6, -0.2, 0.8, 0.7),
+        ];
+        for (x0, y0, x1, y1, x2, y2, x3, y3) in cases {
+            for step in 0..=40 {
+                let x = x0 + (x3 - x0) * (step as f32 / 40.0);
+                let fast = eval_cubic_bezier_at_x(x0, y0, x1, y1, x2, y2, x3, y3, x);
+                let ref_val = reference_bisection(x0, y0, x1, y1, x2, y2, x3, y3, x);
+                assert!(
+                    (fast - ref_val).abs() <= 2e-5,
+                    "mismatch at x={x}: fast={fast}, ref={ref_val}"
+                );
+            }
+        }
     }
 }

@@ -5411,6 +5411,7 @@ impl<'a> Compiler<'a> {
 // 2D Antialiased Scanline Rasterizer (4x Vertical SS + Exact Horizontal Coverage)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 struct Edge {
     y_min: f64,
     y_max: f64,
@@ -5450,7 +5451,7 @@ fn build_scanline_edges(polygons: &[Vec<[f64; 2]>]) -> (Vec<Edge>, f64, f64) {
 }
 
 /// Computes exact horizontal span coverage averaged across 4 vertical sub-rows per scanline
-/// and calls `blend_row(y, &row_cov)` for every row with non-zero coverage.
+/// and calls `blend_row(y, x0, &row_cov[x0..x1])` for every row with non-zero coverage.
 fn rasterize_polygons_aa<F>(
     polygons: &[Vec<[f64; 2]>],
     width: usize,
@@ -5458,12 +5459,12 @@ fn rasterize_polygons_aa<F>(
     even_odd: bool,
     mut blend_row: F,
 ) where
-    F: FnMut(usize, &[f32]),
+    F: FnMut(usize, usize, &[f32]),
 {
     if width == 0 || height == 0 || polygons.is_empty() {
         return;
     }
-    let (edges, min_y, max_y) = build_scanline_edges(polygons);
+    let (mut edges, min_y, max_y) = build_scanline_edges(polygons);
     if edges.is_empty() || !min_y.is_finite() || !max_y.is_finite() {
         return;
     }
@@ -5473,19 +5474,46 @@ fn rasterize_polygons_aa<F>(
         return;
     }
 
+    // Sort edges by y_min so each scanline maintains only active in-range edges.
+    edges.sort_by(|a, b| a.y_min.total_cmp(&b.y_min));
+
     let mut row_cov = vec![0.0_f32; width];
+    let mut active_edges: Vec<Edge> = Vec::new();
+    let mut next_edge = 0usize;
     let mut crossings: Vec<(f64, i32)> = Vec::new();
     const SUB_SAMPLES: usize = 4;
     const SUB_WEIGHT: f32 = 1.0 / (SUB_SAMPLES as f32);
+    const SUB_MIN_OFF: f64 = 0.5 / (SUB_SAMPLES as f64);
+    const SUB_MAX_OFF: f64 = (SUB_SAMPLES as f64 - 0.5) / (SUB_SAMPLES as f64);
     let wf = width as f64;
 
     for y in y0..y1 {
-        row_cov.fill(0.0);
-        let mut any = false;
+        let sy_min = y as f64 + SUB_MIN_OFF;
+        let sy_max = y as f64 + SUB_MAX_OFF;
+
+        // Evict edges that end before this scanline's first sub-sample.
+        active_edges.retain(|e| e.y_max > sy_min);
+        // Activate edges whose y_min starts on or before this scanline's last sub-sample.
+        while next_edge < edges.len() {
+            let e = edges[next_edge];
+            if e.y_min > sy_max {
+                break;
+            }
+            if e.y_max > sy_min {
+                active_edges.push(e);
+            }
+            next_edge += 1;
+        }
+        if active_edges.len() < 2 {
+            continue;
+        }
+
+        let mut row_min_px = width;
+        let mut row_max_px = 0usize;
         for sub in 0..SUB_SAMPLES {
             let ys = y as f64 + (sub as f64 + 0.5) / (SUB_SAMPLES as f64);
             crossings.clear();
-            for e in &edges {
+            for e in &active_edges {
                 if ys >= e.y_min && ys < e.y_max {
                     let x = e.x_at_ymin + (ys - e.y_min) * e.dx_dy;
                     crossings.push((x, e.dir));
@@ -5514,9 +5542,10 @@ fn rasterize_polygons_aa<F>(
                     let a = span_start.clamp(0.0, wf);
                     let b = x.clamp(0.0, wf);
                     if b > a {
-                        any = true;
                         let px0 = (a.floor() as usize).min(width - 1);
                         let px1 = ((b.ceil() as usize).saturating_sub(1)).min(width - 1);
+                        row_min_px = row_min_px.min(px0);
+                        row_max_px = row_max_px.max(px1 + 1);
                         if px0 == px1 {
                             row_cov[px0] += ((b - a) as f32) * SUB_WEIGHT;
                         } else {
@@ -5530,8 +5559,9 @@ fn rasterize_polygons_aa<F>(
                 }
             }
         }
-        if any {
-            blend_row(y, &row_cov);
+        if row_min_px < row_max_px {
+            blend_row(y, row_min_px, &row_cov[row_min_px..row_max_px]);
+            row_cov[row_min_px..row_max_px].fill(0.0);
         }
     }
 }
@@ -5585,8 +5615,9 @@ fn execute_render_commands(
                 let cr = color[0] as f32;
                 let cg = color[1] as f32;
                 let cb = color[2] as f32;
-                rasterize_polygons_aa(&px_polys, width, height, *even_odd, |y, cov| {
-                    let row = &mut fb[y * width..(y + 1) * width];
+                rasterize_polygons_aa(&px_polys, width, height, *even_odd, |y, x0, cov| {
+                    let row_start = y * width + x0;
+                    let row = &mut fb[row_start..row_start + cov.len()];
                     for (px, &c) in row.iter_mut().zip(cov.iter()) {
                         if c > 0.0 {
                             let a = (c * op).clamp(0.0, 1.0);
@@ -5613,11 +5644,13 @@ fn execute_render_commands(
                     .iter()
                     .map(|p| p.iter().map(|&pt| mat_transform_pt(pt, display)).collect())
                     .collect();
-                rasterize_polygons_aa(&px_polys, width, height, *even_odd, |y, cov| {
+                rasterize_polygons_aa(&px_polys, width, height, *even_odd, |y, x0, cov| {
                     let py = y as f64 + 0.5;
-                    let row = &mut fb[y * width..(y + 1) * width];
-                    for (x, (px, &c)) in row.iter_mut().zip(cov.iter()).enumerate() {
+                    let row_start = y * width + x0;
+                    let row = &mut fb[row_start..row_start + cov.len()];
+                    for (dx, (px, &c)) in row.iter_mut().zip(cov.iter()).enumerate() {
                         if c > 0.0 {
+                            let x = x0 + dx;
                             let sampled = gradient.sample_premul([x as f64 + 0.5, py], inv_total);
                             let mult = c * op;
                             let src = [
@@ -7181,8 +7214,9 @@ pub fn rasterize_masks_aa(masks: &[EvaluatedMask], width: u32, height: u32) -> V
             if flat.points.len() >= 3 && has_non_degenerate_bbox(&flat.points) {
                 if expansion.abs() < 1e-6 {
                     // 4x supersampled subpixel AA even at feather==0 && expansion==0!
-                    rasterize_polygons_aa(&[flat.points], rw, rh, true, |y, cov| {
-                        let dst_row = &mut scratch[y * rw..(y + 1) * rw];
+                    rasterize_polygons_aa(&[flat.points], rw, rh, true, |y, x0, cov| {
+                        let row_start = y * rw + x0;
+                        let dst_row = &mut scratch[row_start..row_start + cov.len()];
                         for (d, &c) in dst_row.iter_mut().zip(cov.iter()) {
                             *d = c.clamp(0.0, 1.0);
                         }

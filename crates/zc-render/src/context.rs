@@ -457,9 +457,6 @@ impl TargetPool {
         {
             self.pooled_bytes = self.pooled_bytes.saturating_sub(entry.bytes);
             self.pooled_count = self.pooled_count.saturating_sub(1);
-            if entries.is_empty() {
-                self.buckets.remove(&key);
-            }
             return Ok(entry.target);
         }
 
@@ -589,6 +586,19 @@ pub fn readback_rgba8(
     target: &RenderTarget,
     out: &mut Vec<u8>,
 ) -> Result<(), RenderError> {
+    let mut staging = None;
+    readback_rgba8_with_staging(ctx, target, &mut staging, out)
+}
+
+/// Reads back an 8-bit 4-channel render target into tightly packed RGBA8 bytes,
+/// reusing a caller-owned `MAP_READ` staging buffer across frames when its capacity
+/// is sufficient.
+pub fn readback_rgba8_with_staging(
+    ctx: &GpuContext,
+    target: &RenderTarget,
+    staging_slot: &mut Option<(wgpu::Buffer, u64)>,
+    out: &mut Vec<u8>,
+) -> Result<(), RenderError> {
     let (padded_bytes_per_row, staging_size, _) =
         ctx.validate_rgba8_readback_dimensions(target.width, target.height)?;
 
@@ -598,12 +608,20 @@ pub fn readback_rgba8(
         other => return Err(RenderError::UnsupportedFormat(other)),
     };
 
-    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("zc-render rgba8 readback staging"),
-        size: staging_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
+    let needs_alloc = staging_slot
+        .as_ref()
+        .is_none_or(|(_, cap)| *cap < staging_size);
+    if needs_alloc {
+        let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("zc-render rgba8 readback staging"),
+            size: staging_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        *staging_slot = Some((buf, staging_size));
+    }
+
+    let staging = &staging_slot.as_ref().expect("staging buffer allocated").0;
 
     let mut encoder = ctx
         .device
@@ -619,7 +637,7 @@ pub fn readback_rgba8(
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::TexelCopyBufferInfo {
-            buffer: &staging,
+            buffer: staging,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded_bytes_per_row),
@@ -635,19 +653,28 @@ pub fn readback_rgba8(
 
     ctx.queue.submit(std::iter::once(encoder.finish()));
 
-    let slice = staging.slice(..);
+    let slice = staging.slice(0..staging_size);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = tx.send(res);
     });
 
-    ctx.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .map_err(|e| RenderError::DevicePoll(e.to_string()))?;
+    if let Err(e) = ctx.device.poll(wgpu::PollType::wait_indefinitely()) {
+        *staging_slot = None;
+        return Err(RenderError::DevicePoll(e.to_string()));
+    }
 
-    rx.recv()
-        .map_err(|e| RenderError::BufferMap(e.to_string()))?
-        .map_err(|e| RenderError::BufferMap(e.to_string()))?;
+    match rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            *staging_slot = None;
+            return Err(RenderError::BufferMap(e.to_string()));
+        }
+        Err(e) => {
+            *staging_slot = None;
+            return Err(RenderError::BufferMap(e.to_string()));
+        }
+    }
 
     let row_len = (target.width as usize) * 4;
     let padded_stride = padded_bytes_per_row as usize;
@@ -655,23 +682,33 @@ pub fn readback_rgba8(
     out.clear();
     out.reserve(total_len);
 
-    {
+    let copy_res = {
         let mapped = slice
             .get_mapped_range()
-            .map_err(|e| RenderError::BufferMap(e.to_string()))?;
-        for row in 0..(target.height as usize) {
-            let start = row * padded_stride;
-            let src_row = &mapped[start..(start + row_len)];
-            if swap_rb {
-                for px in src_row.as_chunks::<4>().0 {
-                    out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            .map_err(|e| RenderError::BufferMap(e.to_string()));
+        match mapped {
+            Ok(mapped) => {
+                if !swap_rb && padded_stride == row_len {
+                    out.extend_from_slice(&mapped[..total_len]);
+                } else {
+                    for row in 0..(target.height as usize) {
+                        let start = row * padded_stride;
+                        let src_row = &mapped[start..(start + row_len)];
+                        if swap_rb {
+                            for px in src_row.as_chunks::<4>().0 {
+                                out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                            }
+                        } else {
+                            out.extend_from_slice(src_row);
+                        }
+                    }
                 }
-            } else {
-                out.extend_from_slice(src_row);
+                Ok(())
             }
+            Err(err) => Err(err),
         }
-    }
+    };
 
     staging.unmap();
-    Ok(())
+    copy_res
 }

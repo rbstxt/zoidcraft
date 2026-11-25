@@ -2166,4 +2166,195 @@ f 2 5 6 3
             "Wire with size [20,20,20] unexpectedly shrunken: {wsz:?}"
         );
     }
+
+    #[test]
+    fn mesh_merge_o1_bounds_exactness_including_empty_and_off_origin() {
+        // 1. Empty + empty stays zero bounds.
+        let mut acc = MeshData::empty();
+        acc.merge(&MeshData::empty());
+        assert!(acc.vertices.is_empty());
+        assert_eq!(acc.bounds.min, Vec3::ZERO);
+        assert_eq!(acc.bounds.max, Vec3::ZERO);
+
+        // 2. Empty + off-origin non-empty adopts exact `other.bounds` (must NOT union with ZERO).
+        let mut first = build_box(2.0, 4.0, 6.0);
+        first.translate(Vec3::new(10.0, 20.0, 30.0));
+        acc.merge(&first);
+        assert_eq!(acc.bounds, first.bounds);
+        assert_eq!(acc.bounds, compute_bounds(&acc.vertices));
+
+        // 3. Non-empty + empty preserves existing bounds unchanged.
+        acc.merge(&MeshData::empty());
+        assert_eq!(acc.bounds, first.bounds);
+
+        // 4. 128 sequential merges (Repeater-style) produce exact bounds matching full vertex scan.
+        let mut repeated = MeshData::empty();
+        for i in 0..128 {
+            let mut copy = build_box(1.5, 2.5, 3.5);
+            copy.translate(Vec3::new(
+                (i as f32) * 0.7 - 40.0,
+                ((i % 7) as f32) * 3.0 - 9.0,
+                -((i as f32) * 0.25),
+            ));
+            repeated.merge(&copy);
+        }
+        assert_eq!(repeated.bounds, compute_bounds(&repeated.vertices));
+    }
+
+    #[test]
+    fn voronoi_optimized_high_cell_anisotropic_and_hollow_parity() {
+        // High cell count (48 cells) + anisotropic cell_scale on a watertight cube:
+        // verifies sorted-neighbor early-out, AABB rejection, scratch buffers, and O(M) cap stitching.
+        let cube = build_box(6.0, 6.0, 6.0);
+        let params = VoronoiFractureParams {
+            cells: 48,
+            seed: 77,
+            closed: true,
+            cell_scale: Vec3::new(180.0, 75.0, 120.0),
+            distance: 0.0,
+            ..VoronoiFractureParams::default()
+        };
+        let frac_a = apply_voronoi_fracture_with_params(&cube, &params, None, None);
+        let frac_b = apply_voronoi_fracture_with_params(&cube, &params, None, None);
+        assert_valid_mesh(&frac_a, "voronoi_48_aniso");
+        assert_eq!(frac_a, frac_b, "Voronoi fracture must remain deterministic");
+        let vol = mesh_signed_volume(&frac_a);
+        assert!(
+            (vol - 216.0).abs() < 0.75,
+            "expected watertight 48-cell anisotropic cube volume ~216.0, got {vol}"
+        );
+        assert!(frac_a.vertices.iter().any(|v| v.material_slot == 0));
+        assert!(frac_a.vertices.iter().any(|v| v.material_slot == 1));
+
+        // Multi-hole extruded slab with 20 cells verifies O(M) hashed cap chain stitching on complex cuts.
+        let multi_hole_contours = vec![
+            vec![
+                Vec2::new(-8.0, -5.0),
+                Vec2::new(8.0, -5.0),
+                Vec2::new(8.0, 5.0),
+                Vec2::new(-8.0, 5.0),
+            ],
+            vec![
+                Vec2::new(-5.0, -2.0),
+                Vec2::new(-5.0, 2.0),
+                Vec2::new(-1.0, 2.0),
+                Vec2::new(-1.0, -2.0),
+            ],
+            vec![
+                Vec2::new(1.0, -2.0),
+                Vec2::new(1.0, 2.0),
+                Vec2::new(5.0, 2.0),
+                Vec2::new(5.0, -2.0),
+            ],
+        ];
+        let slab = extrude_contours(
+            &multi_hole_contours,
+            &Text3DParams {
+                thickness: 6.0,
+                align: TextAlignMode::Center,
+                ..Text3DParams::default()
+            },
+        )
+        .expect("multi-hole slab");
+        let slab_vol = mesh_signed_volume(&slab);
+        let expected_slab_vol = (16.0 * 10.0 - 2.0 * 16.0) * 6.0;
+        assert!((slab_vol - expected_slab_vol).abs() < 0.5);
+
+        let frac_slab = apply_voronoi_fracture(&slab, 20, 314, 0.0);
+        assert_valid_mesh(&frac_slab, "voronoi_multi_hole_20");
+        let frac_slab_vol = mesh_signed_volume(&frac_slab);
+        assert!(
+            (frac_slab_vol - slab_vol).abs() < 1.5,
+            "multi-hole fracture must preserve volume (expected ~{slab_vol}, got {frac_slab_vol})"
+        );
+    }
+
+    #[test]
+    fn normalized_uv_and_particle_unsorted_gradient_parity() {
+        // 1. High-segment extruded beveled text exercises ContourSpatialIndex uniform grid in apply_normalized_uv_layout.
+        let mut text_mesh = build_fallback_text_mesh(&Text3DParams {
+            text: String::from("ZOID80"),
+            height: 8.0,
+            thickness: 2.0,
+            curve_segments: 8,
+            bevel_enabled: true,
+            bevel_thickness: 0.3,
+            bevel_size: 0.25,
+            bevel_segments: 3,
+            ..Text3DParams::default()
+        });
+        apply_normalized_uv_layout(&mut text_mesh);
+        assert_valid_mesh(&text_mesh, "normalized_uv_beveled_text");
+        assert!(
+            text_mesh
+                .vertices
+                .iter()
+                .all(|v| v.uv[0].is_finite() && v.uv[1].is_finite())
+        );
+
+        // 2. Particle evaluation and gradient LUT baking with unsorted stops must match pre-sorted stops bit-for-bit.
+        let unsorted_color = vec![
+            GradientStop {
+                position: 1.0,
+                color: [0.1, 0.2, 0.3, 0.0],
+            },
+            GradientStop {
+                position: 0.0,
+                color: [1.0, 0.5, 0.0, 1.0],
+            },
+            GradientStop {
+                position: 0.4,
+                color: [0.2, 0.9, 0.4, 0.8],
+            },
+        ];
+        let mut sorted_color = unsorted_color.clone();
+        sorted_color.sort_by(|a, b| a.position.total_cmp(&b.position));
+
+        let unsorted_size = vec![
+            GradientStop {
+                position: 0.8,
+                color: [0.6, 0.6, 0.6, 1.0],
+            },
+            GradientStop {
+                position: 0.2,
+                color: [0.1, 0.1, 0.1, 1.0],
+            },
+        ];
+        let mut sorted_size = unsorted_size.clone();
+        sorted_size.sort_by(|a, b| a.position.total_cmp(&b.position));
+
+        assert_eq!(
+            bake_gradient_lut(&unsorted_color, 64),
+            bake_gradient_lut(&sorted_color, 64)
+        );
+        assert_eq!(
+            bake_cm3_gradient_lut_rgba8(&unsorted_color, true),
+            bake_cm3_gradient_lut_rgba8(&sorted_color, true)
+        );
+        assert_eq!(
+            bake_cm3_gradient_lut_rgba8(&unsorted_color, false),
+            bake_cm3_gradient_lut_rgba8(&sorted_color, false)
+        );
+
+        let params_unsorted = ParticleSystemParams {
+            count: 250,
+            rate: 100.0,
+            lifetime: 2.0,
+            color_gradient: unsorted_color,
+            size_gradient: unsorted_size,
+            ..ParticleSystemParams::zoidium_default()
+        };
+        let params_sorted = ParticleSystemParams {
+            color_gradient: sorted_color,
+            size_gradient: sorted_size,
+            ..params_unsorted.clone()
+        };
+
+        let batch_unsorted = evaluate_particles(1.37, &params_unsorted);
+        let batch_sorted = evaluate_particles(1.37, &params_sorted);
+        assert_eq!(batch_unsorted, batch_sorted);
+        for (pid, inst) in batch_unsorted.iter().enumerate() {
+            assert_eq!(*inst, evaluate_particle(pid as u32, 1.37, &params_unsorted));
+        }
+    }
 }

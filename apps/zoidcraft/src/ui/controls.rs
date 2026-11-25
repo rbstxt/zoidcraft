@@ -664,6 +664,36 @@ fn cm3_scrub_number_styled(
     (ev, text_commit)
 }
 
+fn cached_monospace_char_width(ui: &Ui, font_size: f32, theme: &Cm3Theme) -> f32 {
+    let font = theme.font(font_size);
+    let cache_id = Id::unique((
+        "zc_mono_char_w",
+        font.size.to_bits(),
+        theme.editor_font,
+        ui.pixels_per_point().to_bits(),
+    ));
+    if let Some(w) = ui.data(|d| d.get_temp::<f32>(cache_id)) {
+        return w;
+    }
+    let w = ui
+        .painter()
+        .layout_no_wrap("0".to_owned(), font, theme.value())
+        .size()
+        .x
+        .max(1.0);
+    ui.data_mut(|d| d.insert_temp(cache_id, w));
+    w
+}
+
+struct CharCounter(usize);
+
+impl std::fmt::Write for CharCounter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 += s.chars().count();
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn measure_vector_inline_width(
     ui: &Ui,
@@ -675,31 +705,24 @@ fn measure_vector_inline_width(
     inset: f32,
     spacing: f32,
 ) -> f32 {
+    use std::fmt::Write as _;
+
     let safe_scale = if config.scale_factor.is_finite() && config.scale_factor.abs() > 1e-12 {
         config.scale_factor
     } else {
         1.0
     };
-    let font = theme.font(font_size);
-    let sep_w = ui
-        .painter()
-        .layout_no_wrap(sep.to_owned(), font.clone(), TEXT_DISABLED)
-        .size()
-        .x;
+    let char_w = cached_monospace_char_width(ui, font_size, theme);
+    let sep_w = sep.chars().count() as f32 * char_w;
     let mut total = 0.0_f32;
     for (idx, &v) in values.iter().enumerate() {
         if idx > 0 {
             total += spacing + sep_w + spacing;
         }
         let disp = clamp_and_round(v / safe_scale, config);
-        let s = format!("{:.*}", config.decimals, disp);
-        let w = ui
-            .painter()
-            .layout_no_wrap(s, font.clone(), theme.value())
-            .size()
-            .x
-            .max(14.0)
-            + inset;
+        let mut counter = CharCounter(0);
+        let _ = write!(&mut counter, "{:.*}", config.decimals, disp);
+        let w = (counter.0 as f32 * char_w).max(14.0) + inset;
         total += w;
     }
     total
@@ -2708,15 +2731,64 @@ pub fn cm3_icon_button(
     cm3_icon_button_enabled(ui, icon, icon_px, color, tooltip, true, theme)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DropdownWidthCacheKey {
+    option_count: usize,
+    options_hash: u64,
+    font_size_bits: u32,
+    editor_font: super::theme::EditorFontChoice,
+    ppp_bits: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 struct DropdownPopupState {
     open: bool,
     highlighted: usize,
     last_option_count: usize,
     open_epoch: u64,
+    cached_max_opt_w: Option<(DropdownWidthCacheKey, f32)>,
 }
 
-/// Truncates `text` with a trailing ellipsis (`…`) so it fits strictly within `max_width`.
+fn hash_dropdown_options(options: &[&str]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for opt in options {
+        for &b in opt.as_bytes() {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+fn cached_dropdown_mono_glyph_widths(painter: &Painter, font: &egui::FontId) -> (f32, f32) {
+    let ctx = painter.ctx();
+    let cache_id = Id::unique((
+        "zc_dd_label_metrics",
+        font.size.to_bits(),
+        ctx.pixels_per_point().to_bits(),
+    ));
+    if let Some(metrics) = ctx.data(|d| d.get_temp::<(f32, f32)>(cache_id)) {
+        return metrics;
+    }
+    let char_w = painter
+        .layout_no_wrap("M".to_owned(), font.clone(), Color32::WHITE)
+        .size()
+        .x
+        .max(1.0);
+    let ellipsis_w = painter
+        .layout_no_wrap("…".to_owned(), font.clone(), Color32::WHITE)
+        .size()
+        .x
+        .max(1.0);
+    let metrics = (char_w, ellipsis_w);
+    ctx.data_mut(|d| d.insert_temp(cache_id, metrics));
+    metrics
+}
+
+/// Truncates `text` with a trailing ellipsis (`…`) so it fits strictly within `max_width`
+/// using cached monospace glyph-width estimation + single-pass verification.
 fn layout_truncated_dropdown_label(
     painter: &Painter,
     text: &str,
@@ -2727,20 +2799,41 @@ fn layout_truncated_dropdown_label(
     if max_width <= 6.0 {
         return painter.layout_no_wrap(String::new(), font, color);
     }
-    let chars: Vec<char> = text.chars().collect();
-    let mut lo = 0usize;
-    let mut hi = chars.len();
-    let mut best = painter.layout_no_wrap("…".to_owned(), font.clone(), color);
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        let mut candidate: String = chars[..mid].iter().collect();
-        candidate.push('…');
-        let g = painter.layout_no_wrap(candidate, font.clone(), color);
-        if g.size().x <= max_width {
-            best = g;
-            lo = mid;
+    let (char_w, ellipsis_w) = cached_dropdown_mono_glyph_widths(painter, &font);
+    if ellipsis_w > max_width {
+        return painter.layout_no_wrap("…".to_owned(), font, color);
+    }
+    let char_count = text.chars().count();
+    let mut prefix_chars = ((max_width - ellipsis_w) / char_w).floor().max(0.0) as usize;
+    prefix_chars = prefix_chars.min(char_count.saturating_sub(1));
+
+    let make_candidate = |n: usize| -> String {
+        let byte_end = text
+            .char_indices()
+            .nth(n)
+            .map_or(text.len(), |(idx, _)| idx);
+        let mut s = String::with_capacity(byte_end + 3);
+        s.push_str(&text[..byte_end]);
+        s.push('…');
+        s
+    };
+
+    let mut best = painter.layout_no_wrap(make_candidate(prefix_chars), font.clone(), color);
+    if best.size().x > max_width {
+        while prefix_chars > 0 && best.size().x > max_width {
+            prefix_chars -= 1;
+            best = painter.layout_no_wrap(make_candidate(prefix_chars), font.clone(), color);
+        }
+        return best;
+    }
+
+    while prefix_chars + 1 < char_count && best.size().x + char_w * 0.5 <= max_width {
+        let next = painter.layout_no_wrap(make_candidate(prefix_chars + 1), font.clone(), color);
+        if next.size().x <= max_width {
+            best = next;
+            prefix_chars += 1;
         } else {
-            hi = mid - 1;
+            break;
         }
     }
     best
@@ -2782,6 +2875,7 @@ pub fn cm3_dropdown(
             highlighted: *selected_idx,
             last_option_count: options.len(),
             open_epoch: 0,
+            cached_max_opt_w: None,
         });
     if popup_state.last_option_count != options.len() {
         popup_state.last_option_count = options.len();
@@ -2790,17 +2884,32 @@ pub fn cm3_dropdown(
     let mut changed = false;
 
     let font = theme.font(13.3);
-    let mut max_opt_w = 0.0_f32;
+    let max_opt_key = DropdownWidthCacheKey {
+        option_count: options.len(),
+        options_hash: hash_dropdown_options(options),
+        font_size_bits: font.size.to_bits(),
+        editor_font: theme.editor_font,
+        ppp_bits: ui.pixels_per_point().to_bits(),
+    };
     let mut current_galley = None;
-    for (idx, opt) in options.iter().enumerate() {
-        let galley = ui
-            .painter()
-            .layout_no_wrap((*opt).to_owned(), font.clone(), theme.value());
-        max_opt_w = max_opt_w.max(galley.size().x);
-        if idx == *selected_idx {
-            current_galley = Some(galley);
+    let max_opt_w = if let Some((cached_key, cached_w)) = popup_state.cached_max_opt_w
+        && cached_key == max_opt_key
+    {
+        cached_w
+    } else {
+        let mut computed_max = 0.0_f32;
+        for (idx, opt) in options.iter().enumerate() {
+            let galley =
+                ui.painter()
+                    .layout_no_wrap((*opt).to_owned(), font.clone(), theme.value());
+            computed_max = computed_max.max(galley.size().x);
+            if idx == *selected_idx {
+                current_galley = Some(galley);
+            }
         }
-    }
+        popup_state.cached_max_opt_w = Some((max_opt_key, computed_max));
+        computed_max
+    };
     let label_galley = current_galley.unwrap_or_else(|| {
         ui.painter()
             .layout_no_wrap(current_label.to_owned(), font.clone(), theme.value())

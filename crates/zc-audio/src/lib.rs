@@ -16,7 +16,11 @@ pub use decode::{
     encode_wav_f32_stereo, encode_wav_pcm16_stereo, f32_to_pcm16, resample_stereo,
     resample_stereo_48k, try_encode_wav_f32_stereo, try_encode_wav_pcm16_stereo,
 };
-pub use expr::{AudioExprContext, eval_audio_expression, eval_audio_expression_or_fallback};
+pub use expr::{
+    AudioExprContext, CompiledAudioExpr, compile_audio_expression, eval_audio_expression,
+    eval_audio_expression_or_fallback, eval_compiled_audio_expression,
+    eval_compiled_audio_expression_or_fallback,
+};
 pub use meter::{AudioMeterState, METER_ANALYSIS_WINDOW, METER_MIN_PX};
 pub use mixer::{
     AudioClipScheduleItem, AudioClipTrackItem, ClipAudioSampleParams, FlattenedAudioClip,

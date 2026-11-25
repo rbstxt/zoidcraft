@@ -65,7 +65,7 @@ struct ActiveTransaction<T> {
 #[derive(Debug, Clone)]
 pub struct UndoStack<T> {
     undo_stack: VecDeque<HistoryEntry<T>>,
-    redo_stack: Vec<HistoryEntry<T>>,
+    redo_stack: VecDeque<HistoryEntry<T>>,
     undo_bytes: usize,
     redo_bytes: usize,
     max_entries: usize,
@@ -94,7 +94,7 @@ impl<T> UndoStack<T> {
     pub fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             undo_stack: VecDeque::new(),
-            redo_stack: Vec::new(),
+            redo_stack: VecDeque::new(),
             undo_bytes: 0,
             redo_bytes: 0,
             max_entries,
@@ -176,7 +176,7 @@ impl<T> UndoStack<T> {
     /// Label of the next operation that `redo` would reapply.
     #[must_use]
     pub fn peek_redo_label(&self) -> Option<&str> {
-        self.redo_stack.last().map(|entry| entry.label.as_str())
+        self.redo_stack.back().map(|entry| entry.label.as_str())
     }
 
     /// Returns `true` when the current revision differs from the last saved revision.
@@ -263,6 +263,10 @@ impl<T> UndoStack<T> {
     where
         T: ByteSized,
     {
+        if self.active_tx.is_some() {
+            self.record_transaction_edit();
+            return;
+        }
         let bytes = before_snapshot.estimated_bytes();
         self.push_with_bytes(label, before_snapshot, bytes);
     }
@@ -378,7 +382,7 @@ impl<T> UndoStack<T> {
 
         if self.max_entries > 0 && current_bytes <= self.max_bytes {
             self.redo_bytes = self.redo_bytes.saturating_add(current_bytes);
-            self.redo_stack.push(HistoryEntry {
+            self.redo_stack.push_back(HistoryEntry {
                 label: entry.label.clone(),
                 snapshot: current_snapshot,
                 bytes: current_bytes,
@@ -412,7 +416,7 @@ impl<T> UndoStack<T> {
             return None;
         }
 
-        let entry = self.redo_stack.pop()?;
+        let entry = self.redo_stack.pop_back()?;
         self.redo_bytes = self.redo_bytes.saturating_sub(entry.bytes);
 
         let undo_revision = self.current_revision;
@@ -468,22 +472,23 @@ impl<T> UndoStack<T> {
             }
         }
         while self.redo_stack.len() > self.max_entries {
-            let evicted = self.redo_stack.remove(0);
-            self.redo_bytes = self.redo_bytes.saturating_sub(evicted.bytes);
+            if let Some(evicted) = self.redo_stack.pop_front() {
+                self.redo_bytes = self.redo_bytes.saturating_sub(evicted.bytes);
+            } else {
+                break;
+            }
         }
 
         while self.total_bytes() > self.max_bytes {
             if prefer_keeping_redo {
                 if let Some(evicted) = self.undo_stack.pop_front() {
                     self.undo_bytes = self.undo_bytes.saturating_sub(evicted.bytes);
-                } else if !self.redo_stack.is_empty() {
-                    let evicted = self.redo_stack.remove(0);
+                } else if let Some(evicted) = self.redo_stack.pop_front() {
                     self.redo_bytes = self.redo_bytes.saturating_sub(evicted.bytes);
                 } else {
                     break;
                 }
-            } else if !self.redo_stack.is_empty() {
-                let evicted = self.redo_stack.remove(0);
+            } else if let Some(evicted) = self.redo_stack.pop_front() {
                 self.redo_bytes = self.redo_bytes.saturating_sub(evicted.bytes);
             } else if let Some(evicted) = self.undo_stack.pop_front() {
                 self.undo_bytes = self.undo_bytes.saturating_sub(evicted.bytes);

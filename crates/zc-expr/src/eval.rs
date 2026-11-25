@@ -43,7 +43,17 @@ pub fn evaluate_program(
     ctx: &dyn ExprContext,
     config: &EvalConfig,
 ) -> Result<Value, ExprError> {
-    let program_extended = is_extended(program);
+    evaluate_program_with_extended(program, ctx, config, is_extended(program))
+}
+
+/// Evaluates a parsed [`Program`] with a precomputed `program_extended` flag, avoiding
+/// redundant full-AST analysis walks on repeated [`crate::CompiledExpr::evaluate`] calls.
+pub(crate) fn evaluate_program_with_extended(
+    program: &Program,
+    ctx: &dyn ExprContext,
+    config: &EvalConfig,
+    program_extended: bool,
+) -> Result<Value, ExprError> {
     let mut evaluator = Evaluator::new(ctx, *config, program_extended);
     let root_env = evaluator.push_env(None)?;
     evaluator.hoist_decls(&program.body, root_env)?;
@@ -133,6 +143,22 @@ impl From<&str> for JsStr {
 }
 
 #[derive(Debug, Clone)]
+enum BuiltinRef {
+    Static(&'static str),
+    Dynamic(Rc<str>),
+}
+
+impl BuiltinRef {
+    #[inline]
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Static(s) => s,
+            Self::Dynamic(s) => s,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum RuntimeValue {
     /// Sentinel used by statements that do not update the completion value.
     Empty,
@@ -144,7 +170,7 @@ enum RuntimeValue {
     Array(usize),
     Object(usize),
     Closure(usize),
-    BuiltinFn(Rc<str>),
+    BuiltinFn(BuiltinRef),
     Namespace(NamespaceKind),
     Intrinsic(IntrinsicSentinel),
     Handle(HandleRef),
@@ -352,7 +378,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
 
     fn alloc_builtin_fn(&mut self, name: String) -> Result<RuntimeValue, ExprError> {
         self.check_string_alloc(name.len())?;
-        Ok(RuntimeValue::BuiltinFn(Rc::from(name)))
+        Ok(RuntimeValue::BuiltinFn(BuiltinRef::Dynamic(Rc::from(name))))
     }
 
     fn check_array_alloc(&mut self, elem_count: usize) -> Result<(), ExprError> {
@@ -1902,12 +1928,18 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             }
             "Math" => return Ok(RuntimeValue::Namespace(NamespaceKind::Math)),
             "isNaN" | "isFinite" | "parseInt" | "parseFloat" => {
+                if let Some(s) = static_global_builtin_name(name) {
+                    return Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(s)));
+                }
                 return self.alloc_builtin_fn(name.to_string());
             }
             // Exact 17 Vanilla CM3 built-in functions
             "add" | "sub" | "mul" | "div" | "clamp" | "dot" | "cross" | "normalize" | "length"
             | "wave" | "lerp" | "linear" | "catmullRom" | "ease" | "random" | "gaussRandom"
             | "shake" => {
+                if let Some(s) = static_global_builtin_name(name) {
+                    return Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(s)));
+                }
                 return self.alloc_builtin_fn(name.to_string());
             }
             _ => {}
@@ -1917,8 +1949,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         if let Some(c) = math_constant(name) {
             return Ok(RuntimeValue::Number(c));
         }
-        if is_top_level_math_fn(name) {
-            return self.alloc_builtin_fn(format!("Math.{name}"));
+        if let Some(math_fn) = static_math_builtin_name(name) {
+            return Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(math_fn)));
         }
 
         // Expressions+ globals & handles
@@ -1973,6 +2005,9 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 | "seedRandom" | "wiggle" | "layer" | "effect" | "object" | "property" | "prop"
                 | "control" | "toWorld" | "fromWorld" | "worldPosition" | "worldRotation"
                 | "toScreen" | "fromScreen" => {
+                    if let Some(s) = static_global_builtin_name(name) {
+                        return Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(s)));
+                    }
                     return self.alloc_builtin_fn(name.to_string());
                 }
                 _ => {}
@@ -2252,6 +2287,36 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         let left = self.deref_property_handle(left)?;
         let right = self.deref_property_handle(right)?;
 
+        if let (RuntimeValue::Number(l), RuntimeValue::Number(r)) = (&left, &right) {
+            let (l, r) = (*l, *r);
+            return Ok(match op {
+                BinaryOp::Add => RuntimeValue::Number(l + r),
+                BinaryOp::Sub => RuntimeValue::Number(l - r),
+                BinaryOp::Mul => RuntimeValue::Number(l * r),
+                BinaryOp::Div => RuntimeValue::Number(l / r),
+                BinaryOp::Rem => RuntimeValue::Number(l % r),
+                BinaryOp::Pow => RuntimeValue::Number(l.powf(r)),
+                BinaryOp::StrictEq | BinaryOp::Eq => RuntimeValue::Bool(l == r),
+                BinaryOp::StrictNe | BinaryOp::Ne => RuntimeValue::Bool(l != r),
+                BinaryOp::Lt => RuntimeValue::Bool(l < r),
+                BinaryOp::Le => RuntimeValue::Bool(l <= r),
+                BinaryOp::Gt => RuntimeValue::Bool(l > r),
+                BinaryOp::Ge => RuntimeValue::Bool(l >= r),
+                BinaryOp::BitAnd => RuntimeValue::Number((to_i32(l) & to_i32(r)) as f64),
+                BinaryOp::BitOr => RuntimeValue::Number((to_i32(l) | to_i32(r)) as f64),
+                BinaryOp::BitXor => RuntimeValue::Number((to_i32(l) ^ to_i32(r)) as f64),
+                BinaryOp::Shl => {
+                    RuntimeValue::Number(to_i32(l).wrapping_shl(to_u32(r) & 0x1f) as f64)
+                }
+                BinaryOp::Shr => {
+                    RuntimeValue::Number(to_i32(l).wrapping_shr(to_u32(r) & 0x1f) as f64)
+                }
+                BinaryOp::UShr => {
+                    RuntimeValue::Number(to_u32(l).wrapping_shr(to_u32(r) & 0x1f) as f64)
+                }
+            });
+        }
+
         match op {
             BinaryOp::Add => {
                 // String concatenation wins if either operand is a string.
@@ -2429,16 +2494,20 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             (RuntimeValue::Array(x), RuntimeValue::Array(y)) => x == y,
             (RuntimeValue::Object(x), RuntimeValue::Object(y)) => x == y,
             (RuntimeValue::Closure(x), RuntimeValue::Closure(y)) => x == y,
-            (RuntimeValue::BuiltinFn(x), RuntimeValue::BuiltinFn(y)) => {
-                if Rc::ptr_eq(&x, &y) {
-                    true
-                } else if x.len() != y.len() {
-                    false
-                } else {
-                    self.charge_byte_work(x.len())?;
-                    x == y
+            (RuntimeValue::BuiltinFn(x), RuntimeValue::BuiltinFn(y)) => match (x, y) {
+                (BuiltinRef::Static(a), BuiltinRef::Static(b)) => a == b,
+                (BuiltinRef::Dynamic(a), BuiltinRef::Dynamic(b)) => {
+                    if Rc::ptr_eq(&a, &b) {
+                        true
+                    } else if a.len() != b.len() {
+                        false
+                    } else {
+                        self.charge_byte_work(a.len())?;
+                        a == b
+                    }
                 }
-            }
+                (a, b) => a.as_str() == b.as_str(),
+            },
             (RuntimeValue::Handle(x), RuntimeValue::Handle(y)) => x == y,
             (RuntimeValue::Namespace(x), RuntimeValue::Namespace(y)) => x == y,
             (RuntimeValue::Intrinsic(x), RuntimeValue::Intrinsic(y)) => x == y,
@@ -2602,11 +2671,18 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 if let Some(c) = math_constant(prop) {
                     return Ok(RuntimeValue::Number(c));
                 }
+                if let Some(s) = static_math_builtin_name(prop) {
+                    return Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(s)));
+                }
                 self.alloc_builtin_fn(format!("Math.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::Methods) => {
                 if is_methods_member(prop, self.config.mode) {
-                    self.alloc_builtin_fn(prop.to_string())
+                    if let Some(s) = static_global_builtin_name(prop) {
+                        Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(s)))
+                    } else {
+                        self.alloc_builtin_fn(prop.to_string())
+                    }
                 } else {
                     Ok(RuntimeValue::Undefined)
                 }
@@ -2618,20 +2694,62 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 "POSITIVE_INFINITY" => Ok(RuntimeValue::Number(f64::INFINITY)),
                 "NEGATIVE_INFINITY" => Ok(RuntimeValue::Number(f64::NEG_INFINITY)),
                 "NaN" => Ok(RuntimeValue::Number(f64::NAN)),
+                "isNaN" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Number.isNaN"))),
+                "isFinite" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(
+                    "Number.isFinite",
+                ))),
+                "isInteger" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(
+                    "Number.isInteger",
+                ))),
+                "isSafeInteger" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(
+                    "Number.isSafeInteger",
+                ))),
+                "parseInt" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(
+                    "Number.parseInt",
+                ))),
+                "parseFloat" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(
+                    "Number.parseFloat",
+                ))),
                 _ => self.alloc_builtin_fn(format!("Number.{prop}")),
             },
-            RuntimeValue::Namespace(NamespaceKind::Array) => {
-                self.alloc_builtin_fn(format!("Array.{prop}"))
-            }
-            RuntimeValue::Namespace(NamespaceKind::String) => {
-                self.alloc_builtin_fn(format!("String.{prop}"))
-            }
-            RuntimeValue::Namespace(NamespaceKind::Object) => {
-                self.alloc_builtin_fn(format!("Object.{prop}"))
-            }
-            RuntimeValue::Namespace(NamespaceKind::Json) => {
-                self.alloc_builtin_fn(format!("JSON.{prop}"))
-            }
+            RuntimeValue::Namespace(NamespaceKind::Array) => match prop {
+                "isArray" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Array.isArray"))),
+                "from" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Array.from"))),
+                "of" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Array.of"))),
+                _ => self.alloc_builtin_fn(format!("Array.{prop}")),
+            },
+            RuntimeValue::Namespace(NamespaceKind::String) => match prop {
+                "fromCharCode" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(
+                    "String.fromCharCode",
+                ))),
+                "fromCodePoint" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(
+                    "String.fromCodePoint",
+                ))),
+                _ => self.alloc_builtin_fn(format!("String.{prop}")),
+            },
+            RuntimeValue::Namespace(NamespaceKind::Object) => match prop {
+                "keys" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Object.keys"))),
+                "values" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Object.values"))),
+                "entries" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(
+                    "Object.entries",
+                ))),
+                "assign" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Object.assign"))),
+                "fromEntries" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(
+                    "Object.fromEntries",
+                ))),
+                "hasOwn" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Object.hasOwn"))),
+                "is" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Object.is"))),
+                "freeze" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Object.freeze"))),
+                "create" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("Object.create"))),
+                _ => self.alloc_builtin_fn(format!("Object.{prop}")),
+            },
+            RuntimeValue::Namespace(NamespaceKind::Json) => match prop {
+                "parse" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static("JSON.parse"))),
+                "stringify" => Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(
+                    "JSON.stringify",
+                ))),
+                _ => self.alloc_builtin_fn(format!("JSON.{prop}")),
+            },
             RuntimeValue::Namespace(NamespaceKind::Boolean) => Ok(RuntimeValue::Undefined),
             RuntimeValue::Handle(handle) => self.get_handle_property(handle, prop),
             RuntimeValue::Array(id) => {
@@ -2916,7 +3034,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     if prop == "random" {
                         return Err(ExprError::Forbidden("Math.random".to_string()));
                     }
-                    Ok(!is_top_level_math_fn(prop) && math_constant(prop).is_none())
+                    Ok(static_math_builtin_name(prop).is_none() && math_constant(prop).is_none())
                 }
                 NamespaceKind::Methods => Ok(!is_methods_member(prop, self.config.mode)),
                 NamespaceKind::Array => Ok(!matches!(prop, "isArray" | "from")),
@@ -3208,7 +3326,7 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         self.tick()?;
         match callee {
             RuntimeValue::Closure(cid) => self.call_closure(cid, args),
-            RuntimeValue::BuiltinFn(name) => self.call_builtin(&name, args),
+            RuntimeValue::BuiltinFn(name) => self.call_builtin(name.as_str(), args),
             RuntimeValue::Intrinsic(IntrinsicSentinel::FunctionCtor) => Err(ExprError::Forbidden(
                 "Expression cannot call Function constructors or eval".to_string(),
             )),
@@ -3351,11 +3469,20 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 if method == "random" {
                     return Err(ExprError::Forbidden("Math.random".to_string()));
                 }
-                let mut nums = Vec::with_capacity(args.len());
-                for a in &args {
-                    nums.push(self.runtime_to_number(a)?);
-                }
-                match eval_math_fn(method, &nums)? {
+                let result = if args.len() <= 4 {
+                    let mut stack_nums = [0.0_f64; 4];
+                    for (slot, a) in stack_nums.iter_mut().zip(args.iter()) {
+                        *slot = self.runtime_to_number(a)?;
+                    }
+                    eval_math_fn(method, &stack_nums[..args.len()])?
+                } else {
+                    let mut nums = Vec::with_capacity(args.len());
+                    for a in &args {
+                        nums.push(self.runtime_to_number(a)?);
+                    }
+                    eval_math_fn(method, &nums)?
+                };
+                match result {
                     Some(v) => Ok(RuntimeValue::Number(v)),
                     None => Err(ExprError::TypeError(format!(
                         "Math.{} is not a function",
@@ -5129,44 +5256,90 @@ fn normalize_slice_index(idx: f64, len: isize) -> usize {
     }
 }
 
-fn is_top_level_math_fn(name: &str) -> bool {
-    matches!(
-        name,
-        "abs"
-            | "acos"
-            | "acosh"
-            | "asin"
-            | "asinh"
-            | "atan"
-            | "atan2"
-            | "atanh"
-            | "cbrt"
-            | "ceil"
-            | "clz32"
-            | "cos"
-            | "cosh"
-            | "exp"
-            | "expm1"
-            | "floor"
-            | "fround"
-            | "hypot"
-            | "imul"
-            | "log"
-            | "log1p"
-            | "log2"
-            | "log10"
-            | "max"
-            | "min"
-            | "pow"
-            | "round"
-            | "sign"
-            | "sin"
-            | "sinh"
-            | "sqrt"
-            | "tan"
-            | "tanh"
-            | "trunc"
-    )
+fn static_math_builtin_name(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "abs" => "Math.abs",
+        "acos" => "Math.acos",
+        "acosh" => "Math.acosh",
+        "asin" => "Math.asin",
+        "asinh" => "Math.asinh",
+        "atan" => "Math.atan",
+        "atan2" => "Math.atan2",
+        "atanh" => "Math.atanh",
+        "cbrt" => "Math.cbrt",
+        "ceil" => "Math.ceil",
+        "clz32" => "Math.clz32",
+        "cos" => "Math.cos",
+        "cosh" => "Math.cosh",
+        "exp" => "Math.exp",
+        "expm1" => "Math.expm1",
+        "floor" => "Math.floor",
+        "fround" => "Math.fround",
+        "hypot" => "Math.hypot",
+        "imul" => "Math.imul",
+        "log" => "Math.log",
+        "log1p" => "Math.log1p",
+        "log2" => "Math.log2",
+        "log10" => "Math.log10",
+        "max" => "Math.max",
+        "min" => "Math.min",
+        "pow" => "Math.pow",
+        "round" => "Math.round",
+        "sign" => "Math.sign",
+        "sin" => "Math.sin",
+        "sinh" => "Math.sinh",
+        "sqrt" => "Math.sqrt",
+        "tan" => "Math.tan",
+        "tanh" => "Math.tanh",
+        "trunc" => "Math.trunc",
+        _ => return None,
+    })
+}
+
+fn static_global_builtin_name(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "isNaN" => "isNaN",
+        "isFinite" => "isFinite",
+        "parseInt" => "parseInt",
+        "parseFloat" => "parseFloat",
+        "add" => "add",
+        "sub" => "sub",
+        "mul" => "mul",
+        "div" => "div",
+        "clamp" => "clamp",
+        "dot" => "dot",
+        "cross" => "cross",
+        "normalize" => "normalize",
+        "length" => "length",
+        "wave" => "wave",
+        "lerp" => "lerp",
+        "linear" => "linear",
+        "catmullRom" => "catmullRom",
+        "ease" => "ease",
+        "random" => "random",
+        "gaussRandom" => "gaussRandom",
+        "shake" => "shake",
+        "easeIn" => "easeIn",
+        "easeOut" => "easeOut",
+        "degreesToRadians" => "degreesToRadians",
+        "radiansToDegrees" => "radiansToDegrees",
+        "lookAt" => "lookAt",
+        "seedRandom" => "seedRandom",
+        "wiggle" => "wiggle",
+        "layer" => "layer",
+        "effect" => "effect",
+        "object" => "object",
+        "property" => "property",
+        "prop" => "prop",
+        "control" => "control",
+        "toWorld" => "toWorld",
+        "fromWorld" => "fromWorld",
+        "worldPosition" => "worldPosition",
+        "worldRotation" => "worldRotation",
+        "toScreen" => "toScreen",
+        "fromScreen" => "fromScreen",
+        _ => return None,
+    })
 }
 
 fn is_methods_member(name: &str, mode: ExprMode) -> bool {

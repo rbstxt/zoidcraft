@@ -9,14 +9,18 @@ pub mod expresstext;
 pub mod lexer;
 pub mod parser;
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
 pub use ast::{Program, Span, is_cacheable, is_extended};
 
 /// Expression language compatibility tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum ExprMode {
     /// Vanilla CM3 compatibility tier (ES5 subset, `var` only, 17 built-ins,
     /// compile-time free-identifier check).
@@ -473,17 +477,38 @@ pub trait ExprContext {
                 id.as_str()
             )));
         }
-        let mut best = self.property_key(id, 1)?;
-        let mut best_dist = (best.time - seconds).abs();
-        for idx in 2..=count {
-            let candidate = self.property_key(id, idx)?;
-            let dist = (candidate.time - seconds).abs();
-            if dist < best_dist {
-                best = candidate;
-                best_dist = dist;
+        if count == 1 || seconds.is_nan() {
+            return self.property_key(id, 1);
+        }
+        // Binary search over 1..=count for the first keyframe with `time >= seconds`.
+        let mut lo = 1usize;
+        let mut hi = count;
+        let mut cached_hi: Option<(usize, KeyframeRecord)> = None;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let rec = self.property_key(id, mid)?;
+            if rec.time < seconds {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+                cached_hi = Some((mid, rec));
             }
         }
-        Ok(best)
+        let right = match cached_hi {
+            Some((idx, rec)) if idx == lo => rec,
+            _ => self.property_key(id, lo)?,
+        };
+        if lo == 1 {
+            return Ok(right);
+        }
+        let left = self.property_key(id, lo - 1)?;
+        let left_dist = (left.time - seconds).abs();
+        let right_dist = (right.time - seconds).abs();
+        if left_dist <= right_dist {
+            Ok(left)
+        } else {
+            Ok(right)
+        }
     }
 
     /// Looks up an active video layer by name or 1-based track index.
@@ -691,7 +716,7 @@ impl CompiledExpr {
             mode: self.mode,
             ..*config
         };
-        eval::evaluate_program(&self.program, ctx, &effective)
+        eval::evaluate_program_with_extended(&self.program, ctx, &effective, self.extended)
     }
 
     /// Evaluates this compiled expression, falling back to `ctx.value()` on error
@@ -704,21 +729,22 @@ impl CompiledExpr {
     ) -> EvalOutcome {
         match self.evaluate(ctx, config) {
             Ok(value) => {
-                let base = ctx.value();
-                if matches!(base, Value::Number(_)) && !value.to_number().is_finite() {
-                    let msg = if self.unseeded_zero_arg_random {
-                        "random() needs a seed. Use random(frame), or call seedRandom(1) first."
-                            .to_string()
-                    } else {
-                        "The result is not a finite number.".to_string()
-                    };
-                    EvalOutcome {
-                        value: base,
-                        error: Some(ExprError::RuntimeError(msg)),
+                if !value.to_number().is_finite() {
+                    let base = ctx.value();
+                    if matches!(base, Value::Number(_)) {
+                        let msg = if self.unseeded_zero_arg_random {
+                            "random() needs a seed. Use random(frame), or call seedRandom(1) first."
+                                .to_string()
+                        } else {
+                            "The result is not a finite number.".to_string()
+                        };
+                        return EvalOutcome {
+                            value: base,
+                            error: Some(ExprError::RuntimeError(msg)),
+                        };
                     }
-                } else {
-                    EvalOutcome { value, error: None }
                 }
+                EvalOutcome { value, error: None }
             }
             Err(err) => EvalOutcome {
                 value: ctx.value(),
@@ -728,6 +754,85 @@ impl CompiledExpr {
     }
 }
 
+const EXPR_CACHE_CAP: usize = 512;
+
+struct ExprCacheEntry {
+    mode: ExprMode,
+    source: String,
+    compiled: Rc<CompiledExpr>,
+}
+
+#[derive(Default)]
+struct ExprCache {
+    buckets: HashMap<u64, Vec<ExprCacheEntry>>,
+    order: VecDeque<u64>,
+    len: usize,
+}
+
+impl ExprCache {
+    fn key_hash(mode: ExprMode, source: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        mode.hash(&mut hasher);
+        source.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn get(&self, mode: ExprMode, source: &str) -> Option<Rc<CompiledExpr>> {
+        let hash = Self::key_hash(mode, source);
+        let bucket = self.buckets.get(&hash)?;
+        bucket
+            .iter()
+            .find(|entry| entry.mode == mode && entry.source == source)
+            .map(|entry| Rc::clone(&entry.compiled))
+    }
+
+    fn insert(&mut self, mode: ExprMode, source: &str, compiled: Rc<CompiledExpr>) {
+        let hash = Self::key_hash(mode, source);
+        if let Some(bucket) = self.buckets.get(&hash)
+            && bucket
+                .iter()
+                .any(|entry| entry.mode == mode && entry.source == source)
+        {
+            return;
+        }
+        if self.len >= EXPR_CACHE_CAP
+            && let Some(old_hash) = self.order.pop_front()
+            && let Some(bucket) = self.buckets.get_mut(&old_hash)
+            && !bucket.is_empty()
+        {
+            bucket.remove(0);
+            if bucket.is_empty() {
+                self.buckets.remove(&old_hash);
+            }
+            self.len -= 1;
+        }
+        self.buckets.entry(hash).or_default().push(ExprCacheEntry {
+            mode,
+            source: source.to_owned(),
+            compiled,
+        });
+        self.order.push_back(hash);
+        self.len += 1;
+    }
+}
+
+thread_local! {
+    static EXPR_CACHE: RefCell<ExprCache> = RefCell::new(ExprCache::default());
+}
+
+fn compile_cached(source: &str, mode: ExprMode) -> Result<Rc<CompiledExpr>, ExprError> {
+    if let Some(hit) = EXPR_CACHE.with(|cache| cache.borrow().get(mode, source)) {
+        return Ok(hit);
+    }
+    let compiled = Rc::new(CompiledExpr::compile(source, mode)?);
+    EXPR_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(mode, source, Rc::clone(&compiled));
+    });
+    Ok(compiled)
+}
+
 /// Compiles an expression string in the given [`ExprMode`].
 pub fn compile(source: &str, mode: ExprMode) -> Result<CompiledExpr, ExprError> {
     CompiledExpr::compile(source, mode)
@@ -735,14 +840,14 @@ pub fn compile(source: &str, mode: ExprMode) -> Result<CompiledExpr, ExprError> 
 
 /// Compiles and evaluates an expression string in a single step.
 pub fn eval(source: &str, ctx: &dyn ExprContext, config: &EvalConfig) -> Result<Value, ExprError> {
-    let compiled = CompiledExpr::compile(source, config.mode)?;
+    let compiled = compile_cached(source, config.mode)?;
     compiled.evaluate(ctx, config)
 }
 
 /// Compiles and evaluates an expression string, falling back to `ctx.value()` on
 /// any syntax, validation, or runtime error (Spec 03 §6.2).
 pub fn eval_with_fallback(source: &str, ctx: &dyn ExprContext, config: &EvalConfig) -> EvalOutcome {
-    match CompiledExpr::compile(source, config.mode) {
+    match compile_cached(source, config.mode) {
         Ok(compiled) => compiled.evaluate_with_fallback(ctx, config),
         Err(err) => EvalOutcome {
             value: ctx.value(),
@@ -1881,6 +1986,128 @@ mod tests {
         assert_eq!(
             eval("wiggle()", &RemappedSceneCtx, &cfg).unwrap(),
             expected_wig
+        );
+    }
+
+    #[test]
+    fn expr_cache_fallback_value_skip_binary_search_and_static_builtins() {
+        use std::cell::Cell;
+
+        // 1. Thread-local EXPR_CACHE separates modes and enforces capacity cap.
+        let mut local_cache = ExprCache::default();
+        let c_plus = Rc::new(compile("1 + 2", ExprMode::ExpressionsPlus).unwrap());
+        let c_van = Rc::new(compile("1 + 2", ExprMode::VanillaCm3).unwrap());
+        local_cache.insert(ExprMode::ExpressionsPlus, "1 + 2", Rc::clone(&c_plus));
+        local_cache.insert(ExprMode::VanillaCm3, "1 + 2", Rc::clone(&c_van));
+        assert_eq!(
+            local_cache
+                .get(ExprMode::ExpressionsPlus, "1 + 2")
+                .unwrap()
+                .mode(),
+            ExprMode::ExpressionsPlus
+        );
+        assert_eq!(
+            local_cache
+                .get(ExprMode::VanillaCm3, "1 + 2")
+                .unwrap()
+                .mode(),
+            ExprMode::VanillaCm3
+        );
+        for i in 0..(EXPR_CACHE_CAP + 32) {
+            local_cache.insert(
+                ExprMode::ExpressionsPlus,
+                &format!("k{i}"),
+                Rc::clone(&c_plus),
+            );
+        }
+        assert_eq!(local_cache.len, EXPR_CACHE_CAP);
+        assert!(
+            local_cache
+                .get(ExprMode::ExpressionsPlus, "1 + 2")
+                .is_none()
+        );
+
+        // 2. evaluate_with_fallback avoids calling ctx.value() when result is finite.
+        struct CountingCtx {
+            value_calls: Cell<usize>,
+            key_calls: Cell<usize>,
+        }
+        impl ExprContext for CountingCtx {
+            fn value(&self) -> Value {
+                self.value_calls.set(self.value_calls.get() + 1);
+                Value::Number(99.0)
+            }
+            fn property_num_keys(&self, _id: &HandleId) -> usize {
+                128
+            }
+            fn property_key(
+                &self,
+                _id: &HandleId,
+                index_1based: usize,
+            ) -> Result<KeyframeRecord, ExprError> {
+                self.key_calls.set(self.key_calls.get() + 1);
+                Ok(KeyframeRecord {
+                    index: index_1based,
+                    time: (index_1based as f64) * 0.5,
+                    value: Value::Number(index_1based as f64),
+                })
+            }
+        }
+
+        let ctx = CountingCtx {
+            value_calls: Cell::new(0),
+            key_calls: Cell::new(0),
+        };
+        let cfg = EvalConfig::expressions_plus();
+        let ok_res = eval_with_fallback("sin(0) + 42", &ctx, &cfg);
+        assert_eq!(ok_res.error, None);
+        assert_eq!(ok_res.value, Value::Number(42.0));
+        assert_eq!(
+            ctx.value_calls.get(),
+            0,
+            "finite result must not fetch ctx.value()"
+        );
+
+        let nan_res = eval_with_fallback("0 / 0", &ctx, &cfg);
+        assert!(nan_res.error.is_some());
+        assert_eq!(nan_res.value, Value::Number(99.0));
+        assert_eq!(ctx.value_calls.get(), 1);
+
+        // 3. property_nearest_key uses O(log N) binary search with earlier-key tie breaking.
+        let pid = HandleId::new("thisProperty");
+        ctx.key_calls.set(0);
+        let k_mid = ctx.property_nearest_key(&pid, 32.0).unwrap();
+        assert_eq!(k_mid.index, 64);
+        assert!(
+            ctx.key_calls.get() <= 16,
+            "expected O(log N) key lookups, got {}",
+            ctx.key_calls.get()
+        );
+        // Equidistant between key 10 (t=5.0) and key 11 (t=5.5) -> earlier key 10 wins.
+        let k_tie = ctx.property_nearest_key(&pid, 5.25).unwrap();
+        assert_eq!(k_tie.index, 10);
+        assert_eq!(ctx.property_nearest_key(&pid, -10.0).unwrap().index, 1);
+        assert_eq!(ctx.property_nearest_key(&pid, 999.0).unwrap().index, 128);
+        assert_eq!(ctx.property_nearest_key(&pid, f64::NAN).unwrap().index, 1);
+
+        // 4. Static builtin identity, Math stack/spill arg counts, and case-insensitive cm3_ease.
+        assert_eq!(eval_plus("Math.sin === sin"), Value::Bool(true));
+        assert_eq!(eval_plus("Math.max(1, 5, 3, 2)"), Value::Number(5.0));
+        assert_eq!(eval_plus("Math.max(1, 5, 3, 2, 9, 4)"), Value::Number(9.0));
+        assert_near(
+            builtins::cm3_ease(0.5, "QUADRATIC", "INOUT").unwrap(),
+            0.5,
+            1e-12,
+        );
+        assert_near(
+            builtins::cm3_ease(0.5, "Cubic", "OutIn").unwrap(),
+            0.5,
+            1e-12,
+        );
+        assert_near(
+            builtins::cm3_ease(0.37, "LiNeAr", "anything").unwrap(),
+            0.37,
+            1e-12,
         );
     }
 }

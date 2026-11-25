@@ -163,7 +163,8 @@ fn import_pz_from_reader<R: Read>(reader: R) -> Result<PzImportResult, ProjectEr
                         limit_bytes: MAX_RETAINED_ASSET_BYTES,
                     });
                 }
-                let mut data = Vec::new();
+                let reserve = declared_size.min(remaining_budget).min(32 * 1024 * 1024) as usize;
+                let mut data = Vec::with_capacity(reserve);
                 let mut bounded = (&mut entry).take(remaining_budget.saturating_add(1));
                 bounded
                     .read_to_end(&mut data)
@@ -282,6 +283,7 @@ fn import_pz_from_reader<R: Read>(reader: R) -> Result<PzImportResult, ProjectEr
     let (mut assets, asset_key_remap, explicit_kind_keys) = parse_assets(
         root_obj.get("assets"),
         &mut binary_entries,
+        &raw_entry_hashes,
         &declared_missing_assets,
         &mut warnings,
     );
@@ -727,6 +729,7 @@ fn is_full_sha256_hex(s: &str) -> bool {
 fn parse_assets(
     assets_val: Option<&Value>,
     binary_entries: &mut BTreeMap<String, Vec<u8>>,
+    raw_entry_hashes: &BTreeMap<String, (u64, String)>,
     declared_missing: &BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> (
@@ -771,17 +774,21 @@ fn parse_assets(
             .unwrap_or(key.as_str())
             .to_owned();
 
-        let blob = binary_entries
-            .remove(key)
-            .or_else(|| binary_entries.remove(&format!("assets/{key}")))
-            .or_else(|| binary_entries.remove(&declared_sha))
-            .or_else(|| binary_entries.remove(&format!("assets/{declared_sha}")))
-            .or_else(|| binary_entries.remove(&format!("pz/{key}")))
-            .or_else(|| binary_entries.remove(&format!("pz/{declared_sha}")));
+        let matched_entry = binary_entries
+            .remove_entry(key)
+            .or_else(|| binary_entries.remove_entry(&format!("assets/{key}")))
+            .or_else(|| binary_entries.remove_entry(&declared_sha))
+            .or_else(|| binary_entries.remove_entry(&format!("assets/{declared_sha}")))
+            .or_else(|| binary_entries.remove_entry(&format!("pz/{key}")))
+            .or_else(|| binary_entries.remove_entry(&format!("pz/{declared_sha}")));
 
-        let (bytes, size, sha256, missing) = if let Some(data) = blob {
+        let (bytes, size, sha256, missing) = if let Some((entry_name, data)) = matched_entry {
             let sz = data.len() as u64;
-            let full_sha = sha256_hex(&data);
+            let full_sha = raw_entry_hashes
+                .get(&entry_name)
+                .filter(|(hashed_sz, _)| *hashed_sz == sz)
+                .map(|(_, hash)| hash.clone())
+                .unwrap_or_else(|| sha256_hex(&data));
             (Some(data), sz, full_sha, false)
         } else if external {
             let normalized_sha = if is_full_sha256_hex(&declared_sha) {

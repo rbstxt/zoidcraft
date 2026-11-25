@@ -115,6 +115,14 @@ pub fn decode_audio_bytes(bytes: &[u8], hint_ext: Option<&str>) -> Result<AudioB
         .channels
         .as_ref()
         .and_then(|ch| u16::try_from(ch.count()).ok());
+    let estimated_samples = track
+        .num_frames
+        .and_then(|frames| header_channels.map(|ch| frames.saturating_mul(u64::from(ch))))
+        .map_or(0, |n| {
+            usize::try_from(n)
+                .unwrap_or(MAX_DECODED_AUDIO_SAMPLES)
+                .min(MAX_DECODED_AUDIO_SAMPLES)
+        });
 
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
@@ -123,6 +131,9 @@ pub fn decode_audio_bytes(bytes: &[u8], hint_ext: Option<&str>) -> Result<AudioB
     let mut sample_rate: Option<u32> = None;
     let mut channels: Option<u16> = None;
     let mut samples_interleaved_f32 = Vec::new();
+    if estimated_samples > 0 {
+        let _ = samples_interleaved_f32.try_reserve(estimated_samples);
+    }
     let mut scratch: Vec<f32> = Vec::new();
 
     loop {
@@ -266,9 +277,10 @@ pub fn resample_stereo(buffer: &AudioBuffer, target_sample_rate: u32) -> Vec<[f3
 
     let mut out = Vec::with_capacity(out_frames);
     if use_antialias {
+        let sinc_kernel = SincResampleKernel::new(ratio);
         for out_idx in 0..out_frames {
             let src_pos = (out_idx as f64) * ratio;
-            out.push(sample_stereo_sinc(buffer, src_pos, ratio));
+            out.push(sinc_kernel.sample_stereo(buffer, src_pos));
         }
     } else {
         for out_idx in 0..out_frames {
@@ -286,55 +298,190 @@ pub fn resample_stereo(buffer: &AudioBuffer, target_sample_rate: u32) -> Vec<[f3
     out
 }
 
+/// Precomputed Hann-windowed sinc oscillator step constants for a fixed downsampling ratio.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SincResampleKernel {
+    cutoff: f64,
+    radius: isize,
+    radius_f: f64,
+    inv_radius_pi: f64,
+    w_sin_step: f64,
+    w_cos_step: f64,
+    x_step: f64,
+    x_sin_step: f64,
+    x_cos_step: f64,
+}
+
+impl SincResampleKernel {
+    #[must_use]
+    pub(crate) fn new(ratio: f64) -> Self {
+        let effective_ratio = ratio.max(1.0);
+        // Cutoff slightly below target Nyquist (0.9 / ratio) to prevent fold-back aliasing.
+        let cutoff = 0.9 / effective_ratio;
+        let radius = ((8.0 * effective_ratio - 1e-9).ceil() as isize).clamp(8, 64);
+        let radius_f = radius as f64;
+        let inv_radius_pi = PI / radius_f;
+        let (w_sin_step, w_cos_step) = (-inv_radius_pi).sin_cos();
+        let x_step = -PI * cutoff;
+        let (x_sin_step, x_cos_step) = x_step.sin_cos();
+        Self {
+            cutoff,
+            radius,
+            radius_f,
+            inv_radius_pi,
+            w_sin_step,
+            w_cos_step,
+            x_step,
+            x_sin_step,
+            x_cos_step,
+        }
+    }
+
+    /// Samples a stereo frame from `buffer` at fractional source frame index `src_pos` using a
+    /// 2-oscillator trigonometric recurrence (2 `sin_cos` calls total before the tap loop) and
+    /// channel-specialized inner loops.
+    #[must_use]
+    pub(crate) fn sample_stereo(&self, buffer: &AudioBuffer, src_pos: f64) -> [f32; 2] {
+        let frames = buffer.frame_count();
+        if !src_pos.is_finite() || src_pos < 0.0 || frames == 0 {
+            return [0.0, 0.0];
+        }
+        let center = src_pos.floor() as isize;
+        if center as usize >= frames {
+            return [0.0, 0.0];
+        }
+        let max_idx = (frames - 1) as isize;
+        let mut start = (center - self.radius).max(0);
+        let end = (center + self.radius).min(max_idx);
+        if start <= end && (src_pos - start as f64) > self.radius_f {
+            start += 1;
+        }
+        if start > end {
+            return downmix_frame_to_stereo(buffer, (center as usize).min(frames - 1));
+        }
+
+        let start_u = start as usize;
+        let end_u = end as usize;
+        let d0 = src_pos - start as f64;
+        let (mut w_sin, mut w_cos) = (self.inv_radius_pi * d0).sin_cos();
+        let mut x = PI * self.cutoff * d0;
+        let (mut x_sin, mut x_cos) = x.sin_cos();
+
+        let w_sin_step = self.w_sin_step;
+        let w_cos_step = self.w_cos_step;
+        let x_step = self.x_step;
+        let x_sin_step = self.x_sin_step;
+        let x_cos_step = self.x_cos_step;
+
+        let mut acc_l = 0.0_f64;
+        let mut acc_r = 0.0_f64;
+        let mut weight_sum = 0.0_f64;
+
+        let samples = &buffer.samples_interleaved_f32;
+        match buffer.channels {
+            1 => {
+                for &raw in &samples[start_u..=end_u] {
+                    let window = 0.5 * (1.0 + w_cos);
+                    let sinc = if x.abs() < 1e-4 {
+                        1.0 - x * x * (1.0 / 6.0)
+                    } else {
+                        x_sin / x
+                    };
+                    let w = sinc * window;
+                    let m = f64::from(clean_sample(raw));
+                    acc_l += m * w;
+                    weight_sum += w;
+
+                    let next_w_sin = w_sin * w_cos_step + w_cos * w_sin_step;
+                    let next_w_cos = w_cos * w_cos_step - w_sin * w_sin_step;
+                    w_sin = next_w_sin;
+                    w_cos = next_w_cos;
+
+                    x += x_step;
+                    let next_x_sin = x_sin * x_cos_step + x_cos * x_sin_step;
+                    let next_x_cos = x_cos * x_cos_step - x_sin * x_sin_step;
+                    x_sin = next_x_sin;
+                    x_cos = next_x_cos;
+                }
+                if weight_sum.abs() <= 1e-12 {
+                    return downmix_frame_to_stereo(buffer, (center as usize).min(frames - 1));
+                }
+                let out = (acc_l / weight_sum) as f32;
+                return [out, out];
+            }
+            2 => {
+                for &[raw_l, raw_r] in samples[start_u * 2..(end_u + 1) * 2].as_chunks::<2>().0 {
+                    let window = 0.5 * (1.0 + w_cos);
+                    let sinc = if x.abs() < 1e-4 {
+                        1.0 - x * x * (1.0 / 6.0)
+                    } else {
+                        x_sin / x
+                    };
+                    let w = sinc * window;
+                    acc_l += f64::from(clean_sample(raw_l)) * w;
+                    acc_r += f64::from(clean_sample(raw_r)) * w;
+                    weight_sum += w;
+
+                    let next_w_sin = w_sin * w_cos_step + w_cos * w_sin_step;
+                    let next_w_cos = w_cos * w_cos_step - w_sin * w_sin_step;
+                    w_sin = next_w_sin;
+                    w_cos = next_w_cos;
+
+                    x += x_step;
+                    let next_x_sin = x_sin * x_cos_step + x_cos * x_sin_step;
+                    let next_x_cos = x_cos * x_cos_step - x_sin * x_sin_step;
+                    x_sin = next_x_sin;
+                    x_cos = next_x_cos;
+                }
+            }
+            _ => {
+                for idx in start_u..=end_u {
+                    let window = 0.5 * (1.0 + w_cos);
+                    let sinc = if x.abs() < 1e-4 {
+                        1.0 - x * x * (1.0 / 6.0)
+                    } else {
+                        x_sin / x
+                    };
+                    let w = sinc * window;
+                    let s = downmix_frame_to_stereo(buffer, idx);
+                    acc_l += f64::from(s[0]) * w;
+                    acc_r += f64::from(s[1]) * w;
+                    weight_sum += w;
+
+                    let next_w_sin = w_sin * w_cos_step + w_cos * w_sin_step;
+                    let next_w_cos = w_cos * w_cos_step - w_sin * w_sin_step;
+                    w_sin = next_w_sin;
+                    w_cos = next_w_cos;
+
+                    x += x_step;
+                    let next_x_sin = x_sin * x_cos_step + x_cos * x_sin_step;
+                    let next_x_cos = x_cos * x_cos_step - x_sin * x_sin_step;
+                    x_sin = next_x_sin;
+                    x_cos = next_x_cos;
+                }
+            }
+        }
+
+        if weight_sum.abs() <= 1e-12 {
+            return downmix_frame_to_stereo(buffer, (center as usize).min(frames - 1));
+        }
+        let inv = 1.0 / weight_sum;
+        [(acc_l * inv) as f32, (acc_r * inv) as f32]
+    }
+}
+
 /// Samples a stereo frame from `buffer` at fractional source frame index `src_pos` using a
 /// Hann-windowed sinc low-pass anti-aliasing filter tuned for downsampling ratio `ratio > 1.0`.
 #[must_use]
 pub(crate) fn sample_stereo_sinc(buffer: &AudioBuffer, src_pos: f64, ratio: f64) -> [f32; 2] {
-    let frames = buffer.frame_count();
-    if !src_pos.is_finite() || !ratio.is_finite() || src_pos < 0.0 || frames == 0 {
+    if !ratio.is_finite() {
         return [0.0, 0.0];
     }
-    let center = src_pos.floor() as isize;
-    if center as usize >= frames {
-        return [0.0, 0.0];
-    }
-    let effective_ratio = ratio.max(1.0);
-    // Cutoff slightly below target Nyquist (0.9 / ratio) to prevent fold-back aliasing.
-    let cutoff = 0.9 / effective_ratio;
-    let radius = ((8.0 * effective_ratio).ceil() as isize).clamp(8, 64);
-    let radius_f = radius as f64;
-    let max_idx = (frames - 1) as isize;
-
-    let mut acc_l = 0.0_f64;
-    let mut acc_r = 0.0_f64;
-    let mut weight_sum = 0.0_f64;
-
-    let start = (center - radius).max(0);
-    let end = (center + radius).min(max_idx);
-    for idx in start..=end {
-        let d = src_pos - idx as f64;
-        if d.abs() > radius_f {
-            continue;
-        }
-        let window = 0.5 * (1.0 + (PI * d / radius_f).cos());
-        let x = PI * cutoff * d;
-        let sinc = if x.abs() < 1e-9 { 1.0 } else { x.sin() / x };
-        let w = sinc * window;
-        let s = downmix_frame_to_stereo(buffer, idx as usize);
-        acc_l += f64::from(s[0]) * w;
-        acc_r += f64::from(s[1]) * w;
-        weight_sum += w;
-    }
-
-    if weight_sum.abs() <= 1e-12 {
-        return downmix_frame_to_stereo(buffer, (center as usize).min(frames - 1));
-    }
-    let inv = 1.0 / weight_sum;
-    [(acc_l * inv) as f32, (acc_r * inv) as f32]
+    SincResampleKernel::new(ratio).sample_stereo(buffer, src_pos)
 }
 
 #[inline]
-fn clean_sample(s: f32) -> f32 {
+pub(crate) fn clean_sample(s: f32) -> f32 {
     if s.is_finite() { s } else { 0.0 }
 }
 
@@ -421,13 +568,11 @@ pub fn f32_to_pcm16(sample: f32) -> i16 {
     }
     let clamped = sample.clamp(-1.0, 1.0);
     let scaled = if clamped < 0.0 {
-        f64::from(clamped) * 32_768.0
+        clamped * 32_768.0
     } else {
-        f64::from(clamped) * 32_767.0
+        clamped * 32_767.0
     };
-    scaled
-        .round()
-        .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+    scaled.round().clamp(-32_768.0, 32_767.0) as i16
 }
 
 pub(crate) fn checked_wav_chunk_sizes(
@@ -760,5 +905,93 @@ mod tests {
             (steady_lo_peak - 1.0).abs() < 0.05,
             "expected 1 kHz passband tone near 1.0, got {steady_lo_peak}"
         );
+    }
+
+    #[test]
+    fn trig_recurrence_sinc_matches_direct_sin_cos_reference() {
+        fn reference_sample_stereo_sinc(
+            buffer: &AudioBuffer,
+            src_pos: f64,
+            ratio: f64,
+        ) -> [f32; 2] {
+            let frames = buffer.frame_count();
+            if !src_pos.is_finite() || !ratio.is_finite() || src_pos < 0.0 || frames == 0 {
+                return [0.0, 0.0];
+            }
+            let center = src_pos.floor() as isize;
+            if center as usize >= frames {
+                return [0.0, 0.0];
+            }
+            let effective_ratio = ratio.max(1.0);
+            let cutoff = 0.9 / effective_ratio;
+            let radius = ((8.0 * effective_ratio - 1e-9).ceil() as isize).clamp(8, 64);
+            let radius_f = radius as f64;
+            let max_idx = (frames - 1) as isize;
+
+            let mut acc_l = 0.0_f64;
+            let mut acc_r = 0.0_f64;
+            let mut weight_sum = 0.0_f64;
+
+            let start = (center - radius).max(0);
+            let end = (center + radius).min(max_idx);
+            for idx in start..=end {
+                let d = src_pos - idx as f64;
+                if d.abs() > radius_f {
+                    continue;
+                }
+                let window = 0.5 * (1.0 + (PI * d / radius_f).cos());
+                let x = PI * cutoff * d;
+                let sinc = if x.abs() < 1e-9 { 1.0 } else { x.sin() / x };
+                let w = sinc * window;
+                let s = downmix_frame_to_stereo(buffer, idx as usize);
+                acc_l += f64::from(s[0]) * w;
+                acc_r += f64::from(s[1]) * w;
+                weight_sum += w;
+            }
+            if weight_sum.abs() <= 1e-12 {
+                return downmix_frame_to_stereo(buffer, (center as usize).min(frames - 1));
+            }
+            let inv = 1.0 / weight_sum;
+            [(acc_l * inv) as f32, (acc_r * inv) as f32]
+        }
+
+        let frames = 512_usize;
+        for channels in [1_u16, 2, 6] {
+            let mut samples = Vec::with_capacity(frames * usize::from(channels));
+            for i in 0..frames {
+                let t = i as f64 / 48_000.0;
+                for c in 0..channels {
+                    let freq = 440.0 + f64::from(c) * 310.0;
+                    samples.push((TAU * freq * t + f64::from(c) * 0.37).sin() as f32 * 0.8);
+                }
+            }
+            let buf = AudioBuffer {
+                sample_rate: 96_000,
+                channels,
+                samples_interleaved_f32: samples,
+            };
+            for ratio in [1.1, 1.5, 2.0, 4.0, 10.0] {
+                let kernel = SincResampleKernel::new(ratio);
+                for &pos in &[
+                    0.0,
+                    0.35,
+                    1.0 + 1e-10,
+                    12.0 + 1e-6,
+                    64.0,
+                    128.5,
+                    250.999999,
+                    511.25,
+                ] {
+                    let expected = reference_sample_stereo_sinc(&buf, pos, ratio);
+                    let got = kernel.sample_stereo(&buf, pos);
+                    let diff_l = (got[0] - expected[0]).abs();
+                    let diff_r = (got[1] - expected[1]).abs();
+                    assert!(
+                        diff_l < 1e-6 && diff_r < 1e-6,
+                        "ch={channels} ratio={ratio} pos={pos}: got={got:?} expected={expected:?} diff=({diff_l}, {diff_r})"
+                    );
+                }
+            }
+        }
     }
 }

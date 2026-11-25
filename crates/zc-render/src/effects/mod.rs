@@ -2720,6 +2720,169 @@ struct CustomPipelineEntry {
     last_used: u64,
 }
 
+const DEFAULT_EFFECT_SCRATCH_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+struct ScratchTarget {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ScratchKey {
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+}
+
+struct PooledScratchEntry {
+    target: ScratchTarget,
+    last_used_epoch: u64,
+}
+
+struct EffectScratchPool {
+    buckets: HashMap<ScratchKey, Vec<PooledScratchEntry>>,
+    pooled_bytes: usize,
+    max_bytes: usize,
+    epoch: u64,
+}
+
+impl EffectScratchPool {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            pooled_bytes: 0,
+            max_bytes,
+            epoch: 0,
+        }
+    }
+
+    fn begin_frame(&mut self) {
+        self.epoch = self.epoch.saturating_add(1);
+    }
+
+    fn acquire(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        label: &str,
+    ) -> ScratchTarget {
+        let w = width.max(1);
+        let h = height.max(1);
+        let key = ScratchKey {
+            width: w,
+            height: h,
+            format,
+        };
+        if let Some(entries) = self.buckets.get_mut(&key)
+            && let Some(entry) = entries.pop()
+        {
+            self.pooled_bytes = self.pooled_bytes.saturating_sub(entry.target.bytes);
+            return entry.target;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bpp = match format {
+            wgpu::TextureFormat::Rgba16Float => 8usize,
+            _ => 4usize,
+        };
+        let bytes = (w as usize).saturating_mul(h as usize).saturating_mul(bpp);
+        ScratchTarget {
+            _texture: texture,
+            view,
+            width: w,
+            height: h,
+            format,
+            bytes,
+        }
+    }
+
+    fn release(&mut self, target: ScratchTarget) {
+        let bytes = target.bytes;
+        if self.max_bytes == 0 || bytes > self.max_bytes {
+            return;
+        }
+        let key = ScratchKey {
+            width: target.width,
+            height: target.height,
+            format: target.format,
+        };
+        self.buckets
+            .entry(key)
+            .or_default()
+            .push(PooledScratchEntry {
+                target,
+                last_used_epoch: self.epoch,
+            });
+        self.pooled_bytes = self.pooled_bytes.saturating_add(bytes);
+        self.evict_to_budget();
+    }
+
+    fn trim_stale(&mut self, max_age_frames: u64) {
+        let cutoff = self.epoch.saturating_sub(max_age_frames);
+        let mut removed_bytes = 0usize;
+        self.buckets.retain(|_, entries| {
+            entries.retain(|entry| {
+                if entry.last_used_epoch < cutoff {
+                    removed_bytes = removed_bytes.saturating_add(entry.target.bytes);
+                    false
+                } else {
+                    true
+                }
+            });
+            !entries.is_empty()
+        });
+        self.pooled_bytes = self.pooled_bytes.saturating_sub(removed_bytes);
+    }
+
+    fn clear(&mut self) {
+        self.buckets.clear();
+        self.pooled_bytes = 0;
+    }
+
+    fn evict_to_budget(&mut self) {
+        while self.pooled_bytes > self.max_bytes {
+            let mut oldest: Option<(ScratchKey, usize, u64)> = None;
+            for (&key, entries) in &self.buckets {
+                for (idx, entry) in entries.iter().enumerate() {
+                    let is_older = match oldest {
+                        None => true,
+                        Some((_, _, best)) => entry.last_used_epoch < best,
+                    };
+                    if is_older {
+                        oldest = Some((key, idx, entry.last_used_epoch));
+                    }
+                }
+            }
+            let Some((key, idx, _)) = oldest else {
+                break;
+            };
+            if let Some(entries) = self.buckets.get_mut(&key) {
+                let removed = entries.swap_remove(idx);
+                self.pooled_bytes = self.pooled_bytes.saturating_sub(removed.target.bytes);
+            }
+        }
+    }
+}
+
 /// Lazily-compiled GPU post-processing pipeline registry and multi-pass effect runner.
 pub struct EffectRegistry {
     format: wgpu::TextureFormat,
@@ -2733,6 +2896,7 @@ pub struct EffectRegistry {
     polly_mesh_pipeline: Option<wgpu::RenderPipeline>,
     custom_pipelines: HashMap<u64, CustomPipelineEntry>,
     custom_tick: u64,
+    scratch_pool: EffectScratchPool,
 }
 
 impl EffectRegistry {
@@ -2873,7 +3037,23 @@ impl EffectRegistry {
             polly_mesh_pipeline: None,
             custom_pipelines: HashMap::new(),
             custom_tick: 0,
+            scratch_pool: EffectScratchPool::new(DEFAULT_EFFECT_SCRATCH_MAX_BYTES),
         }
+    }
+
+    /// Advances the internal frame epoch of the effect scratch target pool.
+    pub fn begin_frame(&mut self) {
+        self.scratch_pool.begin_frame();
+    }
+
+    /// Releases pooled intermediate effect targets older than `max_age_frames` epochs.
+    pub fn trim_scratch_stale(&mut self, max_age_frames: u64) {
+        self.scratch_pool.trim_stale(max_age_frames);
+    }
+
+    /// Immediately drops all idle intermediate textures held in the effect scratch pool.
+    pub fn clear_scratch_pool(&mut self) {
+        self.scratch_pool.clear();
     }
 
     /// Returns the render target texture format this registry compiles pipelines for.
@@ -3162,43 +3342,38 @@ impl EffectRegistry {
         // For large blur radii (`delta > 2.0`), build a 2x2 anti-aliased pyramid until the
         // effective tap stride is <= 2 texels so 21-tap box blur stays buttery smooth with
         // zero discrete ghost clones.
-        let mut owned_mips: Vec<wgpu::Texture> = Vec::new();
+        let mut owned_mips: Vec<ScratchTarget> = Vec::new();
         let mut work_w = width;
         let mut work_h = height;
         let mut eff_delta = raw_delta;
-        let mut down_view: Option<wgpu::TextureView> = None;
         while eff_delta > 2.0 && work_w > 16 && work_h > 16 {
             let nw = (work_w / 2).max(1);
             let nh = (work_h / 2).max(1);
             let mip_tex = self.create_temp_target(device, nw, nh, "zc-boxblur-mip");
-            let mip_view = mip_tex.create_view(&wgpu::TextureViewDescriptor::default());
             let mut u_dn = EffectUniforms::from_params(params);
             u_dn.resolution = [nw as f32, nh as f32];
             u_dn.pass = 99;
             u_dn.p0 = [0.5 / (work_w as f32), 0.5 / (work_h as f32), 0.0, 0.0];
-            let src_v = down_view.as_ref().unwrap_or(targets.input);
+            let src_v = owned_mips.last().map_or(targets.input, |m| &m.view);
             self.encode_pass(
                 device,
                 encoder,
                 (canonical, false, self.format),
                 &u_dn,
                 src_v,
-                &mip_view,
+                &mip_tex.view,
                 None,
                 None,
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
             owned_mips.push(mip_tex);
-            down_view = Some(mip_view);
             work_w = nw;
             work_h = nh;
             eff_delta *= 0.5;
         }
         let eff_delta = eff_delta.min(2.0);
-        let blur_src = down_view.as_ref().unwrap_or(targets.input);
-
         let temp = self.create_temp_target(device, work_w, work_h, "zc-boxblur-temp");
-        let temp_view = temp.create_view(&wgpu::TextureViewDescriptor::default());
+        let blur_src = owned_mips.last().map_or(targets.input, |m| &m.view);
 
         // Pass 0: Vertical (blur_src -> temp at work_w x work_h)
         let mut u_v = EffectUniforms::from_params(params);
@@ -3211,7 +3386,7 @@ impl EffectRegistry {
             (canonical, false, self.format),
             &u_v,
             blur_src,
-            &temp_view,
+            &temp.view,
             None,
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -3226,13 +3401,14 @@ impl EffectRegistry {
             encoder,
             (canonical, false, self.format),
             &u_h,
-            &temp_view,
+            &temp.view,
             targets.output,
             None,
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
-        let _ = owned_mips;
+        self.release_temp_target(temp);
+        self.release_temp_targets(owned_mips);
         Ok(())
     }
 
@@ -3249,51 +3425,45 @@ impl EffectRegistry {
         let raw_delta = params.float_or("delta", 1.0).abs();
 
         // Downsample smoothly when `delta > 2.0` so large Gaussian radii never scatter ghost clones.
-        let mut owned_mips: Vec<wgpu::Texture> = Vec::new();
+        let mut owned_mips: Vec<ScratchTarget> = Vec::new();
         let mut work_w = width;
         let mut work_h = height;
         let mut eff_delta = raw_delta;
-        let mut down_view: Option<wgpu::TextureView> = None;
         while eff_delta > 2.0 && work_w > 16 && work_h > 16 {
             let nw = (work_w / 2).max(1);
             let nh = (work_h / 2).max(1);
             let mip_tex = self.create_temp_target(device, nw, nh, "zc-gauss-mip");
-            let mip_view = mip_tex.create_view(&wgpu::TextureViewDescriptor::default());
             let mut u_dn = EffectUniforms::from_params(params);
             u_dn.resolution = [nw as f32, nh as f32];
             u_dn.pass = 99;
             u_dn.p0 = [0.5 / (work_w as f32), 0.5 / (work_h as f32), 0.0, 0.0];
-            let src_v = down_view.as_ref().unwrap_or(targets.input);
+            let src_v = owned_mips.last().map_or(targets.input, |m| &m.view);
             self.encode_pass(
                 device,
                 encoder,
                 (canonical, false, self.format),
                 &u_dn,
                 src_v,
-                &mip_view,
+                &mip_tex.view,
                 None,
                 None,
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
             owned_mips.push(mip_tex);
-            down_view = Some(mip_view);
             work_w = nw;
             work_h = nh;
             eff_delta *= 0.5;
         }
         let eff_delta = eff_delta.min(2.0);
-        let blur_src = down_view.as_ref().unwrap_or(targets.input);
-
         let temp_a = self.create_temp_target(device, work_w, work_h, "zc-gauss-temp-a");
         let temp_b = self.create_temp_target(device, work_w, work_h, "zc-gauss-temp-b");
-        let view_a = temp_a.create_view(&wgpu::TextureViewDescriptor::default());
-        let view_b = temp_b.create_view(&wgpu::TextureViewDescriptor::default());
+        let blur_src = owned_mips.last().map_or(targets.input, |m| &m.view);
         let inv_w = 1.0 / (work_w as f32);
         let inv_h = 1.0 / (work_h as f32);
 
         // 3 consecutive iterations of H -> V = 6 passes total.
         for iter in 0..3u32 {
-            let src_h = if iter == 0 { blur_src } else { &view_b };
+            let src_h = if iter == 0 { blur_src } else { &temp_b.view };
             let mut u_h = EffectUniforms::from_params(params);
             u_h.resolution = [work_w as f32, work_h as f32];
             u_h.pass = iter * 2;
@@ -3304,13 +3474,17 @@ impl EffectRegistry {
                 (canonical, false, self.format),
                 &u_h,
                 src_h,
-                &view_a,
+                &temp_a.view,
                 None,
                 None,
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
 
-            let dst_v = if iter == 2 { targets.output } else { &view_b };
+            let dst_v = if iter == 2 {
+                targets.output
+            } else {
+                &temp_b.view
+            };
             let mut u_v = EffectUniforms::from_params(params);
             if iter < 2 {
                 u_v.resolution = [work_w as f32, work_h as f32];
@@ -3322,14 +3496,16 @@ impl EffectRegistry {
                 encoder,
                 (canonical, false, self.format),
                 &u_v,
-                &view_a,
+                &temp_a.view,
                 dst_v,
                 None,
                 None,
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
         }
-        let _ = owned_mips;
+        self.release_temp_target(temp_a);
+        self.release_temp_target(temp_b);
+        self.release_temp_targets(owned_mips);
         Ok(())
     }
 
@@ -3377,24 +3553,22 @@ impl EffectRegistry {
 
         let temp_a = self.create_temp_target(device, width, height, "zc-dirblur-a");
         let temp_b = self.create_temp_target(device, width, height, "zc-dirblur-b");
-        let view_a = temp_a.create_view(&wgpu::TextureViewDescriptor::default());
-        let view_b = temp_b.create_view(&wgpu::TextureViewDescriptor::default());
 
         let last_idx = steps.len() - 1;
         for (idx, &step_px) in steps.iter().enumerate() {
             let src_v = if idx == 0 {
                 targets.input
             } else if idx % 2 == 1 {
-                &view_a
+                &temp_a.view
             } else {
-                &view_b
+                &temp_b.view
             };
             let dst_v = if idx == last_idx {
                 targets.output
             } else if idx % 2 == 0 {
-                &view_a
+                &temp_a.view
             } else {
-                &view_b
+                &temp_b.view
             };
             let mut u = EffectUniforms::from_params(params);
             u.pass = idx as u32;
@@ -3411,6 +3585,8 @@ impl EffectRegistry {
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
         }
+        self.release_temp_target(temp_a);
+        self.release_temp_target(temp_b);
         Ok(())
     }
 
@@ -3465,7 +3641,6 @@ impl EffectRegistry {
         // Pass 0: High-pass extraction into mip-0 HDR seed texture.
         let bright_tex =
             self.create_temp_target_with_format(device, mw0, mh0, hdr_fmt, "zc-glow-bright");
-        let bright_view = bright_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let mut u_hp = EffectUniforms::from_params(params);
         u_hp.pass = 0;
         u_hp.p0 = [threshold, soften, 0.0, 0.0];
@@ -3475,7 +3650,7 @@ impl EffectRegistry {
             (canonical, false, hdr_fmt),
             &u_hp,
             targets.input,
-            &bright_view,
+            &bright_tex.view,
             None,
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -3484,12 +3659,11 @@ impl EffectRegistry {
         // HDR Rgba16Float accumulator prevents 8-bit highlight clipping before `amount` & highlight protection.
         let accum_tex =
             self.create_temp_target_with_format(device, mw0, mh0, hdr_fmt, "zc-glow-accum");
-        let accum_view = accum_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let kernels = [3.0_f32, 5.0, 7.0, 9.0, 11.0];
         let base_factors = [1.0_f32, 0.8, 0.6, 0.4, 0.2];
-        let mut prev_tex: Option<wgpu::Texture> = None;
-        let mut prev_view: Option<wgpu::TextureView> = None;
+        let mut prev_tex: Option<ScratchTarget> = None;
+        let mut scratch_used: Vec<ScratchTarget> = Vec::with_capacity(10);
 
         for (m, (&k_m, &f_m)) in kernels.iter().zip(base_factors.iter()).enumerate() {
             let div = 2.0_f32.powi((m + 1) as i32);
@@ -3502,9 +3676,10 @@ impl EffectRegistry {
 
             let mip_h =
                 self.create_temp_target_with_format(device, mw, mh, hdr_fmt, "zc-glow-mip-h");
-            let mip_h_view = mip_h.create_view(&wgpu::TextureViewDescriptor::default());
+            let mip_v =
+                self.create_temp_target_with_format(device, mw, mh, hdr_fmt, "zc-glow-mip-v");
 
-            let src_view = prev_view.as_ref().unwrap_or(&bright_view);
+            let src_view = prev_tex.as_ref().map_or(&bright_tex.view, |t| &t.view);
 
             // Horizontal Gaussian pass on mip m
             let mut u_bh = EffectUniforms::from_params(params);
@@ -3517,16 +3692,13 @@ impl EffectRegistry {
                 (canonical, false, hdr_fmt),
                 &u_bh,
                 src_view,
-                &mip_h_view,
+                &mip_h.view,
                 None,
                 None,
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
 
             // Vertical Gaussian pass on mip m (matches CM3 ALFPass & UnrealBloomPass: both run H + V)
-            let mip_v =
-                self.create_temp_target_with_format(device, mw, mh, hdr_fmt, "zc-glow-mip-v");
-            let mip_v_view = mip_v.create_view(&wgpu::TextureViewDescriptor::default());
             let mut u_bv = EffectUniforms::from_params(params);
             u_bv.resolution = [mw as f32, mh as f32];
             u_bv.pass = 1;
@@ -3536,14 +3708,14 @@ impl EffectRegistry {
                 encoder,
                 (canonical, false, hdr_fmt),
                 &u_bv,
-                &mip_h_view,
-                &mip_v_view,
+                &mip_h.view,
+                &mip_v.view,
                 None,
                 None,
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
 
-            // Weighted tinted additive HDR accumulation into `accum_view`
+            // Weighted tinted additive HDR accumulation into `accum_tex`
             let w_m = (f_m + ((1.2 - f_m) - f_m) * radius).max(0.0);
             let tint = if m < 3 { inner } else { outer };
             let mut u_acc = EffectUniforms::from_params(params);
@@ -3560,20 +3732,24 @@ impl EffectRegistry {
                 encoder,
                 (canonical, true, hdr_fmt),
                 &u_acc,
-                &mip_v_view,
-                &accum_view,
+                &mip_v.view,
+                &accum_tex.view,
                 None,
                 None,
                 load_op,
             );
 
-            prev_tex = Some(mip_v);
-            prev_view = Some(mip_v_view);
+            scratch_used.push(mip_h);
+            if let Some(old_prev) = prev_tex.replace(mip_v) {
+                scratch_used.push(old_prev);
+            }
         }
-        let _ = prev_tex;
+        if let Some(last_prev) = prev_tex {
+            scratch_used.push(last_prev);
+        }
 
         // Final composite onto unmodified input -> output
-        // For CM3 `bloom`, pass `bright_view` in `aux2` (`flags = 1`) so `blendThreshold`/`blendSoften`
+        // For CM3 `bloom`, pass `bright_tex.view` in `aux2` (`flags = 1`) so `blendThreshold`/`blendSoften`
         // gate on `brightTexture` luma exactly matching CM3 `bloom.js`.
         let mut u_fin = EffectUniforms::from_params(params);
         u_fin.pass = 3;
@@ -3586,10 +3762,17 @@ impl EffectRegistry {
             &u_fin,
             targets.input,
             targets.output,
-            Some(&accum_view),
-            if anamorphic { None } else { Some(&bright_view) },
+            Some(&accum_tex.view),
+            if anamorphic {
+                None
+            } else {
+                Some(&bright_tex.view)
+            },
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
+        self.release_temp_target(bright_tex);
+        self.release_temp_target(accum_tex);
+        self.release_temp_targets(scratch_used);
         Ok(())
     }
 
@@ -3604,7 +3787,6 @@ impl EffectRegistry {
     ) -> Result<(), EffectError> {
         let canonical = self.ensure_pipeline(device, "pixelsort", false)?;
         let map_tex = self.create_temp_target(device, width, height, "zc-pixelsort-map");
-        let map_view = map_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut u_sort = pack_effect_uniforms("pixelsort", params, false, false);
         u_sort.pass = 0;
@@ -3614,7 +3796,7 @@ impl EffectRegistry {
             (canonical, false, self.format),
             &u_sort,
             targets.input,
-            &map_view,
+            &map_tex.view,
             None,
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -3629,10 +3811,11 @@ impl EffectRegistry {
             &u_draw,
             targets.input,
             targets.output,
-            Some(&map_view),
+            Some(&map_tex.view),
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
+        self.release_temp_target(map_tex);
         Ok(())
     }
 
@@ -3648,8 +3831,6 @@ impl EffectRegistry {
         let canonical = self.ensure_pipeline(device, "dropshadow", false)?;
         let temp_a = self.create_temp_target(device, width, height, "zc-dropshadow-a");
         let temp_b = self.create_temp_target(device, width, height, "zc-dropshadow-b");
-        let view_a = temp_a.create_view(&wgpu::TextureViewDescriptor::default());
-        let view_b = temp_b.create_view(&wgpu::TextureViewDescriptor::default());
 
         let col = if params.values.contains_key("color") {
             params.vec3_or("color", [0.0, 0.0, 0.0])
@@ -3692,7 +3873,7 @@ impl EffectRegistry {
             (canonical, false, self.format),
             &u0,
             targets.input,
-            &view_a,
+            &temp_a.view,
             None,
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -3712,8 +3893,8 @@ impl EffectRegistry {
                     encoder,
                     (canonical, false, self.format),
                     &u1h,
-                    &view_a,
-                    &view_b,
+                    &temp_a.view,
+                    &temp_b.view,
                     None,
                     None,
                     wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -3727,8 +3908,8 @@ impl EffectRegistry {
                     encoder,
                     (canonical, false, self.format),
                     &u1v,
-                    &view_b,
-                    &view_a,
+                    &temp_b.view,
+                    &temp_a.view,
                     None,
                     None,
                     wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -3747,10 +3928,12 @@ impl EffectRegistry {
             &u2,
             targets.input,
             targets.output,
-            Some(&view_a),
+            Some(&temp_a.view),
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
+        self.release_temp_target(temp_a);
+        self.release_temp_target(temp_b);
         Ok(())
     }
 
@@ -3815,10 +3998,10 @@ impl EffectRegistry {
         let wf = width as f32;
         let hf = height as f32;
 
-        // Track HDR textures alive until encoder submission.
-        let mut owned_textures: Vec<wgpu::Texture> = Vec::new();
-        let mut fine_view: Option<wgpu::TextureView> = None;
-        let mut coarse_view: Option<wgpu::TextureView> = None;
+        // Track pooled HDR scratch targets alive until Pass 5 finishes encoding.
+        let mut scratch_used: Vec<ScratchTarget> = Vec::new();
+        let mut fine_result: Option<ScratchTarget> = None;
+        let mut coarse_result: Option<ScratchTarget> = None;
         let mut ae_mix: f32 = 0.0;
         let mut no_blur = false;
         let mut use_ae_blend = false;
@@ -3859,6 +4042,7 @@ impl EffectRegistry {
                     .clamp(0.0, 10.0);
                 let fine_level = (lod.floor() as i32) - 1;
                 let mix_frac = lod - lod.floor();
+                let need_coarse = mix_frac > 1e-6;
 
                 let split_box = |r: f32| -> [f32; 3] {
                     let n = (r / 3.0).floor();
@@ -3870,22 +4054,108 @@ impl EffectRegistry {
                     ]
                 };
 
-                let mut run_ae_level = |selected: i32,
-                                        owned: &mut Vec<wgpu::Texture>|
-                 -> (wgpu::Texture, wgpu::TextureView) {
-                    let (work_tex, mut work_view, work_w, work_h) = if selected < 0 {
+                // Build downsample pyramid ONCE up to `fine_level`, then reuse `fine_mip`
+                // directly as input to `fine_level + 1` when blending two LOD levels.
+                let fine_mip = if fine_level < 0 {
+                    let t = self.create_temp_target_with_format(
+                        device,
+                        width,
+                        height,
+                        hdr_fmt,
+                        "zc-sglow-extract-full",
+                    );
+                    let mut u_ex = EffectUniforms::from_params(params);
+                    u_ex.pass = 0;
+                    u_ex.p0 = [threshold, from_alpha, opacity_mode, edge_mode];
+                    u_ex.p1 = [0.0, 0.0, 1.0, 0.0];
+                    u_ex.c1 = [thresh_add[0], thresh_add[1], thresh_add[2], 1.0];
+                    self.encode_pass(
+                        device,
+                        encoder,
+                        (canonical, false, hdr_fmt),
+                        &u_ex,
+                        targets.input,
+                        &t.view,
+                        None,
+                        None,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
+                    t
+                } else {
+                    let mut old_w = width;
+                    let mut old_h = height;
+                    let mut prev_t: Option<ScratchTarget> = None;
+                    for lvl in 0..=fine_level {
+                        let nw = ((old_w as f32) * 0.5).round().max(1.0) as u32;
+                        let nh = ((old_h as f32) * 0.5).round().max(1.0) as u32;
                         let t = self.create_temp_target_with_format(
                             device,
-                            width,
-                            height,
+                            nw,
+                            nh,
                             hdr_fmt,
-                            "zc-sglow-extract-full",
+                            "zc-sglow-down",
                         );
-                        let v = t.create_view(&wgpu::TextureViewDescriptor::default());
+                        if lvl == 0 {
+                            let mut u_ex = EffectUniforms::from_params(params);
+                            u_ex.resolution = [nw as f32, nh as f32];
+                            u_ex.pass = 0;
+                            u_ex.p0 = [threshold, from_alpha, opacity_mode, edge_mode];
+                            u_ex.p1 = [1.0 / wf, 1.0 / hf, 0.0, 0.0];
+                            u_ex.c1 = [thresh_add[0], thresh_add[1], thresh_add[2], 1.0];
+                            self.encode_pass(
+                                device,
+                                encoder,
+                                (canonical, false, hdr_fmt),
+                                &u_ex,
+                                targets.input,
+                                &t.view,
+                                None,
+                                None,
+                                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            );
+                        } else {
+                            let mut u_dn = EffectUniforms::from_params(params);
+                            u_dn.resolution = [nw as f32, nh as f32];
+                            u_dn.pass = 1;
+                            u_dn.p0 = [1.0 / (old_w as f32), 1.0 / (old_h as f32), edge_mode, 0.0];
+                            self.encode_pass(
+                                device,
+                                encoder,
+                                (canonical, false, hdr_fmt),
+                                &u_dn,
+                                &prev_t.as_ref().expect("previous mip").view,
+                                &t.view,
+                                None,
+                                None,
+                                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            );
+                        }
+                        if let Some(old_t) = prev_t.replace(t) {
+                            scratch_used.push(old_t);
+                        }
+                        old_w = nw;
+                        old_h = nh;
+                    }
+                    prev_t.expect("fine mip target")
+                };
+
+                let coarse_mip = if need_coarse {
+                    let nw = ((fine_mip.width as f32) * 0.5).round().max(1.0) as u32;
+                    let nh = ((fine_mip.height as f32) * 0.5).round().max(1.0) as u32;
+                    let t = self.create_temp_target_with_format(
+                        device,
+                        nw,
+                        nh,
+                        hdr_fmt,
+                        "zc-sglow-down-coarse",
+                    );
+                    if fine_level < 0 {
+                        // `fine_level + 1 == 0`: extract + half-res downsample from `targets.input`.
                         let mut u_ex = EffectUniforms::from_params(params);
+                        u_ex.resolution = [nw as f32, nh as f32];
                         u_ex.pass = 0;
                         u_ex.p0 = [threshold, from_alpha, opacity_mode, edge_mode];
-                        u_ex.p1 = [0.0, 0.0, 1.0, 0.0];
+                        u_ex.p1 = [1.0 / wf, 1.0 / hf, 0.0, 0.0];
                         u_ex.c1 = [thresh_add[0], thresh_add[1], thresh_add[2], 1.0];
                         self.encode_pass(
                             device,
@@ -3893,80 +4163,46 @@ impl EffectRegistry {
                             (canonical, false, hdr_fmt),
                             &u_ex,
                             targets.input,
-                            &v,
+                            &t.view,
                             None,
                             None,
                             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         );
-                        (t, v, width, height)
                     } else {
-                        let mut old_w = width;
-                        let mut old_h = height;
-                        let mut prev_t: Option<wgpu::Texture> = None;
-                        let mut prev_v: Option<wgpu::TextureView> = None;
-                        for lvl in 0..=selected {
-                            let nw = ((old_w as f32) * 0.5).round().max(1.0) as u32;
-                            let nh = ((old_h as f32) * 0.5).round().max(1.0) as u32;
-                            let t = self.create_temp_target_with_format(
-                                device,
-                                nw,
-                                nh,
-                                hdr_fmt,
-                                "zc-sglow-down",
-                            );
-                            let v = t.create_view(&wgpu::TextureViewDescriptor::default());
-                            if lvl == 0 {
-                                let mut u_ex = EffectUniforms::from_params(params);
-                                u_ex.resolution = [nw as f32, nh as f32];
-                                u_ex.pass = 0;
-                                u_ex.p0 = [threshold, from_alpha, opacity_mode, edge_mode];
-                                u_ex.p1 = [1.0 / wf, 1.0 / hf, 0.0, 0.0];
-                                u_ex.c1 = [thresh_add[0], thresh_add[1], thresh_add[2], 1.0];
-                                self.encode_pass(
-                                    device,
-                                    encoder,
-                                    (canonical, false, hdr_fmt),
-                                    &u_ex,
-                                    targets.input,
-                                    &v,
-                                    None,
-                                    None,
-                                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                );
-                            } else {
-                                let mut u_dn = EffectUniforms::from_params(params);
-                                u_dn.resolution = [nw as f32, nh as f32];
-                                u_dn.pass = 1;
-                                u_dn.p0 =
-                                    [1.0 / (old_w as f32), 1.0 / (old_h as f32), edge_mode, 0.0];
-                                self.encode_pass(
-                                    device,
-                                    encoder,
-                                    (canonical, false, hdr_fmt),
-                                    &u_dn,
-                                    prev_v.as_ref().expect("previous mip view"),
-                                    &v,
-                                    None,
-                                    None,
-                                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                );
-                            }
-                            if let Some(old_t) = prev_t.replace(t) {
-                                owned.push(old_t);
-                            }
-                            prev_v = Some(v);
-                            old_w = nw;
-                            old_h = nh;
-                        }
-                        (
-                            prev_t.expect("mip texture"),
-                            prev_v.expect("mip view"),
-                            old_w,
-                            old_h,
-                        )
-                    };
-                    owned.push(work_tex);
+                        // Reuse `fine_mip` directly as input to `fine_level + 1`.
+                        let mut u_dn = EffectUniforms::from_params(params);
+                        u_dn.resolution = [nw as f32, nh as f32];
+                        u_dn.pass = 1;
+                        u_dn.p0 = [
+                            1.0 / (fine_mip.width as f32),
+                            1.0 / (fine_mip.height as f32),
+                            edge_mode,
+                            0.0,
+                        ];
+                        self.encode_pass(
+                            device,
+                            encoder,
+                            (canonical, false, hdr_fmt),
+                            &u_dn,
+                            &fine_mip.view,
+                            &t.view,
+                            None,
+                            None,
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        );
+                    }
+                    Some(t)
+                } else {
+                    None
+                };
 
+                // Run 6-pass separable 3-box blur on `fine_mip` (and `coarse_mip` when blending),
+                // reusing `&ping.view` and `&pong.view` without recreating TextureViews per pass.
+                for (is_coarse, mip) in std::iter::once((false, fine_mip))
+                    .chain(coarse_mip.into_iter().map(|c| (true, c)))
+                {
+                    let work_w = mip.width;
+                    let work_h = mip.height;
                     let ping = self.create_temp_target_with_format(
                         device,
                         work_w,
@@ -3981,8 +4217,6 @@ impl EffectRegistry {
                         hdr_fmt,
                         "zc-sglow-ae-pong",
                     );
-                    let ping_v = ping.create_view(&wgpu::TextureViewDescriptor::default());
-                    let pong_v = pong.create_view(&wgpu::TextureViewDescriptor::default());
 
                     let scale_x = wf / (work_w as f32);
                     let scale_y = hf / (work_h as f32);
@@ -4020,43 +4254,39 @@ impl EffectRegistry {
                         u_box.p1 = [r0[0], r0[1], r0[2], 0.0];
                         u_box.p2 = [r1[0], r1[1], r1[2], 0.0];
                         u_box.p3 = [fracs[0], fracs[1], fracs[2], 0.0];
-                        let dst_v = if pass_index % 2 == 0 {
-                            &ping_v
+                        let src_v = if pass_index == 0 {
+                            &mip.view
+                        } else if pass_index % 2 == 1 {
+                            &ping.view
                         } else {
-                            &pong_v
+                            &pong.view
+                        };
+                        let dst_v = if pass_index % 2 == 0 {
+                            &ping.view
+                        } else {
+                            &pong.view
                         };
                         self.encode_pass(
                             device,
                             encoder,
                             (canonical, false, hdr_fmt),
                             &u_box,
-                            &work_view,
+                            src_v,
                             dst_v,
                             None,
                             None,
                             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         );
-                        work_view = if pass_index % 2 == 0 {
-                            ping.create_view(&wgpu::TextureViewDescriptor::default())
-                        } else {
-                            pong.create_view(&wgpu::TextureViewDescriptor::default())
-                        };
                     }
-                    owned.push(ping);
-                    (pong, pong_v)
-                };
-
-                let (fine_t, fine_v) = run_ae_level(fine_level, &mut owned_textures);
-                owned_textures.push(fine_t);
-                if mix_frac > 1e-6 {
-                    let (coarse_t, coarse_v) = run_ae_level(fine_level + 1, &mut owned_textures);
-                    owned_textures.push(coarse_t);
-                    fine_view = Some(fine_v);
-                    coarse_view = Some(coarse_v);
-                    ae_mix = mix_frac;
-                    use_ae_blend = true;
-                } else {
-                    fine_view = Some(fine_v);
+                    scratch_used.push(mip);
+                    scratch_used.push(ping);
+                    if is_coarse {
+                        coarse_result = Some(pong);
+                        ae_mix = mix_frac;
+                        use_ae_blend = true;
+                    } else {
+                        fine_result = Some(pong);
+                    }
                 }
             }
         } else if !show && brightness > 0.0 && glow_width > 0.0 {
@@ -4097,11 +4327,10 @@ impl EffectRegistry {
             let mh0 = (hf * 0.5).round().max(1.0) as u32;
             let accum_t =
                 self.create_temp_target_with_format(device, mw0, mh0, hdr_fmt, "zc-sglow-accum");
-            let accum_v = accum_t.create_view(&wgpu::TextureViewDescriptor::default());
 
             let mut old_w = width;
             let mut old_h = height;
-            let mut prev_blur_v: Option<wgpu::TextureView> = None;
+            let mut prev_blur_t: Option<ScratchTarget> = None;
 
             for (m, mip_weights) in weights.iter().enumerate().take(mip_count) {
                 let nw = ((old_w as f32) * 0.5).round().max(1.0) as u32;
@@ -4112,9 +4341,6 @@ impl EffectRegistry {
                     self.create_temp_target_with_format(device, nw, nh, hdr_fmt, "zc-sglow-l-tmp");
                 let blur_t =
                     self.create_temp_target_with_format(device, nw, nh, hdr_fmt, "zc-sglow-l-blr");
-                let down_v = down_t.create_view(&wgpu::TextureViewDescriptor::default());
-                let temp_v = temp_t.create_view(&wgpu::TextureViewDescriptor::default());
-                let blur_v = blur_t.create_view(&wgpu::TextureViewDescriptor::default());
 
                 if m == 0 {
                     let mut u_ex = EffectUniforms::from_params(params);
@@ -4129,7 +4355,7 @@ impl EffectRegistry {
                         (canonical, false, hdr_fmt),
                         &u_ex,
                         targets.input,
-                        &down_v,
+                        &down_t.view,
                         None,
                         None,
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -4144,8 +4370,8 @@ impl EffectRegistry {
                         encoder,
                         (canonical, false, hdr_fmt),
                         &u_dn,
-                        prev_blur_v.as_ref().expect("prev blur mip"),
-                        &down_v,
+                        &prev_blur_t.as_ref().expect("prev blur mip").view,
+                        &down_t.view,
                         None,
                         None,
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -4161,8 +4387,8 @@ impl EffectRegistry {
                     encoder,
                     (canonical, false, hdr_fmt),
                     &u_h,
-                    &down_v,
-                    &temp_v,
+                    &down_t.view,
+                    &temp_t.view,
                     None,
                     None,
                     wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -4177,8 +4403,8 @@ impl EffectRegistry {
                     encoder,
                     (canonical, false, hdr_fmt),
                     &u_v,
-                    &temp_v,
-                    &blur_v,
+                    &temp_t.view,
+                    &blur_t.view,
                     None,
                     None,
                     wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -4198,22 +4424,25 @@ impl EffectRegistry {
                     encoder,
                     (canonical, true, hdr_fmt),
                     &u_acc,
-                    &blur_v,
-                    &accum_v,
+                    &blur_t.view,
+                    &accum_t.view,
                     None,
                     None,
                     load_op,
                 );
 
-                owned_textures.push(down_t);
-                owned_textures.push(temp_t);
-                owned_textures.push(blur_t);
-                prev_blur_v = Some(blur_v);
+                scratch_used.push(down_t);
+                scratch_used.push(temp_t);
+                if let Some(old_blur) = prev_blur_t.replace(blur_t) {
+                    scratch_used.push(old_blur);
+                }
                 old_w = nw;
                 old_h = nh;
             }
-            owned_textures.push(accum_t);
-            fine_view = Some(accum_v);
+            if let Some(last_blur) = prev_blur_t {
+                scratch_used.push(last_blur);
+            }
+            fine_result = Some(accum_t);
         }
 
         // Pass 5: Final composite onto unmodified input -> output
@@ -4237,11 +4466,17 @@ impl EffectRegistry {
             &u_fin,
             targets.input,
             targets.output,
-            fine_view.as_ref(),
-            coarse_view.as_ref(),
+            fine_result.as_ref().map(|t| &t.view),
+            coarse_result.as_ref().map(|t| &t.view),
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
-        let _ = owned_textures;
+        if let Some(t) = fine_result {
+            self.release_temp_target(t);
+        }
+        if let Some(t) = coarse_result {
+            self.release_temp_target(t);
+        }
+        self.release_temp_targets(scratch_used);
         Ok(())
     }
 
@@ -4480,9 +4715,6 @@ impl EffectRegistry {
         let stage0 = self.create_temp_target_with_format(device, dct_w, dct_h, hdr_fmt, "zc-jd-s0");
         let stage1 = self.create_temp_target_with_format(device, dct_w, dct_h, hdr_fmt, "zc-jd-s1");
         let stage2 = self.create_temp_target_with_format(device, dct_w, dct_h, hdr_fmt, "zc-jd-s2");
-        let v0 = stage0.create_view(&wgpu::TextureViewDescriptor::default());
-        let v1 = stage1.create_view(&wgpu::TextureViewDescriptor::default());
-        let v2 = stage2.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Pass 0: Row forward DCT (input -> stage0)
         let mut u0 = base_u;
@@ -4494,7 +4726,7 @@ impl EffectRegistry {
             (canonical, false, hdr_fmt),
             &u0,
             targets.input,
-            &v0,
+            &stage0.view,
             None,
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -4509,8 +4741,8 @@ impl EffectRegistry {
             encoder,
             (canonical, false, hdr_fmt),
             &u1,
-            &v0,
-            &v1,
+            &stage0.view,
+            &stage1.view,
             None,
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -4525,8 +4757,8 @@ impl EffectRegistry {
             encoder,
             (canonical, false, hdr_fmt),
             &u2,
-            &v1,
-            &v2,
+            &stage1.view,
+            &stage2.view,
             None,
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -4543,10 +4775,13 @@ impl EffectRegistry {
             &u3,
             targets.input,
             targets.output,
-            Some(&v2),
+            Some(&stage2.view),
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
+        self.release_temp_target(stage0);
+        self.release_temp_target(stage1);
+        self.release_temp_target(stage2);
         Ok(())
     }
 
@@ -4567,15 +4802,13 @@ impl EffectRegistry {
 
         let mut u_warp = pack_effect_uniforms("datamosh", params, targets.aux.is_some(), false);
         let algorithm = u_warp.p1[0];
-        let mut owned_mv: Option<wgpu::Texture> = None;
-        let mut mv_view: Option<wgpu::TextureView> = None;
+        let mut owned_mv: Option<ScratchTarget> = None;
 
         if algorithm < 0.5 && targets.aux.is_some() {
             let bs = u_warp.p0[2].max(2.0);
             let gw = ((width as f32) / bs).ceil().clamp(1.0, 256.0) as u32;
             let gh = ((height as f32) / bs).ceil().clamp(1.0, 256.0) as u32;
             let mv_tex = self.create_temp_target_with_format(device, gw, gh, hdr_fmt, "zc-dm-mv");
-            let v_mv = mv_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
             let mut u0 = u_warp;
             u0.pass = 0;
@@ -4588,14 +4821,13 @@ impl EffectRegistry {
                 (canonical, false, hdr_fmt),
                 &u0,
                 targets.input,
-                &v_mv,
+                &mv_tex.view,
                 targets.aux,
                 None,
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
             u_warp.flags |= 1u32 << 1;
             owned_mv = Some(mv_tex);
-            mv_view = Some(v_mv);
         }
 
         u_warp.pass = 1;
@@ -4607,10 +4839,12 @@ impl EffectRegistry {
             targets.input,
             targets.output,
             targets.aux,
-            mv_view.as_ref().or(targets.aux2),
+            owned_mv.as_ref().map(|t| &t.view).or(targets.aux2),
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
-        let _ = owned_mv;
+        if let Some(mv) = owned_mv {
+            self.release_temp_target(mv);
+        }
         Ok(())
     }
 
@@ -4627,7 +4861,6 @@ impl EffectRegistry {
     ) -> Result<(), EffectError> {
         let canonical = self.ensure_pipeline(device, "tracery", false)?;
         let mask_tex = self.create_temp_target(device, width, height, "zc-tracery-mask");
-        let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut u0 = pack_effect_uniforms("tracery", params, false, false);
         u0.pass = 0;
@@ -4637,7 +4870,7 @@ impl EffectRegistry {
             (canonical, false, self.format),
             &u0,
             targets.input,
-            &mask_view,
+            &mask_tex.view,
             None,
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -4652,10 +4885,11 @@ impl EffectRegistry {
             &u1,
             targets.input,
             targets.output,
-            Some(&mask_view),
+            Some(&mask_tex.view),
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
+        self.release_temp_target(mask_tex);
         Ok(())
     }
 
@@ -4707,9 +4941,7 @@ impl EffectRegistry {
             self.create_temp_target_with_format(device, width, height, hdr_fmt, "zc-ml-ping");
         let pong =
             self.create_temp_target_with_format(device, width, height, hdr_fmt, "zc-ml-pong");
-        let ping_v = ping.create_view(&wgpu::TextureViewDescriptor::default());
-        let pong_v = pong.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut owned_textures: Vec<wgpu::Texture> = Vec::new();
+        let mut owned_luts: Vec<wgpu::Texture> = Vec::new();
 
         let uploaded_3d_lut = if let Some(EffectParamValue::Lut3D { size, data }) =
             params.values.get("lut")
@@ -4740,9 +4972,9 @@ impl EffectRegistry {
             let src_view: &wgpu::TextureView = if first_pass {
                 targets.input
             } else if read_ping {
-                &ping_v
+                &ping.view
             } else {
-                &pong_v
+                &pong.view
             };
             let in_straight = !first_pass;
 
@@ -4758,8 +4990,10 @@ impl EffectRegistry {
             u.c2 = tool.c2;
             u.c3 = tool.c3;
 
-            let mut aux_v: Option<wgpu::TextureView> = None;
-            let mut aux2_v: Option<wgpu::TextureView> = None;
+            let mut aux_lut_v: Option<wgpu::TextureView> = None;
+            let mut aux_scratch: Option<ScratchTarget> = None;
+            let mut aux2_scratch: Option<ScratchTarget> = None;
+            let mut tool_scratch: Vec<ScratchTarget> = Vec::new();
 
             match tool.mode {
                 // curves (13): 1D RGBA LUT
@@ -4767,8 +5001,8 @@ impl EffectRegistry {
                     if let Some(ref json_str) = tool.aux_json {
                         let lut = bake_curves_json_rgba8(json_str);
                         let t = upload_rgba8_texture(device, queue, "zc-ml-curves", 256, 1, &lut);
-                        aux_v = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
-                        owned_textures.push(t);
+                        aux_lut_v = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
+                        owned_luts.push(t);
                     }
                 }
                 // s-curve (14): 1D luminance LUT
@@ -4776,8 +5010,8 @@ impl EffectRegistry {
                     if let Some(ref json_str) = tool.aux_json {
                         let lut = bake_scurve_json_rgba8(json_str);
                         let t = upload_rgba8_texture(device, queue, "zc-ml-scurve", 256, 1, &lut);
-                        aux_v = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
-                        owned_textures.push(t);
+                        aux_lut_v = Some(t.create_view(&wgpu::TextureViewDescriptor::default()));
+                        owned_luts.push(t);
                     }
                 }
                 // lut (15): optional 3D LUT
@@ -4806,8 +5040,6 @@ impl EffectRegistry {
                         hdr_fmt,
                         "zc-ml-diff-v",
                     );
-                    let bh_v = blur_h.create_view(&wgpu::TextureViewDescriptor::default());
-                    let bv_v = blur_v.create_view(&wgpu::TextureViewDescriptor::default());
 
                     let mut u_bh = EffectUniforms::from_params(params);
                     u_bh.pass = 1;
@@ -4819,7 +5051,7 @@ impl EffectRegistry {
                         (canonical, false, hdr_fmt),
                         &u_bh,
                         src_view,
-                        &bh_v,
+                        &blur_h.view,
                         None,
                         None,
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -4834,15 +5066,14 @@ impl EffectRegistry {
                         encoder,
                         (canonical, false, hdr_fmt),
                         &u_bv,
-                        &bh_v,
-                        &bv_v,
+                        &blur_h.view,
+                        &blur_v.view,
                         None,
                         None,
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     );
-                    owned_textures.push(blur_h);
-                    owned_textures.push(blur_v);
-                    aux_v = Some(bv_v);
+                    tool_scratch.push(blur_h);
+                    aux_scratch = Some(blur_v);
                 }
                 // star-filter (22): dual-axis directional streak passes
                 22 if u.p0[1].abs() > 1e-5 => {
@@ -4863,8 +5094,6 @@ impl EffectRegistry {
                         hdr_fmt,
                         "zc-ml-star-2",
                     );
-                    let s1_v = s1_t.create_view(&wgpu::TextureViewDescriptor::default());
-                    let s2_v = s2_t.create_view(&wgpu::TextureViewDescriptor::default());
 
                     let mut us1 = EffectUniforms::from_params(params);
                     us1.pass = 2;
@@ -4876,7 +5105,7 @@ impl EffectRegistry {
                         (canonical, false, hdr_fmt),
                         &us1,
                         src_view,
-                        &s1_v,
+                        &s1_t.view,
                         None,
                         None,
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -4890,15 +5119,13 @@ impl EffectRegistry {
                         (canonical, false, hdr_fmt),
                         &us2,
                         src_view,
-                        &s2_v,
+                        &s2_t.view,
                         None,
                         None,
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     );
-                    owned_textures.push(s1_t);
-                    owned_textures.push(s2_t);
-                    aux_v = Some(s1_v);
-                    aux2_v = Some(s2_v);
+                    aux_scratch = Some(s1_t);
+                    aux2_scratch = Some(s2_t);
                 }
                 // anamorphic-flare (23): horizontal streak pass
                 23 if u.p0[1].abs() > 1e-5 => {
@@ -4906,7 +5133,6 @@ impl EffectRegistry {
                     let thresh = u.p0[2];
                     let af_t = self
                         .create_temp_target_with_format(device, width, height, hdr_fmt, "zc-ml-af");
-                    let af_v = af_t.create_view(&wgpu::TextureViewDescriptor::default());
                     let mut uaf = EffectUniforms::from_params(params);
                     uaf.pass = 2;
                     uaf.flags = u32::from(in_straight) | (1u32 << 1);
@@ -4917,13 +5143,12 @@ impl EffectRegistry {
                         (canonical, false, hdr_fmt),
                         &uaf,
                         src_view,
-                        &af_v,
+                        &af_t.view,
                         None,
                         None,
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     );
-                    owned_textures.push(af_t);
-                    aux_v = Some(af_v);
+                    aux_scratch = Some(af_t);
                 }
                 _ => {}
             }
@@ -4931,9 +5156,9 @@ impl EffectRegistry {
             let effective_aux: Option<&wgpu::TextureView> = if tool.mode == 15 {
                 lut3d_view.as_ref().map(|(_, v)| v).or(targets.aux)
             } else {
-                aux_v.as_ref()
+                aux_scratch.as_ref().map(|t| &t.view).or(aux_lut_v.as_ref())
             };
-            let effective_aux2: Option<&wgpu::TextureView> = aux2_v.as_ref();
+            let effective_aux2: Option<&wgpu::TextureView> = aux2_scratch.as_ref().map(|t| &t.view);
 
             let out_straight = !is_last;
             u.flags = u32::from(in_straight)
@@ -4943,9 +5168,9 @@ impl EffectRegistry {
             let (dst_view, dst_fmt) = if is_last {
                 (targets.output, self.format)
             } else if read_ping {
-                (&pong_v, hdr_fmt)
+                (&pong.view, hdr_fmt)
             } else {
-                (&ping_v, hdr_fmt)
+                (&ping.view, hdr_fmt)
             };
 
             self.encode_pass(
@@ -4960,12 +5185,23 @@ impl EffectRegistry {
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
 
+            // Release per-tool scratch targets immediately so subsequent tools can reuse them.
+            if let Some(t) = aux_scratch {
+                self.release_temp_target(t);
+            }
+            if let Some(t) = aux2_scratch {
+                self.release_temp_target(t);
+            }
+            self.release_temp_targets(tool_scratch);
+
             if !is_last {
                 read_ping = !read_ping;
                 first_pass = false;
             }
         }
-        let _ = owned_textures;
+        self.release_temp_target(ping);
+        self.release_temp_target(pong);
+        let _ = owned_luts;
         Ok(())
     }
 
@@ -5287,37 +5523,36 @@ impl EffectRegistry {
     }
 
     fn create_temp_target(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         width: u32,
         height: u32,
         label: &str,
-    ) -> wgpu::Texture {
-        self.create_temp_target_with_format(device, width, height, self.format, label)
+    ) -> ScratchTarget {
+        let fmt = self.format;
+        self.create_temp_target_with_format(device, width, height, fmt, label)
     }
 
     fn create_temp_target_with_format(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
         label: &str,
-    ) -> wgpu::Texture {
-        device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        })
+    ) -> ScratchTarget {
+        self.scratch_pool
+            .acquire(device, width, height, format, label)
+    }
+
+    fn release_temp_target(&mut self, target: ScratchTarget) {
+        self.scratch_pool.release(target);
+    }
+
+    fn release_temp_targets(&mut self, targets: Vec<ScratchTarget>) {
+        for target in targets {
+            self.scratch_pool.release(target);
+        }
     }
 
     fn compile_wgsl_pipeline(

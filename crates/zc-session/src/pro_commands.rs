@@ -733,6 +733,7 @@ impl Session {
             }
         }
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({ "clip_id": clip_id.to_string() }))
     }
 
@@ -760,6 +761,7 @@ impl Session {
         entry.push(mask);
         let count = entry.len();
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "clip_id": clip_id.to_string(),
             "layer_id": layer_id.to_string(),
@@ -791,6 +793,7 @@ impl Session {
         let final_id = mask.id.clone();
         masks[pos] = mask;
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "clip_id": clip_id.to_string(),
             "mask_id": final_id,
@@ -816,6 +819,7 @@ impl Session {
             seq.layer_masks.remove(&layer_id);
         }
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "clip_id": clip_id.to_string(),
             "removed_mask_id": mask_id,
@@ -844,6 +848,7 @@ impl Session {
         let insert_at = to_index.min(masks.len());
         masks.insert(insert_at, item);
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "clip_id": clip_id.to_string(),
             "mask_id": mask_id,
@@ -873,6 +878,7 @@ impl Session {
         cloned.name = format!("{} Copy", cloned.name);
         masks.insert(pos + 1, cloned);
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "clip_id": clip_id.to_string(),
             "mask_id": new_id,
@@ -943,6 +949,7 @@ impl Session {
         };
         self.project.compositions.insert(comp_id, comp);
         self.enable_plugin_requirement("precomp-plus");
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "comp_id": comp_id.to_string(),
             "name": trimmed,
@@ -969,6 +976,7 @@ impl Session {
             .get_mut(&comp_id)
             .ok_or_else(|| SessionError::NotFound(format!("composition '{comp_id}'")))?;
         comp.name = trimmed.to_owned();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "comp_id": comp_id.to_string(),
             "name": trimmed,
@@ -991,6 +999,7 @@ impl Session {
         let new_id = cloned.id;
         let new_name = cloned.name.clone();
         self.project.compositions.insert(new_id, cloned);
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "comp_id": new_id.to_string(),
             "source_comp_id": comp_id.to_string(),
@@ -1017,11 +1026,17 @@ impl Session {
         self.project.compositions.remove(&comp_id);
         self.project.composition_ids.retain(|_, v| *v != comp_id);
         if self.document.active_composition_id == Some(comp_id) {
-            self.document =
-                SessionDocument::from_sequence(&self.project, &self.project.sequence, None);
+            self.document = SessionDocument::from_sequence(
+                &self.project.name,
+                &self.project.assets,
+                &self.project.media,
+                &self.project.sequence,
+                None,
+            );
             self.selection.clear_all();
         }
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({ "deleted_comp_id": comp_id.to_string() }))
     }
 
@@ -1364,11 +1379,26 @@ impl Session {
         self.enable_plugin_requirement("precomp-plus");
 
         let active_id = self.document.active_composition_id;
-        let active_seq = self.active_sequence().clone();
-        self.document = SessionDocument::from_sequence(&self.project, &active_seq, active_id);
+        let active_seq = match active_id {
+            Some(cid) => self
+                .project
+                .compositions
+                .get(&cid)
+                .unwrap_or(&self.project.sequence),
+            None => &self.project.sequence,
+        };
+        self.document = SessionDocument::from_sequence(
+            &self.project.name,
+            &self.project.assets,
+            &self.project.media,
+            active_seq,
+            active_id,
+        );
         self.document.recompute_sequence_length_if_extended();
+        self.active_sequence_mut().length_frames = self.document.sequence_length;
         self.selection.clear_all();
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
 
         Ok(json!({
             "comp_id": comp_id.to_string(),
@@ -1385,26 +1415,38 @@ impl Session {
     ) -> Result<Value, SessionError> {
         // Flush any edits in the currently active composition before switching.
         self.sync_document_to_project();
+        if let Some(id) = comp_id
+            && !self.project.compositions.contains_key(&id)
+        {
+            return Err(SessionError::NotFound(format!("composition '{id}'")));
+        }
+        if comp_id.is_some() {
+            self.enable_plugin_requirement("precomp-plus");
+        }
         let target_seq = match comp_id {
-            None => self.project.sequence.clone(),
+            None => &self.project.sequence,
             Some(id) => self
                 .project
                 .compositions
                 .get(&id)
-                .cloned()
                 .ok_or_else(|| SessionError::NotFound(format!("composition '{id}'")))?,
         };
-        if comp_id.is_some() {
-            self.enable_plugin_requirement("precomp-plus");
-        }
-        self.document = SessionDocument::from_sequence(&self.project, &target_seq, comp_id);
+        let target_name = target_seq.name.clone();
+        self.document = SessionDocument::from_sequence(
+            &self.project.name,
+            &self.project.assets,
+            &self.project.media,
+            target_seq,
+            comp_id,
+        );
         self.selection.clear_all();
         let max_frame = (self.document.sequence_length - 1.0).max(0.0);
         self.playback.current_frame = self.playback.current_frame.clamp(0.0, max_frame);
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "active_composition_id": comp_id.map(|u| u.to_string()),
-            "name": target_seq.name,
+            "name": target_name,
         }))
     }
 
@@ -1475,6 +1517,7 @@ impl Session {
             }
         }
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "clip_id": clip_id.to_string(),
             "key": key,
@@ -1499,6 +1542,7 @@ impl Session {
             }
         }
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "clip_id": clip_id.to_string(),
             "shape_kind": shape_kind,
@@ -1726,6 +1770,7 @@ impl Session {
         });
         colors.push(color.as_ref().map_or(Value::Null, |c| json!(c)));
         write_marker_colors_vec(seq, colors);
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "index": idx,
             "frame": frame,
@@ -1755,6 +1800,7 @@ impl Session {
         seq.markers[index].label = name.clone();
         colors[index] = color.as_ref().map_or(Value::Null, |c| json!(c));
         write_marker_colors_vec(seq, colors);
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "index": index,
             "frame": frame,
@@ -1774,6 +1820,7 @@ impl Session {
             colors.remove(index);
         }
         write_marker_colors_vec(seq, colors);
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "deleted_index": index,
             "frame": removed.frame,
@@ -1823,6 +1870,7 @@ impl Session {
             });
         refresh_sequence_controls_in_document(self);
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "control_id": control_id,
             "name": trimmed,
@@ -1882,6 +1930,7 @@ impl Session {
         }
         refresh_sequence_controls_in_document(self);
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "control_id": control_id,
             "name": trimmed,
@@ -1901,6 +1950,7 @@ impl Session {
         seq.controls.remove(pos);
         refresh_sequence_controls_in_document(self);
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({ "deleted_control_id": control_id }))
     }
 
@@ -1920,6 +1970,7 @@ impl Session {
         seq.controls.insert(insert_at, item);
         refresh_sequence_controls_in_document(self);
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "control_id": control_id,
             "index": insert_at,
@@ -2307,6 +2358,7 @@ impl Session {
         rec.external = false;
         rec.bytes = Some(bytes);
         self.playback.bump_epoch();
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "asset_id": asset_id,
             "filename": trimmed,
@@ -2338,6 +2390,7 @@ impl Session {
                 .as_deref()
                 .is_none_or(|aid| !purged_set.contains(aid))
         });
+        self.doc_already_synced_with_project = true;
         Ok(json!({
             "purged_count": purged.len(),
             "purged_asset_ids": purged,

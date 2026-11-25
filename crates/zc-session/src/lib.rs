@@ -8,7 +8,7 @@ mod pro_commands;
 mod pz_clipboard;
 pub mod selection;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -632,12 +632,186 @@ fn property_track_to_session(track: &zc_project::PropertyTrack) -> SessionProper
     }
 }
 
+fn f64_matches_json_value(n: f64, json_val: &Value) -> bool {
+    match serde_json::Number::from_f64(n) {
+        Some(num) => matches!(json_val, Value::Number(other) if *other == num),
+        None => json_val.is_null(),
+    }
+}
+
+fn f64_slice_matches_json(slice: &[f64], json_val: &Value) -> bool {
+    let Some(arr) = json_val.as_array() else {
+        return false;
+    };
+    if arr.len() != slice.len() {
+        return false;
+    }
+    slice
+        .iter()
+        .zip(arr.iter())
+        .all(|(&n, elem)| f64_matches_json_value(n, elem))
+}
+
+fn prop_value_matches_json(v: &zc_project::PropertyValue, json_val: &Value) -> bool {
+    match v {
+        zc_project::PropertyValue::Number(n) => f64_matches_json_value(*n, json_val),
+        zc_project::PropertyValue::Bool(b) => {
+            matches!(json_val, Value::Bool(other) if *other == *b)
+        }
+        zc_project::PropertyValue::Option(o) => {
+            matches!(json_val, Value::Number(other) if *other == serde_json::Number::from(*o))
+        }
+        zc_project::PropertyValue::Text(s)
+        | zc_project::PropertyValue::List(s)
+        | zc_project::PropertyValue::Shader(s) => {
+            matches!(json_val, Value::String(other) if other == s)
+        }
+        zc_project::PropertyValue::Asset(a) => match a {
+            Some(s) => matches!(json_val, Value::String(other) if other == s),
+            None => json_val.is_null(),
+        },
+        zc_project::PropertyValue::Vec2(a) => f64_slice_matches_json(a, json_val),
+        zc_project::PropertyValue::Vec3(a) | zc_project::PropertyValue::Color(a) => {
+            f64_slice_matches_json(a, json_val)
+        }
+        zc_project::PropertyValue::Vec4(a) | zc_project::PropertyValue::ColorRgba(a) => {
+            f64_slice_matches_json(a, json_val)
+        }
+        zc_project::PropertyValue::Gradient(stops) => {
+            serde_json::to_value(stops).unwrap_or(Value::Null) == *json_val
+        }
+        zc_project::PropertyValue::Curve(v) | zc_project::PropertyValue::Json(v) => v == json_val,
+    }
+}
+
+/// Zero-allocation equivalence check matching `property_track_to_session(track) == *prop`.
+fn property_track_matches_session(
+    track: &zc_project::PropertyTrack,
+    prop: &SessionProperty,
+) -> bool {
+    let animated = track.animated || track.channels.iter().any(|c| c.animated);
+    if prop.animated != animated || prop.expression != track.expression {
+        return false;
+    }
+    if !prop_value_matches_json(&track.value, &prop.default_value) {
+        return false;
+    }
+
+    if !track.keyframes.is_empty() {
+        if prop.keyframes.len() != track.keyframes.len() {
+            return false;
+        }
+        return track
+            .keyframes
+            .iter()
+            .zip(prop.keyframes.iter())
+            .all(|(kf, skf)| {
+                skf.frame == kf.frame
+                    && skf.tween == (kf.tween as u16)
+                    && skf.control_points == kf.control_points
+                    && skf.continuous_tangent == kf.continuous_tangent
+                    && skf.value_kind == Some(SessionValueKind::from_prop_value(&kf.value))
+                    && prop_value_matches_json(&kf.value, &skf.value)
+            });
+    }
+
+    let default_kind = SessionValueKind::from_prop_value(&track.value);
+    if !track.channels.is_empty() {
+        let has_channel_kfs = track.channels.iter().any(|ch| !ch.keyframes.is_empty());
+        if !has_channel_kfs {
+            if prop.keyframes.len() != 1 {
+                return false;
+            }
+            let skf = &prop.keyframes[0];
+            if skf.frame != 0.0
+                || skf.tween != 1
+                || skf.control_points != default_control_points()
+                || !skf.continuous_tangent
+                || skf.value_kind != Some(default_kind)
+            {
+                return false;
+            }
+            let Some(arr) = skf.value.as_array() else {
+                return false;
+            };
+            if arr.len() != track.channels.len() {
+                return false;
+            }
+            return track
+                .channels
+                .iter()
+                .zip(arr.iter())
+                .all(|(ch, elem)| f64_matches_json_value(eval_channel_linear(ch, 0.0), elem));
+        }
+
+        let mut frames: Vec<f64> = Vec::new();
+        for ch in &track.channels {
+            for kf in &ch.keyframes {
+                if !frames.iter().any(|&f| (f - kf.frame).abs() < 1e-6) {
+                    frames.push(kf.frame);
+                }
+            }
+        }
+        frames.sort_by(f64::total_cmp);
+        if frames.is_empty() {
+            frames.push(0.0);
+        }
+        if prop.keyframes.len() != frames.len() {
+            return false;
+        }
+        return frames
+            .into_iter()
+            .zip(prop.keyframes.iter())
+            .all(|(frame, skf)| {
+                if skf.frame != frame || skf.value_kind != Some(default_kind) {
+                    return false;
+                }
+                let (tween, cp, cont) = track
+                    .channels
+                    .iter()
+                    .find_map(|ch| {
+                        ch.keyframes
+                            .iter()
+                            .find(|k| (k.frame - frame).abs() < 1e-6)
+                            .map(|k| (k.tween as u16, k.control_points, k.continuous_tangent))
+                    })
+                    .unwrap_or((1, default_control_points(), true));
+                if skf.tween != tween || skf.control_points != cp || skf.continuous_tangent != cont
+                {
+                    return false;
+                }
+                let Some(arr) = skf.value.as_array() else {
+                    return false;
+                };
+                if arr.len() != track.channels.len() {
+                    return false;
+                }
+                track
+                    .channels
+                    .iter()
+                    .zip(arr.iter())
+                    .all(|(ch, elem)| f64_matches_json_value(eval_channel_linear(ch, frame), elem))
+            });
+    }
+
+    if prop.keyframes.len() != 1 {
+        return false;
+    }
+    let skf = &prop.keyframes[0];
+    skf.frame == 0.0
+        && skf.tween == 1
+        && skf.control_points == default_control_points()
+        && skf.continuous_tangent
+        && skf.value_kind == Some(default_kind)
+        && prop_value_matches_json(&track.value, &skf.value)
+}
+
 fn session_property_to_track(
     prop: &SessionProperty,
     fallback: Option<&zc_project::PropertyTrack>,
 ) -> zc_project::PropertyTrack {
     if let Some(prev) = fallback
-        && property_track_to_session(prev) == *prop
+        && property_track_matches_session(prev, prop)
     {
         return prev.clone();
     }
@@ -866,20 +1040,20 @@ fn extract_media_length_from_preserved(
 }
 
 fn extract_media_length_frames(
-    project: &zc_project::Project,
+    assets: &BTreeMap<String, zc_project::AssetRecord>,
+    media: &[zc_project::MediaItem],
     media_id: Option<&str>,
     fps: f64,
 ) -> Option<f64> {
     let id = media_id?;
-    if let Some(item) = project
-        .media
+    if let Some(item) = media
         .iter()
         .find(|m| m.asset_id.as_deref() == Some(id) || m.id.to_string() == id)
         && let Some(len) = extract_media_length_from_preserved(&item.preserved, fps)
     {
         return Some(len);
     }
-    if let Some(asset) = project.assets.get(id)
+    if let Some(asset) = assets.get(id)
         && let Some(len) = extract_media_length_from_preserved(&asset.preserved, fps)
     {
         return Some(len);
@@ -2647,11 +2821,19 @@ fn default_clip_properties(
 
 impl SessionDocument {
     fn from_project(project: &zc_project::Project) -> Self {
-        Self::from_sequence(project, &project.sequence, None)
+        Self::from_sequence(
+            &project.name,
+            &project.assets,
+            &project.media,
+            &project.sequence,
+            None,
+        )
     }
 
     pub(crate) fn from_sequence(
-        project: &zc_project::Project,
+        project_name: &str,
+        assets: &BTreeMap<String, zc_project::AssetRecord>,
+        media: &[zc_project::MediaItem],
         seq: &zc_project::Sequence,
         active_composition_id: Option<zc_project::Uuid>,
     ) -> Self {
@@ -2876,7 +3058,8 @@ impl SessionDocument {
                     }
                     _ => vc.media.as_deref(),
                 };
-                let media_length = extract_media_length_frames(project, media_id_for_len, fps);
+                let media_length =
+                    extract_media_length_frames(assets, media, media_id_for_len, fps);
                 let mut clip = SessionClip {
                     id: vc.id.to_string(),
                     kind: layer_kind_to_session_kind(&vc.layer.kind),
@@ -2929,7 +3112,8 @@ impl SessionDocument {
                         SessionProperty::static_value(json!(asset_id)),
                     );
                 }
-                let media_length = extract_media_length_frames(project, ac.media.as_deref(), fps);
+                let media_length =
+                    extract_media_length_frames(assets, media, ac.media.as_deref(), fps);
                 let mut clip = SessionClip {
                     id: ac.id.to_string(),
                     kind: "audio".to_string(),
@@ -3002,7 +3186,7 @@ impl SessionDocument {
         }
 
         Self {
-            project_name: project.name.clone(),
+            project_name: project_name.to_owned(),
             resolution: seq.resolution,
             fps,
             sequence_length: seq.length_frames,
@@ -3155,11 +3339,10 @@ impl SessionDocument {
                 }
                 for fx in &clip.effects {
                     inspect_kind(&fx.kind, &mut deps);
-                    if let Some(template) = zc_project::create_effect_by_id(&fx.kind)
-                        && let zc_project::EffectKind::Plugin { plugin_id, .. } = template.kind
+                    if let Some(plugin_id) = zc_project::zoidium_effect_plugin_id(&fx.kind)
                         && !plugin_id.is_empty()
                     {
-                        deps.insert(plugin_id);
+                        deps.insert(plugin_id.to_string());
                     }
                     if fx.properties.values().any(|p| p.expression.is_some()) {
                         deps.insert("expressions-plus".to_string());
@@ -3204,35 +3387,626 @@ pub struct SessionSnapshot {
     asset_blob_refs: BTreeMap<String, String>,
 }
 
+fn estimate_json_value_bytes(v: &Value) -> usize {
+    let base = std::mem::size_of::<Value>();
+    match v {
+        Value::Null | Value::Bool(_) | Value::Number(_) => base,
+        Value::String(s) => base.saturating_add(s.len()),
+        Value::Array(items) => items.iter().fold(base, |acc, item| {
+            acc.saturating_add(estimate_json_value_bytes(item))
+        }),
+        Value::Object(map) => map.iter().fold(base, |acc, (k, val)| {
+            acc.saturating_add(k.len())
+                .saturating_add(estimate_json_value_bytes(val))
+                .saturating_add(32)
+        }),
+    }
+}
+
+fn estimate_preserved_bytes(map: &BTreeMap<String, Value>) -> usize {
+    map.iter().fold(0usize, |acc, (k, v)| {
+        acc.saturating_add(k.len())
+            .saturating_add(estimate_json_value_bytes(v))
+            .saturating_add(48)
+    })
+}
+
+fn estimate_prop_value_bytes(v: &zc_project::PropertyValue) -> usize {
+    let base = std::mem::size_of::<zc_project::PropertyValue>();
+    match v {
+        zc_project::PropertyValue::Text(s)
+        | zc_project::PropertyValue::List(s)
+        | zc_project::PropertyValue::Shader(s) => base.saturating_add(s.len()),
+        zc_project::PropertyValue::Asset(opt) => {
+            base.saturating_add(opt.as_ref().map_or(0, String::len))
+        }
+        zc_project::PropertyValue::Gradient(stops) => base.saturating_add(
+            stops
+                .len()
+                .saturating_mul(std::mem::size_of::<zc_project::GradientStop>()),
+        ),
+        zc_project::PropertyValue::Curve(val) | zc_project::PropertyValue::Json(val) => {
+            base.saturating_add(estimate_json_value_bytes(val))
+        }
+        _ => base,
+    }
+}
+
+fn estimate_prop_track_bytes(track: &zc_project::PropertyTrack) -> usize {
+    let mut total = std::mem::size_of::<zc_project::PropertyTrack>()
+        .saturating_add(track.expression.as_ref().map_or(0, String::len))
+        .saturating_add(estimate_prop_value_bytes(&track.value));
+    for kf in &track.keyframes {
+        total = total
+            .saturating_add(std::mem::size_of::<zc_project::PropertyKeyframe>())
+            .saturating_add(estimate_prop_value_bytes(&kf.value));
+    }
+    for ch in &track.channels {
+        total = total.saturating_add(estimate_prop_track_bytes(ch));
+    }
+    total
+}
+
+fn estimate_custom_properties_bytes(props: &[zc_project::CustomProperty]) -> usize {
+    props.iter().fold(0usize, |acc, cp| {
+        acc.saturating_add(std::mem::size_of::<zc_project::CustomProperty>())
+            .saturating_add(cp.name.len())
+            .saturating_add(estimate_prop_track_bytes(&cp.track))
+            .saturating_add(estimate_preserved_bytes(&cp.metadata))
+    })
+}
+
+fn estimate_material_bytes(mat: &zc_project::MaterialSpec) -> usize {
+    let base = std::mem::size_of::<zc_project::MaterialSpec>();
+    match mat {
+        zc_project::MaterialSpec::SingleColor { color, .. } => {
+            base.saturating_add(estimate_prop_track_bytes(color))
+        }
+        zc_project::MaterialSpec::Texture(t) => base
+            .saturating_add(std::mem::size_of::<zc_project::TextureMaterial>())
+            .saturating_add(t.texture.as_ref().map_or(0, String::len))
+            .saturating_add(estimate_prop_track_bytes(&t.repeat))
+            .saturating_add(estimate_prop_track_bytes(&t.offset))
+            .saturating_add(estimate_prop_track_bytes(&t.center))
+            .saturating_add(estimate_prop_track_bytes(&t.rotation)),
+        zc_project::MaterialSpec::Video(v) => base
+            .saturating_add(std::mem::size_of::<zc_project::VideoMaterial>())
+            .saturating_add(v.video.as_ref().map_or(0, String::len))
+            .saturating_add(estimate_prop_track_bytes(&v.color))
+            .saturating_add(estimate_prop_track_bytes(&v.opacity)),
+        zc_project::MaterialSpec::CustomPbr(p) => base
+            .saturating_add(std::mem::size_of::<zc_project::CustomPbrMaterial>())
+            .saturating_add(p.texture.as_ref().map_or(0, String::len))
+            .saturating_add(p.normal_map.as_ref().map_or(0, String::len))
+            .saturating_add(estimate_prop_track_bytes(&p.color))
+            .saturating_add(estimate_prop_track_bytes(&p.emissive))
+            .saturating_add(estimate_prop_track_bytes(&p.roughness))
+            .saturating_add(estimate_prop_track_bytes(&p.metalness))
+            .saturating_add(estimate_prop_track_bytes(&p.opacity))
+            .saturating_add(estimate_prop_track_bytes(&p.repeat))
+            .saturating_add(estimate_prop_track_bytes(&p.offset))
+            .saturating_add(estimate_prop_track_bytes(&p.center))
+            .saturating_add(estimate_prop_track_bytes(&p.rotation)),
+        zc_project::MaterialSpec::CustomShader {
+            frag_shader,
+            custom_properties,
+        } => base
+            .saturating_add(frag_shader.len())
+            .saturating_add(estimate_custom_properties_bytes(custom_properties)),
+        zc_project::MaterialSpec::PbrPlus(p) => base
+            .saturating_add(std::mem::size_of::<zc_project::PbrPlusMaterial>())
+            .saturating_add(p.base_color_map.as_ref().map_or(0, String::len))
+            .saturating_add(p.emissive_map.as_ref().map_or(0, String::len))
+            .saturating_add(p.roughness_map.as_ref().map_or(0, String::len))
+            .saturating_add(p.metalness_map.as_ref().map_or(0, String::len))
+            .saturating_add(p.normal_map.as_ref().map_or(0, String::len))
+            .saturating_add(p.alpha_map.as_ref().map_or(0, String::len))
+            .saturating_add(p.ao_texture.as_ref().map_or(0, String::len))
+            .saturating_add(estimate_prop_track_bytes(&p.base_color))
+            .saturating_add(estimate_prop_track_bytes(&p.emissive))
+            .saturating_add(estimate_prop_track_bytes(&p.roughness))
+            .saturating_add(estimate_prop_track_bytes(&p.metalness))
+            .saturating_add(estimate_prop_track_bytes(&p.opacity))
+            .saturating_add(estimate_prop_track_bytes(&p.emissive_intensity))
+            .saturating_add(estimate_prop_track_bytes(&p.repeat))
+            .saturating_add(estimate_prop_track_bytes(&p.offset))
+            .saturating_add(estimate_prop_track_bytes(&p.center))
+            .saturating_add(estimate_prop_track_bytes(&p.rotation))
+            .saturating_add(
+                p.normal_scale_track
+                    .as_ref()
+                    .map_or(0, estimate_prop_track_bytes),
+            )
+            .saturating_add(
+                p.reflection_intensity_track
+                    .as_ref()
+                    .map_or(0, estimate_prop_track_bytes),
+            )
+            .saturating_add(estimate_preserved_bytes(&p.preserved)),
+        zc_project::MaterialSpec::Matcap(m) => base
+            .saturating_add(std::mem::size_of::<zc_project::MatcapMaterial>())
+            .saturating_add(m.texture.as_ref().map_or(0, String::len))
+            .saturating_add(estimate_prop_track_bytes(&m.color))
+            .saturating_add(estimate_prop_track_bytes(&m.brightness))
+            .saturating_add(estimate_prop_track_bytes(&m.opacity)),
+        zc_project::MaterialSpec::ImagePlus(i) => base
+            .saturating_add(std::mem::size_of::<zc_project::ImagePlusMaterial>())
+            .saturating_add(i.texture.as_ref().map_or(0, String::len))
+            .saturating_add(estimate_prop_track_bytes(&i.opacity))
+            .saturating_add(estimate_prop_track_bytes(&i.repeat))
+            .saturating_add(estimate_prop_track_bytes(&i.offset))
+            .saturating_add(estimate_prop_track_bytes(&i.center))
+            .saturating_add(estimate_prop_track_bytes(&i.rotation)),
+        zc_project::MaterialSpec::NodeMaterial { graph, .. } => {
+            base.saturating_add(estimate_json_value_bytes(graph))
+        }
+        zc_project::MaterialSpec::Unknown {
+            material_type,
+            payload,
+        } => base
+            .saturating_add(material_type.len())
+            .saturating_add(estimate_json_value_bytes(payload)),
+    }
+}
+
+fn estimate_effect_bytes(fx: &zc_project::EffectInstance) -> usize {
+    let mut total = std::mem::size_of::<zc_project::EffectInstance>()
+        .saturating_add(fx.name.len())
+        .saturating_add(estimate_prop_track_bytes(&fx.enabled))
+        .saturating_add(estimate_preserved_bytes(&fx.preserved));
+    for (k, v) in &fx.params {
+        total = total
+            .saturating_add(k.len())
+            .saturating_add(estimate_prop_track_bytes(v))
+            .saturating_add(48);
+    }
+    match &fx.kind {
+        zc_project::EffectKind::Standard(id) => total.saturating_add(id.len()),
+        zc_project::EffectKind::Plugin {
+            plugin_id,
+            effect_id,
+        } => total
+            .saturating_add(plugin_id.len())
+            .saturating_add(effect_id.len()),
+        zc_project::EffectKind::CustomShader {
+            frag_shader,
+            custom_properties,
+        } => total
+            .saturating_add(frag_shader.len())
+            .saturating_add(estimate_custom_properties_bytes(custom_properties)),
+        zc_project::EffectKind::EffectGroup {
+            custom_properties,
+            children,
+        } => children.iter().fold(
+            total.saturating_add(estimate_custom_properties_bytes(custom_properties)),
+            |acc, child| acc.saturating_add(estimate_effect_bytes(child)),
+        ),
+    }
+}
+
+fn estimate_object3d_bytes(obj: &zc_project::Object3D) -> usize {
+    let mut total = std::mem::size_of::<zc_project::Object3D>()
+        .saturating_add(obj.name.len())
+        .saturating_add(estimate_prop_track_bytes(&obj.enabled))
+        .saturating_add(estimate_prop_track_bytes(&obj.position))
+        .saturating_add(estimate_prop_track_bytes(&obj.rotation))
+        .saturating_add(estimate_prop_track_bytes(&obj.scale))
+        .saturating_add(estimate_preserved_bytes(&obj.preserved));
+    if let Some(mat) = &obj.material {
+        total = total.saturating_add(estimate_material_bytes(mat));
+    }
+    for (k, mat) in &obj.material_slots {
+        total = total
+            .saturating_add(k.len())
+            .saturating_add(estimate_material_bytes(mat))
+            .saturating_add(48);
+    }
+    if let Some(tt) = &obj.constraints.track_to {
+        total = total
+            .saturating_add(tt.target_id.len())
+            .saturating_add(estimate_prop_track_bytes(&tt.influence));
+    }
+    if let Some(fl) = &obj.constraints.follow {
+        total = total
+            .saturating_add(fl.target_id.len())
+            .saturating_add(estimate_prop_track_bytes(&fl.position_offset))
+            .saturating_add(estimate_prop_track_bytes(&fl.rotation_offset))
+            .saturating_add(estimate_prop_track_bytes(&fl.scale_offset));
+    }
+    match &obj.kind {
+        zc_project::Object3DKind::Group {
+            custom_properties,
+            children,
+            ..
+        } => {
+            total = total.saturating_add(estimate_custom_properties_bytes(custom_properties));
+            for child in children {
+                total = total.saturating_add(estimate_object3d_bytes(child));
+            }
+        }
+        zc_project::Object3DKind::Text3D(t) => {
+            total = total
+                .saturating_add(std::mem::size_of::<zc_project::Text3DData>())
+                .saturating_add(t.text.len())
+                .saturating_add(t.font.as_ref().map_or(0, String::len));
+        }
+        zc_project::Object3DKind::Light(l) => {
+            total = total
+                .saturating_add(std::mem::size_of::<zc_project::LightData>())
+                .saturating_add(estimate_prop_track_bytes(&l.color))
+                .saturating_add(estimate_prop_track_bytes(&l.ground_color))
+                .saturating_add(estimate_prop_track_bytes(&l.target))
+                .saturating_add(estimate_prop_track_bytes(&l.intensity))
+                .saturating_add(estimate_prop_track_bytes(&l.angle));
+        }
+        zc_project::Object3DKind::Camera(c) => {
+            total = total
+                .saturating_add(std::mem::size_of::<zc_project::CameraData>())
+                .saturating_add(estimate_prop_track_bytes(&c.fov))
+                .saturating_add(estimate_prop_track_bytes(&c.zoom))
+                .saturating_add(estimate_prop_track_bytes(&c.shake_amplitude))
+                .saturating_add(estimate_prop_track_bytes(&c.shake_speed))
+                .saturating_add(estimate_prop_track_bytes(&c.focal_length))
+                .saturating_add(estimate_prop_track_bytes(&c.film_offset_x))
+                .saturating_add(estimate_prop_track_bytes(&c.film_offset_y));
+        }
+        zc_project::Object3DKind::Particles(p) => {
+            total = total
+                .saturating_add(std::mem::size_of::<zc_project::ParticlesData>())
+                .saturating_add(p.sprite_preset.as_ref().map_or(0, String::len))
+                .saturating_add(estimate_prop_track_bytes(&p.time));
+        }
+        zc_project::Object3DKind::Model(m) => {
+            total = total
+                .saturating_add(std::mem::size_of::<zc_project::ModelData>())
+                .saturating_add(m.asset_id.as_ref().map_or(0, String::len));
+            for (k, v) in &m.model_properties {
+                total = total
+                    .saturating_add(k.len())
+                    .saturating_add(estimate_prop_track_bytes(v))
+                    .saturating_add(48);
+            }
+        }
+        zc_project::Object3DKind::Dummy {
+            original_type,
+            payload,
+        } => {
+            total = total
+                .saturating_add(original_type.as_ref().map_or(0, String::len))
+                .saturating_add(estimate_json_value_bytes(payload));
+        }
+        zc_project::Object3DKind::Shape3D(_) => {}
+    }
+    total
+}
+
+fn estimate_layer_bytes(layer: &zc_project::Layer) -> usize {
+    let mut total = std::mem::size_of::<zc_project::Layer>()
+        .saturating_add(layer.name.len())
+        .saturating_add(layer.blending.len())
+        .saturating_add(estimate_prop_track_bytes(&layer.position))
+        .saturating_add(estimate_prop_track_bytes(&layer.scale))
+        .saturating_add(estimate_prop_track_bytes(&layer.rotation))
+        .saturating_add(estimate_prop_track_bytes(&layer.anchor))
+        .saturating_add(estimate_prop_track_bytes(&layer.opacity))
+        .saturating_add(estimate_preserved_bytes(&layer.preserved));
+    for fx in &layer.effects {
+        total = total.saturating_add(estimate_effect_bytes(fx));
+    }
+    match &layer.kind {
+        zc_project::LayerKind::Scene3D { objects, .. } => {
+            for obj in objects {
+                total = total.saturating_add(estimate_object3d_bytes(obj));
+            }
+        }
+        zc_project::LayerKind::Composite { layers } => {
+            for child in layers {
+                total = total.saturating_add(estimate_layer_bytes(child));
+            }
+        }
+        zc_project::LayerKind::Image { image } => {
+            total = total.saturating_add(image.as_ref().map_or(0, String::len));
+        }
+        zc_project::LayerKind::Video { media } => {
+            total = total.saturating_add(media.as_ref().map_or(0, String::len));
+        }
+        zc_project::LayerKind::Text2D {
+            text, font, shapes, ..
+        } => {
+            total = total
+                .saturating_add(text.len())
+                .saturating_add(font.as_ref().map_or(0, String::len));
+            for shape in shapes {
+                total = total
+                    .saturating_add(std::mem::size_of::<zc_project::Shape2DNode>())
+                    .saturating_add(estimate_preserved_bytes(&shape.preserved));
+            }
+        }
+        zc_project::LayerKind::Shape2D { shapes }
+        | zc_project::LayerKind::PresetShape2D { shapes, .. } => {
+            for shape in shapes {
+                total = total
+                    .saturating_add(std::mem::size_of::<zc_project::Shape2DNode>())
+                    .saturating_add(estimate_preserved_bytes(&shape.preserved));
+            }
+        }
+        zc_project::LayerKind::Plugin {
+            plugin_type,
+            payload,
+        } => {
+            total = total
+                .saturating_add(plugin_type.len())
+                .saturating_add(estimate_json_value_bytes(payload));
+        }
+        _ => {}
+    }
+    total
+}
+
+fn estimate_sequence_bytes(seq: &zc_project::Sequence) -> usize {
+    let mut total = std::mem::size_of::<zc_project::Sequence>()
+        .saturating_add(seq.name.len())
+        .saturating_add(estimate_prop_track_bytes(&seq.motion_blur.samples))
+        .saturating_add(estimate_prop_track_bytes(&seq.motion_blur.shutter))
+        .saturating_add(estimate_preserved_bytes(&seq.preserved));
+    for m in &seq.markers {
+        total = total
+            .saturating_add(std::mem::size_of::<zc_project::Marker>())
+            .saturating_add(m.label.len());
+    }
+    for ctl in &seq.controls {
+        total = total
+            .saturating_add(std::mem::size_of::<zc_project::SequenceControl>())
+            .saturating_add(ctl.id.len())
+            .saturating_add(ctl.name.len())
+            .saturating_add(estimate_prop_track_bytes(&ctl.track))
+            .saturating_add(estimate_preserved_bytes(&ctl.preserved));
+    }
+    for vt in &seq.video_tracks {
+        total = total
+            .saturating_add(std::mem::size_of::<zc_project::VideoTrack>())
+            .saturating_add(vt.name.len())
+            .saturating_add(estimate_preserved_bytes(&vt.preserved));
+        for vc in &vt.clips {
+            total = total
+                .saturating_add(std::mem::size_of::<zc_project::VideoClip>())
+                .saturating_add(vc.name.len())
+                .saturating_add(vc.media.as_ref().map_or(0, String::len))
+                .saturating_add(estimate_prop_track_bytes(&vc.time_curve))
+                .saturating_add(estimate_layer_bytes(&vc.layer))
+                .saturating_add(estimate_preserved_bytes(&vc.preserved));
+        }
+    }
+    for at in &seq.audio_tracks {
+        total = total
+            .saturating_add(std::mem::size_of::<zc_project::AudioTrack>())
+            .saturating_add(at.name.len())
+            .saturating_add(estimate_preserved_bytes(&at.preserved));
+        for ac in &at.clips {
+            total = total
+                .saturating_add(std::mem::size_of::<zc_project::AudioClip>())
+                .saturating_add(ac.name.len())
+                .saturating_add(ac.media.as_ref().map_or(0, String::len))
+                .saturating_add(estimate_prop_track_bytes(&ac.time_curve))
+                .saturating_add(estimate_prop_track_bytes(&ac.audio.volume))
+                .saturating_add(estimate_prop_track_bytes(&ac.audio.pan))
+                .saturating_add(estimate_preserved_bytes(&ac.preserved));
+        }
+    }
+    for masks in seq.layer_masks.values() {
+        for mask in masks {
+            total = total
+                .saturating_add(std::mem::size_of::<zc_project::LayerMask>())
+                .saturating_add(mask.id.len())
+                .saturating_add(mask.name.len())
+                .saturating_add(estimate_preserved_bytes(&mask.preserved));
+        }
+    }
+    total =
+        total
+            .saturating_add(seq.scene_backdrops.len().saturating_mul(
+                std::mem::size_of::<zc_project::SceneBackdrop>().saturating_add(32),
+            ))
+            .saturating_add(seq.layer_3d_props.len().saturating_mul(
+                std::mem::size_of::<zc_project::Layer3DProps>().saturating_add(32),
+            ));
+    for cam_objs in seq.camera_layer_objects.values() {
+        for obj in cam_objs {
+            total = total.saturating_add(estimate_object3d_bytes(obj));
+        }
+    }
+    total = total
+        .saturating_add(seq.bypassed_effects.len().saturating_mul(32))
+        .saturating_add(seq.precomp_offsets.len().saturating_mul(48))
+        .saturating_add(
+            seq.clip_links
+                .values()
+                .map(|v| v.len().saturating_mul(16).saturating_add(32))
+                .fold(0usize, usize::saturating_add),
+        );
+    total
+}
+
+fn estimate_project_bytes(project: &zc_project::Project) -> usize {
+    let mut total = std::mem::size_of::<zc_project::Project>()
+        .saturating_add(project.name.len())
+        .saturating_add(estimate_sequence_bytes(&project.sequence))
+        .saturating_add(estimate_preserved_bytes(&project.preserved));
+    for (k, record) in &project.assets {
+        total = total
+            .saturating_add(std::mem::size_of::<zc_project::AssetRecord>())
+            .saturating_add(k.len())
+            .saturating_add(record.id.len())
+            .saturating_add(record.filename.len())
+            .saturating_add(record.url.as_ref().map_or(0, String::len))
+            .saturating_add(record.sha256.len())
+            .saturating_add(record.bytes.as_ref().map_or(0, Vec::len))
+            .saturating_add(estimate_preserved_bytes(&record.preserved))
+            .saturating_add(48);
+    }
+    for media in &project.media {
+        total = total
+            .saturating_add(std::mem::size_of::<zc_project::MediaItem>())
+            .saturating_add(media.name.len())
+            .saturating_add(media.asset_id.as_ref().map_or(0, String::len))
+            .saturating_add(estimate_preserved_bytes(&media.preserved));
+    }
+    for comp in project.compositions.values() {
+        total = total
+            .saturating_add(estimate_sequence_bytes(comp))
+            .saturating_add(48);
+    }
+    for req in &project.plugin_requirements {
+        total = total.saturating_add(req.len()).saturating_add(32);
+    }
+    total
+}
+
+fn estimate_session_property_bytes(prop: &SessionProperty) -> usize {
+    let mut total = std::mem::size_of::<SessionProperty>()
+        .saturating_add(prop.expression.as_ref().map_or(0, String::len))
+        .saturating_add(estimate_json_value_bytes(&prop.default_value));
+    for kf in &prop.keyframes {
+        total = total
+            .saturating_add(std::mem::size_of::<SessionKeyframe>())
+            .saturating_add(estimate_json_value_bytes(&kf.value));
+    }
+    total
+}
+
+fn estimate_session_document_bytes(doc: &SessionDocument) -> usize {
+    let mut total = std::mem::size_of::<SessionDocument>().saturating_add(doc.project_name.len());
+    for track in doc.video_tracks.iter().chain(doc.audio_tracks.iter()) {
+        total = total
+            .saturating_add(std::mem::size_of::<SessionTrack>())
+            .saturating_add(track.id.len())
+            .saturating_add(track.name.len());
+        for clip in &track.clips {
+            total = total
+                .saturating_add(std::mem::size_of::<SessionClip>())
+                .saturating_add(clip.id.len())
+                .saturating_add(clip.kind.len())
+                .saturating_add(clip.name.len())
+                .saturating_add(clip.source_clip_id.as_ref().map_or(0, String::len));
+            for (k, p) in &clip.properties {
+                total = total
+                    .saturating_add(k.len())
+                    .saturating_add(estimate_session_property_bytes(p))
+                    .saturating_add(48);
+            }
+            for obj in &clip.objects_3d {
+                total = total
+                    .saturating_add(std::mem::size_of::<SessionObject3D>())
+                    .saturating_add(obj.id.len())
+                    .saturating_add(obj.kind.len())
+                    .saturating_add(obj.name.len())
+                    .saturating_add(obj.parent_id.as_ref().map_or(0, String::len))
+                    .saturating_add(obj.source_id.as_ref().map_or(0, String::len));
+                for (k, p) in &obj.properties {
+                    total = total
+                        .saturating_add(k.len())
+                        .saturating_add(estimate_session_property_bytes(p))
+                        .saturating_add(48);
+                }
+            }
+            for fx in &clip.effects {
+                total = total
+                    .saturating_add(std::mem::size_of::<SessionEffect>())
+                    .saturating_add(fx.id.len())
+                    .saturating_add(fx.kind.len())
+                    .saturating_add(fx.name.len())
+                    .saturating_add(fx.source_id.as_ref().map_or(0, String::len));
+                for (k, p) in &fx.properties {
+                    total = total
+                        .saturating_add(k.len())
+                        .saturating_add(estimate_session_property_bytes(p))
+                        .saturating_add(48);
+                }
+            }
+        }
+    }
+    for (k, p) in &doc.sequence_properties {
+        total = total
+            .saturating_add(k.len())
+            .saturating_add(estimate_session_property_bytes(p))
+            .saturating_add(48);
+    }
+    for (k, id) in &doc.sequence_control_order {
+        total = total
+            .saturating_add(k.len())
+            .saturating_add(id.len())
+            .saturating_add(48);
+    }
+    total
+}
+
+fn estimate_selection_bytes(sel: &SelectionState) -> usize {
+    let mut total = std::mem::size_of::<SelectionState>()
+        .saturating_add(sel.clip_base_type.as_ref().map_or(0, String::len))
+        .saturating_add(sel.object_3d_base_type.as_ref().map_or(0, String::len))
+        .saturating_add(sel.effect_base_type.as_ref().map_or(0, String::len));
+    for id in sel
+        .clip_ids
+        .iter()
+        .chain(sel.object_3d_ids.iter())
+        .chain(sel.effect_ids.iter())
+    {
+        total = total
+            .saturating_add(std::mem::size_of::<String>())
+            .saturating_add(id.len());
+    }
+    for kf in &sel.keyframes {
+        total = total
+            .saturating_add(std::mem::size_of::<KeyframeRef>())
+            .saturating_add(kf.target_id.len())
+            .saturating_add(kf.property.len())
+            .saturating_add(kf.channel.as_ref().map_or(0, String::len));
+    }
+    total
+}
+
 impl ByteSized for SessionSnapshot {
     fn estimated_bytes(&self) -> usize {
-        let project_json_bytes = serde_json::to_vec(&self.project).map_or(0, |b| b.len());
-        let asset_blob_bytes: usize = self
-            .project
-            .assets
-            .values()
-            .filter_map(|record| record.bytes.as_ref())
-            .map(Vec::len)
-            .fold(0usize, usize::saturating_add);
-        let doc_bytes = serde_json::to_vec(&self.document).map_or(0, |b| b.len());
-        let sel_bytes = serde_json::to_vec(&self.selection).map_or(0, |b| b.len());
+        let project_bytes = estimate_project_bytes(&self.project);
+        let doc_bytes = estimate_session_document_bytes(&self.document);
+        let sel_bytes = estimate_selection_bytes(&self.selection);
         let plugin_bytes = self.enabled_plugins.as_ref().map_or(0, |set| {
             set.iter()
-                .map(String::len)
+                .map(|s| s.len().saturating_add(32))
                 .fold(0usize, usize::saturating_add)
         });
         let ref_bytes = self
             .asset_blob_refs
             .iter()
-            .map(|(k, v)| k.len() + v.len())
+            .map(|(k, v)| k.len().saturating_add(v.len()).saturating_add(48))
             .fold(0usize, usize::saturating_add);
-        project_json_bytes
-            .saturating_add(asset_blob_bytes)
+        project_bytes
             .saturating_add(doc_bytes)
             .saturating_add(sel_bytes)
             .saturating_add(plugin_bytes)
             .saturating_add(ref_bytes)
     }
+}
+
+fn is_valid_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// O(1) edge/midpoint byte sample check (at most 192 bytes compared) to detect direct
+/// same-length in-place mutations of `AssetRecord::bytes` without hashing multi-megabyte media.
+fn bytes_edge_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    const SAMPLE: usize = 64;
+    if a.len() <= SAMPLE * 3 {
+        return a == b;
+    }
+    let mid = (a.len() / 2).saturating_sub(SAMPLE / 2);
+    let tail = a.len() - SAMPLE;
+    a[..SAMPLE] == b[..SAMPLE]
+        && a[mid..mid + SAMPLE] == b[mid..mid + SAMPLE]
+        && a[tail..] == b[tail..]
 }
 
 fn record_uuid_str(id: &str, used_ids: &mut BTreeSet<String>, max_counter: &mut u64) {
@@ -3377,6 +4151,10 @@ pub struct Session {
     plugin_revision: u64,
     /// Keyframe shifts to apply when cloning `layer_masks` for newly split clips on sync.
     pending_clip_side_table_shifts: BTreeMap<String, f64>,
+    /// Set by command handlers that mutate `self.project` directly (and rebuild `self.document`
+    /// from `self.project` if needed) so `Session::execute` can skip a redundant
+    /// `sync_document_to_project()` pass.
+    pub(crate) doc_already_synced_with_project: bool,
     next_id: u64,
 }
 
@@ -3428,6 +4206,7 @@ impl Session {
             external_plugin_requirements,
             plugin_revision: 0,
             pending_clip_side_table_shifts: BTreeMap::new(),
+            doc_already_synced_with_project: false,
             next_id,
         }
     }
@@ -3547,18 +4326,37 @@ impl Session {
         }
     }
 
-    /// Captures a lightweight undo snapshot for history storage without copying embedded
-    /// media buffers on each edit: temporarily moves raw asset `Vec<u8>` buffers out of
-    /// `self.project.assets`, interns them by content SHA-256 in `self.asset_blobs` (only
-    /// when not already cached), clones the byte-free metadata `Project`, and moves the
-    /// live buffers back into `self.project.assets`.
+    /// Captures a lightweight undo snapshot for history storage without copying or re-hashing
+    /// embedded media buffers on each edit: temporarily moves raw asset `Vec<u8>` buffers out of
+    /// `self.project.assets`, interns them by content SHA-256 in `self.asset_blobs` (reusing
+    /// `rec.sha256` in O(1) whenever it is a valid 64-hex digest matching `rec.size`), clones
+    /// the byte-free metadata `Project`, and moves the live buffers back into `self.project.assets`.
     fn capture_history_snapshot(&mut self) -> SessionSnapshot {
         let mut taken: Vec<(String, Vec<u8>)> = Vec::new();
         let mut asset_blob_refs: BTreeMap<String, String> = BTreeMap::new();
 
         for (key, rec) in &mut self.project.assets {
             if let Some(bytes) = rec.bytes.take() {
-                let digest = zc_project::sha256_hex(&bytes);
+                let bytes_len = bytes.len() as u64;
+                let cached_digest = if is_valid_sha256_hex(&rec.sha256) && rec.size == bytes_len {
+                    match self.asset_blobs.get(&rec.sha256) {
+                        Some(existing) if bytes_edge_eq(existing, &bytes) => {
+                            Some(rec.sha256.clone())
+                        }
+                        Some(_) => None,
+                        None => Some(rec.sha256.clone()),
+                    }
+                } else {
+                    None
+                };
+                let digest = if let Some(digest) = cached_digest {
+                    digest
+                } else {
+                    let computed = zc_project::sha256_hex(&bytes);
+                    rec.sha256 = computed.clone();
+                    rec.size = bytes_len;
+                    computed
+                };
                 if !self.asset_blobs.contains_key(&digest) {
                     self.asset_blobs
                         .insert(digest.clone(), Arc::new(bytes.clone()));
@@ -3878,9 +4676,6 @@ impl Session {
             }
         }
         collect_plugin_deps_from_project(&self.project, &mut deps);
-        if let Ok(val) = serde_json::to_value(&self.project) {
-            collect_plugin_deps_from_json(&val, &mut deps);
-        }
         deps
     }
 
@@ -3944,9 +4739,11 @@ impl Session {
             } else {
                 Some(self.capture_history_snapshot())
             };
+            self.doc_already_synced_with_project = false;
             let result = match self.execute_inner(command) {
                 Ok(val) => val,
                 Err(err) => {
+                    self.doc_already_synced_with_project = false;
                     if before.is_some() {
                         drop(before);
                         self.gc_asset_blobs();
@@ -3960,7 +4757,12 @@ impl Session {
             } else {
                 self.history.record_transaction_edit();
             }
-            self.sync_document_to_project();
+            if self.doc_already_synced_with_project {
+                self.doc_already_synced_with_project = false;
+                self.refresh_plugin_requirements_from_document();
+            } else {
+                self.sync_document_to_project();
+            }
             Ok(result)
         } else {
             self.execute_inner(command)
@@ -4006,12 +4808,27 @@ impl Session {
         let prev_active_comp = self.document.active_composition_id;
         // Rehydrate ONLY assets explicitly recorded in `asset_blob_refs` (preserving
         // exact content-addressed versions and leaving originally-`None` assets as `None`).
+        // When the live project already holds the exact same content-addressed buffer, move it
+        // in O(1) instead of cloning multi-megabyte media payloads on every Undo/Redo.
         for (asset_key, blob_digest) in &snapshot.asset_blob_refs {
             if let Some(rec) = snapshot.project.assets.get_mut(asset_key)
                 && rec.bytes.is_none()
                 && let Some(blob) = self.asset_blobs.get(blob_digest)
             {
-                rec.bytes = Some((**blob).clone());
+                let blob_len = blob.len() as u64;
+                let reused = self
+                    .project
+                    .assets
+                    .get_mut(asset_key)
+                    .filter(|cur| {
+                        cur.sha256 == *blob_digest
+                            && cur.size == blob_len
+                            && cur.bytes.as_deref().is_some_and(|b| bytes_edge_eq(b, blob))
+                    })
+                    .and_then(|cur| cur.bytes.take());
+                rec.bytes = Some(reused.unwrap_or_else(|| (**blob).clone()));
+                rec.sha256 = blob_digest.clone();
+                rec.size = blob_len;
             }
         }
         self.project = snapshot.project;
@@ -4033,16 +4850,20 @@ impl Session {
                 prev_active_comp.filter(|id| self.project.compositions.contains_key(id));
             if target_comp != self.document.active_composition_id {
                 let target_seq = match target_comp {
-                    None => self.project.sequence.clone(),
+                    None => &self.project.sequence,
                     Some(id) => self
                         .project
                         .compositions
                         .get(&id)
-                        .cloned()
-                        .unwrap_or_else(|| self.project.sequence.clone()),
+                        .unwrap_or(&self.project.sequence),
                 };
-                self.document =
-                    SessionDocument::from_sequence(&self.project, &target_seq, target_comp);
+                self.document = SessionDocument::from_sequence(
+                    &self.project.name,
+                    &self.project.assets,
+                    &self.project.media,
+                    target_seq,
+                    target_comp,
+                );
                 self.selection.clear_all();
             }
         }
@@ -4216,7 +5037,12 @@ impl Session {
                     existing_vclips.insert(vc.id.to_string(), vc);
                 }
             }
-            let vclip_templates = existing_vclips.clone();
+            let needs_vclip_templates = self
+                .document
+                .video_tracks
+                .iter()
+                .any(|st| st.clips.iter().any(|sc| sc.source_clip_id.is_some()));
+            let vclip_templates = needs_vclip_templates.then(|| existing_vclips.clone());
 
             let mut cloned_layer_pairs: Vec<(zc_project::Uuid, zc_project::Uuid, f64)> = Vec::new();
             let mut precomp_offset_updates: Vec<(zc_project::Uuid, f64)> = Vec::new();
@@ -4246,25 +5072,31 @@ impl Session {
                     .iter_mut()
                     .map(|sclip| {
                         let base = existing_vclips.remove(&sclip.id).or_else(|| {
-                            sclip
-                                .source_clip_id
-                                .as_deref()
-                                .and_then(|src_id| vclip_templates.get(src_id))
-                                .map(|tpl| {
-                                    let old_layer_id = tpl.layer.id;
-                                    let mut cloned = tpl.clone();
-                                    cloned.id = parse_uuid_or_new(&sclip.id);
-                                    cloned.link = None;
-                                    regenerate_cloned_layer_ids(
-                                        &mut cloned.layer,
-                                        true,
-                                        &mut alloc_uuid,
-                                    );
-                                    let shift =
-                                        pending_shifts.get(&sclip.id).copied().unwrap_or(0.0);
-                                    cloned_layer_pairs.push((old_layer_id, cloned.layer.id, shift));
-                                    cloned
-                                })
+                            vclip_templates.as_ref().and_then(|templates| {
+                                sclip
+                                    .source_clip_id
+                                    .as_deref()
+                                    .and_then(|src_id| templates.get(src_id))
+                                    .map(|tpl| {
+                                        let old_layer_id = tpl.layer.id;
+                                        let mut cloned = tpl.clone();
+                                        cloned.id = parse_uuid_or_new(&sclip.id);
+                                        cloned.link = None;
+                                        regenerate_cloned_layer_ids(
+                                            &mut cloned.layer,
+                                            true,
+                                            &mut alloc_uuid,
+                                        );
+                                        let shift =
+                                            pending_shifts.get(&sclip.id).copied().unwrap_or(0.0);
+                                        cloned_layer_pairs.push((
+                                            old_layer_id,
+                                            cloned.layer.id,
+                                            shift,
+                                        ));
+                                        cloned
+                                    })
+                            })
                         });
                         sclip.source_clip_id = None;
                         let mut synced = sync_video_clip_from_session(
@@ -4370,7 +5202,12 @@ impl Session {
                     existing_aclips.insert(ac.id.to_string(), ac);
                 }
             }
-            let aclip_templates = existing_aclips.clone();
+            let needs_aclip_templates = self
+                .document
+                .audio_tracks
+                .iter()
+                .any(|st| st.clips.iter().any(|sc| sc.source_clip_id.is_some()));
+            let aclip_templates = needs_aclip_templates.then(|| existing_aclips.clone());
 
             let mut synced_atracks = Vec::with_capacity(self.document.audio_tracks.len());
             for strack in &mut self.document.audio_tracks {
@@ -4401,16 +5238,18 @@ impl Session {
                     .iter_mut()
                     .map(|sclip| {
                         let base = existing_aclips.remove(&sclip.id).or_else(|| {
-                            sclip
-                                .source_clip_id
-                                .as_deref()
-                                .and_then(|src_id| aclip_templates.get(src_id))
-                                .map(|tpl| {
-                                    let mut cloned = tpl.clone();
-                                    cloned.id = parse_uuid_or_new(&sclip.id);
-                                    cloned.link = None;
-                                    cloned
-                                })
+                            aclip_templates.as_ref().and_then(|templates| {
+                                sclip
+                                    .source_clip_id
+                                    .as_deref()
+                                    .and_then(|src_id| templates.get(src_id))
+                                    .map(|tpl| {
+                                        let mut cloned = tpl.clone();
+                                        cloned.id = parse_uuid_or_new(&sclip.id);
+                                        cloned.link = None;
+                                        cloned
+                                    })
+                            })
                         });
                         sclip.source_clip_id = None;
                         let synced = sync_audio_clip_from_session(sclip, base, fps_u32);
@@ -4434,7 +5273,10 @@ impl Session {
         }
         self.next_id = next_id_counter;
         self.used_ids = used_ids_local;
+        self.refresh_plugin_requirements_from_document();
+    }
 
+    fn refresh_plugin_requirements_from_document(&mut self) {
         let new_doc_deps = self.document.collect_plugin_dependencies();
         for old_dep in &self.prev_doc_plugin_deps {
             if !new_doc_deps.contains(old_dep)
@@ -7418,9 +8260,36 @@ fn sync_material_from_session_with_prefix(
     if !has_any_mat_prop {
         return;
     }
-    let key = |suffix: &str| format!("{prefix}{suffix}");
+
+    struct PrefixKeyBuf {
+        buf: String,
+        prefix_len: usize,
+    }
+    impl PrefixKeyBuf {
+        fn new(prefix: &str) -> Self {
+            let mut buf = String::with_capacity(prefix.len() + 32);
+            buf.push_str(prefix);
+            Self {
+                buf,
+                prefix_len: prefix.len(),
+            }
+        }
+        fn key(&mut self, suffix: &str) -> &str {
+            self.buf.truncate(self.prefix_len);
+            self.buf.push_str(suffix);
+            &self.buf
+        }
+        fn key2(&mut self, mid: &str, suffix: &str) -> &str {
+            self.buf.truncate(self.prefix_len);
+            self.buf.push_str(mid);
+            self.buf.push_str(suffix);
+            &self.buf
+        }
+    }
+
+    let mut kbuf = PrefixKeyBuf::new(prefix);
     let desired_type =
-        prop_f64_static(props, &key("type")).map(|v| v.round().clamp(0.0, 8.0) as u32);
+        prop_f64_static(props, kbuf.key("type")).map(|v| v.round().clamp(0.0, 8.0) as u32);
     if let Some(t_idx) = desired_type {
         let current_idx = mat_slot.as_ref().and_then(material_type_index);
         if current_idx != Some(t_idx) {
@@ -7451,135 +8320,139 @@ fn sync_material_from_session_with_prefix(
     let Some(mat) = mat_slot.as_mut() else {
         return;
     };
-    let tex_key = key("texture");
-    let has_tex_prop = props.contains_key(&tex_key);
-    let tex_opt = prop_str_static(props, &tex_key).filter(|s| !s.is_empty());
-    let opt_asset = |suffix: &str| prop_str_static(props, &key(suffix)).filter(|s| !s.is_empty());
+    let has_tex_prop = props.contains_key(kbuf.key("texture"));
+    let tex_opt = prop_str_static(props, kbuf.key("texture")).filter(|s| !s.is_empty());
     match mat {
         zc_project::MaterialSpec::SingleColor { color, side } => {
-            if let Some(p) = props.get(&key("color")) {
+            if let Some(p) = props.get(kbuf.key("color")) {
                 *color = session_property_to_track(p, Some(color));
             }
-            if let Some(s) = prop_f64_static(props, &key("side")) {
+            if let Some(s) = prop_f64_static(props, kbuf.key("side")) {
                 *side = s.round().clamp(0.0, 2.0) as u32;
             }
         }
         zc_project::MaterialSpec::CustomPbr(pbr) => {
-            if let Some(p) = props.get(&key("color")) {
+            if let Some(p) = props.get(kbuf.key("color")) {
                 pbr.color = session_property_to_track(p, Some(&pbr.color));
             }
-            if let Some(p) = props.get(&key("emissive")) {
+            if let Some(p) = props.get(kbuf.key("emissive")) {
                 pbr.emissive = session_property_to_track(p, Some(&pbr.emissive));
             }
-            if let Some(p) = props.get(&key("roughness")) {
+            if let Some(p) = props.get(kbuf.key("roughness")) {
                 pbr.roughness = session_property_to_track(p, Some(&pbr.roughness));
             }
-            if let Some(p) = props.get(&key("metalness")) {
+            if let Some(p) = props.get(kbuf.key("metalness")) {
                 pbr.metalness = session_property_to_track(p, Some(&pbr.metalness));
             }
             let prev_transparent = pbr.transparent;
-            if let Some(tr) = prop_f64_static(props, &key("transparent")) {
+            if let Some(tr) = prop_f64_static(props, kbuf.key("transparent")) {
                 pbr.transparent = tr.round() as i64 != 0;
             }
             let transparent_explicitly_changed = pbr.transparent != prev_transparent;
-            if let Some(p) = props.get(&key("opacity")) {
-                let opacity_changed = property_track_to_session(&pbr.opacity) != *p;
+            if let Some(p) = props.get(kbuf.key("opacity")) {
+                let opacity_changed = !property_track_matches_session(&pbr.opacity, p);
                 pbr.opacity = session_property_to_track(p, Some(&pbr.opacity));
-                let op = prop_f64_static(props, &key("opacity")).unwrap_or(1.0);
+                let op = prop_f64_static(props, kbuf.key("opacity")).unwrap_or(1.0);
                 if opacity_changed && !transparent_explicitly_changed && (op < 0.999 || p.animated)
                 {
                     pbr.transparent = true;
                 }
             }
-            if let Some(b) = prop_f64_static(props, &key("blending")) {
+            if let Some(b) = prop_f64_static(props, kbuf.key("blending")) {
                 pbr.blending = b.round().clamp(0.0, 4.0) as u32;
             }
-            if let Some(s) = prop_f64_static(props, &key("side")) {
+            if let Some(s) = prop_f64_static(props, kbuf.key("side")) {
                 pbr.side = s.round().clamp(0.0, 2.0) as u32;
             }
             if has_tex_prop {
                 pbr.texture = tex_opt;
             }
-            if props.contains_key(&key("normalMap")) {
-                pbr.normal_map = opt_asset("normalMap");
+            if props.contains_key(kbuf.key("normalMap")) {
+                pbr.normal_map =
+                    prop_str_static(props, kbuf.key("normalMap")).filter(|s| !s.is_empty());
             }
-            if let Some(ns) = prop_f64_static(props, &key("normalScale")) {
+            if let Some(ns) = prop_f64_static(props, kbuf.key("normalScale")) {
                 pbr.normal_scale = ns;
             }
-            if let Some(w) = prop_f64_static(props, &key("wrap")) {
+            if let Some(w) = prop_f64_static(props, kbuf.key("wrap")) {
                 pbr.wrap = w.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(p) = props.get(&key("repeat")) {
+            if let Some(p) = props.get(kbuf.key("repeat")) {
                 pbr.repeat = session_property_to_track(p, Some(&pbr.repeat));
             }
-            if let Some(p) = props.get(&key("offset")) {
+            if let Some(p) = props.get(kbuf.key("offset")) {
                 pbr.offset = session_property_to_track(p, Some(&pbr.offset));
             }
-            if let Some(p) = props.get(&key("center")) {
+            if let Some(p) = props.get(kbuf.key("center")) {
                 pbr.center = session_property_to_track(p, Some(&pbr.center));
             }
-            if let Some(p) = props.get(&key("rotation")) {
+            if let Some(p) = props.get(kbuf.key("rotation")) {
                 pbr.rotation = session_property_to_track(p, Some(&pbr.rotation));
             }
-            if let Some(r) = prop_f64_static(props, &key("reflection")) {
+            if let Some(r) = prop_f64_static(props, kbuf.key("reflection")) {
                 pbr.reflection = r.round() as i64 != 0;
             }
-            if let Some(uv) = prop_f64_static(props, &key("uvNormalized")) {
+            if let Some(uv) = prop_f64_static(props, kbuf.key("uvNormalized")) {
                 pbr.uv_normalized = uv.round() as i64 != 0;
             }
         }
         zc_project::MaterialSpec::PbrPlus(pbr) => {
-            if let Some(p) = props.get(&key("color")) {
+            if let Some(p) = props.get(kbuf.key("color")) {
                 pbr.base_color = session_property_to_track(p, Some(&pbr.base_color));
             }
-            if let Some(p) = props.get(&key("emissive")) {
+            if let Some(p) = props.get(kbuf.key("emissive")) {
                 pbr.emissive = session_property_to_track(p, Some(&pbr.emissive));
             }
-            if let Some(p) = props.get(&key("roughness")) {
+            if let Some(p) = props.get(kbuf.key("roughness")) {
                 pbr.roughness = session_property_to_track(p, Some(&pbr.roughness));
             }
-            if let Some(p) = props.get(&key("metalness")) {
+            if let Some(p) = props.get(kbuf.key("metalness")) {
                 pbr.metalness = session_property_to_track(p, Some(&pbr.metalness));
             }
             let prev_transparent = pbr.transparent;
-            if let Some(tr) = prop_f64_static(props, &key("transparent")) {
+            if let Some(tr) = prop_f64_static(props, kbuf.key("transparent")) {
                 pbr.transparent = tr.round() as i64 != 0;
             }
             let transparent_explicitly_changed = pbr.transparent != prev_transparent;
-            if let Some(p) = props.get(&key("opacity")) {
-                let opacity_changed = property_track_to_session(&pbr.opacity) != *p;
+            if let Some(p) = props.get(kbuf.key("opacity")) {
+                let opacity_changed = !property_track_matches_session(&pbr.opacity, p);
                 pbr.opacity = session_property_to_track(p, Some(&pbr.opacity));
-                let op = prop_f64_static(props, &key("opacity")).unwrap_or(1.0);
+                let op = prop_f64_static(props, kbuf.key("opacity")).unwrap_or(1.0);
                 if opacity_changed && !transparent_explicitly_changed && (op < 0.999 || p.animated)
                 {
                     pbr.transparent = true;
                 }
             }
-            if let Some(b) = prop_f64_static(props, &key("blending")) {
+            if let Some(b) = prop_f64_static(props, kbuf.key("blending")) {
                 pbr.blending = b.round().clamp(0.0, 4.0) as u32;
             }
-            if let Some(s) = prop_f64_static(props, &key("side")) {
+            if let Some(s) = prop_f64_static(props, kbuf.key("side")) {
                 pbr.side = s.round().clamp(0.0, 2.0) as u32;
             }
             if has_tex_prop {
                 pbr.base_color_map = tex_opt;
-            } else if props.contains_key(&key("baseColorMap")) {
-                pbr.base_color_map = opt_asset("baseColorMap");
+            } else if props.contains_key(kbuf.key("baseColorMap")) {
+                pbr.base_color_map =
+                    prop_str_static(props, kbuf.key("baseColorMap")).filter(|s| !s.is_empty());
             }
-            if props.contains_key(&key("emissiveMap")) {
-                pbr.emissive_map = opt_asset("emissiveMap");
+            if props.contains_key(kbuf.key("emissiveMap")) {
+                pbr.emissive_map =
+                    prop_str_static(props, kbuf.key("emissiveMap")).filter(|s| !s.is_empty());
             }
-            if props.contains_key(&key("roughnessMap")) {
-                pbr.roughness_map = opt_asset("roughnessMap");
+            if props.contains_key(kbuf.key("roughnessMap")) {
+                pbr.roughness_map =
+                    prop_str_static(props, kbuf.key("roughnessMap")).filter(|s| !s.is_empty());
             }
-            if props.contains_key(&key("metalnessMap")) {
-                pbr.metalness_map = opt_asset("metalnessMap");
+            if props.contains_key(kbuf.key("metalnessMap")) {
+                pbr.metalness_map =
+                    prop_str_static(props, kbuf.key("metalnessMap")).filter(|s| !s.is_empty());
             }
-            if props.contains_key(&key("normalMap")) {
-                pbr.normal_map = opt_asset("normalMap");
+            if props.contains_key(kbuf.key("normalMap")) {
+                pbr.normal_map =
+                    prop_str_static(props, kbuf.key("normalMap")).filter(|s| !s.is_empty());
             }
-            if let Some(p) = props.get(&key("normalScale")) {
-                if let Some(ns) = prop_f64_static(props, &key("normalScale")) {
+            if let Some(p) = props.get(kbuf.key("normalScale")) {
+                if let Some(ns) = prop_f64_static(props, kbuf.key("normalScale")) {
                     pbr.normal_scale = ns;
                 }
                 if pbr.normal_scale_track.is_some() || p.animated || p.expression.is_some() {
@@ -7589,51 +8462,55 @@ fn sync_material_from_session_with_prefix(
                     ));
                 }
             }
-            if props.contains_key(&key("alphaMap")) {
-                pbr.alpha_map = opt_asset("alphaMap");
+            if props.contains_key(kbuf.key("alphaMap")) {
+                pbr.alpha_map =
+                    prop_str_static(props, kbuf.key("alphaMap")).filter(|s| !s.is_empty());
             }
-            let has_ao_tex = props.contains_key(&key("aoTexture"));
-            let has_ao_map = props.contains_key(&key("aoMap"));
+            let has_ao_tex = props.contains_key(kbuf.key("aoTexture"));
+            let has_ao_map = props.contains_key(kbuf.key("aoMap"));
             if has_ao_tex && has_ao_map {
-                let tex_val = opt_asset("aoTexture");
-                let map_val = opt_asset("aoMap");
+                let tex_val =
+                    prop_str_static(props, kbuf.key("aoTexture")).filter(|s| !s.is_empty());
+                let map_val = prop_str_static(props, kbuf.key("aoMap")).filter(|s| !s.is_empty());
                 if tex_val != pbr.ao_texture {
                     pbr.ao_texture = tex_val;
                 } else if map_val != pbr.ao_texture {
                     pbr.ao_texture = map_val;
                 }
             } else if has_ao_tex {
-                pbr.ao_texture = opt_asset("aoTexture");
+                pbr.ao_texture =
+                    prop_str_static(props, kbuf.key("aoTexture")).filter(|s| !s.is_empty());
             } else if has_ao_map {
-                pbr.ao_texture = opt_asset("aoMap");
+                pbr.ao_texture =
+                    prop_str_static(props, kbuf.key("aoMap")).filter(|s| !s.is_empty());
             }
-            if let Some(p) = props.get(&key("emissiveIntensity")) {
+            if let Some(p) = props.get(kbuf.key("emissiveIntensity")) {
                 pbr.emissive_intensity =
                     session_property_to_track(p, Some(&pbr.emissive_intensity));
             }
-            if let Some(at) = prop_f64_static(props, &key("alphaTest")) {
+            if let Some(at) = prop_f64_static(props, kbuf.key("alphaTest")) {
                 pbr.alpha_test = at;
             }
-            if let Some(r) = prop_f64_static(props, &key("reflection")) {
+            if let Some(r) = prop_f64_static(props, kbuf.key("reflection")) {
                 pbr.reflection = r.round() as i64 != 0;
             }
-            if let Some(w) = prop_f64_static(props, &key("wrap")) {
+            if let Some(w) = prop_f64_static(props, kbuf.key("wrap")) {
                 pbr.wrap = w.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(p) = props.get(&key("repeat")) {
+            if let Some(p) = props.get(kbuf.key("repeat")) {
                 pbr.repeat = session_property_to_track(p, Some(&pbr.repeat));
             }
-            if let Some(p) = props.get(&key("offset")) {
+            if let Some(p) = props.get(kbuf.key("offset")) {
                 pbr.offset = session_property_to_track(p, Some(&pbr.offset));
             }
-            if let Some(p) = props.get(&key("center")) {
+            if let Some(p) = props.get(kbuf.key("center")) {
                 pbr.center = session_property_to_track(p, Some(&pbr.center));
             }
-            if let Some(p) = props.get(&key("rotation")) {
+            if let Some(p) = props.get(kbuf.key("rotation")) {
                 pbr.rotation = session_property_to_track(p, Some(&pbr.rotation));
             }
-            if let Some(p) = props.get(&key("reflectionIntensity")) {
-                if let Some(ri) = prop_f64_static(props, &key("reflectionIntensity")) {
+            if let Some(p) = props.get(kbuf.key("reflectionIntensity")) {
+                if let Some(ri) = prop_f64_static(props, kbuf.key("reflectionIntensity")) {
                     pbr.reflection_intensity = ri;
                 }
                 if pbr.reflection_intensity_track.is_some() || p.animated || p.expression.is_some()
@@ -7646,9 +8523,10 @@ fn sync_material_from_session_with_prefix(
             }
             // Sync Material+ surface props (AO, Cel, Fresnel, Color Ramp, Bump Noise, UV Projection, Env).
             for &sk in PBR_PLUS_SURFACE_KEYS {
-                let direct_k = key(sk);
-                let surface_k = format!("{prefix}surface.{sk}");
-                if let Some(prop) = props.get(&direct_k).or_else(|| props.get(&surface_k)) {
+                let prop = props
+                    .get(kbuf.key(sk))
+                    .or_else(|| props.get(kbuf.key2("surface.", sk)));
+                if let Some(prop) = prop {
                     let val = session_property_to_preserved_value(prop, |p| {
                         session_property_to_track(p, None)
                     });
@@ -7664,50 +8542,50 @@ fn sync_material_from_session_with_prefix(
             if has_tex_prop {
                 tex.texture = tex_opt;
             }
-            if let Some(s) = prop_f64_static(props, &key("side")) {
+            if let Some(s) = prop_f64_static(props, kbuf.key("side")) {
                 tex.side = s.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(w) = prop_f64_static(props, &key("wrap")) {
+            if let Some(w) = prop_f64_static(props, kbuf.key("wrap")) {
                 tex.wrap = w.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(p) = props.get(&key("repeat")) {
+            if let Some(p) = props.get(kbuf.key("repeat")) {
                 tex.repeat = session_property_to_track(p, Some(&tex.repeat));
             }
-            if let Some(p) = props.get(&key("offset")) {
+            if let Some(p) = props.get(kbuf.key("offset")) {
                 tex.offset = session_property_to_track(p, Some(&tex.offset));
             }
-            if let Some(p) = props.get(&key("center")) {
+            if let Some(p) = props.get(kbuf.key("center")) {
                 tex.center = session_property_to_track(p, Some(&tex.center));
             }
-            if let Some(p) = props.get(&key("rotation")) {
+            if let Some(p) = props.get(kbuf.key("rotation")) {
                 tex.rotation = session_property_to_track(p, Some(&tex.rotation));
             }
         }
         zc_project::MaterialSpec::Video(vid) => {
-            if let Some(p) = props.get(&key("color")) {
+            if let Some(p) = props.get(kbuf.key("color")) {
                 vid.color = session_property_to_track(p, Some(&vid.color));
             }
             let prev_transparent = vid.transparent;
-            if let Some(tr) = prop_f64_static(props, &key("transparent")) {
+            if let Some(tr) = prop_f64_static(props, kbuf.key("transparent")) {
                 vid.transparent = tr.round() as i64 != 0;
             }
             let transparent_explicitly_changed = vid.transparent != prev_transparent;
-            if let Some(p) = props.get(&key("opacity")) {
-                let opacity_changed = property_track_to_session(&vid.opacity) != *p;
+            if let Some(p) = props.get(kbuf.key("opacity")) {
+                let opacity_changed = !property_track_matches_session(&vid.opacity, p);
                 vid.opacity = session_property_to_track(p, Some(&vid.opacity));
-                let op = prop_f64_static(props, &key("opacity")).unwrap_or(1.0);
+                let op = prop_f64_static(props, kbuf.key("opacity")).unwrap_or(1.0);
                 if opacity_changed && !transparent_explicitly_changed && (op < 0.999 || p.animated)
                 {
                     vid.transparent = true;
                 }
             }
-            if let Some(b) = prop_f64_static(props, &key("blending")) {
+            if let Some(b) = prop_f64_static(props, kbuf.key("blending")) {
                 vid.blending = b.round().clamp(0.0, 4.0) as u32;
             }
-            if let Some(so) = prop_f64_static(props, &key("startOffset")) {
+            if let Some(so) = prop_f64_static(props, kbuf.key("startOffset")) {
                 vid.start_offset = so.round().max(0.0) as u32;
             }
-            if let Some(mo) = prop_f64_static(props, &key("mediaOffset")) {
+            if let Some(mo) = prop_f64_static(props, kbuf.key("mediaOffset")) {
                 vid.media_offset = mo.round().max(0.0) as u32;
             }
             if has_tex_prop {
@@ -7715,30 +8593,30 @@ fn sync_material_from_session_with_prefix(
             }
         }
         zc_project::MaterialSpec::Matcap(mc) => {
-            if let Some(p) = props.get(&key("color")) {
+            if let Some(p) = props.get(kbuf.key("color")) {
                 mc.color = session_property_to_track(p, Some(&mc.color));
             }
-            if let Some(p) = props.get(&key("brightness")) {
+            if let Some(p) = props.get(kbuf.key("brightness")) {
                 mc.brightness = session_property_to_track(p, Some(&mc.brightness));
             }
             let prev_transparent = mc.transparent;
-            if let Some(tr) = prop_f64_static(props, &key("transparent")) {
+            if let Some(tr) = prop_f64_static(props, kbuf.key("transparent")) {
                 mc.transparent = tr.round() as i64 != 0;
             }
             let transparent_explicitly_changed = mc.transparent != prev_transparent;
-            if let Some(p) = props.get(&key("opacity")) {
-                let opacity_changed = property_track_to_session(&mc.opacity) != *p;
+            if let Some(p) = props.get(kbuf.key("opacity")) {
+                let opacity_changed = !property_track_matches_session(&mc.opacity, p);
                 mc.opacity = session_property_to_track(p, Some(&mc.opacity));
-                let op = prop_f64_static(props, &key("opacity")).unwrap_or(1.0);
+                let op = prop_f64_static(props, kbuf.key("opacity")).unwrap_or(1.0);
                 if opacity_changed && !transparent_explicitly_changed && (op < 0.999 || p.animated)
                 {
                     mc.transparent = true;
                 }
             }
-            if let Some(b) = prop_f64_static(props, &key("blending")) {
+            if let Some(b) = prop_f64_static(props, kbuf.key("blending")) {
                 mc.blending = b.round().clamp(0.0, 4.0) as u32;
             }
-            if let Some(s) = prop_f64_static(props, &key("side")) {
+            if let Some(s) = prop_f64_static(props, kbuf.key("side")) {
                 mc.side = s.round().clamp(0.0, 2.0) as u32;
             }
             if has_tex_prop {
@@ -7746,31 +8624,31 @@ fn sync_material_from_session_with_prefix(
             }
         }
         zc_project::MaterialSpec::ImagePlus(img) => {
-            if let Some(p) = props.get(&key("opacity")) {
+            if let Some(p) = props.get(kbuf.key("opacity")) {
                 img.opacity = session_property_to_track(p, Some(&img.opacity));
             }
-            if let Some(tr) = prop_f64_static(props, &key("transparent")) {
+            if let Some(tr) = prop_f64_static(props, kbuf.key("transparent")) {
                 img.transparent = tr.round() as i64 != 0;
             }
-            if let Some(b) = prop_f64_static(props, &key("blending")) {
+            if let Some(b) = prop_f64_static(props, kbuf.key("blending")) {
                 img.blending = b.round().clamp(0.0, 4.0) as u32;
             }
-            if let Some(s) = prop_f64_static(props, &key("side")) {
+            if let Some(s) = prop_f64_static(props, kbuf.key("side")) {
                 img.side = s.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(w) = prop_f64_static(props, &key("wrap")) {
+            if let Some(w) = prop_f64_static(props, kbuf.key("wrap")) {
                 img.wrap = w.round().clamp(0.0, 2.0) as u32;
             }
-            if let Some(p) = props.get(&key("repeat")) {
+            if let Some(p) = props.get(kbuf.key("repeat")) {
                 img.repeat = session_property_to_track(p, Some(&img.repeat));
             }
-            if let Some(p) = props.get(&key("offset")) {
+            if let Some(p) = props.get(kbuf.key("offset")) {
                 img.offset = session_property_to_track(p, Some(&img.offset));
             }
-            if let Some(p) = props.get(&key("center")) {
+            if let Some(p) = props.get(kbuf.key("center")) {
                 img.center = session_property_to_track(p, Some(&img.center));
             }
-            if let Some(p) = props.get(&key("rotation")) {
+            if let Some(p) = props.get(kbuf.key("rotation")) {
                 img.rotation = session_property_to_track(p, Some(&img.rotation));
             }
             if has_tex_prop {
@@ -7781,20 +8659,19 @@ fn sync_material_from_session_with_prefix(
             frag_shader,
             custom_properties,
         } => {
-            if let Some(code) = prop_str_static(props, &key("fragShader")) {
+            if let Some(code) = prop_str_static(props, kbuf.key("fragShader")) {
                 *frag_shader = code;
             }
-            let custom_prefix = format!("{prefix}custom.");
             let mut handled = BTreeSet::new();
             for cp in custom_properties.iter_mut() {
-                let ck = format!("{custom_prefix}{}", cp.name);
-                if let Some(prop) = props.get(&ck) {
+                if let Some(prop) = props.get(kbuf.key2("custom.", &cp.name)) {
                     cp.track = session_property_to_track(prop, Some(&cp.track));
                     handled.insert(cp.name.clone());
                 }
             }
+            let custom_prefix = kbuf.key("custom.");
             for (pk, prop) in props {
-                if let Some(name) = pk.strip_prefix(&custom_prefix)
+                if let Some(name) = pk.strip_prefix(custom_prefix)
                     && !name.is_empty()
                     && !handled.contains(name)
                 {
@@ -7812,10 +8689,10 @@ fn sync_material_from_session_with_prefix(
             resolution,
             graph,
         } => {
-            if let Some(sv) = prop_f64_static(props, &key("schemaVersion")) {
+            if let Some(sv) = prop_f64_static(props, kbuf.key("schemaVersion")) {
                 *schema_version = sv.round().max(1.0) as u32;
             }
-            if let Some(br) = prop_f64_static(props, &key("bakeResolution")) {
+            if let Some(br) = prop_f64_static(props, kbuf.key("bakeResolution")) {
                 let raw = br.round().max(0.0) as u32;
                 *resolution = match raw {
                     0 => 128,
@@ -7827,7 +8704,10 @@ fn sync_material_from_session_with_prefix(
                     _ => 256,
                 };
             }
-            if let Some(gp) = props.get(&key("graph")).and_then(|p| p.keyframes.first()) {
+            if let Some(gp) = props
+                .get(kbuf.key("graph"))
+                .and_then(|p| p.keyframes.first())
+            {
                 if let Some(s) = gp.value.as_str() {
                     if let Ok(parsed) = serde_json::from_str::<Value>(s) {
                         *graph = parsed;
@@ -8898,7 +9778,7 @@ fn build_object_3d_from_session(
                     dof.focus_distance = session_property_to_track(p, Some(&dof.focus_distance));
                 }
                 if let Some(p) = sobj.properties.get("dofAperture") {
-                    let changed = property_track_to_session(&dof.aperture) != *p;
+                    let changed = !property_track_matches_session(&dof.aperture, p);
                     dof.aperture = session_property_to_track(p, Some(&dof.aperture));
                     if changed {
                         clamp_track_f64_range(&mut dof.aperture, 0.0, 40.0);
@@ -9124,7 +10004,7 @@ fn build_object_3d_from_session(
                 tt.up_axis = ua.round().clamp(0.0, 2.0) as u32;
             }
             if let Some(p) = sobj.properties.get("constraint.trackTo.influence") {
-                let changed = property_track_to_session(&tt.influence) != *p;
+                let changed = !property_track_matches_session(&tt.influence, p);
                 tt.influence = session_property_to_track(p, Some(&tt.influence));
                 if changed {
                     clamp_track_f64_range(&mut tt.influence, 0.0, 100.0);
@@ -9216,31 +10096,58 @@ fn collect_existing_objects(
 
 fn rebuild_object_tree(
     flat: &[SessionObject3D],
+    existing: &mut BTreeMap<String, zc_project::Object3D>,
+    templates: Option<&BTreeMap<String, zc_project::Object3D>>,
+) -> Vec<zc_project::Object3D> {
+    let mut children_by_parent: HashMap<Option<&str>, Vec<usize>> =
+        HashMap::with_capacity(flat.len().min(64) + 1);
+    for (idx, sobj) in flat.iter().enumerate() {
+        children_by_parent
+            .entry(sobj.parent_id.as_deref())
+            .or_default()
+            .push(idx);
+    }
+    rebuild_object_tree_node(flat, &children_by_parent, None, existing, templates, 0)
+}
+
+fn rebuild_object_tree_node(
+    flat: &[SessionObject3D],
+    children_by_parent: &HashMap<Option<&str>, Vec<usize>>,
     parent_id: Option<&str>,
     existing: &mut BTreeMap<String, zc_project::Object3D>,
-    templates: &BTreeMap<String, zc_project::Object3D>,
+    templates: Option<&BTreeMap<String, zc_project::Object3D>>,
     depth: usize,
 ) -> Vec<zc_project::Object3D> {
     if depth > 64 {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    for sobj in flat {
-        if sobj.parent_id.as_deref() == parent_id {
-            let children =
-                rebuild_object_tree(flat, Some(&sobj.id), existing, templates, depth + 1);
-            let prev = existing.remove(&sobj.id).or_else(|| {
+    let Some(indices) = children_by_parent.get(&parent_id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        let sobj = &flat[idx];
+        let children = rebuild_object_tree_node(
+            flat,
+            children_by_parent,
+            Some(&sobj.id),
+            existing,
+            templates,
+            depth + 1,
+        );
+        let prev = existing.remove(&sobj.id).or_else(|| {
+            templates.and_then(|tpls| {
                 sobj.source_id
                     .as_deref()
-                    .and_then(|src_id| templates.get(src_id))
+                    .and_then(|src_id| tpls.get(src_id))
                     .map(|tpl| {
                         let mut cloned = tpl.clone();
                         cloned.id = parse_uuid_or_new(&sobj.id);
                         cloned
                     })
-            });
-            out.push(build_object_3d_from_session(sobj, prev, children));
-        }
+            })
+        });
+        out.push(build_object_3d_from_session(sobj, prev, children));
     }
     out
 }
@@ -9707,13 +10614,12 @@ fn sync_video_clip_from_session(
             }
             let mut existing_objs = BTreeMap::new();
             collect_existing_objects(std::mem::take(objects), &mut existing_objs);
-            let obj_templates = existing_objs.clone();
+            let needs_obj_templates = sclip.objects_3d.iter().any(|sobj| sobj.source_id.is_some());
+            let obj_templates = needs_obj_templates.then(|| existing_objs.clone());
             *objects = rebuild_object_tree(
                 &sclip.objects_3d,
-                None,
                 &mut existing_objs,
-                &obj_templates,
-                0,
+                obj_templates.as_ref(),
             );
             for sobj in &mut sclip.objects_3d {
                 sobj.source_id = None;
@@ -9728,21 +10634,24 @@ fn sync_video_clip_from_session(
         .drain(..)
         .map(|fx| (fx.id.to_string(), fx))
         .collect();
-    let fx_templates = existing_fx.clone();
+    let needs_fx_templates = sclip.effects.iter().any(|sfx| sfx.source_id.is_some());
+    let fx_templates = needs_fx_templates.then(|| existing_fx.clone());
     vc.layer.effects = sclip
         .effects
         .iter_mut()
         .map(|sfx| {
             let base = existing_fx.remove(&sfx.id).or_else(|| {
-                sfx.source_id
-                    .as_deref()
-                    .and_then(|src_id| fx_templates.get(src_id))
-                    .map(|tpl| {
-                        let mut cloned = tpl.clone();
-                        cloned.id = parse_uuid_or_new(&sfx.id);
-                        regenerate_effect_ids(&mut cloned, false, alloc_uuid);
-                        cloned
-                    })
+                fx_templates.as_ref().and_then(|templates| {
+                    sfx.source_id
+                        .as_deref()
+                        .and_then(|src_id| templates.get(src_id))
+                        .map(|tpl| {
+                            let mut cloned = tpl.clone();
+                            cloned.id = parse_uuid_or_new(&sfx.id);
+                            regenerate_effect_ids(&mut cloned, false, alloc_uuid);
+                            cloned
+                        })
+                })
             });
             sfx.source_id = None;
             sync_effect_from_session(sfx, base)
@@ -9813,6 +10722,28 @@ fn track_has_expression(track: &zc_project::PropertyTrack) -> bool {
     track.expression.is_some() || track.channels.iter().any(track_has_expression)
 }
 
+fn collect_plugin_deps_from_preserved(
+    preserved: &BTreeMap<String, Value>,
+    deps: &mut BTreeSet<String>,
+) {
+    for (k, v) in preserved {
+        if matches!(k.as_str(), "required_plugins" | "plugin_requirements")
+            && let Some(req) = v.as_array()
+        {
+            for item in req {
+                if let Some(id) = item
+                    .as_str()
+                    .or_else(|| item.get("id").and_then(Value::as_str))
+                    && !id.is_empty()
+                {
+                    deps.insert(id.to_string());
+                }
+            }
+        }
+        collect_plugin_deps_from_json(v, deps);
+    }
+}
+
 fn collect_plugin_deps_from_material(mat: &zc_project::MaterialSpec, deps: &mut BTreeSet<String>) {
     match mat {
         zc_project::MaterialSpec::SingleColor { color, .. } => {
@@ -9851,11 +10782,11 @@ fn collect_plugin_deps_from_material(mat: &zc_project::MaterialSpec, deps: &mut 
         zc_project::MaterialSpec::CustomShader {
             custom_properties, ..
         } => {
-            if custom_properties
-                .iter()
-                .any(|cp| track_has_expression(&cp.track))
-            {
-                deps.insert("expressions-plus".to_string());
+            for cp in custom_properties {
+                if track_has_expression(&cp.track) {
+                    deps.insert("expressions-plus".to_string());
+                }
+                collect_plugin_deps_from_preserved(&cp.metadata, deps);
             }
         }
         zc_project::MaterialSpec::PbrPlus(p) => {
@@ -9872,6 +10803,7 @@ fn collect_plugin_deps_from_material(mat: &zc_project::MaterialSpec, deps: &mut 
             {
                 deps.insert("expressions-plus".to_string());
             }
+            collect_plugin_deps_from_preserved(&p.preserved, deps);
         }
         zc_project::MaterialSpec::Matcap(m) => {
             deps.insert("material-plus".to_string());
@@ -9893,13 +10825,18 @@ fn collect_plugin_deps_from_material(mat: &zc_project::MaterialSpec, deps: &mut 
                 deps.insert("expressions-plus".to_string());
             }
         }
-        zc_project::MaterialSpec::NodeMaterial { .. } => {
+        zc_project::MaterialSpec::NodeMaterial { graph, .. } => {
             deps.insert("material-plus".to_string());
+            collect_plugin_deps_from_json(graph, deps);
         }
-        zc_project::MaterialSpec::Unknown { material_type, .. } => {
+        zc_project::MaterialSpec::Unknown {
+            material_type,
+            payload,
+        } => {
             if let Some(pid) = extract_namespaced_plugin_id(material_type) {
                 deps.insert(pid.to_string());
             }
+            collect_plugin_deps_from_json(payload, deps);
         }
     }
 }
@@ -9912,6 +10849,7 @@ fn collect_plugin_deps_from_effects(
         if track_has_expression(&fx.enabled) || fx.params.values().any(track_has_expression) {
             deps.insert("expressions-plus".to_string());
         }
+        collect_plugin_deps_from_preserved(&fx.preserved, deps);
         match &fx.kind {
             zc_project::EffectKind::Plugin { plugin_id, .. } => {
                 if !plugin_id.is_empty() {
@@ -9921,22 +10859,22 @@ fn collect_plugin_deps_from_effects(
             zc_project::EffectKind::CustomShader {
                 custom_properties, ..
             } => {
-                if custom_properties
-                    .iter()
-                    .any(|cp| track_has_expression(&cp.track))
-                {
-                    deps.insert("expressions-plus".to_string());
+                for cp in custom_properties {
+                    if track_has_expression(&cp.track) {
+                        deps.insert("expressions-plus".to_string());
+                    }
+                    collect_plugin_deps_from_preserved(&cp.metadata, deps);
                 }
             }
             zc_project::EffectKind::EffectGroup {
                 custom_properties,
                 children,
             } => {
-                if custom_properties
-                    .iter()
-                    .any(|cp| track_has_expression(&cp.track))
-                {
-                    deps.insert("expressions-plus".to_string());
+                for cp in custom_properties {
+                    if track_has_expression(&cp.track) {
+                        deps.insert("expressions-plus".to_string());
+                    }
+                    collect_plugin_deps_from_preserved(&cp.metadata, deps);
                 }
                 collect_plugin_deps_from_effects(children, deps);
             }
@@ -9975,25 +10913,18 @@ fn collect_plugin_deps_from_objects(objects: &[zc_project::Object3D], deps: &mut
         for mat in obj.material_slots.values() {
             collect_plugin_deps_from_material(mat, deps);
         }
-        if let Some(pt) = obj
-            .preserved
-            .get("zoidiumPluginObjectType")
-            .and_then(Value::as_str)
-            && let Some(pid) = extract_namespaced_plugin_id(pt)
-        {
-            deps.insert(pid.to_string());
-        }
+        collect_plugin_deps_from_preserved(&obj.preserved, deps);
         match &obj.kind {
             zc_project::Object3DKind::Group {
                 custom_properties,
                 children,
                 ..
             } => {
-                if custom_properties
-                    .iter()
-                    .any(|cp| track_has_expression(&cp.track))
-                {
-                    deps.insert("expressions-plus".to_string());
+                for cp in custom_properties {
+                    if track_has_expression(&cp.track) {
+                        deps.insert("expressions-plus".to_string());
+                    }
+                    collect_plugin_deps_from_preserved(&cp.metadata, deps);
                 }
                 collect_plugin_deps_from_objects(children, deps);
             }
@@ -10080,18 +11011,17 @@ fn collect_plugin_deps_from_objects(objects: &[zc_project::Object3D], deps: &mut
                 }
             }
             zc_project::Object3DKind::Dummy {
-                original_type: Some(t),
-                ..
+                original_type,
+                payload,
             } => {
-                if let Some(pid) = extract_namespaced_plugin_id(t) {
+                if let Some(t) = original_type
+                    && let Some(pid) = extract_namespaced_plugin_id(t)
+                {
                     deps.insert(pid.to_string());
                 }
+                collect_plugin_deps_from_json(payload, deps);
             }
-            zc_project::Object3DKind::Text3D(_)
-            | zc_project::Object3DKind::Dummy {
-                original_type: None,
-                ..
-            } => {}
+            zc_project::Object3DKind::Text3D(_) => {}
         }
     }
 }
@@ -10105,6 +11035,7 @@ fn collect_plugin_deps_from_layer(layer: &zc_project::Layer, deps: &mut BTreeSet
     {
         deps.insert("expressions-plus".to_string());
     }
+    collect_plugin_deps_from_preserved(&layer.preserved, deps);
     collect_plugin_deps_from_effects(&layer.effects, deps);
     match &layer.kind {
         zc_project::LayerKind::Scene3D { objects, .. } => {
@@ -10115,16 +11046,27 @@ fn collect_plugin_deps_from_layer(layer: &zc_project::Layer, deps: &mut BTreeSet
                 collect_plugin_deps_from_layer(child, deps);
             }
         }
+        zc_project::LayerKind::Shape2D { shapes }
+        | zc_project::LayerKind::Text2D { shapes, .. }
+        | zc_project::LayerKind::PresetShape2D { shapes, .. } => {
+            for shape in shapes {
+                collect_plugin_deps_from_preserved(&shape.preserved, deps);
+            }
+        }
         zc_project::LayerKind::CameraLayer { .. } => {
             deps.insert("camera-plus".to_string());
         }
         zc_project::LayerKind::PrecompRef { .. } => {
             deps.insert("precomp-plus".to_string());
         }
-        zc_project::LayerKind::Plugin { plugin_type, .. } => {
+        zc_project::LayerKind::Plugin {
+            plugin_type,
+            payload,
+        } => {
             if let Some(pid) = extract_namespaced_plugin_id(plugin_type) {
                 deps.insert(pid.to_string());
             }
+            collect_plugin_deps_from_json(payload, deps);
         }
         _ => {}
     }
@@ -10138,18 +11080,25 @@ fn collect_plugin_deps_from_sequence(seq: &zc_project::Sequence, deps: &mut BTre
     {
         deps.insert("expressions-plus".to_string());
     }
+    collect_plugin_deps_from_preserved(&seq.preserved, deps);
+    for ctl in &seq.controls {
+        collect_plugin_deps_from_preserved(&ctl.preserved, deps);
+    }
     for vt in &seq.video_tracks {
         if vt.is_3d {
             deps.insert("camera-plus".to_string());
         }
+        collect_plugin_deps_from_preserved(&vt.preserved, deps);
         for vc in &vt.clips {
             if track_has_expression(&vc.time_curve) {
                 deps.insert("expressions-plus".to_string());
             }
+            collect_plugin_deps_from_preserved(&vc.preserved, deps);
             collect_plugin_deps_from_layer(&vc.layer, deps);
         }
     }
     for at in &seq.audio_tracks {
+        collect_plugin_deps_from_preserved(&at.preserved, deps);
         for ac in &at.clips {
             if track_has_expression(&ac.time_curve)
                 || track_has_expression(&ac.audio.volume)
@@ -10157,11 +11106,27 @@ fn collect_plugin_deps_from_sequence(seq: &zc_project::Sequence, deps: &mut BTre
             {
                 deps.insert("expressions-plus".to_string());
             }
+            collect_plugin_deps_from_preserved(&ac.preserved, deps);
         }
+    }
+    for masks in seq.layer_masks.values() {
+        for m in masks {
+            collect_plugin_deps_from_preserved(&m.preserved, deps);
+        }
+    }
+    for cam_objs in seq.camera_layer_objects.values() {
+        collect_plugin_deps_from_objects(cam_objs, deps);
     }
 }
 
 fn collect_plugin_deps_from_project(project: &zc_project::Project, deps: &mut BTreeSet<String>) {
+    collect_plugin_deps_from_preserved(&project.preserved, deps);
+    for asset in project.assets.values() {
+        collect_plugin_deps_from_preserved(&asset.preserved, deps);
+    }
+    for media in &project.media {
+        collect_plugin_deps_from_preserved(&media.preserved, deps);
+    }
     collect_plugin_deps_from_sequence(&project.sequence, deps);
     for comp in project.compositions.values() {
         collect_plugin_deps_from_sequence(comp, deps);
@@ -14535,5 +15500,276 @@ mod tests {
             Some(&12.5),
             "precomp_offset must attach even when snap.video_clip is None"
         );
+    }
+
+    #[test]
+    fn large_video_asset_edits_skip_sha256_rehash_and_restore_on_undo_redo() {
+        const VIDEO_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+        let mut video_payload = vec![0x5Au8; VIDEO_BYTES];
+        video_payload[0] = 0x11;
+        video_payload[VIDEO_BYTES / 2] = 0x22;
+        video_payload[VIDEO_BYTES - 1] = 0x33;
+
+        let mut project = zc_project::Project::new_cm3_default();
+        let prehashed_digest = "0123456789abcdef".repeat(4);
+        let video_key = project.insert_binary_asset_prehashed(
+            zc_project::AssetKind::Av,
+            "large_clip.mp4",
+            Some("/videos/large_clip.mp4".to_owned()),
+            video_payload.clone(),
+            prehashed_digest.clone(),
+        );
+        // Also add a small unhashed asset so we verify fallback hashing populates `sha256` & `size`.
+        let unhashed_bytes = b"small-unhashed-asset".to_vec();
+        project.assets.insert(
+            "unhashed-key".to_owned(),
+            zc_project::AssetRecord {
+                id: "unhashed-key".to_owned(),
+                kind: zc_project::AssetKind::Image,
+                source: zc_project::AssetSource::File,
+                filename: "thumb.png".to_owned(),
+                url: None,
+                external: false,
+                bytes: Some(unhashed_bytes.clone()),
+                missing: false,
+                sha256: String::new(),
+                size: 0,
+                preserved: BTreeMap::new(),
+            },
+        );
+
+        let mut session = Session::from_project(project, zc_plugin::PluginRegistry::new());
+
+        let started = std::time::Instant::now();
+        for i in 0..30_u32 {
+            session
+                .execute(Command::SetProjectName {
+                    name: format!("Edit {i}"),
+                })
+                .expect("sequential edit");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "30 sequential edits with an 8 MiB video asset must avoid per-edit SHA-256 re-hashing (took {elapsed:?})"
+        );
+
+        // Prehashed digest was reused in O(1) without recomputing SHA-256 on the 8 MiB video.
+        assert_eq!(session.project.assets[&video_key].sha256, prehashed_digest);
+        assert_eq!(session.project.assets[&video_key].size, VIDEO_BYTES as u64);
+        assert!(session.asset_blobs.contains_key(&prehashed_digest));
+        // Fallback path populated sha256 & size on the unhashed asset so future edits are O(1).
+        let expected_small_sha = zc_project::sha256_hex(&unhashed_bytes);
+        assert_eq!(
+            session.project.assets["unhashed-key"].sha256,
+            expected_small_sha
+        );
+        assert_eq!(
+            session.project.assets["unhashed-key"].size,
+            unhashed_bytes.len() as u64
+        );
+
+        // Undo and Redo restore exact asset bytes, sha256, size, and disk url.
+        for _ in 0..5 {
+            session.execute(Command::Undo).expect("undo");
+        }
+        assert_eq!(session.document().project_name, "Edit 24");
+        let restored_undo = &session.project.assets[&video_key];
+        assert_eq!(
+            restored_undo.bytes.as_deref(),
+            Some(video_payload.as_slice())
+        );
+        assert_eq!(restored_undo.sha256, prehashed_digest);
+        assert_eq!(restored_undo.size, VIDEO_BYTES as u64);
+        assert_eq!(restored_undo.url.as_deref(), Some("/videos/large_clip.mp4"));
+
+        for _ in 0..5 {
+            session.execute(Command::Redo).expect("redo");
+        }
+        assert_eq!(session.document().project_name, "Edit 29");
+        let restored_redo = &session.project.assets[&video_key];
+        assert_eq!(
+            restored_redo.bytes.as_deref(),
+            Some(video_payload.as_slice())
+        );
+        assert_eq!(restored_redo.sha256, prehashed_digest);
+        assert_eq!(restored_redo.size, VIDEO_BYTES as u64);
+        assert_eq!(
+            session.project.assets["unhashed-key"].bytes.as_deref(),
+            Some(unhashed_bytes.as_slice())
+        );
+    }
+
+    #[test]
+    fn structural_estimated_bytes_tracks_assets_and_document_growth() {
+        let mut session = Session::new();
+        let base_bytes = session.snapshot().estimated_bytes();
+        assert!(base_bytes > 0, "baseline snapshot size must be non-zero");
+
+        let payload = vec![0xABu8; 256 * 1024];
+        session.project.insert_binary_asset(
+            zc_project::AssetKind::Image,
+            "big.png",
+            payload.clone(),
+        );
+        let with_asset_bytes = session.snapshot().estimated_bytes();
+        assert!(
+            with_asset_bytes >= base_bytes + payload.len(),
+            "structural estimate must include embedded asset bytes ({with_asset_bytes} vs {} + {})",
+            base_bytes,
+            payload.len()
+        );
+
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        for i in 0..25 {
+            session
+                .execute(Command::AddObject3D {
+                    clip_id: clip_id.clone(),
+                    parent_id: None,
+                    kind: "box".to_owned(),
+                    name: Some(format!("Cube {i}")),
+                })
+                .expect("add box");
+        }
+        let with_objects_bytes = session.snapshot().estimated_bytes();
+        assert!(
+            with_objects_bytes > with_asset_bytes,
+            "adding 25 3D objects must grow structural estimate ({with_objects_bytes} > {with_asset_bytes})"
+        );
+    }
+
+    #[test]
+    fn rebuild_object_tree_handles_large_hierarchy_in_linear_time_with_exact_order() {
+        // Build a 1,000-node hierarchy: 10 root groups, each with 99 children (some nested).
+        let mut flat = Vec::with_capacity(1000);
+        let mut counter = 1u64;
+        let mut next_uuid = || {
+            let id = format!("00000000-0000-4000-8000-{counter:012x}");
+            counter += 1;
+            id
+        };
+
+        let mut root_ids = Vec::new();
+        for g in 0..10 {
+            let gid = next_uuid();
+            root_ids.push(gid.clone());
+            flat.push(SessionObject3D {
+                id: gid.clone(),
+                kind: "group".to_owned(),
+                name: format!("Group {g}"),
+                parent_id: None,
+                source_id: None,
+                properties: BTreeMap::new(),
+            });
+            let sub_gid = next_uuid();
+            flat.push(SessionObject3D {
+                id: sub_gid.clone(),
+                kind: "group".to_owned(),
+                name: format!("SubGroup {g}"),
+                parent_id: Some(gid.clone()),
+                source_id: None,
+                properties: BTreeMap::new(),
+            });
+            for c in 0..98 {
+                let parent = if c % 2 == 0 { &gid } else { &sub_gid };
+                flat.push(SessionObject3D {
+                    id: next_uuid(),
+                    kind: "box".to_owned(),
+                    name: format!("Box {g}_{c}"),
+                    parent_id: Some(parent.clone()),
+                    source_id: None,
+                    properties: BTreeMap::new(),
+                });
+            }
+        }
+        assert_eq!(flat.len(), 1000);
+
+        let mut existing = BTreeMap::new();
+        let started = std::time::Instant::now();
+        let tree = rebuild_object_tree(&flat, &mut existing, None);
+        let elapsed = started.elapsed();
+
+        assert_eq!(tree.len(), 10);
+        for (g, root) in tree.iter().enumerate() {
+            assert_eq!(root.name, format!("Group {g}"));
+            let zc_project::Object3DKind::Group { ref children, .. } = root.kind else {
+                panic!("expected root group");
+            };
+            // 1 SubGroup + 49 even boxes
+            assert_eq!(children.len(), 50);
+            assert_eq!(children[0].name, format!("SubGroup {g}"));
+            let zc_project::Object3DKind::Group {
+                children: ref sub_children,
+                ..
+            } = children[0].kind
+            else {
+                panic!("expected nested subgroup");
+            };
+            // 49 odd boxes
+            assert_eq!(sub_children.len(), 49);
+            assert_eq!(sub_children[0].name, format!("Box {g}_1"));
+            assert_eq!(sub_children[48].name, format!("Box {g}_97"));
+        }
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "O(N) rebuild_object_tree on 1,000 objects should be fast (took {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn property_track_matches_session_agrees_with_property_track_to_session() {
+        let mut animated_track = zc_project::PropertyTrack::vec3([1.0, 2.0, 3.0]);
+        animated_track.animated = true;
+        animated_track.expression = Some("time * 2.0".to_owned());
+        animated_track.keyframes = vec![
+            zc_project::PropertyKeyframe::linear(
+                0.0,
+                zc_project::PropertyValue::Vec3([1.0, 2.0, 3.0]),
+            ),
+            zc_project::PropertyKeyframe::linear(
+                30.0,
+                zc_project::PropertyValue::Vec3([4.0, 5.0, 6.0]),
+            ),
+        ];
+
+        let mut channel_track = zc_project::PropertyTrack::vec3([0.0, 0.0, 0.0]);
+        channel_track.channels = vec![
+            zc_project::PropertyTrack::number(1.5),
+            zc_project::PropertyTrack::number(2.5),
+            zc_project::PropertyTrack::number(3.5),
+        ];
+
+        let mut animated_channel_track = channel_track.clone();
+        animated_channel_track.channels[0].animated = true;
+        animated_channel_track.channels[0].keyframes = vec![
+            zc_project::PropertyKeyframe::linear(0.0, zc_project::PropertyValue::Number(0.0)),
+            zc_project::PropertyKeyframe::linear(10.0, zc_project::PropertyValue::Number(10.0)),
+        ];
+
+        let tracks = [
+            zc_project::PropertyTrack::number(0.75),
+            zc_project::PropertyTrack::option(2),
+            zc_project::PropertyTrack::color([0.1, 0.2, 0.3]),
+            zc_project::PropertyTrack::asset(Some("asset-1".to_owned())),
+            zc_project::PropertyTrack::asset(None),
+            animated_track,
+            channel_track,
+            animated_channel_track,
+        ];
+
+        for track in &tracks {
+            let prop = property_track_to_session(track);
+            assert!(property_track_matches_session(track, &prop));
+
+            let mut mutated_anim = prop.clone();
+            mutated_anim.animated = !mutated_anim.animated;
+            assert!(!property_track_matches_session(track, &mutated_anim));
+            assert_ne!(property_track_to_session(track), mutated_anim);
+
+            let mut mutated_kf = prop.clone();
+            mutated_kf.keyframes[0].frame += 1.0;
+            assert!(!property_track_matches_session(track, &mutated_kf));
+            assert_ne!(property_track_to_session(track), mutated_kf);
+        }
     }
 }

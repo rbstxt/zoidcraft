@@ -572,6 +572,7 @@ impl Session {
                 let enabled_plugins = self.enable_required_plugins(&required_plugins);
                 self.rebuild_document_from_active_sequence();
                 self.document.recompute_sequence_length_if_extended();
+                self.active_sequence_mut().length_frames = self.document.sequence_length;
 
                 for (idx, cid) in pasted_ids.iter().enumerate() {
                     let _ = self.selection.select_clip(cid.clone(), None, idx > 0);
@@ -808,9 +809,23 @@ impl Session {
 
     fn rebuild_document_from_active_sequence(&mut self) {
         let active_id = self.document.active_composition_id;
-        let active_seq = self.active_sequence().clone();
-        self.document = SessionDocument::from_sequence(&self.project, &active_seq, active_id);
+        let active_seq = match active_id {
+            Some(comp_id) => self
+                .project
+                .compositions
+                .get(&comp_id)
+                .unwrap_or(&self.project.sequence),
+            None => &self.project.sequence,
+        };
+        self.document = SessionDocument::from_sequence(
+            &self.project.name,
+            &self.project.assets,
+            &self.project.media,
+            active_seq,
+            active_id,
+        );
         self.record_snapshot_ids();
+        self.doc_already_synced_with_project = true;
     }
 
     fn ensure_clip_track_unlocked(&self, clip_id: &str) -> Result<(), SessionError> {

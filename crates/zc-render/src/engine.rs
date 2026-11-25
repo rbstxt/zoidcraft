@@ -57,16 +57,18 @@ use zc_scene::{
     repeater_echo_frames, repeater_instance_transform,
 };
 use zc_shader::{
-    CompileOptions, CompiledCustomShader, GradientColorSpace, GradientInterpolation, GradientSpec,
-    GradientStop as ShaderGradientStop, OpacityStop as ShaderOpacityStop, UniformType,
-    UniformValue, bake_gradient_rgba8, bake_gradient_rgba8_with_opacity, bake_node_material_maps,
-    compile_node_effect_to_glsl, pack_uniforms,
+    CompileOptions, CompiledCustomShader, CompiledNodeEffect, GradientColorSpace,
+    GradientInterpolation, GradientSpec, GradientStop as ShaderGradientStop,
+    OpacityStop as ShaderOpacityStop, UniformType, UniformValue, bake_gradient_rgba8,
+    bake_gradient_rgba8_with_opacity, bake_node_material_maps, compile_node_effect_to_glsl,
+    pack_uniforms,
 };
 
 use crate::cache::{FrameCache, FrameCacheKey};
 use crate::compositor::{BlendMode, Compositor2D, LayerTransform2D};
 use crate::context::{
     GpuContext, RenderError, RenderTarget, TargetPool, f32_to_f16_bits, readback_rgba8,
+    readback_rgba8_with_staging,
 };
 use crate::effects::{
     EffectParamValue as RegParamValue, EffectParams as RegEffectParams, EffectRegistry,
@@ -105,7 +107,7 @@ pub type RenderContext = GpuContext;
 pub const MAX_CACHED_MESHES: usize = 512;
 
 /// Maximum number of decoded image / 2D raster textures retained simultaneously.
-pub const MAX_CACHED_TEXTURES: usize = 256;
+pub const MAX_CACHED_TEXTURES: usize = 512;
 
 /// Maximum VRAM byte budget for the decoded image / 2D raster texture cache (256 MiB).
 pub const MAX_CACHED_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
@@ -117,6 +119,9 @@ const MAX_EFFECT_GROUP_DEPTH: usize = 16;
 const MAX_TEMPORAL_DEPTH: usize = 4;
 const MAX_CACHED_GIFS: usize = 32;
 const MAX_CACHED_NODE_MATERIALS: usize = 64;
+const MAX_CACHED_TEXT_CHAR_MESHES: usize = 32;
+const MAX_CACHED_CUBE_LUTS: usize = 32;
+const MAX_CACHED_NODE_EFFECTS: usize = 32;
 const MAX_CUBE_LUT_3D_SIZE: u32 = 128;
 const MAX_CUBE_LUT_1D_SIZE: usize = 65_536;
 
@@ -297,6 +302,51 @@ struct CachedNodeMaterial {
     last_used: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TextCharMeshCacheKey {
+    font_hash: u64,
+    text: String,
+    height_bits: u32,
+    thickness_bits: u32,
+    curve_segments: u32,
+    bevel_enabled: bool,
+    bevel_thickness_bits: u32,
+    bevel_size_bits: u32,
+    bevel_segments: u32,
+    align: u8,
+    uv_mode: u8,
+    letter_spacing_bits: u32,
+    line_height_bits: u32,
+    bevel_side: u8,
+    bevel_profile: u8,
+    bevel_tension_bits: u32,
+    kerning: bool,
+    use_font_line_height: bool,
+    text_scale_mode: u8,
+    text_scale_bits: [u32; 3],
+}
+
+struct CachedTextCharMeshes {
+    meshes: Arc<Vec<zc_scene::Text3DCharacterMesh>>,
+    last_used: u64,
+}
+
+struct ParsedCubeLut {
+    lut: RegParamValue,
+    domain_min: [f32; 3],
+    domain_max: [f32; 3],
+}
+
+struct CachedCubeLut {
+    parsed: Arc<ParsedCubeLut>,
+    last_used: u64,
+}
+
+struct CachedNodeEffect {
+    compiled: Arc<CompiledNodeEffect>,
+    last_used: u64,
+}
+
 struct CachedCustomPipeline {
     compiled: CompiledCustomShader,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -415,7 +465,13 @@ pub struct ProjectRenderEngine {
     texture_cache: HashMap<TextureCacheKey, CachedGpuTexture>,
     texture_cache_bytes: usize,
     gif_cache: HashMap<String, CachedGifAnimation>,
+    video_pool: crate::video::VideoDecoderPool,
     node_material_cache: HashMap<u64, CachedNodeMaterial>,
+    text_char_mesh_cache: HashMap<TextCharMeshCacheKey, CachedTextCharMeshes>,
+    cube_lut_cache: HashMap<u64, CachedCubeLut>,
+    node_effect_cache: HashMap<u64, CachedNodeEffect>,
+    unit_quad_mesh: Option<Arc<GpuMesh>>,
+    readback_staging: Option<(wgpu::Buffer, u64)>,
     registered_custom_3d_materials: HashSet<String>,
     custom_pipelines: HashMap<u64, CachedCustomPipeline>,
     custom_vs_module: wgpu::ShaderModule,
@@ -425,6 +481,7 @@ pub struct ProjectRenderEngine {
     fallback_white: RenderTarget,
     cache_tick: u64,
     output_target: Option<RenderTarget>,
+    current_render_dims: Option<(u32, u32)>,
     transparent_background: bool,
 }
 
@@ -488,7 +545,13 @@ impl ProjectRenderEngine {
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
             gif_cache: HashMap::new(),
+            video_pool: crate::video::VideoDecoderPool::new(),
             node_material_cache: HashMap::new(),
+            text_char_mesh_cache: HashMap::new(),
+            cube_lut_cache: HashMap::new(),
+            node_effect_cache: HashMap::new(),
+            unit_quad_mesh: None,
+            readback_staging: None,
             registered_custom_3d_materials: HashSet::new(),
             custom_pipelines: HashMap::new(),
             custom_vs_module,
@@ -498,6 +561,7 @@ impl ProjectRenderEngine {
             fallback_white,
             cache_tick: 0,
             output_target: None,
+            current_render_dims: None,
             transparent_background: false,
         })
     }
@@ -558,10 +622,16 @@ impl ProjectRenderEngine {
         self.texture_cache.clear();
         self.texture_cache_bytes = 0;
         self.gif_cache.clear();
+        self.video_pool.clear();
         self.node_material_cache.clear();
+        self.text_char_mesh_cache.clear();
+        self.cube_lut_cache.clear();
+        self.node_effect_cache.clear();
+        self.readback_staging = None;
         self.registered_custom_3d_materials.clear();
         self.custom_pipelines.clear();
         self.effects.evict_custom_shaders();
+        self.effects.clear_scratch_pool();
     }
 
     /// Renders `project` at `frame` into a GPU texture of size `(width, height)` and
@@ -636,7 +706,9 @@ impl ProjectRenderEngine {
         self.ctx
             .validate_dimensions(width, height, wgpu::TextureFormat::Rgba8Unorm)?;
 
+        self.current_render_dims = Some((width, height));
         self.targets.begin_frame();
+        self.effects.begin_frame();
         if let Some(prev) = self.output_target.take() {
             self.targets.release(prev);
         }
@@ -658,7 +730,8 @@ impl ProjectRenderEngine {
             transparent_background,
         )?;
 
-        self.targets.trim_unused();
+        self.targets.trim_stale(4);
+        self.effects.trim_scratch_stale(4);
         let stored = self.output_target.insert(final_target);
         Ok(&stored.view)
     }
@@ -704,7 +777,7 @@ impl ProjectRenderEngine {
             ));
         };
         let mut pixels = Vec::new();
-        readback_rgba8(&self.ctx, target, &mut pixels)?;
+        readback_rgba8_with_staging(&self.ctx, target, &mut self.readback_staging, &mut pixels)?;
         Ok(pixels)
     }
 
@@ -728,7 +801,7 @@ impl ProjectRenderEngine {
             ));
         };
         let mut pixels = Vec::new();
-        readback_rgba8(&self.ctx, target, &mut pixels)?;
+        readback_rgba8_with_staging(&self.ctx, target, &mut self.readback_staging, &mut pixels)?;
         Ok(pixels)
     }
 
@@ -749,8 +822,8 @@ impl ProjectRenderEngine {
             return Ok(cached.pixels);
         }
         let pixels = self.render_frame_rgba8(project, plugins, frame, width, height)?;
-        let arc: Arc<[u8]> = Arc::from(pixels.clone());
-        let _ = self.cache.insert(key, width, height, pixels);
+        let arc: Arc<[u8]> = Arc::from(pixels);
+        let _ = self.cache.insert_arc(key, width, height, Arc::clone(&arc));
         Ok(arc)
     }
 
@@ -1634,8 +1707,17 @@ impl ProjectRenderEngine {
         let quad_w = (src.width as f32 / width.max(1) as f32) * seq_w * unit_per_px;
         let quad_h = (src.height as f32 / height.max(1) as f32) * seq_h * unit_per_px;
 
-        let quad_mesh_cpu = build_rectangle(quad_w.max(1e-3), quad_h.max(1e-3));
-        let gpu_mesh = GpuMesh::from_mesh_data(&self.ctx, &quad_mesh_cpu, Some("zc-layer-3d-quad"));
+        let quad_mesh = self
+            .unit_quad_mesh
+            .get_or_insert_with(|| {
+                let unit_quad_cpu = build_rectangle(1.0, 1.0);
+                Arc::new(GpuMesh::from_mesh_data(
+                    &self.ctx,
+                    &unit_quad_cpu,
+                    Some("zc-layer-3d-unit-quad"),
+                ))
+            })
+            .clone();
 
         let anchor_offset = Vec3::new(
             -raw_anchor[0] * unit_per_px,
@@ -1651,7 +1733,8 @@ impl ProjectRenderEngine {
         let model = Mat4::from_translation(world_pos)
             * Mat4::from_quat(rot_q)
             * Mat4::from_scale(Vec3::new(scale[0], scale[1], 1.0))
-            * Mat4::from_translation(anchor_offset);
+            * Mat4::from_translation(anchor_offset)
+            * Mat4::from_scale(Vec3::new(quad_w.max(1e-3), quad_h.max(1e-3), 1.0));
 
         let camera = shared_camera.unwrap_or_else(|| {
             CameraParams::perspective_look_at(
@@ -1673,7 +1756,7 @@ impl ProjectRenderEngine {
                 .acquire(&self.ctx, width, height, wgpu::TextureFormat::Depth32Float)?;
 
         let draw = [MeshDrawCall {
-            mesh: &gpu_mesh,
+            mesh: quad_mesh.as_ref(),
             model: model.to_cols_array_2d(),
             normal_matrix: compute_normal_matrix(model),
             material: MaterialParams {
@@ -2071,24 +2154,64 @@ impl ProjectRenderEngine {
                 // AND sample video at `env.time`!
                 let sample_time = env.time.max(0.0);
                 let gif_enabled = env.plugins.is_enabled("gif-support");
-                let tex_opt = media.as_deref().and_then(|asset_id| {
-                    if gif_enabled
-                        && let Some(gif_tex) =
-                            self.ensure_gif_frame_texture(env.project, asset_id, sample_time, true)
-                    {
-                        return Some(gif_tex);
+                let video_hint = if layer.resolution[0] > 0 && layer.resolution[1] > 0 {
+                    let hint_w = ((layer.resolution[0] as f32) * scale_x).round().max(2.0) as u32;
+                    let hint_h = ((layer.resolution[1] as f32) * scale_y).round().max(2.0) as u32;
+                    Some((hint_w, hint_h))
+                } else {
+                    Some((width.max(2), height.max(2)))
+                };
+                let (tex_opt, native_video_dims) = match media.as_deref() {
+                    Some(asset_id) => {
+                        if gif_enabled
+                            && let Some(gif_tex) = self.ensure_gif_frame_texture(
+                                env.project,
+                                asset_id,
+                                sample_time,
+                                true,
+                            )
+                        {
+                            (Some(gif_tex), None)
+                        } else if let Some(vid_tex) = self.ensure_video_frame_texture(
+                            env.project,
+                            asset_id,
+                            sample_time,
+                            true,
+                            video_hint,
+                        ) {
+                            let native = env.project.assets.get(asset_id).and_then(|rec| {
+                                let h = hash_asset_record(rec);
+                                self.video_pool
+                                    .probe_asset(
+                                        h,
+                                        rec.url.as_deref(),
+                                        &rec.filename,
+                                        rec.bytes.as_deref(),
+                                    )
+                                    .map(|m| (m.width, m.height))
+                            });
+                            (Some(vid_tex), native)
+                        } else {
+                            (
+                                self.ensure_image_asset_texture(env.project, asset_id, true),
+                                None,
+                            )
+                        }
                     }
-                    self.ensure_video_frame_texture(env.project, asset_id, sample_time, true)
-                        .or_else(|| self.ensure_image_asset_texture(env.project, asset_id, true))
-                });
+                    None => (None, None),
+                };
                 if let Some(tex) = tex_opt {
                     let natural_w = if layer.resolution[0] > 0 {
                         layer.resolution[0]
+                    } else if let Some((nw, _)) = native_video_dims {
+                        nw
                     } else {
                         tex.width
                     };
                     let natural_h = if layer.resolution[1] > 0 {
                         layer.resolution[1]
+                    } else if let Some((_, nh)) = native_video_dims {
+                        nh
                     } else {
                         tex.height
                     };
@@ -3024,9 +3147,9 @@ impl ProjectRenderEngine {
                     {
                         let (text_params, ext_opts) =
                             build_text3d_params_and_options(text_data, obj);
-                        let char_meshes = build_text3d_character_meshes_with_fallback(
+                        let char_meshes = self.get_or_build_text_character_meshes(
                             env.project,
-                            text_data,
+                            text_data.font.as_deref(),
                             &text_params,
                             &ext_opts,
                             node.local_scale,
@@ -3093,7 +3216,7 @@ impl ProjectRenderEngine {
                             let mut min_x = f64::INFINITY;
                             let mut max_x = f64::NEG_INFINITY;
                             let mut world_bases = Vec::with_capacity(char_meshes.len());
-                            for ch in &char_meshes {
+                            for ch in char_meshes.iter() {
                                 let b = [
                                     f64::from(ch.anchor_pos.x),
                                     f64::from(ch.anchor_pos.y),
@@ -3201,7 +3324,7 @@ impl ProjectRenderEngine {
                             }
 
                             let char_count_local = char_meshes.len();
-                            for ch in char_meshes {
+                            for ch in char_meshes.iter() {
                                 if ch.mesh.indices.is_empty() {
                                     continue;
                                 }
@@ -3272,28 +3395,6 @@ impl ProjectRenderEngine {
                                     }
                                 }
 
-                                // 3. ExpressText+ Voronoi shatter effector (`shatter_glyph_triangles` + `apply_chunk_pose_to_positions`).
-                                // Keep the glyph completely intact when `distance == 0 && scatter == 0`.
-                                let mut ch_mesh = apply_object_effectors(ch.mesh, obj, &node_env);
-                                let mut et_voronoi_applied = false;
-                                if !et_layers.is_empty()
-                                    && let Some(vparams) = evaluate_expresstext_voronoi_params(
-                                        &et_layers, env.frame, eff_idx, &list, base_local,
-                                    )
-                                    && (vparams.distance.abs() > 1e-5
-                                        || vparams.scatter.abs() > 1e-5)
-                                {
-                                    let shattered =
-                                        shatter_mesh_data_expresstext(&ch_mesh, &vparams);
-                                    if !shattered.indices.is_empty() {
-                                        ch_mesh = shattered;
-                                        et_voronoi_applied = true;
-                                    }
-                                }
-                                if object_uses_normalized_uv(obj) {
-                                    apply_normalized_uv_layout(&mut ch_mesh);
-                                }
-
                                 let char_pos = ch.anchor_pos + acc_pos;
                                 let char_rot = euler_to_quat(acc_rot_euler, GeomEulerOrder::XYZ);
                                 let anchor_mat = Mat4::from_scale_rotation_translation(
@@ -3321,6 +3422,135 @@ impl ProjectRenderEngine {
                                     } else {
                                         effector_chain.clone()
                                     };
+
+                                let et_voronoi_params = if !et_layers.is_empty() {
+                                    evaluate_expresstext_voronoi_params(
+                                        &et_layers, env.frame, eff_idx, &list, base_local,
+                                    )
+                                    .filter(|vp| {
+                                        vp.distance.abs() > 1e-5 || vp.scatter.abs() > 1e-5
+                                    })
+                                } else {
+                                    None
+                                };
+
+                                // Fast path: when no effector chain and no active ExpressText+ Voronoi
+                                // shatter, check the GPU mesh cache BEFORE cloning `ch.mesh` or running
+                                // CPU effectors.
+                                if filtered_chain.is_empty() && et_voronoi_params.is_none() {
+                                    let mut h =
+                                        hash_text3d_and_effectors(text_data, obj, &node_env);
+                                    h = hash_u64(h, 0xE7_0001);
+                                    h = hash_u64(h, char_salt);
+                                    let key = MeshCacheKey {
+                                        object_id: obj.id,
+                                        content_hash: h,
+                                    };
+                                    let cached_opt = if let Some(hit) = self.touch_cached_mesh(key)
+                                    {
+                                        Some(hit)
+                                    } else {
+                                        let mut ch_mesh =
+                                            apply_object_effectors(ch.mesh.clone(), obj, &node_env);
+                                        if object_uses_normalized_uv(obj) {
+                                            apply_normalized_uv_layout(&mut ch_mesh);
+                                        }
+                                        if ch_mesh.indices.is_empty() {
+                                            None
+                                        } else {
+                                            Some(self.insert_cached_mesh(
+                                                key,
+                                                &ch_mesh,
+                                                "zc-expresstext-char-mesh",
+                                            ))
+                                        }
+                                    };
+                                    if let Some(cached) = cached_opt {
+                                        push_prepared_mesh_ex(
+                                            out,
+                                            obj.id,
+                                            &cached,
+                                            char_world,
+                                            &ch_mat,
+                                            &ch_slot_mats,
+                                            cast_sh,
+                                            recv_sh,
+                                            false,
+                                        );
+
+                                        // 4. ExpressText+ Repeater effector (`evaluate_expresstext_repeater_instances`).
+                                        if !et_layers.is_empty() {
+                                            let rep_insts = evaluate_expresstext_repeater_instances(
+                                                &et_layers, env.frame, eff_idx, &list, base_local,
+                                                &aux,
+                                            );
+                                            for r_inst in rep_insts {
+                                                let r_pos = ch.anchor_pos
+                                                    + Vec3::new(
+                                                        r_inst.controls.position[0] as f32,
+                                                        r_inst.controls.position[1] as f32,
+                                                        r_inst.controls.position[2] as f32,
+                                                    );
+                                                let r_rot = euler_to_quat(
+                                                    Vec3::new(
+                                                        r_inst.controls.rotation[0] as f32,
+                                                        r_inst.controls.rotation[1] as f32,
+                                                        r_inst.controls.rotation[2] as f32,
+                                                    ),
+                                                    GeomEulerOrder::XYZ,
+                                                );
+                                                let r_scale = Vec3::new(
+                                                    r_inst.controls.scale[0] as f32,
+                                                    r_inst.controls.scale[1] as f32,
+                                                    r_inst.controls.scale[2] as f32,
+                                                );
+                                                let r_world = container_world
+                                                    * Mat4::from_scale_rotation_translation(
+                                                        r_scale, r_rot, r_pos,
+                                                    )
+                                                    * glyph_mat;
+                                                let mut r_mat = ch_mat.clone();
+                                                r_mat.params.opacity = (r_mat.params.opacity
+                                                    * r_inst.opacity as f32)
+                                                    .clamp(0.0, 1.0);
+                                                if r_mat.params.opacity < 0.999
+                                                    && r_mat.params.blend == MaterialBlend::Opaque
+                                                {
+                                                    r_mat.params.blend = MaterialBlend::Normal;
+                                                }
+                                                push_prepared_mesh_ex(
+                                                    out,
+                                                    obj.id,
+                                                    &cached,
+                                                    r_world,
+                                                    &r_mat,
+                                                    &ch_slot_mats,
+                                                    cast_sh,
+                                                    recv_sh,
+                                                    false,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                // 3. ExpressText+ Voronoi shatter effector (`shatter_glyph_triangles` + `apply_chunk_pose_to_positions`).
+                                // Keep the glyph completely intact when `distance == 0 && scatter == 0`.
+                                let mut ch_mesh =
+                                    apply_object_effectors(ch.mesh.clone(), obj, &node_env);
+                                let mut et_voronoi_applied = false;
+                                if let Some(vparams) = et_voronoi_params {
+                                    let shattered =
+                                        shatter_mesh_data_expresstext(&ch_mesh, &vparams);
+                                    if !shattered.indices.is_empty() {
+                                        ch_mesh = shattered;
+                                        et_voronoi_applied = true;
+                                    }
+                                }
+                                if object_uses_normalized_uv(obj) {
+                                    apply_normalized_uv_layout(&mut ch_mesh);
+                                }
                                 let ch_has_voronoi = et_voronoi_applied
                                     || filtered_chain.iter().any(|&i| {
                                         effector_kinds[i]
@@ -4233,6 +4463,10 @@ impl ProjectRenderEngine {
                     / env.fps.max(1.0))
                 .max(0.0);
                 let gif_enabled = env.plugins.is_enabled("gif-support");
+                let video_hint = self.current_render_dims.or_else(|| {
+                    (env.sequence_resolution[0] > 0 && env.sequence_resolution[1] > 0)
+                        .then_some((env.sequence_resolution[0], env.sequence_resolution[1]))
+                });
                 let albedo = m.video.as_deref().and_then(|id| {
                     if gif_enabled
                         && let Some(gif_tex) =
@@ -4240,7 +4474,7 @@ impl ProjectRenderEngine {
                     {
                         return Some(gif_tex);
                     }
-                    self.ensure_video_frame_texture(env.project, id, video_time, false)
+                    self.ensure_video_frame_texture(env.project, id, video_time, false, video_hint)
                         .or_else(|| self.ensure_image_asset_texture(env.project, id, false))
                 });
                 EvaluatedMaterial {
@@ -4444,28 +4678,19 @@ impl ProjectRenderEngine {
                 resolution, graph, ..
             } => {
                 let bake_res = (*resolution).clamp(32, 1024);
-                let unwrapped = unwrap_node_material_graph(graph);
-                let (sanitized_graph, direct_asset_slots) =
-                    prepare_node_material_graph_with_assets(&unwrapped, env.project);
-                let mut h = fnv1a_hash64(b"node_material_v2");
+                let mut h = fnv1a_hash64(b"node_material_v3");
                 h = hash_u64(h, u64::from(bake_res));
-                if let Ok(bytes) = serde_json::to_vec(&sanitized_graph) {
-                    h = hash_u64(h, fnv1a_hash64(&bytes));
-                }
-                for (slot_name, asset_id) in &direct_asset_slots {
-                    h = hash_u64(h, fnv1a_hash64(slot_name.as_bytes()));
-                    h = hash_u64(h, fnv1a_hash64(asset_id.as_bytes()));
-                    if let Some(rec) = env.project.assets.get(asset_id)
-                        && let Some(bytes) = rec.bytes.as_deref()
-                    {
-                        h = hash_u64(h, fnv1a_hash64(bytes));
-                    }
-                }
+                h = hash_json_value(h, graph);
+                h = hash_node_material_referenced_assets(h, graph, env.project);
                 if let Some(entry) = self.node_material_cache.get_mut(&h) {
                     self.cache_tick = self.cache_tick.wrapping_add(1);
                     entry.last_used = self.cache_tick;
                     return entry.eval.clone();
                 }
+
+                let unwrapped = unwrap_node_material_graph(graph);
+                let (sanitized_graph, direct_asset_slots) =
+                    prepare_node_material_graph_with_assets(&unwrapped, env.project);
 
                 let resolve_direct_tex =
                     |engine: &mut Self, slot_name: &str| -> Option<Arc<RenderTarget>> {
@@ -4823,15 +5048,16 @@ impl ProjectRenderEngine {
         width: u32,
         height: u32,
     ) -> Result<RenderTarget, RenderError> {
-        let mut h = fnv1a_hash64(b"shape_plus_2d_v2");
+        let mut h = fnv1a_hash64(b"shape_plus_2d_v3");
         h = hash_u64(h, u64::from(width));
         h = hash_u64(h, u64::from(height));
         h = hash_u64(h, u64::from(env.sequence_resolution[0]));
         h = hash_u64(h, u64::from(env.sequence_resolution[1]));
-        h = hash_f64(h, env.frame);
-        if let Ok(bytes) = serde_json::to_vec(payload) {
-            h = hash_u64(h, fnv1a_hash64(&bytes));
+        if shape_plus_is_time_dependent(payload) {
+            h = hash_f64(h, env.frame);
+            h = hash_f64(h, env.fps);
         }
+        h = hash_json_value(h, payload);
         let key = TextureCacheKey {
             asset_key: format!("shapeplus:{layer_id}"),
             content_hash: h,
@@ -5097,27 +5323,13 @@ impl ProjectRenderEngine {
                 line_height: 1.2,
             };
             let ext_opts = Text3DExtendedOptions::default();
-            let char_meshes = zc_scene::build_text3d_character_meshes_with_fallback(
-                primary_bytes,
-                fallback_slice,
+            let char_meshes = self.get_or_build_text_character_meshes(
+                env.project,
+                font,
                 &params,
                 &ext_opts,
                 Vec3::ONE,
-            )
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or_else(|| {
-                zc_scene::build_text3d_character_meshes_with_fallback(
-                    DEFAULT_TTF_FONT_BYTES,
-                    fallback_slice,
-                    &params,
-                    &ext_opts,
-                    Vec3::ONE,
-                )
-                .ok()
-                .filter(|v| !v.is_empty())
-            })
-            .unwrap_or_default();
+            );
             if !char_meshes.is_empty() {
                 let expr_cb = |expr_src: &str, f: f64| -> Option<f64> {
                     eval_scalar_expr_at_frame(expr_src, env, f)
@@ -5151,7 +5363,7 @@ impl ProjectRenderEngine {
                         .unwrap_or([1.0, 1.0, 1.0, 1.0]);
                     let mut gpu_chars: Vec<(Arc<GpuMesh>, Mat4, f32)> =
                         Vec::with_capacity(char_meshes.len());
-                    for (ci, ch) in char_meshes.into_iter().enumerate() {
+                    for (ci, ch) in char_meshes.iter().enumerate() {
                         if ch.mesh.indices.is_empty() {
                             continue;
                         }
@@ -5469,9 +5681,48 @@ impl ProjectRenderEngine {
             };
         }
 
-        // Stroke + Fill ordered path: render opaque white glyph silhouette to `mask_target`,
-        // read back silhouette, compute exact Euclidean signed distance transform (EDT), and
-        // composite all Fill & Stroke DrawOps in exact CM3 order.
+        // Stroke + Fill ordered path: check cached stroked texture first so unchanged stroked
+        // Text2D avoids GPU silhouette render, readback stall, and 2D CPU EDT on every frame.
+        let mut stroke_h = fnv1a_hash64(b"text2d_stroked_v1");
+        stroke_h = hash_u64(stroke_h, u64::from(width));
+        stroke_h = hash_u64(stroke_h, u64::from(height));
+        stroke_h = hash_u64(stroke_h, h);
+        stroke_h = hash_u64(stroke_h, u64::from(scale_x.to_bits()));
+        stroke_h = hash_u64(stroke_h, u64::from(scale_y.to_bits()));
+        stroke_h = hash_u64(stroke_h, u64::from(preview_scale.to_bits()));
+        stroke_h = hash_u64(stroke_h, u64::from(text_transform.position[0].to_bits()));
+        stroke_h = hash_u64(stroke_h, u64::from(text_transform.position[1].to_bits()));
+        stroke_h = hash_u64(stroke_h, u64::from(text_transform.rotation.to_bits()));
+        stroke_h = hash_u64(stroke_h, u64::from(text_transform.scale[0].to_bits()));
+        stroke_h = hash_u64(stroke_h, u64::from(text_transform.scale[1].to_bits()));
+        stroke_h = hash_u64(stroke_h, paint_ops.len() as u64);
+        for op in &paint_ops {
+            match op {
+                EvalPaintOp::Fill(c) => {
+                    stroke_h = hash_u64(stroke_h, 1);
+                    for ch in c {
+                        stroke_h = hash_u64(stroke_h, u64::from(ch.to_bits()));
+                    }
+                }
+                EvalPaintOp::Stroke(c, w) => {
+                    stroke_h = hash_u64(stroke_h, 2);
+                    for ch in c {
+                        stroke_h = hash_u64(stroke_h, u64::from(ch.to_bits()));
+                    }
+                    stroke_h = hash_u64(stroke_h, u64::from(w.to_bits()));
+                }
+            }
+        }
+        let stroke_key = TextureCacheKey {
+            asset_key: format!("text2d_stroked:{layer_id}"),
+            content_hash: stroke_h,
+            premultiply: true,
+        };
+        if let Some(cached) = self.touch_cached_texture(&stroke_key) {
+            self.compositor.blit(&self.ctx, &cached.view, &color);
+            return Ok(color);
+        }
+
         let mask_target =
             self.targets
                 .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
@@ -5518,7 +5769,12 @@ impl ProjectRenderEngine {
         }
 
         let mut silhouette_rgba = Vec::new();
-        let rb_res = readback_rgba8(&self.ctx, &mask_target, &mut silhouette_rgba);
+        let rb_res = readback_rgba8_with_staging(
+            &self.ctx,
+            &mask_target,
+            &mut self.readback_staging,
+            &mut silhouette_rgba,
+        );
         self.targets.release(mask_target);
         if let Err(err) = rb_res {
             self.targets.release(color);
@@ -5532,10 +5788,18 @@ impl ProjectRenderEngine {
             &paint_ops,
             preview_scale,
         );
-        let tex = self
+        let tex = match self
             .ctx
-            .create_rgba8_texture("zc-text2d-stroked", width, height, &shaded)?;
-        self.compositor.blit(&self.ctx, &tex.view, &color);
+            .create_rgba8_texture("zc-text2d-stroked", width, height, &shaded)
+        {
+            Ok(t) => t,
+            Err(err) => {
+                self.targets.release(color);
+                return Err(err);
+            }
+        };
+        let cached = self.insert_cached_texture(stroke_key, tex);
+        self.compositor.blit(&self.ctx, &cached.view, &color);
         Ok(color)
     }
 
@@ -5619,7 +5883,7 @@ impl ProjectRenderEngine {
             );
         }
 
-        let (frame_idx, w, h, mut pixels) = {
+        let (frame_idx, w, h) = {
             let entry = self.gif_cache.get_mut(asset_id)?;
             self.cache_tick = self.cache_tick.wrapping_add(1);
             entry.last_used = self.cache_tick;
@@ -5634,7 +5898,7 @@ impl ProjectRenderEngine {
                 .position(|f| t_mod < f.end_time_sec)
                 .unwrap_or(entry.frames.len() - 1);
             let f = &entry.frames[idx];
-            (idx, f.width, f.height, f.rgba_straight.clone())
+            (idx, f.width, f.height)
         };
 
         let key = TextureCacheKey {
@@ -5645,18 +5909,21 @@ impl ProjectRenderEngine {
         if let Some(cached) = self.touch_cached_texture(&key) {
             return Some(cached);
         }
-        if premultiply {
-            for px in pixels.as_chunks_mut::<4>().0 {
-                let a = f32::from(px[3]) / 255.0;
-                px[0] = (f32::from(px[0]) * a).round() as u8;
-                px[1] = (f32::from(px[1]) * a).round() as u8;
-                px[2] = (f32::from(px[2]) * a).round() as u8;
+
+        let target = {
+            let f = &self.gif_cache.get(asset_id)?.frames[frame_idx];
+            if premultiply {
+                let mut pixels = f.rgba_straight.clone();
+                crate::video::fast_premultiply_rgba8(&mut pixels);
+                self.ctx
+                    .create_rgba8_texture("zc-asset-gif-frame", w, h, &pixels)
+                    .ok()?
+            } else {
+                self.ctx
+                    .create_rgba8_texture("zc-asset-gif-frame", w, h, &f.rgba_straight)
+                    .ok()?
             }
-        }
-        let target = self
-            .ctx
-            .create_rgba8_texture("zc-asset-gif-frame", w, h, &pixels)
-            .ok()?;
+        };
         Some(self.insert_cached_texture(key, target))
     }
 
@@ -5668,89 +5935,79 @@ impl ProjectRenderEngine {
         asset_id: &str,
         time_secs: f64,
         premultiply: bool,
+        target_hint: Option<(u32, u32)>,
     ) -> Option<Arc<RenderTarget>> {
         let record = project.assets.get(asset_id)?;
         if record.kind != zc_project::AssetKind::Av {
             return None;
         }
-        // Quantize timestamp to millisecond bucket for cache reuse.
-        let ms_bucket = (time_secs.max(0.0) * 1000.0).round() as u64;
         let base_hash = hash_asset_record(record);
+        let meta = self.video_pool.probe_asset(
+            base_hash,
+            record.url.as_deref(),
+            &record.filename,
+            record.bytes.as_deref(),
+        )?;
+        let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
+        let (dec_w, dec_h) =
+            crate::video::compute_decode_dimensions(meta.width, meta.height, target_hint, max_dim);
+        let clamped_time = crate::video::clamp_video_time(time_secs, &meta);
+        // Quantize cache key by the video's native frame index + decode dimensions so hitting
+        // the same frame at slightly different float timestamps achieves 100% GPU cache reuse.
+        let frame_idx = (clamped_time * meta.fps).round().max(0.0) as u64;
+        let mut content_hash = hash_u64(base_hash, frame_idx);
+        content_hash = hash_u64(content_hash, (u64::from(dec_w) << 32) | u64::from(dec_h));
         let key = TextureCacheKey {
-            asset_key: format!("vid:{asset_id}@{ms_bucket}"),
-            content_hash: hash_u64(base_hash, ms_bucket),
+            asset_key: format!("vid:{asset_id}@{frame_idx}:{dec_w}x{dec_h}"),
+            content_hash,
             premultiply,
         };
         if let Some(cached) = self.touch_cached_texture(&key) {
             return Some(cached);
         }
-        // If the asset bytes decode as a regular image (e.g. single-frame still in Av slot), let fallback handle it.
-        if let Some(bytes) = record.bytes.as_deref()
-            && image::ImageReader::new(std::io::Cursor::new(bytes))
-                .with_guessed_format()
-                .ok()
-                .and_then(|r| r.into_dimensions().ok())
-                .is_some()
-        {
-            return None;
-        }
-        // Best-effort offline video frame extraction via ffmpeg when media bytes or file path exist.
-        let input_path_opt: Option<(std::path::PathBuf, bool)> =
-            if let Some(bytes) = record.bytes.as_deref() {
-                let ext = std::path::Path::new(&record.filename)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("mp4");
-                let tmp = std::env::temp_dir().join(format!("zc_vid_{base_hash:016x}.{ext}"));
-                if !tmp.exists() && std::fs::write(&tmp, bytes).is_err() {
-                    None
-                } else {
-                    Some((tmp, false))
-                }
-            } else {
-                record.url.as_deref().and_then(|u| {
-                    let p = std::path::PathBuf::from(u);
-                    p.exists().then_some((p, false))
-                })
-            };
-        let (input_path, _) = input_path_opt?;
-        let output = std::process::Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-ss",
-                &format!("{:.6}", time_secs.max(0.0)),
-                "-i",
-            ])
-            .arg(&input_path)
-            .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
-            .output()
-            .ok()?;
-        if !output.status.success() || output.stdout.is_empty() {
-            return None;
-        }
-        let img = image::load_from_memory(&output.stdout).ok()?.to_rgba8();
-        let (w, h) = img.dimensions();
+
+        let decoded = self.video_pool.decode_frame(
+            base_hash,
+            record.url.as_deref(),
+            &record.filename,
+            record.bytes.as_deref(),
+            clamped_time,
+            target_hint,
+            max_dim,
+        )?;
         if self
             .ctx
-            .validate_dimensions(w, h, wgpu::TextureFormat::Rgba8Unorm)
+            .validate_dimensions(
+                decoded.width,
+                decoded.height,
+                wgpu::TextureFormat::Rgba8Unorm,
+            )
             .is_err()
         {
             return None;
         }
-        let mut pixels = img.into_raw();
-        if premultiply {
-            for px in pixels.as_chunks_mut::<4>().0 {
-                let a = f32::from(px[3]) / 255.0;
-                px[0] = (f32::from(px[0]) * a).round() as u8;
-                px[1] = (f32::from(px[1]) * a).round() as u8;
-                px[2] = (f32::from(px[2]) * a).round() as u8;
-            }
-        }
-        let target = self
-            .ctx
-            .create_rgba8_texture("zc-asset-video-frame", w, h, &pixels)
-            .ok()?;
+
+        let target = if premultiply && crate::video::has_non_opaque_alpha(&decoded.rgba) {
+            let mut pixels = (*decoded.rgba).clone();
+            crate::video::fast_premultiply_rgba8(&mut pixels);
+            self.ctx
+                .create_rgba8_texture(
+                    "zc-asset-video-frame",
+                    decoded.width,
+                    decoded.height,
+                    &pixels,
+                )
+                .ok()?
+        } else {
+            self.ctx
+                .create_rgba8_texture(
+                    "zc-asset-video-frame",
+                    decoded.width,
+                    decoded.height,
+                    &decoded.rgba,
+                )
+                .ok()?
+        };
         Some(self.insert_cached_texture(key, target))
     }
 
@@ -5848,12 +6105,7 @@ impl ProjectRenderEngine {
         let mut pixels = img.into_raw();
         if premultiply {
             // Premultiply RGB by alpha to preserve the renderer's premultiplied-alpha invariant.
-            for px in pixels.as_chunks_mut::<4>().0 {
-                let a = f32::from(px[3]) / 255.0;
-                px[0] = (f32::from(px[0]) * a).round() as u8;
-                px[1] = (f32::from(px[1]) * a).round() as u8;
-                px[2] = (f32::from(px[2]) * a).round() as u8;
-            }
+            crate::video::fast_premultiply_rgba8(&mut pixels);
         }
 
         let target = self
@@ -5861,6 +6113,156 @@ impl ProjectRenderEngine {
             .create_rgba8_texture("zc-asset-image", w, h, &pixels)
             .ok()?;
         Some(self.insert_cached_texture(key, target))
+    }
+
+    fn get_or_build_text_character_meshes(
+        &mut self,
+        project: &Project,
+        font: Option<&str>,
+        params: &Text3DParams,
+        options: &Text3DExtendedOptions,
+        text_scale: Vec3,
+    ) -> Arc<Vec<zc_scene::Text3DCharacterMesh>> {
+        let mut font_hash = 0u64;
+        if let Some(f) = font {
+            font_hash = fnv1a_hash64(f.as_bytes());
+            if let Some(rec) = project.assets.get(f) {
+                font_hash = hash_u64(font_hash, hash_asset_record(rec));
+            }
+        }
+        let key = TextCharMeshCacheKey {
+            font_hash,
+            text: params.text.clone(),
+            height_bits: params.height.to_bits(),
+            thickness_bits: params.thickness.to_bits(),
+            curve_segments: params.curve_segments,
+            bevel_enabled: params.bevel_enabled,
+            bevel_thickness_bits: params.bevel_thickness.to_bits(),
+            bevel_size_bits: params.bevel_size.to_bits(),
+            bevel_segments: params.bevel_segments,
+            align: params.align as u8,
+            uv_mode: params.uv_mode as u8,
+            letter_spacing_bits: params.letter_spacing.to_bits(),
+            line_height_bits: params.line_height.to_bits(),
+            bevel_side: options.bevel_side as u8,
+            bevel_profile: options.bevel_profile as u8,
+            bevel_tension_bits: options.bevel_tension.to_bits(),
+            kerning: options.kerning,
+            use_font_line_height: options.use_font_line_height,
+            text_scale_mode: options.text_scale_mode as u8,
+            text_scale_bits: [
+                text_scale.x.to_bits(),
+                text_scale.y.to_bits(),
+                text_scale.z.to_bits(),
+            ],
+        };
+        if let Some(entry) = self.text_char_mesh_cache.get_mut(&key) {
+            self.cache_tick = self.cache_tick.wrapping_add(1);
+            entry.last_used = self.cache_tick;
+            return Arc::clone(&entry.meshes);
+        }
+
+        let built = Arc::new(build_text3d_character_meshes_with_fallback(
+            project, font, params, options, text_scale,
+        ));
+        while self.text_char_mesh_cache.len() >= MAX_CACHED_TEXT_CHAR_MESHES {
+            let Some(oldest) = self
+                .text_char_mesh_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.text_char_mesh_cache.remove(&oldest);
+        }
+        self.cache_tick = self.cache_tick.wrapping_add(1);
+        let tick = self.cache_tick;
+        self.text_char_mesh_cache.insert(
+            key,
+            CachedTextCharMeshes {
+                meshes: Arc::clone(&built),
+                last_used: tick,
+            },
+        );
+        built
+    }
+
+    fn get_or_parse_cube_lut(
+        &mut self,
+        record: &zc_project::AssetRecord,
+    ) -> Option<Arc<ParsedCubeLut>> {
+        let bytes = record.bytes.as_deref()?;
+        let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
+        let key = hash_u64(hash_asset_record(record), u64::from(max_dim));
+        if let Some(entry) = self.cube_lut_cache.get_mut(&key) {
+            self.cache_tick = self.cache_tick.wrapping_add(1);
+            entry.last_used = self.cache_tick;
+            return Some(Arc::clone(&entry.parsed));
+        }
+
+        let (lut, domain_min, domain_max) = parse_cube_lut_bytes(bytes, max_dim)?;
+        let parsed = Arc::new(ParsedCubeLut {
+            lut,
+            domain_min,
+            domain_max,
+        });
+        while self.cube_lut_cache.len() >= MAX_CACHED_CUBE_LUTS {
+            let Some(oldest) = self
+                .cube_lut_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(&k, _)| k)
+            else {
+                break;
+            };
+            self.cube_lut_cache.remove(&oldest);
+        }
+        self.cache_tick = self.cache_tick.wrapping_add(1);
+        let tick = self.cache_tick;
+        self.cube_lut_cache.insert(
+            key,
+            CachedCubeLut {
+                parsed: Arc::clone(&parsed),
+                last_used: tick,
+            },
+        );
+        Some(parsed)
+    }
+
+    fn get_or_compile_node_effect(
+        &mut self,
+        graph: &serde_json::Value,
+    ) -> Result<Arc<CompiledNodeEffect>, String> {
+        let key = hash_json_value(fnv1a_hash64(b"node_effect_v1"), graph);
+        if let Some(entry) = self.node_effect_cache.get_mut(&key) {
+            self.cache_tick = self.cache_tick.wrapping_add(1);
+            entry.last_used = self.cache_tick;
+            return Ok(Arc::clone(&entry.compiled));
+        }
+
+        let compiled = Arc::new(compile_node_effect_to_glsl(graph)?);
+        while self.node_effect_cache.len() >= MAX_CACHED_NODE_EFFECTS {
+            let Some(oldest) = self
+                .node_effect_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(&k, _)| k)
+            else {
+                break;
+            };
+            self.node_effect_cache.remove(&oldest);
+        }
+        self.cache_tick = self.cache_tick.wrapping_add(1);
+        let tick = self.cache_tick;
+        self.node_effect_cache.insert(
+            key,
+            CachedNodeEffect {
+                compiled: Arc::clone(&compiled),
+                last_used: tick,
+            },
+        );
+        Ok(compiled)
     }
 
     fn touch_cached_texture(&mut self, key: &TextureCacheKey) -> Option<Arc<RenderTarget>> {
@@ -6309,15 +6711,12 @@ impl ProjectRenderEngine {
                         source_image_asset = Some(asset_id.clone());
                     }
                     if effect_id == "cubelut" || canonical_id == "magiclooks" {
-                        let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
                         if let Some(record) = env.project.assets.get(&asset_id)
-                            && let Some(bytes) = record.bytes.as_deref()
-                            && let Some((lut_val, domain_min, domain_max)) =
-                                parse_cube_lut_bytes(bytes, max_dim)
+                            && let Some(parsed) = self.get_or_parse_cube_lut(record)
                         {
-                            reg_params.set("lut", lut_val);
-                            reg_params.set("domainMin", RegParamValue::Vec3(domain_min));
-                            reg_params.set("domainMax", RegParamValue::Vec3(domain_max));
+                            reg_params.set("lut", parsed.lut.clone());
+                            reg_params.set("domainMin", RegParamValue::Vec3(parsed.domain_min));
+                            reg_params.set("domainMax", RegParamValue::Vec3(parsed.domain_max));
                         }
                     } else if aux_tex.is_none() {
                         // P4 P0-9: `displacementmap` and `layerinputdisplacement` expect straight
@@ -6390,7 +6789,7 @@ impl ProjectRenderEngine {
             let Some(graph) = graph_json else {
                 return Ok(source);
             };
-            let compiled = match compile_node_effect_to_glsl(&graph) {
+            let compiled = match self.get_or_compile_node_effect(&graph) {
                 Ok(c) => c,
                 Err(err) => {
                     warn!(error = %err, "failed to compile nodeeffect graph");
@@ -6452,7 +6851,6 @@ impl ProjectRenderEngine {
                 && let Ok(serde_json::Value::Array(items)) =
                     serde_json::from_str::<serde_json::Value>(json_str)
             {
-                let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
                 'lut_search: for item in &items {
                     for candidate in [
                         item.get("lutAsset"),
@@ -6463,13 +6861,11 @@ impl ProjectRenderEngine {
                     ] {
                         if let Some(asset_id) = candidate.and_then(serde_json::Value::as_str)
                             && let Some(record) = env.project.assets.get(asset_id)
-                            && let Some(bytes) = record.bytes.as_deref()
-                            && let Some((lut_val, domain_min, domain_max)) =
-                                parse_cube_lut_bytes(bytes, max_dim)
+                            && let Some(parsed) = self.get_or_parse_cube_lut(record)
                         {
-                            reg_params.set("lut", lut_val);
-                            reg_params.set("domainMin", RegParamValue::Vec3(domain_min));
-                            reg_params.set("domainMax", RegParamValue::Vec3(domain_max));
+                            reg_params.set("lut", parsed.lut.clone());
+                            reg_params.set("domainMin", RegParamValue::Vec3(parsed.domain_min));
+                            reg_params.set("domainMax", RegParamValue::Vec3(parsed.domain_max));
                             break 'lut_search;
                         }
                     }
@@ -7889,26 +8285,19 @@ impl ProjectRenderEngine {
                 gradient_names.push(fix_property_name(&cp.name));
             }
         }
-        let transformed_source: Cow<'_, str> =
-            if curve_names.is_empty() && gradient_names.is_empty() {
-                Cow::Borrowed(frag_shader)
-            } else {
-                let mut src = frag_shader.to_owned();
-                if !curve_names.is_empty() {
-                    src = zc_shader::bind_curve_ranges(&src, &curve_names);
-                }
-                if !gradient_names.is_empty() {
-                    src = zc_shader::bind_gradient_cycles(&src, &gradient_names);
-                }
-                Cow::Owned(src)
-            };
-        let effective_shader = transformed_source.as_ref();
-
-        // Build CompileOptions from custom_properties (static defines, Dropdown constants,
-        // ZOIDIUM_TIME_SAMPLES) and include defines in the pipeline cache hash (P8 P0-3).
-        let compile_opts =
-            build_custom_shader_compile_options(effective_shader, custom_properties, env);
-        let mut shader_hash = fnv1a_hash64(effective_shader.as_bytes());
+        // Build CompileOptions and hash raw shader + curve/gradient binding names + defines
+        // BEFORE running GLSL string rewrites so `bind_curve_ranges` / `bind_gradient_cycles`
+        // only execute on a pipeline cache miss.
+        let compile_opts = build_custom_shader_compile_options(frag_shader, custom_properties, env);
+        let mut shader_hash = fnv1a_hash64(frag_shader.as_bytes());
+        shader_hash = hash_u64(shader_hash, curve_names.len() as u64);
+        for name in &curve_names {
+            shader_hash = hash_u64(shader_hash, fnv1a_hash64(name.as_bytes()));
+        }
+        shader_hash = hash_u64(shader_hash, gradient_names.len() as u64);
+        for name in &gradient_names {
+            shader_hash = hash_u64(shader_hash, fnv1a_hash64(name.as_bytes()));
+        }
         for (k, v) in &compile_opts.defines {
             shader_hash = hash_u64(shader_hash, fnv1a_hash64(k.as_bytes()));
             shader_hash = hash_u64(shader_hash, fnv1a_hash64(v.as_bytes()));
@@ -7920,15 +8309,29 @@ impl ProjectRenderEngine {
         if let Some(entry) = self.custom_pipelines.get_mut(&shader_hash) {
             entry.last_used = tick;
         } else {
-            let compiled =
-                match zc_shader::translate_glsl_es100_with_options(effective_shader, &compile_opts)
-                {
-                    Ok(c) => c,
-                    Err(err) => {
-                        self.targets.release(source);
-                        return Err(RenderError::Shader(err.to_string()));
+            let transformed_source: Cow<'_, str> =
+                if curve_names.is_empty() && gradient_names.is_empty() {
+                    Cow::Borrowed(frag_shader)
+                } else {
+                    let mut src = frag_shader.to_owned();
+                    if !curve_names.is_empty() {
+                        src = zc_shader::bind_curve_ranges(&src, &curve_names);
                     }
+                    if !gradient_names.is_empty() {
+                        src = zc_shader::bind_gradient_cycles(&src, &gradient_names);
+                    }
+                    Cow::Owned(src)
                 };
+            let compiled = match zc_shader::translate_glsl_es100_with_options(
+                transformed_source.as_ref(),
+                &compile_opts,
+            ) {
+                Ok(c) => c,
+                Err(err) => {
+                    self.targets.release(source);
+                    return Err(RenderError::Shader(err.to_string()));
+                }
+            };
 
             let limits = self.ctx.device.limits();
             if u64::from(compiled.uniform_layout.byte_size) > limits.max_uniform_buffer_binding_size
@@ -12046,28 +12449,38 @@ fn eval_track_keyframes_only(track: &PropertyTrack, frame: f64) -> PropertyValue
         return track.keyframes[0].value.clone();
     }
 
-    // Keyframes are normally sorted; collect sorted references defensively without mutating.
-    let mut sorted: Vec<&PropertyKeyframe> = track.keyframes.iter().collect();
-    sorted.sort_by(|a, b| a.frame.total_cmp(&b.frame));
-
-    if frame <= sorted[0].frame {
-        return sorted[0].value.clone();
-    }
-    let last = sorted[sorted.len() - 1];
-    if frame >= last.frame {
-        return last.value.clone();
-    }
-
-    let mut seg_idx = 0usize;
-    for i in 0..(sorted.len() - 1) {
-        if frame >= sorted[i].frame && frame <= sorted[i + 1].frame {
-            seg_idx = i;
-            break;
+    // Fast path: keyframes are almost always sorted by frame; avoid Vec alloc + sort.
+    let sorted_storage: Vec<&PropertyKeyframe>;
+    let (k0, k1): (&PropertyKeyframe, &PropertyKeyframe) = if track
+        .keyframes
+        .is_sorted_by(|a, b| a.frame.total_cmp(&b.frame).is_le())
+    {
+        let kfs = &track.keyframes;
+        if frame <= kfs[0].frame {
+            return kfs[0].value.clone();
         }
-    }
-
-    let k0 = sorted[seg_idx];
-    let k1 = sorted[seg_idx + 1];
+        let last = &kfs[kfs.len() - 1];
+        if frame >= last.frame {
+            return last.value.clone();
+        }
+        let upper = kfs.partition_point(|kf| kf.frame <= frame);
+        let seg_idx = upper.saturating_sub(1).min(kfs.len() - 2);
+        (&kfs[seg_idx], &kfs[seg_idx + 1])
+    } else {
+        let mut sorted: Vec<&PropertyKeyframe> = track.keyframes.iter().collect();
+        sorted.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+        sorted_storage = sorted;
+        if frame <= sorted_storage[0].frame {
+            return sorted_storage[0].value.clone();
+        }
+        let last = sorted_storage[sorted_storage.len() - 1];
+        if frame >= last.frame {
+            return last.value.clone();
+        }
+        let upper = sorted_storage.partition_point(|kf| kf.frame <= frame);
+        let seg_idx = upper.saturating_sub(1).min(sorted_storage.len() - 2);
+        (sorted_storage[seg_idx], sorted_storage[seg_idx + 1])
+    };
     let duration = k1.frame - k0.frame;
     if duration.abs() < 1e-9 {
         return k0.value.clone();
@@ -13930,12 +14343,12 @@ fn build_text3d_mesh_cpu(
 
 fn build_text3d_character_meshes_with_fallback(
     project: &Project,
-    data: &zc_project::Text3DData,
+    font: Option<&str>,
     params: &Text3DParams,
     options: &Text3DExtendedOptions,
     text_scale: Vec3,
 ) -> Vec<zc_scene::Text3DCharacterMesh> {
-    let resolved = resolve_font_bytes(project, data.font.as_deref());
+    let resolved = resolve_font_bytes(project, font);
     let primary_bytes = resolved
         .as_ref()
         .map_or(DEFAULT_TTF_FONT_BYTES, ResolvedFont::as_slice);
@@ -15932,14 +16345,127 @@ fn hash_f64(acc: u64, value: f64) -> u64 {
     hash_u64(acc, value.to_bits())
 }
 
+fn hash_json_value(mut h: u64, v: &serde_json::Value) -> u64 {
+    match v {
+        serde_json::Value::Null => hash_u64(h, 0x01),
+        serde_json::Value::Bool(b) => hash_u64(hash_u64(h, 0x02), u64::from(*b)),
+        serde_json::Value::Number(n) => {
+            h = hash_u64(h, 0x03);
+            if let Some(u) = n.as_u64() {
+                hash_u64(hash_u64(h, 1), u)
+            } else if let Some(i) = n.as_i64() {
+                hash_u64(hash_u64(h, 2), i as u64)
+            } else if let Some(f) = n.as_f64() {
+                hash_f64(hash_u64(h, 3), f)
+            } else {
+                h
+            }
+        }
+        serde_json::Value::String(s) => {
+            h = hash_u64(h, 0x04);
+            h = hash_u64(h, s.len() as u64);
+            hash_u64(h, fnv1a_hash64(s.as_bytes()))
+        }
+        serde_json::Value::Array(arr) => {
+            h = hash_u64(h, 0x05);
+            h = hash_u64(h, arr.len() as u64);
+            for item in arr {
+                h = hash_json_value(h, item);
+            }
+            h
+        }
+        serde_json::Value::Object(map) => {
+            h = hash_u64(h, 0x06);
+            h = hash_u64(h, map.len() as u64);
+            for (k, val) in map {
+                h = hash_u64(h, k.len() as u64);
+                h = hash_u64(h, fnv1a_hash64(k.as_bytes()));
+                h = hash_json_value(h, val);
+            }
+            h
+        }
+    }
+}
+
+fn hash_node_material_referenced_assets(
+    mut h: u64,
+    v: &serde_json::Value,
+    project: &Project,
+) -> u64 {
+    if project.assets.is_empty() {
+        return h;
+    }
+    match v {
+        serde_json::Value::String(s) => {
+            if let Some(rec) = project.assets.get(s.as_str()) {
+                h = hash_u64(h, fnv1a_hash64(s.as_bytes()));
+                h = hash_u64(h, hash_asset_record(rec));
+            } else if s.as_bytes().first() == Some(&b'{') {
+                // Handle `.pz`-wrapped stringified JSON graphs without parsing/decoding on cache hits.
+                for (aid, rec) in &project.assets {
+                    if s.contains(aid.as_str()) {
+                        h = hash_u64(h, fnv1a_hash64(aid.as_bytes()));
+                        h = hash_u64(h, hash_asset_record(rec));
+                    }
+                }
+            }
+            h
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                h = hash_node_material_referenced_assets(h, item, project);
+            }
+            h
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values() {
+                h = hash_node_material_referenced_assets(h, val, project);
+            }
+            h
+        }
+        _ => h,
+    }
+}
+
+fn shape_plus_is_time_dependent(payload: &serde_json::Value) -> bool {
+    match payload {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if k == "keyframes" && v.as_array().is_some_and(|arr| !arr.is_empty()) {
+                    return true;
+                }
+                if k == "expression" && v.as_str().is_some_and(|s| !s.trim().is_empty()) {
+                    return true;
+                }
+                if matches!(
+                    k.as_str(),
+                    "wigglePaths" | "wiggleTransform" | "textAnimator"
+                ) {
+                    return true;
+                }
+                if k == "type"
+                    && v.as_str().is_some_and(|s| {
+                        matches!(s, "wigglePaths" | "wiggleTransform" | "textAnimator")
+                    })
+                {
+                    return true;
+                }
+                if shape_plus_is_time_dependent(v) {
+                    return true;
+                }
+            }
+            false
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(shape_plus_is_time_dependent),
+        _ => false,
+    }
+}
+
 fn hash_effectors(mut h: u64, obj: &Object3D, env: &EvalEnv<'_>) -> u64 {
     let active = env.plugins.is_enabled("repeater") || env.plugins.is_enabled("effector-plus");
     h = hash_u64(h, u64::from(active));
-    if active
-        && let Some(val) = obj.preserved.get("effectors")
-        && let Ok(bytes) = serde_json::to_vec(val)
-    {
-        h = hash_u64(h, fnv1a_hash64(&bytes));
+    if active && let Some(val) = obj.preserved.get("effectors") {
+        h = hash_json_value(h, val);
     }
     h
 }
@@ -15948,7 +16474,21 @@ fn hash_asset_record(rec: &zc_project::AssetRecord) -> u64 {
     if !rec.sha256.is_empty() {
         fnv1a_hash64(rec.sha256.as_bytes())
     } else if let Some(bytes) = rec.bytes.as_deref() {
-        fnv1a_hash64(bytes)
+        if bytes.len() <= 1_048_576 {
+            fnv1a_hash64(bytes)
+        } else {
+            let sample = 8192usize;
+            let mid = bytes.len() / 2;
+            let mut h = hash_u64(fnv1a_hash64(b"large_asset_v1"), bytes.len() as u64);
+            h = hash_u64(h, fnv1a_hash64(&bytes[..sample]));
+            h = hash_u64(h, fnv1a_hash64(&bytes[mid..mid + sample]));
+            h = hash_u64(h, fnv1a_hash64(&bytes[bytes.len() - sample..]));
+            h
+        }
+    } else if let Some(url) = rec.url.as_deref() {
+        hash_u64(fnv1a_hash64(url.as_bytes()), rec.size)
+    } else if !rec.filename.is_empty() {
+        hash_u64(fnv1a_hash64(rec.filename.as_bytes()), rec.size)
     } else {
         0
     }
@@ -17332,6 +17872,12 @@ fn resolve_system_font_by_name(font_key: &str) -> Option<Arc<[u8]>> {
     None
 }
 
+fn font_supports_cjk(bytes: &[u8]) -> bool {
+    !font_has_missing_glyphs(bytes, "あ")
+        || !font_has_missing_glyphs(bytes, "テ")
+        || !font_has_missing_glyphs(bytes, "中")
+}
+
 fn resolve_system_cjk_fallback_font() -> Option<Arc<[u8]>> {
     static CJK_FALLBACK: OnceLock<Option<Arc<[u8]>>> = OnceLock::new();
     CJK_FALLBACK
@@ -17364,12 +17910,13 @@ fn resolve_system_cjk_fallback_font() -> Option<Arc<[u8]>> {
                         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
                         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
                         "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
-                        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                     ]
                 }
             };
             for path_str in candidates {
-                if let Some(bytes) = load_font_file_cached(Path::new(path_str)) {
+                if let Some(bytes) = load_font_file_cached(Path::new(path_str))
+                    && font_supports_cjk(&bytes)
+                {
                     return Some(bytes);
                 }
             }
@@ -23653,5 +24200,185 @@ DOMAIN_MAX 0.9 0.8 0.7
             base_v_px, vor_v_px,
             "ExpressText+ Voronoi must keep text 100% intact when distance == 0 && scatter == 0"
         );
+    }
+
+    #[test]
+    fn cjk_fallback_font_rejects_latin_only_and_validates_glyph_coverage() {
+        assert!(
+            !font_supports_cjk(DEFAULT_TTF_FONT_BYTES),
+            "Latin-only Geist-Regular.ttf must not pass CJK glyph validation"
+        );
+        assert!(
+            !font_supports_cjk(b"not a valid font"),
+            "invalid font bytes must not pass CJK glyph validation"
+        );
+        if let Some(bytes) = resolve_system_cjk_fallback_font() {
+            assert!(
+                font_supports_cjk(&bytes),
+                "resolved OS CJK fallback font must actually contain CJK glyphs"
+            );
+        }
+    }
+
+    #[test]
+    fn shape_plus_is_time_dependent_gates_static_vs_animated_payloads() {
+        let static_payload = serde_json::json!({
+            "version": 1,
+            "contents": [{
+                "type": "rect",
+                "size": { "value": [200.0, 100.0], "keyframes": [] },
+                "expression": ""
+            }]
+        });
+        assert!(
+            !shape_plus_is_time_dependent(&static_payload),
+            "static Shape+ payload with empty keyframes & expression must not be time-dependent"
+        );
+
+        let kf_payload = serde_json::json!({
+            "contents": [{
+                "type": "rect",
+                "size": { "keyframes": [{ "frame": 0.0, "value": [100.0, 100.0] }] }
+            }]
+        });
+        assert!(shape_plus_is_time_dependent(&kf_payload));
+
+        let expr_payload = serde_json::json!({
+            "contents": [{
+                "type": "rect",
+                "rotation": { "expression": "time * 90" }
+            }]
+        });
+        assert!(shape_plus_is_time_dependent(&expr_payload));
+
+        for op in ["wigglePaths", "wiggleTransform", "textAnimator"] {
+            let as_type = serde_json::json!({ "contents": [{ "type": op }] });
+            assert!(
+                shape_plus_is_time_dependent(&as_type),
+                "Shape+ item with type={op} must be time-dependent"
+            );
+            let as_key = serde_json::json!({ op: {} });
+            assert!(
+                shape_plus_is_time_dependent(&as_key),
+                "Shape+ payload with key={op} must be time-dependent"
+            );
+        }
+    }
+
+    #[test]
+    fn stroked_text2d_caches_rasterized_edt_texture_across_frames() {
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(e) => e,
+            Err(err) => {
+                assert!(
+                    !crate::require_gpu_in_tests(),
+                    "ZOIDCRAFT_REQUIRE_GPU=1 set but headless GPU unavailable: {err}"
+                );
+                return;
+            }
+        };
+        let plugins = PluginRegistry::new();
+        let mut p2d = Project::new_cm3_default();
+        p2d.sequence.resolution = [160, 90];
+        p2d.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+        p2d.sequence.video_tracks[0].clips.clear();
+
+        let node = Shape2DNode {
+            id: Uuid::new_v4(),
+            name: "Text".to_owned(),
+            kind: Shape2DKind::Group {
+                children: Vec::new(),
+            },
+            position: PropertyTrack::vec2([0.0, 0.0]),
+            rotation: PropertyTrack::number(0.0),
+            scale: PropertyTrack::vec2([1.0, 1.0]),
+            operations: vec![
+                DrawOp::Stroke {
+                    color: PropertyTrack::color([0.1, 0.8, 1.0]),
+                    opacity: PropertyTrack::number(1.0),
+                    size: PropertyTrack::number(6.0),
+                },
+                DrawOp::Fill {
+                    color: PropertyTrack::constant(PropertyValue::ColorRgba([1.0, 1.0, 1.0, 1.0])),
+                },
+            ],
+            preserved: BTreeMap::new(),
+        };
+        p2d.sequence.video_tracks[0]
+            .clips
+            .push(zc_project::VideoClip {
+                id: Uuid::new_v4(),
+                name: "StrokedText2D".to_owned(),
+                start: 0.0,
+                length: 60.0,
+                link: None,
+                media: None,
+                time_curve: PropertyTrack::linear_time_curve(60.0, 30),
+                layer: Layer::new(
+                    "StrokedText2D",
+                    LayerKind::Text2D {
+                        text: "HI".to_owned(),
+                        font: Some("Geist-Regular.ttf".to_owned()),
+                        size: 40,
+                        shapes: vec![node],
+                    },
+                    [160, 90],
+                ),
+                preserved: BTreeMap::new(),
+            });
+
+        assert_eq!(engine.cached_texture_count(), 0);
+        let px_f0 = engine
+            .render_frame_rgba8(&p2d, &plugins, 0.0, 160, 90)
+            .expect("stroked text2d frame 0");
+        assert!(
+            count_non_black_rgb_pixels(&px_f0) > 50,
+            "stroked Text2D must render visible pixels"
+        );
+        let after_f0 = engine.cached_texture_count();
+        assert_eq!(
+            after_f0, 1,
+            "stroked Text2D must insert its finished texture into texture_cache"
+        );
+
+        let px_f10 = engine
+            .render_frame_rgba8(&p2d, &plugins, 10.0, 160, 90)
+            .expect("stroked text2d frame 10");
+        assert_eq!(
+            engine.cached_texture_count(),
+            after_f0,
+            "unchanged stroked Text2D on frame 10 must hit texture_cache without creating a new entry"
+        );
+        assert_eq!(
+            px_f0, px_f10,
+            "cached stroked Text2D must match frame 0 bit-for-bit"
+        );
+    }
+
+    #[test]
+    fn eval_track_keyframes_only_sorted_fast_path_matches_unsorted() {
+        let mut sorted_track = PropertyTrack::number(0.0);
+        sorted_track.animated = true;
+        sorted_track.keyframes = vec![
+            PropertyKeyframe::linear(0.0, PropertyValue::Number(10.0)),
+            PropertyKeyframe::linear(10.0, PropertyValue::Number(30.0)),
+            PropertyKeyframe::linear(20.0, PropertyValue::Number(90.0)),
+            PropertyKeyframe::linear(30.0, PropertyValue::Number(100.0)),
+        ];
+        let mut unsorted_track = sorted_track.clone();
+        unsorted_track.keyframes.swap(1, 2);
+
+        for frame in [-5.0, 0.0, 2.5, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0] {
+            let a = eval_track_keyframes_only(&sorted_track, frame)
+                .as_f64()
+                .unwrap();
+            let b = eval_track_keyframes_only(&unsorted_track, frame)
+                .as_f64()
+                .unwrap();
+            assert!(
+                (a - b).abs() < 1e-9,
+                "sorted fast-path ({a}) must match unsorted fallback ({b}) at frame {frame}"
+            );
+        }
     }
 }

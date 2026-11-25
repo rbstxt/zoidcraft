@@ -8,6 +8,7 @@ pub mod engine;
 pub mod scene3d;
 pub mod shape_plus;
 pub mod text_plus_2d;
+pub mod video;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ pub use cache::{CachedFrame, FrameCache, FrameCacheKey};
 pub use compositor::{BlendMode, Compositor2D, LayerTransform2D, encode_png};
 pub use context::{
     DEFAULT_TARGET_POOL_MAX_BYTES, GpuContext, RenderError, RenderTarget, TargetPool,
-    f32_to_f16_bits, readback_rgba8,
+    f32_to_f16_bits, readback_rgba8, readback_rgba8_with_staging,
 };
 pub use engine::*;
 pub use scene3d::{
@@ -367,24 +368,52 @@ impl RenderEngine {
     }
 }
 
+const UNPREMUL_SHIFT: u32 = 18;
+const UNPREMUL_HALF: u64 = 1u64 << (UNPREMUL_SHIFT - 1);
+
+/// Fixed-point reciprocal LUT for exact rounding unpremultiplication:
+/// `UNPREMUL_RECIP_LUT[a] = ceil((255 << 18) / a)` for `a in 1..=255`.
+const UNPREMUL_RECIP_LUT: [u32; 256] = {
+    let mut lut = [0u32; 256];
+    let mut a = 1u32;
+    while a < 256 {
+        lut[a as usize] = (255u32 << UNPREMUL_SHIFT).div_ceil(a);
+        a += 1;
+    }
+    lut
+};
+
+/// Converts premultiplied RGBA8 pixel data to straight-alpha RGBA8 **in place**.
+///
+/// Uses a `const` 256-entry fixed-point reciprocal LUT with exact bit-for-bit parity
+/// against `((u16::from(c) * 255 + (a / 2)) / a).min(255) as u8`, skipping fully opaque
+/// pixels (`a == 255`) with zero writes and zeroing RGB for transparent pixels (`a == 0`).
+pub fn unpremultiply_rgba8_in_place(buf: &mut [u8]) {
+    for px in buf.as_chunks_mut::<4>().0 {
+        let a = px[3];
+        if a == 255 {
+            continue;
+        }
+        if a == 0 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+            continue;
+        }
+        let recip = u64::from(UNPREMUL_RECIP_LUT[usize::from(a)]);
+        px[0] = (((u64::from(px[0]) * recip) + UNPREMUL_HALF) >> UNPREMUL_SHIFT).min(255) as u8;
+        px[1] = (((u64::from(px[1]) * recip) + UNPREMUL_HALF) >> UNPREMUL_SHIFT).min(255) as u8;
+        px[2] = (((u64::from(px[2]) * recip) + UNPREMUL_HALF) >> UNPREMUL_SHIFT).min(255) as u8;
+    }
+}
+
 /// Converts premultiplied RGBA8 pixel data (the renderer's internal format) to
 /// straight-alpha RGBA8 suitable for PNG export and standard image viewers.
 #[must_use]
 pub fn unpremultiply_rgba8(premul: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(premul.len());
-    for px in premul.as_chunks::<4>().0 {
-        let a = u16::from(px[3]);
-        if a == 0 {
-            out.extend_from_slice(&[0, 0, 0, 0]);
-        } else if a == 255 {
-            out.extend_from_slice(px);
-        } else {
-            let r = ((u16::from(px[0]) * 255 + (a / 2)) / a).min(255) as u8;
-            let g = ((u16::from(px[1]) * 255 + (a / 2)) / a).min(255) as u8;
-            let b = ((u16::from(px[2]) * 255 + (a / 2)) / a).min(255) as u8;
-            out.extend_from_slice(&[r, g, b, px[3]]);
-        }
-    }
+    let aligned_len = premul.len() & !3usize;
+    let mut out = premul[..aligned_len].to_vec();
+    unpremultiply_rgba8_in_place(&mut out);
     out
 }
 
@@ -692,5 +721,35 @@ mod tests {
         engine.targets.release(tint_overlay);
         engine.targets.release(final_target);
         engine.end_frame();
+    }
+
+    #[test]
+    fn unpremultiply_rgba8_in_place_matches_reference_exhaustively() {
+        let mut buf = Vec::with_capacity(256 * 256 * 4);
+        let mut expected = Vec::with_capacity(256 * 256 * 4);
+        for a in 0u16..=255 {
+            for c in 0u16..=255 {
+                let c_u8 = c as u8;
+                let a_u8 = a as u8;
+                buf.extend_from_slice(&[c_u8, 255 - c_u8, c_u8 ^ 0x5A, a_u8]);
+
+                if a == 0 {
+                    expected.extend_from_slice(&[0, 0, 0, 0]);
+                } else if a == 255 {
+                    expected.extend_from_slice(&[c_u8, 255 - c_u8, c_u8 ^ 0x5A, 255]);
+                } else {
+                    let r = ((c * 255 + (a / 2)) / a).min(255) as u8;
+                    let g = (((255 - c) * 255 + (a / 2)) / a).min(255) as u8;
+                    let b = ((u16::from(c_u8 ^ 0x5A) * 255 + (a / 2)) / a).min(255) as u8;
+                    expected.extend_from_slice(&[r, g, b, a_u8]);
+                }
+            }
+        }
+
+        let alloc_out = unpremultiply_rgba8(&buf);
+        assert_eq!(alloc_out, expected);
+
+        unpremultiply_rgba8_in_place(&mut buf);
+        assert_eq!(buf, expected);
     }
 }

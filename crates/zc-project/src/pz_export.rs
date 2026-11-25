@@ -13,13 +13,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::Path;
 
+#[cfg(test)]
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::ProjectError;
-use crate::atomic::write_atomic;
+use crate::atomic::write_atomic_with;
 use crate::model::{
     AssetKind, AssetRecord, AudioClip, AudioTrack, CameraData, CameraKind, CompatMode,
     CustomProperty, DrawOp, EffectInstance, EffectKind, GradientStop, Layer, LayerKind, LayerMask,
@@ -28,23 +29,36 @@ use crate::model::{
     SequenceControl, SequenceControlKind, Shape2DKind, Shape2DNode, Shape3DKind, Text3DAlign,
     Text3DData, VideoClip, VideoTrack,
 };
-use crate::sha256::{cm3_asset_key, sha256_hex};
+use crate::sha256::{
+    CM3_ASSET_HASH_PREFIX_BYTES, cm3_asset_key, cm3_asset_key_from_bytes, sha256_bytes, sha256_hex,
+    sha256_hex_from_bytes,
+};
 use crate::zcraft::{
     MAX_ARCHIVE_ENTRIES, MAX_JSON_ENTRY_BYTES, MAX_JSON_NESTING_DEPTH, MAX_RETAINED_ASSET_BYTES,
-    MAX_UNCOMPRESSED_ARCHIVE_BYTES, check_json_depth, validate_archive_path,
+    MAX_UNCOMPRESSED_ARCHIVE_BYTES, check_json_depth, choose_archive_gzip_compression,
+    validate_archive_path,
 };
 
 const DEFAULT_PZ_VERSION: &str = "1.0.102";
 
-/// Atomically exports `project` as a CM3/Zoidium `.pz` archive to `path`.
+/// Atomically exports `project` as a CM3/Zoidium `.pz` archive to `path`, streaming
+/// directly through a crash-safe temporary file without buffering the full archive in RAM.
 pub fn export_pz(project: &Project, path: impl AsRef<Path>) -> Result<(), ProjectError> {
-    let bytes = export_pz_to_bytes(project)?;
-    write_atomic(path.as_ref(), &bytes)
+    write_atomic_with(path.as_ref(), |writer| export_pz_to_writer(project, writer))
 }
 
 /// Serializes `project` into an in-memory CM3/Zoidium `.pz` (gzip + POSIX USTAR TAR) byte vector.
 pub fn export_pz_to_bytes(project: &Project) -> Result<Vec<u8>, ProjectError> {
-    // 1. Build asset table, CM3 asset key remap, embedded binary list, and missing assets list.
+    let mut out = Vec::new();
+    export_pz_to_writer(project, &mut out)?;
+    Ok(out)
+}
+
+/// Streams `project` as a CM3/Zoidium `.pz` (single-member gzip + POSIX USTAR TAR) archive
+/// directly into `writer`.
+pub fn export_pz_to_writer<W: Write>(project: &Project, writer: W) -> Result<(), ProjectError> {
+    // 1. Build asset table, CM3 asset key remap, embedded binary list (with single-pass SHA-256),
+    //    and missing assets list.
     let (assets_json, asset_key_remap, embedded_assets, missing_assets) = build_assets(project)?;
 
     // 2. Build stable Precomp+ string IDs for every composition UUID.
@@ -95,14 +109,16 @@ pub fn export_pz_to_bytes(project: &Project) -> Result<Vec<u8>, ProjectError> {
             "sha256": sha256_hex(&project_bytes),
         }),
     );
-    for (entry_name, data) in &embedded_assets {
+    let mut compression_probe: Vec<(String, &[u8])> = Vec::with_capacity(embedded_assets.len());
+    for asset in &embedded_assets {
         integrity.insert(
-            entry_name.clone(),
+            asset.entry_name.clone(),
             json!({
-                "size": data.len() as u64,
-                "sha256": sha256_hex(data),
+                "size": asset.bytes.len() as u64,
+                "sha256": asset.sha256_hex,
             }),
         );
+        compression_probe.push((asset.filename.clone(), asset.bytes));
     }
 
     let mut zoidium_obj = Map::new();
@@ -123,7 +139,7 @@ pub fn export_pz_to_bytes(project: &Project) -> Result<Vec<u8>, ProjectError> {
         });
     }
 
-    // 6. Stream POSIX USTAR TAR entries through a bounded writer into gzip.
+    // 6. Stream POSIX USTAR TAR entries through a bounded writer into single-member gzip.
     struct LimitedWriter<W> {
         inner: W,
         written: u64,
@@ -148,7 +164,8 @@ pub fn export_pz_to_bytes(project: &Project) -> Result<Vec<u8>, ProjectError> {
         }
     }
 
-    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let compression = choose_archive_gzip_compression(&compression_probe);
+    let encoder = GzEncoder::new(writer, compression);
     let limited_writer = LimitedWriter {
         inner: encoder,
         written: 0,
@@ -160,8 +177,8 @@ pub fn export_pz_to_bytes(project: &Project) -> Result<Vec<u8>, ProjectError> {
     let write_res: Result<(), ProjectError> = (|| {
         append_ustar_file(&mut builder, "meta", &meta_bytes)?;
         append_ustar_file(&mut builder, "project", &project_bytes)?;
-        for (entry_name, data) in embedded_assets {
-            append_ustar_file(&mut builder, &entry_name, data)?;
+        for asset in embedded_assets {
+            append_ustar_file(&mut builder, &asset.entry_name, asset.bytes)?;
         }
         append_ustar_file(&mut builder, "zoidium.json", &zoidium_bytes)?;
         builder.finish()?;
@@ -183,8 +200,8 @@ pub fn export_pz_to_bytes(project: &Project) -> Result<Vec<u8>, ProjectError> {
             limit_bytes: MAX_UNCOMPRESSED_ARCHIVE_BYTES,
         });
     }
-    let compressed = limited.inner.finish()?;
-    Ok(compressed)
+    let _writer = limited.inner.finish()?;
+    Ok(())
 }
 
 fn append_ustar_file<W: Write>(
@@ -222,23 +239,30 @@ fn resolve_meta_version(project: &Project) -> String {
     DEFAULT_PZ_VERSION.to_owned()
 }
 
+struct EmbeddedExportAsset<'a> {
+    entry_name: String,
+    filename: String,
+    bytes: &'a [u8],
+    sha256_hex: String,
+}
+
 type BuiltAssets<'a> = (
     Map<String, Value>,
     BTreeMap<String, String>,
-    Vec<(String, &'a [u8])>,
+    Vec<EmbeddedExportAsset<'a>>,
     Vec<String>,
 );
 
 fn build_assets(project: &Project) -> Result<BuiltAssets<'_>, ProjectError> {
     let mut assets_map = Map::new();
     let mut remap: BTreeMap<String, String> = BTreeMap::new();
-    let mut embedded: Vec<(String, &[u8])> = Vec::new();
+    let mut embedded: Vec<EmbeddedExportAsset<'_>> = Vec::new();
     let mut embedded_names: BTreeSet<String> = BTreeSet::new();
     let mut missing_assets: Vec<String> = Vec::new();
     let mut total_embedded_bytes = 0_u64;
 
     for (zc_key, record) in &project.assets {
-        let export_key = derive_export_asset_key(zc_key, record);
+        let (export_key, full_sha256_opt) = derive_export_asset_key_and_sha256(zc_key, record);
         if export_key != *zc_key {
             remap.insert(zc_key.clone(), export_key.clone());
         }
@@ -258,7 +282,13 @@ fn build_assets(project: &Project) -> Result<BuiltAssets<'_>, ProjectError> {
                         limit_bytes: MAX_RETAINED_ASSET_BYTES,
                     });
                 }
-                embedded.push((export_key.clone(), bytes));
+                let sha256_hex_str = full_sha256_opt.unwrap_or_else(|| sha256_hex(bytes));
+                embedded.push(EmbeddedExportAsset {
+                    entry_name: export_key.clone(),
+                    filename: record.filename.clone(),
+                    bytes,
+                    sha256_hex: sha256_hex_str,
+                });
             }
             bytes.len() as u64
         } else {
@@ -290,16 +320,26 @@ fn build_assets(project: &Project) -> Result<BuiltAssets<'_>, ProjectError> {
         assets_map.insert(export_key, Value::Object(asset_obj));
     }
 
-    embedded.sort_by(|a, b| a.0.cmp(&b.0));
+    embedded.sort_by(|a, b| a.entry_name.cmp(&b.entry_name));
     missing_assets.sort();
     missing_assets.dedup();
 
     Ok((assets_map, remap, embedded, missing_assets))
 }
 
-fn derive_export_asset_key(zc_key: &str, record: &AssetRecord) -> String {
+fn derive_export_asset_key_and_sha256(
+    zc_key: &str,
+    record: &AssetRecord,
+) -> (String, Option<String>) {
     if let Some(bytes) = record.bytes.as_deref() {
-        return cm3_asset_key(bytes);
+        if bytes.len() <= CM3_ASSET_HASH_PREFIX_BYTES {
+            let digest = sha256_bytes(bytes);
+            return (
+                cm3_asset_key_from_bytes(&digest),
+                Some(sha256_hex_from_bytes(&digest)),
+            );
+        }
+        return (cm3_asset_key(bytes), None);
     }
     if let Some(legacy) = record
         .preserved
@@ -307,9 +347,9 @@ fn derive_export_asset_key(zc_key: &str, record: &AssetRecord) -> String {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
     {
-        return legacy.to_owned();
+        return (legacy.to_owned(), None);
     }
-    zc_key.to_owned()
+    (zc_key.to_owned(), None)
 }
 
 fn build_composition_str_ids(project: &Project) -> BTreeMap<Uuid, String> {

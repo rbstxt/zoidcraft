@@ -1033,6 +1033,9 @@ pub struct Scene3DRenderer {
     optical_flare_shader: wgpu::ShaderModule,
     shadow_pipeline_current: wgpu::RenderPipeline,
     shadow_pipeline_legacy: wgpu::RenderPipeline,
+    mesh_scene_bgl: wgpu::BindGroupLayout,
+    mesh_obj_bgl: wgpu::BindGroupLayout,
+    mesh_pipeline_layout: wgpu::PipelineLayout,
     mesh_pipelines: HashMap<MeshPipelineKey, wgpu::RenderPipeline>,
     lines_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     particle_pipelines: HashMap<ParticlePipelineKey, wgpu::RenderPipeline>,
@@ -1056,6 +1059,8 @@ pub struct Scene3DRenderer {
     point_shadow_maps_array_view: wgpu::TextureView,
     point_shadow_maps_layer_views: Vec<wgpu::TextureView>,
     shadow_initialized: bool,
+    shadow_2d_dirty: [bool; MAX_SHADOW_MAPS_2D],
+    point_shadow_dirty: [bool; MAX_POINT_SHADOW_LIGHTS],
     shadow_sampler: wgpu::Sampler,
     linear_sampler: wgpu::Sampler,
     clamp_sampler: wgpu::Sampler,
@@ -1248,6 +1253,102 @@ impl Scene3DRenderer {
         });
         ctx.queue.write_buffer(&grid_vertex_buffer, 0, grid_bytes);
 
+        let mesh_scene_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("zc-render scene3d group0 layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Depth,
+                                view_dimension: wgpu::TextureViewDimension::D2Array,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Depth,
+                                view_dimension: wgpu::TextureViewDimension::D2Array,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                            count: None,
+                        },
+                    ],
+                });
+
+        let tex2d_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let sampler_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let mesh_obj_bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zc-render scene3d group1 layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    tex2d_entry(1),
+                    tex2d_entry(2),
+                    tex2d_entry(3),
+                    sampler_entry(4),
+                    tex2d_entry(5),
+                    tex2d_entry(6),
+                    tex2d_entry(7),
+                    tex2d_entry(8),
+                    tex2d_entry(9),
+                    sampler_entry(10),
+                    tex2d_entry(11),
+                ],
+            });
+        let mesh_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("zc-render scene3d mesh pipeline layout"),
+                    bind_group_layouts: &[Some(&mesh_scene_bgl), Some(&mesh_obj_bgl)],
+                    immediate_size: 0,
+                });
+
         Ok(Self {
             shadow_shader,
             mesh_shader,
@@ -1259,6 +1360,9 @@ impl Scene3DRenderer {
             optical_flare_shader,
             shadow_pipeline_current,
             shadow_pipeline_legacy,
+            mesh_scene_bgl,
+            mesh_obj_bgl,
+            mesh_pipeline_layout,
             mesh_pipelines: HashMap::new(),
             lines_pipelines: HashMap::new(),
             particle_pipelines: HashMap::new(),
@@ -1282,6 +1386,8 @@ impl Scene3DRenderer {
             point_shadow_maps_array_view,
             point_shadow_maps_layer_views,
             shadow_initialized: false,
+            shadow_2d_dirty: [false; MAX_SHADOW_MAPS_2D],
+            point_shadow_dirty: [false; MAX_POINT_SHADOW_LIGHTS],
             shadow_sampler,
             linear_sampler,
             clamp_sampler,
@@ -1328,6 +1434,7 @@ impl Scene3DRenderer {
         self.shadow_maps_2d_layer_views = layer_views;
         self.shadow_map_size_2d = target;
         self.shadow_initialized = false;
+        self.shadow_2d_dirty = [false; MAX_SHADOW_MAPS_2D];
     }
 
     /// Renders a 3D scene into premultiplied RGBA `color_target` with
@@ -1465,8 +1572,12 @@ impl Scene3DRenderer {
                 label: Some("zc-render scene3d encoder"),
             });
 
-        // 1. Shadow map passes (initialize all array layers on first use).
+        // 1. Shadow map passes (initialize all array layers on first use; skip empty passes once clean).
         {
+            let has_shadow_casters = input
+                .meshes
+                .iter()
+                .any(|draw| draw.cast_shadow && draw.mesh.index_count > 0);
             let shadow_pipeline = match input.compat_mode {
                 CompatMode::Current => &self.shadow_pipeline_current,
                 CompatMode::Legacy => &self.shadow_pipeline_legacy,
@@ -1477,21 +1588,32 @@ impl Scene3DRenderer {
             let mut active_2d_layers = [false; MAX_SHADOW_MAPS_2D];
             for &(slot, light_view_proj, _) in &shadow_assign.spot_dir_casters {
                 active_2d_layers[slot] = true;
-                encode_shadow_layer_pass(
-                    ctx,
-                    &mut encoder,
-                    shadow_pipeline,
-                    &shadow_bgl,
-                    &self.shadow_maps_2d_layer_views[slot],
-                    light_view_proj,
-                    input.meshes,
-                    "zc-render shadow 2d pass",
-                );
+                if has_shadow_casters {
+                    encode_shadow_layer_pass(
+                        ctx,
+                        &mut encoder,
+                        shadow_pipeline,
+                        &shadow_bgl,
+                        &self.shadow_maps_2d_layer_views[slot],
+                        light_view_proj,
+                        input.meshes,
+                        "zc-render shadow 2d pass",
+                    );
+                    self.shadow_2d_dirty[slot] = true;
+                } else if !self.shadow_initialized || self.shadow_2d_dirty[slot] {
+                    clear_depth_layer(
+                        &mut encoder,
+                        &self.shadow_maps_2d_layer_views[slot],
+                        "zc-render shadow 2d empty clear",
+                    );
+                    self.shadow_2d_dirty[slot] = false;
+                }
             }
             if !self.shadow_initialized {
                 for (slot, view) in self.shadow_maps_2d_layer_views.iter().enumerate() {
                     if !active_2d_layers[slot] {
                         clear_depth_layer(&mut encoder, view, "zc-render shadow 2d init clear");
+                        self.shadow_2d_dirty[slot] = false;
                     }
                 }
             }
@@ -1500,19 +1622,32 @@ impl Scene3DRenderer {
             let mut active_point_slots = [false; MAX_POINT_SHADOW_LIGHTS];
             for &(pslot, pos, near, far, _) in &shadow_assign.point_casters {
                 active_point_slots[pslot] = true;
-                let faces = point_light_cube_face_matrices(pos, near, far);
-                for (face_idx, &face_vp) in faces.iter().enumerate() {
-                    let layer = pslot * 6 + face_idx;
-                    encode_shadow_layer_pass(
-                        ctx,
-                        &mut encoder,
-                        shadow_pipeline,
-                        &shadow_bgl,
-                        &self.point_shadow_maps_layer_views[layer],
-                        face_vp,
-                        input.meshes,
-                        "zc-render shadow point face pass",
-                    );
+                if has_shadow_casters {
+                    let faces = point_light_cube_face_matrices(pos, near, far);
+                    for (face_idx, &face_vp) in faces.iter().enumerate() {
+                        let layer = pslot * 6 + face_idx;
+                        encode_shadow_layer_pass(
+                            ctx,
+                            &mut encoder,
+                            shadow_pipeline,
+                            &shadow_bgl,
+                            &self.point_shadow_maps_layer_views[layer],
+                            face_vp,
+                            input.meshes,
+                            "zc-render shadow point face pass",
+                        );
+                    }
+                    self.point_shadow_dirty[pslot] = true;
+                } else if !self.shadow_initialized || self.point_shadow_dirty[pslot] {
+                    for face_idx in 0..6 {
+                        let layer = pslot * 6 + face_idx;
+                        clear_depth_layer(
+                            &mut encoder,
+                            &self.point_shadow_maps_layer_views[layer],
+                            "zc-render shadow point empty clear",
+                        );
+                    }
+                    self.point_shadow_dirty[pslot] = false;
                 }
             }
             if !self.shadow_initialized {
@@ -1526,6 +1661,7 @@ impl Scene3DRenderer {
                                 "zc-render shadow point init clear",
                             );
                         }
+                        self.point_shadow_dirty[pslot] = false;
                     }
                 }
             }
@@ -1547,11 +1683,39 @@ impl Scene3DRenderer {
             bytemuck::bytes_of(&scene_uniforms),
         );
 
-        // Pre-build per-draw bind groups so all borrowed resources live across the pass.
+        // Pre-build shared scene bind group once per pass and per-draw object bind groups.
+        let scene_bg = (!input.meshes.is_empty()).then(|| {
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zc-render scene3d group0"),
+                layout: &self.mesh_scene_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: scene_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(
+                            &self.shadow_maps_2d_array_view,
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            &self.point_shadow_maps_array_view,
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.shadow_sampler),
+                    },
+                ],
+            })
+        });
+
         struct PreparedMeshDraw<'a> {
             key: MeshPipelineKey,
             mesh: &'a GpuMesh,
-            scene_bg: wgpu::BindGroup,
             obj_bg: wgpu::BindGroup,
             _obj_ubo: wgpu::Buffer,
             view_z: f32,
@@ -1575,36 +1739,6 @@ impl Scene3DRenderer {
                 blend: draw.material.blend,
                 polygon_offset_cap: draw.material.polygon_offset_cap,
             };
-            let pipeline = &self.mesh_pipelines[&key];
-            let bgl0 = pipeline.get_bind_group_layout(0);
-            let bgl1 = pipeline.get_bind_group_layout(1);
-
-            let scene_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("zc-render scene3d group0"),
-                layout: &bgl0,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: scene_ubo.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(
-                            &self.shadow_maps_2d_array_view,
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(
-                            &self.point_shadow_maps_array_view,
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&self.shadow_sampler),
-                    },
-                ],
-            });
 
             let obj_u = build_object_uniforms(draw, &extra_maps, ao_view.is_some(), neg_scale);
             let obj_ubo =
@@ -1634,7 +1768,7 @@ impl Scene3DRenderer {
 
             let obj_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("zc-render scene3d group1"),
-                layout: &bgl1,
+                layout: &self.mesh_obj_bgl,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1693,7 +1827,6 @@ impl Scene3DRenderer {
             prepared_meshes.push(PreparedMeshDraw {
                 key,
                 mesh: draw.mesh,
-                scene_bg,
                 obj_bg,
                 _obj_ubo: obj_ubo,
                 view_z,
@@ -1834,27 +1967,35 @@ impl Scene3DRenderer {
                     ],
                 });
 
-                // Sort Normal-blended particle instances back-to-front by view-space depth.
+                // Sort Normal-blended particle instances back-to-front using precomputed view-space depth.
                 let sorted_instances;
-                let upload_instances: &[ParticleInstance] =
+                let (upload_instances, avg_z): (&[ParticleInstance], f32) =
                     if pdraw.blend == ParticleBlend::Normal && pdraw.instances.len() > 1 {
-                        let mut v_inst = pdraw.instances.to_vec();
-                        v_inst.sort_by(|a, b| {
-                            let za = view_space_z(&input.camera.view, a.position);
-                            let zb = view_space_z(&input.camera.view, b.position);
-                            za.total_cmp(&zb)
-                        });
-                        sorted_instances = v_inst;
-                        &sorted_instances
+                        let mut z_sum = 0.0_f32;
+                        let mut indexed: Vec<(f32, usize)> = pdraw
+                            .instances
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, inst)| {
+                                let z = view_space_z(&input.camera.view, inst.position);
+                                z_sum += z;
+                                (z, idx)
+                            })
+                            .collect();
+                        indexed.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        sorted_instances = indexed
+                            .into_iter()
+                            .map(|(_, idx)| pdraw.instances[idx])
+                            .collect::<Vec<_>>();
+                        (&sorted_instances, z_sum / (pdraw.instances.len() as f32))
                     } else {
-                        pdraw.instances
+                        let z_sum: f32 = pdraw
+                            .instances
+                            .iter()
+                            .map(|inst| view_space_z(&input.camera.view, inst.position))
+                            .sum();
+                        (pdraw.instances, z_sum / (pdraw.instances.len() as f32))
                     };
-
-                let avg_z = upload_instances
-                    .iter()
-                    .map(|inst| view_space_z(&input.camera.view, inst.position))
-                    .sum::<f32>()
-                    / (upload_instances.len() as f32);
 
                 let max_buf = ctx.device.limits().max_buffer_size;
                 let max_instances = (max_buf / (size_of::<ParticleInstance>() as u64).max(1))
@@ -1934,19 +2075,24 @@ impl Scene3DRenderer {
             });
 
             // Draw opaque meshes first, then back-to-front sorted transparent meshes.
-            for idx in opaque_mesh_order
-                .iter()
-                .chain(transparent_mesh_order.iter())
-            {
-                let item = &prepared_meshes[*idx];
-                let pipeline = &self.mesh_pipelines[&item.key];
-                rpass.set_pipeline(pipeline);
-                rpass.set_bind_group(0, &item.scene_bg, &[]);
-                rpass.set_bind_group(1, &item.obj_bg, &[]);
-                rpass.set_vertex_buffer(0, item.mesh.vertex_buffer.slice(..));
-                rpass.set_vertex_buffer(1, item.mesh.color_buffer.slice(..));
-                rpass.set_index_buffer(item.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..item.mesh.index_count, 0, 0..1);
+            if let Some(ref bg0) = scene_bg {
+                rpass.set_bind_group(0, bg0, &[]);
+                for idx in opaque_mesh_order
+                    .iter()
+                    .chain(transparent_mesh_order.iter())
+                {
+                    let item = &prepared_meshes[*idx];
+                    let pipeline = &self.mesh_pipelines[&item.key];
+                    rpass.set_pipeline(pipeline);
+                    rpass.set_bind_group(1, &item.obj_bg, &[]);
+                    rpass.set_vertex_buffer(0, item.mesh.vertex_buffer.slice(..));
+                    rpass.set_vertex_buffer(1, item.mesh.color_buffer.slice(..));
+                    rpass.set_index_buffer(
+                        item.mesh.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    rpass.draw_indexed(0..item.mesh.index_count, 0, 0..1);
+                }
             }
 
             // Draw instanced camera-facing particles.
@@ -2820,7 +2966,7 @@ impl Scene3DRenderer {
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("zc-render scene3d mesh pipeline"),
-                layout: None,
+                layout: Some(&self.mesh_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &self.mesh_shader,
                     entry_point: Some("vs_main"),

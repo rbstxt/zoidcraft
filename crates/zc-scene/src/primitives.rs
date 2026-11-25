@@ -1498,41 +1498,364 @@ fn reconstruct_xy_contours(mesh: &MeshData) -> Vec<PreparedContour> {
     prepared
 }
 
-fn contour_u_candidates(contours: &[PreparedContour], pt: Vec2, scale: f32) -> Vec<f32> {
-    let mut best_d2 = f32::INFINITY;
-    let mut out = Vec::new();
-    let tie_eps = 1e-8_f32;
+const CONTOUR_TIE_EPS: f32 = 1e-8;
 
-    for contour in contours {
-        let len = contour.points.len();
-        for i in 0..len {
-            let a = contour.points[i];
-            let b = contour.points[(i + 1) % len];
-            let ab = b - a;
-            let len2 = ab.length_squared();
-            let t = if len2 > 0.0 {
-                ((pt - a).dot(ab) / len2).clamp(0.0, 1.0)
-            } else {
-                0.0
+struct ContourSegment {
+    a: Vec2,
+    ab: Vec2,
+    len2: f32,
+    len: f32,
+    arc_start: f32,
+    denom: f32,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+}
+
+#[inline]
+fn eval_contour_segment(seg: &ContourSegment, pt: Vec2) -> (f32, f32) {
+    let t = if seg.len2 > 0.0 {
+        ((pt - seg.a).dot(seg.ab) / seg.len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let proj = seg.a + seg.ab * t;
+    let d2 = pt.distance_squared(proj);
+    let arc = seg.arc_start + seg.len * t;
+    (d2, arc / seg.denom)
+}
+
+/// 2D uniform-grid spatial index over contour segments for O(T + S) exact nearest-segment queries.
+struct ContourSpatialIndex {
+    segments: Vec<ContourSegment>,
+    grid_min: Vec2,
+    cell_w: f32,
+    cell_h: f32,
+    safety_margin: f32,
+    nx: usize,
+    ny: usize,
+    cell_offsets: Vec<u32>,
+    cell_items: Vec<u32>,
+    visited_stamp: Vec<u32>,
+    stamp: u32,
+    candidates: Vec<(u32, f32, f32)>,
+}
+
+impl ContourSpatialIndex {
+    fn build(contours: &[PreparedContour], scale: f32) -> Self {
+        let total_segs: usize = contours.iter().map(|c| c.points.len()).sum();
+        let mut segments = Vec::with_capacity(total_segs);
+        let mut min_pt = Vec2::splat(f32::INFINITY);
+        let mut max_pt = Vec2::splat(f32::NEG_INFINITY);
+
+        for contour in contours {
+            let len = contour.points.len();
+            let denom = if scale > 0.0 { scale } else { contour.total };
+            for i in 0..len {
+                let a = contour.points[i];
+                let b = contour.points[(i + 1) % len];
+                let ab = b - a;
+                let len2 = ab.length_squared();
+                let seg_min_x = a.x.min(b.x);
+                let seg_min_y = a.y.min(b.y);
+                let seg_max_x = a.x.max(b.x);
+                let seg_max_y = a.y.max(b.y);
+                min_pt.x = min_pt.x.min(seg_min_x);
+                min_pt.y = min_pt.y.min(seg_min_y);
+                max_pt.x = max_pt.x.max(seg_max_x);
+                max_pt.y = max_pt.y.max(seg_max_y);
+                segments.push(ContourSegment {
+                    a,
+                    ab,
+                    len2,
+                    len: len2.sqrt(),
+                    arc_start: contour.cumulative[i],
+                    denom,
+                    min_x: seg_min_x,
+                    min_y: seg_min_y,
+                    max_x: seg_max_x,
+                    max_y: seg_max_y,
+                });
+            }
+        }
+
+        if segments.len() <= 16 {
+            return Self {
+                segments,
+                grid_min: Vec2::ZERO,
+                cell_w: 1.0,
+                cell_h: 1.0,
+                safety_margin: 0.0,
+                nx: 0,
+                ny: 0,
+                cell_offsets: Vec::new(),
+                cell_items: Vec::new(),
+                visited_stamp: Vec::new(),
+                stamp: 0,
+                candidates: Vec::new(),
             };
-            let proj = a + ab * t;
-            let d2 = pt.distance_squared(proj);
-            if d2 < best_d2 - tie_eps {
-                best_d2 = d2;
+        }
+
+        let span = (max_pt - min_pt).max(Vec2::splat(1e-5));
+        let pad = span.x.max(span.y) * 1e-4 + 1e-5;
+        let grid_min = min_pt - Vec2::splat(pad);
+        let grid_span = (max_pt + Vec2::splat(pad) - grid_min).max(Vec2::splat(1e-5));
+
+        let target_cells = (segments.len() as f32).clamp(16.0, 4096.0);
+        let approx_cell = ((grid_span.x * grid_span.y) / target_cells)
+            .sqrt()
+            .max(1e-5);
+        let nx = ((grid_span.x / approx_cell).ceil() as usize).clamp(1, 64);
+        let ny = ((grid_span.y / approx_cell).ceil() as usize).clamp(1, 64);
+        let cell_w = grid_span.x / nx as f32;
+        let cell_h = grid_span.y / ny as f32;
+        let safety_margin = grid_span.x.max(grid_span.y) * 1e-5;
+
+        let cell_count = nx * ny;
+        let mut counts = vec![0_u32; cell_count];
+
+        let cell_range = |seg: &ContourSegment| -> (usize, usize, usize, usize) {
+            let cx0 = (((seg.min_x - grid_min.x) / cell_w).floor() as isize)
+                .clamp(0, (nx - 1) as isize) as usize;
+            let cx1 = (((seg.max_x - grid_min.x) / cell_w).floor() as isize)
+                .clamp(0, (nx - 1) as isize) as usize;
+            let cy0 = (((seg.min_y - grid_min.y) / cell_h).floor() as isize)
+                .clamp(0, (ny - 1) as isize) as usize;
+            let cy1 = (((seg.max_y - grid_min.y) / cell_h).floor() as isize)
+                .clamp(0, (ny - 1) as isize) as usize;
+            (cx0, cx1, cy0, cy1)
+        };
+
+        for seg in &segments {
+            let (cx0, cx1, cy0, cy1) = cell_range(seg);
+            for cy in cy0..=cy1 {
+                let row = cy * nx;
+                for cx in cx0..=cx1 {
+                    counts[row + cx] += 1;
+                }
+            }
+        }
+
+        let mut cell_offsets = Vec::with_capacity(cell_count + 1);
+        let mut total_items = 0_u32;
+        cell_offsets.push(0);
+        for &c in &counts {
+            total_items += c;
+            cell_offsets.push(total_items);
+        }
+
+        let mut write_cursor = cell_offsets[..cell_count].to_vec();
+        let mut cell_items = vec![0_u32; total_items as usize];
+        for (seg_idx, seg) in segments.iter().enumerate() {
+            let (cx0, cx1, cy0, cy1) = cell_range(seg);
+            let id = seg_idx as u32;
+            for cy in cy0..=cy1 {
+                let row = cy * nx;
+                for cx in cx0..=cx1 {
+                    let cell = row + cx;
+                    let slot = write_cursor[cell] as usize;
+                    cell_items[slot] = id;
+                    write_cursor[cell] += 1;
+                }
+            }
+        }
+
+        Self {
+            visited_stamp: vec![0_u32; segments.len()],
+            segments,
+            grid_min,
+            cell_w,
+            cell_h,
+            safety_margin,
+            nx,
+            ny,
+            cell_offsets,
+            cell_items,
+            stamp: 0,
+            candidates: Vec::with_capacity(8),
+        }
+    }
+
+    fn query_u_candidates(&mut self, pt: Vec2, out: &mut Vec<f32>) {
+        out.clear();
+        if self.segments.is_empty() {
+            return;
+        }
+
+        if self.nx == 0 {
+            let mut best_d2 = f32::INFINITY;
+            for seg in &self.segments {
+                let (d2, u) = eval_contour_segment(seg, pt);
+                if d2 < best_d2 - CONTOUR_TIE_EPS {
+                    best_d2 = d2;
+                    out.clear();
+                } else if d2 > best_d2 + CONTOUR_TIE_EPS {
+                    continue;
+                }
+                out.push(u);
+            }
+            return;
+        }
+
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.visited_stamp.fill(0);
+            self.stamp = 1;
+        }
+        let stamp = self.stamp;
+        self.candidates.clear();
+
+        let qx = (((pt.x - self.grid_min.x) / self.cell_w).floor() as isize)
+            .clamp(0, (self.nx - 1) as isize) as usize;
+        let qy = (((pt.y - self.grid_min.y) / self.cell_h).floor() as isize)
+            .clamp(0, (self.ny - 1) as isize) as usize;
+        let max_r = qx.max(self.nx - 1 - qx).max(qy).max(self.ny - 1 - qy);
+
+        let mut best_d2 = f32::INFINITY;
+        let keep_eps = 2.0 * CONTOUR_TIE_EPS;
+
+        let visit_cell = |cx: usize,
+                          cy: usize,
+                          best_d2: &mut f32,
+                          visited_stamp: &mut [u32],
+                          candidates: &mut Vec<(u32, f32, f32)>| {
+            let cell = cy * self.nx + cx;
+            let start = self.cell_offsets[cell] as usize;
+            let end = self.cell_offsets[cell + 1] as usize;
+            for &seg_idx in &self.cell_items[start..end] {
+                let idx = seg_idx as usize;
+                if visited_stamp[idx] == stamp {
+                    continue;
+                }
+                visited_stamp[idx] = stamp;
+                let (d2, u) = eval_contour_segment(&self.segments[idx], pt);
+                if d2 < *best_d2 {
+                    *best_d2 = d2;
+                    let thresh = *best_d2 + keep_eps;
+                    candidates.retain(|c| c.1 <= thresh);
+                    candidates.push((seg_idx, d2, u));
+                } else if d2 <= *best_d2 + keep_eps {
+                    candidates.push((seg_idx, d2, u));
+                }
+            }
+        };
+
+        for r in 0..=max_r {
+            let x0 = qx.saturating_sub(r);
+            let x1 = (qx + r).min(self.nx - 1);
+            let y0 = qy.saturating_sub(r);
+            let y1 = (qy + r).min(self.ny - 1);
+
+            if r == 0 {
+                visit_cell(
+                    qx,
+                    qy,
+                    &mut best_d2,
+                    &mut self.visited_stamp,
+                    &mut self.candidates,
+                );
+            } else {
+                if qy >= r {
+                    let cy = qy - r;
+                    for cx in x0..=x1 {
+                        visit_cell(
+                            cx,
+                            cy,
+                            &mut best_d2,
+                            &mut self.visited_stamp,
+                            &mut self.candidates,
+                        );
+                    }
+                }
+                if qy + r < self.ny {
+                    let cy = qy + r;
+                    for cx in x0..=x1 {
+                        visit_cell(
+                            cx,
+                            cy,
+                            &mut best_d2,
+                            &mut self.visited_stamp,
+                            &mut self.candidates,
+                        );
+                    }
+                }
+                let inner_y0 = if qy >= r { y0 + 1 } else { y0 };
+                let inner_y1 = if qy + r < self.ny {
+                    y1.saturating_sub(1)
+                } else {
+                    y1
+                };
+                if inner_y0 <= inner_y1 {
+                    if qx >= r {
+                        let cx = qx - r;
+                        for cy in inner_y0..=inner_y1 {
+                            visit_cell(
+                                cx,
+                                cy,
+                                &mut best_d2,
+                                &mut self.visited_stamp,
+                                &mut self.candidates,
+                            );
+                        }
+                    }
+                    if qx + r < self.nx {
+                        let cx = qx + r;
+                        for cy in inner_y0..=inner_y1 {
+                            visit_cell(
+                                cx,
+                                cy,
+                                &mut best_d2,
+                                &mut self.visited_stamp,
+                                &mut self.candidates,
+                            );
+                        }
+                    }
+                }
+            }
+
+            if best_d2.is_finite() {
+                let mut min_out = f32::INFINITY;
+                if x0 > 0 {
+                    let edge_x = self.grid_min.x + x0 as f32 * self.cell_w;
+                    min_out = min_out.min((pt.x - edge_x).max(0.0));
+                }
+                if x1 + 1 < self.nx {
+                    let edge_x = self.grid_min.x + (x1 + 1) as f32 * self.cell_w;
+                    min_out = min_out.min((edge_x - pt.x).max(0.0));
+                }
+                if y0 > 0 {
+                    let edge_y = self.grid_min.y + y0 as f32 * self.cell_h;
+                    min_out = min_out.min((pt.y - edge_y).max(0.0));
+                }
+                if y1 + 1 < self.ny {
+                    let edge_y = self.grid_min.y + (y1 + 1) as f32 * self.cell_h;
+                    min_out = min_out.min((edge_y - pt.y).max(0.0));
+                }
+                if !min_out.is_finite() {
+                    break;
+                }
+                let safe_out = (min_out - self.safety_margin).max(0.0);
+                if safe_out * safe_out > best_d2 + keep_eps {
+                    break;
+                }
+            }
+        }
+
+        if self.candidates.len() > 1 {
+            self.candidates.sort_unstable_by_key(|c| c.0);
+        }
+        let mut ref_best = f32::INFINITY;
+        for &(_, d2, u) in &self.candidates {
+            if d2 < ref_best - CONTOUR_TIE_EPS {
+                ref_best = d2;
                 out.clear();
-            } else if d2 > best_d2 + tie_eps {
+            } else if d2 > ref_best + CONTOUR_TIE_EPS {
                 continue;
             }
-            let arc = contour.cumulative[i] + len2.sqrt() * t;
-            let u = if scale > 0.0 {
-                arc / scale
-            } else {
-                arc / contour.total
-            };
             out.push(u);
         }
     }
-    out
 }
 
 /// Material+ normalized UV layout matching Zoidium `plugins/material-plus/uv-layout.js`.
@@ -1572,6 +1895,9 @@ pub fn apply_normalized_uv_layout(mesh: &mut MeshData) {
     };
 
     if !contours.is_empty() {
+        let mut spatial_index = ContourSpatialIndex::build(&contours, scale);
+        let mut scratch_u: Vec<f32> = Vec::with_capacity(8);
+
         for tri in mesh.indices.as_chunks::<3>().0 {
             let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
             if i0 >= mesh.vertices.len() || i1 >= mesh.vertices.len() || i2 >= mesh.vertices.len() {
@@ -1594,10 +1920,8 @@ pub fn apply_normalized_uv_layout(mesh: &mut MeshData) {
                     (ps[0].x + ps[1].x + ps[2].x) / 3.0,
                     (ps[0].y + ps[1].y + ps[2].y) / 3.0,
                 );
-                contour_u_candidates(&contours, centroid, scale)
-                    .first()
-                    .copied()
-                    .unwrap_or(0.0)
+                spatial_index.query_u_candidates(centroid, &mut scratch_u);
+                scratch_u.first().copied().unwrap_or(0.0)
             };
 
             let base = out_verts.len() as u32;
@@ -1607,9 +1931,10 @@ pub fn apply_normalized_uv_layout(mesh: &mut MeshData) {
                 if is_cap {
                     v.uv = [(p.x - b_min.x) / scale, (p.y - b_min.y) / scale];
                 } else {
-                    let cands = contour_u_candidates(&contours, Vec2::new(p.x, p.y), scale);
-                    let best_u = cands
-                        .into_iter()
+                    spatial_index.query_u_candidates(Vec2::new(p.x, p.y), &mut scratch_u);
+                    let best_u = scratch_u
+                        .iter()
+                        .copied()
                         .min_by(|a, b| (a - anchor_u).abs().total_cmp(&(b - anchor_u).abs()))
                         .unwrap_or(anchor_u);
                     v.uv = [best_u, (p.z - b_min.z) / scale];
@@ -2081,5 +2406,101 @@ pub fn build_preset_model(preset_type: u32, lid_rotation_rad: f32) -> MeshData {
         1 => build_rifle_preset(),
         2 => build_mystery_box_preset(lid_rotation_rad),
         _ => build_box(10.0, 10.0, 10.0),
+    }
+}
+
+#[cfg(test)]
+mod uv_index_tests {
+    use super::*;
+
+    fn brute_force_u_candidates(contours: &[PreparedContour], pt: Vec2, scale: f32) -> Vec<f32> {
+        let mut best_d2 = f32::INFINITY;
+        let mut out = Vec::new();
+        for contour in contours {
+            let len = contour.points.len();
+            for i in 0..len {
+                let a = contour.points[i];
+                let b = contour.points[(i + 1) % len];
+                let ab = b - a;
+                let len2 = ab.length_squared();
+                let t = if len2 > 0.0 {
+                    ((pt - a).dot(ab) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let proj = a + ab * t;
+                let d2 = pt.distance_squared(proj);
+                if d2 < best_d2 - CONTOUR_TIE_EPS {
+                    best_d2 = d2;
+                    out.clear();
+                } else if d2 > best_d2 + CONTOUR_TIE_EPS {
+                    continue;
+                }
+                let arc = contour.cumulative[i] + len2.sqrt() * t;
+                let u = if scale > 0.0 {
+                    arc / scale
+                } else {
+                    arc / contour.total
+                };
+                out.push(u);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn contour_spatial_index_matches_brute_force_exactly() {
+        // Build two multi-segment circular contours (96 + 48 = 144 segments > 16 threshold)
+        // so the 2D uniform-grid expanding-ring search is exercised thoroughly.
+        let make_ring = |cx: f32, cy: f32, r: f32, n: usize| -> PreparedContour {
+            let mut points = Vec::with_capacity(n);
+            for i in 0..n {
+                let theta = TAU * (i as f32) / (n as f32);
+                points.push(Vec2::new(cx + r * theta.cos(), cy + r * theta.sin()));
+            }
+            let mut cumulative = Vec::with_capacity(n + 1);
+            cumulative.push(0.0);
+            let mut total = 0.0;
+            for i in 0..n {
+                total += points[i].distance(points[(i + 1) % n]);
+                cumulative.push(total);
+            }
+            PreparedContour {
+                points,
+                cumulative,
+                total,
+            }
+        };
+
+        let contours = vec![make_ring(0.0, 0.0, 10.0, 96), make_ring(2.5, -1.5, 3.0, 48)];
+        let scale = 20.0_f32;
+        let mut index = ContourSpatialIndex::build(&contours, scale);
+        assert!(index.nx > 0 && index.ny > 0, "expected uniform grid path");
+
+        let mut scratch = Vec::new();
+        let mut queries = Vec::new();
+        // Exact contour vertices (guaranteed 2-segment ties), midpoints, beveled offsets, and out-of-bounds points.
+        for c in &contours {
+            for i in 0..c.points.len() {
+                let a = c.points[i];
+                let b = c.points[(i + 1) % c.points.len()];
+                queries.push(a);
+                queries.push((a + b) * 0.5);
+                let perp = Vec2::new(-(b.y - a.y), b.x - a.x).normalize_or_zero();
+                queries.push((a + b) * 0.5 + perp * 0.45);
+            }
+        }
+        queries.push(Vec2::new(-25.0, -25.0));
+        queries.push(Vec2::new(30.0, 18.0));
+        queries.push(Vec2::new(0.0, 0.0));
+
+        for pt in queries {
+            index.query_u_candidates(pt, &mut scratch);
+            let expected = brute_force_u_candidates(&contours, pt, scale);
+            assert_eq!(
+                scratch, expected,
+                "spatial index diverged from brute-force at query point {pt:?}"
+            );
+        }
     }
 }

@@ -567,6 +567,16 @@ pub struct PanelsState {
     font_picker_search: String,
     shader_editor_just_opened: bool,
     debug_copied_notice: Option<String>,
+    /// Cached asset reference counts keyed by `session.revision()`.
+    cached_asset_usage: Option<(u64, std::sync::Arc<BTreeMap<String, usize>>)>,
+    /// Bounded cache of compiled expressions keyed by `(expressions_plus, trimmed_source)`.
+    cached_compiled_exprs:
+        BTreeMap<(bool, String), Result<std::sync::Arc<zc_expr::CompiledExpr>, String>>,
+    /// Cached sequence control values for expression evaluation keyed by `session.revision()`.
+    cached_expr_controls: Option<(u64, BTreeMap<String, zc_expr::Value>)>,
+    /// Cached selected clip snapshot keyed by `(session.revision(), clip_id)` so Objects/Effects/Edit
+    /// tabs avoid deep-cloning `SessionClip` twice per 60Hz frame when the document hasn't changed.
+    cached_selected_clip: Option<(u64, String, std::sync::Arc<SessionClip>)>,
 }
 
 impl Default for PanelsState {
@@ -644,6 +654,10 @@ impl Default for PanelsState {
             font_picker_search: String::new(),
             shader_editor_just_opened: false,
             debug_copied_notice: None,
+            cached_asset_usage: None,
+            cached_compiled_exprs: BTreeMap::new(),
+            cached_expr_controls: None,
+            cached_selected_clip: None,
         }
     }
 }
@@ -702,6 +716,68 @@ fn begin_inspector_tx(
         true
     } else {
         false
+    }
+}
+
+/// Tracks continuous egui widget drag / color-picker edit lifecycles so sliders, DragValues,
+/// and color editors group 60Hz edits into a single undo transaction via `PanelsState`.
+#[derive(Debug, Default, Clone, Copy)]
+struct WidgetTxTracker {
+    drag_started: bool,
+    drag_stopped: bool,
+    changed: bool,
+}
+
+impl WidgetTxTracker {
+    fn observe(&mut self, resp: &egui::Response) -> bool {
+        if resp.drag_started() {
+            self.drag_started = true;
+        }
+        if resp.drag_stopped() {
+            self.drag_stopped = true;
+        }
+        if resp.changed() {
+            self.changed = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_widget_tx_command(
+    ui: &Ui,
+    session: &mut Session,
+    state: &mut PanelsState,
+    target_id: &str,
+    owner_key: &str,
+    label: &str,
+    tracker: WidgetTxTracker,
+    execute_cmd: impl FnOnce(&mut Session),
+) {
+    touch_inspector_tx_owner(state, target_id, owner_key);
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+    let mut owns_tx = owns_inspector_tx(state, target_id, owner_key);
+    if tracker.drag_started || (tracker.changed && !owns_tx && primary_down) {
+        close_existing_tx_before_start(session, state);
+        owns_tx = begin_inspector_tx(session, state, target_id, owner_key, label);
+    }
+    if tracker.changed {
+        execute_cmd(session);
+        if owns_tx {
+            state.inspector_tx_has_edits = true;
+        }
+    }
+    if owns_tx && (tracker.drag_stopped || !primary_down) {
+        if session.history.is_in_transaction() {
+            if state.inspector_tx_has_edits {
+                let _ = session.commit_transaction(true);
+            } else {
+                let _ = session.cancel_transaction();
+            }
+        }
+        clear_inspector_tx_state(state);
     }
 }
 
@@ -2420,8 +2496,11 @@ fn show_sequence_tab(
                         .rect_filled(gap_div, CornerRadius::ZERO, BORDER_ROW_SOFT);
 
                     // Multisample motion blur (compact dropdown "off"/"on", NO stopwatch)
-                    let mb_prop = lookup_session_prop(session, "sequence", "motionBlur.enabled");
-                    let mut mb_idx = eval_prop_u32(mb_prop.as_ref(), frame, 0) as usize;
+                    let mut mb_idx = eval_prop_u32(
+                        lookup_session_prop_ref(session, "sequence", "motionBlur.enabled"),
+                        frame,
+                        0,
+                    ) as usize;
                     let mb_changed = cm3_property_row_aligned(
                         ui,
                         "Multisample motion blur",
@@ -2541,7 +2620,7 @@ fn show_edit_tab(
         return;
     };
 
-    let Some(clip_snapshot) = find_clip_clone(session, &clip_id) else {
+    let Some(clip_snapshot) = find_clip_cached(session, state, &clip_id) else {
         empty_panel_message(ui, "select a clip", theme);
         return;
     };
@@ -3881,7 +3960,8 @@ fn show_objects_tab(
         empty_panel_message(ui, "Select a clip to edit its objects", theme);
         return;
     };
-    let Some(clip) = find_clip_clone(session, &clip_id) else {
+    let rev_before = session.revision();
+    let Some(clip) = find_clip_cached(session, state, &clip_id) else {
         state.add_object_open = false;
         empty_panel_message(ui, "Select a clip to edit its objects", theme);
         return;
@@ -4414,9 +4494,13 @@ fn show_objects_tab(
     );
     // Crisp single 1px #333333 border around top pane (layout.rs paints the focus accent only when SideInspector is focused)
     paint_crisp_panel_border(ui.painter(), top_rect, BORDER_PANEL);
-    // Re-read clip snapshot after pane 0 mutations (AddObject3D, duplicate, reorder, rename)
-    // so the inspector immediately reflects newly created/selected objects without flashing empty.
-    let clip_for_inspector = find_clip_clone(session, &clip_id).unwrap_or(clip);
+    // Only re-fetch clip snapshot if pane 0 actually mutated the session (avoids a second full
+    // clip clone on every 60Hz frame).
+    let clip_for_inspector = if session.revision() != rev_before {
+        find_clip_cached(session, state, &clip_id).unwrap_or(clip)
+    } else {
+        clip
+    };
     show_split_pane(
         ui,
         Id::unique("objects_40_60_split_p1"),
@@ -4953,7 +5037,7 @@ fn show_object_inspector(
                     actions,
                 );
                 let lkind = eval_prop_u32(
-                    lookup_session_prop(session, &obj.id, "light.kind").as_ref(),
+                    lookup_session_prop_ref(session, &obj.id, "light.kind"),
                     local_frame,
                     default_lkind,
                 );
@@ -5166,13 +5250,13 @@ fn show_object_inspector(
                         actions,
                     );
                     let casts = eval_prop_u32(
-                        lookup_session_prop(session, &obj.id, "castShadow").as_ref(),
+                        lookup_session_prop_ref(session, &obj.id, "castShadow"),
                         local_frame,
                         0,
                     ) != 0;
                     if casts {
                         let cur_sz = eval_prop_u32(
-                            lookup_session_prop(session, &obj.id, "shadowMapSize").as_ref(),
+                            lookup_session_prop_ref(session, &obj.id, "shadowMapSize"),
                             local_frame,
                             1024,
                         );
@@ -5334,12 +5418,12 @@ fn show_object_inspector(
                 // Combined non-animated Size ([height, thickness], default [20, 3], 0 decimals)
                 touch_inspector_tx_owner(state, &obj.id, "text3d_size");
                 let h_val = eval_prop_f64(
-                    lookup_session_prop(session, &obj.id, "height").as_ref(),
+                    lookup_session_prop_ref(session, &obj.id, "height"),
                     local_frame,
                     20.0,
                 );
                 let t_val = eval_prop_f64(
-                    lookup_session_prop(session, &obj.id, "thickness").as_ref(),
+                    lookup_session_prop_ref(session, &obj.id, "thickness"),
                     local_frame,
                     3.0,
                 );
@@ -5375,7 +5459,7 @@ fn show_object_inspector(
                 // Detail (non-animated scalar, default 5)
                 touch_inspector_tx_owner(state, &obj.id, "detail");
                 let mut detail_val = eval_prop_f64(
-                    lookup_session_prop(session, &obj.id, "detail").as_ref(),
+                    lookup_session_prop_ref(session, &obj.id, "detail"),
                     local_frame,
                     5.0,
                 );
@@ -5426,19 +5510,19 @@ fn show_object_inspector(
                     actions,
                 );
                 let bevel_on = eval_prop_u32(
-                    lookup_session_prop(session, &obj.id, "bevelEnabled").as_ref(),
+                    lookup_session_prop_ref(session, &obj.id, "bevelEnabled"),
                     local_frame,
                     0,
                 ) != 0;
                 if bevel_on {
                     touch_inspector_tx_owner(state, &obj.id, "text3d_bevel_size");
                     let bt = eval_prop_f64(
-                        lookup_session_prop(session, &obj.id, "bevelThickness").as_ref(),
+                        lookup_session_prop_ref(session, &obj.id, "bevelThickness"),
                         local_frame,
                         0.1,
                     );
                     let bs = eval_prop_f64(
-                        lookup_session_prop(session, &obj.id, "bevelSize").as_ref(),
+                        lookup_session_prop_ref(session, &obj.id, "bevelSize"),
                         local_frame,
                         0.5,
                     );
@@ -5694,12 +5778,12 @@ fn show_constraint_target_rows(
 
     // Track to target dropdown
     let track_enabled = eval_prop_u32(
-        lookup_session_prop(session, obj_id, "constraint.trackTo.enabled").as_ref(),
+        lookup_session_prop_ref(session, obj_id, "constraint.trackTo.enabled"),
         local_frame,
         0,
     ) != 0;
     let track_target = eval_prop_str(
-        lookup_session_prop(session, obj_id, "constraint.trackTo.targetId").as_ref(),
+        lookup_session_prop_ref(session, obj_id, "constraint.trackTo.targetId"),
         local_frame,
         "",
     );
@@ -5811,12 +5895,12 @@ fn show_constraint_target_rows(
 
     // Follow target dropdown
     let follow_enabled = eval_prop_u32(
-        lookup_session_prop(session, obj_id, "constraint.follow.enabled").as_ref(),
+        lookup_session_prop_ref(session, obj_id, "constraint.follow.enabled"),
         local_frame,
         0,
     ) != 0;
     let follow_target = eval_prop_str(
-        lookup_session_prop(session, obj_id, "constraint.follow.targetId").as_ref(),
+        lookup_session_prop_ref(session, obj_id, "constraint.follow.targetId"),
         local_frame,
         "",
     );
@@ -6191,11 +6275,12 @@ fn discover_system_fonts_in_dirs(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Discovers installed `.ttf` / `.otf` / `.ttc` system fonts once per process (sorted, deduplicated).
-fn installed_system_fonts() -> &'static [(String, std::path::PathBuf)] {
+/// Discovers installed `.ttf` / `.otf` / `.ttc` system fonts once per process (sorted, deduplicated),
+/// with precomputed ASCII-lowercased display names for zero-allocation filtering.
+fn installed_system_fonts() -> &'static [(String, String, std::path::PathBuf)] {
     use std::path::PathBuf;
     use std::sync::OnceLock;
-    static CACHE: OnceLock<Vec<(String, PathBuf)>> = OnceLock::new();
+    static CACHE: OnceLock<Vec<(String, String, PathBuf)>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let mut dirs: Vec<PathBuf> = Vec::new();
         #[cfg(target_os = "macos")]
@@ -6228,21 +6313,83 @@ fn installed_system_fonts() -> &'static [(String, std::path::PathBuf)] {
         }
 
         discover_system_fonts_in_dirs(dirs)
+            .into_iter()
+            .map(|(display, path)| {
+                let lower = display.to_ascii_lowercase();
+                (display, lower, path)
+            })
+            .collect()
     })
 }
 
+const BUILTIN_FONT_CHOICES: [(&str, &str, &str); 3] = [
+    ("Geist-Regular.ttf", "Geist Regular", "geist regular"),
+    ("GeistMono-Regular.ttf", "Geist Mono", "geist mono"),
+    (
+        "SourceCodePro-Regular.ttf",
+        "Source Code Pro",
+        "source code pro",
+    ),
+];
+
 enum FontChoice {
-    Builtin(String, String),
-    ProjectAsset(String, String),
-    SystemFont(String, std::path::PathBuf),
+    Builtin(&'static str, &'static str, &'static str),
+    ProjectAsset(String, String, String),
+    SystemFont(&'static str, &'static str, &'static std::path::Path),
 }
 
 impl FontChoice {
     fn label(&self) -> &str {
         match self {
-            Self::Builtin(_, l) | Self::ProjectAsset(_, l) | Self::SystemFont(l, _) => l.as_str(),
+            Self::Builtin(_, l, _) => l,
+            Self::ProjectAsset(_, l, _) => l.as_str(),
+            Self::SystemFont(l, _, _) => l,
         }
     }
+
+    fn lower_label(&self) -> &str {
+        match self {
+            Self::Builtin(_, _, low) => low,
+            Self::ProjectAsset(_, _, low) => low.as_str(),
+            Self::SystemFont(_, low, _) => low,
+        }
+    }
+}
+
+fn is_font_asset_filename(filename: &str) -> bool {
+    let bytes = filename.as_bytes();
+    let ends_ci = |ext: &[u8]| {
+        bytes.len() >= ext.len() && bytes[bytes.len() - ext.len()..].eq_ignore_ascii_case(ext)
+    };
+    ends_ci(b".ttf") || ends_ci(b".otf") || ends_ci(b".ttc") || ends_ci(b".woff")
+}
+
+/// Resolves the active font display label without allocating a `Vec<FontChoice>` when the
+/// font selector dropdown is closed.
+fn resolve_current_font_display_label(session: &Session, cur_font: &str) -> String {
+    for &(key, label, _) in &BUILTIN_FONT_CHOICES {
+        if key.eq_ignore_ascii_case(cur_font) {
+            return label.to_owned();
+        }
+    }
+    for asset in session.project.assets.values() {
+        if !is_font_asset_filename(&asset.filename) {
+            continue;
+        }
+        let stem = std::path::Path::new(&asset.filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&asset.filename);
+        if asset.id == cur_font || stem.eq_ignore_ascii_case(cur_font) {
+            return stem.to_owned();
+        }
+    }
+    for (display, _, path) in installed_system_fonts() {
+        if display.eq_ignore_ascii_case(cur_font) || path.to_str().is_some_and(|p| p == cur_font) {
+            return display.clone();
+        }
+    }
+    "Geist Regular".to_owned()
 }
 
 /// Shared Font selector for both `Text3D` and `Text2D` (bundled OFL fonts + project font assets
@@ -6260,67 +6407,12 @@ fn show_font_selector_row(
     actions: &mut Vec<PanelAction>,
 ) {
     let cur_font = eval_prop_str(
-        lookup_session_prop(session, target_id, "font").as_ref(),
+        lookup_session_prop_ref(session, target_id, "font"),
         local_frame,
         "Geist-Regular.ttf",
     );
+    let current_label = resolve_current_font_display_label(session, &cur_font);
 
-    let mut choices: Vec<FontChoice> = vec![
-        FontChoice::Builtin("Geist-Regular.ttf".to_owned(), "Geist Regular".to_owned()),
-        FontChoice::Builtin("GeistMono-Regular.ttf".to_owned(), "Geist Mono".to_owned()),
-        FontChoice::Builtin(
-            "SourceCodePro-Regular.ttf".to_owned(),
-            "Source Code Pro".to_owned(),
-        ),
-    ];
-
-    let mut project_fonts: Vec<(String, String)> = session
-        .project
-        .assets
-        .values()
-        .filter(|asset| {
-            let lower = asset.filename.to_ascii_lowercase();
-            lower.ends_with(".ttf")
-                || lower.ends_with(".otf")
-                || lower.ends_with(".ttc")
-                || lower.ends_with(".woff")
-        })
-        .map(|asset| (asset.id.clone(), asset.filename.clone()))
-        .collect();
-    project_fonts.sort_by(|a, b| a.1.cmp(&b.1));
-
-    let mut project_stems: BTreeSet<String> = BTreeSet::new();
-    for (aid, fname) in project_fonts {
-        let stem = std::path::Path::new(&fname)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&fname)
-            .to_owned();
-        project_stems.insert(stem.to_ascii_lowercase());
-        choices.push(FontChoice::ProjectAsset(aid, stem));
-    }
-
-    for (display, path) in installed_system_fonts() {
-        if !project_stems.contains(&display.to_ascii_lowercase()) {
-            choices.push(FontChoice::SystemFont(display.clone(), path.clone()));
-        }
-    }
-
-    let font_labels: Vec<&str> = choices.iter().map(FontChoice::label).collect();
-    let mut font_idx = choices
-        .iter()
-        .position(|c| match c {
-            FontChoice::Builtin(k, _) => k.eq_ignore_ascii_case(&cur_font),
-            FontChoice::ProjectAsset(aid, lbl) => {
-                aid == &cur_font || lbl.eq_ignore_ascii_case(&cur_font)
-            }
-            FontChoice::SystemFont(lbl, path) => {
-                lbl.eq_ignore_ascii_case(&cur_font) || path.to_str().is_some_and(|p| p == cur_font)
-            }
-        })
-        .unwrap_or(0);
-
-    let mut font_changed = false;
     let popup_id = Id::unique((target_id, id_salt, "font_search_popup"));
     let search_id = popup_id.with("search_input");
     let mut popup_open = ui
@@ -6361,10 +6453,6 @@ fn show_font_selector_row(
                         BORDER_CONTROL
                     },
                 );
-                let current_label = font_labels
-                    .get(font_idx)
-                    .copied()
-                    .unwrap_or("Geist Regular");
                 let text_clip = Rect::from_min_max(
                     btn_rect.left_top(),
                     Pos2::new(
@@ -6375,7 +6463,7 @@ fn show_font_selector_row(
                 ui.painter().with_clip_rect(text_clip).text(
                     Pos2::new(btn_rect.left() + 5.0, btn_rect.center().y),
                     Align2::LEFT_CENTER,
-                    current_label,
+                    &current_label,
                     theme.font(FONT_SMALL),
                     theme.value(),
                 );
@@ -6416,7 +6504,61 @@ fn show_font_selector_row(
     if just_opened_popup {
         state.font_picker_search.clear();
     }
+
+    let mut chosen_font: Option<FontChoice> = None;
     if popup_open {
+        let sys_fonts = installed_system_fonts();
+        let mut choices: Vec<FontChoice> = Vec::with_capacity(3 + sys_fonts.len());
+        for &(key, label, lower) in &BUILTIN_FONT_CHOICES {
+            choices.push(FontChoice::Builtin(key, label, lower));
+        }
+
+        let mut project_fonts: Vec<(String, String)> = session
+            .project
+            .assets
+            .values()
+            .filter(|asset| is_font_asset_filename(&asset.filename))
+            .map(|asset| (asset.id.clone(), asset.filename.clone()))
+            .collect();
+        project_fonts.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let mut project_stems: BTreeSet<String> = BTreeSet::new();
+        for (aid, fname) in project_fonts {
+            let stem = std::path::Path::new(&fname)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&fname)
+                .to_owned();
+            let stem_lower = stem.to_ascii_lowercase();
+            project_stems.insert(stem_lower.clone());
+            choices.push(FontChoice::ProjectAsset(aid, stem, stem_lower));
+        }
+
+        for (display, display_lower, path) in sys_fonts {
+            if project_stems.is_empty() || !project_stems.contains(display_lower.as_str()) {
+                choices.push(FontChoice::SystemFont(
+                    display.as_str(),
+                    display_lower.as_str(),
+                    path.as_path(),
+                ));
+            }
+        }
+
+        let mut font_idx = choices
+            .iter()
+            .position(|c| match c {
+                FontChoice::Builtin(k, _, _) => k.eq_ignore_ascii_case(&cur_font),
+                FontChoice::ProjectAsset(aid, lbl, _) => {
+                    aid == &cur_font || lbl.eq_ignore_ascii_case(&cur_font)
+                }
+                FontChoice::SystemFont(lbl, _, path) => {
+                    lbl.eq_ignore_ascii_case(&cur_font)
+                        || path.to_str().is_some_and(|p| p == cur_font)
+                }
+            })
+            .unwrap_or(0);
+        let mut font_changed = false;
+
         let popup_w = 290.0_f32
             .max(btn_rect_saved.width())
             .min((viewport_rect.width() - 16.0).max(180.0));
@@ -6466,24 +6608,36 @@ fn show_font_selector_row(
                         }
                         ui.add_space(4.0);
                         let q = state.font_picker_search.trim().to_ascii_lowercase();
-                        let mut first_match: Option<usize> = None;
-                        ScrollArea::vertical()
+                        let filtered: Vec<usize> = if q.is_empty() {
+                            (0..choices.len()).collect()
+                        } else {
+                            choices
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| c.lower_label().contains(&q))
+                                .map(|(idx, _)| idx)
+                                .collect()
+                        };
+                        let first_match = filtered.first().copied();
+                        let scroll = ScrollArea::vertical()
                             .id_salt((popup_id, "list"))
                             .min_scrolled_height(list_h)
                             .max_height(list_h)
                             .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
+                            .auto_shrink([false, false]);
+                        if filtered.is_empty() {
+                            scroll.show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("No matching fonts")
+                                        .font(theme.font(FONT_SMALL))
+                                        .color(TEXT_FAINT),
+                                );
+                            });
+                        } else {
+                            scroll.show_rows(ui, 24.0, filtered.len(), |ui, row_range| {
                                 ui.spacing_mut().item_spacing.y = 1.0;
-                                let mut any = false;
-                                for (idx, lbl) in font_labels.iter().enumerate() {
-                                    if !q.is_empty() && !lbl.to_ascii_lowercase().contains(&q) {
-                                        continue;
-                                    }
-                                    if first_match.is_none() {
-                                        first_match = Some(idx);
-                                    }
-                                    any = true;
+                                for &idx in &filtered[row_range] {
+                                    let lbl = choices[idx].label();
                                     let is_sel = idx == font_idx;
                                     let (row_rect, row_resp) = ui.allocate_exact_size(
                                         Vec2::new(ui.available_width(), 24.0),
@@ -6509,7 +6663,7 @@ fn show_font_selector_row(
                                         .text(
                                             Pos2::new(row_rect.left() + 6.0, row_rect.center().y),
                                             Align2::LEFT_CENTER,
-                                            *lbl,
+                                            lbl,
                                             theme.font(FONT_SMALL),
                                             if is_sel { TEXT_BRIGHT } else { TEXT_PRIMARY },
                                         );
@@ -6519,14 +6673,8 @@ fn show_font_selector_row(
                                         close_now = true;
                                     }
                                 }
-                                if !any {
-                                    ui.label(
-                                        egui::RichText::new("No matching fonts")
-                                            .font(theme.font(FONT_SMALL))
-                                            .color(TEXT_FAINT),
-                                    );
-                                }
                             });
+                        }
                         if ui.input(|i| i.key_pressed(Key::Enter))
                             && let Some(idx) = first_match
                         {
@@ -6563,14 +6711,17 @@ fn show_font_selector_row(
         if close_now || clicked_outside {
             popup_open = false;
         }
+        if font_changed && font_idx < choices.len() {
+            chosen_font = Some(choices.swap_remove(font_idx));
+        }
     }
     ui.data_mut(|d| d.insert_temp(popup_id, popup_open));
 
-    if font_changed && let Some(choice) = choices.get(font_idx) {
+    if let Some(choice) = chosen_font {
         let resolved_value: Option<String> = match choice {
-            FontChoice::Builtin(key, _) => Some(key.clone()),
-            FontChoice::ProjectAsset(aid, _) => Some(aid.clone()),
-            FontChoice::SystemFont(display, path) => {
+            FontChoice::Builtin(key, _, _) => Some(key.to_owned()),
+            FontChoice::ProjectAsset(aid, _, _) => Some(aid),
+            FontChoice::SystemFont(display, _, path) => {
                 // Embed the selected OS system font into `session.project.assets` so the
                 // project renders cleanly and stays portable across `.zcraft` / `.pz` export.
                 match std::fs::read(path) {
@@ -6578,7 +6729,7 @@ fn show_font_selector_row(
                         let filename = path
                             .file_name()
                             .and_then(|n| n.to_str())
-                            .unwrap_or(display.as_str())
+                            .unwrap_or(display)
                             .to_owned();
                         let existing_id = session
                             .project
@@ -6634,8 +6785,11 @@ fn show_session_asset_prop(
     theme: &Cm3Theme,
     actions: &mut Vec<PanelAction>,
 ) {
-    let prop_opt = lookup_session_prop(session, target_id, key);
-    let cur_id = eval_prop_str(prop_opt.as_ref(), local_frame, "");
+    let cur_id = eval_prop_str(
+        lookup_session_prop_ref(session, target_id, key),
+        local_frame,
+        "",
+    );
 
     let mut assets: Vec<(String, String)> = session
         .project
@@ -6805,7 +6959,8 @@ fn show_effects_tab(
         empty_panel_message(ui, "select a clip", theme);
         return;
     };
-    let Some(clip) = find_clip_clone(session, &clip_id) else {
+    let rev_before = session.revision();
+    let Some(clip) = find_clip_cached(session, state, &clip_id) else {
         empty_panel_message(ui, "select a clip", theme);
         return;
     };
@@ -7465,9 +7620,13 @@ fn show_effects_tab(
     );
     // Crisp single 1px #333333 border around top pane (layout.rs paints the focus accent only when SideInspector is focused)
     paint_crisp_panel_border(ui.painter(), top_rect, BORDER_PANEL);
-    // Re-read clip snapshot after pane 0 mutations (AddEffect, duplicate, reorder, rename)
-    // so the inspector reflects the newly selected effect immediately.
-    let clip_for_inspector = find_clip_clone(session, &clip_id).unwrap_or(clip);
+    // Only re-fetch clip snapshot if pane 0 actually mutated the session (avoids a second full
+    // clip clone on every 60Hz frame).
+    let clip_for_inspector = if session.revision() != rev_before {
+        find_clip_cached(session, state, &clip_id).unwrap_or(clip)
+    } else {
+        clip
+    };
     show_split_pane(
         ui,
         Id::unique("effects_40_60_split_p1"),
@@ -9616,8 +9775,11 @@ fn render_template_param(
             );
         }
         PropertyValue::List(def) if key == "blending" => {
-            let prop_opt = lookup_session_prop(session, target_id, key);
-            let cur = eval_prop_str(prop_opt.as_ref(), local_frame, def);
+            let cur = eval_prop_str(
+                lookup_session_prop_ref(session, target_id, key),
+                local_frame,
+                def,
+            );
             let mut idx = BlendMode::ALL
                 .iter()
                 .position(|b| b.token() == cur)
@@ -9652,11 +9814,15 @@ fn render_template_param(
         }
         PropertyValue::Gradient(def) => {
             touch_inspector_tx_owner(state, target_id, key);
-            let prop_opt = lookup_session_prop(session, target_id, key);
-            let animated = prop_opt.as_ref().is_some_and(|p| p.animated);
-            let mut stops = eval_prop_value(prop_opt.as_ref(), local_frame)
-                .and_then(|v| serde_json::from_value::<Vec<GradientStop>>(v).ok())
-                .unwrap_or_else(|| def.clone());
+            let (animated, mut stops) = {
+                let prop_opt = lookup_session_prop_ref(session, target_id, key);
+                (
+                    prop_opt.is_some_and(|p| p.animated),
+                    eval_prop_value(prop_opt, local_frame)
+                        .and_then(|v| serde_json::from_value::<Vec<GradientStop>>(v).ok())
+                        .unwrap_or_else(|| def.clone()),
+                )
+            };
             let ev = panel_property_row(
                 ui,
                 lbl,
@@ -9698,7 +9864,7 @@ fn render_template_param(
                                 property: key.to_owned(),
                                 frame: resolve_kf_write_frame(
                                     session,
-                                    prop_opt.as_ref(),
+                                    lookup_session_prop_ref(session, target_id, key),
                                     local_frame,
                                 ),
                                 value: v,
@@ -9758,9 +9924,11 @@ fn render_template_param(
         }
         PropertyValue::Asset(def) => {
             let is_lut = key == "lut";
-            let prop_opt = lookup_session_prop(session, target_id, key);
-            let cur_id =
-                eval_prop_str(prop_opt.as_ref(), local_frame, def.as_deref().unwrap_or(""));
+            let cur_id = eval_prop_str(
+                lookup_session_prop_ref(session, target_id, key),
+                local_frame,
+                def.as_deref().unwrap_or(""),
+            );
 
             // Build sorted project asset list for dropdown selection
             let mut assets: Vec<(String, String)> = session
@@ -9901,8 +10069,10 @@ fn render_template_param(
                 |ui| cm3_prop_button(ui, btn_label, ButtonVariant::Primary, true, theme).clicked(),
             );
             if clicked {
-                let cur_val = lookup_session_prop(session, target_id, key)
-                    .and_then(|p| eval_prop_value(Some(&p), local_frame));
+                let cur_val = eval_prop_value(
+                    lookup_session_prop_ref(session, target_id, key),
+                    local_frame,
+                );
                 match effect_kind {
                     "nodeeffect" => {
                         state.node_graph_editor.open_for_target(
@@ -10150,8 +10320,11 @@ fn render_custom_shader_uniform(
             ui.set_max_width((ui.available_width() - 24.0).max(80.0));
             if is_sampler2d {
                 let default_asset = val.as_str().unwrap_or("");
-                let prop = lookup_session_prop(session, target_id, key);
-                let cur_asset = eval_prop_str(prop.as_ref(), local_frame, default_asset);
+                let cur_asset = eval_prop_str(
+                    lookup_session_prop_ref(session, target_id, key),
+                    local_frame,
+                    default_asset,
+                );
                 let (asset_labels, asset_ids, mut sel_idx) =
                     collect_shader_image_asset_choices(session, &cur_asset);
                 let label_refs: Vec<&str> = asset_labels.iter().map(String::as_str).collect();
@@ -10187,13 +10360,15 @@ fn render_custom_shader_uniform(
                     Value::Number(n) => n.as_f64().unwrap_or(0.0) >= 0.5,
                     _ => false,
                 };
-                let prop = lookup_session_prop(session, target_id, key);
-                let cur_bool =
-                    eval_prop_value(prop.as_ref(), local_frame).map_or(default_bool, |v| {
-                        v.as_bool()
-                            .or_else(|| v.as_f64().map(|f| f >= 0.5))
-                            .unwrap_or(default_bool)
-                    });
+                let cur_bool = eval_prop_value(
+                    lookup_session_prop_ref(session, target_id, key),
+                    local_frame,
+                )
+                .map_or(default_bool, |v| {
+                    v.as_bool()
+                        .or_else(|| v.as_f64().map(|f| f >= 0.5))
+                        .unwrap_or(default_bool)
+                });
                 let mut idx = usize::from(cur_bool);
                 let changed = panel_property_row(
                     ui,
@@ -12466,7 +12641,7 @@ fn show_assets_tab(
 
             let q = state.assets_filter.trim().to_ascii_lowercase();
 
-            let asset_usage = compute_asset_usage_counts(session);
+            let asset_usage = compute_asset_usage_counts_cached(session, state);
             let unused_asset_count = session
                 .project
                 .assets
@@ -15369,7 +15544,7 @@ fn show_inspector_floating_windows(
                 for ((fx_id, prop_key), &kind_idx) in &state.shader_prop_kinds {
                     if fx_id == &editor.effect_id && kind_idx == 9 {
                         let v = eval_prop_u32(
-                            lookup_session_prop(session, &editor.effect_id, prop_key).as_ref(),
+                            lookup_session_prop_ref(session, &editor.effect_id, prop_key),
                             session.playback.current_frame,
                             0,
                         );
@@ -15447,8 +15622,9 @@ fn show_inspector_floating_windows(
             let mut commit_expr = false;
             let mut clear_expr = false;
             let mut close_expr = false;
-            let live_diag = evaluate_expression_live_preview(
+            let live_diag = evaluate_expression_live_preview_cached(
                 session,
+                state,
                 &expr.target_id,
                 &expr.property,
                 &expr.code,
@@ -15675,7 +15851,7 @@ fn target_exists_in_session(session: &Session, target_id: &str) -> bool {
 // Shared Property Binding Helpers (Stopwatch + Keyframe Bar + Session Execute)
 // ---------------------------------------------------------------------------
 
-fn find_clip_clone(session: &Session, clip_id: &str) -> Option<SessionClip> {
+fn find_clip_ref<'a>(session: &'a Session, clip_id: &str) -> Option<&'a SessionClip> {
     for track in session
         .document()
         .video_tracks
@@ -15683,23 +15859,41 @@ fn find_clip_clone(session: &Session, clip_id: &str) -> Option<SessionClip> {
         .chain(session.document().audio_tracks.iter())
     {
         if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
-            return Some(clip.clone());
+            return Some(clip);
         }
     }
     None
 }
 
-fn lookup_session_prop(
+fn find_clip_cached(
     session: &Session,
+    state: &mut PanelsState,
+    clip_id: &str,
+) -> Option<std::sync::Arc<SessionClip>> {
+    let rev = session.revision();
+    if let Some((cached_rev, cached_id, cached_clip)) = &state.cached_selected_clip
+        && *cached_rev == rev
+        && cached_id == clip_id
+    {
+        return Some(std::sync::Arc::clone(cached_clip));
+    }
+    let clip = std::sync::Arc::new(find_clip_ref(session, clip_id)?.clone());
+    state.cached_selected_clip = Some((rev, clip_id.to_owned(), std::sync::Arc::clone(&clip)));
+    Some(clip)
+}
+
+#[cfg(test)]
+fn find_clip_clone(session: &Session, clip_id: &str) -> Option<SessionClip> {
+    find_clip_ref(session, clip_id).cloned()
+}
+
+fn lookup_session_prop_ref<'a>(
+    session: &'a Session,
     target_id: &str,
     property: &str,
-) -> Option<SessionProperty> {
+) -> Option<&'a SessionProperty> {
     if target_id == "sequence" {
-        return session
-            .document()
-            .sequence_properties
-            .get(property)
-            .cloned();
+        return session.document().sequence_properties.get(property);
     }
     for track in session
         .document()
@@ -15709,17 +15903,26 @@ fn lookup_session_prop(
     {
         for clip in &track.clips {
             if clip.id == target_id {
-                return clip.properties.get(property).cloned();
+                return clip.properties.get(property);
             }
             if let Some(obj) = clip.objects_3d.iter().find(|o| o.id == target_id) {
-                return obj.properties.get(property).cloned();
+                return obj.properties.get(property);
             }
             if let Some(fx) = clip.effects.iter().find(|e| e.id == target_id) {
-                return fx.properties.get(property).cloned();
+                return fx.properties.get(property);
             }
         }
     }
     None
+}
+
+#[cfg(test)]
+fn lookup_session_prop(
+    session: &Session,
+    target_id: &str,
+    property: &str,
+) -> Option<SessionProperty> {
+    lookup_session_prop_ref(session, target_id, property).cloned()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16112,6 +16315,40 @@ fn apply_kf_bar_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_kf_bar_event_live(
+    session: &mut Session,
+    target_id: &str,
+    prop_name: &str,
+    local_frame: f64,
+    clip_start: f64,
+    current_val: Value,
+    ev: KeyframeBarEvent,
+    actions: &mut Vec<PanelAction>,
+) {
+    if !ev.prev_kf
+        && !ev.next_kf
+        && !ev.toggle_kf
+        && !ev.toggle_interp
+        && ev.set_easing.is_none()
+        && !ev.open_easing_plus
+    {
+        return;
+    }
+    let prop_opt = lookup_session_prop_ref(session, target_id, prop_name).cloned();
+    apply_kf_bar_event(
+        session,
+        target_id,
+        prop_name,
+        prop_opt.as_ref(),
+        local_frame,
+        clip_start,
+        current_val,
+        ev,
+        actions,
+    );
+}
+
 fn execute_prop_value_command(
     session: &mut Session,
     target_id: &str,
@@ -16121,11 +16358,15 @@ fn execute_prop_value_command(
     value: Value,
 ) {
     let cmd = if animated {
-        let prop = lookup_session_prop(session, target_id, prop_name);
+        let frame = resolve_kf_write_frame(
+            session,
+            lookup_session_prop_ref(session, target_id, prop_name),
+            local_frame,
+        );
         Command::SetKeyframe {
             target_id: target_id.to_owned(),
             property: prop_name.to_owned(),
-            frame: resolve_kf_write_frame(session, prop.as_ref(), local_frame),
+            frame,
             value,
             tween: None,
         }
@@ -16418,13 +16659,13 @@ fn show_session_number_prop(
     actions: &mut Vec<PanelAction>,
 ) {
     touch_inspector_tx_owner(state, target_id, prop_key);
-    let prop = lookup_session_prop(session, target_id, prop_key);
-    let animated = prop.as_ref().is_some_and(|p| p.animated);
-    let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
+    let prop = lookup_session_prop_ref(session, target_id, prop_key);
+    let animated = prop.is_some_and(|p| p.animated);
+    let existing_expr = prop.and_then(|p| p.expression.clone());
     let has_expr = existing_expr.is_some();
     // Clip `time` initializes as a non-animated 2-keyframe linear ramp [0 -> start, length -> end].
     let base_val = if prop_key == "time"
-        && let Some(p) = prop.as_ref()
+        && let Some(p) = prop
         && !p.animated
         && p.keyframes.len() == 2
         && let (Some(v0), Some(v1)) = (p.keyframes[0].value.as_f64(), p.keyframes[1].value.as_f64())
@@ -16435,10 +16676,11 @@ fn show_session_number_prop(
         let t = ((local_frame - f0) / span).clamp(0.0, 1.0);
         v0 + (v1 - v0) * t
     } else {
-        eval_prop_f64(prop.as_ref(), local_frame, default_val)
+        eval_prop_f64(prop, local_frame, default_val)
     };
     let mut val = if let Some(expr_code) = existing_expr.as_deref() {
-        eval_session_expr_f64(session, target_id, prop_key, expr_code, base_val).unwrap_or(base_val)
+        eval_session_expr_f64(session, state, target_id, prop_key, expr_code, base_val)
+            .unwrap_or(base_val)
     } else {
         base_val
     };
@@ -16461,13 +16703,8 @@ fn show_session_number_prop(
         },
         |ui| {
             if animated && !has_expr {
-                let bar_state = build_kf_bar_state(
-                    prop.as_ref(),
-                    local_frame,
-                    true,
-                    easing_plus,
-                    viewport_rect,
-                );
+                let bar_state =
+                    build_kf_bar_state(prop, local_frame, true, easing_plus, viewport_rect);
                 kf_ev = cm3_keyframe_bar(
                     ui,
                     Id::unique((target_id, prop_key, "kf")),
@@ -16482,7 +16719,7 @@ fn show_session_number_prop(
                 config.with_read_only(config.read_only || has_expr),
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop, theme) {
                 open_expr = true;
             }
             ev
@@ -16519,11 +16756,10 @@ fn show_session_number_prop(
             viewport_rect,
         );
     }
-    apply_kf_bar_event(
+    apply_kf_bar_event_live(
         session,
         target_id,
         prop_key,
-        prop.as_ref(),
         local_frame,
         clip_start,
         json!(val),
@@ -16560,13 +16796,13 @@ fn show_session_vec2_prop(
     actions: &mut Vec<PanelAction>,
 ) {
     touch_inspector_tx_owner(state, target_id, prop_key);
-    let prop = lookup_session_prop(session, target_id, prop_key);
-    let animated = prop.as_ref().is_some_and(|p| p.animated);
-    let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
+    let prop = lookup_session_prop_ref(session, target_id, prop_key);
+    let animated = prop.is_some_and(|p| p.animated);
+    let existing_expr = prop.and_then(|p| p.expression.clone());
     let has_expr = existing_expr.is_some();
-    let base_val = eval_prop_vec2(prop.as_ref(), local_frame, default_val);
+    let base_val = eval_prop_vec2(prop, local_frame, default_val);
     let mut val = if let Some(expr_code) = existing_expr.as_deref() {
-        eval_session_expr_vec2(session, target_id, prop_key, expr_code, base_val)
+        eval_session_expr_vec2(session, state, target_id, prop_key, expr_code, base_val)
             .unwrap_or(base_val)
     } else {
         base_val
@@ -16615,13 +16851,8 @@ fn show_session_vec2_prop(
         },
         |ui| {
             if animated && !has_expr {
-                let bar_state = build_kf_bar_state(
-                    prop.as_ref(),
-                    local_frame,
-                    true,
-                    easing_plus,
-                    viewport_rect,
-                );
+                let bar_state =
+                    build_kf_bar_state(prop, local_frame, true, easing_plus, viewport_rect);
                 kf_ev = cm3_keyframe_bar(
                     ui,
                     Id::unique((target_id, prop_key, "kf")),
@@ -16637,7 +16868,7 @@ fn show_session_vec2_prop(
                 link_ratio,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop, theme) {
                 open_expr = true;
             }
             ev
@@ -16680,11 +16911,10 @@ fn show_session_vec2_prop(
             viewport_rect,
         );
     }
-    apply_kf_bar_event(
+    apply_kf_bar_event_live(
         session,
         target_id,
         prop_key,
-        prop.as_ref(),
         local_frame,
         clip_start,
         json!(val),
@@ -16759,13 +16989,13 @@ fn show_session_vec3_prop(
     actions: &mut Vec<PanelAction>,
 ) {
     touch_inspector_tx_owner(state, target_id, prop_key);
-    let prop = lookup_session_prop(session, target_id, prop_key);
-    let animated = prop.as_ref().is_some_and(|p| p.animated);
-    let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
+    let prop = lookup_session_prop_ref(session, target_id, prop_key);
+    let animated = prop.is_some_and(|p| p.animated);
+    let existing_expr = prop.and_then(|p| p.expression.clone());
     let has_expr = existing_expr.is_some();
-    let base_val = eval_prop_vec3(prop.as_ref(), local_frame, default_val);
+    let base_val = eval_prop_vec3(prop, local_frame, default_val);
     let mut val = if let Some(expr_code) = existing_expr.as_deref() {
-        eval_session_expr_vec3(session, target_id, prop_key, expr_code, base_val)
+        eval_session_expr_vec3(session, state, target_id, prop_key, expr_code, base_val)
             .unwrap_or(base_val)
     } else {
         base_val
@@ -16814,13 +17044,8 @@ fn show_session_vec3_prop(
         },
         |ui| {
             if animated && !has_expr {
-                let bar_state = build_kf_bar_state(
-                    prop.as_ref(),
-                    local_frame,
-                    true,
-                    easing_plus,
-                    viewport_rect,
-                );
+                let bar_state =
+                    build_kf_bar_state(prop, local_frame, true, easing_plus, viewport_rect);
                 kf_ev = cm3_keyframe_bar(
                     ui,
                     Id::unique((target_id, prop_key, "kf")),
@@ -16836,7 +17061,7 @@ fn show_session_vec3_prop(
                 link_ratio,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop, theme) {
                 open_expr = true;
             }
             ev
@@ -16879,11 +17104,10 @@ fn show_session_vec3_prop(
             viewport_rect,
         );
     }
-    apply_kf_bar_event(
+    apply_kf_bar_event_live(
         session,
         target_id,
         prop_key,
-        prop.as_ref(),
         local_frame,
         clip_start,
         json!(val),
@@ -16992,13 +17216,13 @@ fn show_session_vec4_prop_ex(
     actions: &mut Vec<PanelAction>,
 ) {
     touch_inspector_tx_owner(state, target_id, prop_key);
-    let prop = lookup_session_prop(session, target_id, prop_key);
-    let animated = animatable && prop.as_ref().is_some_and(|p| p.animated);
-    let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
+    let prop = lookup_session_prop_ref(session, target_id, prop_key);
+    let animated = animatable && prop.is_some_and(|p| p.animated);
+    let existing_expr = prop.and_then(|p| p.expression.clone());
     let has_expr = animatable && existing_expr.is_some();
-    let base_val = eval_prop_vec4(prop.as_ref(), local_frame, default_val);
+    let base_val = eval_prop_vec4(prop, local_frame, default_val);
     let mut val = if has_expr && let Some(expr_code) = existing_expr.as_deref() {
-        eval_session_expr_vec4(session, target_id, prop_key, expr_code, base_val)
+        eval_session_expr_vec4(session, state, target_id, prop_key, expr_code, base_val)
             .unwrap_or(base_val)
     } else {
         base_val
@@ -17024,13 +17248,8 @@ fn show_session_vec4_prop_ex(
         },
         |ui| {
             if animated && !has_expr {
-                let bar_state = build_kf_bar_state(
-                    prop.as_ref(),
-                    local_frame,
-                    true,
-                    easing_plus,
-                    viewport_rect,
-                );
+                let bar_state =
+                    build_kf_bar_state(prop, local_frame, true, easing_plus, viewport_rect);
                 kf_ev = cm3_keyframe_bar(
                     ui,
                     Id::unique((target_id, prop_key, "kf")),
@@ -17046,7 +17265,7 @@ fn show_session_vec4_prop_ex(
                 cfg,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop, theme) {
                 open_expr = true;
             }
             total
@@ -17083,11 +17302,10 @@ fn show_session_vec4_prop_ex(
                 viewport_rect,
             );
         }
-        apply_kf_bar_event(
+        apply_kf_bar_event_live(
             session,
             target_id,
             prop_key,
-            prop.as_ref(),
             local_frame,
             clip_start,
             json!(val),
@@ -17123,13 +17341,13 @@ fn show_session_color_prop(
     actions: &mut Vec<PanelAction>,
 ) {
     touch_inspector_tx_owner(state, target_id, prop_key);
-    let prop = lookup_session_prop(session, target_id, prop_key);
-    let animated = prop.as_ref().is_some_and(|p| p.animated);
-    let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
+    let prop = lookup_session_prop_ref(session, target_id, prop_key);
+    let animated = prop.is_some_and(|p| p.animated);
+    let existing_expr = prop.and_then(|p| p.expression.clone());
     let has_expr = existing_expr.is_some();
-    let base_rgb = eval_prop_vec3(prop.as_ref(), local_frame, default_rgb);
+    let base_rgb = eval_prop_vec3(prop, local_frame, default_rgb);
     let rgb_f64 = if let Some(expr_code) = existing_expr.as_deref() {
-        eval_session_expr_vec3(session, target_id, prop_key, expr_code, base_rgb)
+        eval_session_expr_vec3(session, state, target_id, prop_key, expr_code, base_rgb)
             .unwrap_or(base_rgb)
     } else {
         base_rgb
@@ -17154,13 +17372,8 @@ fn show_session_color_prop(
         },
         |ui| {
             if animated && !has_expr {
-                let bar_state = build_kf_bar_state(
-                    prop.as_ref(),
-                    local_frame,
-                    true,
-                    easing_plus,
-                    viewport_rect,
-                );
+                let bar_state =
+                    build_kf_bar_state(prop, local_frame, true, easing_plus, viewport_rect);
                 kf_ev = cm3_keyframe_bar(
                     ui,
                     Id::unique((target_id, prop_key, "kf")),
@@ -17177,7 +17390,7 @@ fn show_session_color_prop(
                 viewport_rect,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop, theme) {
                 open_expr = true;
             }
             ev
@@ -17229,11 +17442,10 @@ fn show_session_color_prop(
             viewport_rect,
         );
     }
-    apply_kf_bar_event(
+    apply_kf_bar_event_live(
         session,
         target_id,
         prop_key,
-        prop.as_ref(),
         local_frame,
         clip_start,
         out_val,
@@ -17264,13 +17476,13 @@ fn show_session_color_rgba_prop(
     actions: &mut Vec<PanelAction>,
 ) {
     touch_inspector_tx_owner(state, target_id, prop_key);
-    let prop = lookup_session_prop(session, target_id, prop_key);
-    let animated = prop.as_ref().is_some_and(|p| p.animated);
-    let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
+    let prop = lookup_session_prop_ref(session, target_id, prop_key);
+    let animated = prop.is_some_and(|p| p.animated);
+    let existing_expr = prop.and_then(|p| p.expression.clone());
     let has_expr = existing_expr.is_some();
-    let base_rgba = eval_prop_vec4(prop.as_ref(), local_frame, default_rgba);
+    let base_rgba = eval_prop_vec4(prop, local_frame, default_rgba);
     let rgba_f64 = if let Some(expr_code) = existing_expr.as_deref() {
-        eval_session_expr_vec4(session, target_id, prop_key, expr_code, base_rgba)
+        eval_session_expr_vec4(session, state, target_id, prop_key, expr_code, base_rgba)
             .unwrap_or(base_rgba)
     } else {
         base_rgba
@@ -17300,13 +17512,8 @@ fn show_session_color_rgba_prop(
         },
         |ui| {
             if animated && !has_expr {
-                let bar_state = build_kf_bar_state(
-                    prop.as_ref(),
-                    local_frame,
-                    true,
-                    easing_plus,
-                    viewport_rect,
-                );
+                let bar_state =
+                    build_kf_bar_state(prop, local_frame, true, easing_plus, viewport_rect);
                 kf_ev = cm3_keyframe_bar(
                     ui,
                     Id::unique((target_id, prop_key, "kf")),
@@ -17323,7 +17530,7 @@ fn show_session_color_rgba_prop(
                 viewport_rect,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop, theme) {
                 open_expr = true;
             }
             ev
@@ -17376,11 +17583,10 @@ fn show_session_color_rgba_prop(
             viewport_rect,
         );
     }
-    apply_kf_bar_event(
+    apply_kf_bar_event_live(
         session,
         target_id,
         prop_key,
-        prop.as_ref(),
         local_frame,
         clip_start,
         out_val,
@@ -17446,16 +17652,21 @@ fn show_session_option_prop_ex(
     theme: &Cm3Theme,
     actions: &mut Vec<PanelAction>,
 ) {
-    let prop = lookup_session_prop(session, target_id, prop_key);
-    let animated = animatable && prop.as_ref().is_some_and(|p| p.animated);
-    let existing_expr = prop.as_ref().and_then(|p| p.expression.clone());
+    let prop = lookup_session_prop_ref(session, target_id, prop_key);
+    let animated = animatable && prop.is_some_and(|p| p.animated);
+    let existing_expr = prop.and_then(|p| p.expression.clone());
     let has_expr = animatable && existing_expr.is_some();
-    let base_idx = eval_prop_u32(prop.as_ref(), local_frame, default_idx) as usize;
+    let base_idx = eval_prop_u32(prop, local_frame, default_idx) as usize;
     let mut idx = if has_expr
         && let Some(expr_code) = existing_expr.as_deref()
-        && let Some(live_n) =
-            eval_session_expr_f64(session, target_id, prop_key, expr_code, base_idx as f64)
-    {
+        && let Some(live_n) = eval_session_expr_f64(
+            session,
+            state,
+            target_id,
+            prop_key,
+            expr_code,
+            base_idx as f64,
+        ) {
         let max_opt = options.len().saturating_sub(1);
         (live_n.round().max(0.0) as usize).min(max_opt)
     } else {
@@ -17480,8 +17691,7 @@ fn show_session_option_prop_ex(
         },
         |ui| {
             if animated && !has_expr {
-                let bar_state =
-                    build_kf_bar_state(prop.as_ref(), local_frame, false, false, viewport_rect);
+                let bar_state = build_kf_bar_state(prop, local_frame, false, false, viewport_rect);
                 kf_ev = cm3_keyframe_bar(
                     ui,
                     Id::unique((target_id, prop_key, "kf")),
@@ -17498,7 +17708,7 @@ fn show_session_option_prop_ex(
                 viewport_rect,
                 theme,
             );
-            if has_expr && show_expression_inline_chip(ui, session, prop.as_ref(), theme) {
+            if has_expr && show_expression_inline_chip(ui, session, prop, theme) {
                 open_expr = true;
             }
             ch
@@ -17535,11 +17745,10 @@ fn show_session_option_prop_ex(
                 viewport_rect,
             );
         }
-        apply_kf_bar_event(
+        apply_kf_bar_event_live(
             session,
             target_id,
             prop_key,
-            prop.as_ref(),
             local_frame,
             clip_start,
             json!(idx),
@@ -17549,10 +17758,15 @@ fn show_session_option_prop_ex(
     }
     if changed {
         let cmd = if animated {
+            let frame = resolve_kf_write_frame(
+                session,
+                lookup_session_prop_ref(session, target_id, prop_key),
+                local_frame,
+            );
             Command::SetKeyframe {
                 target_id: target_id.to_owned(),
                 property: prop_key.to_owned(),
-                frame: resolve_kf_write_frame(session, prop.as_ref(), local_frame),
+                frame,
                 value: json!(idx),
                 tween: Some(0),
             }
@@ -17595,8 +17809,8 @@ fn show_session_curve_prop(
         ("a", "A", Color32::from_rgb(0xb8, 0xb8, 0xb8)),
     ];
 
-    let prop = lookup_session_prop(session, target_id, prop_key);
-    let mut curve_val = eval_prop_value(prop.as_ref(), local_frame)
+    let prop = lookup_session_prop_ref(session, target_id, prop_key);
+    let mut curve_val = eval_prop_value(prop, local_frame)
         .filter(|v| v.is_object())
         .unwrap_or_else(|| default_curve.clone());
     let id = Id::unique((target_id, prop_key, "curve_ed"));
@@ -17936,9 +18150,13 @@ fn show_session_text_prop_ex(
     theme: &Cm3Theme,
 ) {
     touch_inspector_tx_owner(state, target_id, prop_key);
-    let prop = lookup_session_prop(session, target_id, prop_key);
-    let animated = prop.as_ref().is_some_and(|p| p.animated);
-    let current = eval_prop_str(prop.as_ref(), local_frame, default_text);
+    let (animated, current) = {
+        let prop = lookup_session_prop_ref(session, target_id, prop_key);
+        (
+            prop.is_some_and(|p| p.animated),
+            eval_prop_str(prop, local_frame, default_text),
+        )
+    };
 
     // Guard multi-megabyte fuzzer / pasted strings from stalling egui TextEdit layout every frame.
     if let Some(summary) = oversized_text_summary(&current) {
@@ -18106,10 +18324,15 @@ fn show_session_text_prop_ex(
                 );
             }
             let cmd = if animated {
+                let frame = resolve_kf_write_frame(
+                    session,
+                    lookup_session_prop_ref(session, target_id, prop_key),
+                    local_frame,
+                );
                 Command::SetKeyframe {
                     target_id: target_id.to_owned(),
                     property: prop_key.to_owned(),
-                    frame: resolve_kf_write_frame(session, prop.as_ref(), local_frame),
+                    frame,
                     value: json!(edit_st.buf),
                     tween: Some(0),
                 }
@@ -18216,7 +18439,7 @@ fn clear_property_expression(
     property: &str,
 ) -> Result<(), zc_session::SessionError> {
     let should_reset_animated =
-        lookup_session_prop(session, target_id, property).is_some_and(|p| {
+        lookup_session_prop_ref(session, target_id, property).is_some_and(|p| {
             p.animated
                 && (p.keyframes.is_empty()
                     || (p.keyframes.len() == 1 && p.keyframes[0].frame.abs() < 1e-6))
@@ -19410,6 +19633,7 @@ fn show_sequence_controls_section(
                 let mut name_buf = ctl.name.clone();
                 let mut updated_val: Option<PropertyValue> = None;
                 let mut name_changed = false;
+                let mut tx_tracker = WidgetTxTracker::default();
 
                 Frame::NONE
                     .inner_margin(egui::Margin::symmetric(6, 3))
@@ -19475,14 +19699,12 @@ fn show_sequence_controls_section(
                                 let st = step_v.unwrap_or(0.1).max(0.001);
                                 ui.spacing_mut().slider_width =
                                     (ui.available_width() - 68.0).max(64.0);
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut v, lo..=hi)
-                                            .step_by(st)
-                                            .clamping(egui::SliderClamping::Never),
-                                    )
-                                    .changed()
-                                {
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut v, lo..=hi)
+                                        .step_by(st)
+                                        .clamping(egui::SliderClamping::Never),
+                                );
+                                if tx_tracker.observe(&resp) {
                                     updated_val = Some(PropertyValue::Number(v));
                                 }
                             }
@@ -19491,15 +19713,13 @@ fn show_sequence_controls_section(
                                 let lo = min_v.unwrap_or(-360.0);
                                 let hi = max_v.unwrap_or(360.0);
                                 let st = step_v.unwrap_or(0.5);
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut v)
-                                            .range(lo..=hi)
-                                            .speed(st)
-                                            .suffix("°"),
-                                    )
-                                    .changed()
-                                {
+                                let resp = ui.add(
+                                    egui::DragValue::new(&mut v)
+                                        .range(lo..=hi)
+                                        .speed(st)
+                                        .suffix("°"),
+                                );
+                                if tx_tracker.observe(&resp) {
                                     updated_val = Some(PropertyValue::Number(v));
                                 }
                             }
@@ -19516,7 +19736,8 @@ fn show_sequence_controls_section(
                             SequenceControlKind::Color => {
                                 let c = ctl.track.value.as_vec3().unwrap_or([1.0, 1.0, 1.0]);
                                 let mut rgb = [c[0] as f32, c[1] as f32, c[2] as f32];
-                                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                let resp = ui.color_edit_button_rgb(&mut rgb);
+                                if tx_tracker.observe(&resp) {
                                     updated_val = Some(PropertyValue::Color([
                                         f64::from(rgb[0]),
                                         f64::from(rgb[1]),
@@ -19533,7 +19754,9 @@ fn show_sequence_controls_section(
                                     let cy = ui.add(
                                         egui::DragValue::new(&mut p[1]).speed(1.0).prefix("Y "),
                                     );
-                                    if cx.changed() || cy.changed() {
+                                    let ch_x = tx_tracker.observe(&cx);
+                                    let ch_y = tx_tracker.observe(&cy);
+                                    if ch_x || ch_y {
                                         updated_val = Some(PropertyValue::Vec2(p));
                                     }
                                 });
@@ -19550,7 +19773,10 @@ fn show_sequence_controls_section(
                                     let cz = ui.add(
                                         egui::DragValue::new(&mut p[2]).speed(1.0).prefix("Z "),
                                     );
-                                    if cx.changed() || cy.changed() || cz.changed() {
+                                    let ch_x = tx_tracker.observe(&cx);
+                                    let ch_y = tx_tracker.observe(&cy);
+                                    let ch_z = tx_tracker.observe(&cz);
+                                    if ch_x || ch_y || ch_z {
                                         updated_val = Some(PropertyValue::Vec3(p));
                                     }
                                 });
@@ -19559,15 +19785,28 @@ fn show_sequence_controls_section(
                     });
 
                 if name_changed || updated_val.is_some() {
-                    let _ = session.execute(Command::UpdateSequenceControl {
-                        control_id: ctl.id,
-                        name: name_buf.trim().to_owned(),
-                        value: updated_val.unwrap_or(ctl.track.value),
-                        min: min_v,
-                        max: max_v,
-                        step: step_v,
-                    });
+                    tx_tracker.changed = true;
                 }
+                let ctl_owner_key = format!("seq_ctl_{}", ctl.id);
+                apply_widget_tx_command(
+                    ui,
+                    session,
+                    state,
+                    "sequence",
+                    &ctl_owner_key,
+                    "edit sequence control",
+                    tx_tracker,
+                    |session| {
+                        let _ = session.execute(Command::UpdateSequenceControl {
+                            control_id: ctl.id,
+                            name: name_buf.trim().to_owned(),
+                            value: updated_val.unwrap_or(ctl.track.value),
+                            min: min_v,
+                            max: max_v,
+                            step: step_v,
+                        });
+                    },
+                );
             }
 
             // Legacy ctl_* sequence_properties compatibility (skip keys already backed by
@@ -19767,6 +20006,7 @@ fn show_edit_layer_masks_section(
         };
         let expanded = state.expanded_masks.contains(&mask.id);
         let mut changed = false;
+        let mut tx_tracker = WidgetTxTracker::default();
 
         Frame::NONE
             .fill(BG_SUNKEN)
@@ -19955,14 +20195,12 @@ fn show_edit_layer_masks_section(
                                 .font(theme.font(FONT_COMPACT))
                                 .color(TEXT_MUTED),
                         );
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut mask.feather)
-                                    .range(0.0..=500.0)
-                                    .speed(0.5),
-                            )
-                            .changed()
-                        {
+                        let feather_resp = ui.add(
+                            egui::DragValue::new(&mut mask.feather)
+                                .range(0.0..=500.0)
+                                .speed(0.5),
+                        );
+                        if tx_tracker.observe(&feather_resp) {
                             changed = true;
                         }
                         ui.label(
@@ -19970,14 +20208,12 @@ fn show_edit_layer_masks_section(
                                 .font(theme.font(FONT_COMPACT))
                                 .color(TEXT_MUTED),
                         );
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut mask.expansion)
-                                    .range(-500.0..=500.0)
-                                    .speed(0.5),
-                            )
-                            .changed()
-                        {
+                        let expand_resp = ui.add(
+                            egui::DragValue::new(&mut mask.expansion)
+                                .range(-500.0..=500.0)
+                                .speed(0.5),
+                        );
+                        if tx_tracker.observe(&expand_resp) {
                             changed = true;
                         }
                     });
@@ -19987,14 +20223,14 @@ fn show_edit_layer_masks_section(
                                 .font(theme.font(FONT_COMPACT))
                                 .color(TEXT_MUTED),
                         );
-                        if ui
-                            .add(egui::Slider::new(&mut mask.opacity, 0.0..=1.0).max_decimals(2))
-                            .changed()
-                        {
+                        let opacity_resp =
+                            ui.add(egui::Slider::new(&mut mask.opacity, 0.0..=1.0).max_decimals(2));
+                        if tx_tracker.observe(&opacity_resp) {
                             changed = true;
                         }
                         let mut hex = parse_hex_rgb_f32(&mask.outline_color);
-                        if ui.color_edit_button_rgb(&mut hex).changed() {
+                        let col_resp = ui.color_edit_button_rgb(&mut hex);
+                        if tx_tracker.observe(&col_resp) {
                             mask.outline_color = format!(
                                 "#{:02x}{:02x}{:02x}",
                                 (hex[0] * 255.0).round() as u8,
@@ -20008,13 +20244,26 @@ fn show_edit_layer_masks_section(
             });
 
         if changed {
-            let mask_id = mask.id.clone();
-            let _ = session.execute(Command::UpdateLayerMask {
-                clip_id: cid,
-                mask_id,
-                mask,
-            });
+            tx_tracker.changed = true;
         }
+        let mask_owner_key = format!("mask_{}", mask.id);
+        let mask_id = mask.id.clone();
+        apply_widget_tx_command(
+            ui,
+            session,
+            state,
+            clip_id,
+            &mask_owner_key,
+            "edit layer mask",
+            tx_tracker,
+            |session| {
+                let _ = session.execute(Command::UpdateLayerMask {
+                    clip_id: cid,
+                    mask_id,
+                    mask,
+                });
+            },
+        );
     }
 
     let (mask_div, _) = ui.allocate_exact_size(Vec2::new(mask_w, 1.0), Sense::hover());
@@ -20833,6 +21082,7 @@ fn show_shape_plus_objects_tab(
     paint_crisp_panel_border(ui.painter(), top_rect, BORDER_PANEL);
 
     // Bottom Pane: Selected Shape+ Item Property Inspector
+    let mut shape_tx_tracker = WidgetTxTracker::default();
     show_split_pane(
         ui,
         Id::unique("shape_plus_split_p1"),
@@ -20962,7 +21212,8 @@ fn show_shape_plus_objects_tab(
                                             .font(theme.font(FONT_SMALL))
                                             .color(TEXT_PRIMARY),
                                     );
-                                    if ui.add(egui::DragValue::new(&mut v).speed(0.5)).changed() {
+                                    let resp = ui.add(egui::DragValue::new(&mut v).speed(0.5));
+                                    if shape_tx_tracker.observe(&resp) {
                                         props.insert(key, json!(v));
                                         payload_dirty = true;
                                     }
@@ -20979,7 +21230,9 @@ fn show_shape_plus_objects_tab(
                                     );
                                     let cx = ui.add(egui::DragValue::new(&mut x).speed(1.0));
                                     let cy = ui.add(egui::DragValue::new(&mut y).speed(1.0));
-                                    if cx.changed() || cy.changed() {
+                                    let ch_x = shape_tx_tracker.observe(&cx);
+                                    let ch_y = shape_tx_tracker.observe(&cy);
+                                    if ch_x || ch_y {
                                         props.insert(key, json!([x, y]));
                                         payload_dirty = true;
                                     }
@@ -20997,7 +21250,8 @@ fn show_shape_plus_objects_tab(
                                             .font(theme.font(FONT_SMALL))
                                             .color(TEXT_PRIMARY),
                                     );
-                                    if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                    let resp = ui.color_edit_button_rgb(&mut rgb);
+                                    if shape_tx_tracker.observe(&resp) {
                                         props.insert(
                                             key,
                                             json!([
@@ -21019,11 +21273,23 @@ fn show_shape_plus_objects_tab(
     paint_crisp_panel_border(ui.painter(), bot_rect, BORDER_PANEL);
 
     if payload_dirty {
-        let _ = session.execute(Command::UpdateShapePlusPayload {
-            clip_id: cid,
-            payload,
-        });
+        shape_tx_tracker.changed = true;
     }
+    apply_widget_tx_command(
+        ui,
+        session,
+        state,
+        &clip.id,
+        "shape_plus_payload",
+        "edit shape+ property",
+        shape_tx_tracker,
+        |session| {
+            let _ = session.execute(Command::UpdateShapePlusPayload {
+                clip_id: cid,
+                payload,
+            });
+        },
+    );
 }
 
 /// Paints a crisp vector visibility eye icon (never relying on missing emoji glyphs).
@@ -21413,6 +21679,7 @@ fn show_text2d_objects_tab(
                                 });
                             }
 
+                            let tx_cell = std::cell::Cell::new(WidgetTxTracker::default());
                             let drag_scalar = |ui: &mut Ui,
                                                lbl: &str,
                                                v: &mut f64,
@@ -21429,7 +21696,11 @@ fn show_text2d_objects_tab(
                                     if let Some((lo, hi)) = range {
                                         dv = dv.range(lo..=hi);
                                     }
-                                    ui.add(dv).changed()
+                                    let resp = ui.add(dv);
+                                    let mut tr = tx_cell.get();
+                                    let ch = tr.observe(&resp);
+                                    tx_cell.set(tr);
+                                    ch
                                 })
                                 .inner
                             };
@@ -21452,7 +21723,11 @@ fn show_text2d_objects_tab(
                                     let cy = ui.add(
                                         egui::DragValue::new(&mut v[1]).speed(speed).prefix("Y "),
                                     );
-                                    cx.changed() || cy.changed()
+                                    let mut tr = tx_cell.get();
+                                    let ch_x = tr.observe(&cx);
+                                    let ch_y = tr.observe(&cy);
+                                    tx_cell.set(tr);
+                                    ch_x || ch_y
                                 })
                                 .inner
                             };
@@ -21762,14 +22037,27 @@ fn show_text2d_objects_tab(
                                 }
                                 _ => {}
                             }
-                        }
-
-                        if dirty {
-                            let _ = session.execute(Command::UpdateLayerPreserved {
-                                clip_id: clip_uuid,
-                                key: "zoidiumTextPlus2D".to_owned(),
-                                value: Some(root),
-                            });
+                            if dirty {
+                                let mut tr = tx_cell.get();
+                                tr.changed = true;
+                                tx_cell.set(tr);
+                            }
+                            apply_widget_tx_command(
+                                ui,
+                                session,
+                                state,
+                                &clip.id,
+                                "text2d_animator",
+                                "edit text2d animator",
+                                tx_cell.get(),
+                                |session| {
+                                    let _ = session.execute(Command::UpdateLayerPreserved {
+                                        clip_id: clip_uuid,
+                                        key: "zoidiumTextPlus2D".to_owned(),
+                                        value: Some(root),
+                                    });
+                                },
+                            );
                         }
                     },
                 );
@@ -22033,7 +22321,7 @@ fn show_camera_plus_controls(
 
     // 12 Film Gate presets dropdown + numeric scrub
     let cur_gate = eval_prop_f64(
-        lookup_session_prop(session, obj_id, "filmGate").as_ref(),
+        lookup_session_prop_ref(session, obj_id, "filmGate"),
         local_frame,
         36.0,
     );
@@ -22238,7 +22526,7 @@ fn show_camera_plus_controls(
         );
         if picked && pick_idx > 0 {
             let cam_pos = eval_prop_vec3(
-                lookup_session_prop(session, obj_id, "position").as_ref(),
+                lookup_session_prop_ref(session, obj_id, "position"),
                 local_frame,
                 [0.0, 0.0, 80.0],
             );
@@ -22991,7 +23279,7 @@ fn show_particles_3d_inspector(
             // Color over Life and Size over Life are immediately visible without scrolling)
             let particles_plus_enabled = session.plugins.is_enabled("particles-plus");
             let cur_sprite = eval_prop_str(
-                lookup_session_prop(session, obj_id, "particles.spritePreset").as_ref(),
+                lookup_session_prop_ref(session, obj_id, "particles.spritePreset"),
                 local_frame,
                 "soft_glow",
             );
@@ -23075,9 +23363,9 @@ fn show_particles_3d_inspector(
             .on_hover_text("Browse 54 procedural sprites (Particles+)");
 
             // Color-over-Life stop editor (`particles.color` JSON)
-            show_particle_color_over_life_editor(ui, session, obj_id, local_frame, theme);
+            show_particle_color_over_life_editor(ui, session, state, obj_id, local_frame, theme);
             // Size-over-Life stop editor (`particles.size` JSON)
-            show_particle_size_over_life_editor(ui, session, obj_id, local_frame, theme);
+            show_particle_size_over_life_editor(ui, session, state, obj_id, local_frame, theme);
         }
     }
 }
@@ -23085,41 +23373,11 @@ fn show_particles_3d_inspector(
 fn show_particle_color_over_life_editor(
     ui: &mut Ui,
     session: &mut Session,
+    state: &mut PanelsState,
     obj_id: &str,
     local_frame: f64,
     theme: &Cm3Theme,
 ) {
-    let raw = eval_prop_str(
-        lookup_session_prop(session, obj_id, "particles.color").as_ref(),
-        local_frame,
-        "",
-    );
-    let mut stops: Vec<(f64, [f32; 4])> = serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .map(|arr| {
-            arr.into_iter()
-                .filter_map(|item| {
-                    let t = item
-                        .get("t")
-                        .or_else(|| item.get("pos"))
-                        .and_then(Value::as_f64)?;
-                    let c = item.get("color").and_then(Value::as_array)?;
-                    Some((
-                        t,
-                        [
-                            c.first()?.as_f64()? as f32,
-                            c.get(1)?.as_f64()? as f32,
-                            c.get(2)?.as_f64()? as f32,
-                            c.get(3).and_then(Value::as_f64).unwrap_or(1.0) as f32,
-                        ],
-                    ))
-                })
-                .collect()
-        })
-        .filter(|v: &Vec<_>| v.len() >= 2)
-        .unwrap_or_else(|| vec![(0.0, [1.0, 0.9, 0.6, 1.0]), (1.0, [1.0, 0.3, 0.1, 0.0])]);
-
     cm3_collapsible_section(
         ui,
         Id::unique((obj_id, "particles_color_life")),
@@ -23127,21 +23385,53 @@ fn show_particle_color_over_life_editor(
         false,
         theme,
         |ui| {
+            let raw = eval_prop_str(
+                lookup_session_prop_ref(session, obj_id, "particles.color"),
+                local_frame,
+                "",
+            );
+            let mut stops: Vec<(f64, [f32; 4])> = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .map(|arr| {
+                    arr.into_iter()
+                        .filter_map(|item| {
+                            let t = item
+                                .get("t")
+                                .or_else(|| item.get("pos"))
+                                .and_then(Value::as_f64)?;
+                            let c = item.get("color").and_then(Value::as_array)?;
+                            Some((
+                                t,
+                                [
+                                    c.first()?.as_f64()? as f32,
+                                    c.get(1)?.as_f64()? as f32,
+                                    c.get(2)?.as_f64()? as f32,
+                                    c.get(3).and_then(Value::as_f64).unwrap_or(1.0) as f32,
+                                ],
+                            ))
+                        })
+                        .collect()
+                })
+                .filter(|v: &Vec<_>| v.len() >= 2)
+                .unwrap_or_else(|| vec![(0.0, [1.0, 0.9, 0.6, 1.0]), (1.0, [1.0, 0.3, 0.1, 0.0])]);
+
             let mut dirty = false;
             let mut remove_idx = None;
+            let mut tx_tracker = WidgetTxTracker::default();
             let stops_len = stops.len();
             Frame::NONE
                 .inner_margin(egui::Margin::symmetric(6, 4))
                 .show(ui, |ui| {
                     for (si, (t, rgba)) in stops.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
-                            if ui.color_edit_button_rgba_unmultiplied(rgba).changed() {
+                            let col_resp = ui.color_edit_button_rgba_unmultiplied(rgba);
+                            if tx_tracker.observe(&col_resp) {
                                 dirty = true;
                             }
-                            if ui
-                                .add(egui::DragValue::new(t).range(0.0..=1.0).speed(0.01))
-                                .changed()
-                            {
+                            let t_resp =
+                                ui.add(egui::DragValue::new(t).range(0.0..=1.0).speed(0.01));
+                            if tx_tracker.observe(&t_resp) {
                                 dirty = true;
                             }
                             if stops_len > 2 && ui.small_button("×").clicked() {
@@ -23159,25 +23449,37 @@ fn show_particle_color_over_life_editor(
                     }
                 });
             if dirty {
-                stops.sort_by(|a, b| a.0.total_cmp(&b.0));
-                let encoded = Value::Array(
-                    stops
-                        .into_iter()
-                        .map(|(t, c)| {
-                            json!({
-                                "t": t,
-                                "color": [f64::from(c[0]), f64::from(c[1]), f64::from(c[2]), f64::from(c[3])]
-                            })
-                        })
-                        .collect(),
-                )
-                .to_string();
-                let _ = session.execute(Command::SetPropertyValue {
-                    target_id: obj_id.to_owned(),
-                    property: "particles.color".to_owned(),
-                    value: json!(encoded),
-                });
+                tx_tracker.changed = true;
             }
+            apply_widget_tx_command(
+                ui,
+                session,
+                state,
+                obj_id,
+                "particles.color",
+                "edit particles.color",
+                tx_tracker,
+                |session| {
+                    stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let encoded = Value::Array(
+                        stops
+                            .into_iter()
+                            .map(|(t, c)| {
+                                json!({
+                                    "t": t,
+                                    "color": [f64::from(c[0]), f64::from(c[1]), f64::from(c[2]), f64::from(c[3])]
+                                })
+                            })
+                            .collect(),
+                    )
+                    .to_string();
+                    let _ = session.execute(Command::SetPropertyValue {
+                        target_id: obj_id.to_owned(),
+                        property: "particles.color".to_owned(),
+                        value: json!(encoded),
+                    });
+                },
+            );
         },
     );
 }
@@ -23185,36 +23487,11 @@ fn show_particle_color_over_life_editor(
 fn show_particle_size_over_life_editor(
     ui: &mut Ui,
     session: &mut Session,
+    state: &mut PanelsState,
     obj_id: &str,
     local_frame: f64,
     theme: &Cm3Theme,
 ) {
-    let raw = eval_prop_str(
-        lookup_session_prop(session, obj_id, "particles.size").as_ref(),
-        local_frame,
-        "",
-    );
-    let mut stops: Vec<(f64, f64)> = serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .map(|arr| {
-            arr.into_iter()
-                .filter_map(|item| {
-                    let t = item
-                        .get("t")
-                        .or_else(|| item.get("pos"))
-                        .and_then(Value::as_f64)?;
-                    let s = item
-                        .get("size")
-                        .or_else(|| item.get("value"))
-                        .and_then(Value::as_f64)?;
-                    Some((t, s))
-                })
-                .collect()
-        })
-        .filter(|v: &Vec<_>| v.len() >= 2)
-        .unwrap_or_else(|| vec![(0.0, 1.0), (1.0, 0.0)]);
-
     cm3_collapsible_section(
         ui,
         Id::unique((obj_id, "particles_size_life")),
@@ -23222,34 +23499,57 @@ fn show_particle_size_over_life_editor(
         false,
         theme,
         |ui| {
+            let raw = eval_prop_str(
+                lookup_session_prop_ref(session, obj_id, "particles.size"),
+                local_frame,
+                "",
+            );
+            let mut stops: Vec<(f64, f64)> = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .map(|arr| {
+                    arr.into_iter()
+                        .filter_map(|item| {
+                            let t = item
+                                .get("t")
+                                .or_else(|| item.get("pos"))
+                                .and_then(Value::as_f64)?;
+                            let s = item
+                                .get("size")
+                                .or_else(|| item.get("value"))
+                                .and_then(Value::as_f64)?;
+                            Some((t, s))
+                        })
+                        .collect()
+                })
+                .filter(|v: &Vec<_>| v.len() >= 2)
+                .unwrap_or_else(|| vec![(0.0, 1.0), (1.0, 0.0)]);
+
             let mut dirty = false;
             let mut remove_idx = None;
+            let mut tx_tracker = WidgetTxTracker::default();
             let stops_len = stops.len();
             Frame::NONE
                 .inner_margin(egui::Margin::symmetric(6, 4))
                 .show(ui, |ui| {
                     for (si, (t, sz)) in stops.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
-                            if ui
-                                .add(
-                                    egui::DragValue::new(t)
-                                        .range(0.0..=1.0)
-                                        .speed(0.01)
-                                        .prefix("t "),
-                                )
-                                .changed()
-                            {
+                            let t_resp = ui.add(
+                                egui::DragValue::new(t)
+                                    .range(0.0..=1.0)
+                                    .speed(0.01)
+                                    .prefix("t "),
+                            );
+                            if tx_tracker.observe(&t_resp) {
                                 dirty = true;
                             }
-                            if ui
-                                .add(
-                                    egui::DragValue::new(sz)
-                                        .range(0.0..=100.0)
-                                        .speed(0.05)
-                                        .prefix("sz "),
-                                )
-                                .changed()
-                            {
+                            let sz_resp = ui.add(
+                                egui::DragValue::new(sz)
+                                    .range(0.0..=100.0)
+                                    .speed(0.05)
+                                    .prefix("sz "),
+                            );
+                            if tx_tracker.observe(&sz_resp) {
                                 dirty = true;
                             }
                             if stops_len > 2 && ui.small_button("×").clicked() {
@@ -23267,20 +23567,32 @@ fn show_particle_size_over_life_editor(
                     }
                 });
             if dirty {
-                stops.sort_by(|a, b| a.0.total_cmp(&b.0));
-                let encoded = Value::Array(
-                    stops
-                        .into_iter()
-                        .map(|(t, s)| json!({ "t": t, "size": s }))
-                        .collect(),
-                )
-                .to_string();
-                let _ = session.execute(Command::SetPropertyValue {
-                    target_id: obj_id.to_owned(),
-                    property: "particles.size".to_owned(),
-                    value: json!(encoded),
-                });
+                tx_tracker.changed = true;
             }
+            apply_widget_tx_command(
+                ui,
+                session,
+                state,
+                obj_id,
+                "particles.size",
+                "edit particles.size",
+                tx_tracker,
+                |session| {
+                    stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let encoded = Value::Array(
+                        stops
+                            .into_iter()
+                            .map(|(t, s)| json!({ "t": t, "size": s }))
+                            .collect(),
+                    )
+                    .to_string();
+                    let _ = session.execute(Command::SetPropertyValue {
+                        target_id: obj_id.to_owned(),
+                        property: "particles.size".to_owned(),
+                        value: json!(encoded),
+                    });
+                },
+            );
         },
     );
 }
@@ -25068,8 +25380,11 @@ fn show_extended_3d_object_props(
         k if k.contains("expresstext-plus") => {
             let sub = k.rsplit('/').next().unwrap_or("expresstext");
             // `lettersMode` dropdown: ["Per Letter", "Per Word", "Per Text"]
-            let lm_prop = lookup_session_prop(session, &obj.id, "lettersMode");
-            let mut lm_idx = eval_prop_value(lm_prop.as_ref(), local_frame).map_or(0usize, |v| {
+            let mut lm_idx = eval_prop_value(
+                lookup_session_prop_ref(session, &obj.id, "lettersMode"),
+                local_frame,
+            )
+            .map_or(0usize, |v| {
                 if let Some(n) = v.as_f64() {
                     (n.round().clamp(0.0, 2.0)) as usize
                 } else if let Some(s) = v.as_str() {
@@ -26499,7 +26814,7 @@ fn show_material_slot_inspector(
         };
         let type_key = k("type");
         let prev_mat_type = eval_prop_u32(
-            lookup_session_prop(session, obj_id, &type_key).as_ref(),
+            lookup_session_prop_ref(session, obj_id, &type_key),
             local_frame,
             0,
         );
@@ -26520,7 +26835,7 @@ fn show_material_slot_inspector(
             actions,
         );
         let mat_type = eval_prop_u32(
-            lookup_session_prop(session, obj_id, &type_key).as_ref(),
+            lookup_session_prop_ref(session, obj_id, &type_key),
             local_frame,
             0,
         );
@@ -26869,7 +27184,7 @@ fn show_material_slot_inspector(
             4 => {
                 let frag_key = k("fragShader");
                 let cur_code = eval_prop_str(
-                    lookup_session_prop(session, obj_id, &frag_key).as_ref(),
+                    lookup_session_prop_ref(session, obj_id, &frag_key),
                     local_frame,
                     DEFAULT_CUSTOM_SHADER_GLSL,
                 );
@@ -27673,7 +27988,7 @@ fn show_material_slot_inspector(
                 // NodeMaterial -> Opens real interactive Node Graph Editor!
                 let res_key = k("bakeResolution");
                 let cur_res_raw = eval_prop_u32(
-                    lookup_session_prop(session, obj_id, &res_key).as_ref(),
+                    lookup_session_prop_ref(session, obj_id, &res_key),
                     local_frame,
                     512,
                 );
@@ -27732,8 +28047,10 @@ fn show_material_slot_inspector(
                     })
                     .inner;
                 if open_node_mat {
-                    let cur_graph = lookup_session_prop(session, obj_id, &graph_key)
-                        .and_then(|p| eval_prop_value(Some(&p), local_frame));
+                    let cur_graph = eval_prop_value(
+                        lookup_session_prop_ref(session, obj_id, &graph_key),
+                        local_frame,
+                    );
                     state.node_graph_editor.open_for_target(
                         NodeGraphTargetKind::NodeMaterial,
                         obj_id,
@@ -27765,8 +28082,7 @@ fn node_material_prop_key(prefix: &str, suffix: &str) -> String {
 /// Returns `true` when the `NodeMaterial` at `(obj_id, prefix)` already has a non-empty `nodes` graph.
 fn node_material_has_populated_graph(session: &Session, obj_id: &str, prefix: &str) -> bool {
     let graph_key = node_material_prop_key(prefix, "graph");
-    lookup_session_prop(session, obj_id, &graph_key)
-        .and_then(|p| eval_prop_value(Some(&p), 0.0))
+    eval_prop_value(lookup_session_prop_ref(session, obj_id, &graph_key), 0.0)
         .and_then(|v| {
             if let Some(s) = v.as_str() {
                 serde_json::from_str::<Value>(s).ok()
@@ -27793,7 +28109,7 @@ fn initialize_node_material_defaults(
 ) {
     let res_key = node_material_prop_key(prefix, "bakeResolution");
     let graph_key = node_material_prop_key(prefix, "graph");
-    let needs_res = just_switched || lookup_session_prop(session, obj_id, &res_key).is_none();
+    let needs_res = just_switched || lookup_session_prop_ref(session, obj_id, &res_key).is_none();
     let needs_graph = !node_material_has_populated_graph(session, obj_id, prefix);
     if !needs_res && !needs_graph {
         return;
@@ -27895,39 +28211,57 @@ fn compute_asset_usage_counts(session: &Session) -> BTreeMap<String, usize> {
     counts
 }
 
-fn evaluate_session_expression_raw(
+fn compute_asset_usage_counts_cached(
     session: &Session,
-    target_id: &str,
-    property: &str,
-    code: &str,
-    base_val_override: Option<Value>,
-) -> Result<zc_expr::Value, String> {
-    let trimmed = code.trim();
-    if trimmed.is_empty() {
-        return Err("Expression is empty".to_owned());
+    state: &mut PanelsState,
+) -> std::sync::Arc<BTreeMap<String, usize>> {
+    let rev = session.revision();
+    if let Some((cached_rev, counts)) = &state.cached_asset_usage
+        && *cached_rev == rev
+    {
+        return std::sync::Arc::clone(counts);
     }
-    let mode = if session.plugins.is_enabled("expressions-plus") {
-        zc_expr::ExprMode::ExpressionsPlus
-    } else {
-        zc_expr::ExprMode::VanillaCm3
-    };
-    let compiled = zc_expr::compile(trimmed, mode).map_err(|e| e.to_string())?;
-    let fps = session.document().fps.max(1.0);
-    let frame = session.playback.current_frame;
-    let cur_val = base_val_override
-        .or_else(|| {
-            lookup_session_prop(session, target_id, property)
-                .and_then(|p| eval_prop_value(Some(&p), frame))
-        })
-        .map(|v| json_to_expr_value(&v))
-        .unwrap_or(zc_expr::Value::Number(0.0));
-    let mut ctx = zc_expr::BasicContext {
-        frame,
-        time: Some(frame / fps),
-        fps,
-        value: cur_val,
-        properties: BTreeMap::new(),
-    };
+    let counts = std::sync::Arc::new(compute_asset_usage_counts(session));
+    state.cached_asset_usage = Some((rev, std::sync::Arc::clone(&counts)));
+    counts
+}
+
+struct BorrowedExprContext<'a> {
+    frame: f64,
+    time: f64,
+    fps: f64,
+    value: zc_expr::Value,
+    properties: &'a BTreeMap<String, zc_expr::Value>,
+}
+
+impl zc_expr::ExprContext for BorrowedExprContext<'_> {
+    fn frame(&self) -> f64 {
+        self.frame
+    }
+
+    fn time(&self) -> f64 {
+        self.time
+    }
+
+    fn fps(&self) -> f64 {
+        self.fps
+    }
+
+    fn value(&self) -> zc_expr::Value {
+        self.value.clone()
+    }
+
+    fn properties(&self) -> BTreeMap<String, zc_expr::Value> {
+        if self.properties.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.properties.clone()
+        }
+    }
+}
+
+fn build_expr_controls_map(session: &Session) -> BTreeMap<String, zc_expr::Value> {
+    let mut properties = BTreeMap::new();
     for ctl in &session.active_sequence().controls {
         let ev = match &ctl.track.value {
             PropertyValue::Number(n) => Some(zc_expr::Value::Number(*n)),
@@ -27950,17 +28284,107 @@ fn evaluate_session_expression_raw(
             _ => None,
         };
         if let Some(val) = ev {
-            ctx.properties.insert(ctl.name.clone(), val.clone());
+            properties.insert(ctl.name.clone(), val.clone());
             let clean = sanitize_control_identifier(&ctl.name, &ctl.name);
-            ctx.properties.entry(clean).or_insert(val);
+            properties.entry(clean).or_insert(val);
         }
     }
+    properties
+}
+
+fn compile_expr_cached(
+    state: &mut PanelsState,
+    trimmed: &str,
+    mode: zc_expr::ExprMode,
+) -> Result<std::sync::Arc<zc_expr::CompiledExpr>, String> {
+    let is_plus = matches!(mode, zc_expr::ExprMode::ExpressionsPlus);
+    let key = (is_plus, trimmed.to_owned());
+    if let Some(cached) = state.cached_compiled_exprs.get(&key) {
+        return cached.clone();
+    }
+    let result = zc_expr::compile(trimmed, mode)
+        .map(std::sync::Arc::new)
+        .map_err(|e| e.to_string());
+    if state.cached_compiled_exprs.len() >= 128 {
+        state.cached_compiled_exprs.clear();
+    }
+    state.cached_compiled_exprs.insert(key, result.clone());
+    result
+}
+
+fn evaluate_session_expression_raw_with_state(
+    session: &Session,
+    mut state: Option<&mut PanelsState>,
+    target_id: &str,
+    property: &str,
+    code: &str,
+    base_val_override: Option<Value>,
+) -> Result<zc_expr::Value, String> {
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        return Err("Expression is empty".to_owned());
+    }
+    let mode = if session.plugins.is_enabled("expressions-plus") {
+        zc_expr::ExprMode::ExpressionsPlus
+    } else {
+        zc_expr::ExprMode::VanillaCm3
+    };
+    let compiled = if let Some(st) = state.as_deref_mut() {
+        compile_expr_cached(st, trimmed, mode)?
+    } else {
+        std::sync::Arc::new(zc_expr::compile(trimmed, mode).map_err(|e| e.to_string())?)
+    };
+    let fps = session.document().fps.max(1.0);
+    let frame = session.playback.current_frame;
+    let cur_val = base_val_override
+        .or_else(|| eval_prop_value(lookup_session_prop_ref(session, target_id, property), frame))
+        .map(|v| json_to_expr_value(&v))
+        .unwrap_or(zc_expr::Value::Number(0.0));
+    let owned_controls;
+    let controls_ref: &BTreeMap<String, zc_expr::Value> = if let Some(st) = state {
+        let rev = session.revision();
+        if !st
+            .cached_expr_controls
+            .as_ref()
+            .is_some_and(|(r, _)| *r == rev)
+        {
+            st.cached_expr_controls = Some((rev, build_expr_controls_map(session)));
+        }
+        &st.cached_expr_controls.as_ref().expect("just populated").1
+    } else {
+        owned_controls = build_expr_controls_map(session);
+        &owned_controls
+    };
+    let ctx = BorrowedExprContext {
+        frame,
+        time: frame / fps,
+        fps,
+        value: cur_val,
+        properties: controls_ref,
+    };
     let cfg = zc_expr::EvalConfig {
         mode,
         max_steps: 200_000,
         max_recursion: 64,
     };
     compiled.evaluate(&ctx, &cfg).map_err(|e| e.to_string())
+}
+
+fn evaluate_session_expression_raw(
+    session: &Session,
+    target_id: &str,
+    property: &str,
+    code: &str,
+    base_val_override: Option<Value>,
+) -> Result<zc_expr::Value, String> {
+    evaluate_session_expression_raw_with_state(
+        session,
+        None,
+        target_id,
+        property,
+        code,
+        base_val_override,
+    )
 }
 
 fn expr_value_to_f64(v: &zc_expr::Value) -> Option<f64> {
@@ -27974,27 +28398,41 @@ fn expr_value_to_f64(v: &zc_expr::Value) -> Option<f64> {
 
 fn eval_session_expr_f64(
     session: &Session,
+    state: &mut PanelsState,
     target_id: &str,
     property: &str,
     code: &str,
     base: f64,
 ) -> Option<f64> {
-    let out =
-        evaluate_session_expression_raw(session, target_id, property, code, Some(json!(base)))
-            .ok()?;
+    let out = evaluate_session_expression_raw_with_state(
+        session,
+        Some(state),
+        target_id,
+        property,
+        code,
+        Some(json!(base)),
+    )
+    .ok()?;
     expr_value_to_f64(&out)
 }
 
 fn eval_session_expr_vec2(
     session: &Session,
+    state: &mut PanelsState,
     target_id: &str,
     property: &str,
     code: &str,
     base: [f64; 2],
 ) -> Option<[f64; 2]> {
-    let out =
-        evaluate_session_expression_raw(session, target_id, property, code, Some(json!(base)))
-            .ok()?;
+    let out = evaluate_session_expression_raw_with_state(
+        session,
+        Some(state),
+        target_id,
+        property,
+        code,
+        Some(json!(base)),
+    )
+    .ok()?;
     match &out {
         zc_expr::Value::Array(arr) => Some([
             arr.first().and_then(expr_value_to_f64).unwrap_or(base[0]),
@@ -28006,14 +28444,21 @@ fn eval_session_expr_vec2(
 
 fn eval_session_expr_vec3(
     session: &Session,
+    state: &mut PanelsState,
     target_id: &str,
     property: &str,
     code: &str,
     base: [f64; 3],
 ) -> Option<[f64; 3]> {
-    let out =
-        evaluate_session_expression_raw(session, target_id, property, code, Some(json!(base)))
-            .ok()?;
+    let out = evaluate_session_expression_raw_with_state(
+        session,
+        Some(state),
+        target_id,
+        property,
+        code,
+        Some(json!(base)),
+    )
+    .ok()?;
     match &out {
         zc_expr::Value::Array(arr) => Some([
             arr.first().and_then(expr_value_to_f64).unwrap_or(base[0]),
@@ -28026,14 +28471,21 @@ fn eval_session_expr_vec3(
 
 fn eval_session_expr_vec4(
     session: &Session,
+    state: &mut PanelsState,
     target_id: &str,
     property: &str,
     code: &str,
     base: [f64; 4],
 ) -> Option<[f64; 4]> {
-    let out =
-        evaluate_session_expression_raw(session, target_id, property, code, Some(json!(base)))
-            .ok()?;
+    let out = evaluate_session_expression_raw_with_state(
+        session,
+        Some(state),
+        target_id,
+        property,
+        code,
+        Some(json!(base)),
+    )
+    .ok()?;
     match &out {
         zc_expr::Value::Array(arr) => Some([
             arr.first().and_then(expr_value_to_f64).unwrap_or(base[0]),
@@ -28045,6 +28497,25 @@ fn eval_session_expr_vec4(
     }
 }
 
+fn evaluate_expression_live_preview_cached(
+    session: &Session,
+    state: &mut PanelsState,
+    target_id: &str,
+    property: &str,
+    code: &str,
+) -> Result<String, String> {
+    let out = evaluate_session_expression_raw_with_state(
+        session,
+        Some(state),
+        target_id,
+        property,
+        code,
+        None,
+    )?;
+    Ok(format_expr_value(&out))
+}
+
+#[cfg(test)]
 fn evaluate_expression_live_preview(
     session: &Session,
     target_id: &str,
@@ -30310,6 +30781,171 @@ mod tests {
         assert!(
             parent_offset_y.abs() < 1e-3,
             "expected parent inspector ScrollArea NOT to scroll while wheeling over font popup, got {parent_offset_y}"
+        );
+    }
+
+    #[test]
+    fn caches_reuse_across_frames_and_invalidate_on_revision() {
+        let mut session = Session::new();
+        let track_id = session.document().video_tracks[0].id.clone();
+        let res = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "scene".to_owned(),
+                start: 0.0,
+                length: 60.0,
+                name: Some("Scene".to_owned()),
+            })
+            .unwrap();
+        let clip_id = res["clip_id"].as_str().unwrap().to_owned();
+        let mut state = PanelsState::default();
+
+        // 1. Asset usage cache
+        let u1 = compute_asset_usage_counts_cached(&session, &mut state);
+        let u2 = compute_asset_usage_counts_cached(&session, &mut state);
+        assert!(std::sync::Arc::ptr_eq(&u1, &u2));
+
+        // 2. Selected clip cache
+        let c1 = find_clip_cached(&session, &mut state, &clip_id).unwrap();
+        let c2 = find_clip_cached(&session, &mut state, &clip_id).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&c1, &c2));
+
+        // 3. Compiled expression cache
+        let e1 = compile_expr_cached(
+            &mut state,
+            "Math.sin(time) * 10",
+            zc_expr::ExprMode::ExpressionsPlus,
+        )
+        .unwrap();
+        let e2 = compile_expr_cached(
+            &mut state,
+            "Math.sin(time) * 10",
+            zc_expr::ExprMode::ExpressionsPlus,
+        )
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&e1, &e2));
+
+        // Mutating session bumps revision and invalidates revision-keyed caches.
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: clip_id.clone(),
+                property: "opacity".to_owned(),
+                value: json!(0.5),
+            })
+            .unwrap();
+        let c3 = find_clip_cached(&session, &mut state, &clip_id).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&c1, &c3));
+        let u3 = compute_asset_usage_counts_cached(&session, &mut state);
+        assert!(!std::sync::Arc::ptr_eq(&u1, &u3));
+    }
+
+    #[test]
+    fn widget_tx_command_groups_continuous_drag_into_single_undo_entry() {
+        let ctx = egui::Context::default();
+        let mut session = Session::new();
+        let track_id = session.document().video_tracks[0].id.clone();
+        let res = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "shape".to_owned(),
+                start: 0.0,
+                length: 60.0,
+                name: Some("Box".to_owned()),
+            })
+            .unwrap();
+        let clip_id = res["clip_id"].as_str().unwrap().to_owned();
+        let mut state = PanelsState::default();
+        let initial_undo_len = session.history.undo_len();
+
+        let run_step = |primary_down: bool,
+                        tracker: WidgetTxTracker,
+                        val: f64,
+                        session: &mut Session,
+                        state: &mut PanelsState| {
+            let mut events = Vec::new();
+            if primary_down {
+                events.push(egui::Event::PointerButton {
+                    pos: Pos2::new(20.0, 20.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            } else {
+                events.push(egui::Event::PointerButton {
+                    pos: Pos2::new(20.0, 20.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 120.0))),
+                events,
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |ui| {
+                apply_widget_tx_command(
+                    ui,
+                    session,
+                    state,
+                    &clip_id,
+                    "opacity_slider",
+                    "edit opacity",
+                    tracker,
+                    |session| {
+                        let _ = session.execute(Command::SetPropertyValue {
+                            target_id: clip_id.clone(),
+                            property: "opacity".to_owned(),
+                            value: json!(val),
+                        });
+                    },
+                );
+            });
+            full.textures_delta.clear();
+        };
+
+        // Start drag + 3 mid-drag frames + release frame -> must produce EXACTLY 1 undo entry.
+        run_step(
+            true,
+            WidgetTxTracker {
+                drag_started: true,
+                drag_stopped: false,
+                changed: true,
+            },
+            0.8,
+            &mut session,
+            &mut state,
+        );
+        for v in [0.7, 0.6, 0.5] {
+            run_step(
+                true,
+                WidgetTxTracker {
+                    drag_started: false,
+                    drag_stopped: false,
+                    changed: true,
+                },
+                v,
+                &mut session,
+                &mut state,
+            );
+        }
+        assert!(session.history.is_in_transaction());
+        run_step(
+            false,
+            WidgetTxTracker {
+                drag_started: false,
+                drag_stopped: true,
+                changed: false,
+            },
+            0.5,
+            &mut session,
+            &mut state,
+        );
+        assert!(!session.history.is_in_transaction());
+        assert_eq!(
+            session.history.undo_len(),
+            initial_undo_len + 1,
+            "continuous slider drag must coalesce into a single undo entry"
         );
     }
 }

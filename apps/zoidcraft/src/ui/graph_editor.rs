@@ -209,6 +209,16 @@ struct CopiedGraphKey {
     continuous_tangent: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExprCurveCacheKey {
+    session_rev: u64,
+    track_key: String,
+    min_f_bits: u64,
+    max_f_bits: u64,
+    steps: usize,
+    speed_mode: bool,
+}
+
 /// Persistent state for the dual-mode Graph Editor widget.
 #[derive(Debug, Clone)]
 pub struct GraphEditorState {
@@ -247,6 +257,9 @@ pub struct GraphEditorState {
     copied_keys: Vec<CopiedGraphKey>,
     easing_clipboard: Option<String>,
     easing_css_input: String,
+    /// Cached sampled expression curves keyed by `(session_revision, track_key, min_f_bits, max_f_bits, steps, speed_mode)`.
+    expr_curve_cache: BTreeMap<ExprCurveCacheKey, Vec<(f64, f64)>>,
+    expr_curve_cache_rev: u64,
 }
 
 impl Default for GraphEditorState {
@@ -290,6 +303,8 @@ impl GraphEditorState {
             copied_keys: Vec::new(),
             easing_clipboard: None,
             easing_css_input: String::new(),
+            expr_curve_cache: BTreeMap::new(),
+            expr_curve_cache_rev: 0,
         }
     }
 
@@ -2328,7 +2343,7 @@ fn show_curve_canvas(
     paint_adaptive_grid(&painter, state, rect, graph_plus);
 
     let fps = session.document().fps.max(1.0);
-    let doc_snapshot = session.document().clone();
+    let session_rev = session.revision();
 
     // Paint all visible curves (Value mode or Speed velocity mode, plus live expression evaluation).
     let (drag_df, drag_dv) = match &state.drag_state {
@@ -2358,7 +2373,8 @@ fn show_curve_canvas(
                         &painter,
                         state,
                         track,
-                        &doc_snapshot,
+                        session.document(),
+                        session_rev,
                         rect,
                         graph_plus,
                         false,
@@ -2373,7 +2389,8 @@ fn show_curve_canvas(
                         &painter,
                         state,
                         track,
-                        &doc_snapshot,
+                        session.document(),
+                        session_rev,
                         rect,
                         graph_plus,
                         true,
@@ -2600,7 +2617,7 @@ fn show_curve_canvas(
                         if track.is_expression {
                             eval_track_live_value(
                                 track,
-                                &doc_snapshot,
+                                session.document(),
                                 &state.handles,
                                 last.local_frame,
                             )
@@ -2848,11 +2865,13 @@ fn paint_adaptive_grid(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_expression_curve_track(
     painter: &egui::Painter,
-    state: &GraphEditorState,
+    state: &mut GraphEditorState,
     track: &CurveTrack,
     doc: &zc_session::SessionDocument,
+    session_rev: u64,
     rect: Rect,
     graph_plus: bool,
     speed_mode: bool,
@@ -2860,11 +2879,38 @@ fn paint_expression_curve_track(
     let min_f = state.screen_x_to_frame(rect.left(), rect);
     let max_f = state.screen_x_to_frame(rect.right(), rect);
     let steps = ((rect.width() / 2.5).round() as usize).clamp(48, 300);
-    let samples = if speed_mode {
-        sample_expression_velocity_curve(track, doc, &state.handles, min_f, max_f, steps)
-    } else {
-        sample_expression_curve(track, doc, &state.handles, min_f, max_f, steps)
+
+    let can_use_cache = matches!(state.drag_state, GraphDragState::None);
+    if state.expr_curve_cache_rev != session_rev {
+        state.expr_curve_cache.clear();
+        state.expr_curve_cache_rev = session_rev;
+    }
+
+    let cache_key = ExprCurveCacheKey {
+        session_rev,
+        track_key: track.track_key.clone(),
+        min_f_bits: min_f.to_bits(),
+        max_f_bits: max_f.to_bits(),
+        steps,
+        speed_mode,
     };
+    let samples: Vec<(f64, f64)> =
+        if can_use_cache && let Some(cached) = state.expr_curve_cache.get(&cache_key) {
+            cached.clone()
+        } else {
+            let computed = if speed_mode {
+                sample_expression_velocity_curve(track, doc, &state.handles, min_f, max_f, steps)
+            } else {
+                sample_expression_curve(track, doc, &state.handles, min_f, max_f, steps)
+            };
+            if can_use_cache {
+                if state.expr_curve_cache.len() >= 64 {
+                    state.expr_curve_cache.clear();
+                }
+                state.expr_curve_cache.insert(cache_key, computed.clone());
+            }
+            computed
+        };
     if samples.len() < 2 {
         return;
     }
@@ -2954,49 +3000,64 @@ fn paint_speed_curve_track(
         if span <= 1e-9 {
             continue;
         }
-        // Build temporary handle lookup keyed by shifted local frames for accurate live drag preview.
-        let mut preview_handles = state.handles.clone();
-        if (k0.local_frame - *orig_f0).abs() > 1e-9 {
-            let old0 = GraphKeyId::new(
-                &track.target_id,
-                &track.property,
-                track.channel_index,
-                *orig_f0,
-            );
-            if let Some(h) = state.handles.get(&old0).copied() {
-                let new0 = GraphKeyId::new(
+        let x0 = state.frame_to_screen_x(track.frame_offset + k0.local_frame, rect);
+        let x1 = state.frame_to_screen_x(track.frame_offset + k1.local_frame, rect);
+        if x1 < rect.left() || x0 > rect.right() {
+            prev_end_pt = None;
+            continue;
+        }
+        // Only clone handle map when an endpoint is actively shifted during a drag preview.
+        let k0_shifted = drag_df.abs() > 1e-9 && (k0.local_frame - *orig_f0).abs() > 1e-9;
+        let k1_shifted = drag_df.abs() > 1e-9 && (k1.local_frame - *orig_f1).abs() > 1e-9;
+        let owned_preview_handles;
+        let preview_handles: &BTreeMap<GraphKeyId, BezierHandlePair> = if k0_shifted || k1_shifted {
+            let mut map = state.handles.clone();
+            if k0_shifted {
+                let old0 = GraphKeyId::new(
                     &track.target_id,
                     &track.property,
                     track.channel_index,
-                    k0.local_frame,
+                    *orig_f0,
                 );
-                preview_handles.insert(new0, h);
+                if let Some(h) = state.handles.get(&old0).copied() {
+                    let new0 = GraphKeyId::new(
+                        &track.target_id,
+                        &track.property,
+                        track.channel_index,
+                        k0.local_frame,
+                    );
+                    map.insert(new0, h);
+                }
             }
-        }
-        if (k1.local_frame - *orig_f1).abs() > 1e-9 {
-            let old1 = GraphKeyId::new(
-                &track.target_id,
-                &track.property,
-                track.channel_index,
-                *orig_f1,
-            );
-            if let Some(h) = state.handles.get(&old1).copied() {
-                let new1 = GraphKeyId::new(
+            if k1_shifted {
+                let old1 = GraphKeyId::new(
                     &track.target_id,
                     &track.property,
                     track.channel_index,
-                    k1.local_frame,
+                    *orig_f1,
                 );
-                preview_handles.insert(new1, h);
+                if let Some(h) = state.handles.get(&old1).copied() {
+                    let new1 = GraphKeyId::new(
+                        &track.target_id,
+                        &track.property,
+                        track.channel_index,
+                        k1.local_frame,
+                    );
+                    map.insert(new1, h);
+                }
             }
-        }
+            owned_preview_handles = map;
+            &owned_preview_handles
+        } else {
+            &state.handles
+        };
 
         let steps = 48_usize;
         let mut pts = Vec::with_capacity(steps + 1);
         for s in 0..=steps {
             let u = s as f64 / steps as f64;
             let f = k0.local_frame + span * u;
-            let vel = eval_segment_velocity(track, k0, k1, f, fps, &preview_handles);
+            let vel = eval_segment_velocity(track, k0, k1, f, fps, preview_handles);
             pts.push(pos2(
                 state.frame_to_screen_x(track.frame_offset + f, rect),
                 state.value_to_screen_y(vel, rect),
@@ -3230,10 +3291,15 @@ fn paint_curve_track(
         }
     }
 
-    // Sample each segment accurately via zc_anim::eval_easing / eval_segment_bezier.
+    // Sample each visible segment accurately via zc_anim::eval_easing / eval_segment_bezier.
     for pair in adjusted.windows(2) {
         let (k0, orig_f0) = &pair[0];
         let (k1, orig_f1) = &pair[1];
+        let x0 = state.frame_to_screen_x(track.frame_offset + k0.local_frame, rect);
+        let x1 = state.frame_to_screen_x(track.frame_offset + k1.local_frame, rect);
+        if x1 < rect.left() || x0 > rect.right() {
+            continue;
+        }
         let (mode, easing) = InterpolationMode::from_cm3_tween_code(k1.tween);
 
         let pts: Vec<Pos2> = match mode {

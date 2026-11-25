@@ -4,7 +4,10 @@
 //! WGSL modules along with deterministic `std140` uniform buffer layouts and texture
 //! binding tables for `zc-render`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
 
 use naga::back::wgsl::{self, WriterFlags};
 use naga::front::glsl::{Frontend, Options};
@@ -306,62 +309,128 @@ fn bind_helper_arguments(
         return source.to_string();
     }
 
-    edits.sort_by_key(|a| std::cmp::Reverse(a.0));
-    let mut result = source.to_string();
-    for (at, text) in edits {
-        result.insert_str(at, &text);
-    }
-
-    // Check which `<name><suffix>` uniforms are already declared (ignoring comments).
-    let stripped = strip_comments_and_join_continuations(&result).join("\n");
-    let stripped_tokens = tokenize(&stripped);
+    // Check which `<name><suffix>` uniforms are already declared (ignoring comments) with zero allocations.
     let mut missing = Vec::new();
     for name in declarations {
         let target_uniform = format!("{name}{suffix}");
-        let already_declared =
-            has_uniform_decl_tokens(&stripped_tokens, uniform_ty, &target_uniform);
-        if !already_declared {
+        if !has_uniform_decl_in_source(source, uniform_ty, &target_uniform) {
             missing.push(format!("uniform {uniform_ty} {target_uniform};"));
         }
     }
 
     if !missing.is_empty() {
-        let insert_at = find_after_last_precision(&result);
+        let insert_at = find_after_last_precision(source);
         let decl_block = format!("\n{}\n", missing.join("\n"));
-        result.insert_str(insert_at, &decl_block);
+        edits.push((insert_at, decl_block));
     }
+
+    edits.sort_by_key(|(at, _)| *at);
+    let extra_bytes: usize = edits.iter().map(|(_, text)| text.len()).sum();
+    let mut result = String::with_capacity(source.len() + extra_bytes);
+    let mut cursor = 0;
+    for (at, text) in &edits {
+        result.push_str(&source[cursor..*at]);
+        result.push_str(text);
+        cursor = *at;
+    }
+    result.push_str(&source[cursor..]);
 
     result
 }
 
-fn has_uniform_decl_tokens(tokens: &[Token], expected_ty: &str, expected_name: &str) -> bool {
-    let mut i = 0;
-    while i < tokens.len() {
-        if matches!(&tokens[i], Token::Ident(kw) if kw == "uniform") {
-            let mut j = next_non_newline(tokens, i + 1);
-            if let Some(Token::Ident(q)) = tokens.get(j)
-                && is_precision_qual(q)
-            {
-                j = next_non_newline(tokens, j + 1);
+fn skip_ws_and_comments(bytes: &[u8], i: &mut usize) {
+    let len = bytes.len();
+    loop {
+        while *i < len && bytes[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+        if *i + 1 < len && bytes[*i] == b'\\' && bytes[*i + 1] == b'\n' {
+            *i += 2;
+            continue;
+        }
+        if *i + 2 < len && bytes[*i] == b'\\' && bytes[*i + 1] == b'\r' && bytes[*i + 2] == b'\n' {
+            *i += 3;
+            continue;
+        }
+        if *i + 1 < len && bytes[*i] == b'/' && bytes[*i + 1] == b'/' {
+            *i += 2;
+            while *i < len && bytes[*i] != b'\n' {
+                *i += 1;
             }
-            if matches!(tokens.get(j), Some(Token::Ident(ty)) if ty == expected_ty) {
-                j = next_non_newline(tokens, j + 1);
-                while j < tokens.len() {
-                    if matches!(tokens.get(j), Some(Token::Ident(n)) if n == expected_name) {
-                        let after = next_non_newline(tokens, j + 1);
-                        if matches!(tokens.get(after), Some(Token::Punct(p)) if p == ";" || p == ",")
-                        {
-                            return true;
+            continue;
+        }
+        if *i + 1 < len && bytes[*i] == b'/' && bytes[*i + 1] == b'*' {
+            *i += 2;
+            while *i + 1 < len && !(bytes[*i] == b'*' && bytes[*i + 1] == b'/') {
+                *i += 1;
+            }
+            *i = (*i + 2).min(len);
+            continue;
+        }
+        break;
+    }
+}
+
+fn scan_ident<'a>(source: &'a str, bytes: &[u8], i: &mut usize) -> Option<&'a str> {
+    let len = bytes.len();
+    if *i < len && is_ident_start_byte(bytes[*i]) {
+        let start = *i;
+        *i += 1;
+        while *i < len && is_ident_continue_byte(bytes[*i]) {
+            *i += 1;
+        }
+        Some(&source[start..*i])
+    } else {
+        None
+    }
+}
+
+fn has_uniform_decl_in_source(source: &str, expected_ty: &str, expected_name: &str) -> bool {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        skip_ws_and_comments(bytes, &mut i);
+        if i >= len {
+            break;
+        }
+        if let Some(ident) = scan_ident(source, bytes, &mut i) {
+            if ident == "uniform" {
+                let mut j = i;
+                skip_ws_and_comments(bytes, &mut j);
+                let Some(mut ty) = scan_ident(source, bytes, &mut j) else {
+                    continue;
+                };
+                if is_precision_qual(ty) {
+                    skip_ws_and_comments(bytes, &mut j);
+                    let Some(next_ty) = scan_ident(source, bytes, &mut j) else {
+                        continue;
+                    };
+                    ty = next_ty;
+                }
+                if ty == expected_ty {
+                    loop {
+                        skip_ws_and_comments(bytes, &mut j);
+                        if j >= len || bytes[j] == b';' {
+                            break;
+                        }
+                        if let Some(name) = scan_ident(source, bytes, &mut j) {
+                            if name == expected_name {
+                                let mut after = j;
+                                skip_ws_and_comments(bytes, &mut after);
+                                if after < len && (bytes[after] == b';' || bytes[after] == b',') {
+                                    return true;
+                                }
+                            }
+                        } else {
+                            j += 1;
                         }
                     }
-                    if matches!(tokens.get(j), Some(Token::Punct(p)) if p == ";") {
-                        break;
-                    }
-                    j += 1;
                 }
             }
+        } else {
+            i += 1;
         }
-        i += 1;
     }
     false
 }
@@ -457,7 +526,7 @@ pub enum ShaderError {
 }
 
 /// Optional compilation inputs such as static dropdown `#define` values and extra includes.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CompileOptions {
     /// Preprocessor macros injected right after `#version 450` (e.g., Shader+ `StaticDropdown`s).
     pub defines: BTreeMap<String, String>,
@@ -779,6 +848,73 @@ impl RewriteBudget {
     }
 }
 
+const TRANSLATION_CACHE_CAP: usize = 128;
+
+struct TranslationCacheEntry {
+    source: String,
+    options: CompileOptions,
+    compiled: CompiledCustomShader,
+}
+
+#[derive(Default)]
+struct TranslationCache {
+    buckets: HashMap<u64, Vec<TranslationCacheEntry>>,
+    order: VecDeque<u64>,
+    len: usize,
+}
+
+impl TranslationCache {
+    fn key_hash(source: &str, options: &CompileOptions) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        options.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn get(&self, source: &str, options: &CompileOptions) -> Option<CompiledCustomShader> {
+        let hash = Self::key_hash(source, options);
+        let bucket = self.buckets.get(&hash)?;
+        bucket
+            .iter()
+            .find(|entry| entry.source == source && entry.options == *options)
+            .map(|entry| entry.compiled.clone())
+    }
+
+    fn insert(&mut self, source: &str, options: &CompileOptions, compiled: CompiledCustomShader) {
+        let hash = Self::key_hash(source, options);
+        if let Some(bucket) = self.buckets.get(&hash)
+            && bucket
+                .iter()
+                .any(|entry| entry.source == source && entry.options == *options)
+        {
+            return;
+        }
+        if self.len >= TRANSLATION_CACHE_CAP
+            && let Some(old_hash) = self.order.pop_front()
+            && let Some(bucket) = self.buckets.get_mut(&old_hash)
+            && !bucket.is_empty()
+        {
+            bucket.remove(0);
+            if bucket.is_empty() {
+                self.buckets.remove(&old_hash);
+            }
+            self.len -= 1;
+        }
+        self.buckets
+            .entry(hash)
+            .or_default()
+            .push(TranslationCacheEntry {
+                source: source.to_owned(),
+                options: options.clone(),
+                compiled,
+            });
+        self.order.push_back(hash);
+        self.len += 1;
+    }
+}
+
+static TRANSLATION_CACHE: OnceLock<Mutex<TranslationCache>> = OnceLock::new();
+
 /// Translates a Panzoid GLSL ES 1.00 fragment shader into validated WGSL with custom defines/includes.
 pub fn translate_glsl_es100_with_options(
     source: &str,
@@ -795,6 +931,26 @@ pub fn translate_glsl_es100_with_options(
         )));
     }
 
+    let cache = TRANSLATION_CACHE.get_or_init(|| Mutex::new(TranslationCache::default()));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = guard.get(source, options) {
+            return Ok(hit);
+        }
+    }
+
+    let compiled = translate_glsl_es100_with_options_uncached(source, options)?;
+    {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(source, options, compiled.clone());
+    }
+    Ok(compiled)
+}
+
+fn translate_glsl_es100_with_options_uncached(
+    source: &str,
+    options: &CompileOptions,
+) -> Result<CompiledCustomShader, ShaderError> {
     let preprocessed = preprocess_source(source, options)?;
     if preprocessed.source.len() > MAX_GLSL_SOURCE_BYTES {
         return Err(ShaderError::GlslParse(format!(
@@ -951,22 +1107,20 @@ pub fn pack_uniforms(
     values: &BTreeMap<String, UniformValue>,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; layout.byte_size as usize];
-    let normalized_lookup: Option<HashMap<String, &UniformValue>> =
-        if values.keys().any(|k| k.chars().any(char::is_whitespace)) {
-            let mut map = HashMap::with_capacity(values.len());
-            for (k, v) in values {
-                if k.chars().any(char::is_whitespace) {
-                    map.entry(fix_property_name(k)).or_insert(v);
-                }
-            }
-            Some(map)
-        } else {
-            None
-        };
+    let mut normalized_lookup: Option<Option<HashMap<String, &UniformValue>>> = None;
 
     for field in &layout.fields {
         let value = values.get(&field.name).or_else(|| {
-            normalized_lookup
+            let lookup = normalized_lookup.get_or_insert_with(|| {
+                let mut map = HashMap::new();
+                for (k, v) in values {
+                    if k.chars().any(char::is_whitespace) {
+                        map.entry(fix_property_name(k)).or_insert(v);
+                    }
+                }
+                if map.is_empty() { None } else { Some(map) }
+            });
+            lookup
                 .as_ref()
                 .and_then(|map| map.get(&field.name).copied())
         });
@@ -5133,51 +5287,55 @@ fn strip_unreachable_after_return(tokens: Vec<Token>) -> Vec<Token> {
     let mut brace_depth: usize = 0;
     let mut paren_depth: usize = 0;
     let mut prev_is_block_stmt_boundary = false;
-    let mut i = 0;
+    let mut iter = tokens.into_iter().peekable();
 
-    while i < tokens.len() {
-        let tok = &tokens[i];
+    while let Some(tok) = iter.next() {
         if brace_depth > 0
             && paren_depth == 0
             && prev_is_block_stmt_boundary
-            && matches!(tok, Token::Ident(kw) if kw == "return")
+            && matches!(&tok, Token::Ident(kw) if kw == "return")
         {
             // Emit `return ...;` up through its terminating `;`.
+            out.push(tok);
             let mut ret_pd: usize = 0;
-            while i < tokens.len() {
-                let t = &tokens[i];
-                out.push(t.clone());
-                match t {
-                    Token::Punct(p) if p == "(" => ret_pd += 1,
-                    Token::Punct(p) if p == ")" => ret_pd = ret_pd.saturating_sub(1),
-                    Token::Punct(p) if p == ";" && ret_pd == 0 => {
-                        i += 1;
-                        break;
+            for t in iter.by_ref() {
+                let done = match &t {
+                    Token::Punct(p) if p == "(" => {
+                        ret_pd += 1;
+                        false
                     }
-                    _ => {}
+                    Token::Punct(p) if p == ")" => {
+                        ret_pd = ret_pd.saturating_sub(1);
+                        false
+                    }
+                    Token::Punct(p) if p == ";" && ret_pd == 0 => true,
+                    _ => false,
+                };
+                out.push(t);
+                if done {
+                    break;
                 }
-                i += 1;
             }
             // Skip unreachable tokens in the same block until matching `}` or `case`/`default`.
             let mut nested_braces: usize = 0;
-            while i < tokens.len() {
-                match &tokens[i] {
+            while let Some(next_tok) = iter.peek() {
+                match next_tok {
                     Token::Punct(p) if p == "{" => {
                         nested_braces += 1;
-                        i += 1;
+                        iter.next();
                     }
                     Token::Punct(p) if p == "}" => {
                         if nested_braces == 0 {
                             break;
                         }
                         nested_braces -= 1;
-                        i += 1;
+                        iter.next();
                     }
                     Token::Ident(kw) if nested_braces == 0 && (kw == "case" || kw == "default") => {
                         break;
                     }
                     _ => {
-                        i += 1;
+                        iter.next();
                     }
                 }
             }
@@ -5185,7 +5343,7 @@ fn strip_unreachable_after_return(tokens: Vec<Token>) -> Vec<Token> {
             continue;
         }
 
-        match tok {
+        match &tok {
             Token::Punct(p) if p == "{" => {
                 brace_depth += 1;
                 prev_is_block_stmt_boundary = true;
@@ -5210,8 +5368,7 @@ fn strip_unreachable_after_return(tokens: Vec<Token>) -> Vec<Token> {
                 prev_is_block_stmt_boundary = false;
             }
         }
-        out.push(tok.clone());
-        i += 1;
+        out.push(tok);
     }
 
     out
@@ -5531,4 +5688,76 @@ fn assemble_glsl450(
     src.push_str(body_glsl.trim());
     src.push('\n');
     src
+}
+
+#[cfg(test)]
+mod opt_tests {
+    use super::*;
+
+    #[test]
+    fn bind_helper_arguments_forward_copy_and_zero_alloc_uniform_scan() {
+        let src = r#"precision highp float;
+// uniform vec2 CurveA_range;
+uniform highp vec2 CurveB_range;
+uniform vec2 other, CurveC_range;
+void main() {
+    float a = zCurve(CurveA, zCurve(CurveB, 0.5));
+    float c = zCurve(CurveC, a);
+    gl_FragColor = vec4(c);
+}"#;
+        let out = bind_curve_ranges(src, ["CurveA", "CurveB", "CurveC"]);
+        assert!(out.contains("uniform vec2 CurveA_range;"));
+        assert_eq!(out.matches("CurveB_range").count(), 2); // decl + call arg only
+        assert_eq!(out.matches("CurveC_range").count(), 2); // decl + call arg only
+        assert!(out.contains("zCurve(CurveA, zCurve(CurveB, 0.5, CurveB_range), CurveA_range)"));
+        assert!(out.contains("zCurve(CurveC, a, CurveC_range)"));
+    }
+
+    #[test]
+    fn translation_cache_hits_respects_options_and_stays_bounded() {
+        let src = "precision mediump float; uniform float Gain; void main() { gl_FragColor = vec4(Gain); }";
+        let mut opts_a = CompileOptions::default();
+        opts_a.defines.insert("MODE".to_string(), "1".to_string());
+        let mut opts_b = CompileOptions::default();
+        opts_b.defines.insert("MODE".to_string(), "2".to_string());
+
+        let r1 = translate_glsl_es100_with_options(src, &opts_a).expect("compile a1");
+        let r2 = translate_glsl_es100_with_options(src, &opts_a).expect("compile a2 cached");
+        assert_eq!(r1, r2);
+
+        let src_if = "precision mediump float; void main() {\n#if MODE == 1\n gl_FragColor = vec4(1.0);\n#else\n gl_FragColor = vec4(0.0);\n#endif\n}";
+        let ra = translate_glsl_es100_with_options(src_if, &opts_a).expect("mode 1");
+        let rb = translate_glsl_es100_with_options(src_if, &opts_b).expect("mode 2");
+        assert_ne!(ra.wgsl, rb.wgsl);
+
+        // Verify cache capacity cap is strictly enforced.
+        let mut local_cache = TranslationCache::default();
+        for i in 0..(TRANSLATION_CACHE_CAP + 32) {
+            local_cache.insert(&format!("s{i}"), &opts_a, r1.clone());
+        }
+        assert_eq!(local_cache.len, TRANSLATION_CACHE_CAP);
+        assert!(local_cache.get("s0", &opts_a).is_none());
+        assert!(
+            local_cache
+                .get(&format!("s{}", TRANSLATION_CACHE_CAP + 31), &opts_a)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pack_uniforms_lazy_normalized_lookup_handles_exact_and_spaced_keys() {
+        let src = "precision mediump float; uniform float My_Param; uniform float Plain; void main() { gl_FragColor = vec4(My_Param + Plain); }";
+        let compiled = translate_glsl_es100_with_options(src, &CompileOptions::default()).unwrap();
+
+        let mut exact = BTreeMap::new();
+        exact.insert("My_Param".to_string(), UniformValue::Float(2.5));
+        exact.insert("Plain".to_string(), UniformValue::Float(4.0));
+        let buf_exact = pack_uniforms(&compiled.uniform_layout, &exact);
+
+        let mut spaced = BTreeMap::new();
+        spaced.insert("My Param".to_string(), UniformValue::Float(2.5));
+        spaced.insert("Plain".to_string(), UniformValue::Float(4.0));
+        let buf_spaced = pack_uniforms(&compiled.uniform_layout, &spaced);
+        assert_eq!(buf_exact, buf_spaced);
+    }
 }

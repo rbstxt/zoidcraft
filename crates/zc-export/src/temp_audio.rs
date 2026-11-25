@@ -124,7 +124,7 @@ pub fn write_temp_stereo_wav_f32(
     let guard = TempFileGuard::new(path.clone());
 
     let file = File::create(&path)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
     writer.write_all(b"RIFF")?;
     writer.write_all(&riff_size.to_le_bytes())?;
@@ -148,19 +148,27 @@ pub fn write_temp_stereo_wav_f32(
     // data chunk
     writer.write_all(b"data")?;
     writer.write_all(&data_bytes.to_le_bytes())?;
-    for &[l, r] in samples {
-        let l_clean = if l.is_finite() {
-            l.clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        let r_clean = if r.is_finite() {
-            r.clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        writer.write_all(&l_clean.to_le_bytes())?;
-        writer.write_all(&r_clean.to_le_bytes())?;
+
+    // Batch 1,024 stereo frames (8,192 bytes) on the stack per `write_all` call.
+    let mut batch_buf = [0_u8; 8192];
+    for chunk in samples.chunks(1024) {
+        let mut offset = 0_usize;
+        for &[l, r] in chunk {
+            let l_clean = if l.is_finite() {
+                l.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            let r_clean = if r.is_finite() {
+                r.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            batch_buf[offset..offset + 4].copy_from_slice(&l_clean.to_le_bytes());
+            batch_buf[offset + 4..offset + 8].copy_from_slice(&r_clean.to_le_bytes());
+            offset += 8;
+        }
+        writer.write_all(&batch_buf[..offset])?;
     }
 
     writer.flush()?;

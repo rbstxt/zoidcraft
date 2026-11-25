@@ -264,7 +264,7 @@ impl MeshData {
         subdivide_mesh(self, polygon_count)
     }
 
-    /// Appends another mesh into `self`, offsetting indices and updating bounds.
+    /// Appends another mesh into `self`, offsetting indices and updating bounds in O(1).
     pub fn merge(&mut self, other: &MeshData) {
         if other.vertices.is_empty() {
             return;
@@ -286,7 +286,14 @@ impl MeshData {
         }
         self.vertices.extend_from_slice(&other.vertices);
         self.indices.extend(other.indices.iter().map(|&i| i + base));
-        self.recompute_bounds();
+        if prev_len == 0 {
+            self.bounds = other.bounds;
+        } else {
+            self.bounds = Aabb3 {
+                min: self.bounds.min.min(other.bounds.min),
+                max: self.bounds.max.max(other.bounds.max),
+            };
+        }
     }
 }
 

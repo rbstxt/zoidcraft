@@ -51,35 +51,97 @@ impl WaveformPeaks {
         let mut max_peaks = Vec::with_capacity(bucket_count);
         let inv_ch = 1.0_f32 / ch as f32;
 
-        for bucket_idx in 0..bucket_count {
-            let start = (((bucket_idx as f64) * sr / pps).floor() as usize).min(total_frames - 1);
-            let end = ((((bucket_idx + 1) as f64) * sr / pps)
-                .floor()
-                .max((start + 1) as f64) as usize)
-                .min(total_frames);
-            let mut min_avg = 0.0_f32;
-            let mut max_avg = 0.0_f32;
+        let samples = &buffer.samples_interleaved_f32;
+        match ch {
+            1 => {
+                for bucket_idx in 0..bucket_count {
+                    let start =
+                        (((bucket_idx as f64) * sr / pps).floor() as usize).min(total_frames - 1);
+                    let end = ((((bucket_idx + 1) as f64) * sr / pps)
+                        .floor()
+                        .max((start + 1) as f64) as usize)
+                        .min(total_frames);
+                    let mut min_sum = 0.0_f32;
+                    let mut max_sum = 0.0_f32;
 
-            for frame_idx in start..end {
-                let base = frame_idx * ch;
-                let mut sum = 0.0_f32;
-                for c in 0..ch {
-                    let s = buffer.samples_interleaved_f32[base + c];
-                    if s.is_finite() {
-                        sum += s;
+                    for &s in &samples[start..end] {
+                        if s.is_finite() {
+                            if s < min_sum {
+                                min_sum = s;
+                            }
+                            if s > max_sum {
+                                max_sum = s;
+                            }
+                        }
                     }
-                }
-                let avg = (sum * inv_ch).clamp(-1.0, 1.0);
-                if avg < min_avg {
-                    min_avg = avg;
-                }
-                if avg > max_avg {
-                    max_avg = avg;
+
+                    let min_avg = min_sum.clamp(-1.0, 1.0);
+                    let max_avg = max_sum.clamp(-1.0, 1.0);
+                    min_peaks.push((min_avg * 127.0).clamp(-127.0, 127.0) as i8);
+                    max_peaks.push((max_avg * 127.0).clamp(-127.0, 127.0) as i8);
                 }
             }
+            2 => {
+                for bucket_idx in 0..bucket_count {
+                    let start =
+                        (((bucket_idx as f64) * sr / pps).floor() as usize).min(total_frames - 1);
+                    let end = ((((bucket_idx + 1) as f64) * sr / pps)
+                        .floor()
+                        .max((start + 1) as f64) as usize)
+                        .min(total_frames);
+                    let mut min_sum = 0.0_f32;
+                    let mut max_sum = 0.0_f32;
 
-            min_peaks.push((min_avg * 127.0).clamp(-127.0, 127.0) as i8);
-            max_peaks.push((max_avg * 127.0).clamp(-127.0, 127.0) as i8);
+                    for &[p0, p1] in samples[start * 2..end * 2].as_chunks::<2>().0 {
+                        let s0 = if p0.is_finite() { p0 } else { 0.0 };
+                        let s1 = if p1.is_finite() { p1 } else { 0.0 };
+                        let sum = s0 + s1;
+                        if sum < min_sum {
+                            min_sum = sum;
+                        }
+                        if sum > max_sum {
+                            max_sum = sum;
+                        }
+                    }
+
+                    let min_avg = (min_sum * 0.5).clamp(-1.0, 1.0);
+                    let max_avg = (max_sum * 0.5).clamp(-1.0, 1.0);
+                    min_peaks.push((min_avg * 127.0).clamp(-127.0, 127.0) as i8);
+                    max_peaks.push((max_avg * 127.0).clamp(-127.0, 127.0) as i8);
+                }
+            }
+            _ => {
+                for bucket_idx in 0..bucket_count {
+                    let start =
+                        (((bucket_idx as f64) * sr / pps).floor() as usize).min(total_frames - 1);
+                    let end = ((((bucket_idx + 1) as f64) * sr / pps)
+                        .floor()
+                        .max((start + 1) as f64) as usize)
+                        .min(total_frames);
+                    let mut min_sum = 0.0_f32;
+                    let mut max_sum = 0.0_f32;
+
+                    for frame in samples[start * ch..end * ch].chunks_exact(ch) {
+                        let mut sum = 0.0_f32;
+                        for &s in frame {
+                            if s.is_finite() {
+                                sum += s;
+                            }
+                        }
+                        if sum < min_sum {
+                            min_sum = sum;
+                        }
+                        if sum > max_sum {
+                            max_sum = sum;
+                        }
+                    }
+
+                    let min_avg = (min_sum * inv_ch).clamp(-1.0, 1.0);
+                    let max_avg = (max_sum * inv_ch).clamp(-1.0, 1.0);
+                    min_peaks.push((min_avg * 127.0).clamp(-127.0, 127.0) as i8);
+                    max_peaks.push((max_avg * 127.0).clamp(-127.0, 127.0) as i8);
+                }
+            }
         }
 
         Self {
@@ -325,5 +387,80 @@ mod tests {
         let frozen_end = peaks.sample_columns(1.0, 1.0, 8);
         assert_eq!(frozen_end.len(), 8);
         assert!(frozen_end.iter().all(|c| c.min_i8 <= -70 && c.max_i8 == 0));
+    }
+
+    #[test]
+    fn waveform_peaks_channel_specializations_match_reference_and_handle_non_finite() {
+        for ch in [1_u16, 2, 4] {
+            let sr = 48_000_u32;
+            let frames = 2_400_usize;
+            let ch_u = usize::from(ch);
+            let mut samples = Vec::with_capacity(frames * ch_u);
+            for i in 0..frames {
+                let t = i as f64 / f64::from(sr);
+                for c in 0..ch_u {
+                    let v = if i == 100 && c == 0 {
+                        f32::NAN
+                    } else if i == 250 && c == ch_u - 1 {
+                        f32::INFINITY
+                    } else if i == 500 {
+                        1.5 // tests > 1.0 clamping
+                    } else if i == 750 {
+                        -1.5 // tests < -1.0 clamping
+                    } else {
+                        ((TAU * (150.0 + c as f64 * 90.0) * t).sin() as f32) * 0.85
+                    };
+                    samples.push(v);
+                }
+            }
+            let buf = AudioBuffer {
+                sample_rate: sr,
+                channels: ch,
+                samples_interleaved_f32: samples,
+            };
+            let peaks = WaveformPeaks::from_audio_buffer_with_rate(&buf, 200);
+
+            // Reference calculation matching original per-sample implementation.
+            let pps = 200.0_f64;
+            let sr_f = f64::from(sr);
+            let bucket_count = (((frames as f64) * pps) / sr_f).ceil().max(1.0) as usize;
+            let inv_ch = 1.0_f32 / ch_u as f32;
+            let mut ref_min = Vec::with_capacity(bucket_count);
+            let mut ref_max = Vec::with_capacity(bucket_count);
+            for b in 0..bucket_count {
+                let start = (((b as f64) * sr_f / pps).floor() as usize).min(frames - 1);
+                let end = ((((b + 1) as f64) * sr_f / pps)
+                    .floor()
+                    .max((start + 1) as f64) as usize)
+                    .min(frames);
+                let mut min_avg = 0.0_f32;
+                let mut max_avg = 0.0_f32;
+                for f in start..end {
+                    let mut sum = 0.0_f32;
+                    for c in 0..ch_u {
+                        let s = buf.samples_interleaved_f32[f * ch_u + c];
+                        if s.is_finite() {
+                            sum += s;
+                        }
+                    }
+                    let avg = (sum * inv_ch).clamp(-1.0, 1.0);
+                    min_avg = min_avg.min(avg);
+                    max_avg = max_avg.max(avg);
+                }
+                ref_min.push((min_avg * 127.0).clamp(-127.0, 127.0) as i8);
+                ref_max.push((max_avg * 127.0).clamp(-127.0, 127.0) as i8);
+            }
+
+            assert_eq!(
+                peaks.min_peaks(),
+                ref_min.as_slice(),
+                "min mismatch ch={ch}"
+            );
+            assert_eq!(
+                peaks.max_peaks(),
+                ref_max.as_slice(),
+                "max mismatch ch={ch}"
+            );
+        }
     }
 }

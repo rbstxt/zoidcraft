@@ -35,6 +35,79 @@ pub struct AudioExprContext<'a> {
     pub controls_by_id: &'a HashMap<String, f64>,
 }
 
+/// Pre-parsed audio scalar expression AST for repeated evaluation without re-lexing or re-parsing.
+#[derive(Debug, Clone)]
+pub struct CompiledAudioExpr {
+    stmts: Vec<Stmt>,
+}
+
+impl CompiledAudioExpr {
+    /// Returns `true` if the compiled expression contains no executable statements.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.stmts.is_empty()
+    }
+}
+
+/// Tokenizes and parses a CM3 / Expressions+ scalar expression once for repeated evaluation.
+pub fn compile_audio_expression(source: &str) -> Result<CompiledAudioExpr, String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Ok(CompiledAudioExpr { stmts: Vec::new() });
+    }
+    let tokens = tokenize(trimmed)?;
+    if tokens.is_empty() {
+        return Ok(CompiledAudioExpr { stmts: Vec::new() });
+    }
+    let mut parser = Parser {
+        tokens: &tokens,
+        pos: 0,
+        depth: 0,
+    };
+    let stmts = parser.parse_program()?;
+    Ok(CompiledAudioExpr { stmts })
+}
+
+/// Evaluates a pre-compiled [`CompiledAudioExpr`] against `ctx`.
+pub fn eval_compiled_audio_expression(
+    compiled: &CompiledAudioExpr,
+    ctx: &AudioExprContext<'_>,
+) -> Result<f64, String> {
+    if compiled.stmts.is_empty() {
+        return Ok(ctx.value);
+    }
+    let mut env = EvalState {
+        ctx,
+        vars: HashMap::new(),
+        steps: 0,
+    };
+    let mut last = Val::Num(ctx.value);
+    for stmt in &compiled.stmts {
+        match env.eval_stmt(stmt)? {
+            StmtFlow::Value(v) => last = v,
+            StmtFlow::Return(v) => return val_to_f64(&v),
+        }
+    }
+    val_to_f64(&last)
+}
+
+/// Evaluates a pre-compiled [`CompiledAudioExpr`], falling back to `ctx.value` on error or
+/// non-finite output.
+#[must_use]
+pub fn eval_compiled_audio_expression_or_fallback(
+    compiled: &CompiledAudioExpr,
+    ctx: &AudioExprContext<'_>,
+) -> f64 {
+    match eval_compiled_audio_expression(compiled, ctx) {
+        Ok(v) if v.is_finite() => v,
+        Ok(_) => ctx.value,
+        Err(err) => {
+            tracing::debug!("compiled audio expression fallback ({err})");
+            ctx.value
+        }
+    }
+}
+
 /// Evaluates a CM3 / Expressions+ scalar expression for an audio clip property,
 /// falling back to `ctx.value` if the expression is empty, unsupported, non-finite, or errors.
 #[must_use]
@@ -51,33 +124,8 @@ pub fn eval_audio_expression_or_fallback(source: &str, ctx: &AudioExprContext<'_
 
 /// Evaluates a CM3 / Expressions+ scalar expression for an audio clip property.
 pub fn eval_audio_expression(source: &str, ctx: &AudioExprContext<'_>) -> Result<f64, String> {
-    let trimmed = source.trim();
-    if trimmed.is_empty() {
-        return Ok(ctx.value);
-    }
-    let tokens = tokenize(trimmed)?;
-    if tokens.is_empty() {
-        return Ok(ctx.value);
-    }
-    let mut parser = Parser {
-        tokens: &tokens,
-        pos: 0,
-        depth: 0,
-    };
-    let stmts = parser.parse_program()?;
-    let mut env = EvalState {
-        ctx,
-        vars: HashMap::new(),
-        steps: 0,
-    };
-    let mut last = Val::Num(ctx.value);
-    for stmt in &stmts {
-        match env.eval_stmt(stmt)? {
-            StmtFlow::Value(v) => last = v,
-            StmtFlow::Return(v) => return val_to_f64(&v),
-        }
-    }
-    val_to_f64(&last)
+    let compiled = compile_audio_expression(source)?;
+    eval_compiled_audio_expression(&compiled, ctx)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1348,5 +1396,44 @@ mod tests {
         );
         // Unknown curve returns error (and fallback returns ctx.value).
         assert!(eval_audio_expression("ease(0.5, 'NoSuchCurve', 'In')", &ctx).is_err());
+    }
+
+    #[test]
+    fn compiled_audio_expression_matches_uncompiled_across_frames() {
+        let mut by_name = HashMap::new();
+        by_name.insert("Gain".to_owned(), 0.65);
+        let mut by_id = HashMap::new();
+        by_id.insert("c_pan".to_owned(), -0.4);
+
+        let expressions = [
+            "linear(frame, 0, 60, 0.2, 1.0) * control('Gain')",
+            "var ph = time * Math.PI * 2; return Math.sin(ph) * control('Pan', 'c_pan');",
+            "frame >= 30 ? ease(time, 'Cubic', 'InOut') : clamp(value + wave(frame) * 0.1, 0, 1)",
+            "random(frame + 1) * 0.5 + 0.25",
+            "   // comments only",
+        ];
+
+        for src in expressions {
+            let compiled = compile_audio_expression(src).expect("valid expression compiles");
+            for f in 0..64 {
+                let ctx = AudioExprContext {
+                    frame: f64::from(f),
+                    time: f64::from(f) / 30.0,
+                    fps: 30.0,
+                    value: 0.8,
+                    controls_by_name: &by_name,
+                    controls_by_id: &by_id,
+                };
+                let expected = eval_audio_expression_or_fallback(src, &ctx);
+                let got = eval_compiled_audio_expression_or_fallback(&compiled, &ctx);
+                assert!(
+                    (got - expected).abs() < 1e-12,
+                    "mismatch for `{src}` at frame {f}: got {got}, expected {expected}"
+                );
+            }
+        }
+
+        // Syntax error rejected once at compile time.
+        assert!(compile_audio_expression("1 + (2 * 3").is_err());
     }
 }

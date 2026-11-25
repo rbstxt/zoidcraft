@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::easing::{
     BezierSegment, EasingKind, InterpolationMode, eval_easing, eval_segment_bezier,
-    has_native_bezier_defaults,
+    has_native_bezier_defaults, segment_bezier_weights,
 };
 
 /// Tolerance used to match keyframe frame positions for overwrite/removal/navigation.
@@ -229,6 +229,52 @@ impl Animatable for f64 {
     }
 }
 
+#[inline]
+fn eval_bezier_array<const N: usize>(
+    f0: f64,
+    v0: &[f64; N],
+    out_tangent: [f64; 2],
+    f1: f64,
+    v1: &[f64; N],
+    in_tangent: [f64; 2],
+    frame: f64,
+) -> [f64; N] {
+    let duration = f1 - f0;
+    if !frame.is_finite() || !duration.is_finite() || duration <= 0.0 || frame <= f0 {
+        return *v0;
+    }
+    if frame >= f1 {
+        return *v1;
+    }
+    let out_y = if out_tangent[1].is_finite() {
+        out_tangent[1]
+    } else {
+        0.0
+    };
+    let in_y = if in_tangent[1].is_finite() {
+        in_tangent[1]
+    } else {
+        0.0
+    };
+    if out_y == 0.0 && in_y == 0.0 && (0..N).all(|i| (v1[i] - v0[i]).abs() == 0.0) {
+        return *v0;
+    }
+    let (s, w) = segment_bezier_weights(f0, out_tangent[0], f1, in_tangent[0], frame, true);
+    let s_out_y = s * out_y;
+    let s_in_y = s * in_y;
+    std::array::from_fn(|i| {
+        let y0 = v0[i];
+        let y3 = v1[i];
+        if (y3 - y0).abs() == 0.0 && out_y == 0.0 && in_y == 0.0 {
+            y0
+        } else {
+            let y1 = y0 + s_out_y;
+            let y2 = y3 + s_in_y;
+            w[0] * y0 + w[1] * y1 + w[2] * y2 + w[3] * y3
+        }
+    })
+}
+
 impl Animatable for [f64; 2] {
     const IS_INTERPOLATABLE: bool = true;
 
@@ -249,10 +295,7 @@ impl Animatable for [f64; 2] {
         in_tangent: [f64; 2],
         frame: f64,
     ) -> Self {
-        [
-            f64::eval_bezier_segment(f0, &v0[0], out_tangent, f1, &v1[0], in_tangent, frame),
-            f64::eval_bezier_segment(f0, &v0[1], out_tangent, f1, &v1[1], in_tangent, frame),
-        ]
+        eval_bezier_array(f0, v0, out_tangent, f1, v1, in_tangent, frame)
     }
 
     fn sub(a: &Self, b: &Self) -> Self {
@@ -292,11 +335,7 @@ impl Animatable for [f64; 3] {
         in_tangent: [f64; 2],
         frame: f64,
     ) -> Self {
-        [
-            f64::eval_bezier_segment(f0, &v0[0], out_tangent, f1, &v1[0], in_tangent, frame),
-            f64::eval_bezier_segment(f0, &v0[1], out_tangent, f1, &v1[1], in_tangent, frame),
-            f64::eval_bezier_segment(f0, &v0[2], out_tangent, f1, &v1[2], in_tangent, frame),
-        ]
+        eval_bezier_array(f0, v0, out_tangent, f1, v1, in_tangent, frame)
     }
 
     fn sub(a: &Self, b: &Self) -> Self {
@@ -337,12 +376,7 @@ impl Animatable for [f64; 4] {
         in_tangent: [f64; 2],
         frame: f64,
     ) -> Self {
-        [
-            f64::eval_bezier_segment(f0, &v0[0], out_tangent, f1, &v1[0], in_tangent, frame),
-            f64::eval_bezier_segment(f0, &v0[1], out_tangent, f1, &v1[1], in_tangent, frame),
-            f64::eval_bezier_segment(f0, &v0[2], out_tangent, f1, &v1[2], in_tangent, frame),
-            f64::eval_bezier_segment(f0, &v0[3], out_tangent, f1, &v1[3], in_tangent, frame),
-        ]
+        eval_bezier_array(f0, v0, out_tangent, f1, v1, in_tangent, frame)
     }
 
     fn sub(a: &Self, b: &Self) -> Self {
@@ -383,44 +417,20 @@ impl Animatable for [f32; 4] {
         in_tangent: [f64; 2],
         frame: f64,
     ) -> Self {
-        [
-            f64::eval_bezier_segment(
-                f0,
-                &f64::from(v0[0]),
-                out_tangent,
-                f1,
-                &f64::from(v1[0]),
-                in_tangent,
-                frame,
-            ) as f32,
-            f64::eval_bezier_segment(
-                f0,
-                &f64::from(v0[1]),
-                out_tangent,
-                f1,
-                &f64::from(v1[1]),
-                in_tangent,
-                frame,
-            ) as f32,
-            f64::eval_bezier_segment(
-                f0,
-                &f64::from(v0[2]),
-                out_tangent,
-                f1,
-                &f64::from(v1[2]),
-                in_tangent,
-                frame,
-            ) as f32,
-            f64::eval_bezier_segment(
-                f0,
-                &f64::from(v0[3]),
-                out_tangent,
-                f1,
-                &f64::from(v1[3]),
-                in_tangent,
-                frame,
-            ) as f32,
-        ]
+        let v0_f64 = [
+            f64::from(v0[0]),
+            f64::from(v0[1]),
+            f64::from(v0[2]),
+            f64::from(v0[3]),
+        ];
+        let v1_f64 = [
+            f64::from(v1[0]),
+            f64::from(v1[1]),
+            f64::from(v1[2]),
+            f64::from(v1[3]),
+        ];
+        let out = eval_bezier_array(f0, &v0_f64, out_tangent, f1, &v1_f64, in_tangent, frame);
+        [out[0] as f32, out[1] as f32, out[2] as f32, out[3] as f32]
     }
 
     fn sub(a: &Self, b: &Self) -> Self {
@@ -584,7 +594,12 @@ impl<T: Animatable> DynamicProperty<T> {
 
     /// Ensures `keyframes` are sorted by ascending `frame`.
     pub fn sort_keyframes(&mut self) {
-        self.keyframes.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+        if !self
+            .keyframes
+            .is_sorted_by(|a, b| a.frame.total_cmp(&b.frame).is_le())
+        {
+            self.keyframes.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+        }
     }
 
     /// Evaluates the property's keyframed/static value at `frame`.
@@ -832,8 +847,9 @@ impl<T: Animatable> DynamicProperty<T> {
             return;
         }
         let len = self.keyframes.len();
-        let seg_is_native_default: Vec<bool> = (0..len.saturating_sub(1))
-            .map(|i| {
+        let mut prev_seg_native_default = false;
+        for i in 0..len {
+            let cur_seg_native_default = if i + 1 < len {
                 match (
                     self.keyframes[i].out_tangent,
                     self.keyframes[i + 1].in_tangent,
@@ -841,14 +857,15 @@ impl<T: Animatable> DynamicProperty<T> {
                     (Some(out_t), Some(in_t)) => has_native_bezier_defaults(out_t, in_t),
                     _ => false,
                 }
-            })
-            .collect();
+            } else {
+                false
+            };
 
-        for (i, kf) in self.keyframes.iter_mut().enumerate() {
+            let kf = &mut self.keyframes[i];
             kf.frame *= scale;
             if let Some(in_t) = &mut kf.in_tangent {
                 let skip = if i > 0 {
-                    seg_is_native_default[i - 1]
+                    prev_seg_native_default
                 } else {
                     (in_t[0] + 10.0).abs() <= 1e-8 && in_t[1].abs() <= 1e-8
                 };
@@ -858,7 +875,7 @@ impl<T: Animatable> DynamicProperty<T> {
             }
             if let Some(out_t) = &mut kf.out_tangent {
                 let skip = if i + 1 < len {
-                    seg_is_native_default[i]
+                    cur_seg_native_default
                 } else {
                     (out_t[0] - 10.0).abs() <= 1e-8 && out_t[1].abs() <= 1e-8
                 };
@@ -866,6 +883,7 @@ impl<T: Animatable> DynamicProperty<T> {
                     out_t[0] *= scale;
                 }
             }
+            prev_seg_native_default = cur_seg_native_default;
         }
     }
 }
@@ -886,7 +904,11 @@ impl DynamicProperty<f64> {
             acc += first.value * (b.min(first.frame) - a);
         }
 
-        for pair in self.keyframes.windows(2) {
+        let start_idx = self
+            .keyframes
+            .partition_point(|kf| kf.frame <= a)
+            .saturating_sub(1);
+        for pair in self.keyframes[start_idx..].windows(2) {
             let k0 = &pair[0];
             let k1 = &pair[1];
             if !k0.frame.is_finite() || !k1.frame.is_finite() {
@@ -1326,5 +1348,55 @@ mod tests {
         let fps = 30.0;
         let expected_vel = (cubic.evaluate(f + 0.01 * fps) - cubic.evaluate(f - 0.01 * fps)) / 0.02;
         assert!(approx_eq(cubic.velocity(f, fps), expected_vel, 1e-12));
+    }
+
+    #[test]
+    fn integrate_many_keyframes_partition_point_matches_trapezoid_sum() {
+        let mut kfs = Vec::new();
+        for i in -5..=20 {
+            let f = (i * 5) as f64;
+            let v = (i * i) as f64;
+            kfs.push(Keyframe::new(f, v));
+        }
+        let prop = DynamicProperty::new_animated(kfs);
+        // Reference full-scan trapezoid integral over [a, b].
+        let ref_integral = |a: f64, b: f64| -> f64 {
+            let first = &prop.keyframes[0];
+            let last = prop.keyframes.last().unwrap();
+            let mut acc = 0.0;
+            if a < first.frame {
+                acc += first.value * (b.min(first.frame) - a);
+            }
+            for pair in prop.keyframes.windows(2) {
+                let (k0, k1) = (&pair[0], &pair[1]);
+                let s = a.max(k0.frame);
+                let e = b.min(k1.frame);
+                if e > s {
+                    let span = k1.frame - k0.frame;
+                    let slope = (k1.value - k0.value) / span;
+                    let dt = e - s;
+                    let v0 = k0.value + slope * (s - k0.frame);
+                    acc += 0.5 * slope * dt * dt + v0 * dt;
+                }
+            }
+            if b > last.frame {
+                acc += last.value * (b - a.max(last.frame));
+            }
+            acc
+        };
+        for &target in &[
+            -40.0, -25.0, -12.5, -5.0, 0.0, 7.5, 25.0, 63.25, 100.0, 120.0,
+        ] {
+            let expected = if target >= 0.0 {
+                ref_integral(0.0, target)
+            } else {
+                -ref_integral(target, 0.0)
+            };
+            assert!(
+                approx_eq(prop.integrate(target), expected, 1e-9),
+                "integrate({target}) mismatch: got {}, expected {expected}",
+                prop.integrate(target)
+            );
+        }
     }
 }

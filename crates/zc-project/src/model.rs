@@ -577,13 +577,39 @@ impl Project {
         bytes: Vec<u8>,
     ) -> String {
         let digest = sha256_hex(&bytes);
+        self.insert_binary_asset_prehashed(kind, filename, None, bytes, digest)
+    }
+
+    /// Inserts or replaces an embedded binary asset using a pre-computed 64-character ASCII hex
+    /// SHA-256 digest when valid, avoiding synchronous re-hashing of large media payloads on the
+    /// UI thread (falls back to [`sha256_hex`] if `sha256` is not a valid 64-hex digest).
+    ///
+    /// Preserves an optional canonical `url` (e.g. local disk path) so media decoders can open
+    /// the original file directly without spilling large embedded buffers to temporary files.
+    pub fn insert_binary_asset_prehashed(
+        &mut self,
+        kind: AssetKind,
+        filename: impl Into<String>,
+        url: Option<String>,
+        bytes: Vec<u8>,
+        sha256: String,
+    ) -> String {
+        let digest = if sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if sha256.bytes().any(|b| b.is_ascii_uppercase()) {
+                sha256.to_ascii_lowercase()
+            } else {
+                sha256
+            }
+        } else {
+            sha256_hex(&bytes)
+        };
         let size = bytes.len() as u64;
         let record = AssetRecord {
             id: digest.clone(),
             kind,
             source: AssetSource::File,
             filename: filename.into(),
-            url: None,
+            url,
             external: false,
             bytes: Some(bytes),
             missing: false,
@@ -593,6 +619,39 @@ impl Project {
         };
         self.assets.insert(digest.clone(), record);
         digest
+    }
+
+    /// Inserts or replaces an external file-linked asset without buffering its bytes into RAM
+    /// (for large local media files that should stream directly from disk and must not count
+    /// against embedded archive memory limits).
+    ///
+    /// Derives a deterministic 64-character lowercase hex identifier from `sha256_seed`
+    /// (e.g. canonical path + size + mtime) and sets `external: true`, `bytes: None`,
+    /// `missing: false`, `url: Some(url)`, `sha256: id`, and `size`.
+    pub fn insert_external_asset(
+        &mut self,
+        kind: AssetKind,
+        filename: impl Into<String>,
+        url: String,
+        size: u64,
+        sha256_seed: &str,
+    ) -> String {
+        let id = sha256_hex(sha256_seed.as_bytes());
+        let record = AssetRecord {
+            id: id.clone(),
+            kind,
+            source: AssetSource::File,
+            filename: filename.into(),
+            url: Some(url),
+            external: true,
+            bytes: None,
+            missing: false,
+            sha256: id.clone(),
+            size,
+            preserved: BTreeMap::new(),
+        };
+        self.assets.insert(id.clone(), record);
+        id
     }
 }
 
@@ -2740,5 +2799,102 @@ mod tests {
         let dof = CameraDofParams::default();
         assert_eq!(dof.near_blur.value.as_f64(), Some(100.0));
         assert_eq!(dof.far_blur.value.as_f64(), Some(100.0));
+    }
+
+    #[test]
+    fn insert_binary_asset_prehashed_preserves_url_and_avoids_rehashing() {
+        let mut project = Project::new_cm3_default();
+        let payload = b"prehashed-video-payload".to_vec();
+        // Deliberately distinct valid 64-hex digest (with uppercase letters) proves we trust
+        // a valid pre-computed SHA-256 without recomputing `sha256_hex(&bytes)`.
+        let sentinel_digest = "A1B2C3D4".repeat(8);
+        let expected_canonical = sentinel_digest.to_ascii_lowercase();
+        let disk_path = "/media/clips/intro.mp4".to_owned();
+
+        let id = project.insert_binary_asset_prehashed(
+            AssetKind::Av,
+            "intro.mp4",
+            Some(disk_path.clone()),
+            payload.clone(),
+            sentinel_digest,
+        );
+        assert_eq!(id, expected_canonical);
+        assert_ne!(id, sha256_hex(&payload));
+        let rec = &project.assets[&id];
+        assert_eq!(rec.id, expected_canonical);
+        assert_eq!(rec.sha256, expected_canonical);
+        assert_eq!(rec.url.as_deref(), Some(disk_path.as_str()));
+        assert!(!rec.external);
+        assert!(!rec.missing);
+        assert_eq!(rec.size, payload.len() as u64);
+        assert_eq!(rec.bytes.as_deref(), Some(payload.as_slice()));
+
+        // Invalid digest (wrong length or non-hex) falls back to computing real SHA-256.
+        let fallback_short = project.insert_binary_asset_prehashed(
+            AssetKind::Av,
+            "short.mp4",
+            Some("/media/short.mp4".to_owned()),
+            payload.clone(),
+            "deadbeef".to_owned(),
+        );
+        let real_digest = sha256_hex(&payload);
+        assert_eq!(fallback_short, real_digest);
+        assert_eq!(project.assets[&fallback_short].sha256, real_digest);
+        assert_eq!(
+            project.assets[&fallback_short].url.as_deref(),
+            Some("/media/short.mp4")
+        );
+
+        let fallback_non_hex = project.insert_binary_asset_prehashed(
+            AssetKind::Av,
+            "badhex.mp4",
+            None,
+            payload.clone(),
+            "z".repeat(64),
+        );
+        assert_eq!(fallback_non_hex, real_digest);
+        assert_eq!(project.assets[&fallback_non_hex].url, None);
+    }
+
+    #[test]
+    fn insert_external_asset_roundtrips_through_zcraft_without_missing_flag() {
+        let mut project = Project::new_cm3_default();
+        let path = "/footage/4k_master_raw.mov".to_owned();
+        let size = 1_500_000_000_u64; // 1.5 GB — far above MAX_RETAINED_ASSET_BYTES
+        let seed = format!("{path}:{size}:1700000000");
+
+        let id = project.insert_external_asset(
+            AssetKind::Av,
+            "4k_master_raw.mov",
+            path.clone(),
+            size,
+            &seed,
+        );
+        assert_eq!(id.len(), 64);
+        assert_eq!(id, sha256_hex(seed.as_bytes()));
+
+        let rec = &project.assets[&id];
+        assert!(rec.external);
+        assert!(!rec.missing);
+        assert!(rec.bytes.is_none());
+        assert_eq!(rec.url.as_deref(), Some(path.as_str()));
+        assert_eq!(rec.sha256, id);
+        assert_eq!(rec.size, size);
+
+        // Save and reload via `.zcraft`: must succeed without hitting MAX_RETAINED_ASSET_BYTES
+        // and must preserve `external: true, bytes: None, missing: false`.
+        let archive = crate::zcraft::save_zcraft_to_bytes(&project).expect("save zcraft");
+        let reloaded = crate::zcraft::load_zcraft_from_bytes(&archive).expect("load zcraft");
+        let loaded_rec = reloaded
+            .assets
+            .get(&id)
+            .expect("external asset preserved after zcraft roundtrip");
+        assert!(loaded_rec.external);
+        assert!(!loaded_rec.missing);
+        assert!(loaded_rec.bytes.is_none());
+        assert_eq!(loaded_rec.url.as_deref(), Some(path.as_str()));
+        assert_eq!(loaded_rec.sha256, id);
+        assert_eq!(loaded_rec.size, size);
+        assert_eq!(loaded_rec.filename, "4k_master_raw.mov");
     }
 }

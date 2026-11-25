@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::shader_plus::{ZoidiumCurvePoint, evaluate_zoidium_curve_points};
+use crate::shader_plus::{PreparedCurve, ZoidiumCurvePoint};
 
 // ===========================================================================
 // Shared Graph Parsing, Topological Sort & Color/Value Helpers
@@ -3530,23 +3530,31 @@ impl<'a> MaterialEvaluator<'a> {
                 let src = self.get_input(&node.id, &["color", "a", "in"]).cloned();
                 let fac = param_f64(p, &["factor"], 1.0).clamp(0.0, 1.0);
                 let curves_val = p.get("curves");
-                let master = parse_curve_points_channel(curves_val.and_then(|v| {
-                    v.get("c")
-                        .or_else(|| v.get("master"))
-                        .or_else(|| v.get("rgb"))
-                }));
-                let red = parse_curve_points_channel(curves_val.and_then(|v| v.get("r")));
-                let green = parse_curve_points_channel(curves_val.and_then(|v| v.get("g")));
-                let blue = parse_curve_points_channel(curves_val.and_then(|v| v.get("b")));
+                let master = PreparedCurve::from_zoidium(&parse_curve_points_channel(
+                    curves_val.and_then(|v| {
+                        v.get("c")
+                            .or_else(|| v.get("master"))
+                            .or_else(|| v.get("rgb"))
+                    }),
+                ));
+                let red = PreparedCurve::from_zoidium(&parse_curve_points_channel(
+                    curves_val.and_then(|v| v.get("r")),
+                ));
+                let green = PreparedCurve::from_zoidium(&parse_curve_points_channel(
+                    curves_val.and_then(|v| v.get("g")),
+                ));
+                let blue = PreparedCurve::from_zoidium(&parse_curve_points_channel(
+                    curves_val.and_then(|v| v.get("b")),
+                ));
                 let mut lut_r = [0.0f32; 256];
                 let mut lut_g = [0.0f32; 256];
                 let mut lut_b = [0.0f32; 256];
                 for i in 0..256 {
                     let x = (i as f32) / 255.0;
-                    let m = evaluate_zoidium_curve_points(&master, x);
-                    lut_r[i] = evaluate_zoidium_curve_points(&red, m);
-                    lut_g[i] = evaluate_zoidium_curve_points(&green, m);
-                    lut_b[i] = evaluate_zoidium_curve_points(&blue, m);
+                    let m = master.evaluate(x);
+                    lut_r[i] = red.evaluate(m);
+                    lut_g[i] = green.evaluate(m);
+                    lut_b[i] = blue.evaluate(m);
                 }
                 let mut out = self.alloc_image()?;
                 for px in 0..(size * size) {

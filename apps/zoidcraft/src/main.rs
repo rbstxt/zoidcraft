@@ -10,11 +10,12 @@
 
 mod ui;
 
+#[cfg(test)]
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -26,8 +27,8 @@ use egui::{Align2, Area, Color32, CornerRadius, Frame, Id, Key, Order, Pos2, Rec
 use serde_json::{Value, json};
 use zc_anim::{BezierSegment, InterpolationMode, eval_easing, eval_segment_bezier};
 use zc_audio::{
-    AudioBuffer, AudioError, AudioMixWindow, AudioOutputHandle, MasterPlaybackClock,
-    STANDARD_SAMPLE_RATE, WaveformPeaks, apply_gain_and_pan,
+    AudioBuffer, AudioError, AudioMixWindow, AudioOutputHandle, FlattenedAudioClip,
+    MasterPlaybackClock, STANDARD_SAMPLE_RATE, WaveformPeaks, apply_gain_and_pan,
     collect_flattened_audio_clips_with_precomp, decode_audio_bytes, mix_flattened_audio_clips,
 };
 use zc_export::{
@@ -38,8 +39,8 @@ use zc_export::{
 use zc_geom::{EulerOrder as GeomEulerOrder, Mat4, Transform3D, Vec3};
 use zc_plugin::PluginRegistry;
 use zc_project::{
-    AssetKind, LayerKind, MediaItem, Project, Uuid, export_pz, import_pz, load_zcraft, save_zcraft,
-    write_atomic,
+    AssetKind, AssetRecord, AssetSource, LayerKind, MediaItem, Project, Uuid, export_pz, import_pz,
+    load_zcraft, save_zcraft, sha256_hex, write_atomic,
 };
 use zc_render::scene3d::mat4_perspective_rh;
 use zc_render::{
@@ -76,6 +77,16 @@ const LIVE_AUDIO_WINDOW_SECS: f64 = 60.0;
 const ZOIDCRAFT_ENABLED_PLUGINS_KEY: &str = "zoidcraftEnabledPlugins";
 /// Upper bound on cached GPU preview frame textures in [`PreviewFrameCache`].
 const MAX_PREVIEW_CACHE_ENTRIES: usize = 1024;
+/// Video files at or below 64 MiB (and within remaining embedded budget) are embedded in the
+/// project alongside their canonical local `url`; larger files are linked as external local assets.
+const VIDEO_INLINE_EMBED_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum WAV byte cap when extracting embedded audio from a video container via `ffmpeg`.
+const VIDEO_AUDIO_EXTRACT_MAX_BYTES: usize = 120 * 1024 * 1024;
+/// Number of leading file bytes sampled when deriving a fast deterministic external asset ID.
+const EXTERNAL_ID_HEADER_SAMPLE_BYTES: usize = 64 * 1024;
+/// Assets larger than 8 MiB with a local file `url` are converted to lightweight external
+/// references inside periodic recovery snapshots so autosave never copies or gzips huge videos.
+const AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Dirty-Tracking Render Key & Bounded LRU Preview Frame Cache
@@ -137,6 +148,8 @@ struct PreviewFrameCache<T> {
     max_bytes: usize,
     max_entries: usize,
     tick: u64,
+    cached_spans_cache: Vec<(f64, f64)>,
+    spans_dirty: bool,
 }
 
 impl<T> PreviewFrameCache<T> {
@@ -148,6 +161,8 @@ impl<T> PreviewFrameCache<T> {
             max_bytes,
             max_entries: MAX_PREVIEW_CACHE_ENTRIES,
             tick: 0,
+            cached_spans_cache: Vec::new(),
+            spans_dirty: false,
         }
     }
 
@@ -168,6 +183,8 @@ impl<T> PreviewFrameCache<T> {
         self.entries.clear();
         self.used_bytes = 0;
         self.context = None;
+        self.cached_spans_cache.clear();
+        self.spans_dirty = false;
     }
 
     /// Invalidates cached frames whenever scene/resolution/camera context changes, while
@@ -177,6 +194,8 @@ impl<T> PreviewFrameCache<T> {
             self.entries.clear();
             self.used_bytes = 0;
             self.context = Some(ctx);
+            self.cached_spans_cache.clear();
+            self.spans_dirty = false;
         }
     }
 
@@ -185,6 +204,8 @@ impl<T> PreviewFrameCache<T> {
         if max_bytes == 0 {
             self.entries.clear();
             self.used_bytes = 0;
+            self.cached_spans_cache.clear();
+            self.spans_dirty = false;
             return;
         }
         self.evict_to_budget(0);
@@ -221,6 +242,7 @@ impl<T> PreviewFrameCache<T> {
         }
         if let Some(prev) = self.entries.remove(&frame_bucket) {
             self.used_bytes = self.used_bytes.saturating_sub(prev.bytes);
+            self.spans_dirty = true;
         }
         self.evict_to_budget(bytes);
         if self.used_bytes.saturating_add(bytes) > self.max_bytes {
@@ -237,6 +259,7 @@ impl<T> PreviewFrameCache<T> {
             },
         );
         self.used_bytes = self.used_bytes.saturating_add(bytes);
+        self.spans_dirty = true;
         true
     }
 
@@ -256,32 +279,37 @@ impl<T> PreviewFrameCache<T> {
             };
             if let Some(evicted) = self.entries.remove(&oldest_key) {
                 self.used_bytes = self.used_bytes.saturating_sub(evicted.bytes);
+                self.spans_dirty = true;
             }
         }
     }
 
     /// Coalesces cached integer frame buckets into sorted, contiguous `[start, end)` spans
-    /// for the timeline ruler's green preview-cache bar.
-    fn cached_spans(&self) -> Vec<(f64, f64)> {
-        if self.entries.is_empty() {
-            return Vec::new();
-        }
-        let mut frames: Vec<i64> = self.entries.keys().copied().collect();
-        frames.sort_unstable();
-        let mut spans = Vec::new();
-        let mut run_start = frames[0];
-        let mut run_end = frames[0];
-        for f in frames.into_iter().skip(1) {
-            if f <= run_end.saturating_add(1) {
-                run_end = f;
-            } else {
-                spans.push((run_start as f64, (run_end + 1) as f64));
-                run_start = f;
-                run_end = f;
+    /// for the timeline ruler's green preview-cache bar, caching the result until mutated.
+    fn cached_spans(&mut self) -> &[(f64, f64)] {
+        if self.spans_dirty {
+            self.cached_spans_cache.clear();
+            if !self.entries.is_empty() {
+                let mut frames: Vec<i64> = self.entries.keys().copied().collect();
+                frames.sort_unstable();
+                let mut run_start = frames[0];
+                let mut run_end = frames[0];
+                for f in frames.into_iter().skip(1) {
+                    if f <= run_end.saturating_add(1) {
+                        run_end = f;
+                    } else {
+                        self.cached_spans_cache
+                            .push((run_start as f64, (run_end + 1) as f64));
+                        run_start = f;
+                        run_end = f;
+                    }
+                }
+                self.cached_spans_cache
+                    .push((run_start as f64, (run_end + 1) as f64));
             }
+            self.spans_dirty = false;
         }
-        spans.push((run_start as f64, (run_end + 1) as f64));
-        spans
+        &self.cached_spans_cache
     }
 }
 
@@ -405,7 +433,7 @@ impl ViewportGpuPresenter {
         self.preview_cache.used_bytes() as u64
     }
 
-    fn preview_cache_spans(&self) -> Vec<(f64, f64)> {
+    fn preview_cache_spans(&mut self) -> &[(f64, f64)] {
         self.preview_cache.cached_spans()
     }
 
@@ -449,7 +477,7 @@ impl ViewportGpuPresenter {
     #[allow(clippy::too_many_arguments)]
     fn render_viewport_if_dirty(
         &mut self,
-        session: &Session,
+        session: &mut Session,
         frame: f64,
         width: u32,
         height: u32,
@@ -537,15 +565,26 @@ impl ViewportGpuPresenter {
             None
         };
 
-        let render_project = project_for_live_viewport(session);
-        let _ = self.engine.render_frame_to_texture_with_overrides(
-            render_project.as_ref(),
-            &session.plugins,
-            frame,
-            width,
-            height,
-            overrides.as_ref(),
-        )?;
+        let active_comp_id = session.document().active_composition_id;
+        let engine = &mut self.engine;
+        let plugins = &session.plugins;
+        if let Err(err) =
+            with_live_viewport_project(&mut session.project, active_comp_id, |render_project| {
+                engine.render_frame_to_texture_with_overrides(
+                    render_project,
+                    plugins,
+                    frame,
+                    width,
+                    height,
+                    overrides.as_ref(),
+                )
+            })
+        {
+            // Record the failed key so a broken GLSL/WGSL shader does not trigger an infinite
+            // 120Hz retry loop while idle; any subsequent edit/scrub changes `key` and retries.
+            self.last_render_key = Some(key);
+            return Err(err);
+        }
         if let Some(display) = &self.display_target {
             self.engine.blit_output_to(display);
             let frame_bytes = (width as usize)
@@ -593,19 +632,18 @@ impl ViewportGpuPresenter {
     /// suitable for PNG snapshot export.
     fn render_frame_straight_rgba8(
         &mut self,
-        session: &Session,
+        session: &mut Session,
         frame: f64,
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, RenderError> {
-        let render_project = project_for_live_viewport(session);
-        let premul = self.engine.render_frame_rgba8(
-            render_project.as_ref(),
-            &session.plugins,
-            frame,
-            width,
-            height,
-        )?;
+        let active_comp_id = session.document().active_composition_id;
+        let engine = &mut self.engine;
+        let plugins = &session.plugins;
+        let premul =
+            with_live_viewport_project(&mut session.project, active_comp_id, |render_project| {
+                engine.render_frame_rgba8(render_project, plugins, frame, width, height)
+            })?;
         Ok(unpremultiply_rgba8(&premul))
     }
 
@@ -853,7 +891,8 @@ fn classify_dropped_path(path: &Path) -> DroppedFileKind {
     match ext.as_str() {
         "zcraft" | "pz" => DroppedFileKind::Project,
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "wav" | "mp3" | "ogg" | "flac" | "aac"
-        | "mp4" | "obj" | "gltf" | "glb" | "ttf" | "otf" | "cube" => DroppedFileKind::Media,
+        | "mp4" | "mov" | "mkv" | "webm" | "m4v" | "avi" | "obj" | "gltf" | "glb" | "ttf"
+        | "otf" | "cube" => DroppedFileKind::Media,
         _ => DroppedFileKind::Unsupported,
     }
 }
@@ -863,6 +902,318 @@ fn is_audio_extension(ext: &str) -> bool {
         ext.to_ascii_lowercase().as_str(),
         "wav" | "mp3" | "ogg" | "flac" | "aac"
     )
+}
+
+fn is_video_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "mp4" | "mov" | "mkv" | "webm" | "m4v" | "avi"
+    )
+}
+
+fn is_video_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(is_video_extension)
+}
+
+fn canonical_local_url(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn compute_external_asset_id(
+    canonical_path: &str,
+    file_len: u64,
+    mtime_nanos: u128,
+    head: &[u8],
+) -> String {
+    let mut buf = Vec::with_capacity(32 + canonical_path.len() + head.len());
+    buf.extend_from_slice(b"zc-ext-v1\0");
+    buf.extend_from_slice(&(canonical_path.len() as u64).to_le_bytes());
+    buf.extend_from_slice(canonical_path.as_bytes());
+    buf.extend_from_slice(&file_len.to_le_bytes());
+    buf.extend_from_slice(&mtime_nanos.to_le_bytes());
+    buf.extend_from_slice(&(head.len() as u64).to_le_bytes());
+    buf.extend_from_slice(head);
+    sha256_hex(&buf)
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProbedVideoInfo {
+    width: Option<u32>,
+    height: Option<u32>,
+    #[allow(dead_code)]
+    fps: Option<f64>,
+    duration_secs: Option<f64>,
+    has_audio: bool,
+}
+
+fn parse_ffprobe_rate(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim();
+    if let Some((num_s, den_s)) = trimmed.split_once('/') {
+        let num: f64 = num_s.trim().parse().ok()?;
+        let den: f64 = den_s.trim().parse().ok()?;
+        if num.is_finite() && den.is_finite() && num > 0.0 && den > 0.0 {
+            let rate = num / den;
+            return (rate.is_finite() && rate > 0.0).then_some(rate);
+        }
+        None
+    } else {
+        let rate: f64 = trimmed.parse().ok()?;
+        (rate.is_finite() && rate > 0.0).then_some(rate)
+    }
+}
+
+fn parse_ffprobe_duration(val: &Value) -> Option<f64> {
+    let secs = match val {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(s) => s.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    (secs.is_finite() && secs > 0.0).then_some(secs)
+}
+
+fn probe_video_with_ffprobe(path: &Path) -> ProbedVideoInfo {
+    let Ok(output) = ProcessCommand::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,width,height,r_frame_rate,avg_frame_rate,duration",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+    else {
+        return ProbedVideoInfo::default();
+    };
+    if !output.status.success() {
+        return ProbedVideoInfo::default();
+    }
+    let Ok(parsed) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return ProbedVideoInfo::default();
+    };
+    let mut info = ProbedVideoInfo::default();
+    let mut video_stream_duration = None;
+    if let Some(streams) = parsed.get("streams").and_then(Value::as_array) {
+        for stream in streams {
+            let codec_type = stream
+                .get("codec_type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if codec_type == "audio" {
+                info.has_audio = true;
+            } else if codec_type == "video" && info.width.is_none() {
+                info.width = stream
+                    .get("width")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&v| v > 0);
+                info.height = stream
+                    .get("height")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&v| v > 0);
+                info.fps = stream
+                    .get("avg_frame_rate")
+                    .and_then(Value::as_str)
+                    .and_then(parse_ffprobe_rate)
+                    .or_else(|| {
+                        stream
+                            .get("r_frame_rate")
+                            .and_then(Value::as_str)
+                            .and_then(parse_ffprobe_rate)
+                    });
+                video_stream_duration = stream.get("duration").and_then(parse_ffprobe_duration);
+            }
+        }
+    }
+    let format_duration = parsed
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(parse_ffprobe_duration);
+    info.duration_secs = format_duration.or(video_stream_duration);
+    info
+}
+
+fn extract_video_audio_off_thread(
+    path: &Path,
+    ext: &str,
+    embedded_bytes: Option<&[u8]>,
+) -> Option<(AudioBuffer, AudioWaveformPeaks)> {
+    let decoded_buf = embedded_bytes
+        .and_then(|bytes| decode_audio_bytes(bytes, Some(ext)).ok())
+        .or_else(|| {
+            use std::io::Read;
+            let mut child = ProcessCommand::new("ffmpeg")
+                .args(["-v", "error", "-nostdin", "-i"])
+                .arg(path)
+                .args(["-vn", "-ac", "2", "-ar", "48000", "-f", "wav", "pipe:1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?;
+            let stdout = child.stdout.take()?;
+            let mut wav_bytes = Vec::new();
+            let read_ok = stdout
+                .take((VIDEO_AUDIO_EXTRACT_MAX_BYTES as u64).saturating_add(1))
+                .read_to_end(&mut wav_bytes)
+                .is_ok();
+            if !read_ok || wav_bytes.len() > VIDEO_AUDIO_EXTRACT_MAX_BYTES {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            let status = child.wait().ok()?;
+            if !status.success() || wav_bytes.is_empty() {
+                return None;
+            }
+            decode_audio_bytes(&wav_bytes, Some("wav")).ok()
+        })?;
+    let peaks = WaveformPeaks::from_audio_buffer(&decoded_buf);
+    let ui_peaks = AudioWaveformPeaks {
+        points_per_sec: f64::from(peaks.points_per_sec()),
+        min_buf: peaks.min_peaks().to_vec(),
+        max_buf: peaks.max_peaks().to_vec(),
+    };
+    Some((decoded_buf, ui_peaks))
+}
+
+struct VideoImportPayload {
+    filename: String,
+    asset_record: AssetRecord,
+    probed: ProbedVideoInfo,
+    decoded_audio: Option<(Arc<AudioBuffer>, AudioWaveformPeaks)>,
+    desired_start: f64,
+}
+
+type MediaImportOutcome = Result<VideoImportPayload, String>;
+
+struct PendingMediaImport {
+    filename: String,
+    rx: Receiver<MediaImportOutcome>,
+}
+
+fn build_external_video_record(
+    path: &Path,
+    filename: String,
+    canonical_url: String,
+    file_len: u64,
+    mtime_nanos: u128,
+) -> Result<AssetRecord, String> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| {
+            file.take(EXTERNAL_ID_HEADER_SAMPLE_BYTES as u64)
+                .read_to_end(&mut head)
+        })
+        .map_err(|err| format!("Failed to read video header: {err}"))?;
+    let asset_id = compute_external_asset_id(&canonical_url, file_len, mtime_nanos, &head);
+    Ok(AssetRecord {
+        id: asset_id.clone(),
+        kind: AssetKind::Av,
+        source: AssetSource::File,
+        filename,
+        url: Some(canonical_url),
+        external: true,
+        bytes: None,
+        missing: false,
+        sha256: asset_id,
+        size: file_len,
+        preserved: BTreeMap::new(),
+    })
+}
+
+fn prepare_video_import_work(
+    path: &Path,
+    existing_embedded_bytes: u64,
+    desired_start: f64,
+) -> MediaImportOutcome {
+    let meta = fs::metadata(path).map_err(|err| format!("Failed to inspect media file: {err}"))?;
+    let file_len = meta.len();
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("video")
+        .to_owned();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let canonical_url = canonical_local_url(path);
+    let probed = probe_video_with_ffprobe(path);
+
+    let remaining_budget =
+        zc_project::MAX_RETAINED_ASSET_BYTES.saturating_sub(existing_embedded_bytes);
+    let inline_cap = VIDEO_INLINE_EMBED_LIMIT_BYTES.min(remaining_budget);
+
+    let asset_record = if file_len <= inline_cap {
+        use std::io::Read;
+        let bytes = fs::File::open(path)
+            .and_then(|file| {
+                let mut buf = Vec::with_capacity(file_len as usize);
+                file.take(inline_cap.saturating_add(1))
+                    .read_to_end(&mut buf)?;
+                Ok(buf)
+            })
+            .map_err(|err| format!("Failed to read video file: {err}"))?;
+        if (bytes.len() as u64) <= inline_cap {
+            let digest = sha256_hex(&bytes);
+            let size = bytes.len() as u64;
+            AssetRecord {
+                id: digest.clone(),
+                kind: AssetKind::Av,
+                source: AssetSource::File,
+                filename: filename.clone(),
+                url: Some(canonical_url),
+                external: false,
+                bytes: Some(bytes),
+                missing: false,
+                sha256: digest,
+                size,
+                preserved: BTreeMap::new(),
+            }
+        } else {
+            build_external_video_record(
+                path,
+                filename.clone(),
+                canonical_url,
+                file_len,
+                mtime_nanos,
+            )?
+        }
+    } else {
+        build_external_video_record(path, filename.clone(), canonical_url, file_len, mtime_nanos)?
+    };
+
+    let decoded_audio = if probed.has_audio {
+        extract_video_audio_off_thread(path, &ext, asset_record.bytes.as_deref())
+            .map(|(buf, peaks)| (Arc::new(buf), peaks))
+    } else {
+        None
+    };
+
+    Ok(VideoImportPayload {
+        filename,
+        asset_record,
+        probed,
+        decoded_audio,
+        desired_start,
+    })
 }
 
 /// Immutable project & plugin state captured at the moment a job is added to the export queue
@@ -918,13 +1269,62 @@ fn promote_active_composition_for_export(
     project.compositions.insert(prev_root.id, prev_root);
 }
 
-/// Returns the `Project` to pass into `ProjectRenderEngine` for live viewport rendering.
-///
-/// When editing the root sequence (`active_composition_id` is `None`), borrows `&session.project`
-/// with zero cloning. When editing a child composition (`Some(comp_id)` present in
-/// `session.project.compositions`), clones the project and promotes `comp_id` via
-/// [`promote_active_composition_for_export`] so the live viewport isolates the child composition
-/// while preserving root `sequence.controls` for expressions and never mutating `session.project`.
+/// Temporarily promotes `active_composition_id` into `project.sequence` in O(1) without
+/// cloning `project.assets`, preserving root-only `sequence.controls` as fallbacks for
+/// child expressions, runs `f(&*project)`, and unconditionally restores both
+/// `project.sequence` and `project.compositions` before returning (even on `Err` or unwind).
+fn with_live_viewport_project<R>(
+    project: &mut Project,
+    active_composition_id: Option<Uuid>,
+    f: impl FnOnce(&Project) -> R,
+) -> R {
+    let Some(comp_id) = active_composition_id else {
+        return f(project);
+    };
+    let Some(mut comp_seq) = project.compositions.remove(&comp_id) else {
+        return f(project);
+    };
+    let orig_comp_controls_len = comp_seq.controls.len();
+    for root_ctl in &project.sequence.controls {
+        let already_defined = comp_seq
+            .controls
+            .iter()
+            .any(|c| c.id == root_ctl.id || c.name == root_ctl.name);
+        if !already_defined {
+            comp_seq.controls.push(root_ctl.clone());
+        }
+    }
+    let prev_root = std::mem::replace(&mut project.sequence, comp_seq);
+    let prev_root_id = prev_root.id;
+    project.compositions.insert(prev_root_id, prev_root);
+
+    struct RestoreGuard<'a> {
+        project: &'a mut Project,
+        comp_id: Uuid,
+        prev_root_id: Uuid,
+        orig_comp_controls_len: usize,
+    }
+
+    impl Drop for RestoreGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(orig_root) = self.project.compositions.remove(&self.prev_root_id) {
+                let mut comp_seq = std::mem::replace(&mut self.project.sequence, orig_root);
+                comp_seq.controls.truncate(self.orig_comp_controls_len);
+                self.project.compositions.insert(self.comp_id, comp_seq);
+            }
+        }
+    }
+
+    let guard = RestoreGuard {
+        project,
+        comp_id,
+        prev_root_id,
+        orig_comp_controls_len,
+    };
+    f(guard.project)
+}
+
+#[cfg(test)]
 fn project_for_live_viewport(session: &Session) -> Cow<'_, Project> {
     let Some(comp_id) = session.document().active_composition_id else {
         return Cow::Borrowed(&session.project);
@@ -965,6 +1365,30 @@ fn format_viewport_render_error_toast(err_msg: &str) -> String {
     }
 }
 
+type AudioMixHashCacheKey = (u64, usize, u64, u64, bool);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SceneHashCacheKey {
+    revision: u64,
+    project_hash: u64,
+    active_composition_id: Option<Uuid>,
+    editing_camera: bool,
+    selection_hash: u64,
+}
+
+struct AudioMixRawAsset {
+    bytes: Vec<u8>,
+    ext: Option<String>,
+}
+
+struct AudioMixJobResult {
+    mix_hash: u64,
+    win_start: u32,
+    win_end: u32,
+    window: Result<Option<AudioMixWindow>, String>,
+    loop_head: Option<Arc<Vec<[f32; 2]>>>,
+}
+
 struct ZoidCraftApp {
     session: Session,
     theme: Cm3Theme,
@@ -983,6 +1407,16 @@ struct ZoidCraftApp {
     audio_clock: MasterPlaybackClock,
     /// Active OS audio output stream (kept alive while audio playback is active).
     audio_output: Option<AudioOutputHandle>,
+    /// Cheap `Arc` handle to the currently active pre-mixed stereo PCM window (drives O(1) live meter).
+    active_audio_window: Option<AudioMixWindow>,
+    /// Monotonic generation for in-flight background live audio mix jobs (discards stale completions).
+    audio_mix_generation: u64,
+    /// In-flight background live audio window mixer running off the UI thread.
+    pending_audio_mix: Option<(u64, Receiver<AudioMixJobResult>)>,
+    /// Target `(mix_hash, win_start, win_end)` of the currently in-flight background audio mix job.
+    pending_audio_mix_target: Option<(u64, u32, u32)>,
+    /// Cached `((revision, decoded_audio.len(), fps_bits, seq_len_bits, precomp_plus), mix_hash)`.
+    cached_audio_mix_hash: Option<(AudioMixHashCacheKey, u64)>,
     /// Fingerprint of the timeline audio mix currently loaded into `audio_output`.
     audio_mix_hash: u64,
     /// Inclusive start and exclusive end frames currently mixed inside `audio_output`.
@@ -1001,6 +1435,8 @@ struct ZoidCraftApp {
     last_audio_seq_len: f64,
     /// Non-blocking startup `ffmpeg -version` probe channel.
     ffmpeg_probe_rx: Option<Receiver<Result<String, ExportError>>>,
+    /// In-flight background video imports processed off the UI thread.
+    pending_media_imports: Vec<PendingMediaImport>,
     active_export: Option<ActiveExportJob>,
     /// Cancelled export workers from previous projects being reaped asynchronously without touching the current project's `export_status`.
     retired_exports: Vec<ActiveExportJob>,
@@ -1014,10 +1450,20 @@ struct ZoidCraftApp {
     last_autosave_at: Instant,
     /// Session revision captured by the most recent disk autosave snapshot.
     last_autosave_revision: u64,
+    /// In-flight background periodic autosave worker channel returning the saved revision.
+    pending_autosave: Option<Receiver<Result<u64, String>>>,
     /// Optional non-blocking crash-recovery banner offered on launch when a recovery snapshot exists.
     startup_recovery_banner: Option<RecoverySnapshotInfo>,
     /// Whether `egui-winit`'s in-memory clipboard stub has been seeded with `CLIPBOARD_SENTINEL`.
     clipboard_bridge_seeded: bool,
+    /// Cached `(session.revision(), project_render_hash)` avoiding per-frame `serde_json` hashing.
+    cached_project_hash_rev: Option<u64>,
+    cached_project_hash: u64,
+    /// Cached `(SceneHashCacheKey, scene_hash)` avoiding per-frame full `SessionDocument` walks.
+    cached_scene_hash: Option<(SceneHashCacheKey, u64)>,
+    /// Revision & peak-asset-count guard preventing per-frame `ac.id.to_string()` scans in `sync_timeline_audio_peaks`.
+    last_audio_peaks_sync_rev: Option<u64>,
+    last_audio_peaks_asset_count: usize,
     /// Cached `session.revision()` for `cached_missing_plugins`.
     cached_missing_plugins_revision: Option<u64>,
     /// Disabled built-in plugin IDs currently required by the open project.
@@ -1106,6 +1552,11 @@ impl ZoidCraftApp {
             asset_waveform_peaks: HashMap::new(),
             audio_clock,
             audio_output: None,
+            active_audio_window: None,
+            audio_mix_generation: 0,
+            pending_audio_mix: None,
+            pending_audio_mix_target: None,
+            cached_audio_mix_hash: None,
             audio_mix_hash: 0,
             audio_window_start: 0,
             audio_window_end: 0,
@@ -1119,6 +1570,7 @@ impl ZoidCraftApp {
             last_audio_fps: init_fps,
             last_audio_seq_len: init_seq_len,
             ffmpeg_probe_rx: Some(probe_rx),
+            pending_media_imports: Vec::new(),
             active_export: None,
             retired_exports: Vec::new(),
             next_export_job_id: 1,
@@ -1126,8 +1578,14 @@ impl ZoidCraftApp {
             recovery_dir,
             last_autosave_at: Instant::now(),
             last_autosave_revision: init_revision,
+            pending_autosave: None,
             startup_recovery_banner,
             clipboard_bridge_seeded: false,
+            cached_project_hash_rev: None,
+            cached_project_hash: 0,
+            cached_scene_hash: None,
+            last_audio_peaks_sync_rev: None,
+            last_audio_peaks_asset_count: 0,
             cached_missing_plugins_revision: None,
             cached_missing_plugins: Vec::new(),
             dismissed_missing_plugins: BTreeSet::new(),
@@ -1225,6 +1683,10 @@ impl ZoidCraftApp {
     fn reset_live_audio_output(&mut self) {
         self.audio_clock.pause();
         self.audio_output = None;
+        self.active_audio_window = None;
+        self.audio_mix_generation = self.audio_mix_generation.wrapping_add(1);
+        self.pending_audio_mix = None;
+        self.pending_audio_mix_target = None;
         self.audio_mix_hash = 0;
         self.audio_window_start = 0;
         self.audio_window_end = 0;
@@ -1232,6 +1694,153 @@ impl ZoidCraftApp {
         self.audio_failure_latch.on_playback_stopped();
         self.last_audio_playing = false;
         self.last_audio_speed = 0.0;
+    }
+
+    fn cached_audio_mix_hash(&mut self, fps: f64, seq_len: f64) -> u64 {
+        let key = (
+            self.session.revision(),
+            self.decoded_audio.len(),
+            fps.to_bits(),
+            seq_len.to_bits(),
+            self.session.plugins.is_enabled("precomp-plus"),
+        );
+        if let Some((cached_key, hash)) = self.cached_audio_mix_hash
+            && cached_key == key
+        {
+            return hash;
+        }
+        let hash = compute_audio_mix_hash(&self.session, &self.decoded_audio, fps, seq_len);
+        self.cached_audio_mix_hash = Some((key, hash));
+        hash
+    }
+
+    fn spawn_live_audio_mix_job(
+        &mut self,
+        mix_hash: u64,
+        win_start: u32,
+        win_end: u32,
+        fps: f64,
+        total_u32: u32,
+        loop_enabled: bool,
+    ) {
+        let (clips, buffers, raw_assets) = collect_audio_mix_inputs(
+            &self.session,
+            &self.decoded_audio,
+            f64::from(win_start),
+            f64::from(win_end),
+        );
+        let loop_head_inputs = if win_start > 0 && win_end >= total_u32 && loop_enabled {
+            let loop_head_end = ((2.0 * fps).round().max(1.0) as u32).min(total_u32);
+            let (lh_clips, lh_buffers, lh_raw) = collect_audio_mix_inputs(
+                &self.session,
+                &self.decoded_audio,
+                0.0,
+                f64::from(loop_head_end),
+            );
+            Some((lh_clips, lh_buffers, lh_raw, loop_head_end))
+        } else {
+            None
+        };
+
+        self.audio_mix_generation = self.audio_mix_generation.wrapping_add(1);
+        let mix_gen = self.audio_mix_generation;
+        self.audio_stream_attempted_hash = mix_hash;
+        let (tx, rx) = mpsc::channel();
+        let spawn_res = thread::Builder::new()
+            .name("zc-audio-mix".to_owned())
+            .spawn(move || {
+                let window =
+                    execute_audio_mix_work(clips, buffers, raw_assets, win_start, win_end, fps);
+                let loop_head = loop_head_inputs.and_then(|(lc, lb, lr, lend)| {
+                    execute_audio_mix_work(lc, lb, lr, 0, lend, fps)
+                        .ok()
+                        .flatten()
+                        .map(|w| w.samples)
+                });
+                let _ = tx.send(AudioMixJobResult {
+                    mix_hash,
+                    win_start,
+                    win_end,
+                    window,
+                    loop_head,
+                });
+            });
+        match spawn_res {
+            Ok(_) => {
+                self.pending_audio_mix = Some((mix_gen, rx));
+                self.pending_audio_mix_target = Some((mix_hash, win_start, win_end));
+            }
+            Err(err) => {
+                tracing::error!("failed to spawn live audio mix thread: {err}");
+                if self.audio_failure_latch.on_open_failure() {
+                    self.show_toast(format!("Audio playback failed: {err}"));
+                }
+            }
+        }
+    }
+
+    fn poll_pending_audio_mix(&mut self, ctx: &egui::Context) {
+        let Some((job_gen, rx)) = self.pending_audio_mix.as_ref() else {
+            return;
+        };
+        let job_gen = *job_gen;
+        match rx.try_recv() {
+            Ok(result) => {
+                self.pending_audio_mix = None;
+                self.pending_audio_mix_target = None;
+                if job_gen != self.audio_mix_generation || !self.session.playback.is_playing() {
+                    return;
+                }
+                match result.window {
+                    Ok(maybe_window) => {
+                        self.audio_mix_hash = result.mix_hash;
+                        self.audio_window_start = result.win_start;
+                        self.audio_window_end = result.win_end;
+                        self.active_audio_window = maybe_window.clone();
+                        if let Some(handle) = self.audio_output.as_ref() {
+                            // Seamlessly hot-swap the active audio window without tearing down
+                            // or reopening the OS CPAL audio stream.
+                            handle.update_window(maybe_window);
+                            handle.set_loop_head(result.loop_head);
+                        } else if self.audio_failure_latch.should_attempt_open() {
+                            self.audio_clock
+                                .seek_preserving_playback(self.session.playback.current_frame);
+                            self.audio_clock.set_speed(self.session.playback.speed);
+                            match self.audio_clock.start_audio_output_windowed(maybe_window) {
+                                Ok(handle) => {
+                                    handle.set_loop_head(result.loop_head);
+                                    self.audio_output = Some(handle);
+                                    self.audio_failure_latch.on_open_success();
+                                }
+                                Err(err) => {
+                                    tracing::warn!("live audio output unavailable: {err}");
+                                    if self.audio_failure_latch.on_open_failure() {
+                                        self.show_toast(format!(
+                                            "Audio output unavailable ({err}); playing silently"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("failed to mix live playback audio: {err}");
+                        if self.audio_failure_latch.on_open_failure() {
+                            self.show_toast(format!("Audio playback failed: {err}"));
+                        }
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                if self.session.playback.is_playing() {
+                    ctx.request_repaint_after(Duration::from_millis(8));
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.pending_audio_mix = None;
+                self.pending_audio_mix_target = None;
+            }
+        }
     }
 
     /// Pauses live transport and tears down the OS CPAL audio stream immediately before
@@ -1246,6 +1855,8 @@ impl ZoidCraftApp {
     }
 
     fn tick_playback_and_meter(&mut self, ctx: &egui::Context) {
+        self.poll_pending_audio_mix(ctx);
+
         let now = Instant::now();
         let dt = now
             .saturating_duration_since(self.last_tick)
@@ -1277,13 +1888,16 @@ impl ZoidCraftApp {
             self.audio_failure_latch.on_playback_stopped();
         }
 
-        // Lazily build and attach a bounded 60-second CPAL live audio window anchored around the
-        // current playhead so arbitrarily long timelines (12+ min) play audio cleanly without
-        // hitting the mixer's sample cap or freezing the UI thread.
+        // Lazily build and seamlessly hot-swap bounded 60-second CPAL live audio windows off
+        // the UI thread so pressing Space, editing audio during playback, or crossing window
+        // boundaries on long timelines never blocks the UI thread or tears down the CPAL stream.
         if is_playing && self.audio_failure_latch.should_attempt_open() {
-            let mix_hash = compute_audio_mix_hash(&self.session, &self.decoded_audio, fps, seq_len);
+            let mix_hash = self.cached_audio_mix_hash(fps, seq_len);
             if mix_hash == 0 {
-                if self.audio_output.is_some() {
+                if self.audio_output.is_some()
+                    || self.active_audio_window.is_some()
+                    || self.pending_audio_mix.is_some()
+                {
                     self.reset_live_audio_output();
                 }
             } else {
@@ -1291,7 +1905,7 @@ impl ZoidCraftApp {
                 let total_u32 = seq_len.ceil().max(1.0) as u32;
                 let window_frames = (LIVE_AUDIO_WINDOW_SECS * fps).round().max(1.0) as u32;
 
-                if live_audio_needs_rebuild(
+                let needs_rebuild = live_audio_needs_rebuild(
                     self.audio_mix_hash,
                     self.audio_window_start,
                     self.audio_window_end,
@@ -1299,51 +1913,39 @@ impl ZoidCraftApp {
                     self.audio_output.is_some(),
                     mix_hash,
                     cur_f,
-                ) {
-                    let (win_start, win_end) =
-                        compute_live_audio_window(cur_f, speed, total_u32, window_frames);
-                    self.audio_output = None;
-                    self.audio_stream_attempted_hash = mix_hash;
-                    self.audio_window_start = win_start;
-                    self.audio_window_end = win_end;
-                    match mix_sequence_audio_stereo(
-                        &self.session,
-                        &self.decoded_audio,
-                        STANDARD_SAMPLE_RATE,
-                        fps,
-                        win_start,
-                        win_end,
-                    ) {
-                        Ok(maybe_mix) => {
-                            let window = maybe_mix.map(|samples| AudioMixWindow {
-                                origin_frame: f64::from(win_start),
-                                samples: Arc::new(samples),
-                            });
-                            self.audio_clock
-                                .seek_preserving_playback(self.session.playback.current_frame);
-                            self.audio_clock.set_speed(speed);
-                            match self.audio_clock.start_audio_output_windowed(window) {
-                                Ok(handle) => {
-                                    self.audio_output = Some(handle);
-                                    self.audio_mix_hash = mix_hash;
-                                    self.audio_failure_latch.on_open_success();
-                                }
-                                Err(err) => {
-                                    tracing::warn!("live audio output unavailable: {err}");
-                                    if self.audio_failure_latch.on_open_failure() {
-                                        self.show_toast(format!(
-                                            "Audio output unavailable ({err}); playing silently"
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::error!("failed to mix live playback audio: {err}");
-                            if self.audio_failure_latch.on_open_failure() {
-                                self.show_toast(format!("Audio playback failed: {err}"));
-                            }
-                        }
+                );
+                let should_prefetch = !needs_rebuild
+                    && self.audio_output.is_some()
+                    && live_audio_should_prefetch(
+                        self.audio_mix_hash,
+                        self.audio_window_start,
+                        self.audio_window_end,
+                        mix_hash,
+                        cur_f,
+                        speed,
+                        total_u32,
+                    );
+
+                if needs_rebuild || should_prefetch {
+                    let pending_covers_cur = matches!(
+                        self.pending_audio_mix_target,
+                        Some((p_hash, p_start, p_end))
+                            if p_hash == mix_hash
+                                && p_end > p_start
+                                && cur_f >= f64::from(p_start)
+                                && cur_f < f64::from(p_end)
+                    );
+                    if !pending_covers_cur {
+                        let (win_start, win_end) =
+                            compute_live_audio_window(cur_f, speed, total_u32, window_frames);
+                        self.spawn_live_audio_mix_job(
+                            mix_hash,
+                            win_start,
+                            win_end,
+                            fps,
+                            total_u32,
+                            loop_enabled,
+                        );
                     }
                 }
             }
@@ -1405,12 +2007,28 @@ impl ZoidCraftApp {
                         .clamp(0.0, max_frame);
                 }
             }
-            let (rms_l, rms_r) = sample_live_audio_meter(
-                &self.session,
-                &self.decoded_audio,
-                self.session.playback.current_frame,
-                fps,
-            );
+            let (rms_l, rms_r) = self
+                .active_audio_window
+                .as_ref()
+                .and_then(|win| {
+                    sample_live_audio_meter_from_window(
+                        win,
+                        self.session.playback.current_frame,
+                        fps,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    if self.decoded_audio.is_empty() {
+                        (0.0, 0.0)
+                    } else {
+                        sample_live_audio_meter(
+                            &self.session,
+                            &self.decoded_audio,
+                            self.session.playback.current_frame,
+                            fps,
+                        )
+                    }
+                });
             self.workspace
                 .audio_meter
                 .update_stereo(rms_l, rms_r, dt as f32);
@@ -1519,7 +2137,43 @@ impl ZoidCraftApp {
         }
     }
 
-    fn current_viewport_render_key(&self) -> (f64, u32, u32, bool, ViewportRenderKey) {
+    fn invalidate_project_hash_caches(&mut self) {
+        self.cached_project_hash_rev = None;
+        self.cached_scene_hash = None;
+        self.cached_audio_mix_hash = None;
+        self.last_audio_peaks_sync_rev = None;
+    }
+
+    fn cached_project_render_hash(&mut self) -> u64 {
+        let rev = self.session.revision();
+        if self.cached_project_hash_rev != Some(rev) {
+            self.cached_project_hash =
+                zc_render::cache::project_render_hash(&self.session.project, &self.session.plugins);
+            self.cached_project_hash_rev = Some(rev);
+        }
+        self.cached_project_hash
+    }
+
+    fn cached_scene_hash(&mut self) -> u64 {
+        let project_hash = self.cached_project_render_hash();
+        let cache_key = SceneHashCacheKey {
+            revision: self.session.revision(),
+            project_hash,
+            active_composition_id: self.session.document().active_composition_id,
+            editing_camera: self.session.playback.editing_camera,
+            selection_hash: compute_editing_selection_hash(&self.session),
+        };
+        if let Some((prev_key, hash)) = self.cached_scene_hash
+            && prev_key == cache_key
+        {
+            return hash;
+        }
+        let hash = compute_scene_hash_with_project_hash(&self.session, project_hash);
+        self.cached_scene_hash = Some((cache_key, hash));
+        hash
+    }
+
+    fn current_viewport_render_key(&mut self) -> (f64, u32, u32, bool, ViewportRenderKey) {
         let player_plus_enabled = self.session.plugins.is_enabled("player-plus");
         let seq_res = self.session.document().resolution;
         let divisor = if player_plus_enabled {
@@ -1539,11 +2193,12 @@ impl ZoidCraftApp {
                 .session
                 .selection
                 .is_editing_camera_active(&self.session.playback, selected_scene3d_uuid.is_some());
+        let scene_hash = self.cached_scene_hash();
         let key = ViewportRenderKey {
             frame_index,
             width: render_w,
             height: render_h,
-            scene_hash: compute_scene_hash(&self.session),
+            scene_hash,
             active_composition_id: self.session.document().active_composition_id,
             editing_camera,
             active_camera_hash,
@@ -1556,10 +2211,10 @@ impl ZoidCraftApp {
         (frame, render_w, render_h, editing_camera, key)
     }
 
-    fn update_viewport_gpu(&mut self) {
-        if self.renderer.is_none() {
-            return;
-        }
+    fn update_viewport_gpu(&mut self) -> Option<ViewportRenderKey> {
+        let forced = std::mem::take(&mut self.force_single_render)
+            | std::mem::take(&mut self.workspace.player_plus.single_render_requested);
+        self.renderer.as_ref()?;
 
         let cache_budget = self.workspace.panels.app_settings.preview_cache_mib;
         let active_comp_id = self.session.document().active_composition_id;
@@ -1567,33 +2222,26 @@ impl ZoidCraftApp {
             renderer.sync_active_composition(active_comp_id);
         }
         let player_plus_enabled = self.session.plugins.is_enabled("player-plus");
-        if player_plus_enabled && self.workspace.player_plus.drawing_paused {
-            if self.force_single_render || self.workspace.player_plus.single_render_requested {
-                self.force_single_render = false;
-                self.workspace.player_plus.single_render_requested = false;
-                // Clear last_render_key so an explicit "Render Single Frame" always re-renders
-                // even when the render key matches the previously rendered frame.
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.last_render_key = None;
-                }
-            } else {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.sync_cache_budget(cache_budget);
-                }
-                return;
+        if player_plus_enabled && self.workspace.player_plus.drawing_paused && !forced {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.sync_cache_budget(cache_budget);
             }
+            return None;
+        }
+        if forced && let Some(renderer) = self.renderer.as_mut() {
+            // Clear last_render_key so an explicit "Render Single Frame" or forced refresh
+            // always re-renders once even when the render key matches the previously rendered frame.
+            renderer.last_render_key = None;
         }
 
         let (frame, render_w, render_h, editing_camera, key) = self.current_viewport_render_key();
         let active_camera_id = self.viewport.active_camera_id.clone();
         let render_result = {
-            let Some(renderer) = self.renderer.as_mut() else {
-                return;
-            };
+            let renderer = self.renderer.as_mut()?;
             renderer.sync_cache_budget(cache_budget);
             renderer
                 .render_viewport_if_dirty(
-                    &self.session,
+                    &mut self.session,
                     frame,
                     render_w,
                     render_h,
@@ -1605,6 +2253,7 @@ impl ZoidCraftApp {
                 .map_err(|err| err.to_string())
         };
         let _ = self.record_viewport_render_result(render_result);
+        Some(key)
     }
 
     fn reset_ephemeral_ui_state(&mut self) {
@@ -1683,6 +2332,8 @@ impl ZoidCraftApp {
 
     fn perform_new_project(&mut self) {
         self.detach_active_export();
+        self.pending_media_imports.clear();
+        self.pending_autosave = None;
         if self.session.history.is_in_transaction() {
             let _ = self.session.cancel_transaction();
         }
@@ -1693,6 +2344,7 @@ impl ZoidCraftApp {
         self.session.mark_saved();
         self.current_file = None;
         self.pending_unsaved_dialog = None;
+        self.invalidate_project_hash_caches();
         self.cached_missing_plugins_revision = None;
         self.cached_missing_plugins.clear();
         self.dismissed_missing_plugins.clear();
@@ -1810,6 +2462,8 @@ impl ZoidCraftApp {
 
     fn load_project_into_session(&mut self, project: Project, path: Option<PathBuf>) {
         self.detach_active_export();
+        self.pending_media_imports.clear();
+        self.pending_autosave = None;
         let mut plugins = self.session.plugins.clone();
         // Automatically re-enable safe built-in plugins recorded when this `.zcraft` was saved
         // so reopening a saved project renders identically without a false warning banner.
@@ -1821,6 +2475,7 @@ impl ZoidCraftApp {
         self.session.mark_saved();
         self.current_file = path;
         self.pending_unsaved_dialog = None;
+        self.invalidate_project_hash_caches();
         self.cached_missing_plugins_revision = None;
         self.cached_missing_plugins.clear();
         self.dismissed_missing_plugins.clear();
@@ -1965,6 +2620,16 @@ impl ZoidCraftApp {
         }
     }
 
+    fn existing_embedded_asset_bytes(&self) -> u64 {
+        self.session
+            .project
+            .assets
+            .values()
+            .filter_map(|r| r.bytes.as_ref())
+            .map(|b| b.len() as u64)
+            .fold(0_u64, u64::saturating_add)
+    }
+
     fn read_asset_bytes_within_budget(
         &self,
         path: &Path,
@@ -1972,14 +2637,7 @@ impl ZoidCraftApp {
         let file_len = fs::metadata(path)
             .map_err(|err| format!("Failed to inspect media file: {err}"))?
             .len();
-        let existing_asset_bytes: u64 = self
-            .session
-            .project
-            .assets
-            .values()
-            .filter_map(|r| r.bytes.as_ref())
-            .map(|b| b.len() as u64)
-            .fold(0_u64, u64::saturating_add);
+        let existing_asset_bytes = self.existing_embedded_asset_bytes();
         let remaining_budget =
             zc_project::MAX_RETAINED_ASSET_BYTES.saturating_sub(existing_asset_bytes);
         if file_len > remaining_budget {
@@ -2018,7 +2676,7 @@ impl ZoidCraftApp {
 
         let kind = match ext.as_str() {
             "png" | "jpg" | "jpeg" | "webp" | "gif" => AssetKind::Image,
-            "wav" | "mp3" | "ogg" | "flac" | "aac" | "mp4" => AssetKind::Av,
+            e if is_audio_extension(e) || is_video_extension(e) => AssetKind::Av,
             "obj" | "gltf" | "glb" => AssetKind::Geometry,
             "ttf" | "otf" => AssetKind::Font,
             _ => AssetKind::Misc,
@@ -2052,6 +2710,8 @@ impl ZoidCraftApp {
             );
             self.decoded_audio
                 .insert(asset_id.to_owned(), Arc::new(buf));
+            self.cached_audio_mix_hash = None;
+            self.last_audio_peaks_sync_rev = None;
             self.sync_timeline_audio_peaks();
         }
     }
@@ -2074,8 +2734,8 @@ impl ZoidCraftApp {
             rfd::FileDialog::new().add_filter(
                 "Media & Assets",
                 &[
-                    "png", "jpg", "jpeg", "webp", "gif", "mp4", "obj", "gltf", "glb", "ttf", "otf",
-                    "wav", "mp3", "ogg", "flac", "aac", "cube",
+                    "png", "jpg", "jpeg", "webp", "gif", "mp4", "mov", "mkv", "webm", "m4v", "avi",
+                    "obj", "gltf", "glb", "ttf", "otf", "wav", "mp3", "ogg", "flac", "aac", "cube",
                 ],
             )
         };
@@ -2085,12 +2745,57 @@ impl ZoidCraftApp {
             return;
         };
 
-        let (filename, ext, kind, bytes) = match self.read_asset_bytes_within_budget(&path) {
-            Ok(data) => data,
-            Err(msg) => {
-                self.show_toast(msg);
-                return;
+        let (filename, ext, kind, prepared_record) = if is_video_path(&path) {
+            let existing = self.existing_embedded_asset_bytes();
+            let desired_start = self.session.playback.current_frame.round().max(0.0);
+            match prepare_video_import_work(&path, existing, desired_start) {
+                Ok(payload) => {
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    (
+                        payload.filename,
+                        ext,
+                        AssetKind::Av,
+                        Some(payload.asset_record),
+                    )
+                }
+                Err(msg) => {
+                    self.show_toast(msg);
+                    return;
+                }
             }
+        } else {
+            match self.read_asset_bytes_within_budget(&path) {
+                Ok((filename, ext, kind, bytes)) => {
+                    let digest = sha256_hex(&bytes);
+                    let size = bytes.len() as u64;
+                    let rec = AssetRecord {
+                        id: digest.clone(),
+                        kind,
+                        source: AssetSource::File,
+                        filename: filename.clone(),
+                        url: Some(canonical_local_url(&path)),
+                        external: false,
+                        bytes: Some(bytes),
+                        missing: false,
+                        sha256: digest,
+                        size,
+                        preserved: BTreeMap::new(),
+                    };
+                    (filename, ext, kind, Some(rec))
+                }
+                Err(msg) => {
+                    self.show_toast(msg);
+                    return;
+                }
+            }
+        };
+
+        let Some(asset_record) = prepared_record else {
+            return;
         };
 
         // Close any open inspector transaction before starting an atomic asset-assign transaction
@@ -2103,10 +2808,11 @@ impl ZoidCraftApp {
             .begin_transaction(format!("Assign {filename} to {property}"))
             .is_ok();
 
-        let asset_id = self
-            .session
+        let asset_id = asset_record.id.clone();
+        self.session
             .project
-            .insert_binary_asset(kind, filename.clone(), bytes);
+            .assets
+            .insert(asset_id.clone(), asset_record);
         self.session.project.media.push(MediaItem {
             id: Uuid::new_v4(),
             name: filename.clone(),
@@ -2124,6 +2830,7 @@ impl ZoidCraftApp {
                 if tx_started {
                     let _ = self.session.commit_transaction(true);
                 }
+                self.invalidate_project_hash_caches();
                 self.cache_decoded_audio_for_asset(&asset_id, &ext);
                 self.show_toast(format!("Assigned {filename}"));
             }
@@ -2131,8 +2838,239 @@ impl ZoidCraftApp {
                 if tx_started {
                     let _ = self.session.cancel_transaction();
                 }
+                self.invalidate_project_hash_caches();
                 self.show_toast(format!("Failed to assign {filename}: {err}"));
             }
+        }
+    }
+
+    fn spawn_video_import(&mut self, path: PathBuf) -> String {
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("video")
+            .to_owned();
+        let existing_embedded_bytes = self.existing_embedded_asset_bytes();
+        let desired_start = self.session.playback.current_frame.round().max(0.0);
+        let (tx, rx) = mpsc::channel();
+        let spawn_res = thread::Builder::new()
+            .name("zc-video-import".to_owned())
+            .spawn(move || {
+                let outcome =
+                    prepare_video_import_work(&path, existing_embedded_bytes, desired_start);
+                let _ = tx.send(outcome);
+            });
+        match spawn_res {
+            Ok(_) => {
+                self.pending_media_imports.push(PendingMediaImport {
+                    filename: filename.clone(),
+                    rx,
+                });
+                self.show_toast(format!("Importing {filename}..."));
+            }
+            Err(err) => {
+                self.show_toast(format!("Failed to start import for {filename}: {err}"));
+            }
+        }
+        filename
+    }
+
+    fn poll_pending_media_imports(&mut self, ctx: &egui::Context) {
+        if self.pending_media_imports.is_empty() {
+            return;
+        }
+        let mut remaining = Vec::with_capacity(self.pending_media_imports.len());
+        let pending = std::mem::take(&mut self.pending_media_imports);
+        for item in pending {
+            match item.rx.try_recv() {
+                Ok(Ok(payload)) => {
+                    match self.finalize_video_import_payload(payload) {
+                        Ok(msg) | Err(msg) => self.show_toast(msg),
+                    }
+                    self.force_single_render = true;
+                }
+                Ok(Err(err_msg)) => {
+                    self.show_toast(err_msg);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.show_toast(format!("Import failed for {}", item.filename));
+                }
+                Err(TryRecvError::Empty) => {
+                    remaining.push(item);
+                }
+            }
+        }
+        self.pending_media_imports = remaining;
+        if !self.pending_media_imports.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
+
+    fn finalize_video_import_payload(
+        &mut self,
+        payload: VideoImportPayload,
+    ) -> Result<String, String> {
+        if self.session.history.is_in_transaction() {
+            let _ = self.session.commit_transaction(true);
+        }
+        let tx_started = self
+            .session
+            .begin_transaction(format!("Import {}", payload.filename))
+            .is_ok();
+
+        let asset_id = payload.asset_record.id.clone();
+        let is_external = payload.asset_record.external;
+        self.session
+            .project
+            .assets
+            .insert(asset_id.clone(), payload.asset_record);
+        self.session.project.media.push(MediaItem {
+            id: Uuid::new_v4(),
+            name: payload.filename.clone(),
+            asset_id: Some(asset_id.clone()),
+            kind: AssetKind::Av,
+            preserved: BTreeMap::new(),
+        });
+
+        let active_fps = self.session.document().fps.max(1.0);
+        let duration_secs = payload.probed.duration_secs.or_else(|| {
+            payload
+                .decoded_audio
+                .as_ref()
+                .map(|(buf, _)| buf.duration_secs())
+                .filter(|d| d.is_finite() && *d > 0.0)
+        });
+        let length = duration_secs
+            .map(|secs| (secs * active_fps).round().max(1.0))
+            .unwrap_or(150.0);
+        let desired_start = payload.desired_start.round().max(0.0);
+
+        let mut placement_warning: Option<String> = None;
+        let track_id =
+            choose_free_video_track_at(&self.session, desired_start, length).or_else(|| {
+                self.session
+                    .execute(Command::AddVideoTrack { name: None })
+                    .ok()
+                    .and_then(|res| {
+                        res.get("track_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+            });
+        if let Some(track_id) = track_id {
+            match self.session.execute(Command::AddClip {
+                track_id,
+                kind: "video".to_owned(),
+                name: Some(payload.filename.clone()),
+                start: desired_start,
+                length,
+            }) {
+                Ok(res) => {
+                    if let Some(clip_id) = res.get("clip_id").and_then(Value::as_str) {
+                        let _ = self.session.execute(Command::SetPropertyValue {
+                            target_id: clip_id.to_owned(),
+                            property: "assetId".to_owned(),
+                            value: json!(asset_id),
+                        });
+                        if let (Some(w), Some(h)) = (payload.probed.width, payload.probed.height) {
+                            let _ = self.session.execute(Command::SetPropertyValue {
+                                target_id: clip_id.to_owned(),
+                                property: "resolution".to_owned(),
+                                value: json!([f64::from(w), f64::from(h)]),
+                            });
+                        }
+                        let _ = self
+                            .session
+                            .selection
+                            .select_clip(clip_id, Some("video"), false);
+                    }
+                }
+                Err(err) => {
+                    placement_warning = Some(format!(
+                        "Imported {} to Media (could not place clip: {err})",
+                        payload.filename
+                    ));
+                }
+            }
+        }
+
+        if let Some((audio_buf, ui_peaks)) = payload.decoded_audio {
+            self.asset_waveform_peaks
+                .insert(asset_id.clone(), ui_peaks.clone());
+            self.decoded_audio.insert(asset_id.clone(), audio_buf);
+
+            let audio_track_id = choose_free_audio_track_at(&self.session, desired_start, length)
+                .or_else(|| {
+                    self.session
+                        .execute(Command::AddAudioTrack { name: None })
+                        .ok()
+                        .and_then(|res| {
+                            res.get("track_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                });
+            if let Some(audio_track_id) = audio_track_id
+                && let Ok(res) = self.session.execute(Command::AddClip {
+                    track_id: audio_track_id,
+                    kind: "audio".to_owned(),
+                    name: Some(payload.filename.clone()),
+                    start: desired_start,
+                    length,
+                })
+                && let Some(audio_clip_id) = res.get("clip_id").and_then(Value::as_str)
+            {
+                if self
+                    .session
+                    .execute(Command::SetPropertyValue {
+                        target_id: audio_clip_id.to_owned(),
+                        property: "assetId".to_owned(),
+                        value: json!(asset_id),
+                    })
+                    .is_err()
+                {
+                    for at in &mut self.session.project.sequence.audio_tracks {
+                        if let Some(ac) = at
+                            .clips
+                            .iter_mut()
+                            .find(|c| c.id.to_string() == audio_clip_id)
+                        {
+                            ac.media = Some(asset_id.clone());
+                        }
+                    }
+                }
+                self.timeline
+                    .audio_peaks
+                    .insert(audio_clip_id.to_owned(), ui_peaks);
+            }
+        }
+
+        if tx_started {
+            let _ = self.session.commit_transaction(true);
+        }
+        self.invalidate_project_hash_caches();
+
+        if let Some(warn) = placement_warning {
+            return Ok(warn);
+        }
+        let mut details = Vec::new();
+        if let (Some(w), Some(h)) = (payload.probed.width, payload.probed.height) {
+            details.push(format!("{w}x{h}"));
+        }
+        if let Some(secs) = duration_secs {
+            details.push(format!("{secs:.1}s"));
+        }
+        if is_external {
+            details.push("linked".to_owned());
+        }
+        if details.is_empty() {
+            Ok(format!("Imported {}", payload.filename))
+        } else {
+            Ok(format!(
+                "Imported {} ({})",
+                payload.filename,
+                details.join(", ")
+            ))
         }
     }
 
@@ -2143,7 +3081,7 @@ impl ZoidCraftApp {
                 "Media & Assets",
                 &[
                     "png", "jpg", "jpeg", "webp", "gif", "wav", "mp3", "ogg", "flac", "aac", "mp4",
-                    "obj", "gltf", "glb", "ttf", "otf", "cube",
+                    "mov", "mkv", "webm", "m4v", "avi", "obj", "gltf", "glb", "ttf", "otf", "cube",
                 ],
             )
             .pick_file();
@@ -2152,12 +3090,23 @@ impl ZoidCraftApp {
             return;
         };
 
-        match self.import_media_from_path(&path) {
-            Ok(msg) | Err(msg) => self.show_toast(msg),
+        if is_video_path(&path) {
+            let _ = self.spawn_video_import(path);
+        } else {
+            match self.import_media_from_path(&path) {
+                Ok(msg) | Err(msg) => self.show_toast(msg),
+            }
         }
     }
 
     fn import_media_from_path(&mut self, path: &Path) -> Result<String, String> {
+        if is_video_path(path) {
+            let existing = self.existing_embedded_asset_bytes();
+            let desired_start = self.session.playback.current_frame.round().max(0.0);
+            let payload = prepare_video_import_work(path, existing, desired_start)?;
+            return self.finalize_video_import_payload(payload);
+        }
+
         let (filename, ext, kind, bytes) = self.read_asset_bytes_within_budget(path)?;
 
         let is_audio_ext = is_audio_extension(&ext);
@@ -2185,6 +3134,9 @@ impl ZoidCraftApp {
             .session
             .project
             .insert_binary_asset(kind, filename.clone(), bytes);
+        if let Some(rec) = self.session.project.assets.get_mut(&asset_id) {
+            rec.url = Some(canonical_local_url(path));
+        }
         self.session.project.media.push(MediaItem {
             id: Uuid::new_v4(),
             name: filename.clone(),
@@ -2317,6 +3269,7 @@ impl ZoidCraftApp {
         if tx_started {
             let _ = self.session.commit_transaction(true);
         }
+        self.invalidate_project_hash_caches();
 
         Ok(placement_warning.unwrap_or_else(|| format!("Imported {filename}")))
     }
@@ -2360,26 +3313,43 @@ impl ZoidCraftApp {
 
         if !media_paths.is_empty() {
             let mut imported_count = 0usize;
+            let mut spawned_videos = 0usize;
+            let mut last_video_name = String::new();
             let mut last_msg = String::new();
             let mut first_err: Option<String> = None;
-            for path in &media_paths {
-                match self.import_media_from_path(path) {
-                    Ok(msg) => {
-                        imported_count += 1;
-                        last_msg = msg;
-                    }
-                    Err(err) => {
-                        if first_err.is_none() {
-                            first_err = Some(err);
+            for path in media_paths {
+                if is_video_path(&path) {
+                    last_video_name = self.spawn_video_import(path);
+                    spawned_videos += 1;
+                } else {
+                    match self.import_media_from_path(&path) {
+                        Ok(msg) => {
+                            imported_count += 1;
+                            last_msg = msg;
+                        }
+                        Err(err) => {
+                            if first_err.is_none() {
+                                first_err = Some(err);
+                            }
                         }
                     }
                 }
             }
-            if imported_count == 1 && first_err.is_none() {
+            if spawned_videos > 0 && imported_count == 0 && first_err.is_none() {
+                if spawned_videos == 1 {
+                    self.show_toast(format!("Importing {last_video_name}..."));
+                } else {
+                    self.show_toast(format!("Importing {spawned_videos} video file(s)..."));
+                }
+            } else if imported_count == 1 && spawned_videos == 0 && first_err.is_none() {
                 self.show_toast(last_msg);
-            } else if imported_count > 0 {
+            } else if imported_count > 0 || spawned_videos > 0 {
                 if let Some(err) = first_err {
                     self.show_toast(format!("Imported {imported_count} file(s); error: {err}"));
+                } else if spawned_videos > 0 {
+                    self.show_toast(format!(
+                        "Imported {imported_count} file(s), importing {spawned_videos} video(s)..."
+                    ));
                 } else {
                     self.show_toast(format!("Imported {imported_count} media file(s)"));
                 }
@@ -2400,6 +3370,9 @@ impl ZoidCraftApp {
         self.decoded_audio.clear();
         self.asset_waveform_peaks.clear();
         self.timeline.audio_peaks.clear();
+        self.cached_audio_mix_hash = None;
+        self.last_audio_peaks_sync_rev = None;
+        self.last_audio_peaks_asset_count = 0;
 
         // Decode embedded audio assets (including those only present in Media/Assets so placing
         // them later onto the timeline immediately has waveforms and audio playback).
@@ -2488,7 +3461,16 @@ impl ZoidCraftApp {
     /// Ensures newly split, duplicated, or undone/redone audio clips inherit waveform peaks
     /// from their shared content-addressed `asset_id` without re-decoding audio bytes.
     fn sync_timeline_audio_peaks(&mut self) {
-        if self.asset_waveform_peaks.is_empty() {
+        let rev = self.session.revision();
+        let asset_count = self.asset_waveform_peaks.len();
+        if asset_count == 0 {
+            self.last_audio_peaks_sync_rev = Some(rev);
+            self.last_audio_peaks_asset_count = 0;
+            return;
+        }
+        if self.last_audio_peaks_sync_rev == Some(rev)
+            && self.last_audio_peaks_asset_count == asset_count
+        {
             return;
         }
         for at in &self.session.project.sequence.audio_tracks {
@@ -2502,6 +3484,8 @@ impl ZoidCraftApp {
                 }
             }
         }
+        self.last_audio_peaks_sync_rev = Some(rev);
+        self.last_audio_peaks_asset_count = asset_count;
     }
 
     fn handle_start_export(&mut self, ui_cfg: UiExportSettings) {
@@ -2529,19 +3513,27 @@ impl ZoidCraftApp {
             let frame = self.session.playback.current_frame;
             let render_res = if let Some(renderer) = self.renderer.as_mut() {
                 renderer.render_frame_straight_rgba8(
-                    &self.session,
+                    &mut self.session,
                     frame,
                     ui_cfg.width,
                     ui_cfg.height,
                 )
             } else {
+                let active_comp_id = self.session.document().active_composition_id;
+                let plugins = &self.session.plugins;
                 ProjectRenderEngine::new_headless().and_then(|mut eng| {
-                    let premul = eng.render_frame_rgba8(
-                        &self.session.project,
-                        &self.session.plugins,
-                        frame,
-                        ui_cfg.width,
-                        ui_cfg.height,
+                    let premul = with_live_viewport_project(
+                        &mut self.session.project,
+                        active_comp_id,
+                        |render_project| {
+                            eng.render_frame_rgba8(
+                                render_project,
+                                plugins,
+                                frame,
+                                ui_cfg.width,
+                                ui_cfg.height,
+                            )
+                        },
                     )?;
                     Ok(unpremultiply_rgba8(&premul))
                 })
@@ -2990,7 +3982,34 @@ impl ZoidCraftApp {
             list_recovery_snapshots_in_dir(&self.recovery_dir);
     }
 
+    fn poll_pending_autosave(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.pending_autosave.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(rev)) => {
+                self.pending_autosave = None;
+                self.last_autosave_revision = rev;
+                self.refresh_recovery_snapshots();
+            }
+            Ok(Err(err)) => {
+                self.pending_autosave = None;
+                tracing::warn!("autosave recovery snapshot failed: {err}");
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.pending_autosave = None;
+            }
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+        }
+    }
+
     fn maybe_periodic_autosave(&mut self, ctx: &egui::Context) {
+        self.poll_pending_autosave(ctx);
+        if self.pending_autosave.is_some() {
+            return;
+        }
         let rev = self.session.revision();
         let needs_snapshot = self.session.is_dirty() && rev != self.last_autosave_revision;
         if !needs_snapshot {
@@ -3001,18 +4020,28 @@ impl ZoidCraftApp {
             if self.session.history.is_in_transaction() {
                 return;
             }
-            let project_to_save = prepare_project_for_zcraft_save(&self.session);
-            match save_recovery_snapshot_to_dir(
-                &project_to_save,
-                &self.recovery_dir,
-                MAX_RECOVERY_SNAPSHOTS,
-            ) {
+            let recovery_project = prepare_project_for_autosave(&self.session);
+            let recovery_dir = self.recovery_dir.clone();
+            let (tx, rx) = mpsc::channel();
+            let spawn_res =
+                thread::Builder::new()
+                    .name("zc-autosave".to_owned())
+                    .spawn(move || {
+                        let res = save_recovery_snapshot_to_dir(
+                            &recovery_project,
+                            &recovery_dir,
+                            MAX_RECOVERY_SNAPSHOTS,
+                        )
+                        .map(|_| rev);
+                        let _ = tx.send(res);
+                    });
+            match spawn_res {
                 Ok(_) => {
-                    self.last_autosave_revision = rev;
-                    self.refresh_recovery_snapshots();
+                    self.pending_autosave = Some(rx);
+                    ctx.request_repaint_after(Duration::from_millis(200));
                 }
                 Err(err) => {
-                    tracing::warn!("autosave recovery snapshot failed: {err}");
+                    tracing::warn!("failed to spawn zc-autosave thread: {err}");
                 }
             }
         } else {
@@ -3100,6 +4129,7 @@ impl ZoidCraftApp {
                 self.dismissed_missing_plugins.remove(plugin_id);
             }
         }
+        self.invalidate_project_hash_caches();
         self.cached_missing_plugins_revision = None;
         self.workspace.panels.plugin_notice = None;
         self.force_single_render = true;
@@ -3854,6 +4884,7 @@ impl eframe::App for ZoidCraftApp {
         }
         self.workspace.suppress_shortcuts = self.pending_unsaved_dialog.is_some();
         self.poll_ffmpeg_probe(&ctx);
+        self.poll_pending_media_imports(&ctx);
         self.sync_timeline_audio_peaks();
         self.tick_playback_and_meter(&ctx);
         let was_playing = self.session.playback.is_playing();
@@ -4011,18 +5042,35 @@ impl eframe::App for ZoidCraftApp {
         }
 
         // 4. Dirty-tracked zero-copy GPU viewport render & preview cache telemetry sync.
-        self.update_viewport_gpu();
-        let (viewport_tex, cached_spans, cached_used_bytes) = self.renderer.as_ref().map_or_else(
-            || (None, Vec::new(), 0_u64),
-            |r| {
-                (
-                    r.texture_id(),
-                    r.preview_cache_spans(),
-                    r.preview_cache_used_bytes(),
-                )
-            },
-        );
-        self.timeline.cached_frame_spans = cached_spans;
+        let pre_ui_rendered_key = self.update_viewport_gpu();
+        let pre_ui_rev = self.session.revision();
+        let pre_ui_frame_bits = self.session.playback.current_frame.to_bits();
+        let pre_ui_active_comp = self.session.document().active_composition_id;
+        let pre_ui_active_camera_hash =
+            hash_optional_str(self.viewport.active_camera_id.as_deref());
+        let pre_ui_editing_camera = self.session.playback.editing_camera;
+        let pre_ui_is_playing = self.session.playback.is_playing();
+        let pre_ui_camera_bits = if pre_ui_editing_camera {
+            pack_camera_bits(&self.viewport.camera)
+        } else {
+            [0; 9]
+        };
+        let pre_ui_canvas_rect = self.last_canvas_rect;
+        let pre_ui_preview_quality = self.workspace.player_plus.preview_quality;
+        let pre_ui_selection_hash = compute_editing_selection_hash(&self.session);
+        let pre_ui_selected_scene3d = selected_single_scene3d_clip_uuid(&self.session);
+
+        let (viewport_tex, cached_used_bytes) = if let Some(r) = self.renderer.as_mut() {
+            let spans = r.preview_cache_spans();
+            if self.timeline.cached_frame_spans.as_slice() != spans {
+                self.timeline.cached_frame_spans.clear();
+                self.timeline.cached_frame_spans.extend_from_slice(spans);
+            }
+            (r.texture_id(), r.preview_cache_used_bytes())
+        } else {
+            self.timeline.cached_frame_spans.clear();
+            (None, 0_u64)
+        };
         ctx.data_mut(|d| {
             d.insert_temp(Id::unique("zc_preview_cache_used_bytes"), cached_used_bytes);
         });
@@ -4220,17 +5268,40 @@ impl eframe::App for ZoidCraftApp {
         if self.active_export.is_some() || !self.retired_exports.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
-        let (_, _, _, _, post_ui_key) = self.current_viewport_render_key();
         let last_rendered_key = self.renderer.as_ref().and_then(|r| r.last_render_key);
         let player_plus_paused = self.session.plugins.is_enabled("player-plus")
             && self.workspace.player_plus.drawing_paused;
         let single_requested =
             self.force_single_render || self.workspace.player_plus.single_render_requested;
-        if single_requested
-            || (self.renderer.is_some()
-                && !player_plus_paused
-                && last_rendered_key != Some(post_ui_key))
-        {
+        let viewport_inputs_unchanged = pre_ui_rendered_key.is_some()
+            && last_rendered_key == pre_ui_rendered_key
+            && self.cached_project_hash_rev == Some(pre_ui_rev)
+            && self.session.revision() == pre_ui_rev
+            && self.session.playback.current_frame.to_bits() == pre_ui_frame_bits
+            && self.session.document().active_composition_id == pre_ui_active_comp
+            && hash_optional_str(self.viewport.active_camera_id.as_deref())
+                == pre_ui_active_camera_hash
+            && self.session.playback.editing_camera == pre_ui_editing_camera
+            && self.session.playback.is_playing() == pre_ui_is_playing
+            && (!pre_ui_editing_camera
+                || pack_camera_bits(&self.viewport.camera) == pre_ui_camera_bits)
+            && self.last_canvas_rect == pre_ui_canvas_rect
+            && self.workspace.player_plus.preview_quality == pre_ui_preview_quality
+            && compute_editing_selection_hash(&self.session) == pre_ui_selection_hash
+            && selected_single_scene3d_clip_uuid(&self.session) == pre_ui_selected_scene3d;
+        let needs_viewport_repaint = if single_requested {
+            true
+        } else if self.renderer.is_some() && !player_plus_paused {
+            if viewport_inputs_unchanged {
+                false
+            } else {
+                let (_, _, _, _, post_ui_key) = self.current_viewport_render_key();
+                last_rendered_key != Some(post_ui_key)
+            }
+        } else {
+            false
+        };
+        if needs_viewport_repaint {
             ctx.request_repaint();
         }
 
@@ -4793,6 +5864,25 @@ fn choose_free_video_track_at(
         .map(|t| t.id.clone())
 }
 
+fn choose_free_audio_track_at(
+    session: &Session,
+    desired_start: f64,
+    length: f64,
+) -> Option<String> {
+    session
+        .document()
+        .audio_tracks
+        .iter()
+        .find(|t| {
+            !t.locked
+                && !t.clips.iter().any(|c| {
+                    c.start < desired_start + length - 1e-6
+                        && desired_start < c.start + c.length - 1e-6
+                })
+        })
+        .map(|t| t.id.clone())
+}
+
 /// Picks an unlocked audio track with no overlap at `desired_start`, or the earliest
 /// non-overlapping start on the first unlocked audio track (returns `None` when no unlocked
 /// audio track exists, signaling the caller to create a new audio track).
@@ -5021,12 +6111,33 @@ fn fnv_mix_props(hash: &mut u64, props: &BTreeMap<String, SessionProperty>) {
     }
 }
 
-fn compute_scene_hash(session: &Session) -> u64 {
+fn compute_editing_selection_hash(session: &Session) -> u64 {
+    if !session.playback.editing_camera {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    fnv_mix(
+        &mut h,
+        &(session.selection.clip_ids.len() as u64).to_le_bytes(),
+    );
+    for cid in &session.selection.clip_ids {
+        fnv_mix(&mut h, cid.as_bytes());
+    }
+    fnv_mix(
+        &mut h,
+        &(session.selection.object_3d_ids.len() as u64).to_le_bytes(),
+    );
+    for oid in &session.selection.object_3d_ids {
+        fnv_mix(&mut h, oid.as_bytes());
+    }
+    h
+}
+
+fn compute_scene_hash_with_project_hash(session: &Session, project_hash: u64) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     // Mix monotonic session revision so every command/edit/undo/redo invalidates immediately,
     // alongside the full rendered project + plugin fingerprint from `zc_render::cache`.
     fnv_mix(&mut h, &session.revision().to_le_bytes());
-    let project_hash = zc_render::cache::project_render_hash(&session.project, &session.plugins);
     fnv_mix(&mut h, &project_hash.to_le_bytes());
 
     // Also fold live `SessionDocument` + active composition + selection state
@@ -5086,6 +6197,12 @@ fn compute_scene_hash(session: &Session) -> u64 {
         }
     }
     h
+}
+
+#[cfg(test)]
+fn compute_scene_hash(session: &Session) -> u64 {
+    let project_hash = zc_render::cache::project_render_hash(&session.project, &session.plugins);
+    compute_scene_hash_with_project_hash(session, project_hash)
 }
 
 // ---------------------------------------------------------------------------
@@ -5646,6 +6763,141 @@ fn live_audio_needs_rebuild(
     needs_mix && (has_audio_output || audio_stream_attempted_hash != mix_hash || outside_window)
 }
 
+/// Returns `true` when the playhead has crossed 75% of the currently loaded live audio window
+/// and more timeline exists in the active playback direction, triggering an off-thread prefetch
+/// so the next window can be hot-swapped seamlessly before the boundary is reached.
+fn live_audio_should_prefetch(
+    audio_mix_hash: u64,
+    audio_window_start: u32,
+    audio_window_end: u32,
+    mix_hash: u64,
+    cur_f: f64,
+    speed: f64,
+    total_frames: u32,
+) -> bool {
+    if audio_mix_hash != mix_hash || audio_window_end <= audio_window_start {
+        return false;
+    }
+    let span = f64::from(audio_window_end - audio_window_start);
+    if span <= 1.0 {
+        return false;
+    }
+    if speed > 0.0 && audio_window_end < total_frames {
+        let progress = (cur_f - f64::from(audio_window_start)) / span;
+        progress >= 0.75
+    } else if speed < 0.0 && audio_window_start > 0 {
+        let progress = (f64::from(audio_window_end) - cur_f) / span;
+        progress >= 0.75
+    } else {
+        false
+    }
+}
+
+type AudioMixInputs = (
+    Vec<FlattenedAudioClip>,
+    HashMap<String, Arc<AudioBuffer>>,
+    HashMap<String, AudioMixRawAsset>,
+);
+
+fn collect_audio_mix_inputs(
+    session: &Session,
+    cached_buffers: &HashMap<String, Arc<AudioBuffer>>,
+    range_start: f64,
+    range_end: f64,
+) -> AudioMixInputs {
+    let flattened = collect_flattened_audio_clips_with_precomp(
+        &session.project,
+        range_start,
+        range_end,
+        session.plugins.is_enabled("precomp-plus"),
+    );
+    let mut buffers: HashMap<String, Arc<AudioBuffer>> = HashMap::new();
+    let mut raw_assets: HashMap<String, AudioMixRawAsset> = HashMap::new();
+    let mut active_clips = Vec::with_capacity(flattened.len());
+
+    for clip in flattened {
+        if !buffers.contains_key(&clip.asset_id) && !raw_assets.contains_key(&clip.asset_id) {
+            if let Some(cached) = cached_buffers.get(&clip.asset_id) {
+                if cached.is_empty() {
+                    continue;
+                }
+                buffers.insert(clip.asset_id.clone(), Arc::clone(cached));
+            } else if let Some(rec) = session.project.assets.get(&clip.asset_id)
+                && let Some(bytes) = rec.bytes.as_deref()
+            {
+                let ext = Path::new(&rec.filename)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_owned);
+                raw_assets.insert(
+                    clip.asset_id.clone(),
+                    AudioMixRawAsset {
+                        bytes: bytes.to_vec(),
+                        ext,
+                    },
+                );
+            } else {
+                continue;
+            }
+        }
+        active_clips.push(clip);
+    }
+    (active_clips, buffers, raw_assets)
+}
+
+fn execute_audio_mix_work(
+    clips: Vec<FlattenedAudioClip>,
+    mut buffers: HashMap<String, Arc<AudioBuffer>>,
+    raw_assets: HashMap<String, AudioMixRawAsset>,
+    win_start: u32,
+    win_end: u32,
+    fps: f64,
+) -> Result<Option<AudioMixWindow>, String> {
+    if clips.is_empty() {
+        return Ok(None);
+    }
+    let mut silent_assets: HashSet<String> = HashSet::new();
+    for (asset_id, raw) in raw_assets {
+        match decode_audio_bytes(&raw.bytes, raw.ext.as_deref()) {
+            Ok(decoded) => {
+                if decoded.is_empty() {
+                    silent_assets.insert(asset_id);
+                } else {
+                    buffers.insert(asset_id, Arc::new(decoded));
+                }
+            }
+            Err(AudioError::NoAudioTrack) => {
+                silent_assets.insert(asset_id);
+            }
+            Err(err) => {
+                return Err(format!("failed to decode audio asset `{asset_id}`: {err}"));
+            }
+        }
+    }
+    let active_clips: Vec<FlattenedAudioClip> = clips
+        .into_iter()
+        .filter(|c| !silent_assets.contains(&c.asset_id) && buffers.contains_key(&c.asset_id))
+        .collect();
+    if active_clips.is_empty() {
+        return Ok(None);
+    }
+    let range_start = f64::from(win_start);
+    let span_frames = f64::from(win_end.saturating_sub(win_start).max(1));
+    let samples = mix_flattened_audio_clips(
+        &active_clips,
+        range_start,
+        span_frames,
+        fps.max(1.0),
+        STANDARD_SAMPLE_RATE,
+        &buffers,
+    )
+    .map_err(|err| format!("failed to mix sequence audio: {err}"))?;
+    Ok(Some(AudioMixWindow {
+        origin_frame: range_start,
+        samples: Arc::new(samples),
+    }))
+}
+
 /// Computes a bounded `[start_frame, end_frame)` live audio mix window covering `current_frame`
 /// without exceeding `window_frames`, supporting both forward and reverse playback on long timelines.
 fn compute_live_audio_window(
@@ -5897,6 +7149,42 @@ fn mix_sequence_audio_stereo(
     .map_err(|err| format!("failed to mix sequence audio: {err}"))
 }
 
+/// Reads a 512-sample stereo RMS meter window directly from the active pre-mixed
+/// [`AudioMixWindow`] in O(1) without re-flattening or re-mixing clips on the UI thread.
+fn sample_live_audio_meter_from_window(
+    window: &AudioMixWindow,
+    frame: f64,
+    fps: f64,
+) -> Option<(f32, f32)> {
+    const METER_WINDOW: usize = 512;
+    let samples = window.samples.as_slice();
+    if samples.is_empty() {
+        return None;
+    }
+    let safe_fps = fps.max(1.0);
+    let rel_sec = (frame - window.origin_frame) / safe_fps;
+    if !rel_sec.is_finite() || rel_sec < 0.0 {
+        return None;
+    }
+    let start_idx = (rel_sec * f64::from(STANDARD_SAMPLE_RATE)).floor() as usize;
+    if start_idx >= samples.len() {
+        return None;
+    }
+    let end_idx = start_idx.saturating_add(METER_WINDOW).min(samples.len());
+    let mut sum_sq_l = 0.0_f64;
+    let mut sum_sq_r = 0.0_f64;
+    for &[sl, sr] in &samples[start_idx..end_idx] {
+        let l = f64::from(sl.clamp(-1.0, 1.0));
+        let r = f64::from(sr.clamp(-1.0, 1.0));
+        sum_sq_l += l * l;
+        sum_sq_r += r * r;
+    }
+    let denom = METER_WINDOW as f64;
+    let rms_l = (sum_sq_l / denom).sqrt().clamp(0.0, 1.0) as f32;
+    let rms_r = (sum_sq_r / denom).sqrt().clamp(0.0, 1.0) as f32;
+    Some((rms_l, rms_r))
+}
+
 fn sample_live_audio_meter(
     session: &Session,
     buffers: &HashMap<String, Arc<AudioBuffer>>,
@@ -6013,6 +7301,75 @@ fn prepare_project_for_zcraft_save(session: &Session) -> Project {
             .insert(ZOIDCRAFT_ENABLED_PLUGINS_KEY.to_owned(), json!(enabled));
     }
     project
+}
+
+/// Builds a lightweight recovery [`Project`] snapshot for background periodic autosave
+/// without copying or gzipping embedded assets larger than
+/// [`AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES`] when they already have a local `url`.
+/// Leaves `session.project` completely untouched.
+fn prepare_project_for_autosave(session: &Session) -> Project {
+    let src = &session.project;
+    let mut assets = BTreeMap::new();
+    for (k, rec) in &src.assets {
+        let should_externalize = rec.url.is_some()
+            && rec
+                .bytes
+                .as_ref()
+                .is_some_and(|b| b.len() > AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES);
+        let copy = if should_externalize {
+            AssetRecord {
+                id: rec.id.clone(),
+                kind: rec.kind,
+                source: rec.source,
+                filename: rec.filename.clone(),
+                url: rec.url.clone(),
+                external: true,
+                bytes: None,
+                missing: rec.missing,
+                sha256: rec.sha256.clone(),
+                size: rec.size,
+                preserved: rec.preserved.clone(),
+            }
+        } else {
+            rec.clone()
+        };
+        assets.insert(k.clone(), copy);
+    }
+
+    let mut plugin_requirements = src.plugin_requirements.clone();
+    for dep in session.active_plugin_dependencies() {
+        plugin_requirements.insert(dep);
+    }
+    let mut sequence = src.sequence.clone();
+    let mut enabled: Vec<String> = session
+        .plugins
+        .enabled_ids()
+        .iter()
+        .filter(|id| id.as_str() != "core")
+        .cloned()
+        .collect();
+    enabled.sort();
+    enabled.dedup();
+    if enabled.is_empty() {
+        sequence.preserved.remove(ZOIDCRAFT_ENABLED_PLUGINS_KEY);
+    } else {
+        sequence
+            .preserved
+            .insert(ZOIDCRAFT_ENABLED_PLUGINS_KEY.to_owned(), json!(enabled));
+    }
+
+    Project {
+        version: src.version,
+        name: src.name.clone(),
+        assets,
+        media: src.media.clone(),
+        sequence,
+        compositions: src.compositions.clone(),
+        composition_ids: src.composition_ids.clone(),
+        plugin_requirements,
+        imported_from_pz_version: src.imported_from_pz_version,
+        preserved: src.preserved.clone(),
+    }
 }
 
 /// Extracts persisted enabled built-in plugin IDs saved into `sequence.preserved` by
@@ -6985,6 +8342,11 @@ mod tests {
             asset_waveform_peaks: HashMap::new(),
             audio_clock: MasterPlaybackClock::new(fps, seq_len),
             audio_output: None,
+            active_audio_window: None,
+            audio_mix_generation: 0,
+            pending_audio_mix: None,
+            pending_audio_mix_target: None,
+            cached_audio_mix_hash: None,
             audio_mix_hash: 0,
             audio_window_start: 0,
             audio_window_end: 0,
@@ -6998,6 +8360,7 @@ mod tests {
             last_audio_fps: fps,
             last_audio_seq_len: seq_len,
             ffmpeg_probe_rx: None,
+            pending_media_imports: Vec::new(),
             active_export: None,
             retired_exports: Vec::new(),
             next_export_job_id: 1,
@@ -7005,8 +8368,14 @@ mod tests {
             recovery_dir: std::env::temp_dir().join("zoidcraft-test-recovery"),
             last_autosave_at: Instant::now(),
             last_autosave_revision: 0,
+            pending_autosave: None,
             startup_recovery_banner: None,
             clipboard_bridge_seeded: false,
+            cached_project_hash_rev: None,
+            cached_project_hash: 0,
+            cached_scene_hash: None,
+            last_audio_peaks_sync_rev: None,
+            last_audio_peaks_asset_count: 0,
             cached_missing_plugins_revision: None,
             cached_missing_plugins: Vec::new(),
             dismissed_missing_plugins: BTreeSet::new(),
@@ -9255,6 +10624,444 @@ mod tests {
             "toast with recovery banner ({}) must sit strictly above normal bottom ({})",
             with_recovery.anchor_pos.y,
             normal.anchor_pos.y
+        );
+    }
+
+    #[test]
+    fn video_extensions_and_drop_classification_support_all_common_containers() {
+        for ext in [
+            "mp4", "mov", "mkv", "webm", "m4v", "avi", "MP4", "MOV", "MKV",
+        ] {
+            assert!(
+                is_video_extension(ext),
+                "expected '{ext}' to be recognized as a video extension"
+            );
+            let path = PathBuf::from(format!("clip.{ext}"));
+            assert_eq!(
+                classify_dropped_path(&path),
+                DroppedFileKind::Media,
+                "expected '{}' to classify as Media",
+                path.display()
+            );
+            assert!(is_video_path(&path));
+        }
+        for non_video in ["png", "jpg", "wav", "mp3", "zcraft", "pz", "txt"] {
+            assert!(
+                !is_video_extension(non_video),
+                "expected '{non_video}' not to be treated as video"
+            );
+        }
+        assert_eq!(
+            parse_ffprobe_rate("30000/1001").map(|v| (v * 100.0).round()),
+            Some(2997.0)
+        );
+        assert_eq!(parse_ffprobe_rate("60/1"), Some(60.0));
+        assert_eq!(parse_ffprobe_rate("0/0"), None);
+
+        let id1 = compute_external_asset_id("/tmp/clip.mov", 1_000_000_000, 42, b"header-a");
+        let id2 = compute_external_asset_id("/tmp/clip.mov", 1_000_000_000, 42, b"header-a");
+        let id3 = compute_external_asset_id("/tmp/clip.mov", 1_000_000_000, 43, b"header-a");
+        assert_eq!(id1.len(), 64);
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn with_live_viewport_project_is_zero_clone_and_restores_on_ok_and_err() {
+        let mut project = Project::new_cm3_default();
+        let root_seq_id = project.sequence.id;
+        let asset_id =
+            project.insert_binary_asset(AssetKind::Av, "big.mp4".to_owned(), vec![0x5a; 4096]);
+        let original_bytes_ptr = project.assets[&asset_id]
+            .bytes
+            .as_ref()
+            .expect("asset bytes")
+            .as_ptr();
+
+        project.sequence.controls.push(zc_project::SequenceControl {
+            id: "ctl-root-gain".to_owned(),
+            name: "RootGain".to_owned(),
+            kind: zc_project::SequenceControlKind::Slider,
+            track: zc_project::PropertyTrack::constant(zc_project::PropertyValue::Number(2.0)),
+            preserved: BTreeMap::new(),
+        });
+
+        let mut child = Project::new_cm3_default().sequence;
+        let child_id = Uuid::new_v4();
+        let child_track_id = Uuid::new_v4();
+        child.id = child_id;
+        child.name = "ChildComp".to_owned();
+        child.controls.clear();
+        child.video_tracks[0].id = child_track_id;
+        child.video_tracks.truncate(1);
+        project.compositions.insert(child_id, child);
+
+        let observed_ok = with_live_viewport_project(&mut project, Some(child_id), |vp| {
+            assert_eq!(vp.sequence.id, child_id);
+            assert_eq!(vp.sequence.video_tracks.len(), 1);
+            assert_eq!(vp.sequence.video_tracks[0].id, child_track_id);
+            assert!(
+                vp.sequence
+                    .controls
+                    .iter()
+                    .any(|c| c.id == "ctl-root-gain" && c.name == "RootGain"),
+                "child render must see root controls as fallbacks"
+            );
+            assert!(vp.compositions.contains_key(&root_seq_id));
+            // Zero-clone guarantee: asset byte buffer address is identical!
+            let inner_ptr = vp.assets[&asset_id]
+                .bytes
+                .as_ref()
+                .expect("asset bytes")
+                .as_ptr();
+            assert_eq!(inner_ptr, original_bytes_ptr);
+            Ok::<usize, &'static str>(42)
+        });
+        assert_eq!(observed_ok, Ok(42));
+        assert_eq!(project.sequence.id, root_seq_id);
+        assert!(project.compositions.contains_key(&child_id));
+        assert!(
+            project.compositions[&child_id].controls.is_empty(),
+            "child controls must be restored without leaked root fallback controls"
+        );
+
+        // Must also restore cleanly on Err!
+        let observed_err = with_live_viewport_project(&mut project, Some(child_id), |vp| {
+            assert_eq!(vp.sequence.id, child_id);
+            Err::<(), &'static str>("simulated render error")
+        });
+        assert_eq!(observed_err, Err("simulated render error"));
+        assert_eq!(project.sequence.id, root_seq_id);
+        assert!(project.compositions.contains_key(&child_id));
+        assert!(project.compositions[&child_id].controls.is_empty());
+        assert_eq!(
+            project.assets[&asset_id]
+                .bytes
+                .as_ref()
+                .expect("asset bytes")
+                .as_ptr(),
+            original_bytes_ptr
+        );
+    }
+
+    #[test]
+    fn autosave_recovery_snapshot_externalizes_large_local_assets_without_mutating_session() {
+        let mut session = Session::new();
+
+        // 1. Large (> 8 MiB) asset WITH local URL -> externalized in recovery copy only.
+        let large_bytes = vec![0xAB; AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES + 1024];
+        let large_local_id =
+            session
+                .project
+                .insert_binary_asset(AssetKind::Av, "large.mov".to_owned(), large_bytes);
+        session
+            .project
+            .assets
+            .get_mut(&large_local_id)
+            .expect("large asset")
+            .url = Some("/tmp/large.mov".to_owned());
+
+        // 2. Small (<= 8 MiB) asset WITH local URL -> stays embedded in recovery copy.
+        let small_local_id = session.project.insert_binary_asset(
+            AssetKind::Image,
+            "thumb.png".to_owned(),
+            vec![1, 2, 3, 4],
+        );
+        session
+            .project
+            .assets
+            .get_mut(&small_local_id)
+            .expect("small asset")
+            .url = Some("/tmp/thumb.png".to_owned());
+
+        // 3. Large (> 8 MiB) asset WITHOUT local URL -> stays embedded (cannot externalize).
+        let large_mem_id = session.project.insert_binary_asset(
+            AssetKind::Av,
+            "in_memory.mp4".to_owned(),
+            vec![0xCD; AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES + 512],
+        );
+
+        let recovery = prepare_project_for_autosave(&session);
+
+        let rec_large_local = recovery
+            .assets
+            .get(&large_local_id)
+            .expect("recovery large");
+        assert!(rec_large_local.external);
+        assert!(rec_large_local.bytes.is_none());
+        assert_eq!(rec_large_local.url.as_deref(), Some("/tmp/large.mov"));
+
+        let rec_small_local = recovery
+            .assets
+            .get(&small_local_id)
+            .expect("recovery small");
+        assert!(!rec_small_local.external);
+        assert_eq!(rec_small_local.bytes.as_deref(), Some(&[1, 2, 3, 4][..]));
+
+        let rec_large_mem = recovery.assets.get(&large_mem_id).expect("recovery mem");
+        assert!(!rec_large_mem.external);
+        assert!(rec_large_mem.bytes.is_some());
+
+        // Original session.project must remain completely untouched!
+        let orig_large_local = session
+            .project
+            .assets
+            .get(&large_local_id)
+            .expect("orig large");
+        assert!(!orig_large_local.external);
+        assert_eq!(
+            orig_large_local.bytes.as_ref().map(Vec::len),
+            Some(AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES + 1024)
+        );
+    }
+
+    #[test]
+    fn cached_project_render_hash_matches_fresh_hash_and_invalidates_on_revision() {
+        let mut app = make_headless_app_for_test();
+        let rev0 = app.session.revision();
+        let fresh0 =
+            zc_render::cache::project_render_hash(&app.session.project, &app.session.plugins);
+        let cached0 = app.cached_project_render_hash();
+        assert_eq!(cached0, fresh0);
+        assert_eq!(app.cached_project_hash_rev, Some(rev0));
+
+        // Second call at same revision returns identical cached hash.
+        assert_eq!(app.cached_project_render_hash(), fresh0);
+
+        // Mutating the project via session command advances revision and invalidates cached hash.
+        app.session
+            .execute(Command::SetResolution {
+                width: 1280,
+                height: 720,
+            })
+            .expect("set resolution");
+        let rev1 = app.session.revision();
+        assert_ne!(rev1, rev0);
+        let fresh1 =
+            zc_render::cache::project_render_hash(&app.session.project, &app.session.plugins);
+        let cached1 = app.cached_project_render_hash();
+        assert_eq!(cached1, fresh1);
+        assert_ne!(cached1, cached0);
+        assert_eq!(app.cached_project_hash_rev, Some(rev1));
+
+        // Toggling a plugin also advances session.revision() and updates cached hash.
+        let plugin_cmd = if app.session.plugins.is_enabled("camera-plus") {
+            Command::DisablePlugin {
+                plugin_id: "camera-plus".to_owned(),
+            }
+        } else {
+            Command::EnablePlugin {
+                plugin_id: "camera-plus".to_owned(),
+            }
+        };
+        app.session.execute(plugin_cmd).expect("toggle camera-plus");
+        let rev2 = app.session.revision();
+        assert_ne!(rev2, rev1);
+        let fresh2 =
+            zc_render::cache::project_render_hash(&app.session.project, &app.session.plugins);
+        let cached2 = app.cached_project_render_hash();
+        assert_eq!(cached2, fresh2);
+        assert_ne!(cached2, cached1);
+        assert_eq!(app.cached_project_hash_rev, Some(rev2));
+    }
+
+    #[test]
+    fn force_single_render_is_consumed_when_drawing_paused_is_false() {
+        let mut app = make_headless_app_for_test();
+        assert!(app.force_single_render);
+        assert!(!app.workspace.player_plus.drawing_paused);
+
+        app.workspace.player_plus.single_render_requested = true;
+        let _ = app.update_viewport_gpu();
+        assert!(
+            !app.force_single_render,
+            "force_single_render must be unconditionally consumed when drawing_paused == false to prevent 60-120Hz idle spin"
+        );
+        assert!(
+            !app.workspace.player_plus.single_render_requested,
+            "single_render_requested must also be consumed when drawing_paused == false"
+        );
+
+        // Also stays consumed when drawing_paused == true.
+        app.workspace.player_plus.drawing_paused = true;
+        app.force_single_render = true;
+        app.workspace.player_plus.single_render_requested = true;
+        let _ = app.update_viewport_gpu();
+        assert!(!app.force_single_render);
+        assert!(!app.workspace.player_plus.single_render_requested);
+    }
+
+    #[test]
+    fn preview_frame_cache_cached_spans_updates_cleanly_across_insert_evict_and_clear() {
+        // Budget fits at most 3 entries of 100 bytes each.
+        let mut cache: PreviewFrameCache<u32> = PreviewFrameCache::new(300);
+        assert!(cache.cached_spans().is_empty());
+        assert!(!cache.spans_dirty);
+
+        // Out-of-order inserts coalesce into sorted merged spans.
+        assert!(cache.insert(10, 10_000, 100, 10));
+        assert!(cache.insert(2, 2_000, 100, 2));
+        assert!(cache.insert(3, 3_000, 100, 3));
+        assert!(cache.spans_dirty);
+        assert_eq!(cache.cached_spans(), &[(2.0, 4.0), (10.0, 11.0)]);
+        assert!(!cache.spans_dirty);
+
+        // Calling cached_spans again reuses cached result cleanly.
+        assert_eq!(cache.cached_spans(), &[(2.0, 4.0), (10.0, 11.0)]);
+
+        // Inserting a 4th entry evicts the LRU entry (frame 10) and updates spans.
+        assert!(cache.insert(4, 4_000, 100, 4));
+        assert!(cache.spans_dirty);
+        assert_eq!(cache.cached_spans(), &[(2.0, 5.0)]);
+        assert!(!cache.spans_dirty);
+
+        // Shrinking max_bytes evicts oldest entries (frames 2 and 3) and updates spans.
+        cache.set_max_bytes(100);
+        assert!(cache.spans_dirty);
+        assert_eq!(cache.cached_spans(), &[(4.0, 5.0)]);
+        assert!(!cache.spans_dirty);
+
+        // clear() empties cached spans immediately.
+        cache.clear();
+        assert!(!cache.spans_dirty);
+        assert!(cache.cached_spans().is_empty());
+    }
+
+    #[test]
+    fn cached_audio_mix_hash_matches_fresh_and_invalidates_on_revision_and_decoded_audio() {
+        let mut app = make_headless_app_for_test();
+        let fps = 30.0;
+        let seq_len = 180.0;
+
+        // Add an audio clip referencing an asset.
+        let track_id = app.session.document().audio_tracks[0].id.clone();
+        let asset_id = "audio-cache-test-asset".to_owned();
+        let clip_id = app
+            .session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "audio".to_owned(),
+                name: Some("Beat".to_owned()),
+                start: 0.0,
+                length: 90.0,
+            })
+            .expect("add audio clip")["clip_id"]
+            .as_str()
+            .expect("clip_id")
+            .to_owned();
+        app.session.project.sequence.audio_tracks[0].clips[0].media = Some(asset_id.clone());
+
+        let fresh0 = compute_audio_mix_hash(&app.session, &app.decoded_audio, fps, seq_len);
+        let cached0 = app.cached_audio_mix_hash(fps, seq_len);
+        assert_eq!(cached0, fresh0);
+        assert_eq!(cached0, 0, "no decoded buffer or embedded bytes yet -> 0");
+
+        // Inserting into decoded_audio invalidates the cache via decoded_audio.len().
+        let tone = Arc::new(AudioBuffer {
+            sample_rate: STANDARD_SAMPLE_RATE,
+            channels: 2,
+            samples_interleaved_f32: vec![0.25_f32; 4_800 * 2],
+        });
+        app.decoded_audio.insert(asset_id, tone);
+        let fresh1 = compute_audio_mix_hash(&app.session, &app.decoded_audio, fps, seq_len);
+        let cached1 = app.cached_audio_mix_hash(fps, seq_len);
+        assert_eq!(cached1, fresh1);
+        assert_ne!(cached1, 0);
+
+        // Repeated call at same state hits cache and matches fresh.
+        assert_eq!(app.cached_audio_mix_hash(fps, seq_len), fresh1);
+
+        // Session revision mutation (e.g., changing clip volume) invalidates cache.
+        app.session
+            .execute(Command::SetPropertyValue {
+                target_id: clip_id,
+                property: "volume".to_owned(),
+                value: json!(0.5),
+            })
+            .expect("set audio clip volume");
+        let fresh2 = compute_audio_mix_hash(&app.session, &app.decoded_audio, fps, seq_len);
+        let cached2 = app.cached_audio_mix_hash(fps, seq_len);
+        assert_eq!(cached2, fresh2);
+        assert_ne!(cached2, cached1);
+
+        // Changing fps or seq_len also invalidates cache.
+        let fresh3 = compute_audio_mix_hash(&app.session, &app.decoded_audio, 60.0, seq_len);
+        let cached3 = app.cached_audio_mix_hash(60.0, seq_len);
+        assert_eq!(cached3, fresh3);
+        assert_ne!(cached3, cached2);
+    }
+
+    #[test]
+    fn cached_scene_hash_matches_fresh_and_invalidates_on_edit_and_editing_camera_selection() {
+        let mut app = make_headless_app_for_test();
+        let fresh0 = compute_scene_hash(&app.session);
+        let cached0 = app.cached_scene_hash();
+        assert_eq!(cached0, fresh0);
+        // Second call hits cache identically.
+        assert_eq!(app.cached_scene_hash(), fresh0);
+
+        // Enabling editing_camera + selecting an object invalidates scene hash even without revision bump.
+        app.session.playback.editing_camera = true;
+        app.session
+            .selection
+            .object_3d_ids
+            .push("obj-highlight-1".to_owned());
+        let fresh1 = compute_scene_hash(&app.session);
+        let cached1 = app.cached_scene_hash();
+        assert_eq!(cached1, fresh1);
+        assert_ne!(cached1, cached0);
+
+        // Command edit bumps revision and invalidates scene hash.
+        app.session
+            .execute(Command::SetPropertyValue {
+                target_id: "sequence".to_owned(),
+                property: "backgroundColor".to_owned(),
+                value: json!([0.1, 0.2, 0.3]),
+            })
+            .expect("edit sequence bg");
+        let fresh2 = compute_scene_hash(&app.session);
+        let cached2 = app.cached_scene_hash();
+        assert_eq!(cached2, fresh2);
+        assert_ne!(cached2, cached1);
+    }
+
+    #[test]
+    fn live_audio_prefetch_threshold_and_window_meter_read_o1() {
+        let mix_hash = 42;
+        // Short timeline fitting in one window never prefetches.
+        assert!(!live_audio_should_prefetch(
+            mix_hash, 0, 1800, mix_hash, 1500.0, 1.0, 1800
+        ));
+        // Long timeline forward playback: below 75% does not prefetch; at/above 75% prefetches.
+        assert!(!live_audio_should_prefetch(
+            mix_hash, 0, 1800, mix_hash, 1349.0, 1.0, 9000
+        ));
+        assert!(live_audio_should_prefetch(
+            mix_hash, 0, 1800, mix_hash, 1350.0, 1.0, 9000
+        ));
+        // Reverse playback prefetches once playhead passes 75% backwards toward win_start > 0.
+        assert!(!live_audio_should_prefetch(
+            mix_hash, 1800, 3600, mix_hash, 2251.0, -1.0, 9000
+        ));
+        assert!(live_audio_should_prefetch(
+            mix_hash, 1800, 3600, mix_hash, 2250.0, -1.0, 9000
+        ));
+
+        // O(1) window meter reading returns exact stereo RMS and None outside window.
+        let win = AudioMixWindow {
+            origin_frame: 30.0,
+            samples: Arc::new(vec![[0.5_f32, 0.25_f32]; 48_000]),
+        };
+        assert_eq!(sample_live_audio_meter_from_window(&win, 29.0, 30.0), None);
+        let (rms_l, rms_r) =
+            sample_live_audio_meter_from_window(&win, 30.0, 30.0).expect("in-window meter");
+        assert!(
+            (rms_l - 0.5).abs() < 1e-4,
+            "expected L RMS ~0.5, got {rms_l}"
+        );
+        assert!(
+            (rms_r - 0.25).abs() < 1e-4,
+            "expected R RMS ~0.25, got {rms_r}"
         );
     }
 }

@@ -528,7 +528,8 @@ pub fn build_text3d_mesh_with_fallback(
         }
     }
 
-    extrude_oriented_contours_with_options(&all_contours, params, options, true)
+    let mut tessellator = FillTessellator::new();
+    extrude_oriented_contours_with_options(&all_contours, params, options, true, &mut tessellator)
 }
 
 /// Builds per-character 3D meshes and layout transforms matching Zoidium Text+
@@ -586,6 +587,7 @@ pub fn build_text3d_character_meshes_with_fallback(
 
     let mut pending: Vec<PendingChar> = Vec::new();
     let mut line_widths: Vec<f32> = Vec::new();
+    let mut tessellator = FillTessellator::new();
 
     let mut pen_x = 0.0_f32;
     let mut pen_y = 0.0_f32;
@@ -666,7 +668,13 @@ pub fn build_text3d_character_meshes_with_fallback(
             if oriented.is_empty() {
                 MeshData::empty()
             } else {
-                extrude_oriented_contours_with_options(&oriented, params, options, false)?
+                extrude_oriented_contours_with_options(
+                    &oriented,
+                    params,
+                    options,
+                    false,
+                    &mut tessellator,
+                )?
             }
         } else {
             MeshData::empty()
@@ -837,7 +845,8 @@ pub fn build_fallback_text_mesh_with_options(
         }
     }
 
-    extrude_oriented_contours_with_options(&contours, params, options, true)
+    let mut tessellator = FillTessellator::new();
+    extrude_oriented_contours_with_options(&contours, params, options, true, &mut tessellator)
         .unwrap_or_else(|_| MeshData::empty())
 }
 
@@ -859,7 +868,8 @@ pub fn extrude_contours_with_options(
     options: &Text3DExtendedOptions,
 ) -> Result<MeshData, Text3DError> {
     let cleaned = clean_and_orient_contours(raw_contours);
-    extrude_oriented_contours_with_options(&cleaned, params, options, true)
+    let mut tessellator = FillTessellator::new();
+    extrude_oriented_contours_with_options(&cleaned, params, options, true, &mut tessellator)
 }
 
 fn extrude_oriented_contours_with_options(
@@ -867,6 +877,7 @@ fn extrude_oriented_contours_with_options(
     params: &Text3DParams,
     options: &Text3DExtendedOptions,
     apply_alignment: bool,
+    tessellator: &mut FillTessellator,
 ) -> Result<MeshData, Text3DError> {
     if cleaned.is_empty() {
         return Ok(MeshData::empty());
@@ -928,7 +939,6 @@ fn extrude_oriented_contours_with_options(
     let path = path_builder.build();
 
     let mut cap_geo: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
-    let mut tessellator = FillTessellator::new();
     let fill_options = FillOptions::default()
         .with_fill_rule(FillRule::NonZero)
         .with_tolerance(0.01);
@@ -1306,25 +1316,62 @@ fn clean_and_orient_contours(raw_contours: &[Vec<Vec2>]) -> Vec<Vec<Vec2>> {
         .collect();
 
     let count = cleaned.len();
-    let abs_areas: Vec<f32> = cleaned.iter().map(|c| signed_area_2d(c).abs()).collect();
+    if count == 0 {
+        return cleaned;
+    }
+    if count == 1 {
+        if signed_area_2d(&cleaned[0]) < 0.0 {
+            cleaned[0].reverse();
+        }
+        return cleaned;
+    }
+
+    let areas: Vec<f32> = cleaned.iter().map(|c| signed_area_2d(c)).collect();
+    let abs_areas: Vec<f32> = areas.iter().map(|a| a.abs()).collect();
+    let aabbs: Vec<(Vec2, Vec2)> = cleaned
+        .iter()
+        .map(|c| {
+            let mut min = Vec2::splat(f32::INFINITY);
+            let mut max = Vec2::splat(f32::NEG_INFINITY);
+            for &p in c {
+                min = min.min(p);
+                max = max.max(p);
+            }
+            (min, max)
+        })
+        .collect();
     let interior_pts: Vec<Vec2> = cleaned
         .iter()
         .map(|c| strictly_interior_point_2d(c))
         .collect();
     let mut depths = vec![0_usize; count];
     for i in 0..count {
+        let pt = interior_pts[i];
+        let (min_i, max_i) = aabbs[i];
         let mut depth = 0_usize;
         for (j, other) in cleaned.iter().enumerate() {
-            if i != j && abs_areas[j] > abs_areas[i] && point_in_polygon_2d(interior_pts[i], other)
-            {
-                depth += 1;
+            if i != j && abs_areas[j] > abs_areas[i] {
+                let (min_j, max_j) = aabbs[j];
+                if pt.x < min_j.x
+                    || pt.x > max_j.x
+                    || pt.y < min_j.y
+                    || pt.y > max_j.y
+                    || max_i.x < min_j.x
+                    || min_i.x > max_j.x
+                    || max_i.y < min_j.y
+                    || min_i.y > max_j.y
+                {
+                    continue;
+                }
+                if point_in_polygon_2d(pt, other) {
+                    depth += 1;
+                }
             }
         }
         depths[i] = depth;
     }
 
-    for (contour, depth) in cleaned.iter_mut().zip(depths) {
-        let area = signed_area_2d(contour);
+    for ((contour, area), depth) in cleaned.iter_mut().zip(areas).zip(depths) {
         let should_be_ccw = depth.is_multiple_of(2);
         if (should_be_ccw && area < 0.0) || (!should_be_ccw && area > 0.0) {
             contour.reverse();
@@ -1346,8 +1393,8 @@ fn point_in_oriented_tri_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2, sign: f32) -> bo
 }
 
 /// Computes a point guaranteed to lie strictly inside a simple 2D polygon by finding
-/// the largest convex ear triangle and returning its centroid (with a convex-bisector
-/// fallback for degenerate contours).
+/// a valid convex ear triangle and returning its centroid (with a best-ear and
+/// convex-bisector fallback for thin/degenerate contours).
 fn strictly_interior_point_2d(poly: &[Vec2]) -> Vec2 {
     let n = poly.len();
     if n < 3 {
@@ -1356,9 +1403,9 @@ fn strictly_interior_point_2d(poly: &[Vec2]) -> Vec2 {
 
     let area = signed_area_2d(poly);
     let sign = if area >= 0.0 { 1.0_f32 } else { -1.0_f32 };
+    let good_ear_area2 = (area.abs() * 1e-3).max(1e-5);
 
     let mut best_ear: Option<(f32, Vec2)> = None;
-    let mut best_convex_fallback: Option<(f32, Vec2)> = None;
 
     for i in 0..n {
         let prev = (i + n - 1) % n;
@@ -1371,6 +1418,59 @@ fn strictly_interior_point_2d(poly: &[Vec2]) -> Vec2 {
             continue;
         }
 
+        let tri_min_x = a.x.min(b.x).min(c.x) - 1e-5;
+        let tri_max_x = a.x.max(b.x).max(c.x) + 1e-5;
+        let tri_min_y = a.y.min(b.y).min(c.y) - 1e-5;
+        let tri_max_y = a.y.max(b.y).max(c.y) + 1e-5;
+
+        let mut has_intruder = false;
+        for (k, &p) in poly.iter().enumerate() {
+            if k == prev || k == i || k == next {
+                continue;
+            }
+            if p.x < tri_min_x || p.x > tri_max_x || p.y < tri_min_y || p.y > tri_max_y {
+                continue;
+            }
+            if p.distance_squared(a) <= 1e-10
+                || p.distance_squared(b) <= 1e-10
+                || p.distance_squared(c) <= 1e-10
+            {
+                continue;
+            }
+            if point_in_oriented_tri_2d(p, a, b, c, sign) {
+                has_intruder = true;
+                break;
+            }
+        }
+
+        if !has_intruder {
+            let centroid = (a + b + c) / 3.0;
+            if oriented_area2 >= good_ear_area2 {
+                return centroid;
+            }
+            if best_ear.is_none_or(|(best_a, _)| oriented_area2 > best_a) {
+                best_ear = Some((oriented_area2, centroid));
+            }
+        }
+    }
+
+    if let Some((_, pt)) = best_ear {
+        return pt;
+    }
+
+    // Fallback for degenerate/self-intersecting contours with no valid ear:
+    // locate the largest convex corner and return the midpoint to its closest intruder.
+    let mut best_convex_fallback: Option<(f32, Vec2)> = None;
+    for i in 0..n {
+        let prev = (i + n - 1) % n;
+        let next = (i + 1) % n;
+        let a = poly[prev];
+        let b = poly[i];
+        let c = poly[next];
+        let oriented_area2 = cross_2d(a, b, c) * sign;
+        if oriented_area2 <= 1e-8 {
+            continue;
+        }
         let mut closest_intruder: Option<(f32, Vec2)> = None;
         for (k, &p) in poly.iter().enumerate() {
             if k == prev || k == i || k == next {
@@ -1389,22 +1489,12 @@ fn strictly_interior_point_2d(poly: &[Vec2]) -> Vec2 {
                 }
             }
         }
-
         if let Some((_, q)) = closest_intruder {
             let mid = (b + q) * 0.5;
             if best_convex_fallback.is_none_or(|(best_a, _)| oriented_area2 > best_a) {
                 best_convex_fallback = Some((oriented_area2, mid));
             }
-        } else {
-            let centroid = (a + b + c) / 3.0;
-            if best_ear.is_none_or(|(best_a, _)| oriented_area2 > best_a) {
-                best_ear = Some((oriented_area2, centroid));
-            }
         }
-    }
-
-    if let Some((_, pt)) = best_ear {
-        return pt;
     }
     if let Some((_, pt)) = best_convex_fallback {
         return pt;

@@ -102,6 +102,11 @@ pub fn pad_rgba_frame_into(
             let dst_start = y * dst_row_bytes;
             dst.copy_within(last_row_start..last_row_start + dst_row_bytes, dst_start);
         }
+    } else if transparent_pad {
+        for y in (src_h as usize)..(dst_h as usize) {
+            let dst_start = y * dst_row_bytes;
+            dst[dst_start..dst_start + dst_row_bytes].fill(0);
+        }
     } else {
         for y in (src_h as usize)..(dst_h as usize) {
             let dst_start = y * dst_row_bytes;

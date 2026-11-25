@@ -16,9 +16,9 @@ use super::shortcuts::{selected_clip_is_scene3d, toggle_editing_camera_synced};
 use super::theme::{
     AUDIO_PEAK_YELLOW, BG_DROPDOWN_HOVER, BG_INPUT, BG_PANEL, BG_SUNKEN, BG_TITLE, BG_TOOLBAR,
     BORDER_BUTTON_HOVER, BORDER_CONTROL, BORDER_OPTION_ACTIVE, BORDER_PANEL, BORDER_RAIL_FOCUS,
-    Cm3Icon, Cm3Theme, FONT_BODY, FONT_COMPACT, FONT_SMALL, FONT_TAB, TEXT_BRIGHT, TEXT_DISABLED,
-    TEXT_MUTED, TEXT_PRIMARY, TEXT_STRONG, TOGGLE_ACTIVE, TOOLBAR_ICON_INACTIVE, VOID_BLACK,
-    paint_cm3_icon,
+    Cm3Icon, Cm3Theme, EditorFontChoice, FONT_BODY, FONT_COMPACT, FONT_SMALL, FONT_TAB,
+    TEXT_BRIGHT, TEXT_DISABLED, TEXT_MUTED, TEXT_PRIMARY, TEXT_STRONG, TOGGLE_ACTIVE,
+    TOOLBAR_ICON_INACTIVE, VOID_BLACK, paint_cm3_icon,
 };
 
 // ---------------------------------------------------------------------------
@@ -928,6 +928,9 @@ pub struct Cm3Workspace {
     /// When `true`, the host shell already ran `shortcuts::dispatch_shortcuts_with_focus`, so
     /// `handle_global_shortcuts` only processes workspace-exclusive keys (`Backtick` maximize).
     pub external_shortcuts_dispatched: bool,
+    /// Cached `"Paused"` label widths keyed by `(font_scale_bits, editor_font, ppp_bits)`
+    /// so the playback toolbar avoids re-shaping `"Paused"` twice on every 60Hz frame.
+    cached_paused_label_widths: Option<((u32, EditorFontChoice, u32), f32, f32)>,
 }
 
 impl Default for Cm3Workspace {
@@ -970,6 +973,7 @@ impl Cm3Workspace {
             panels: PanelsState::default(),
             suppress_shortcuts: false,
             external_shortcuts_dispatched: false,
+            cached_paused_label_widths: None,
         }
     }
 
@@ -2126,16 +2130,30 @@ impl Cm3Workspace {
 
         // Responsive pitch so all 3 groups (including Loop, Graph, Speed/Pause, Quality)
         // fit cleanly with zero clipping across wide, 900×600, 800×540, and 420px min-width layouts.
-        let paused_label_w_small = ui
-            .painter()
-            .layout_no_wrap("Paused".to_owned(), theme.font(FONT_SMALL), theme.value())
-            .size()
-            .x;
-        let paused_label_w_compact = ui
-            .painter()
-            .layout_no_wrap("Paused".to_owned(), theme.font(FONT_COMPACT), theme.value())
-            .size()
-            .x;
+        let paused_cache_key = (
+            theme.font_scale.to_bits(),
+            theme.editor_font,
+            ui.pixels_per_point().to_bits(),
+        );
+        let (paused_label_w_small, paused_label_w_compact) = if let Some((key, small_w, compact_w)) =
+            self.cached_paused_label_widths
+            && key == paused_cache_key
+        {
+            (small_w, compact_w)
+        } else {
+            let small_w = ui
+                .painter()
+                .layout_no_wrap("Paused".to_owned(), theme.font(FONT_SMALL), theme.value())
+                .size()
+                .x;
+            let compact_w = ui
+                .painter()
+                .layout_no_wrap("Paused".to_owned(), theme.font(FONT_COMPACT), theme.value())
+                .size()
+                .x;
+            self.cached_paused_label_widths = Some((paused_cache_key, small_w, compact_w));
+            (small_w, compact_w)
+        };
         let m = Self::compute_playback_toolbar_metrics(
             inner.width(),
             paused_label_w_small,

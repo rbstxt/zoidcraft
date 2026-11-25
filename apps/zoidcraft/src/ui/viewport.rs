@@ -1,7 +1,7 @@
 //! Zero-copy `egui-wgpu` 3D/2D Viewport Panel with Editing Camera (`C`),
 //! 2D Layer Transform Controls (`T`), and Motion Paths plugin overlay (Spec 01 §1.5 & §5).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::f32::consts::PI;
 
 use egui::{
@@ -813,6 +813,41 @@ fn project_point_with_vp(vp: Mat4, world: Vec3, canvas_rect: Rect) -> Option<Pos
     Some(pos2(sx, sy))
 }
 
+fn build_object_3d_index(objects: &[SessionObject3D]) -> HashMap<&str, usize> {
+    let mut index = HashMap::with_capacity(objects.len());
+    for (idx, obj) in objects.iter().enumerate() {
+        index.entry(obj.id.as_str()).or_insert(idx);
+    }
+    index
+}
+
+fn is_object_3d_enabled_indexed(
+    objects: &[SessionObject3D],
+    index: &HashMap<&str, usize>,
+    id: &str,
+    local_frame: f64,
+) -> bool {
+    let mut cur_id = Some(id);
+    for _ in 0..32 {
+        let Some(cid) = cur_id else {
+            break;
+        };
+        let Some(&obj_idx) = index.get(cid) else {
+            return false;
+        };
+        let obj = &objects[obj_idx];
+        let enabled = obj
+            .properties
+            .get("enabled")
+            .is_none_or(|p| eval_prop_scalar(p, local_frame, 1.0) >= 0.5);
+        if !enabled {
+            return false;
+        }
+        cur_id = obj.parent_id.as_deref();
+    }
+    true
+}
+
 fn is_object_3d_enabled(objects: &[SessionObject3D], id: &str, local_frame: f64) -> bool {
     let mut cur_id = Some(id);
     for _ in 0..32 {
@@ -832,6 +867,52 @@ fn is_object_3d_enabled(objects: &[SessionObject3D], id: &str, local_frame: f64)
         cur_id = obj.parent_id.as_deref();
     }
     true
+}
+
+fn compute_object_3d_world_matrix_indexed(
+    objects: &[SessionObject3D],
+    index: &HashMap<&str, usize>,
+    id: &str,
+    local_frame: f64,
+) -> Mat4 {
+    let mut chain = Vec::new();
+    let mut cur_id = Some(id);
+    for _ in 0..32 {
+        let Some(cid) = cur_id else {
+            break;
+        };
+        let Some(&obj_idx) = index.get(cid) else {
+            break;
+        };
+        let obj = &objects[obj_idx];
+        chain.push(obj);
+        cur_id = obj.parent_id.as_deref();
+    }
+
+    let mut world = Mat4::IDENTITY;
+    for obj in chain.into_iter().rev() {
+        let pos = obj
+            .properties
+            .get("position")
+            .map_or(Vec3::ZERO, |p| eval_prop_vec3(p, local_frame, Vec3::ZERO));
+        let rot = obj
+            .properties
+            .get("rotation")
+            .map_or(Vec3::ZERO, |p| eval_prop_vec3(p, local_frame, Vec3::ZERO));
+        let scale = obj
+            .properties
+            .get("scale")
+            .map_or(Vec3::ONE, |p| eval_prop_vec3(p, local_frame, Vec3::ONE));
+        let euler_order = eval_object_3d_euler_order(obj, local_frame);
+        world *= Transform3D {
+            position: pos,
+            rotation: rot,
+            scale,
+            euler_order,
+        }
+        .to_matrix();
+    }
+    world
 }
 
 fn compute_object_3d_world_matrix(objects: &[SessionObject3D], id: &str, local_frame: f64) -> Mat4 {
@@ -1332,52 +1413,46 @@ fn is_editing_camera_active(session: &Session) -> bool {
         .is_editing_camera_active(&session.playback, selected_clip_is_scene)
 }
 
+fn transparency_checker_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let cache_id = egui::Id::unique("zc_transparency_checker_tex_2x2");
+    if let Some(handle) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_id)) {
+        return handle;
+    }
+    let image = egui::ColorImage::new(
+        [2, 2],
+        vec![
+            COLOR_CHECKER_LIGHT,
+            COLOR_CHECKER_DARK,
+            COLOR_CHECKER_DARK,
+            COLOR_CHECKER_LIGHT,
+        ],
+    );
+    let handle = ctx.load_texture(
+        "zc_transparency_checker_2x2",
+        image,
+        egui::TextureOptions::NEAREST_REPEAT,
+    );
+    ctx.data_mut(|d| d.insert_temp(cache_id, handle.clone()));
+    handle
+}
+
 fn paint_transparency_grid(painter: &egui::Painter, canvas_rect: Rect, visible_rect: Rect) {
     const CELL: f32 = 8.0;
+    const TILE: f32 = CELL * 2.0;
     if !visible_rect.is_positive() {
         return;
     }
-    painter.rect_filled(visible_rect, CornerRadius::ZERO, COLOR_CHECKER_DARK);
-    let col_start = ((visible_rect.left() - canvas_rect.left()) / CELL)
-        .floor()
-        .max(0.0) as usize;
-    let col_end = ((visible_rect.right() - canvas_rect.left()) / CELL)
-        .ceil()
-        .max(0.0) as usize;
-    let row_start = ((visible_rect.top() - canvas_rect.top()) / CELL)
-        .floor()
-        .max(0.0) as usize;
-    let row_end = ((visible_rect.bottom() - canvas_rect.top()) / CELL)
-        .ceil()
-        .max(0.0) as usize;
-    let mut mesh = egui::Mesh::default();
-    for row in row_start..row_end {
-        let y0 = (canvas_rect.top() + row as f32 * CELL).max(visible_rect.top());
-        let y1 = (canvas_rect.top() + (row + 1) as f32 * CELL).min(visible_rect.bottom());
-        if y1 <= y0 {
-            continue;
-        }
-        for col in col_start..col_end {
-            if (row + col) % 2 != 0 {
-                continue;
-            }
-            let x0 = (canvas_rect.left() + col as f32 * CELL).max(visible_rect.left());
-            let x1 = (canvas_rect.left() + (col + 1) as f32 * CELL).min(visible_rect.right());
-            if x1 <= x0 {
-                continue;
-            }
-            let base = mesh.vertices.len() as u32;
-            mesh.colored_vertex(pos2(x0, y0), COLOR_CHECKER_LIGHT);
-            mesh.colored_vertex(pos2(x1, y0), COLOR_CHECKER_LIGHT);
-            mesh.colored_vertex(pos2(x1, y1), COLOR_CHECKER_LIGHT);
-            mesh.colored_vertex(pos2(x0, y1), COLOR_CHECKER_LIGHT);
-            mesh.add_triangle(base, base + 1, base + 2);
-            mesh.add_triangle(base, base + 2, base + 3);
-        }
-    }
-    if !mesh.indices.is_empty() {
-        painter.add(Shape::mesh(mesh));
-    }
+    let tex = transparency_checker_texture(painter.ctx());
+    let u0 = (visible_rect.left() - canvas_rect.left()) / TILE;
+    let u1 = (visible_rect.right() - canvas_rect.left()) / TILE;
+    let v0 = (visible_rect.top() - canvas_rect.top()) / TILE;
+    let v1 = (visible_rect.bottom() - canvas_rect.top()) / TILE;
+    painter.image(
+        tex.id(),
+        visible_rect,
+        Rect::from_min_max(pos2(u0, v0), pos2(u1, v1)),
+        Color32::WHITE,
+    );
 }
 
 /// Reconciles active drag state before overlay handlers run so disabled modes, selection
@@ -4609,6 +4684,16 @@ fn draw_3d_box_wireframe(
     }
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 fn paint_3d_helper_wireframes(
     ui: &Ui,
     session: &Session,
@@ -4625,21 +4710,36 @@ fn paint_3d_helper_wireframes(
         resolve_active_3d_camera(session, state, clip, local_frame, canvas_rect, seq_w, seq_h);
     let visible_canvas = canvas_rect.intersect(panel_rect);
     let painter = ui.painter().with_clip_rect(visible_canvas);
+    let mut obj_index: Option<HashMap<&str, usize>> = None;
 
     for obj in &clip.objects_3d {
-        if !is_object_3d_enabled(&clip.objects_3d, &obj.id, local_frame) {
+        let is_light = contains_ascii_case_insensitive(&obj.kind, b"light");
+        let is_non_active_camera = is_camera_3d_kind(&obj.kind)
+            && cam.camera_object_id.as_deref() != Some(obj.id.as_str());
+        let has_field_prop = obj.properties.contains_key("field")
+            || obj.properties.contains_key("fieldType")
+            || obj.properties.contains_key("field_type");
+        let has_constraint_prop = obj.properties.contains_key("constraint.trackTo.enabled")
+            || obj.properties.contains_key("constraint.follow.enabled");
+
+        if !is_light && !is_non_active_camera && !has_field_prop && !has_constraint_prop {
+            continue;
+        }
+
+        let index = obj_index.get_or_insert_with(|| build_object_3d_index(&clip.objects_3d));
+        if !is_object_3d_enabled_indexed(&clip.objects_3d, index, &obj.id, local_frame) {
             continue;
         }
         let is_selected = session.selection.object_3d_ids.contains(&obj.id);
-        let world = compute_object_3d_world_matrix(&clip.objects_3d, &obj.id, local_frame);
+        let world =
+            compute_object_3d_world_matrix_indexed(&clip.objects_3d, index, &obj.id, local_frame);
         let origin = world.w_axis.truncate();
         let right = normalized_or(world.x_axis.truncate(), Vec3::X);
         let up = normalized_or(world.y_axis.truncate(), Vec3::Y);
         let forward = normalized_or(-world.z_axis.truncate(), Vec3::NEG_Z);
-        let kind_low = obj.kind.to_ascii_lowercase();
 
         // 1. Lights: Directional ray arrow, Point starburst, Spot cone.
-        if kind_low == "light" || kind_low.contains("light") {
+        if is_light {
             let lkind = obj
                 .properties
                 .get("light.kind")
@@ -4801,8 +4901,7 @@ fn paint_3d_helper_wireframes(
         }
 
         // 2. Cameras: frustum pyramid wireframe (skip the active view camera).
-        if is_camera_3d_kind(&obj.kind) && cam.camera_object_id.as_deref() != Some(obj.id.as_str())
-        {
+        if is_non_active_camera {
             let alpha = if is_selected { 235 } else { 150 };
             let col = Color32::from_rgba_unmultiplied(
                 COLOR_WIRE_CAMERA.r(),
@@ -4880,8 +4979,8 @@ fn paint_3d_helper_wireframes(
                     }
                 }
             });
-        let is_effector_obj = kind_low.contains("effector")
-            || kind_low.contains("expresstext")
+        let is_effector_obj = contains_ascii_case_insensitive(&obj.kind, b"effector")
+            || contains_ascii_case_insensitive(&obj.kind, b"expresstext")
             || field_type_token.is_some();
         if is_effector_obj && let Some(ref ftype) = field_type_token {
             let f_pos = eval_prop_from_keys_vec3(
@@ -5011,10 +5110,14 @@ fn paint_3d_helper_wireframes(
             });
             if let Some(tid) = target_id
                 && !tid.is_empty()
-                && clip.objects_3d.iter().any(|o| o.id == tid)
+                && index.contains_key(tid)
             {
-                let target_world =
-                    compute_object_3d_world_matrix(&clip.objects_3d, tid, local_frame);
+                let target_world = compute_object_3d_world_matrix_indexed(
+                    &clip.objects_3d,
+                    index,
+                    tid,
+                    local_frame,
+                );
                 let target_pos = target_world.w_axis.truncate();
                 let stroke = Stroke::new(
                     if is_selected { 1.6 } else { 1.1 },
@@ -5942,16 +6045,22 @@ fn raycast_pick_3d_object(
         resolve_active_3d_camera(session, state, clip, local_frame, canvas_rect, seq_w, seq_h);
     let (ray_origin, ray_dir) = cam.screen_ray(click_pos, canvas_rect)?;
 
+    let obj_index = build_object_3d_index(&clip.objects_3d);
     let mut closest: Option<(f32, String, String)> = None;
     for obj in &clip.objects_3d {
-        if !is_object_3d_enabled(&clip.objects_3d, &obj.id, local_frame) {
+        if !is_object_3d_enabled_indexed(&clip.objects_3d, &obj_index, &obj.id, local_frame) {
             continue;
         }
         // Do not pick the active camera we are currently viewing through.
         if cam.camera_object_id.as_deref() == Some(obj.id.as_str()) {
             continue;
         }
-        let world = compute_object_3d_world_matrix(&clip.objects_3d, &obj.id, local_frame);
+        let world = compute_object_3d_world_matrix_indexed(
+            &clip.objects_3d,
+            &obj_index,
+            &obj.id,
+            local_frame,
+        );
         let half = estimate_object_3d_local_half_extents(obj, local_frame);
 
         let hit_t = if world.determinant().abs() > 1e-8 {
@@ -10559,5 +10668,47 @@ mod tests {
         assert!(
             tiny.x.is_sign_positive() && tiny.y.is_sign_positive() && tiny.z.is_sign_positive()
         );
+    }
+
+    #[test]
+    fn transparency_grid_paints_single_cached_2x2_textured_quad() {
+        let ctx = egui::Context::default();
+        let canvas = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 720.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(canvas),
+            ..Default::default()
+        };
+        let mut full1 = ctx.run_ui(raw.clone(), |ui| {
+            paint_transparency_grid(ui.painter(), canvas, canvas);
+        });
+        assert_eq!(
+            full1.shapes.len(),
+            1,
+            "transparency grid must emit a single textured quad instead of per-cell meshes"
+        );
+        if let Shape::Mesh(mesh) = &full1.shapes[0].shape {
+            assert_eq!(mesh.vertices.len(), 4);
+            assert_eq!(mesh.indices.len(), 6);
+        } else {
+            panic!("expected single textured Mesh quad for transparency grid");
+        }
+        let first_set_count = full1.textures_delta.set.len();
+        assert!(
+            first_set_count >= 1,
+            "first frame should upload 2x2 checker texture"
+        );
+        full1.textures_delta.clear();
+
+        // Second frame must reuse the cached TextureHandle (zero new texture uploads).
+        let mut full2 = ctx.run_ui(raw, |ui| {
+            paint_transparency_grid(ui.painter(), canvas, canvas);
+        });
+        assert_eq!(full2.shapes.len(), 1);
+        assert_eq!(
+            full2.textures_delta.set.len(),
+            0,
+            "subsequent frames must reuse the cached 2x2 checker texture without re-uploading"
+        );
+        full2.textures_delta.clear();
     }
 }

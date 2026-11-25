@@ -771,6 +771,59 @@ pub fn create_zoidium_effect(id: &str) -> Option<EffectInstance> {
     })
 }
 
+fn canonical_zoidium_effect_id_ci(id: &str) -> &str {
+    if id.eq_ignore_ascii_case("looks") || id.eq_ignore_ascii_case("vignette") {
+        "magiclooks"
+    } else if id.eq_ignore_ascii_case("sglow-hq-v2-preview") {
+        "sglow"
+    } else if id.eq_ignore_ascii_case("zsmb") {
+        "smart-motion-blur-lite"
+    } else if id.eq_ignore_ascii_case("layer_input") {
+        "layerinput"
+    } else if id.eq_ignore_ascii_case("node-effect") {
+        "nodeeffect"
+    } else {
+        id
+    }
+}
+
+fn is_standard_effect_id_ci(id: &str) -> bool {
+    let canonical = if id.eq_ignore_ascii_case("chromaticaberration")
+        || id.eq_ignore_ascii_case("chromatic_aberration")
+        || id.eq_ignore_ascii_case("chromatic-aberration")
+    {
+        "rgbshift"
+    } else {
+        id
+    };
+    STANDARD_EFFECTS
+        .iter()
+        .any(|d| d.id.eq_ignore_ascii_case(canonical))
+}
+
+/// Returns the owning Zoidium plugin ID for `id` with zero heap allocations,
+/// matching the plugin resolution of [`create_effect_by_id`].
+///
+/// Accepts both bare IDs (e.g. `"vhs"`, `"vignette"`) and namespaced IDs
+/// (e.g. `"zoidium:openzoid-legacy/vhs"`). Returns `None` for standard CM3 effects
+/// and unknown effect IDs.
+#[must_use]
+pub fn zoidium_effect_plugin_id(id: &str) -> Option<&'static str> {
+    let bare = if let Some(rest) = id.strip_prefix("zoidium:") {
+        rest.split_once('/').map_or(rest, |(_, e)| e)
+    } else {
+        if is_standard_effect_id_ci(id) {
+            return None;
+        }
+        id
+    };
+    let canonical = canonical_zoidium_effect_id_ci(bare);
+    let desc = ZOIDIUM_EFFECTS
+        .iter()
+        .find(|d| d.id.eq_ignore_ascii_case(canonical))?;
+    Some(desc.plugin_id.unwrap_or("zoidium"))
+}
+
 /// Instantiates either a standard CM3 effect or a Zoidium plugin effect by ID.
 /// Accepts both bare IDs (e.g. `"vhs"`) and namespaced IDs (e.g. `"zoidium:native-fx/vhs"`).
 #[must_use]
@@ -1922,5 +1975,49 @@ mod tests {
                 && l["to"] == "n2"
                 && l["toPort"] == "alpha"
         }));
+    }
+
+    #[test]
+    fn zoidium_effect_plugin_id_matches_create_effect_by_id_without_allocation() {
+        for desc in standard_effect_catalog() {
+            assert_eq!(
+                zoidium_effect_plugin_id(desc.id),
+                None,
+                "standard effect {} must not resolve to a plugin ID",
+                desc.id
+            );
+        }
+        assert_eq!(zoidium_effect_plugin_id("chromaticaberration"), None);
+        assert_eq!(zoidium_effect_plugin_id("zoidium:custom/bloom"), None);
+        assert_eq!(zoidium_effect_plugin_id("unknown-fx"), None);
+
+        for desc in zoidium_effect_catalog() {
+            let expected = desc.plugin_id.unwrap_or("zoidium");
+            assert_eq!(
+                zoidium_effect_plugin_id(desc.id),
+                Some(expected),
+                "bare zoidium effect {}",
+                desc.id
+            );
+            let namespaced = format!("zoidium:{expected}/{}", desc.id);
+            assert_eq!(
+                zoidium_effect_plugin_id(&namespaced),
+                Some(expected),
+                "namespaced zoidium effect {namespaced}"
+            );
+        }
+        // Aliases & case-insensitivity
+        assert_eq!(zoidium_effect_plugin_id("VIGNETTE"), Some("magic-looks"));
+        assert_eq!(zoidium_effect_plugin_id("looks"), Some("magic-looks"));
+        assert_eq!(
+            zoidium_effect_plugin_id("sglow-hq-v2-preview"),
+            Some("sglow-hq-v2-preview")
+        );
+        assert_eq!(
+            zoidium_effect_plugin_id("zsmb"),
+            Some("smart-motion-blur-lite")
+        );
+        assert_eq!(zoidium_effect_plugin_id("layer_input"), Some("layer-input"));
+        assert_eq!(zoidium_effect_plugin_id("node-effect"), Some("node-effect"));
     }
 }

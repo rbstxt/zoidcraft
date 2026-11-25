@@ -21,6 +21,7 @@ pub use effects::{
     EffectCategory, EffectDescriptor, STANDARD_EFFECT_IDS, ZOIDIUM_PLUGIN_EFFECT_IDS,
     create_custom_shader, create_effect_by_id, create_effect_group, create_standard_effect,
     create_zoidium_effect, find_effect_descriptor, standard_effect_catalog, zoidium_effect_catalog,
+    zoidium_effect_plugin_id,
 };
 pub use model::{
     AssetKind, AssetRecord, AssetSource, AudioClip, AudioClipData, AudioTrack,
@@ -41,14 +42,17 @@ pub use pz_clipboard::{
     serialize_pz_effects_json, serialize_pz_masks_json, serialize_pz_material_json,
     serialize_pz_objects3d_json, serialize_pz_property_track_json,
 };
-pub use pz_export::{export_pz, export_pz_to_bytes};
+pub use pz_export::{export_pz, export_pz_to_bytes, export_pz_to_writer};
 pub use pz_import::{PzImportResult, import_pz, import_pz_from_bytes};
-pub use sha256::{cm3_asset_key, sha256_bytes, sha256_hex};
+pub use sha256::{
+    cm3_asset_key, cm3_asset_key_from_bytes, sha256_bytes, sha256_hex, sha256_hex_from_bytes,
+};
 pub use uuid::Uuid;
 pub use zcraft::{
     IntegrityEntry, MAX_ARCHIVE_ENTRIES, MAX_JSON_ENTRY_BYTES, MAX_JSON_NESTING_DEPTH,
     MAX_RETAINED_ASSET_BYTES, MAX_UNCOMPRESSED_ARCHIVE_BYTES, ManifestPluginRequirement,
     ZcraftMeta, load_zcraft, load_zcraft_from_bytes, save_zcraft, save_zcraft_to_bytes,
+    save_zcraft_to_writer,
 };
 
 /// Errors produced by project serialization, atomic I/O, archive validation, and `.pz` import.

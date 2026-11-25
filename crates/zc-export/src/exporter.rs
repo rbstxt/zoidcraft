@@ -506,61 +506,309 @@ where
     fs::create_dir_all(staging_dir.path())?;
 
     let expected_bytes = checked_rgba_len(settings.width, settings.height)?;
-    let mut frame_buf = vec![0_u8; expected_bytes];
     let total_frames = settings.total_frames();
-    let mut staged_names = Vec::with_capacity(total_frames as usize);
+    let worker_count = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(2)
+        .clamp(2, 4)
+        .min(total_frames.max(1) as usize);
+    let buffer_count = worker_count + 1;
 
-    for (offset, frame_index) in (settings.start_frame..settings.end_frame).enumerate() {
-        if cancel.load(Ordering::Acquire) {
-            return Err(ExportError::Cancelled);
+    struct PngEncodeJob {
+        frame_index: u32,
+        offset: usize,
+        buf: Vec<u8>,
+    }
+
+    struct PngPoolShutdown {
+        abort: Arc<AtomicBool>,
+        job_tx: Option<mpsc::SyncSender<PngEncodeJob>>,
+    }
+
+    impl PngPoolShutdown {
+        fn close_jobs(&mut self) {
+            drop(self.job_tx.take());
         }
 
-        frame_provider.render_frame(frame_index, &mut frame_buf)?;
-        if frame_buf.len() != expected_bytes {
-            return Err(ExportError::InvalidFrameSize {
-                frame_index,
-                expected: expected_bytes,
-                actual: frame_buf.len(),
+        fn abort_and_close(&mut self) {
+            self.abort.store(true, Ordering::Release);
+            drop(self.job_tx.take());
+        }
+    }
+
+    impl Drop for PngPoolShutdown {
+        fn drop(&mut self) {
+            if self.job_tx.is_some() {
+                self.abort.store(true, Ordering::Release);
+                drop(self.job_tx.take());
+            }
+        }
+    }
+
+    let (job_tx, job_rx) = mpsc::sync_channel::<PngEncodeJob>(worker_count);
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(buffer_count);
+    for _ in 0..buffer_count {
+        let _ = recycle_tx.send(vec![0_u8; expected_bytes]);
+    }
+    let (done_tx, done_rx) = mpsc::channel::<Result<u32, ExportError>>();
+    let abort = Arc::new(AtomicBool::new(false));
+
+    let width = settings.width;
+    let height = settings.height;
+    let transparent_alpha = settings.transparent_alpha;
+    let staging_path = staging_dir.path();
+
+    let encode_result: Result<(), ExportError> = std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let job_rx_w = Arc::clone(&job_rx);
+            let recycle_tx_w = recycle_tx.clone();
+            let done_tx_w = done_tx.clone();
+            let abort_w = Arc::clone(&abort);
+            let cancel_w = Arc::clone(cancel);
+            scope.spawn(move || {
+                loop {
+                    let job = {
+                        let rx = job_rx_w.lock().unwrap_or_else(|poison| poison.into_inner());
+                        rx.recv()
+                    };
+                    let Ok(mut job) = job else {
+                        break;
+                    };
+                    if abort_w.load(Ordering::Acquire) || cancel_w.load(Ordering::Acquire) {
+                        let _ = recycle_tx_w.try_send(job.buf);
+                        break;
+                    }
+                    if !transparent_alpha {
+                        flatten_rgba_over_black_in_place(&mut job.buf);
+                    }
+                    let file_name = format!("frame_{:06}.png", job.offset + 1);
+                    let staged_path = staging_path.join(&file_name);
+                    let write_res: Result<(), ExportError> = (|| {
+                        let file = File::create(&staged_path)?;
+                        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+                        {
+                            let encoder = PngEncoder::new(&mut writer);
+                            encoder
+                                .write_image(&job.buf, width, height, ExtendedColorType::Rgba8)
+                                .map_err(|err| ExportError::ImageEncode(err.to_string()))?;
+                        }
+                        writer.flush()?;
+                        Ok(())
+                    })();
+                    let _ = recycle_tx_w.try_send(job.buf);
+                    match write_res {
+                        Ok(()) => {
+                            let _ = done_tx_w.send(Ok(job.frame_index));
+                        }
+                        Err(err) => {
+                            abort_w.store(true, Ordering::Release);
+                            let _ = done_tx_w.send(Err(err));
+                            break;
+                        }
+                    }
+                }
             });
         }
 
+        // Drop main-thread sender clones so `recycle_rx` and `done_rx` disconnect once workers exit.
+        drop(recycle_tx);
+        drop(done_tx);
+
+        let mut shutdown = PngPoolShutdown {
+            abort: Arc::clone(&abort),
+            job_tx: Some(job_tx),
+        };
+        let mut completed_frames = 0_u32;
+        let mut first_error: Option<ExportError> = None;
+
+        let drain_completed = |done_rx: &mpsc::Receiver<Result<u32, ExportError>>,
+                               completed_frames: &mut u32,
+                               first_error: &mut Option<ExportError>,
+                               abort: &AtomicBool,
+                               on_progress: &mut P| {
+            while let Ok(res) = done_rx.try_recv() {
+                match res {
+                    Ok(done_frame) => {
+                        *completed_frames = completed_frames.saturating_add(1);
+                        on_progress(ExportProgress {
+                            completed_frames: *completed_frames,
+                            total_frames,
+                            frame_index: done_frame,
+                        });
+                    }
+                    Err(err) => {
+                        abort.store(true, Ordering::Release);
+                        if first_error.is_none() {
+                            *first_error = Some(err);
+                        }
+                    }
+                }
+            }
+        };
+
+        for (offset, frame_index) in (settings.start_frame..settings.end_frame).enumerate() {
+            if cancel.load(Ordering::Acquire) {
+                shutdown.abort_and_close();
+                return Err(ExportError::Cancelled);
+            }
+
+            let mut frame_buf = loop {
+                if cancel.load(Ordering::Acquire) {
+                    shutdown.abort_and_close();
+                    return Err(ExportError::Cancelled);
+                }
+                drain_completed(
+                    &done_rx,
+                    &mut completed_frames,
+                    &mut first_error,
+                    &abort,
+                    &mut on_progress,
+                );
+                if let Some(err) = first_error.take() {
+                    shutdown.abort_and_close();
+                    return Err(err);
+                }
+                match recycle_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(buf) => break buf,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        drain_completed(
+                            &done_rx,
+                            &mut completed_frames,
+                            &mut first_error,
+                            &abort,
+                            &mut on_progress,
+                        );
+                        shutdown.abort_and_close();
+                        if cancel.load(Ordering::Acquire) {
+                            return Err(ExportError::Cancelled);
+                        }
+                        if let Some(err) = first_error.take() {
+                            return Err(err);
+                        }
+                        return Err(ExportError::ImageEncode(
+                            "PNG encoder worker pool exited unexpectedly".to_string(),
+                        ));
+                    }
+                }
+            };
+
+            if let Err(err) = frame_provider.render_frame(frame_index, &mut frame_buf) {
+                shutdown.abort_and_close();
+                return Err(first_error.take().unwrap_or(err));
+            }
+            if frame_buf.len() != expected_bytes {
+                shutdown.abort_and_close();
+                return Err(ExportError::InvalidFrameSize {
+                    frame_index,
+                    expected: expected_bytes,
+                    actual: frame_buf.len(),
+                });
+            }
+
+            if cancel.load(Ordering::Acquire) {
+                shutdown.abort_and_close();
+                return Err(ExportError::Cancelled);
+            }
+
+            let mut pending = PngEncodeJob {
+                frame_index,
+                offset,
+                buf: frame_buf,
+            };
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    shutdown.abort_and_close();
+                    return Err(ExportError::Cancelled);
+                }
+                drain_completed(
+                    &done_rx,
+                    &mut completed_frames,
+                    &mut first_error,
+                    &abort,
+                    &mut on_progress,
+                );
+                if let Some(err) = first_error.take() {
+                    shutdown.abort_and_close();
+                    return Err(err);
+                }
+                let Some(tx) = shutdown.job_tx.as_ref() else {
+                    break;
+                };
+                match tx.try_send(pending) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(returned)) => {
+                        pending = returned;
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        drain_completed(
+                            &done_rx,
+                            &mut completed_frames,
+                            &mut first_error,
+                            &abort,
+                            &mut on_progress,
+                        );
+                        shutdown.abort_and_close();
+                        if cancel.load(Ordering::Acquire) {
+                            return Err(ExportError::Cancelled);
+                        }
+                        return Err(first_error.take().unwrap_or_else(|| {
+                            ExportError::ImageEncode(
+                                "PNG encoder worker pool disconnected".to_string(),
+                            )
+                        }));
+                    }
+                }
+            }
+        }
+
+        // All frames queued; close the job channel and wait for workers to drain.
+        shutdown.close_jobs();
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                shutdown.abort_and_close();
+                return Err(ExportError::Cancelled);
+            }
+            match done_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(Ok(done_frame)) => {
+                    completed_frames = completed_frames.saturating_add(1);
+                    on_progress(ExportProgress {
+                        completed_frames,
+                        total_frames,
+                        frame_index: done_frame,
+                    });
+                }
+                Ok(Err(err)) => {
+                    abort.store(true, Ordering::Release);
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
         if cancel.load(Ordering::Acquire) {
             return Err(ExportError::Cancelled);
         }
+        Ok(())
+    });
 
-        if !settings.transparent_alpha {
-            flatten_rgba_over_black_in_place(&mut frame_buf);
-        }
-
-        let file_name = format!("frame_{:06}.png", offset + 1);
-        let staged_path = staging_dir.path().join(&file_name);
-        let file = File::create(&staged_path)?;
-        let mut writer = BufWriter::new(file);
-        {
-            let encoder = PngEncoder::new(&mut writer);
-            encoder
-                .write_image(
-                    &frame_buf,
-                    settings.width,
-                    settings.height,
-                    ExtendedColorType::Rgba8,
-                )
-                .map_err(|err| ExportError::ImageEncode(err.to_string()))?;
-        }
-        writer.flush()?;
-        staged_names.push(file_name);
-
-        on_progress(ExportProgress {
-            completed_frames: (offset as u32) + 1,
-            total_frames,
-            frame_index,
-        });
-    }
+    encode_result?;
 
     if cancel.load(Ordering::Acquire) {
         return Err(ExportError::Cancelled);
     }
 
+    let staged_names: Vec<String> = (0..total_frames as usize)
+        .map(|offset| format!("frame_{:06}.png", offset + 1))
+        .collect();
     fs::create_dir_all(&settings.output_path)?;
     publish_staged_png_directory(staging_dir.path(), &settings.output_path, &staged_names)?;
 
@@ -832,39 +1080,70 @@ where
         BrokenPipe(u32),
         Aborted(u32),
         Io(std::io::Error),
+        Error(ExportError),
     }
 
     let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u8>>(2);
-    let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(2);
+    let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(3);
     let (writer_done_tx, writer_done_rx) = mpsc::channel::<WriterOutcome>();
     let writer_abort = Arc::new(AtomicBool::new(false));
     let writer_abort_clone = Arc::clone(&writer_abort);
     let cancel_writer = Arc::clone(cancel);
 
-    // Pre-seed two reusable payload buffers for zero-allocation steady-state streaming.
-    let payload_bytes = if needs_padding {
-        padded_bytes
-    } else {
-        raw_bytes
-    };
-    let _ = recycle_tx.send(vec![0_u8; payload_bytes]);
-    let _ = recycle_tx.send(vec![0_u8; payload_bytes]);
+    // Pre-seed three reusable raw-frame buffers so the GPU render thread can render directly
+    // into a recycled buffer while the writer thread flattens/pads/writes in parallel.
+    for _ in 0..3 {
+        let _ = recycle_tx.send(vec![0_u8; raw_bytes]);
+    }
+
+    let src_width = settings.width;
+    let src_height = settings.height;
+    let transparent_alpha = settings.transparent_alpha;
 
     let writer_handle = std::thread::spawn(move || {
         let mut stdin_pipe = stdin_writer;
+        let mut padded_buf = if needs_padding {
+            vec![0_u8; padded_bytes]
+        } else {
+            Vec::new()
+        };
         let mut broken_pipe = false;
         let mut aborted = false;
         let mut frames_written = 0_u32;
-        while let Ok(buf) = frame_rx.recv() {
+        while let Ok(mut buf) = frame_rx.recv() {
+            if writer_abort_clone.load(Ordering::Acquire) || cancel_writer.load(Ordering::Acquire) {
+                aborted = true;
+                break;
+            }
+            if !transparent_alpha {
+                flatten_rgba_over_black_in_place(&mut buf);
+            }
+            let payload: &[u8] = if needs_padding {
+                if let Err(err) = pad_rgba_frame_into(
+                    &buf,
+                    (src_width, src_height),
+                    (enc_w, enc_h),
+                    transparent_alpha,
+                    &mut padded_buf,
+                ) {
+                    drop(stdin_pipe);
+                    let _ = writer_done_tx.send(WriterOutcome::Error(err));
+                    return;
+                }
+                &padded_buf
+            } else {
+                &buf
+            };
+
             let mut written = 0_usize;
-            while written < buf.len() {
+            while written < payload.len() {
                 if writer_abort_clone.load(Ordering::Acquire)
                     || cancel_writer.load(Ordering::Acquire)
                 {
                     aborted = true;
                     break;
                 }
-                match stdin_pipe.write(&buf[written..]) {
+                match stdin_pipe.write(&payload[written..]) {
                     Ok(0) => {
                         broken_pipe = true;
                         break;
@@ -925,7 +1204,6 @@ where
     });
 
     let child_guard = SharedChildGuard::new(child);
-    let mut raw_frame = vec![0_u8; raw_bytes];
 
     let mut writer_finished = false;
     let mut stderr_finished = false;
@@ -944,33 +1222,9 @@ where
                 return Err(ExportError::Cancelled);
             }
 
-            if let Err(err) = frame_provider.render_frame(frame_index, &mut raw_frame) {
-                writer_abort.store(true, Ordering::Release);
-                drop(frame_tx_opt.take());
-                child_guard.kill_and_reap();
-                return Err(err);
-            }
-
-            if raw_frame.len() != raw_bytes {
-                writer_abort.store(true, Ordering::Release);
-                drop(frame_tx_opt.take());
-                child_guard.kill_and_reap();
-                return Err(ExportError::InvalidFrameSize {
-                    frame_index,
-                    expected: raw_bytes,
-                    actual: raw_frame.len(),
-                });
-            }
-
-            if cancel.load(Ordering::Acquire) {
-                writer_abort.store(true, Ordering::Release);
-                drop(frame_tx_opt.take());
-                child_guard.kill_and_reap();
-                return Err(ExportError::Cancelled);
-            }
-
-            // Acquire a recycled payload buffer cooperatively while checking `cancel` and early child exit.
-            let mut payload_buf = loop {
+            // Acquire a recycled payload buffer BEFORE rendering so `render_frame` writes directly
+            // into it with zero extra full-frame copy.
+            let mut payload_buf = match loop {
                 if cancel.load(Ordering::Acquire) {
                     writer_abort.store(true, Ordering::Release);
                     drop(frame_tx_opt.take());
@@ -978,7 +1232,7 @@ where
                     return Err(ExportError::Cancelled);
                 }
                 match recycle_rx.recv_timeout(Duration::from_millis(10)) {
-                    Ok(buf) => break buf,
+                    Ok(buf) => break Some(buf),
                     Err(RecvTimeoutError::Timeout) => {
                         if let Ok(outcome) = writer_done_rx.try_recv() {
                             writer_finished = true;
@@ -988,9 +1242,13 @@ where
                                     child_guard.kill_and_reap();
                                     return Err(ExportError::Io(err));
                                 }
+                                WriterOutcome::Error(err) => {
+                                    child_guard.kill_and_reap();
+                                    return Err(err);
+                                }
                                 other => {
                                     writer_outcome = Some(other);
-                                    break Vec::new();
+                                    break None;
                                 }
                             }
                         }
@@ -1000,34 +1258,43 @@ where
                             if exited_at.elapsed() >= CHILD_EXIT_WRITER_GRACE {
                                 writer_abort.store(true, Ordering::Release);
                                 drop(frame_tx_opt.take());
-                                break Vec::new();
+                                break None;
                             }
                         }
                     }
-                    Err(RecvTimeoutError::Disconnected) => break Vec::new(),
+                    Err(RecvTimeoutError::Disconnected) => break None,
+                }
+            } {
+                Some(buf) => buf,
+                None => {
+                    // Writer exited early or child exited while stdin remained blocked; collect status/stderr.
+                    break;
                 }
             };
 
-            if payload_buf.is_empty() {
-                // Writer exited early or child exited while stdin remained blocked; collect status/stderr.
-                break;
+            if let Err(err) = frame_provider.render_frame(frame_index, &mut payload_buf) {
+                writer_abort.store(true, Ordering::Release);
+                drop(frame_tx_opt.take());
+                child_guard.kill_and_reap();
+                return Err(err);
             }
 
-            if !settings.transparent_alpha {
-                flatten_rgba_over_black_in_place(&mut raw_frame);
+            if payload_buf.len() != raw_bytes {
+                writer_abort.store(true, Ordering::Release);
+                drop(frame_tx_opt.take());
+                child_guard.kill_and_reap();
+                return Err(ExportError::InvalidFrameSize {
+                    frame_index,
+                    expected: raw_bytes,
+                    actual: payload_buf.len(),
+                });
             }
 
-            if needs_padding {
-                pad_rgba_frame_into(
-                    &raw_frame,
-                    (settings.width, settings.height),
-                    (enc_w, enc_h),
-                    settings.transparent_alpha,
-                    &mut payload_buf,
-                )?;
-            } else {
-                payload_buf.clear();
-                payload_buf.extend_from_slice(&raw_frame);
+            if cancel.load(Ordering::Acquire) {
+                writer_abort.store(true, Ordering::Release);
+                drop(frame_tx_opt.take());
+                child_guard.kill_and_reap();
+                return Err(ExportError::Cancelled);
             }
 
             // Deliver frame to the writer thread without blocking indefinitely on cancel or early child exit.
@@ -1092,6 +1359,11 @@ where
                         writer_finished = true;
                         child_guard.kill_and_reap();
                         return Err(ExportError::Io(err));
+                    }
+                    Ok(WriterOutcome::Error(err)) => {
+                        writer_finished = true;
+                        child_guard.kill_and_reap();
+                        return Err(err);
                     }
                     Ok(other) => {
                         writer_finished = true;
@@ -1308,13 +1580,25 @@ fn publish_temp_output(src: &Path, dst: &Path) -> Result<(), ExportError> {
     }
 }
 
+#[inline]
+fn mul_div_255_round(c: u8, a: u16) -> u8 {
+    let t = u16::from(c) * a + 128;
+    ((t + (t >> 8)) >> 8) as u8
+}
+
 fn flatten_rgba_over_black_in_place(buf: &mut [u8]) {
     for px in buf.as_chunks_mut::<4>().0 {
-        let a = u16::from(px[3]);
-        if a < 255 {
-            px[0] = ((u16::from(px[0]) * a + 127) / 255) as u8;
-            px[1] = ((u16::from(px[1]) * a + 127) / 255) as u8;
-            px[2] = ((u16::from(px[2]) * a + 127) / 255) as u8;
+        let a = px[3];
+        if a == 255 {
+            continue;
+        }
+        if a == 0 {
+            *px = [0, 0, 0, 255];
+        } else {
+            let a16 = u16::from(a);
+            px[0] = mul_div_255_round(px[0], a16);
+            px[1] = mul_div_255_round(px[1], a16);
+            px[2] = mul_div_255_round(px[2], a16);
             px[3] = 255;
         }
     }
@@ -2103,5 +2387,150 @@ mod tests {
                 "M4A export with inherited stderr pipe must not block until background sleep finishes, took {elapsed:?}"
             );
         }
+    }
+
+    #[test]
+    fn flatten_rgba_division_free_matches_exact_rounding_for_all_byte_pairs() {
+        for a in 0_u8..=255 {
+            for c in 0_u8..=255 {
+                let mut px = [c, c.wrapping_add(17), c.wrapping_mul(3), a];
+                flatten_rgba_over_black_in_place(&mut px);
+                let ref_ch = |v: u8| -> u8 {
+                    if a == 255 {
+                        v
+                    } else {
+                        ((u16::from(v) * u16::from(a) + 127) / 255) as u8
+                    }
+                };
+                assert_eq!(
+                    px,
+                    [
+                        ref_ch(c),
+                        ref_ch(c.wrapping_add(17)),
+                        ref_ch(c.wrapping_mul(3)),
+                        255,
+                    ],
+                    "mismatch for c={c}, a={a}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_png_sequence_export_writes_exact_frames_and_propagates_errors() {
+        let width = 48_u32;
+        let height = 32_u32;
+        let frame_count = 16_u32;
+
+        // 1. Multi-frame opaque parallel PNG sequence export verifies exact pixels + monotonic progress.
+        let out_dir = unique_test_path("parallel_png_seq");
+        let settings = ExportSettings {
+            width,
+            height,
+            fps: 30.0,
+            start_frame: 10,
+            end_frame: 10 + frame_count,
+            container: ExportContainer::PngSequence,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::None,
+            quality: QualityMode::Crf(18),
+            audio_bitrate_kbps: 0,
+            sample_rate: 48_000,
+            transparent_alpha: false,
+            output_path: out_dir.clone(),
+            ffmpeg_binary: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut progress_steps = Vec::new();
+        let report = export_video_with_progress(
+            &settings,
+            None,
+            &cancel,
+            |frame_idx, buf: &mut Vec<u8>| {
+                for y in 0..height {
+                    for x in 0..width {
+                        let off = ((y * width + x) * 4) as usize;
+                        buf[off] = ((x * 5 + frame_idx * 11) & 0xFF) as u8;
+                        buf[off + 1] = ((y * 7 + frame_idx * 3) & 0xFF) as u8;
+                        buf[off + 2] = ((frame_idx * 19) & 0xFF) as u8;
+                        buf[off + 3] = if (x + y) % 3 == 0 {
+                            0
+                        } else if (x + y) % 3 == 1 {
+                            128
+                        } else {
+                            255
+                        };
+                    }
+                }
+                Ok(())
+            },
+            |p| {
+                assert_eq!(p.total_frames, frame_count);
+                progress_steps.push(p.completed_frames);
+            },
+        )
+        .expect("parallel PNG sequence export succeeds");
+
+        assert_eq!(report.frames_exported, frame_count);
+        assert_eq!(progress_steps, (1..=frame_count).collect::<Vec<_>>());
+
+        let mut expected_buf = vec![0_u8; (width * height * 4) as usize];
+        for offset in 0..frame_count {
+            let frame_idx = 10 + offset;
+            for y in 0..height {
+                for x in 0..width {
+                    let off = ((y * width + x) * 4) as usize;
+                    expected_buf[off] = ((x * 5 + frame_idx * 11) & 0xFF) as u8;
+                    expected_buf[off + 1] = ((y * 7 + frame_idx * 3) & 0xFF) as u8;
+                    expected_buf[off + 2] = ((frame_idx * 19) & 0xFF) as u8;
+                    expected_buf[off + 3] = if (x + y) % 3 == 0 {
+                        0
+                    } else if (x + y) % 3 == 1 {
+                        128
+                    } else {
+                        255
+                    };
+                }
+            }
+            flatten_rgba_over_black_in_place(&mut expected_buf);
+            let p = out_dir.join(format!("frame_{:06}.png", offset + 1));
+            let decoded = image::open(&p).expect("open exported PNG").to_rgba8();
+            assert_eq!(decoded.dimensions(), (width, height));
+            assert_eq!(
+                decoded.as_raw().as_slice(),
+                expected_buf.as_slice(),
+                "pixel mismatch on parallel PNG frame {}",
+                offset + 1
+            );
+        }
+        let _ = fs::remove_dir_all(&out_dir);
+
+        // 2. Render error mid-sequence aborts workers cleanly without publishing output.
+        let fail_dir = unique_test_path("parallel_png_fail");
+        let fail_settings = ExportSettings {
+            output_path: fail_dir.clone(),
+            ..settings
+        };
+        let err = export_video(
+            &fail_settings,
+            None,
+            &cancel,
+            |frame_idx, buf: &mut Vec<u8>| {
+                if frame_idx == 15 {
+                    return Err(ExportError::Render("frame 15 failed".to_string()));
+                }
+                fill_synthetic_rgba(frame_idx, width, height, buf);
+                Ok(())
+            },
+        )
+        .expect_err("mid-sequence render error must fail export");
+        assert!(
+            matches!(err, ExportError::Render(ref msg) if msg == "frame 15 failed"),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !fail_dir.exists(),
+            "failed parallel PNG export must not publish output directory"
+        );
     }
 }

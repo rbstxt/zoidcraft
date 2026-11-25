@@ -635,20 +635,80 @@ pub fn ae_ease_out(
     lerp_value(a, b, s)
 }
 
+#[derive(Clone, Copy)]
+enum EaseFamily {
+    Quadratic,
+    Cubic,
+    Quartic,
+    Quintic,
+    Sinusoidal,
+    Exponential,
+    Circular,
+    Elastic,
+    Back,
+    Bounce,
+}
+
+#[derive(Clone, Copy)]
+enum EaseDir {
+    In,
+    Out,
+    InOut,
+    OutIn,
+}
+
 /// Evaluates CM3 easing families (`Quadratic`, `Cubic`, `Quartic`, `Quintic`,
 /// `Sinusoidal`, `Exponential`, `Circular`, `Elastic`, `Back`, `Bounce`, `Linear`)
 /// with direction (`In`, `Out`, `InOut`).
 pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
-    let fam = family.to_ascii_lowercase();
-    let d = dir.to_ascii_lowercase();
-    if fam == "linear" {
+    if family.eq_ignore_ascii_case("linear") {
         return Ok(t);
     }
 
-    let val = match (fam.as_str(), d.as_str()) {
-        ("quadratic" | "quad", "in") => t * t,
-        ("quadratic" | "quad", "out") => t * (2.0 - t),
-        ("quadratic" | "quad", "inout") => {
+    let fam = if family.eq_ignore_ascii_case("quadratic") || family.eq_ignore_ascii_case("quad") {
+        EaseFamily::Quadratic
+    } else if family.eq_ignore_ascii_case("cubic") {
+        EaseFamily::Cubic
+    } else if family.eq_ignore_ascii_case("quartic") || family.eq_ignore_ascii_case("quart") {
+        EaseFamily::Quartic
+    } else if family.eq_ignore_ascii_case("quintic") || family.eq_ignore_ascii_case("quint") {
+        EaseFamily::Quintic
+    } else if family.eq_ignore_ascii_case("sinusoidal") || family.eq_ignore_ascii_case("sine") {
+        EaseFamily::Sinusoidal
+    } else if family.eq_ignore_ascii_case("exponential") || family.eq_ignore_ascii_case("expo") {
+        EaseFamily::Exponential
+    } else if family.eq_ignore_ascii_case("circular") || family.eq_ignore_ascii_case("circ") {
+        EaseFamily::Circular
+    } else if family.eq_ignore_ascii_case("elastic") {
+        EaseFamily::Elastic
+    } else if family.eq_ignore_ascii_case("back") {
+        EaseFamily::Back
+    } else if family.eq_ignore_ascii_case("bounce") {
+        EaseFamily::Bounce
+    } else {
+        return Err(ExprError::RangeError(format!(
+            "unknown easing curve '{family}.{dir}'"
+        )));
+    };
+
+    let d = if dir.eq_ignore_ascii_case("in") {
+        EaseDir::In
+    } else if dir.eq_ignore_ascii_case("out") {
+        EaseDir::Out
+    } else if dir.eq_ignore_ascii_case("inout") {
+        EaseDir::InOut
+    } else if dir.eq_ignore_ascii_case("outin") {
+        EaseDir::OutIn
+    } else {
+        return Err(ExprError::RangeError(format!(
+            "unknown easing curve '{family}.{dir}'"
+        )));
+    };
+
+    let val = match (fam, d) {
+        (EaseFamily::Quadratic, EaseDir::In) => t * t,
+        (EaseFamily::Quadratic, EaseDir::Out) => t * (2.0 - t),
+        (EaseFamily::Quadratic, EaseDir::InOut) => {
             let k = t * 2.0;
             if k < 1.0 {
                 0.5 * k * k
@@ -656,12 +716,12 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 -0.5 * ((k - 1.0) * (k - 3.0) - 1.0)
             }
         }
-        ("cubic", "in") => t * t * t,
-        ("cubic", "out") => {
+        (EaseFamily::Cubic, EaseDir::In) => t * t * t,
+        (EaseFamily::Cubic, EaseDir::Out) => {
             let k = t - 1.0;
             k * k * k + 1.0
         }
-        ("cubic", "inout") => {
+        (EaseFamily::Cubic, EaseDir::InOut) => {
             let k = t * 2.0;
             if k < 1.0 {
                 0.5 * k * k * k
@@ -670,13 +730,13 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 0.5 * (m * m * m + 2.0)
             }
         }
-        ("cubic", "outin") => {
+        (EaseFamily::Cubic, EaseDir::OutIn) => {
             let k = t - 0.5;
             4.0 * k * k * k + 0.5
         }
-        ("quartic" | "quart", "in") => t.powi(4),
-        ("quartic" | "quart", "out") => 1.0 - (t - 1.0).powi(4),
-        ("quartic" | "quart", "inout") => {
+        (EaseFamily::Quartic, EaseDir::In) => t.powi(4),
+        (EaseFamily::Quartic, EaseDir::Out) => 1.0 - (t - 1.0).powi(4),
+        (EaseFamily::Quartic, EaseDir::InOut) => {
             let k = t * 2.0;
             if k < 1.0 {
                 0.5 * k.powi(4)
@@ -684,9 +744,9 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 -0.5 * ((k - 2.0).powi(4) - 2.0)
             }
         }
-        ("quintic" | "quint", "in") => t.powi(5),
-        ("quintic" | "quint", "out") => (t - 1.0).powi(5) + 1.0,
-        ("quintic" | "quint", "inout") => {
+        (EaseFamily::Quintic, EaseDir::In) => t.powi(5),
+        (EaseFamily::Quintic, EaseDir::Out) => (t - 1.0).powi(5) + 1.0,
+        (EaseFamily::Quintic, EaseDir::InOut) => {
             let k = t * 2.0;
             if k < 1.0 {
                 0.5 * k.powi(5)
@@ -694,24 +754,24 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 0.5 * ((k - 2.0).powi(5) + 2.0)
             }
         }
-        ("sinusoidal" | "sine", "in") => 1.0 - (t * FRAC_PI_2).cos(),
-        ("sinusoidal" | "sine", "out") => (t * FRAC_PI_2).sin(),
-        ("sinusoidal" | "sine", "inout") => 0.5 * (1.0 - (PI * t).cos()),
-        ("exponential" | "expo", "in") => {
+        (EaseFamily::Sinusoidal, EaseDir::In) => 1.0 - (t * FRAC_PI_2).cos(),
+        (EaseFamily::Sinusoidal, EaseDir::Out) => (t * FRAC_PI_2).sin(),
+        (EaseFamily::Sinusoidal, EaseDir::InOut) => 0.5 * (1.0 - (PI * t).cos()),
+        (EaseFamily::Exponential, EaseDir::In) => {
             if t == 0.0 {
                 0.0
             } else {
                 2.0_f64.powf(10.0 * (t - 1.0))
             }
         }
-        ("exponential" | "expo", "out") => {
+        (EaseFamily::Exponential, EaseDir::Out) => {
             if t == 1.0 {
                 1.0
             } else {
                 1.0 - 2.0_f64.powf(-10.0 * t)
             }
         }
-        ("exponential" | "expo", "inout") => {
+        (EaseFamily::Exponential, EaseDir::InOut) => {
             if t == 0.0 {
                 0.0
             } else if t == 1.0 {
@@ -725,12 +785,12 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 }
             }
         }
-        ("circular" | "circ", "in") => 1.0 - (1.0 - t * t).max(0.0).sqrt(),
-        ("circular" | "circ", "out") => {
+        (EaseFamily::Circular, EaseDir::In) => 1.0 - (1.0 - t * t).max(0.0).sqrt(),
+        (EaseFamily::Circular, EaseDir::Out) => {
             let k = t - 1.0;
             (1.0 - k * k).max(0.0).sqrt()
         }
-        ("circular" | "circ", "inout") => {
+        (EaseFamily::Circular, EaseDir::InOut) => {
             let k = t * 2.0;
             if k < 1.0 {
                 -0.5 * ((1.0 - k * k).max(0.0).sqrt() - 1.0)
@@ -739,7 +799,7 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 0.5 * ((1.0 - m * m).max(0.0).sqrt() + 1.0)
             }
         }
-        ("elastic", "in") => {
+        (EaseFamily::Elastic, EaseDir::In) => {
             if t == 0.0 {
                 0.0
             } else if t == 1.0 {
@@ -748,7 +808,7 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 -(2.0_f64.powf(10.0 * (t - 1.0))) * ((t - 1.1) * 5.0 * PI).sin()
             }
         }
-        ("elastic", "out") => {
+        (EaseFamily::Elastic, EaseDir::Out) => {
             if t == 0.0 {
                 0.0
             } else if t == 1.0 {
@@ -757,7 +817,7 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 2.0_f64.powf(-10.0 * t) * ((t - 0.1) * 5.0 * PI).sin() + 1.0
             }
         }
-        ("elastic", "inout") => {
+        (EaseFamily::Elastic, EaseDir::InOut) => {
             if t == 0.0 {
                 0.0
             } else if t == 1.0 {
@@ -771,16 +831,16 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 }
             }
         }
-        ("back", "in") => {
+        (EaseFamily::Back, EaseDir::In) => {
             let s = 1.70158;
             t * t * ((s + 1.0) * t - s)
         }
-        ("back", "out") => {
+        (EaseFamily::Back, EaseDir::Out) => {
             let s = 1.70158;
             let k = t - 1.0;
             k * k * ((s + 1.0) * k + s) + 1.0
         }
-        ("back", "inout") => {
+        (EaseFamily::Back, EaseDir::InOut) => {
             let s = 1.70158 * 1.525;
             let k = t * 2.0;
             if k < 1.0 {
@@ -790,9 +850,9 @@ pub fn cm3_ease(t: f64, family: &str, dir: &str) -> Result<f64, ExprError> {
                 0.5 * (m * m * ((s + 1.0) * m + s) + 2.0)
             }
         }
-        ("bounce", "in") => 1.0 - bounce_out(1.0 - t),
-        ("bounce", "out") => bounce_out(t),
-        ("bounce", "inout") => {
+        (EaseFamily::Bounce, EaseDir::In) => 1.0 - bounce_out(1.0 - t),
+        (EaseFamily::Bounce, EaseDir::Out) => bounce_out(t),
+        (EaseFamily::Bounce, EaseDir::InOut) => {
             if t < 0.5 {
                 (1.0 - bounce_out(1.0 - t * 2.0)) * 0.5
             } else {

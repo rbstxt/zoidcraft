@@ -7,8 +7,10 @@
 //!   `expresstext-voronoi.js`, `expresstext-delay.js`)
 //! - `LettersMode` (`PerText` vs `AcrossTexts`) and `expressProperties` JSON parser
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::f64::consts::{E, PI};
+use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
@@ -78,11 +80,21 @@ impl EtValue {
 /// Property map for one ExpressText+ layer (either static values or frame-sampled callbacks).
 pub trait EtPropReader {
     fn read(&self, key: &str, frame: f64) -> Option<EtValue>;
+
+    /// Returns `true` if `key` is guaranteed constant across frames (enabling hoisting
+    /// across Delay simulation loops). Defaults to `false` for dynamic readers.
+    fn is_static(&self, _key: &str) -> bool {
+        false
+    }
 }
 
 impl EtPropReader for BTreeMap<String, EtValue> {
     fn read(&self, key: &str, _frame: f64) -> Option<EtValue> {
         self.get(key).cloned()
+    }
+
+    fn is_static(&self, _key: &str) -> bool {
+        true
     }
 }
 
@@ -899,68 +911,86 @@ fn eval_formula_node(node: &FormulaNode, scope: &FormulaScope) -> f64 {
             "e" => E,
             other => scope.get(other).unwrap_or(0.0),
         },
-        FormulaNode::Call(name, args) => {
-            let vals: Vec<f64> = args.iter().map(|a| eval_formula_node(a, scope)).collect();
-            let a0 = vals.first().copied().unwrap_or(f64::NAN);
-            let a1 = vals.get(1).copied().unwrap_or(f64::NAN);
-            match name.as_str() {
-                "sin" => (a0 * FORMULA_DEG).sin(),
-                "cos" => (a0 * FORMULA_DEG).cos(),
-                "tan" => (a0 * FORMULA_DEG).tan(),
-                "asin" => a0.clamp(-1.0, 1.0).asin() / FORMULA_DEG,
-                "acos" => a0.clamp(-1.0, 1.0).acos() / FORMULA_DEG,
-                "atan" => a0.atan() / FORMULA_DEG,
-                "atan2" => a0.atan2(a1) / FORMULA_DEG,
-                "abs" => a0.abs(),
-                "sqrt" => a0.max(0.0).sqrt(),
-                "cbrt" => a0.cbrt(),
-                "exp" => a0.exp(),
-                "ln" => {
-                    if a0 <= 0.0 {
-                        f64::NAN
-                    } else {
-                        a0.ln()
-                    }
-                }
-                "log" => {
-                    if a0 <= 0.0 {
-                        f64::NAN
-                    } else {
-                        a0.log10()
-                    }
-                }
-                "pow" => a0.powf(a1),
-                "min" => vals.into_iter().fold(f64::INFINITY, |acc, v| {
-                    if v.is_nan() || acc.is_nan() {
+        FormulaNode::Call(name, args) => match name.as_str() {
+            "min" => {
+                let mut acc = f64::INFINITY;
+                for a in args {
+                    let v = eval_formula_node(a, scope);
+                    acc = if v.is_nan() || acc.is_nan() {
                         f64::NAN
                     } else {
                         acc.min(v)
-                    }
-                }),
-                "max" => vals.into_iter().fold(f64::NEG_INFINITY, |acc, v| {
-                    if v.is_nan() || acc.is_nan() {
+                    };
+                }
+                acc
+            }
+            "max" => {
+                let mut acc = f64::NEG_INFINITY;
+                for a in args {
+                    let v = eval_formula_node(a, scope);
+                    acc = if v.is_nan() || acc.is_nan() {
                         f64::NAN
                     } else {
                         acc.max(v)
-                    }
-                }),
-                "floor" => a0.floor(),
-                "ceil" => a0.ceil(),
-                "round" => js_round(a0),
-                "trunc" => a0.trunc(),
-                "sign" => {
-                    if a0.is_nan() || a0 == 0.0 {
-                        a0
-                    } else if a0 > 0.0 {
-                        1.0
-                    } else {
-                        -1.0
-                    }
+                    };
                 }
-                "mod" => ((a0 % a1) + a1) % a1,
-                _ => f64::NAN,
+                acc
             }
-        }
+            other => {
+                let a0 = args
+                    .first()
+                    .map_or(f64::NAN, |a| eval_formula_node(a, scope));
+                let a1 = match other {
+                    "atan2" | "pow" | "mod" => args
+                        .get(1)
+                        .map_or(f64::NAN, |a| eval_formula_node(a, scope)),
+                    _ => f64::NAN,
+                };
+                match other {
+                    "sin" => (a0 * FORMULA_DEG).sin(),
+                    "cos" => (a0 * FORMULA_DEG).cos(),
+                    "tan" => (a0 * FORMULA_DEG).tan(),
+                    "asin" => a0.clamp(-1.0, 1.0).asin() / FORMULA_DEG,
+                    "acos" => a0.clamp(-1.0, 1.0).acos() / FORMULA_DEG,
+                    "atan" => a0.atan() / FORMULA_DEG,
+                    "atan2" => a0.atan2(a1) / FORMULA_DEG,
+                    "abs" => a0.abs(),
+                    "sqrt" => a0.max(0.0).sqrt(),
+                    "cbrt" => a0.cbrt(),
+                    "exp" => a0.exp(),
+                    "ln" => {
+                        if a0 <= 0.0 {
+                            f64::NAN
+                        } else {
+                            a0.ln()
+                        }
+                    }
+                    "log" => {
+                        if a0 <= 0.0 {
+                            f64::NAN
+                        } else {
+                            a0.log10()
+                        }
+                    }
+                    "pow" => a0.powf(a1),
+                    "floor" => a0.floor(),
+                    "ceil" => a0.ceil(),
+                    "round" => js_round(a0),
+                    "trunc" => a0.trunc(),
+                    "sign" => {
+                        if a0.is_nan() || a0 == 0.0 {
+                            a0
+                        } else if a0 > 0.0 {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    }
+                    "mod" => ((a0 % a1) + a1) % a1,
+                    _ => f64::NAN,
+                }
+            }
+        },
         FormulaNode::Unary(op, inner) => {
             let v = eval_formula_node(inner, scope);
             if op == "-" {
@@ -1004,10 +1034,51 @@ fn eval_formula_node(node: &FormulaNode, scope: &FormulaScope) -> f64 {
     }
 }
 
+const FORMULA_CACHE_CAP: usize = 128;
+
+#[derive(Default)]
+struct FormulaCache {
+    map: HashMap<String, Rc<CompiledFormula>>,
+    order: VecDeque<String>,
+}
+
+impl FormulaCache {
+    fn get(&self, src: &str) -> Option<Rc<CompiledFormula>> {
+        self.map.get(src).cloned()
+    }
+
+    fn insert(&mut self, src: &str, compiled: Rc<CompiledFormula>) {
+        if self.map.contains_key(src) {
+            return;
+        }
+        if self.map.len() >= FORMULA_CACHE_CAP
+            && let Some(old_key) = self.order.pop_front()
+        {
+            self.map.remove(&old_key);
+        }
+        let key = src.to_owned();
+        self.order.push_back(key.clone());
+        self.map.insert(key, compiled);
+    }
+}
+
+thread_local! {
+    static FORMULA_CACHE: RefCell<FormulaCache> = RefCell::new(FormulaCache::default());
+}
+
 /// Compiles and evaluates a C4D Formula string, failing closed to `0.0` on any syntax/validation/non-finite error.
 pub fn eval_formula(src: &str, scope: &FormulaScope) -> f64 {
-    let Ok(compiled) = CompiledFormula::compile(src) else {
-        return 0.0;
+    let compiled = if let Some(hit) = FORMULA_CACHE.with(|cache| cache.borrow().get(src)) {
+        hit
+    } else {
+        let Ok(fresh) = CompiledFormula::compile(src) else {
+            return 0.0;
+        };
+        let rc = Rc::new(fresh);
+        FORMULA_CACHE.with(|cache| {
+            cache.borrow_mut().insert(src, Rc::clone(&rc));
+        });
+        rc
     };
     let val = compiled.eval(scope);
     if val.is_finite() { val } else { 0.0 }
@@ -1033,7 +1104,50 @@ pub enum EffectorKind {
     Voronoi,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EffectorPropKeys {
+    letters: &'static str,
+    delay_order: &'static str,
+    seed: &'static str,
+    delay: &'static str,
+    strength: &'static str,
+    field: &'static str,
+    field_position: &'static str,
+    field_scale: &'static str,
+}
+
+macro_rules! effector_prop_keys {
+    ($prefix:literal) => {
+        EffectorPropKeys {
+            letters: concat!($prefix, "Letters"),
+            delay_order: concat!($prefix, "DelayOrder"),
+            seed: concat!($prefix, "Seed"),
+            delay: concat!($prefix, "Delay"),
+            strength: concat!($prefix, "Strength"),
+            field: concat!($prefix, "Field"),
+            field_position: concat!($prefix, "FieldPosition"),
+            field_scale: concat!($prefix, "FieldScale"),
+        }
+    };
+}
+
 impl EffectorKind {
+    const fn prop_keys(self) -> EffectorPropKeys {
+        match self {
+            Self::Shake => effector_prop_keys!("shake"),
+            Self::Plain => effector_prop_keys!("plain"),
+            Self::Random => effector_prop_keys!("random"),
+            Self::Formula => effector_prop_keys!("formula"),
+            Self::Twist => effector_prop_keys!("twist"),
+            Self::Wrap => effector_prop_keys!("wrap"),
+            Self::Orbit => effector_prop_keys!("orbit"),
+            Self::Spline => effector_prop_keys!("spline"),
+            Self::Delay => effector_prop_keys!("delay"),
+            Self::Repeater => effector_prop_keys!("repeater"),
+            Self::Voronoi => effector_prop_keys!("voronoi"),
+        }
+    }
+
     /// Canonical Zoidium panel order for all 11 ExpressText+ effectors.
     pub const ALL: [Self; 11] = [
         Self::Shake,
@@ -1337,13 +1451,14 @@ struct LetterCtx {
 
 fn letter_context(
     props: &dyn EtPropReader,
-    prefix: &str,
+    kind: EffectorKind,
     frame: f64,
     index: usize,
     list: &LetterList,
     sections: &BTreeMap<String, Vec<String>>,
 ) -> LetterCtx {
-    let letters_str = read_str(props, &format!("{prefix}Letters"), frame, "");
+    let keys = kind.prop_keys();
+    let letters_str = read_str(props, keys.letters, frame, "");
     let selected = resolve_selection(&letters_str, list.total, sections);
     let order: Vec<usize> = match &selected {
         None => list.order.clone(),
@@ -1360,13 +1475,13 @@ fn letter_context(
         .position(|&i| i == index)
         .map_or(-1_isize, |p| p as isize);
     let rank = delay_rank(
-        read_num(props, &format!("{prefix}DelayOrder"), frame, 0.0),
+        read_num(props, keys.delay_order, frame, 0.0),
         pos,
         slots,
-        read_num(props, &format!("{prefix}Seed"), frame, 1.0),
+        read_num(props, keys.seed, frame, 1.0),
     );
-    let delay = rank * read_num(props, &format!("{prefix}Delay"), frame, 0.0);
-    let strength = strength_weight(read_num(props, &format!("{prefix}Strength"), frame, 100.0));
+    let delay = rank * read_num(props, keys.delay, frame, 0.0);
+    let strength = strength_weight(read_num(props, keys.strength, frame, 100.0));
     LetterCtx {
         selected,
         delay,
@@ -1377,33 +1492,24 @@ fn letter_context(
 fn apply_field_weight(
     weight: f64,
     props: &dyn EtPropReader,
-    prefix: &str,
+    kind: EffectorKind,
     frame: f64,
     base: [f64; 3],
 ) -> f64 {
     if weight <= 0.0 {
         return 0.0;
     }
-    let kind = js_round(read_num(props, &format!("{prefix}Field"), frame, 0.0));
-    if kind == 0.0 {
+    let keys = kind.prop_keys();
+    let field_kind = js_round(read_num(props, keys.field, frame, 0.0));
+    if field_kind == 0.0 {
         return weight;
     }
     weight
         * field_weight(
-            kind,
+            field_kind,
             base,
-            read_vec3(
-                props,
-                &format!("{prefix}FieldPosition"),
-                frame,
-                [0.0, 0.0, 0.0],
-            ),
-            read_vec3(
-                props,
-                &format!("{prefix}FieldScale"),
-                frame,
-                [100.0, 100.0, 100.0],
-            ),
+            read_vec3(props, keys.field_position, frame, [0.0, 0.0, 0.0]),
+            read_vec3(props, keys.field_scale, frame, [100.0, 100.0, 100.0]),
         )
 }
 
@@ -1429,11 +1535,11 @@ fn evaluate_shake(
     if read_num(props, "shakeEnable", frame, 1.0) == 0.0 {
         return;
     }
-    let ctx = letter_context(props, "shake", frame, index, list, sections);
+    let ctx = letter_context(props, EffectorKind::Shake, frame, index, list, sections);
     if !is_letter_selected(&ctx.selected, index) {
         return;
     }
-    let weight = apply_field_weight(ctx.strength, props, "shake", frame, base);
+    let weight = apply_field_weight(ctx.strength, props, EffectorKind::Shake, frame, base);
     if weight <= 0.0 {
         return;
     }
@@ -1478,11 +1584,11 @@ fn evaluate_plain(
     if read_num(props, "plainEnable", frame, 1.0) == 0.0 {
         return;
     }
-    let ctx = letter_context(props, "plain", frame, index, list, sections);
+    let ctx = letter_context(props, EffectorKind::Plain, frame, index, list, sections);
     if !is_letter_selected(&ctx.selected, index) {
         return;
     }
-    let weight = apply_field_weight(ctx.strength, props, "plain", frame, base);
+    let weight = apply_field_weight(ctx.strength, props, EffectorKind::Plain, frame, base);
     if weight <= 0.0 {
         return;
     }
@@ -1593,12 +1699,12 @@ fn evaluate_random(
     if read_num(props, "randomEnable", frame, 1.0) == 0.0 {
         return;
     }
-    let ctx = letter_context(props, "random", frame, index, list, sections);
+    let ctx = letter_context(props, EffectorKind::Random, frame, index, list, sections);
     if !is_letter_selected(&ctx.selected, index) {
         return;
     }
     let raw_strength = read_num(props, "randomStrength", frame, 100.0) / 100.0;
-    let field = apply_field_weight(1.0, props, "random", frame, base);
+    let field = apply_field_weight(1.0, props, EffectorKind::Random, frame, base);
     let weight = raw_strength * field;
     if weight == 0.0 || weight.is_nan() {
         return;
@@ -1691,12 +1797,12 @@ fn evaluate_formula(
     if read_num(props, "formulaEnable", frame, 1.0) == 0.0 {
         return;
     }
-    let ctx = letter_context(props, "formula", frame, index, list, sections);
+    let ctx = letter_context(props, EffectorKind::Formula, frame, index, list, sections);
     if !is_letter_selected(&ctx.selected, index) {
         return;
     }
     let raw_strength = read_num(props, "formulaStrength", frame, 100.0) / 100.0;
-    let field = apply_field_weight(1.0, props, "formula", frame, base);
+    let field = apply_field_weight(1.0, props, EffectorKind::Formula, frame, base);
     let weight = raw_strength * field;
     if weight == 0.0 || weight.is_nan() {
         return;
@@ -1765,11 +1871,11 @@ fn evaluate_twist(
     if read_num(props, "twistEnable", frame, 1.0) == 0.0 {
         return;
     }
-    let ctx = letter_context(props, "twist", frame, index, list, sections);
+    let ctx = letter_context(props, EffectorKind::Twist, frame, index, list, sections);
     if !is_letter_selected(&ctx.selected, index) {
         return;
     }
-    let weight = apply_field_weight(ctx.strength, props, "twist", frame, base);
+    let weight = apply_field_weight(ctx.strength, props, EffectorKind::Twist, frame, base);
     if weight <= 0.0 {
         return;
     }
@@ -1806,11 +1912,11 @@ fn evaluate_wrap(
     if read_num(props, "wrapEnable", frame, 1.0) == 0.0 {
         return;
     }
-    let ctx = letter_context(props, "wrap", frame, index, list, sections);
+    let ctx = letter_context(props, EffectorKind::Wrap, frame, index, list, sections);
     if !is_letter_selected(&ctx.selected, index) {
         return;
     }
-    let weight = apply_field_weight(ctx.strength, props, "wrap", frame, base);
+    let weight = apply_field_weight(ctx.strength, props, EffectorKind::Wrap, frame, base);
     if weight <= 0.0 {
         return;
     }
@@ -1852,11 +1958,11 @@ fn evaluate_orbit(
     if read_num(props, "orbitEnable", frame, 1.0) == 0.0 {
         return;
     }
-    let ctx = letter_context(props, "orbit", frame, index, list, sections);
+    let ctx = letter_context(props, EffectorKind::Orbit, frame, index, list, sections);
     if !is_letter_selected(&ctx.selected, index) {
         return;
     }
-    let weight = apply_field_weight(ctx.strength, props, "orbit", frame, base);
+    let weight = apply_field_weight(ctx.strength, props, EffectorKind::Orbit, frame, base);
     if weight <= 0.0 {
         return;
     }
@@ -2016,12 +2122,12 @@ fn evaluate_spline(
     if read_num(props, "splineEnable", frame, 1.0) == 0.0 {
         return;
     }
-    let ctx = letter_context(props, "spline", frame, index, list, sections);
+    let ctx = letter_context(props, EffectorKind::Spline, frame, index, list, sections);
     if !is_letter_selected(&ctx.selected, index) {
         return;
     }
     let raw_strength = read_num(props, "splineStrength", frame, 100.0) / 100.0;
-    let field = apply_field_weight(1.0, props, "spline", frame, base);
+    let field = apply_field_weight(1.0, props, EffectorKind::Spline, frame, base);
     let weight = raw_strength * field;
     if weight == 0.0 || weight.is_nan() {
         return;
@@ -2118,7 +2224,7 @@ fn sections_at(layers: &[EffectorLayer<'_>], frame: f64) -> BTreeMap<String, Vec
     let mut sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for layer in layers {
         let kind_str = layer.kind.as_str();
-        let letters = read_str(layer.props, &format!("{kind_str}Letters"), frame, "");
+        let letters = read_str(layer.props, layer.kind.prop_keys().letters, frame, "");
         sections
             .entry(kind_str.to_string())
             .or_default()
@@ -2127,16 +2233,15 @@ fn sections_at(layers: &[EffectorLayer<'_>], frame: f64) -> BTreeMap<String, Vec
     sections
 }
 
-/// Evaluates all non-Delay effectors in `layers` for one letter at `frame`.
-pub fn evaluate_effectors(
+fn evaluate_effectors_with_sections(
     layers: &[EffectorLayer<'_>],
     frame: f64,
     index: usize,
     list: &LetterList,
     base: [f64; 3],
     aux: &EvalAux,
+    sections: &BTreeMap<String, Vec<String>>,
 ) -> LetterControls {
-    let sections = sections_at(layers, frame);
     let mut out = LetterControls::default();
     for layer in layers {
         match layer.kind {
@@ -2149,15 +2254,15 @@ pub fn evaluate_effectors(
                     list,
                     base,
                     &mut out,
-                    &sections,
+                    sections,
                     aux,
                 );
             }
             EffectorKind::Plain => {
-                evaluate_plain(layer.props, frame, index, list, base, &mut out, &sections);
+                evaluate_plain(layer.props, frame, index, list, base, &mut out, sections);
             }
             EffectorKind::Random => {
-                evaluate_random(layer.props, frame, index, list, base, &mut out, &sections);
+                evaluate_random(layer.props, frame, index, list, base, &mut out, sections);
             }
             EffectorKind::Formula => {
                 evaluate_formula(
@@ -2167,15 +2272,15 @@ pub fn evaluate_effectors(
                     list,
                     base,
                     &mut out,
-                    &sections,
+                    sections,
                     aux,
                 );
             }
             EffectorKind::Twist => {
-                evaluate_twist(layer.props, frame, index, list, base, &mut out, &sections);
+                evaluate_twist(layer.props, frame, index, list, base, &mut out, sections);
             }
             EffectorKind::Wrap => {
-                evaluate_wrap(layer.props, frame, index, list, base, &mut out, &sections);
+                evaluate_wrap(layer.props, frame, index, list, base, &mut out, sections);
             }
             EffectorKind::Orbit => {
                 evaluate_orbit(
@@ -2185,7 +2290,7 @@ pub fn evaluate_effectors(
                     list,
                     base,
                     &mut out,
-                    &sections,
+                    sections,
                     aux,
                 );
             }
@@ -2197,13 +2302,26 @@ pub fn evaluate_effectors(
                     list,
                     base,
                     &mut out,
-                    &sections,
+                    sections,
                     aux,
                 );
             }
         }
     }
     out
+}
+
+/// Evaluates all non-Delay effectors in `layers` for one letter at `frame`.
+pub fn evaluate_effectors(
+    layers: &[EffectorLayer<'_>],
+    frame: f64,
+    index: usize,
+    list: &LetterList,
+    base: [f64; 3],
+    aux: &EvalAux,
+) -> LetterControls {
+    let sections = sections_at(layers, frame);
+    evaluate_effectors_with_sections(layers, frame, index, list, base, aux, &sections)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2244,7 +2362,7 @@ fn delay_link_params(
     let gated = apply_field_weight(
         strength_weight(read_num(props, "delayStrength", frame, 100.0)),
         props,
-        "delay",
+        EffectorKind::Delay,
         frame,
         base,
     );
@@ -2396,12 +2514,43 @@ pub fn evaluate_stack(
     let step_count = last_step - first_step + 1;
     let frac = frame - (last_step as f64);
 
+    let all_letters_static = layers
+        .iter()
+        .all(|l| l.props.is_static(l.kind.prop_keys().letters));
+    let hoisted_sections = if all_letters_static {
+        Some(sections_at(layers, frame))
+    } else {
+        None
+    };
+    let dynamic_sections_table: Vec<BTreeMap<String, Vec<String>>> = if all_letters_static {
+        Vec::new()
+    } else {
+        (first_step..=last_step)
+            .map(|f| sections_at(layers, f as f64))
+            .collect()
+    };
+    let dynamic_tail_sections = if !all_letters_static && frac > 1e-9 {
+        Some(sections_at(layers, frame))
+    } else {
+        None
+    };
+
     // Stage 0 table: raw effector outputs at integer frames `first_step..=last_step` + fractional end.
     let mut stage_table: Vec<LetterControls> = (first_step..=last_step)
-        .map(|f| evaluate_effectors(layers, f as f64, index, list, base, aux))
+        .enumerate()
+        .map(|(k, f)| {
+            let sections = hoisted_sections
+                .as_ref()
+                .unwrap_or_else(|| &dynamic_sections_table[k]);
+            evaluate_effectors_with_sections(layers, f as f64, index, list, base, aux, sections)
+        })
         .collect();
     let mut stage_tail = if frac > 1e-9 {
-        evaluate_effectors(layers, frame, index, list, base, aux)
+        let sections = hoisted_sections
+            .as_ref()
+            .or(dynamic_tail_sections.as_ref())
+            .unwrap();
+        evaluate_effectors_with_sections(layers, frame, index, list, base, aux, sections)
     } else {
         *stage_table.last().unwrap()
     };
@@ -2442,15 +2591,20 @@ pub fn evaluate_stack(
         let mut next_table = Vec::with_capacity(step_count);
         for (k, &own) in stage_table.iter().enumerate() {
             let f = (first_step + k) as f64;
-            let sections = sections_at(layers, f);
-            let params = delay_link_params(delay.props, f, index, list, base, &sections);
+            let sections = hoisted_sections
+                .as_ref()
+                .unwrap_or_else(|| &dynamic_sections_table[k]);
+            let params = delay_link_params(delay.props, f, index, list, base, sections);
             let (next_state, out) = chase_step(state, &mut velocity, own, params, travel, 1.0);
             state = next_state;
             next_table.push(out);
         }
         let next_tail = if frac > 1e-9 {
-            let sections = sections_at(layers, frame);
-            let params = delay_link_params(delay.props, frame, index, list, base, &sections);
+            let sections = hoisted_sections
+                .as_ref()
+                .or(dynamic_tail_sections.as_ref())
+                .unwrap();
+            let params = delay_link_params(delay.props, frame, index, list, base, sections);
             let mut tail_vel = velocity;
             let (_, out) = chase_step(state, &mut tail_vel, stage_tail, params, travel, frac);
             out
@@ -2678,11 +2832,24 @@ pub fn evaluate_expresstext_repeater_instances(
         if read_num(layer.props, "repeaterEnable", frame, 1.0) == 0.0 {
             continue;
         }
-        let ctx = letter_context(layer.props, "repeater", frame, index, list, &sections);
+        let ctx = letter_context(
+            layer.props,
+            EffectorKind::Repeater,
+            frame,
+            index,
+            list,
+            &sections,
+        );
         if !is_letter_selected(&ctx.selected, index) {
             continue;
         }
-        let weight = apply_field_weight(ctx.strength, layer.props, "repeater", frame, base);
+        let weight = apply_field_weight(
+            ctx.strength,
+            layer.props,
+            EffectorKind::Repeater,
+            frame,
+            base,
+        );
         if !weight.is_finite() || weight <= 0.0 {
             continue;
         }
@@ -3196,17 +3363,35 @@ pub fn shatter_glyph_triangles(
 /// Applies a [`ShatteredVoronoiChunk`]'s pose (`scale`, `rotation`, `offset`) around its
 /// centroid to produce baked triangle vertex positions.
 pub fn apply_chunk_pose_to_positions(chunk: &ShatteredVoronoiChunk) -> Vec<f32> {
+    let (sx, cx) = chunk.rotation[0].sin_cos();
+    let (sy, cy) = chunk.rotation[1].sin_cos();
+    let (sz, cz) = chunk.rotation[2].sin_cos();
+
+    // Precompute R = Rx * Ry * Rz once per chunk (matches `rotate_euler_xyz`).
+    let m00 = cy * cz;
+    let m01 = -cy * sz;
+    let m02 = sy;
+    let m10 = cx * sz + sx * sy * cz;
+    let m11 = cx * cz - sx * sy * sz;
+    let m12 = -sx * cy;
+    let m20 = sx * sz - cx * sy * cz;
+    let m21 = sx * cz + cx * sy * sz;
+    let m22 = cx * cy;
+
+    let [c0, c1, c2] = chunk.center;
+    let [s0, s1, s2] = chunk.scale;
+    let tx = c0 + chunk.offset[0];
+    let ty = c1 + chunk.offset[1];
+    let tz = c2 + chunk.offset[2];
+
     let mut baked = Vec::with_capacity(chunk.positions.len());
     for v in chunk.positions.as_chunks::<3>().0 {
-        let rel = [
-            (f64::from(v[0]) - chunk.center[0]) * chunk.scale[0],
-            (f64::from(v[1]) - chunk.center[1]) * chunk.scale[1],
-            (f64::from(v[2]) - chunk.center[2]) * chunk.scale[2],
-        ];
-        let spun = rotate_euler_xyz(rel, chunk.rotation);
-        baked.push((chunk.center[0] + spun[0] + chunk.offset[0]) as f32);
-        baked.push((chunk.center[1] + spun[1] + chunk.offset[1]) as f32);
-        baked.push((chunk.center[2] + spun[2] + chunk.offset[2]) as f32);
+        let rx = (f64::from(v[0]) - c0) * s0;
+        let ry = (f64::from(v[1]) - c1) * s1;
+        let rz = (f64::from(v[2]) - c2) * s2;
+        baked.push((m00 * rx + m01 * ry + m02 * rz + tx) as f32);
+        baked.push((m10 * rx + m11 * ry + m12 * rz + ty) as f32);
+        baked.push((m20 * rx + m21 * ry + m22 * rz + tz) as f32);
     }
     baked
 }
@@ -3261,11 +3446,24 @@ pub fn evaluate_expresstext_voronoi_params(
                 first_partition = Some((chunks, seed, randomness));
             }
         }
-        let ctx = letter_context(layer.props, "voronoi", frame, index, list, &sections);
+        let ctx = letter_context(
+            layer.props,
+            EffectorKind::Voronoi,
+            frame,
+            index,
+            list,
+            &sections,
+        );
         if !is_letter_selected(&ctx.selected, index) {
             continue;
         }
-        let w = apply_field_weight(ctx.strength, layer.props, "voronoi", frame, base);
+        let w = apply_field_weight(
+            ctx.strength,
+            layer.props,
+            EffectorKind::Voronoi,
+            frame,
+            base,
+        );
         if !w.is_finite() || w <= 0.0 {
             continue;
         }
@@ -4209,5 +4407,123 @@ mod tests {
             build_letter_run_for_text(LettersMode::AcrossTexts, &[3, 5, 2], 1);
         assert_eq!(acr_list.total, 10);
         assert_eq!(acr_start, 3);
+    }
+
+    #[test]
+    fn formula_cache_static_keys_chunk_matrix_and_hoisted_delay_sections() {
+        // 1. FormulaCache cap & stack-evaluated 1/2/variadic math functions.
+        let mut cache = FormulaCache::default();
+        let compiled = Rc::new(CompiledFormula::compile("sin(90)").unwrap());
+        for i in 0..(FORMULA_CACHE_CAP + 16) {
+            cache.insert(&format!("f{i}"), Rc::clone(&compiled));
+        }
+        assert_eq!(cache.map.len(), FORMULA_CACHE_CAP);
+        assert!(cache.get("f0").is_none());
+
+        let scope = FormulaScope {
+            u: 0.5,
+            t: 1.0,
+            f: 2.0,
+            ..FormulaScope::default()
+        };
+        assert!(
+            (eval_formula("sin(90) + pow(2, 3) + min(5, 2, 9) + max(1, 4, 3)", &scope) - 15.0)
+                .abs()
+                < 1e-12
+        );
+        assert!((eval_formula("mod(-1, 4)", &scope) - 3.0).abs() < 1e-12);
+
+        // 2. All 11 EffectorKind static prop keys match dynamic format! strings.
+        for kind in EffectorKind::ALL {
+            let p = kind.as_str();
+            let k = kind.prop_keys();
+            assert_eq!(k.letters, format!("{p}Letters"));
+            assert_eq!(k.delay_order, format!("{p}DelayOrder"));
+            assert_eq!(k.seed, format!("{p}Seed"));
+            assert_eq!(k.delay, format!("{p}Delay"));
+            assert_eq!(k.strength, format!("{p}Strength"));
+            assert_eq!(k.field, format!("{p}Field"));
+            assert_eq!(k.field_position, format!("{p}FieldPosition"));
+            assert_eq!(k.field_scale, format!("{p}FieldScale"));
+        }
+
+        // 3. apply_chunk_pose_to_positions precomputed 3x3 matrix matches rotate_euler_xyz per vertex.
+        let chunk = ShatteredVoronoiChunk {
+            cell_index: 0,
+            positions: vec![1.0, 2.0, 3.0, -4.5, 0.25, 7.5, 2.0, -1.5, 0.0],
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            center: [0.5, -0.25, 1.25],
+            offset: [3.0, -2.0, 4.5],
+            rotation: [0.43, -1.17, 2.05],
+            scale: [1.5, 0.75, 2.25],
+            signs: [1.0, -1.0, 1.0],
+        };
+        let fast_baked = apply_chunk_pose_to_positions(&chunk);
+        for (i, v) in chunk.positions.as_chunks::<3>().0.iter().enumerate() {
+            let rel = [
+                (f64::from(v[0]) - chunk.center[0]) * chunk.scale[0],
+                (f64::from(v[1]) - chunk.center[1]) * chunk.scale[1],
+                (f64::from(v[2]) - chunk.center[2]) * chunk.scale[2],
+            ];
+            let spun = rotate_euler_xyz(rel, chunk.rotation);
+            for axis in 0..3 {
+                let expected = (chunk.center[axis] + spun[axis] + chunk.offset[axis]) as f32;
+                let actual = fast_baked[i * 3 + axis];
+                assert!(
+                    (actual - expected).abs() <= 1e-5,
+                    "vertex {i} axis {axis}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+
+        // 4. Hoisted sections_at for static reader matches dynamic reader in evaluate_stack.
+        struct DynamicWrap(BTreeMap<String, EtValue>);
+        impl EtPropReader for DynamicWrap {
+            fn read(&self, key: &str, frame: f64) -> Option<EtValue> {
+                self.0.read(key, frame)
+            }
+        }
+        let mut plain_map = BTreeMap::new();
+        plain_map.insert(
+            "plainPosition".to_string(),
+            EtValue::Vec3([10.0, 5.0, -2.0]),
+        );
+        plain_map.insert("plainLetters".to_string(), EtValue::Text("1-3".to_string()));
+        let mut delay_map = BTreeMap::new();
+        delay_map.insert("delayMode".to_string(), EtValue::Number(2.0));
+        delay_map.insert("delayStrength".to_string(), EtValue::Number(60.0));
+
+        let dyn_plain = DynamicWrap(plain_map.clone());
+        let dyn_delay = DynamicWrap(delay_map.clone());
+
+        let static_layers = [
+            EffectorLayer {
+                kind: EffectorKind::Plain,
+                props: &plain_map,
+            },
+            EffectorLayer {
+                kind: EffectorKind::Delay,
+                props: &delay_map,
+            },
+        ];
+        let dynamic_layers = [
+            EffectorLayer {
+                kind: EffectorKind::Plain,
+                props: &dyn_plain,
+            },
+            EffectorLayer {
+                kind: EffectorKind::Delay,
+                props: &dyn_delay,
+            },
+        ];
+        let list = LetterList {
+            total: 4,
+            order: vec![0, 1, 2, 3],
+        };
+        let aux = EvalAux::default();
+        let res_static = evaluate_stack(&static_layers, 12.5, 1, &list, [0.0; 3], &aux);
+        let res_dyn = evaluate_stack(&dynamic_layers, 12.5, 1, &list, [0.0; 3], &aux);
+        assert_eq!(res_static, res_dyn);
     }
 }

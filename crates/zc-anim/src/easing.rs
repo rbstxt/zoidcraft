@@ -651,8 +651,22 @@ pub fn eval_cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, t: f64) -> f64 {
         return 1.0;
     }
 
+    let x1 = if x1.is_finite() {
+        x1.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let x2 = if x2.is_finite() {
+        x2.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     let y1 = if y1.is_finite() { y1 } else { 0.0 };
     let y2 = if y2.is_finite() { y2 } else { 1.0 };
+
+    if (x1 - y1).abs() <= 1e-12 && (x2 - y2).abs() <= 1e-12 {
+        return t;
+    }
 
     let u = solve_bezier_param(x1, x2, t);
     let cy = 3.0 * y1;
@@ -724,6 +738,43 @@ pub struct BezierSegment {
     pub in_tangent: [f64; 2],
 }
 
+/// Computes the handle overlap correction factor `s` and the 4 cubic Bernstein basis weights
+/// `[w0, w1, w2, w3]` for a CM3 Bezier segment at `frame` ONCE so vector properties can reuse
+/// the solved time parameter across all components.
+pub fn segment_bezier_weights(
+    f0: f64,
+    out_x: f64,
+    f1: f64,
+    in_x: f64,
+    frame: f64,
+    preserve_crossing: bool,
+) -> (f64, [f64; 4]) {
+    let duration = f1 - f0;
+    if !frame.is_finite() || !duration.is_finite() || duration <= 0.0 || frame <= f0 {
+        return (1.0, [1.0, 0.0, 0.0, 0.0]);
+    }
+    if frame >= f1 {
+        return (1.0, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    let out_x = if out_x.is_finite() {
+        out_x.max(0.0)
+    } else {
+        0.0
+    };
+    let in_x = if in_x.is_finite() { in_x.min(0.0) } else { 0.0 };
+    let s = correct_curve_with_mode(duration, out_x, in_x, preserve_crossing);
+
+    let nx1 = (s * out_x / duration).clamp(0.0, 1.0);
+    let nx2 = (1.0 + s * in_x / duration).clamp(0.0, 1.0);
+    let norm_t = ((frame - f0) / duration).clamp(0.0, 1.0);
+    let u = solve_bezier_param(nx1, nx2, norm_t);
+    let mu = 1.0 - u;
+    let mu2 = mu * mu;
+    let u2 = u * u;
+    (s, [mu2 * mu, 3.0 * mu2 * u, 3.0 * mu * u2, u2 * u])
+}
+
 /// Evaluates a CM3 handle-driven cubic Bezier segment at `frame` with explicit
 /// Easing+ crossing-handle mode (`preserve_crossing = true` for Easing+, `false` for Vanilla CM3).
 pub fn eval_segment_bezier_with_mode(
@@ -743,18 +794,8 @@ pub fn eval_segment_bezier_with_mode(
         return segment.end_value;
     }
 
-    let out_x = if segment.out_tangent[0].is_finite() {
-        segment.out_tangent[0].max(0.0)
-    } else {
-        0.0
-    };
     let out_y = if segment.out_tangent[1].is_finite() {
         segment.out_tangent[1]
-    } else {
-        0.0
-    };
-    let in_x = if segment.in_tangent[0].is_finite() {
-        segment.in_tangent[0].min(0.0)
     } else {
         0.0
     };
@@ -763,20 +804,24 @@ pub fn eval_segment_bezier_with_mode(
     } else {
         0.0
     };
-    let s = correct_curve_with_mode(duration, out_x, in_x, preserve_crossing);
-
-    let nx1 = (s * out_x / duration).clamp(0.0, 1.0);
-    let nx2 = (1.0 + s * in_x / duration).clamp(0.0, 1.0);
-    let norm_t = ((frame - segment.start_frame) / duration).clamp(0.0, 1.0);
-    let u = solve_bezier_param(nx1, nx2, norm_t);
-
     let y0 = segment.start_value;
-    let y1 = segment.start_value + s * out_y;
-    let y2 = segment.end_value + s * in_y;
     let y3 = segment.end_value;
+    if (y3 - y0).abs() == 0.0 && out_y == 0.0 && in_y == 0.0 {
+        return y0;
+    }
 
-    let mu = 1.0 - u;
-    mu * mu * mu * y0 + 3.0 * mu * mu * u * y1 + 3.0 * mu * u * u * y2 + u * u * u * y3
+    let (s, w) = segment_bezier_weights(
+        segment.start_frame,
+        segment.out_tangent[0],
+        segment.end_frame,
+        segment.in_tangent[0],
+        frame,
+        preserve_crossing,
+    );
+
+    let y1 = y0 + s * out_y;
+    let y2 = y3 + s * in_y;
+    w[0] * y0 + w[1] * y1 + w[2] * y2 + w[3] * y3
 }
 
 /// Evaluates a CM3 handle-driven cubic Bezier segment at `frame` (Spec 02 §3.3).
@@ -1544,5 +1589,64 @@ mod tests {
         assert_eq!(kf.easing, EasingKind::Hold);
         assert_eq!(kf.in_tangent, Some([-4.0, 1.5]));
         assert_eq!(kf.out_tangent, Some([6.0, -2.5]));
+    }
+
+    #[test]
+    fn fast_paths_and_segment_bezier_weights_parity() {
+        // Linear cubic Bezier fast path matches identity exactly.
+        for i in 0..=20 {
+            let t = i as f64 / 20.0;
+            assert_eq!(eval_cubic_bezier(0.333, 0.333, 0.667, 0.667, t), t);
+            assert_eq!(eval_cubic_bezier(0.0, 0.0, 1.0, 1.0, t), t);
+        }
+        // Overshooting y1 with out-of-range x1 must NOT trigger the linear fast path because x1 clamps to 1.0.
+        assert!(eval_cubic_bezier(1.5, 1.5, 0.5, 0.5, 0.5) > 0.55);
+
+        // Flat segment fast path returns start_value directly.
+        let flat = BezierSegment {
+            start_frame: 0.0,
+            start_value: 42.5,
+            out_tangent: [10.0, 0.0],
+            end_frame: 30.0,
+            end_value: 42.5,
+            in_tangent: [-10.0, 0.0],
+        };
+        assert_eq!(eval_segment_bezier(flat, 12.3), 42.5);
+
+        // Non-flat untouched CM3 S-curve still evaluates the true cubic S-curve.
+        let s_curve = BezierSegment {
+            start_frame: 0.0,
+            start_value: 0.0,
+            out_tangent: [10.0, 0.0],
+            end_frame: 30.0,
+            end_value: 100.0,
+            in_tangent: [-10.0, 0.0],
+        };
+        let s_val = eval_segment_bezier(s_curve, 7.5);
+        assert!(
+            s_val < 25.0,
+            "S-curve must ease in slower than linear: {s_val}"
+        );
+
+        // segment_bezier_weights forms a partition of unity and reproduces eval_segment_bezier_with_mode.
+        for preserve in [false, true] {
+            for &frame in &[-5.0, 0.0, 4.5, 15.0, 26.25, 30.0, 40.0] {
+                let (s, w) = segment_bezier_weights(0.0, 18.0, 30.0, -16.0, frame, preserve);
+                let w_sum: f64 = w.iter().sum();
+                assert!(approx_eq(w_sum, 1.0, 1e-12));
+                let seg = BezierSegment {
+                    start_frame: 0.0,
+                    start_value: 10.0,
+                    out_tangent: [18.0, 12.0],
+                    end_frame: 30.0,
+                    end_value: 90.0,
+                    in_tangent: [-16.0, -8.0],
+                };
+                let direct = eval_segment_bezier_with_mode(seg, frame, preserve);
+                let via_weights =
+                    w[0] * 10.0 + w[1] * (10.0 + s * 12.0) + w[2] * (90.0 + s * -8.0) + w[3] * 90.0;
+                assert!(approx_eq(direct, via_weights, 1e-12));
+            }
+        }
     }
 }
