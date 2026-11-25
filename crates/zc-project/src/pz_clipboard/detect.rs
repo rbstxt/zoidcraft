@@ -1100,9 +1100,5 @@ pub(super) fn looks_like_property_track_obj(obj: &Map<String, Value>) -> bool {
     {
         return true;
     }
-    if (obj.contains_key("animated") || obj.contains_key("expression")) && obj.contains_key("value")
-    {
-        return true;
-    }
-    false
+    (obj.contains_key("animated") || obj.contains_key("expression")) && obj.contains_key("value")
 }
