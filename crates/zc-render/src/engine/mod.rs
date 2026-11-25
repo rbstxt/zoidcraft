@@ -653,6 +653,7 @@ impl ProjectRenderEngine {
         self.cube_lut_cache.clear();
         self.node_effect_cache.clear();
         self.readback_staging = None;
+        self.scene3d.clear_msaa_attachments();
         self.registered_custom_3d_materials.clear();
         self.custom_pipelines.clear();
         self.effects.evict_custom_shaders();

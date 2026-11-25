@@ -21,6 +21,7 @@ use super::objects_materials::{
 use super::objects_tab::{apply_object_drop, build_object_picker_items, is_container_object};
 use super::plugins_settings::{
     build_debug_info_report, humanize_history_label, rank_filtered_plugin_categories,
+    show_settings_tab,
 };
 use super::property_rows::{
     EXPR_EDITOR_DEFAULT_SIZE, apply_color_picker_to_session, apply_kf_bar_event,
@@ -1417,6 +1418,64 @@ fn live_2d_text_edit_commits_per_keystroke_and_coalesces_undo_transaction() {
         undo_before + 1,
         "multiple live keystrokes must coalesce into a single undo step"
     );
+}
+
+#[test]
+fn default_fps_edit_commits_on_enter_and_when_leaving_settings() {
+    let ctx = egui::Context::default();
+    let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 640.0));
+    let mut state = PanelsState::default();
+    let mut theme = Cm3Theme::default();
+    let mut session = Session::new();
+    session.execute(Command::SetFps { fps: 24.0 }).unwrap();
+
+    let mut draw = |events, visible, focus_input| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                if focus_input {
+                    ctx.memory_mut(|m| m.request_focus(PanelsState::default_fps_input_id()));
+                }
+                if visible {
+                    show_settings_tab(ui, rect, &mut session, &mut theme, &mut state);
+                }
+                state.commit_default_fps_on_blur(&ctx, &mut session, visible);
+            },
+        );
+        output.textures_delta.clear();
+        (state.app_settings.default_fps, session.document().fps)
+    };
+    let key_event = |key, modifiers| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+    let replace_text = |text: &str| {
+        vec![
+            key_event(Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text(text.to_owned()),
+        ]
+    };
+
+    assert_eq!(draw(vec![], true, false), (30.0, 24.0));
+    assert_eq!(draw(replace_text("60"), true, true), (30.0, 24.0));
+    assert_eq!(
+        draw(
+            vec![key_event(Key::Enter, egui::Modifiers::NONE)],
+            true,
+            false
+        ),
+        (60.0, 60.0),
+    );
+    assert_eq!(draw(replace_text("300"), true, true), (60.0, 60.0));
+    assert_eq!(draw(vec![], false, false), (240.0, 240.0));
+    assert_eq!(draw(vec![], true, false), (240.0, 240.0));
 }
 
 #[test]

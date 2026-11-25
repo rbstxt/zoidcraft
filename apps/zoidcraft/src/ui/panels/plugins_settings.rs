@@ -1763,10 +1763,10 @@ pub(super) fn show_settings_tab(
                     bottom: 5,
                 },
                 |ui| {
-                    let fps_id = Id::unique("settings_default_fps");
-                    if !ui.memory(|m| m.has_focus(fps_id)) {
-                        state.settings_default_fps_buf = format!("{:.0}", session.document().fps);
-                    }
+                    let fps_id = PanelsState::default_fps_input_id();
+                    let was_edited = state.settings_default_fps_buf.is_some();
+                    let mut fps_buf = state.settings_default_fps_buf.take()
+                        .unwrap_or_else(|| state.app_settings.default_fps.to_string());
                     ui.horizontal(|ui| {
                         let avail_w = ui.available_width();
                         let box_w = (avail_w * 0.34).clamp(52.0, 90.0);
@@ -1811,9 +1811,7 @@ pub(super) fn show_settings_tab(
                                             .inner_margin(egui::Margin::symmetric(5, 1))
                                             .show(ui, |ui| {
                                                 ui.add(
-                                                    TextEdit::singleline(
-                                                        &mut state.settings_default_fps_buf,
-                                                    )
+                                                    TextEdit::singleline(&mut fps_buf)
                                                     .id(fps_id)
                                                     .frame(Frame::NONE)
                                                     .font(theme.font(FONT_SMALL))
@@ -1825,19 +1823,11 @@ pub(super) fn show_settings_tab(
                                     },
                                 )
                                 .inner;
-                            if resp.lost_focus()
-                                || (resp.has_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
-                            {
-                                if let Ok(parsed) =
-                                    state.settings_default_fps_buf.trim().parse::<f64>()
-                                {
-                                    let clamped = parsed.clamp(1.0, 240.0).round();
-                                    let _ = session.execute(Command::SetFps { fps: clamped });
-                                    state.settings_default_fps_buf = format!("{clamped:.0}");
-                                }
-                                if resp.has_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                                    ui.memory_mut(|m| m.surrender_focus(fps_id));
-                                }
+                            if was_edited || resp.changed() {
+                                state.settings_default_fps_buf = Some(fps_buf);
+                            }
+                            if resp.has_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                resp.surrender_focus();
                             }
                         });
                     });

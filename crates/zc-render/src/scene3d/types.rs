@@ -940,6 +940,7 @@ pub(crate) struct ParticleUniforms {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct MeshPipelineKey {
     pub(crate) format: wgpu::TextureFormat,
+    pub(crate) sample_count: u32,
     pub(crate) side: CullSide,
     pub(crate) blend: MaterialBlend,
     pub(crate) polygon_offset_cap: bool,
@@ -948,6 +949,7 @@ pub(crate) struct MeshPipelineKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ParticlePipelineKey {
     pub(crate) format: wgpu::TextureFormat,
+    pub(crate) sample_count: u32,
     pub(crate) blend: ParticleBlend,
 }
 

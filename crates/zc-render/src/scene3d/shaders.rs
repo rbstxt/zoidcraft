@@ -822,7 +822,9 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
 
     let lit = emissive_c + direct_diff_acc + indirect_diff_acc + direct_spec_acc + indirect_spec_acc;
     var lit_clamped = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
-    if (post_lit_ramp) {
+    let has_emission = u_obj.emissive_intensity.w > 0.0 && any(u_obj.emissive_intensity.rgb > vec3<f32>(0.0));
+    let has_light_source = light_count > 0u || has_env_map || reflection_enabled || has_emission;
+    if (post_lit_ramp && has_light_source) {
         let shaded_luma = clamp(dot(lit_clamped, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
         let ramp_col_raw = evaluate_ramp_4(shaded_luma);
         let ramp_col_c = select(ramp_col_raw, srgb_to_linear(ramp_col_raw), use_linear);

@@ -1113,15 +1113,63 @@ fn viewport_gpu_render_error_throttles_duplicates_emits_shader_toast_and_clears_
 }
 
 #[test]
+fn preview_quality_is_independent_of_logical_canvas_size() {
+    use crate::ui::layout::PreviewQuality;
+
+    let mut app = make_headless_app_for_test();
+    app.last_canvas_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(760.0, 428.0)));
+    for (quality, expected) in [
+        (PreviewQuality::Full, (1920, 1080)),
+        (PreviewQuality::Half, (960, 540)),
+        (PreviewQuality::Quarter, (480, 270)),
+        (PreviewQuality::Eighth, (240, 135)),
+    ] {
+        app.workspace.player_plus.preview_quality = quality;
+        let (_, width, height, _, key) = app.current_viewport_render_key();
+        assert_eq!((width, height), expected, "{quality:?}");
+        assert_eq!((key.width, key.height), expected);
+    }
+
+    app.session
+        .plugins
+        .disable("player-plus", &BTreeSet::new())
+        .expect("disable Player+");
+    let (_, width, height, _, _) = app.current_viewport_render_key();
+    assert_eq!((width, height), (1920, 1080));
+}
+
+#[test]
+fn preview_render_resolution_scales_sequence_and_obeys_texture_limits() {
+    assert_eq!(
+        compute_preview_render_resolution([1921, 1081], 3, 8192),
+        (640, 360)
+    );
+    assert_eq!(
+        compute_preview_render_resolution([80, 48], 8, 8192),
+        (64, 48)
+    );
+    assert_eq!(
+        compute_preview_render_resolution([9000, 6000], 1, 8192),
+        (8192, 6000)
+    );
+    assert_eq!(
+        compute_preview_render_resolution([9000, 6000], 2, 4096),
+        (4096, 3000)
+    );
+}
+
+#[test]
 fn preview_frame_cache_accumulates_across_scrubbing_and_invalidates_on_edit() {
     let mut app = make_headless_app_for_test();
     let w = 640_u32;
     let h = 360_u32;
     let frame_bytes = (w as usize) * (h as usize) * 4;
-    app.last_canvas_rect = Some(Rect::from_min_size(
-        Pos2::ZERO,
-        Vec2::new(w as f32, h as f32),
-    ));
+    app.session
+        .execute(Command::SetResolution {
+            width: w,
+            height: h,
+        })
+        .expect("set sequence resolution");
 
     let budget_bytes = 512 * 1024 * 1024;
     let mut cache: PreviewFrameCache<u32> = PreviewFrameCache::new(budget_bytes);

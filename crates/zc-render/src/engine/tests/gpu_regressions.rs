@@ -184,7 +184,7 @@ fn gpu_qa_fixes_zero_light_pbr_particles_presets_particular_repeaters_and_cjk() 
     let _ = plugins.enable("trapcode-suite");
     let _ = plugins.enable("repeater");
 
-    // 1. Zero-light 3D PBR Sphere renders lit (studio headlight fallback), never pitch-black!
+    // 1. A non-emissive PBR sphere is black until the scene has a light.
     let mut cam = Object3D::new_perspective_camera();
     cam.position = PropertyTrack::vec3([0.0, 0.0, 45.0]);
     let mut sphere = Object3D::new_shape_3d(
@@ -198,21 +198,53 @@ fn gpu_qa_fixes_zero_light_pbr_particles_presets_particular_repeaters_and_cjk() 
     sphere.material = Some(MaterialSpec::PbrPlus(Box::new(
         zc_project::PbrPlusMaterial {
             base_color: PropertyTrack::color([0.9, 0.3, 0.2]),
+            emissive: PropertyTrack::color([0.0, 0.0, 0.0]),
             roughness: PropertyTrack::number(0.5),
             metalness: PropertyTrack::number(0.1),
+            reflection: false,
             ..Default::default()
         },
     )));
     let mut pbr_proj = make_test_scene_project(vec![cam.clone(), sphere], [64, 64]);
-    pbr_proj.sequence.background_color = [0.0, 0.0, 0.0, 1.0];
+    let transparent = RenderFrameOptions {
+        transparent_background: true,
+        ..Default::default()
+    };
     let pbr_px = engine
-        .render_frame_rgba8(&pbr_proj, &plugins, 0.0, 64, 64)
+        .render_frame_rgba8_with_options(&pbr_proj, &plugins, 0.0, 64, 64, &transparent)
         .expect("zero-light pbr sphere");
     let center = (32 * 64 + 32) * 4;
+    assert_eq!(&pbr_px[..4], &[0, 0, 0, 0], "transparent background");
+    assert_eq!(&pbr_px[center..center + 4], &[0, 0, 0, 255]);
     assert!(
-        pbr_px[center] > 60,
-        "zero-light 3D PBR sphere must be lit by studio fallback, got {:?}",
-        &pbr_px[center..center + 4]
+        pbr_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p[..3] == [0, 0, 0])
+    );
+
+    let mut light = Object3D::new_spot_light();
+    light.position = PropertyTrack::vec3([0.0, 0.0, 45.0]);
+    if let Object3DKind::Light(data) = &mut light.kind {
+        data.kind = ProjectLightKind::Directional;
+        data.intensity = PropertyTrack::number(1.0);
+        data.cast_shadow = false;
+    }
+    let LayerKind::Scene3D { objects, .. } =
+        &mut pbr_proj.sequence.video_tracks[0].clips[0].layer.kind
+    else {
+        panic!("expected a 3D scene");
+    };
+    objects.push(light);
+    engine.invalidate_caches();
+    let lit_px = engine
+        .render_frame_rgba8_with_options(&pbr_proj, &plugins, 0.0, 64, 64, &transparent)
+        .expect("explicitly lit pbr sphere");
+    assert!(
+        lit_px[center] > 60,
+        "directional light should illuminate the sphere, got {:?}",
+        &lit_px[center..center + 4]
     );
 
     // 2. Particles+ sprite presets (`star_4` vs `circle_soft` vs `spark`) produce distinct GPU pixels!

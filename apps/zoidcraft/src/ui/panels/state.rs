@@ -326,8 +326,9 @@ impl Default for ExportStatus {
 }
 
 /// Persistent editor preferences shown in the Settings tab.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppSettings {
+    pub default_fps: f64,
     pub preview_cache_mib: u32,
     pub undo_max_entries: usize,
     pub undo_max_mib: usize,
@@ -337,11 +338,21 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            default_fps: 30.0,
             preview_cache_mib: 512,
             undo_max_entries: 200,
             undo_max_mib: 64,
             show_fps_overlay: true,
         }
+    }
+}
+
+impl AppSettings {
+    pub(crate) fn undo_limits(&self) -> (usize, usize) {
+        (
+            self.undo_max_entries.clamp(1, 2000),
+            self.undo_max_mib.clamp(4, 1024) * 1024 * 1024,
+        )
     }
 }
 
@@ -477,7 +488,7 @@ pub struct PanelsState {
     pub(super) shader_prop_kinds: BTreeMap<(String, String), usize>,
     pub(super) settings_editor_layout: usize,
     pub(super) settings_gradient_editor: usize,
-    pub(super) settings_default_fps_buf: String,
+    pub(super) settings_default_fps_buf: Option<String>,
     pub(super) settings_edit_colors: bool,
     pub(super) seq_control_counter: usize,
     pub(super) new_seq_control_kind: usize,
@@ -566,7 +577,7 @@ impl Default for PanelsState {
             shader_prop_kinds: BTreeMap::new(),
             settings_editor_layout: 0,
             settings_gradient_editor: 0,
-            settings_default_fps_buf: String::from("30"),
+            settings_default_fps_buf: None,
             settings_edit_colors: false,
             seq_control_counter: 1,
             new_seq_control_kind: 0,
@@ -608,6 +619,39 @@ impl Default for PanelsState {
 }
 
 impl PanelsState {
+    pub(super) fn default_fps_input_id() -> Id {
+        Id::unique("settings_default_fps")
+    }
+
+    pub(crate) fn commit_default_fps_on_blur(
+        &mut self,
+        ctx: &egui::Context,
+        session: &mut Session,
+        settings_visible: bool,
+    ) {
+        let input_id = Self::default_fps_input_id();
+        if settings_visible && ctx.memory(|m| m.has_focus(input_id)) {
+            return;
+        }
+        let Some(buffer) = self.settings_default_fps_buf.take() else {
+            return;
+        };
+        ctx.memory_mut(|m| m.surrender_focus(input_id));
+        let Ok(fps) = buffer.trim().parse::<f64>() else {
+            return;
+        };
+        if !fps.is_finite() {
+            return;
+        }
+        let clamped = fps.clamp(1.0, 240.0);
+        self.app_settings.default_fps = clamped;
+        if session.document().fps != clamped.round()
+            || session.active_sequence().exact_fps.is_some()
+        {
+            let _ = session.execute(Command::SetFps { fps: clamped });
+        }
+    }
+
     pub fn take_project_actions(&mut self) -> Vec<ProjectAction> {
         std::mem::take(&mut self.pending_project_actions)
     }

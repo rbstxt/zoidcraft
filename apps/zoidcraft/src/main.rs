@@ -11,6 +11,7 @@
 mod audio_playback;
 mod export_worker;
 mod media_import;
+mod preferences;
 mod project_io;
 mod ui;
 mod viewport_renderer;
@@ -21,6 +22,9 @@ mod app_tests;
 use audio_playback::*;
 use export_worker::*;
 use media_import::*;
+use preferences::{
+    UserPreferences, apply_default_project_fps, default_preferences_path, preferences_fingerprint,
+};
 use project_io::*;
 use viewport_renderer::*;
 
@@ -90,7 +94,7 @@ use ui::layout::{Cm3Workspace, PanelFocus, UiAction};
 use ui::panels::{
     ExportAudioCodec, ExportCm3Preset, ExportContainer as UiExportContainer, ExportJobStatus,
     ExportMode, ExportQueueJob, ExportRateControl, ExportSettings as UiExportSettings,
-    ExportStatus, ExportVideoCodec, PanelsState, ProjectAction, RecoverySnapshotInfo,
+    ExportStatus, ExportVideoCodec, PanelsState, ProjectAction, RecoverySnapshotInfo, SideTab,
 };
 
 use ui::pro_editors::show_pro_editor_windows;
@@ -118,6 +122,9 @@ struct ZoidCraftApp {
     viewport: ViewportState,
     renderer: Option<ViewportGpuPresenter>,
     current_file: Option<PathBuf>,
+    preferences_path: Option<PathBuf>,
+    /// Fingerprint and success status of the last preference write, or the startup baseline.
+    last_preferences_write: Option<(u64, bool)>,
     /// Decoded audio buffers keyed by project `asset_id` (shared zero-copy across split/duplicated clips and exports).
     decoded_audio: HashMap<String, Arc<AudioBuffer>>,
     /// Precomputed waveform peaks keyed by project `asset_id`.
@@ -205,6 +212,7 @@ struct ZoidCraftApp {
 
 impl Drop for ZoidCraftApp {
     fn drop(&mut self) {
+        self.save_user_preferences(true);
         self.reset_live_audio_output();
         if let Some(mut job) = self.active_export.take() {
             let _ = job.cancel_and_join_bounded(EXPORT_SHUTDOWN_JOIN_TIMEOUT);
@@ -242,19 +250,7 @@ impl eframe::App for ZoidCraftApp {
             apply_cm3_style(&ctx, &self.theme);
             self.applied_theme = Some(self.theme.clone());
         }
-        let undo_entries = self
-            .workspace
-            .panels
-            .app_settings
-            .undo_max_entries
-            .clamp(1, 2000);
-        let undo_bytes = self
-            .workspace
-            .panels
-            .app_settings
-            .undo_max_mib
-            .clamp(4, 1024)
-            .saturating_mul(1024 * 1024);
+        let (undo_entries, undo_bytes) = self.workspace.panels.app_settings.undo_limits();
         if self.session.history.max_entries() != undo_entries
             || self.session.history.max_bytes() != undo_bytes
         {
@@ -442,7 +438,6 @@ impl eframe::App for ZoidCraftApp {
         } else {
             [0; 9]
         };
-        let pre_ui_canvas_rect = self.last_canvas_rect;
         let pre_ui_preview_quality = self.workspace.player_plus.preview_quality;
         let pre_ui_selection_hash = compute_editing_selection_hash(&self.session);
         let pre_ui_selected_scene3d = selected_single_scene3d_clip_uuid(&self.session);
@@ -508,6 +503,14 @@ impl eframe::App for ZoidCraftApp {
                 );
             });
 
+        let settings_visible = self.workspace.active_tab == SideTab::Settings
+            && !matches!(
+                self.workspace.maximized_panel,
+                Some(PanelFocus::Viewport | PanelFocus::Timeline)
+            );
+        self.workspace
+            .panels
+            .commit_default_fps_on_blur(&ctx, &mut self.session, settings_visible);
         if viewport_force_refresh {
             self.force_single_render = true;
         }
@@ -675,7 +678,6 @@ impl eframe::App for ZoidCraftApp {
             && self.session.playback.is_playing() == pre_ui_is_playing
             && (!pre_ui_editing_camera
                 || pack_camera_bits(&self.viewport.camera) == pre_ui_camera_bits)
-            && self.last_canvas_rect == pre_ui_canvas_rect
             && self.workspace.player_plus.preview_quality == pre_ui_preview_quality
             && compute_editing_selection_hash(&self.session) == pre_ui_selection_hash
             && selected_single_scene3d_clip_uuid(&self.session) == pre_ui_selected_scene3d;
@@ -701,6 +703,7 @@ impl eframe::App for ZoidCraftApp {
         self.show_unsaved_changes_modal(&ctx);
         self.show_status_overlays(&ctx);
         self.update_window_title(&ctx);
+        self.save_user_preferences(false);
 
         // Mirror `Cmd+C`/`Cmd+X` from any focused `TextEdit` widget (Expression Editor,
         // Shader Editor, 2D Text, etc.) to the native OS clipboard.
@@ -791,14 +794,28 @@ impl ZoidCraftApp {
             o.zoom_with_keyboard = false;
         });
         install_cm3_fonts(&cc.egui_ctx);
-        let theme = Cm3Theme::default();
-        apply_cm3_style(&cc.egui_ctx, &theme);
 
+        let preferences_path = default_preferences_path();
         let mut session = Session::new();
+        let mut workspace = Cm3Workspace::new();
+        let theme = if let Some(preferences) = UserPreferences::load(&preferences_path) {
+            preferences.restore_plugins(&mut session.plugins);
+            workspace.panels.app_settings = preferences.app_settings;
+            workspace.player_plus.preview_quality = preferences.preview_quality;
+            preferences.theme
+        } else {
+            Cm3Theme::default()
+        };
+        let (undo_entries, undo_bytes) = workspace.panels.app_settings.undo_limits();
+        session.history.set_limits(undo_entries, undo_bytes);
+        apply_default_project_fps(&mut session, workspace.panels.app_settings.default_fps);
         auto_select_default_scene_clip(&mut session);
         session.playback.editing_camera = false;
-
-        let mut workspace = Cm3Workspace::new();
+        apply_cm3_style(&cc.egui_ctx, &theme);
+        let last_preferences_write = Some((
+            preferences_fingerprint(&workspace, &session.plugins, &theme),
+            true,
+        ));
         sync_export_settings_from_session(&session, &mut workspace.panels.export_settings);
 
         // Probe FFmpeg asynchronously off the UI thread so startup can never hang if `ffmpeg` stalls.
@@ -847,6 +864,8 @@ impl ZoidCraftApp {
             viewport: ViewportState::new(),
             renderer,
             current_file: None,
+            preferences_path: Some(preferences_path),
+            last_preferences_write,
             decoded_audio: HashMap::new(),
             asset_waveform_peaks: HashMap::new(),
             audio_clock,

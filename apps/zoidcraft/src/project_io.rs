@@ -623,10 +623,13 @@ impl ZoidCraftApp {
             let _ = self.session.cancel_transaction();
         }
         let _ = self.session.execute(Command::NewProject);
+        apply_default_project_fps(
+            &mut self.session,
+            self.workspace.panels.app_settings.default_fps,
+        );
         self.session.selection.clear_all();
         auto_select_default_scene_clip(&mut self.session);
         self.session.playback.editing_camera = false;
-        self.session.mark_saved();
         self.current_file = None;
         self.pending_unsaved_dialog = None;
         self.invalidate_project_hash_caches();
@@ -756,6 +759,8 @@ impl ZoidCraftApp {
             let _ = plugins.enable(&plugin_id);
         }
         self.session = Session::from_project(project, plugins);
+        let (undo_entries, undo_bytes) = self.workspace.panels.app_settings.undo_limits();
+        self.session.history.set_limits(undo_entries, undo_bytes);
         self.session.selection.clear_all();
         self.session.mark_saved();
         self.current_file = path;

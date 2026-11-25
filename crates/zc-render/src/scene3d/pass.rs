@@ -2,6 +2,14 @@
 
 use super::*;
 
+const SCENE_MSAA_SAMPLE_COUNT: u32 = 4;
+
+struct SceneMsaaAttachments {
+    size: wgpu::Extent3d,
+    color: wgpu::TextureView,
+    depth: wgpu::TextureView,
+}
+
 /// Forward 3D `wgpu` renderer with multi-light + omni point PCF shadows,
 /// dynamic shadow map sizing, Material+ surface shading (AO, Cel, Fresnel, Color Ramp,
 /// Procedural Bump Noise, UV Projections, Environment Reflection), per-vertex colors,
@@ -22,7 +30,7 @@ pub struct Scene3DRenderer {
     pub(crate) mesh_obj_bgl: wgpu::BindGroupLayout,
     pub(crate) mesh_pipeline_layout: wgpu::PipelineLayout,
     pub(crate) mesh_pipelines: HashMap<MeshPipelineKey, wgpu::RenderPipeline>,
-    pub(crate) lines_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    pub(crate) lines_pipelines: HashMap<(wgpu::TextureFormat, u32), wgpu::RenderPipeline>,
     pub(crate) particle_pipelines: HashMap<ParticlePipelineKey, wgpu::RenderPipeline>,
     pub(crate) dof_tile_bgl: wgpu::BindGroupLayout,
     pub(crate) dof_composite_bgl: wgpu::BindGroupLayout,
@@ -57,6 +65,7 @@ pub struct Scene3DRenderer {
     pub(crate) dof_color_target: Option<RenderTarget>,
     pub(crate) dof_tile_target: Option<RenderTarget>,
     pub(crate) dof_dilate_target: Option<RenderTarget>,
+    msaa_attachments: Option<SceneMsaaAttachments>,
     pub(crate) grid_vertex_buffer: wgpu::Buffer,
     pub(crate) grid_vertex_count: u32,
 }
@@ -384,6 +393,7 @@ impl Scene3DRenderer {
             dof_color_target: None,
             dof_tile_target: None,
             dof_dilate_target: None,
+            msaa_attachments: None,
             grid_vertex_buffer,
             grid_vertex_count: grid_verts.len() as u32,
         })
@@ -495,6 +505,19 @@ impl Scene3DRenderer {
         input: &Scene3DPassInput<'_>,
         ext: &Scene3DExtendedOptions<'_>,
     ) -> Result<(), RenderError> {
+        // Public callers can use the supplied depth texture in a later pass.
+        self.render_scene(ctx, color_target, depth_target, input, ext, true)
+    }
+
+    pub(crate) fn render_scene(
+        &mut self,
+        ctx: &GpuContext,
+        color_target: &RenderTarget,
+        depth_target: &RenderTarget,
+        input: &Scene3DPassInput<'_>,
+        ext: &Scene3DExtendedOptions<'_>,
+        preserve_depth: bool,
+    ) -> Result<(), RenderError> {
         let options = &ext.base;
         if depth_target.format != wgpu::TextureFormat::Depth32Float {
             return Err(RenderError::UnsupportedFormat(depth_target.format));
@@ -526,11 +549,24 @@ impl Scene3DRenderer {
             self.ensure_optical_flare_pipeline(ctx, color_target.format);
         }
 
+        // WebGPU guarantees 4× sampling for Rgba8Unorm and Depth32Float, with
+        // color resolve only. Keep single-sample depth when a later pass needs it.
+        let use_msaa = !preserve_depth
+            && dof_active.is_none()
+            && ext.optical_flares.is_empty()
+            && color_target.format == wgpu::TextureFormat::Rgba8Unorm;
+        let sample_count = if use_msaa { SCENE_MSAA_SAMPLE_COUNT } else { 1 };
+        if use_msaa {
+            self.ensure_msaa_attachments(ctx, color_target.width, color_target.height);
+        }
+        let lines_pipeline_key = (color_target.format, sample_count);
+
         // Pre-warm all needed pipelines before encoding commands.
         for draw in input.meshes {
             let neg_scale = mat4_upper3x3_det(draw.model) < 0.0;
             let key = MeshPipelineKey {
                 format: color_target.format,
+                sample_count,
                 side: effective_cull_side(draw.material.side, neg_scale),
                 blend: draw.material.blend,
                 polygon_offset_cap: draw.material.polygon_offset_cap,
@@ -538,11 +574,12 @@ impl Scene3DRenderer {
             self.ensure_mesh_pipeline(ctx, key);
         }
         if input.editing_camera {
-            self.ensure_lines_pipeline(ctx, color_target.format);
+            self.ensure_lines_pipeline(ctx, lines_pipeline_key);
         }
         for pdraw in input.particles {
             let key = ParticlePipelineKey {
                 format: color_target.format,
+                sample_count,
                 blend: pdraw.blend,
             };
             self.ensure_particle_pipeline(ctx, key);
@@ -720,6 +757,7 @@ impl Scene3DRenderer {
             let neg_scale = mat4_upper3x3_det(draw.model) < 0.0;
             let key = MeshPipelineKey {
                 format: color_target.format,
+                sample_count,
                 side: effective_cull_side(draw.material.side, neg_scale),
                 blend: draw.material.blend,
                 polygon_offset_cap: draw.material.polygon_offset_cap,
@@ -836,7 +874,7 @@ impl Scene3DRenderer {
 
         // Prepare editing-camera overlay resources (only when editing_camera == true).
         let editor_lines_res = if input.editing_camera {
-            let lines_pipeline = &self.lines_pipelines[&color_target.format];
+            let lines_pipeline = &self.lines_pipelines[&lines_pipeline_key];
             let lines_bgl = lines_pipeline.get_bind_group_layout(0);
             let lu = LinesUniforms {
                 view_proj: input.camera.view_proj,
@@ -918,6 +956,7 @@ impl Scene3DRenderer {
                 }
                 let key = ParticlePipelineKey {
                     format: color_target.format,
+                    sample_count,
                     blend: pdraw.blend,
                 };
                 let pipeline = &self.particle_pipelines[&key];
@@ -1024,14 +1063,25 @@ impl Scene3DRenderer {
         }
 
         // 2. Main 3D color + depth pass (renders to offscreen color target when DOF is active).
-        let main_color_view = if dof_active.is_some() {
-            &self
-                .dof_color_target
-                .as_ref()
-                .expect("dof_color_target ensured above")
-                .view
+        let (main_color_view, main_depth_view, resolve_target, store) = if use_msaa {
+            let attachments = self.msaa_attachments.as_ref().expect("MSAA attachments");
+            (
+                &attachments.color,
+                &attachments.depth,
+                Some(&color_target.view),
+                wgpu::StoreOp::Discard,
+            )
         } else {
-            &color_target.view
+            let color_view = if dof_active.is_some() {
+                &self
+                    .dof_color_target
+                    .as_ref()
+                    .expect("dof_color_target ensured above")
+                    .view
+            } else {
+                &color_target.view
+            };
+            (color_view, &depth_target.view, None, wgpu::StoreOp::Store)
         };
 
         {
@@ -1040,17 +1090,17 @@ impl Scene3DRenderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: main_color_view,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
+                        store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_target.view,
+                    view: main_depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+                        store,
                     }),
                     stencil_ops: None,
                 }),
@@ -1091,7 +1141,7 @@ impl Scene3DRenderer {
 
             // Draw editing-camera gizmos (strictly gated on editing_camera == true).
             if let Some((_, ref lines_bg, ref aabb_buf, ref extra_buf)) = editor_lines_res {
-                let lines_pipeline = &self.lines_pipelines[&color_target.format];
+                let lines_pipeline = &self.lines_pipelines[&lines_pipeline_key];
                 rpass.set_pipeline(lines_pipeline);
                 rpass.set_bind_group(0, lines_bg, &[]);
                 rpass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
@@ -1164,6 +1214,52 @@ impl Scene3DRenderer {
         );
         ctx.queue.submit(std::iter::once(encoder.finish()));
         Ok(())
+    }
+
+    pub(crate) fn clear_msaa_attachments(&mut self) {
+        self.msaa_attachments = None;
+    }
+
+    fn ensure_msaa_attachments(&mut self, ctx: &GpuContext, width: u32, height: u32) {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        if self
+            .msaa_attachments
+            .as_ref()
+            .is_some_and(|a| a.size == size)
+        {
+            return;
+        }
+
+        let create_view = |label, format| {
+            ctx.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: SCENE_MSAA_SAMPLE_COUNT,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TRANSIENT_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        self.msaa_attachments = Some(SceneMsaaAttachments {
+            size,
+            color: create_view(
+                "zc-render scene3d MSAA color",
+                wgpu::TextureFormat::Rgba8Unorm,
+            ),
+            depth: create_view(
+                "zc-render scene3d MSAA depth",
+                wgpu::TextureFormat::Depth32Float,
+            ),
+        });
     }
 
     /// Renders additive HDR screen-space optical lens flares over `color_target` with
@@ -1978,7 +2074,10 @@ impl Scene3DRenderer {
                     stencil: wgpu::StencilState::default(),
                     bias: depth_bias,
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                    count: key.sample_count,
+                    ..Default::default()
+                },
                 fragment: Some(wgpu::FragmentState {
                     module: &self.mesh_shader,
                     entry_point: Some("fs_main"),
@@ -1996,10 +2095,15 @@ impl Scene3DRenderer {
         self.mesh_pipelines.insert(key, pipeline);
     }
 
-    pub(crate) fn ensure_lines_pipeline(&mut self, ctx: &GpuContext, format: wgpu::TextureFormat) {
-        if self.lines_pipelines.contains_key(&format) {
+    pub(crate) fn ensure_lines_pipeline(
+        &mut self,
+        ctx: &GpuContext,
+        key: (wgpu::TextureFormat, u32),
+    ) {
+        if self.lines_pipelines.contains_key(&key) {
             return;
         }
+        let (format, sample_count) = key;
         let pipeline = ctx
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2022,7 +2126,10 @@ impl Scene3DRenderer {
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
                 fragment: Some(wgpu::FragmentState {
                     module: &self.lines_shader,
                     entry_point: Some("fs_main"),
@@ -2036,7 +2143,7 @@ impl Scene3DRenderer {
                 multiview_mask: None,
                 cache: None,
             });
-        self.lines_pipelines.insert(format, pipeline);
+        self.lines_pipelines.insert(key, pipeline);
     }
 
     pub(crate) fn ensure_particle_pipeline(&mut self, ctx: &GpuContext, key: ParticlePipelineKey) {
@@ -2082,7 +2189,10 @@ impl Scene3DRenderer {
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                    count: key.sample_count,
+                    ..Default::default()
+                },
                 fragment: Some(wgpu::FragmentState {
                     module: &self.particle_shader,
                     entry_point: Some("fs_main"),

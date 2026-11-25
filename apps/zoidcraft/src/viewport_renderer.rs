@@ -254,36 +254,20 @@ pub(crate) fn pack_camera_bits(cam: &EditorCameraState) -> [u32; 9] {
     ]
 }
 
-/// Computes the interactive preview render resolution matching the viewport canvas's
-/// logical/CSS dimensions (scaled by `player-plus` quality divisor and clamped to
-/// `[64, seq_res]`), falling back to half sequence resolution before frame 0 layout.
+/// Computes preview texture dimensions in sequence pixels, independent of the viewport layout.
 pub(crate) fn compute_preview_render_resolution(
     seq_resolution: [u32; 2],
-    canvas_rect: Option<Rect>,
     divisor: u32,
+    max_texture_dimension: u32,
 ) -> (u32, u32) {
-    let seq_w = seq_resolution[0].max(1);
-    let seq_h = seq_resolution[1].max(1);
     let div = divisor.max(1);
-    let (base_w, base_h) = match canvas_rect {
-        Some(rect)
-            if rect.width().is_finite()
-                && rect.height().is_finite()
-                && rect.width() >= 1.0
-                && rect.height() >= 1.0 =>
-        {
-            (
-                (rect.width().round() as u32).min(seq_w),
-                (rect.height().round() as u32).min(seq_h),
-            )
-        }
-        _ => ((seq_w / 2).max(1), (seq_h / 2).max(1)),
+    let scale = |dimension: u32| {
+        let dimension = dimension.max(1);
+        (dimension / div)
+            .max(dimension.min(64))
+            .min(max_texture_dimension.max(1))
     };
-    let min_w = 64_u32.min(seq_w);
-    let min_h = 64_u32.min(seq_h);
-    let render_w = ((f64::from(base_w) / f64::from(div)).round() as u32).clamp(min_w, seq_w);
-    let render_h = ((f64::from(base_h) / f64::from(div)).round() as u32).clamp(min_h, seq_h);
-    (render_w, render_h)
+    (scale(seq_resolution[0]), scale(seq_resolution[1]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1525,12 +1509,22 @@ impl ZoidCraftApp {
         let player_plus_enabled = self.session.plugins.is_enabled("player-plus");
         let seq_res = self.session.document().resolution;
         let divisor = if player_plus_enabled {
-            self.workspace.player_plus.preview_quality.divisor().max(1)
+            self.workspace.player_plus.preview_quality.divisor()
         } else {
             1
         };
+        let max_texture_dimension = self.renderer.as_ref().map_or_else(
+            || wgpu::Limits::default().max_texture_dimension_2d,
+            |renderer| {
+                renderer
+                    .render_state
+                    .device
+                    .limits()
+                    .max_texture_dimension_2d
+            },
+        );
         let (render_w, render_h) =
-            compute_preview_render_resolution(seq_res, self.last_canvas_rect, divisor);
+            compute_preview_render_resolution(seq_res, divisor, max_texture_dimension);
 
         let frame = self.session.playback.current_frame;
         let frame_index = (frame * 1000.0).round() as i64;

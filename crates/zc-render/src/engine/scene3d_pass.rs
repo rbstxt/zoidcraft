@@ -175,43 +175,6 @@ impl ProjectRenderEngine {
             },
         };
 
-        // Zero-light 3D PBR studio fallback: when no explicit lights exist in the scene, provide
-        // a gentle camera-relative studio headlight + soft hemisphere fill (shadowless) so newly
-        // added 3D PBR primitives are never pitch-black invisible. Adding any explicit light object
-        // disables this fallback automatically.
-        if collected.lights.is_empty() {
-            let eye = Vec3::from_array(camera.eye_position);
-            let key_pos = eye + Vec3::new(12.0, 18.0, 10.0);
-            collected.lights.push(SceneLight {
-                kind: RenderLightKind::Directional,
-                color: [1.0, 0.99, 0.97],
-                ground_color: [0.2, 0.2, 0.25],
-                position: key_pos.to_array(),
-                target: [0.0, 0.0, 0.0],
-                intensity: 0.78,
-                angle_deg: 45.0,
-                distance: 0.0,
-                decay: 1.0,
-                penumbra: 0.5,
-                cast_shadow: false,
-                shadow_bias: 0.0,
-            });
-            collected.lights.push(SceneLight {
-                kind: RenderLightKind::Hemisphere,
-                color: [0.85, 0.9, 1.0],
-                ground_color: [0.24, 0.24, 0.28],
-                position: [0.0, 1.0, 0.0],
-                target: [0.0, 0.0, 0.0],
-                intensity: 0.35,
-                angle_deg: 45.0,
-                distance: 0.0,
-                decay: 1.0,
-                penumbra: 0.5,
-                cast_shadow: false,
-                shadow_bias: 0.0,
-            });
-        }
-
         let mut selection_aabb: Option<([f32; 3], [f32; 3])> = None;
         let mut extra_wireframe_lines: Vec<LineVertex> = Vec::new();
         if let Some(ov) = scene_override
@@ -348,7 +311,9 @@ impl ProjectRenderEngine {
         };
 
         let is_editing_view = scene_override.is_some_and(|ov| ov.show_editor_overlays);
-        let mut render_res = self.scene3d.render_with_extended_options(
+        let preserve_depth =
+            !collected.custom_material_meshes.is_empty() || !optical_flares_draw.is_empty();
+        let mut render_res = self.scene3d.render_scene(
             &self.ctx,
             &color,
             &depth,
@@ -373,6 +338,7 @@ impl ProjectRenderEngine {
                 shadow_map_size: collected.max_shadow_map_size,
                 optical_flares: &[],
             },
+            preserve_depth,
         );
 
         // Render 3D CustomShader material meshes into `(color, depth)` while depth buffer is live.

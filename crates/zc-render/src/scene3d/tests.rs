@@ -291,6 +291,7 @@ fn all_wgsl_shaders_validate_and_compile_cleanly() {
                     &ctx,
                     MeshPipelineKey {
                         format: fmt,
+                        sample_count: 1,
                         side,
                         blend,
                         polygon_offset_cap,
@@ -299,9 +300,16 @@ fn all_wgsl_shaders_validate_and_compile_cleanly() {
             }
         }
     }
-    renderer.ensure_lines_pipeline(&ctx, fmt);
+    renderer.ensure_lines_pipeline(&ctx, (fmt, 1));
     for blend in [ParticleBlend::Normal, ParticleBlend::Additive] {
-        renderer.ensure_particle_pipeline(&ctx, ParticlePipelineKey { format: fmt, blend });
+        renderer.ensure_particle_pipeline(
+            &ctx,
+            ParticlePipelineKey {
+                format: fmt,
+                sample_count: 1,
+                blend,
+            },
+        );
     }
     renderer.ensure_dof_composite_pipeline(&ctx, fmt);
     renderer.ensure_optical_flare_pipeline(&ctx, fmt);
@@ -859,6 +867,84 @@ fn ortho_front_camera() -> CameraParams {
 }
 
 #[test]
+fn scene_msaa_resolves_partial_coverage_on_an_angled_mesh_edge() {
+    let Some(ctx) = headless_ctx_or_skip() else {
+        return;
+    };
+    let mut renderer = Scene3DRenderer::new(&ctx).expect("scene3d renderer");
+    let color = RenderTarget::new(&ctx, 32, 32, wgpu::TextureFormat::Rgba8Unorm, Some("color"))
+        .expect("color");
+    let depth = RenderTarget::new(
+        &ctx,
+        32,
+        32,
+        wgpu::TextureFormat::Depth32Float,
+        Some("depth"),
+    )
+    .expect("depth");
+    let vertices =
+        [[-0.75, -0.75, 0.0], [0.75, -0.75, 0.0], [-0.75, 0.65, 0.0]].map(|position| MeshVertex {
+            position,
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+            material_slot: 0,
+        });
+    let triangle = GpuMesh::from_slices(&ctx, &vertices, &[0, 1, 2], Some("triangle"));
+    let draws = [MeshDrawCall {
+        mesh: &triangle,
+        model: mat4_identity(),
+        normal_matrix: mat4_identity(),
+        material: MaterialParams {
+            shading: ShadingModel::Basic,
+            base_color: [1.0, 0.0, 0.0],
+            ..Default::default()
+        },
+        albedo_view: None,
+        normal_view: None,
+        matcap_view: None,
+        cast_shadow: false,
+        receive_shadow: false,
+    }];
+    let input = Scene3DPassInput {
+        camera: ortho_front_camera(),
+        lights: &[],
+        meshes: &draws,
+        particles: &[],
+        compat_mode: CompatMode::Current,
+        editing_camera: false,
+        selection_aabb: None,
+    };
+
+    renderer
+        .render(&ctx, &color, &depth, &input)
+        .expect("render with single-sample depth output");
+    let single_sample = readback_rgba8(&ctx, &color);
+    assert!(
+        single_sample
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p[3] == 0 || p[3] == 255)
+    );
+
+    renderer
+        .render_scene(&ctx, &color, &depth, &input, &Default::default(), false)
+        .expect("render with MSAA");
+    let multisampled = readback_rgba8(&ctx, &color);
+    let (pixels, _) = multisampled.as_chunks::<4>();
+    assert!(pixels.contains(&[255, 0, 0, 255]));
+    assert!(pixels.contains(&[0, 0, 0, 0]));
+    let partial_edges = pixels
+        .iter()
+        .filter(|p| (1..255).contains(&p[3]) && p[0] == p[3] && p[1] == 0 && p[2] == 0)
+        .count();
+    assert!(
+        partial_edges >= 8,
+        "found {partial_edges} antialiased edge pixels"
+    );
+}
+
+#[test]
 fn vertex_colors_render_distinct_red_and_green_halves() {
     let Some(ctx) = headless_ctx_or_skip() else {
         return;
@@ -1273,6 +1359,40 @@ fn material_plus_cel_fresnel_ramp_bump_uv_proj_ao_and_env_reflection() {
         "ramp right should be blue, got {:?}",
         &px_ramp[right_edge..right_edge + 4]
     );
+
+    // A luminance ramp on a lit material cannot supply light to a dark scene.
+    for shading in [
+        ShadingModel::StandardPbr,
+        ShadingModel::BlinnPhong,
+        ShadingModel::Lambert,
+    ] {
+        let dark_ramp = [MeshDrawCall {
+            material: MaterialParams {
+                shading,
+                ramp_source: 0,
+                ..draw_ramp[0].material
+            },
+            ..draw_ramp[0]
+        }];
+        renderer
+            .render(
+                &ctx,
+                &color,
+                &depth,
+                &Scene3DPassInput {
+                    camera: cam,
+                    lights: &[],
+                    meshes: &dark_ramp,
+                    particles: &[],
+                    compat_mode: CompatMode::Current,
+                    editing_camera: false,
+                    selection_aabb: None,
+                },
+            )
+            .expect("render luminance ramp with zero lights");
+        let pixels = readback_rgba8(&ctx, &color);
+        assert_eq!(&pixels[center_px..center_px + 4], &[0, 0, 0, 255]);
+    }
 
     // 4. Procedural 3D bump noise perturbs normals on a flat lit quad, creating luminance variance.
     let angled_light = [SceneLight {

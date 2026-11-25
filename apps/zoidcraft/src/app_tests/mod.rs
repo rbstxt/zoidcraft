@@ -3,6 +3,7 @@
 use super::*;
 
 mod audio;
+mod preferences;
 mod project_export;
 mod viewport_ui;
 
@@ -22,6 +23,8 @@ fn make_headless_app_for_test() -> ZoidCraftApp {
         viewport: ViewportState::new(),
         renderer: None,
         current_file: None,
+        preferences_path: None,
+        last_preferences_write: None,
         decoded_audio: HashMap::new(),
         asset_waveform_peaks: HashMap::new(),
         audio_clock: MasterPlaybackClock::new(fps, seq_len),
