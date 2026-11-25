@@ -17873,9 +17873,17 @@ fn resolve_system_font_by_name(font_key: &str) -> Option<Arc<[u8]>> {
 }
 
 fn font_supports_cjk(bytes: &[u8]) -> bool {
-    !font_has_missing_glyphs(bytes, "あ")
-        || !font_has_missing_glyphs(bytes, "テ")
-        || !font_has_missing_glyphs(bytes, "中")
+    if font_has_missing_glyphs(bytes, "あテ中") {
+        return false;
+    }
+    let params = zc_scene::Text3DParams {
+        text: "テ".to_owned(),
+        height: 16.0,
+        thickness: 1.0,
+        curve_segments: 2,
+        ..Default::default()
+    };
+    zc_scene::build_text3d_mesh(bytes, &params).is_ok_and(|mesh| !mesh.vertices.is_empty())
 }
 
 fn resolve_system_cjk_fallback_font() -> Option<Arc<[u8]>> {

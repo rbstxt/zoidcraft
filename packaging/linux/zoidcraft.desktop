@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ZoidCraft
+Comment=GPU-accelerated 3D/2D motion-graphics editor
+Exec=zoidcraft %F
+Icon=zoidcraft
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;Graphics;3DGraphics;
+MimeType=application/x-zoidcraft-project;
+StartupWMClass=zoidcraft

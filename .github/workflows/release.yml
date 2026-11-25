@@ -44,6 +44,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Determine release version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          else
+            VER="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          fi
+          echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+          echo "Release version: ${VER}"
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: |
@@ -60,32 +71,90 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
         run: cargo build --locked --release --target ${{ matrix.target }} --bin zoidcraft --bin zoidcraft-cli
-      - name: Package tar.gz (Unix)
+
+      - name: Package macOS DMG installer
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          chmod +x packaging/macos/build_dmg.sh
+          mkdir -p dist
+          packaging/macos/build_dmg.sh \
+            "target/${{ matrix.target }}/release/zoidcraft" \
+            "target/${{ matrix.target }}/release/zoidcraft-cli" \
+            "${{ steps.version.outputs.version }}" \
+            "dist/ZoidCraft-${{ matrix.name }}.dmg"
+
+      - name: Package Linux .deb installer
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          chmod +x packaging/linux/build_deb.sh
+          mkdir -p dist
+          packaging/linux/build_deb.sh \
+            "target/${{ matrix.target }}/release/zoidcraft" \
+            "target/${{ matrix.target }}/release/zoidcraft-cli" \
+            "${{ steps.version.outputs.version }}" \
+            "dist/ZoidCraft-${{ matrix.name }}.deb"
+
+      - name: Package Windows Setup.exe installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $defaultPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+            if (Test-Path $defaultPath) {
+              $iscc = $defaultPath
+            } else {
+              choco install innosetup -y --no-progress
+              $iscc = $defaultPath
+            }
+          } else {
+            $iscc = $iscc.Source
+          }
+          $srcDir = (Resolve-Path "target/${{ matrix.target }}/release").Path
+          $outDir = (Resolve-Path "dist").Path
+          & $iscc `
+            "/DAppVersion=${{ steps.version.outputs.version }}" `
+            "/DSourceDir=$srcDir" `
+            "/DOutputDir=$outDir" `
+            "/DOutputBaseName=ZoidCraft-${{ matrix.name }}-Setup" `
+            "packaging/windows/zoidcraft.iss"
+          if (-not (Test-Path "dist/ZoidCraft-${{ matrix.name }}-Setup.exe")) {
+            throw "Expected Windows installer dist/ZoidCraft-${{ matrix.name }}-Setup.exe was not created"
+          }
+
+      - name: Package portable tar.gz (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
+          mkdir -p dist
           STAGE="zoidcraft-${{ matrix.name }}"
           mkdir -p "$STAGE"
           cp "target/${{ matrix.target }}/release/zoidcraft" "$STAGE/"
           cp "target/${{ matrix.target }}/release/zoidcraft-cli" "$STAGE/"
           cp LICENSE README.md THIRD_PARTY_LICENSES.md "$STAGE/"
-          tar -czf "${STAGE}.tar.gz" "$STAGE"
-          ENTRIES="$(tar -tzf "${STAGE}.tar.gz")"
+          tar -czf "dist/${STAGE}.tar.gz" "$STAGE"
+          ENTRIES="$(tar -tzf "dist/${STAGE}.tar.gz")"
           for req in zoidcraft zoidcraft-cli LICENSE README.md THIRD_PARTY_LICENSES.md; do
             printf '%s\n' "$ENTRIES" | grep -qx "${STAGE}/${req}"
           done
-      - name: Package zip (Windows)
+
+      - name: Package portable zip (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $stage = "zoidcraft-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $stage = "ZoidCraft-${{ matrix.name }}-portable"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/zoidcraft.exe" "$stage/"
           Copy-Item "target/${{ matrix.target }}/release/zoidcraft-cli.exe" "$stage/"
+          Copy-Item "packaging/windows/zoidcraft.ico" "$stage/"
           Copy-Item LICENSE, README.md, THIRD_PARTY_LICENSES.md "$stage/"
-          Compress-Archive -Path "$stage/*" -DestinationPath "${stage}.zip" -Force
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/${stage}.zip" -Force
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = [System.IO.Compression.ZipFile]::OpenRead("${stage}.zip")
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("dist/${stage}.zip")
           try {
             $names = $zip.Entries | ForEach-Object { $_.Name }
             foreach ($req in @("zoidcraft.exe", "zoidcraft-cli.exe", "LICENSE", "README.md", "THIRD_PARTY_LICENSES.md")) {
@@ -94,12 +163,16 @@ jobs:
           } finally {
             $zip.Dispose()
           }
+
       - uses: actions/upload-artifact@v4
         with:
-          name: zoidcraft-${{ matrix.name }}
+          name: release-${{ matrix.name }}
           path: |
-            zoidcraft-*.tar.gz
-            zoidcraft-*.zip
+            dist/*.dmg
+            dist/*.exe
+            dist/*.deb
+            dist/*.zip
+            dist/*.tar.gz
 
   publish:
     name: Publish GitHub Release
@@ -114,10 +187,13 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd artifacts
-          sha256sum zoidcraft-* > SHA256SUMS.txt
+          ls -la
+          sha256sum ZoidCraft-* zoidcraft-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
+            artifacts/ZoidCraft-*
             artifacts/zoidcraft-*
             artifacts/SHA256SUMS.txt
