@@ -269,7 +269,7 @@ fn export_m4a_audio_only(
     )?;
 
     let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
-    let mut cmd = Command::new(bin);
+    let mut cmd = Command::new(bin.as_ref());
     cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null());
 
     // Mirror `export_ffmpeg`'s interruptible stderr setup so cancelling an M4A export
@@ -950,7 +950,7 @@ where
     )?;
 
     let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
-    let mut cmd = Command::new(bin);
+    let mut cmd = Command::new(bin.as_ref());
     cmd.args(&args).stdout(Stdio::null());
 
     // On Unix, connect FFmpeg's stdin and stderr via SOCK_STREAM UnixStream pairs with bounded
@@ -1815,7 +1815,7 @@ mod tests {
         assert!(meta.len() > 1_000, "MP4 output should be non-empty");
 
         // Verify stream metadata via ffprobe if available
-        if let Ok(probe_out) = Command::new("ffprobe")
+        if let Ok(probe_out) = Command::new(zc_render::video::resolve_ffprobe_binary_path())
             .args([
                 "-v",
                 "error",
@@ -1879,7 +1879,7 @@ mod tests {
         assert_eq!(report.output_height, 92);
         assert!(fs::metadata(&out_mp4).expect("output exists").len() > 256);
 
-        if let Ok(probe_out) = Command::new("ffprobe")
+        if let Ok(probe_out) = Command::new(zc_render::video::resolve_ffprobe_binary_path())
             .args([
                 "-v",
                 "error",
@@ -2108,7 +2108,7 @@ mod tests {
         })
         .expect("BT.709 NTSC MP4 export succeeds");
 
-        if let Ok(probe_out) = Command::new("ffprobe")
+        if let Ok(probe_out) = Command::new(zc_render::video::resolve_ffprobe_binary_path())
             .args([
                 "-v",
                 "error",
@@ -2136,7 +2136,7 @@ mod tests {
 
         // Decode frame 0 back to raw YUV420p and verify exact BT.709 limited-range luma for pure red
         // (BT.709 red Y = 63, whereas buggy BT.601 conversion yields Y = 81).
-        if let Ok(dec) = Command::new("ffmpeg")
+        if let Ok(dec) = Command::new(zc_render::video::resolve_ffmpeg_binary_path())
             .args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(&out_mp4)
             .args([
@@ -2224,7 +2224,7 @@ mod tests {
         })
         .expect("VP9 transparent alpha export succeeds");
 
-        if let Ok(dec) = Command::new("ffmpeg")
+        if let Ok(dec) = Command::new(zc_render::video::resolve_ffmpeg_binary_path())
             .args([
                 "-hide_banner",
                 "-loglevel",

@@ -17883,7 +17883,8 @@ fn font_supports_cjk(bytes: &[u8]) -> bool {
         curve_segments: 2,
         ..Default::default()
     };
-    zc_scene::build_text3d_mesh(bytes, &params).is_ok_and(|mesh| !mesh.vertices.is_empty())
+    zc_scene::build_text3d_mesh(bytes, &params)
+        .is_ok_and(|mesh| !mesh.vertices.is_empty() && !mesh.indices.is_empty())
 }
 
 fn resolve_system_cjk_fallback_font() -> Option<Arc<[u8]>> {
@@ -23509,12 +23510,12 @@ DOMAIN_MAX 0.9 0.8 0.7
         // 5. Automatic OS CJK fallback font renders real Japanese glyphs (`テスト`) distinct from `???`!
         if resolve_system_cjk_fallback_font().is_some() {
             let mut tcam = Object3D::new_perspective_camera();
-            tcam.position = PropertyTrack::vec3([0.0, 0.0, 80.0]);
+            tcam.position = PropertyTrack::vec3([0.0, 0.0, 65.0]);
             let make_t3d = |txt: &str| {
                 let mut t = Object3D::new_text_3d(txt);
                 if let Object3DKind::Text3D(ref mut d) = t.kind {
                     d.font = Some("Geist-Regular.ttf".to_owned());
-                    d.size = [20.0, 2.0];
+                    d.size = [24.0, 2.0];
                 }
                 t.material = Some(MaterialSpec::SingleColor {
                     color: PropertyTrack::color([1.0, 1.0, 1.0]),
@@ -23523,23 +23524,25 @@ DOMAIN_MAX 0.9 0.8 0.7
                 t
             };
             let proj_jp =
-                make_test_scene_project(vec![tcam.clone(), make_t3d("テスト")], [128, 64]);
-            let proj_q = make_test_scene_project(vec![tcam, make_t3d("???")], [128, 64]);
+                make_test_scene_project(vec![tcam.clone(), make_t3d("テスト")], [256, 128]);
+            let proj_q = make_test_scene_project(vec![tcam, make_t3d("???")], [256, 128]);
             engine.invalidate_caches();
             let px_jp = engine
-                .render_frame_rgba8(&proj_jp, &plugins, 0.0, 128, 64)
+                .render_frame_rgba8(&proj_jp, &plugins, 0.0, 256, 128)
                 .expect("render jp");
             engine.invalidate_caches();
             let px_q = engine
-                .render_frame_rgba8(&proj_q, &plugins, 0.0, 128, 64)
+                .render_frame_rgba8(&proj_q, &plugins, 0.0, 256, 128)
                 .expect("render ???");
+            let lit_jp = count_non_black_rgb_pixels(&px_jp);
+            let diff_jp_q = diff_count(&px_jp, &px_q);
             assert!(
-                count_non_black_rgb_pixels(&px_jp) > 80,
-                "CJK text must render visible glyphs"
+                lit_jp > 80,
+                "CJK text must render visible glyphs (lit_jp={lit_jp})"
             );
             assert!(
-                diff_count(&px_jp, &px_q) > 80,
-                "CJK Japanese text (`テスト`) must use OS CJK fallback glyphs rather than rendering `???`"
+                diff_jp_q > 80,
+                "CJK Japanese text (`テスト`) must use OS CJK fallback glyphs rather than rendering `???` (diff={diff_jp_q}, lit_jp={lit_jp})"
             );
         }
     }

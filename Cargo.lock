@@ -3993,11 +3993,8 @@ dependencies = [
  "tar",
  "thiserror 2.0.21",
  "uuid",
- "zc-anim",
  "zc-color",
- "zc-expr",
  "zc-geom",
- "zc-plugin",
  "zc-time",
 ]
 

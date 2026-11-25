@@ -951,95 +951,17 @@ struct ProbedVideoInfo {
     has_audio: bool,
 }
 
-fn parse_ffprobe_rate(raw: &str) -> Option<f64> {
-    let trimmed = raw.trim();
-    if let Some((num_s, den_s)) = trimmed.split_once('/') {
-        let num: f64 = num_s.trim().parse().ok()?;
-        let den: f64 = den_s.trim().parse().ok()?;
-        if num.is_finite() && den.is_finite() && num > 0.0 && den > 0.0 {
-            let rate = num / den;
-            return (rate.is_finite() && rate > 0.0).then_some(rate);
-        }
-        None
-    } else {
-        let rate: f64 = trimmed.parse().ok()?;
-        (rate.is_finite() && rate > 0.0).then_some(rate)
-    }
-}
-
-fn parse_ffprobe_duration(val: &Value) -> Option<f64> {
-    let secs = match val {
-        Value::Number(n) => n.as_f64()?,
-        Value::String(s) => s.trim().parse::<f64>().ok()?,
-        _ => return None,
-    };
-    (secs.is_finite() && secs > 0.0).then_some(secs)
-}
-
 fn probe_video_with_ffprobe(path: &Path) -> ProbedVideoInfo {
-    let Ok(output) = ProcessCommand::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=codec_type,width,height,r_frame_rate,avg_frame_rate,duration",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-        ])
-        .arg(path)
-        .output()
-    else {
-        return ProbedVideoInfo::default();
-    };
-    if !output.status.success() {
-        return ProbedVideoInfo::default();
+    if let Some(meta) = zc_render::video::probe_video_metadata(path) {
+        return ProbedVideoInfo {
+            width: Some(meta.width),
+            height: Some(meta.height),
+            fps: Some(meta.fps),
+            duration_secs: (meta.duration_secs > 0.0).then_some(meta.duration_secs),
+            has_audio: meta.has_audio,
+        };
     }
-    let Ok(parsed) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return ProbedVideoInfo::default();
-    };
-    let mut info = ProbedVideoInfo::default();
-    let mut video_stream_duration = None;
-    if let Some(streams) = parsed.get("streams").and_then(Value::as_array) {
-        for stream in streams {
-            let codec_type = stream
-                .get("codec_type")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if codec_type == "audio" {
-                info.has_audio = true;
-            } else if codec_type == "video" && info.width.is_none() {
-                info.width = stream
-                    .get("width")
-                    .and_then(Value::as_u64)
-                    .and_then(|v| u32::try_from(v).ok())
-                    .filter(|&v| v > 0);
-                info.height = stream
-                    .get("height")
-                    .and_then(Value::as_u64)
-                    .and_then(|v| u32::try_from(v).ok())
-                    .filter(|&v| v > 0);
-                info.fps = stream
-                    .get("avg_frame_rate")
-                    .and_then(Value::as_str)
-                    .and_then(parse_ffprobe_rate)
-                    .or_else(|| {
-                        stream
-                            .get("r_frame_rate")
-                            .and_then(Value::as_str)
-                            .and_then(parse_ffprobe_rate)
-                    });
-                video_stream_duration = stream.get("duration").and_then(parse_ffprobe_duration);
-            }
-        }
-    }
-    let format_duration = parsed
-        .get("format")
-        .and_then(|f| f.get("duration"))
-        .and_then(parse_ffprobe_duration);
-    info.duration_secs = format_duration.or(video_stream_duration);
-    info
+    ProbedVideoInfo::default()
 }
 
 fn extract_video_audio_off_thread(
@@ -1051,7 +973,7 @@ fn extract_video_audio_off_thread(
         .and_then(|bytes| decode_audio_bytes(bytes, Some(ext)).ok())
         .or_else(|| {
             use std::io::Read;
-            let mut child = ProcessCommand::new("ffmpeg")
+            let mut child = ProcessCommand::new(zc_render::video::resolve_ffmpeg_binary_path())
                 .args(["-v", "error", "-nostdin", "-i"])
                 .arg(path)
                 .args(["-vn", "-ac", "2", "-ar", "48000", "-f", "wav", "pipe:1"])
@@ -3052,6 +2974,12 @@ impl ZoidCraftApp {
 
         if let Some(warn) = placement_warning {
             return Ok(warn);
+        }
+        if payload.probed.width.is_none() && !zc_render::video::ffprobe_binary_available() {
+            return Ok(format!(
+                "Imported {} (FFmpeg/ffprobe not found — install FFmpeg to preview videos)",
+                payload.filename
+            ));
         }
         let mut details = Vec::new();
         if let (Some(w), Some(h)) = (payload.probed.width, payload.probed.height) {
@@ -5265,7 +5193,10 @@ impl eframe::App for ZoidCraftApp {
             self.tick_playback_and_meter(&ctx);
             ctx.request_repaint();
         }
-        if self.active_export.is_some() || !self.retired_exports.is_empty() {
+        if self.active_export.is_some()
+            || !self.retired_exports.is_empty()
+            || !self.pending_media_imports.is_empty()
+        {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
         let last_rendered_key = self.renderer.as_ref().and_then(|r| r.last_render_key);
@@ -10099,6 +10030,104 @@ mod tests {
     }
 
     #[test]
+    fn video_import_renders_visible_animated_frames_on_gpu() {
+        let ffmpeg_bin = zc_render::video::resolve_ffmpeg_binary_path();
+        if !ProcessCommand::new(&ffmpeg_bin)
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return;
+        }
+        let require_gpu = std::env::var("ZOIDCRAFT_REQUIRE_GPU").as_deref() == Ok("1");
+        let mut engine = match ProjectRenderEngine::new_headless() {
+            Ok(e) => e,
+            Err(RenderError::NoAdapter(_)) if !require_gpu => return,
+            Err(err) => panic!("failed to init headless engine: {err}"),
+        };
+
+        // Generate a 1.5s MP4 that transitions from bright red (t=0) to bright green (t=0.8s).
+        let tmp_mp4 = std::env::temp_dir().join(format!(
+            "zoidcraft_e2e_video_render_{}.mp4",
+            std::process::id()
+        ));
+        let mut encoded = false;
+        for codec in ["libx264", "mpeg4"] {
+            let mut cmd = ProcessCommand::new(&ffmpeg_bin);
+            cmd.args([
+                "-y",
+                "-v",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=320x180:r=30:d=0.6",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=lime:s=320x180:r=30:d=0.9",
+                "-filter_complex",
+                "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+                "-map",
+                "[v]",
+                "-c:v",
+                codec,
+                "-pix_fmt",
+                "yuv420p",
+            ]);
+            if codec == "libx264" {
+                cmd.args(["-preset", "ultrafast"]);
+            }
+            cmd.arg(&tmp_mp4)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if cmd.status().is_ok_and(|s| s.success()) && tmp_mp4.is_file() {
+                encoded = true;
+                break;
+            }
+        }
+        if !encoded {
+            let _ = fs::remove_file(&tmp_mp4);
+            return;
+        }
+
+        let mut app = make_headless_app_for_test();
+        app.session.playback.current_frame = 0.0;
+        let msg = app
+            .import_media_from_path(&tmp_mp4)
+            .expect("import mp4 video");
+        assert!(
+            msg.contains("320x180"),
+            "expected probed dims in toast: {msg}"
+        );
+        assert_eq!(app.session.project.sequence.video_tracks.len(), 2);
+
+        let f0 = engine
+            .render_frame_rgba8(&app.session.project, &app.session.plugins, 0.0, 160, 90)
+            .expect("render imported video frame 0");
+        let f30 = engine
+            .render_frame_rgba8(&app.session.project, &app.session.plugins, 30.0, 160, 90)
+            .expect("render imported video frame 30");
+        let _ = fs::remove_file(&tmp_mp4);
+
+        let center_idx = ((45 * 160) + 80) * 4;
+        assert!(
+            f0[center_idx] > 180 && f0[center_idx + 1] < 80 && f0[center_idx + 3] > 240,
+            "frame 0 must render bright red video pixels over V1 scene, got RGBA={:?}",
+            &f0[center_idx..center_idx + 4]
+        );
+        assert!(
+            f30[center_idx + 1] > 180 && f30[center_idx] < 80 && f30[center_idx + 3] > 240,
+            "frame 30 must advance to bright green video pixels, got RGBA={:?}",
+            &f30[center_idx..center_idx + 4]
+        );
+    }
+
+    #[test]
     fn app_cmd_v_paste_event_attaches_shader_effect_and_consumes_clipboard_events() {
         ui::shortcuts::clear_test_clipboard();
         let mut app = make_headless_app_for_test();
@@ -10651,13 +10680,6 @@ mod tests {
                 "expected '{non_video}' not to be treated as video"
             );
         }
-        assert_eq!(
-            parse_ffprobe_rate("30000/1001").map(|v| (v * 100.0).round()),
-            Some(2997.0)
-        );
-        assert_eq!(parse_ffprobe_rate("60/1"), Some(60.0));
-        assert_eq!(parse_ffprobe_rate("0/0"), None);
-
         let id1 = compute_external_asset_id("/tmp/clip.mov", 1_000_000_000, 42, b"header-a");
         let id2 = compute_external_asset_id("/tmp/clip.mov", 1_000_000_000, 42, b"header-a");
         let id3 = compute_external_asset_id("/tmp/clip.mov", 1_000_000_000, 43, b"header-a");

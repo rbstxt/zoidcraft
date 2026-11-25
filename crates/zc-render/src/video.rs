@@ -9,11 +9,244 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tracing::debug;
+
+/// Candidate executable filename for `tool_name` (`ffmpeg` on Unix, `ffmpeg.exe` on Windows).
+fn executable_file_name(tool_name: &str) -> String {
+    #[cfg(windows)]
+    {
+        if tool_name.to_ascii_lowercase().ends_with(".exe") {
+            tool_name.to_owned()
+        } else {
+            format!("{tool_name}.exe")
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        tool_name.to_owned()
+    }
+}
+
+fn is_usable_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Resolves an external media CLI tool (`ffmpeg` or `ffprobe`) across GUI bundles whose `PATH`
+/// excludes package-manager directories (notably macOS `.app` bundles launched from Finder/DMG,
+/// which omit `/opt/homebrew/bin` and `/usr/local/bin`).
+///
+/// Search order:
+/// 1. Explicit environment override (`env_var`, e.g. `ZOIDCRAFT_FFMPEG` / `ZOIDCRAFT_FFPROBE`)
+/// 2. Bundled sibling binary next to `current_exe()` (or `../Resources/` inside a macOS `.app`)
+/// 3. Entries in `path_env` (`PATH`)
+/// 4. Standard OS install locations (Homebrew, MacPorts, Nix, WinGet, Chocolatey, Program Files)
+/// 5. Bare `tool_name` fallback
+fn resolve_media_tool_with_path(
+    env_var: Option<&str>,
+    tool_name: &str,
+    path_env: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(var) = env_var
+        && let Some(explicit) = std::env::var_os(var)
+        && !explicit.is_empty()
+    {
+        let p = PathBuf::from(explicit);
+        if is_usable_executable(&p) {
+            return p;
+        }
+    }
+
+    let exe_name = executable_file_name(tool_name);
+
+    // Check bundled sibling locations relative to the running executable.
+    if let Ok(cur_exe) = std::env::current_exe()
+        && let Some(exe_dir) = cur_exe.parent()
+    {
+        let sibling = exe_dir.join(&exe_name);
+        if is_usable_executable(&sibling) {
+            return sibling;
+        }
+        if let Some(contents_dir) = exe_dir.parent() {
+            let res_candidate = contents_dir.join("Resources").join(&exe_name);
+            if is_usable_executable(&res_candidate) {
+                return res_candidate;
+            }
+        }
+    }
+
+    // Check explicit/inherited PATH entries.
+    if let Some(paths) = path_env {
+        for dir in std::env::split_paths(paths) {
+            let candidate = dir.join(&exe_name);
+            if is_usable_executable(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    // Check well-known OS package-manager directories (essential for macOS .app / Windows GUI).
+    let mut fallback_dirs: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        fallback_dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        fallback_dirs.push(PathBuf::from("/usr/local/bin"));
+        fallback_dirs.push(PathBuf::from("/opt/local/bin"));
+        fallback_dirs.push(PathBuf::from("/usr/bin"));
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            fallback_dirs.push(home.join(".nix-profile/bin"));
+            fallback_dirs.push(home.join(".local/bin"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        fallback_dirs.push(PathBuf::from("/usr/bin"));
+        fallback_dirs.push(PathBuf::from("/usr/local/bin"));
+        fallback_dirs.push(PathBuf::from("/snap/bin"));
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            fallback_dirs.push(home.join(".nix-profile/bin"));
+            fallback_dirs.push(home.join(".local/bin"));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            fallback_dirs.push(PathBuf::from(local_app_data).join("Microsoft\\WinGet\\Links"));
+        }
+        if let Some(pf) = std::env::var_os("ProgramFiles") {
+            fallback_dirs.push(PathBuf::from(pf).join("ffmpeg\\bin"));
+        }
+        fallback_dirs.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin"));
+        fallback_dirs.push(PathBuf::from(r"C:\ffmpeg\bin"));
+    }
+
+    for dir in fallback_dirs {
+        let candidate = dir.join(&exe_name);
+        if is_usable_executable(&candidate) {
+            return candidate;
+        }
+    }
+
+    PathBuf::from(tool_name)
+}
+
+/// Resolves the `ffmpeg` executable path, searching `ZOIDCRAFT_FFMPEG`, bundled app directories,
+/// `PATH`, and standard OS install locations (including `/opt/homebrew/bin` for macOS `.app`).
+#[must_use]
+pub fn resolve_ffmpeg_binary_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("ZOIDCRAFT_FFMPEG")
+        && !explicit.is_empty()
+    {
+        return PathBuf::from(explicit);
+    }
+    static CACHED_FFMPEG: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(p) = CACHED_FFMPEG.get() {
+        return p.clone();
+    }
+    let path_env = std::env::var_os("PATH");
+    let resolved = resolve_media_tool_with_path(None, "ffmpeg", path_env.as_deref());
+    if is_usable_executable(&resolved) {
+        let _ = CACHED_FFMPEG.set(resolved.clone());
+    }
+    resolved
+}
+
+/// Resolves the `ffprobe` executable path, searching `ZOIDCRAFT_FFPROBE`, bundled app directories,
+/// `PATH`, and standard OS install locations (including `/opt/homebrew/bin` for macOS `.app`).
+#[must_use]
+pub fn resolve_ffprobe_binary_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("ZOIDCRAFT_FFPROBE")
+        && !explicit.is_empty()
+    {
+        return PathBuf::from(explicit);
+    }
+    static CACHED_FFPROBE: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(p) = CACHED_FFPROBE.get() {
+        return p.clone();
+    }
+    let path_env = std::env::var_os("PATH");
+    let resolved = resolve_media_tool_with_path(None, "ffprobe", path_env.as_deref());
+    if is_usable_executable(&resolved) {
+        let _ = CACHED_FFPROBE.set(resolved.clone());
+    }
+    resolved
+}
+
+/// Returns `true` if a runnable `ffprobe` executable is available on this machine.
+#[must_use]
+pub fn ffprobe_binary_available() -> bool {
+    let bin = resolve_ffprobe_binary_path();
+    is_usable_executable(&bin)
+        || Command::new(&bin)
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+}
+
+fn strip_file_url_prefix(url: &str) -> &str {
+    if let Some(rest) = url.strip_prefix("file://") {
+        #[cfg(windows)]
+        {
+            // Strip leading `/` in `file:///C:/path` so Windows accepts `C:/path`.
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0] == b'/'
+                && bytes[1].is_ascii_alphabetic()
+                && bytes[2] == b':'
+            {
+                return &rest[1..];
+            }
+        }
+        rest
+    } else {
+        url
+    }
+}
+
+/// Extracts display rotation in degrees (e.g. `90`, `-90`, `270`) from `ffprobe` stream JSON
+/// (`side_data_list[].rotation` or `tags.rotate`).
+fn parse_stream_rotation_degrees(video_stream: &serde_json::Value) -> i32 {
+    if let Some(side_data) = video_stream
+        .get("side_data_list")
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in side_data {
+            if let Some(rot) = item.get("rotation").and_then(parse_json_f64) {
+                return rot.round() as i32;
+            }
+        }
+    }
+    if let Some(rot) = video_stream
+        .get("tags")
+        .and_then(|t| t.get("rotate"))
+        .and_then(parse_json_f64)
+    {
+        return rot.round() as i32;
+    }
+    0
+}
 
 /// Maximum number of simultaneously active persistent `ffmpeg` decoder sessions (LRU evicted).
 pub const MAX_ACTIVE_VIDEO_SESSIONS: usize = 8;
@@ -92,15 +325,18 @@ fn parse_json_f64(val: &serde_json::Value) -> Option<f64> {
 
 /// Probes video stream dimensions, frame rate, duration, and audio presence via `ffprobe`.
 ///
+/// Accounts for stream rotation metadata (`displaymatrix` / `tags.rotate`) so vertical videos
+/// report display dimensions matching `ffmpeg`'s autorotated rawvideo output.
 /// Returns `None` if `ffprobe` is unavailable, fails, or the media contains no valid video stream.
 #[must_use]
 pub fn probe_video_metadata(path: &Path) -> Option<VideoMetadata> {
-    let output = Command::new("ffprobe")
+    let ffprobe_bin = resolve_ffprobe_binary_path();
+    let output = Command::new(ffprobe_bin)
         .args([
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,width,height,r_frame_rate,avg_frame_rate,duration",
+            "stream=codec_type,width,height,r_frame_rate,avg_frame_rate,duration:stream_tags=rotate:stream_side_data=rotation",
             "-show_entries",
             "format=duration",
             "-of",
@@ -133,11 +369,17 @@ pub fn probe_video_metadata(path: &Path) -> Option<VideoMetadata> {
                 > 0
     })?;
 
-    let width = u32::try_from(video_stream.get("width")?.as_u64()?).ok()?;
-    let height = u32::try_from(video_stream.get("height")?.as_u64()?).ok()?;
-    if width == 0 || height == 0 {
+    let raw_width = u32::try_from(video_stream.get("width")?.as_u64()?).ok()?;
+    let raw_height = u32::try_from(video_stream.get("height")?.as_u64()?).ok()?;
+    if raw_width == 0 || raw_height == 0 {
         return None;
     }
+    let rotation = parse_stream_rotation_degrees(video_stream);
+    let (width, height) = if rotation.abs() % 180 == 90 {
+        (raw_height, raw_width)
+    } else {
+        (raw_width, raw_height)
+    };
 
     let avg_fps = video_stream
         .get("avg_frame_rate")
@@ -311,7 +553,7 @@ impl ActiveStream {
         let stream_fps = meta.fps.clamp(1.0, 240.0);
         let seek = start_secs.max(0.0);
 
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = Command::new(resolve_ffmpeg_binary_path());
         cmd.args(["-v", "error", "-nostdin"]);
         if use_hwaccel {
             cmd.args(["-hwaccel", "auto"]);
@@ -805,7 +1047,11 @@ impl VideoDecoderPool {
         {
             let _ = std::fs::remove_file(tmp);
         }
-        self.metadata_cache.insert(asset_hash, probed.clone());
+        // Only cache negative results when `ffprobe` is genuinely available, so installing
+        // FFmpeg or fixing PATH mid-session does not leave videos stuck invisible forever.
+        if probed.is_some() || ffprobe_binary_available() {
+            self.metadata_cache.insert(asset_hash, probed.clone());
+        }
         probed
     }
 
@@ -911,7 +1157,7 @@ impl VideoDecoderPool {
     ) -> Option<PathBuf> {
         // Prefer direct local file path with zero temp copy when `url` points to a readable file.
         if let Some(u) = url {
-            let trimmed = u.strip_prefix("file://").unwrap_or(u);
+            let trimmed = strip_file_url_prefix(u);
             let p = Path::new(trimmed);
             if p.is_file() {
                 return Some(p.to_path_buf());
@@ -970,7 +1216,7 @@ fn is_static_image_asset(url: Option<&str>, bytes: Option<&[u8]>) -> bool {
             .is_some();
     }
     if let Some(u) = url {
-        let trimmed = u.strip_prefix("file://").unwrap_or(u);
+        let trimmed = strip_file_url_prefix(u);
         let p = Path::new(trimmed);
         if p.is_file() {
             return image::ImageReader::open(p)
@@ -996,14 +1242,14 @@ mod tests {
     }
 
     fn has_ffmpeg_and_ffprobe() -> bool {
-        let ffmpeg_ok = Command::new("ffmpeg")
+        let ffmpeg_ok = Command::new(resolve_ffmpeg_binary_path())
             .arg("-version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|s| s.success());
-        let ffprobe_ok = Command::new("ffprobe")
+        let ffprobe_ok = Command::new(resolve_ffprobe_binary_path())
             .arg("-version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1016,7 +1262,7 @@ mod tests {
     fn generate_test_mp4(path: &Path) -> bool {
         // Prefer libx264 (standard H.264), falling back to mpeg4 if libx264 is absent.
         for codec in ["libx264", "mpeg4"] {
-            let mut cmd = Command::new("ffmpeg");
+            let mut cmd = Command::new(resolve_ffmpeg_binary_path());
             cmd.args([
                 "-y",
                 "-v",
@@ -1263,5 +1509,38 @@ mod tests {
 
         // 7. Clean drop of pool shuts down all ffmpeg processes cleanly.
         drop(pool);
+    }
+
+    #[test]
+    fn resolve_media_tool_finds_ffmpeg_with_minimal_gui_bundle_path() {
+        let minimal_path = std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin");
+        let ffmpeg = resolve_media_tool_with_path(None, "ffmpeg", Some(minimal_path));
+        let ffprobe = resolve_media_tool_with_path(None, "ffprobe", Some(minimal_path));
+        if has_ffmpeg_and_ffprobe() {
+            assert!(
+                is_usable_executable(&ffmpeg),
+                "expected resolved ffmpeg binary even under minimal GUI PATH, got {}",
+                ffmpeg.display()
+            );
+            assert!(
+                is_usable_executable(&ffprobe),
+                "expected resolved ffprobe binary even under minimal GUI PATH, got {}",
+                ffprobe.display()
+            );
+        }
+    }
+
+    #[test]
+    fn parse_stream_rotation_handles_side_data_and_tags() {
+        let sd = serde_json::json!({
+            "side_data_list": [{ "rotation": -90 }]
+        });
+        assert_eq!(parse_stream_rotation_degrees(&sd), -90);
+        let tag = serde_json::json!({
+            "tags": { "rotate": "90" }
+        });
+        assert_eq!(parse_stream_rotation_degrees(&tag), 90);
+        let none = serde_json::json!({});
+        assert_eq!(parse_stream_rotation_degrees(&none), 0);
     }
 }

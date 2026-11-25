@@ -223,10 +223,14 @@ pub(crate) fn abort_and_join_worker<T, R>(
     received
 }
 
-/// Resolves the FFmpeg executable path (`binary` if supplied, otherwise `"ffmpeg"` on `PATH`).
+/// Resolves the FFmpeg executable path (`binary` if supplied, otherwise auto-detected via
+/// `ZOIDCRAFT_FFMPEG`, bundled app directories, `PATH`, and standard OS install paths).
 #[must_use]
-pub fn resolve_ffmpeg_binary(binary: Option<&Path>) -> &Path {
-    binary.unwrap_or_else(|| Path::new("ffmpeg"))
+pub fn resolve_ffmpeg_binary(binary: Option<&Path>) -> std::borrow::Cow<'_, Path> {
+    match binary {
+        Some(p) => std::borrow::Cow::Borrowed(p),
+        None => std::borrow::Cow::Owned(zc_render::video::resolve_ffmpeg_binary_path()),
+    }
 }
 
 /// Probes whether `ffmpeg` is available and returns its version banner line, enforcing
@@ -240,7 +244,7 @@ pub(crate) fn probe_ffmpeg_with_timeout(
     timeout: Duration,
 ) -> Result<String, ExportError> {
     let bin = resolve_ffmpeg_binary(binary);
-    let mut cmd = Command::new(bin);
+    let mut cmd = Command::new(bin.as_ref());
     cmd.arg("-version").stdin(Stdio::null());
 
     #[cfg(unix)]
