@@ -4,7 +4,10 @@ use super::*;
 
 /// Maximum live audio playback mix window duration in seconds (60s = 2.88M stereo frames at 48 kHz,
 /// well inside `zc-audio`'s 32 Mi sample cap even for multi-hour timelines).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const LIVE_AUDIO_WINDOW_SECS: f64 = 60.0;
+#[cfg(target_arch = "wasm32")]
+pub(crate) const LIVE_AUDIO_WINDOW_SECS: f64 = 4.0;
 
 /// Latches OS audio-output open failures so headless or muted machines neither retry CPAL
 /// every 60 seconds during playback nor spam repeated "Audio output unavailable" toasts.
@@ -667,25 +670,32 @@ impl ZoidCraftApp {
         let mix_gen = self.audio_mix_generation;
         self.audio_stream_attempted_hash = mix_hash;
         let (tx, rx) = mpsc::channel();
+        let work = move || {
+            let window =
+                execute_audio_mix_work(clips, buffers, raw_assets, win_start, win_end, fps);
+            let loop_head = loop_head_inputs.and_then(|(lc, lb, lr, lend)| {
+                execute_audio_mix_work(lc, lb, lr, 0, lend, fps)
+                    .ok()
+                    .flatten()
+                    .map(|w| w.samples)
+            });
+            let _ = tx.send(AudioMixJobResult {
+                mix_hash,
+                win_start,
+                win_end,
+                window,
+                loop_head,
+            });
+        };
+        #[cfg(not(target_arch = "wasm32"))]
         let spawn_res = thread::Builder::new()
             .name("zc-audio-mix".to_owned())
-            .spawn(move || {
-                let window =
-                    execute_audio_mix_work(clips, buffers, raw_assets, win_start, win_end, fps);
-                let loop_head = loop_head_inputs.and_then(|(lc, lb, lr, lend)| {
-                    execute_audio_mix_work(lc, lb, lr, 0, lend, fps)
-                        .ok()
-                        .flatten()
-                        .map(|w| w.samples)
-                });
-                let _ = tx.send(AudioMixJobResult {
-                    mix_hash,
-                    win_start,
-                    win_end,
-                    window,
-                    loop_head,
-                });
-            });
+            .spawn(work);
+        #[cfg(target_arch = "wasm32")]
+        let spawn_res: Result<(), std::io::Error> = {
+            work();
+            Ok(())
+        };
         match spawn_res {
             Ok(_) => {
                 self.pending_audio_mix = Some((mix_gen, rx));

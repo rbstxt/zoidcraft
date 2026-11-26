@@ -133,6 +133,7 @@ pub(super) fn apply_paired_scalar_scrub(
 }
 
 /// Returns `true` when `ext` is a supported OS system font extension (`.ttf`, `.otf`, `.ttc`).
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn is_supported_system_font_ext(ext: &str) -> bool {
     ext.eq_ignore_ascii_case("ttf")
         || ext.eq_ignore_ascii_case("otf")
@@ -141,6 +142,7 @@ pub(super) fn is_supported_system_font_ext(ext: &str) -> bool {
 
 /// Scans `dirs` for `.ttf` / `.otf` / `.ttc` fonts, deriving clean display names from file stems,
 /// deduplicating case-insensitively, and sorting alphabetically.
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn discover_system_fonts_in_dirs(
     dirs: Vec<std::path::PathBuf>,
 ) -> Vec<(String, std::path::PathBuf)> {
@@ -209,6 +211,7 @@ pub(super) fn discover_system_fonts_in_dirs(
 #[allow(clippy::too_many_arguments)]
 /// Discovers installed `.ttf` / `.otf` / `.ttc` system fonts once per process (sorted, deduplicated),
 /// with precomputed ASCII-lowercased display names for zero-allocation filtering.
+#[cfg(not(target_arch = "wasm32"))]
 fn installed_system_fonts() -> &'static [(String, String, std::path::PathBuf)] {
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -267,6 +270,7 @@ const BUILTIN_FONT_CHOICES: [(&str, &str, &str); 3] = [
 enum FontChoice {
     Builtin(&'static str, &'static str, &'static str),
     ProjectAsset(String, String, String),
+    #[cfg(not(target_arch = "wasm32"))]
     SystemFont(&'static str, &'static str, &'static std::path::Path),
 }
 
@@ -275,6 +279,7 @@ impl FontChoice {
         match self {
             Self::Builtin(_, l, _) => l,
             Self::ProjectAsset(_, l, _) => l.as_str(),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::SystemFont(l, _, _) => l,
         }
     }
@@ -283,6 +288,7 @@ impl FontChoice {
         match self {
             Self::Builtin(_, _, low) => low,
             Self::ProjectAsset(_, _, low) => low.as_str(),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::SystemFont(_, low, _) => low,
         }
     }
@@ -316,6 +322,7 @@ fn resolve_current_font_display_label(session: &Session, cur_font: &str) -> Stri
             return stem.to_owned();
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
     for (display, _, path) in installed_system_fonts() {
         if display.eq_ignore_ascii_case(cur_font) || path.to_str().is_some_and(|p| p == cur_font) {
             return display.clone();
@@ -439,8 +446,12 @@ pub(super) fn show_font_selector_row(
 
     let mut chosen_font: Option<FontChoice> = None;
     if popup_open {
+        #[cfg(not(target_arch = "wasm32"))]
         let sys_fonts = installed_system_fonts();
+        #[cfg(not(target_arch = "wasm32"))]
         let mut choices: Vec<FontChoice> = Vec::with_capacity(3 + sys_fonts.len());
+        #[cfg(target_arch = "wasm32")]
+        let mut choices: Vec<FontChoice> = Vec::new();
         for &(key, label, lower) in &BUILTIN_FONT_CHOICES {
             choices.push(FontChoice::Builtin(key, label, lower));
         }
@@ -454,6 +465,7 @@ pub(super) fn show_font_selector_row(
             .collect();
         project_fonts.sort_by(|a, b| a.1.cmp(&b.1));
 
+        #[cfg(not(target_arch = "wasm32"))]
         let mut project_stems: BTreeSet<String> = BTreeSet::new();
         for (aid, fname) in project_fonts {
             let stem = std::path::Path::new(&fname)
@@ -462,10 +474,12 @@ pub(super) fn show_font_selector_row(
                 .unwrap_or(&fname)
                 .to_owned();
             let stem_lower = stem.to_ascii_lowercase();
+            #[cfg(not(target_arch = "wasm32"))]
             project_stems.insert(stem_lower.clone());
             choices.push(FontChoice::ProjectAsset(aid, stem, stem_lower));
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         for (display, display_lower, path) in sys_fonts {
             if project_stems.is_empty() || !project_stems.contains(display_lower.as_str()) {
                 choices.push(FontChoice::SystemFont(
@@ -483,6 +497,7 @@ pub(super) fn show_font_selector_row(
                 FontChoice::ProjectAsset(aid, lbl, _) => {
                     aid == &cur_font || lbl.eq_ignore_ascii_case(&cur_font)
                 }
+                #[cfg(not(target_arch = "wasm32"))]
                 FontChoice::SystemFont(lbl, _, path) => {
                     lbl.eq_ignore_ascii_case(&cur_font)
                         || path.to_str().is_some_and(|p| p == cur_font)
@@ -653,6 +668,7 @@ pub(super) fn show_font_selector_row(
         let resolved_value: Option<String> = match choice {
             FontChoice::Builtin(key, _, _) => Some(key.to_owned()),
             FontChoice::ProjectAsset(aid, _, _) => Some(aid),
+            #[cfg(not(target_arch = "wasm32"))]
             FontChoice::SystemFont(display, _, path) => {
                 // Embed the selected OS system font into `session.project.assets` so the
                 // project renders cleanly and stays portable across `.zcraft` / `.pz` export.

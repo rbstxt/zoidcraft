@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::{env, fs};
 
 use serde_json::{Value, json};
 use zc_plugin::{PluginRegistry, PluginSettingsState};
-use zc_project::{ProjectError, write_atomic};
+use zc_project::ProjectError;
+#[cfg(not(target_arch = "wasm32"))]
+use zc_project::write_atomic;
 use zc_session::{Command, Session};
 
 use crate::ZoidCraftApp;
@@ -13,6 +16,15 @@ use crate::ui::layout::{Cm3Workspace, PreviewQuality};
 use crate::ui::panels::AppSettings;
 use crate::ui::theme::{Cm3Theme, EditorFontChoice, ThemeProfileChoice};
 
+#[cfg(target_arch = "wasm32")]
+const STORAGE_KEY: &str = "zoidcraft.preferences.v1";
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn default_preferences_path() -> PathBuf {
+    PathBuf::from(STORAGE_KEY)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn default_preferences_path() -> PathBuf {
     let env_path = |key| {
         env::var_os(key)
@@ -48,7 +60,17 @@ pub(crate) struct UserPreferences {
 
 impl UserPreferences {
     pub(crate) fn load(path: &Path) -> Option<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
         let mut json: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+        #[cfg(target_arch = "wasm32")]
+        let mut json: Value = serde_json::from_str(
+            &web_sys::window()?
+                .local_storage()
+                .ok()??
+                .get_item(path.to_str()?)
+                .ok()??,
+        )
+        .ok()?;
         if !json.is_object() {
             return None;
         }
@@ -156,7 +178,23 @@ impl UserPreferences {
                 "editor_font": theme.editor_font.label(),
             },
         });
-        write_atomic(path, &serde_json::to_vec_pretty(&json)?)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            write_atomic(path, &serde_json::to_vec_pretty(&json)?)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let error = || std::io::Error::other("Browser local storage is unavailable");
+            let storage = web_sys::window()
+                .and_then(|window| window.local_storage().ok().flatten())
+                .ok_or_else(error)?;
+            storage
+                .set_item(
+                    path.to_str().ok_or_else(error)?,
+                    &serde_json::to_string(&json)?,
+                )
+                .map_err(|_| error().into())
+        }
     }
 }
 

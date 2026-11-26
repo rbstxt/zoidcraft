@@ -468,6 +468,7 @@ const GEIST_MONO_TTF: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Regul
 
 /// Standard OS CJK fallback font candidates probed once at startup via safe `std::fs::read`
 /// so Japanese/Chinese/Korean text renders crisply in egui controls without tofu boxes.
+#[cfg(not(target_arch = "wasm32"))]
 const SYSTEM_CJK_FALLBACK_PATHS: &[&str] = &[
     // macOS
     "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
@@ -483,6 +484,7 @@ const SYSTEM_CJK_FALLBACK_PATHS: &[&str] = &[
     "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
 ];
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_system_cjk_fallback_font() -> Option<std::sync::Arc<egui::FontData>> {
     static CACHED: std::sync::OnceLock<Option<std::sync::Arc<egui::FontData>>> =
         std::sync::OnceLock::new();
@@ -500,6 +502,11 @@ fn load_system_cjk_fallback_font() -> Option<std::sync::Arc<egui::FontData>> {
             None
         })
         .clone()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_system_cjk_fallback_font() -> Option<std::sync::Arc<egui::FontData>> {
+    None
 }
 
 /// Rebuilds `FontDefinitions` with both bundled SIL OFL 1.1 fonts (`"source_code_pro"` and

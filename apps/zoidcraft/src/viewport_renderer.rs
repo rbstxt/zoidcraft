@@ -532,6 +532,7 @@ impl ViewportGpuPresenter {
 
     /// Renders a single frame and returns straight-alpha (unpremultiplied) RGBA8 pixels
     /// suitable for PNG snapshot export.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn render_frame_straight_rgba8(
         &mut self,
         session: &mut Session,
@@ -550,10 +551,20 @@ impl ViewportGpuPresenter {
     }
 
     /// Reads back the current interactive display texture for the eyedropper color picker.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn sample_display_pixel(&self, norm_x: f32, norm_y: f32) -> Option<[f64; 3]> {
         let display = self.display_target.as_ref()?;
         let mut rgba = Vec::new();
         readback_rgba8(&self.engine.ctx, display, &mut rgba).ok()?;
+        Self::read_rgba_pixel(display, &rgba, norm_x, norm_y)
+    }
+
+    fn read_rgba_pixel(
+        display: &RenderTarget,
+        rgba: &[u8],
+        norm_x: f32,
+        norm_y: f32,
+    ) -> Option<[f64; 3]> {
         let w = display.width.max(1);
         let h = display.height.max(1);
         let px =
@@ -570,6 +581,31 @@ impl ViewportGpuPresenter {
         let g = (f64::from(rgba[idx + 1]) / 255.0 * inv_a).clamp(0.0, 1.0);
         let b = (f64::from(rgba[idx + 2]) / 255.0 * inv_a).clamp(0.0, 1.0);
         Some([r, g, b])
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn sample_web_display_pixel(
+        &self,
+        norm_x: f32,
+        norm_y: f32,
+    ) -> Option<impl std::future::Future<Output = Result<Option<[f64; 3]>, RenderError>> + use<>>
+    {
+        let display = self.display_target.as_ref()?;
+        let target = RenderTarget {
+            texture: display.texture.clone(),
+            view: display.view.clone(),
+            width: display.width,
+            height: display.height,
+            format: display.format,
+        };
+        let ctx = zc_render::GpuContext::from_shared(
+            Arc::clone(&self.engine.ctx.device),
+            Arc::clone(&self.engine.ctx.queue),
+        );
+        Some(async move {
+            let rgba = zc_render::readback_rgba8_async(&ctx, &target).await?;
+            Ok(Self::read_rgba_pixel(&target, &rgba, norm_x, norm_y))
+        })
     }
 
     pub(crate) fn ensure_display_target_and_texture(
@@ -1598,6 +1634,15 @@ impl ZoidCraftApp {
         Some(key)
     }
 
+    fn apply_eyedropper_color(&mut self, target_id: String, prop_key: String, rgb: [f64; 3]) {
+        let cmd = build_eyedropper_command(&self.session, target_id, prop_key, rgb);
+        if let Err(err) = self.session.execute(cmd) {
+            self.show_toast(format!("Failed to apply sampled color: {err}"));
+        } else {
+            self.show_toast("Sampled color from viewport");
+        }
+    }
+
     pub(crate) fn handle_eyedropper_click(&mut self, ctx: &egui::Context) -> bool {
         let clipped_capture_rect = |canvas: Rect| -> Rect {
             self.last_viewport_rect
@@ -1683,17 +1728,28 @@ impl ZoidCraftApp {
         {
             let nx = (pos.x - canvas_rect.left()) / canvas_rect.width().max(1.0);
             let ny = (pos.y - canvas_rect.top()) / canvas_rect.height().max(1.0);
+            #[cfg(not(target_arch = "wasm32"))]
             if let Some(rgb) = self
                 .renderer
                 .as_ref()
                 .and_then(|r| r.sample_display_pixel(nx, ny))
             {
-                let cmd = build_eyedropper_command(&self.session, target_id, prop_key, rgb);
-                if let Err(err) = self.session.execute(cmd) {
-                    self.show_toast(format!("Failed to apply sampled color: {err}"));
-                } else {
-                    self.show_toast("Sampled color from viewport");
-                }
+                self.apply_eyedropper_color(target_id, prop_key, rgb);
+            }
+            #[cfg(target_arch = "wasm32")]
+            if let Some(sample) = self
+                .renderer
+                .as_ref()
+                .and_then(|r| r.sample_web_display_pixel(nx, ny))
+            {
+                self.web.enqueue(async move {
+                    let color = sample.await.map_err(|err| err.to_string())?;
+                    web::finish_with(move |app| {
+                        if let Some(rgb) = color {
+                            app.apply_eyedropper_color(target_id, prop_key, rgb);
+                        }
+                    })
+                });
             }
             self.pending_eyedropper = None;
             self.eyedropper_swallow_pointer = true;

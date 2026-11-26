@@ -1410,6 +1410,9 @@ pub(super) fn show_assets_tab(
                         );
                         if relink_resp.clicked() {
                             relinked = true;
+                            #[cfg(target_arch = "wasm32")]
+                            actions.push(PanelAction::RelinkWebAsset(aid.clone()));
+                            #[cfg(not(target_arch = "wasm32"))]
                             if let Some(path) = rfd::FileDialog::new()
                                 .set_title(format!("Relink missing asset: {fname}"))
                                 .pick_file()

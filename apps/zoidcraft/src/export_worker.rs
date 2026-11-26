@@ -17,6 +17,7 @@ pub(crate) const EXPORT_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_millis(
 pub(crate) struct ActiveExportJob {
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) rx: Receiver<ExportWorkerEvent>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) handle: Option<JoinHandle<()>>,
     pub(crate) started_at: Instant,
     pub(crate) queue_job_id: Option<u64>,
@@ -27,23 +28,46 @@ impl ActiveExportJob {
         self.cancel.store(true, Ordering::Release);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn is_finished(&self) -> bool {
         self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     pub(crate) fn try_reap_finished(&mut self) -> bool {
-        if !self.is_finished() {
-            return false;
+        #[cfg(target_arch = "wasm32")]
+        {
+            loop {
+                match self.rx.try_recv() {
+                    Ok(ExportWorkerEvent::Progress(_)) => {}
+                    Ok(ExportWorkerEvent::Finished(_)) | Err(TryRecvError::Disconnected) => {
+                        return true;
+                    }
+                    Err(TryRecvError::Empty) => return false,
+                }
+            }
         }
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !self.is_finished() {
+                return false;
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            true
         }
-        true
     }
 
     /// Signals cooperative cancellation and waits up to `timeout` for the worker thread
     /// to finish cleanly, avoiding an indefinite UI-thread freeze if an encoder or frame stalls.
     /// Returns `true` if the worker finished and was joined within `timeout`.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn cancel_and_join_bounded(&mut self, _timeout: Duration) -> bool {
+        self.request_cancel();
+        self.try_reap_finished()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn cancel_and_join_bounded(&mut self, timeout: Duration) -> bool {
         self.request_cancel();
         let Some(handle) = self.handle.take() else {
@@ -155,6 +179,7 @@ pub(crate) fn export_file_dialog_filter(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn render_export_frame_into(
     export_engine: &mut ProjectRenderEngine,
     export_session: &Session,
@@ -371,6 +396,7 @@ pub(crate) fn queue_next_pending_index(queue: &[ExportQueueJob]) -> Option<usize
         .position(|job| job.status == ExportJobStatus::Queued)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn open_output_folder_in_os(path: &Path) -> Result<(), String> {
     let folder = if path.is_dir() {
         path.to_path_buf()
@@ -441,6 +467,7 @@ pub(crate) fn poll_export_job(
 }
 
 impl ZoidCraftApp {
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn poll_ffmpeg_probe(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.ffmpeg_probe_rx.as_ref() else {
             return;
@@ -485,12 +512,17 @@ impl ZoidCraftApp {
         };
 
         if let Some(res) = finished_result {
-            let finished_queue_id = if let Some(mut job) = self.active_export.take() {
-                let qid = job.queue_job_id;
-                if let Some(handle) = job.handle.take() {
-                    let _ = handle.join();
+            let finished_queue_id = if let Some(job) = self.active_export.take() {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let mut job = job;
+                    if let Some(handle) = job.handle.take() {
+                        let _ = handle.join();
+                    }
+                    job.queue_job_id
                 }
-                qid
+                #[cfg(target_arch = "wasm32")]
+                job.queue_job_id
             } else {
                 None
             };
@@ -567,6 +599,7 @@ impl ZoidCraftApp {
         }
 
         // Single-frame PNG snapshot mode.
+        #[cfg(not(target_arch = "wasm32"))]
         if ui_cfg.mode == ExportMode::Frame {
             self.pause_playback_for_modal_dialog();
             let default_name = format!(
@@ -655,6 +688,16 @@ impl ZoidCraftApp {
         &self,
         ui_cfg: &UiExportSettings,
     ) -> Result<(), String> {
+        #[cfg(target_arch = "wasm32")]
+        let frame_settings;
+        #[cfg(target_arch = "wasm32")]
+        let ui_cfg = if ui_cfg.mode == ExportMode::Frame {
+            frame_settings =
+                web::frame_export_settings(ui_cfg, self.session.playback.current_frame);
+            &frame_settings
+        } else {
+            ui_cfg
+        };
         let seq_fps = self.session.document().fps.max(1.0);
         let start_seq_frame = ui_cfg.start_frame.round().max(0.0) as u32;
         let end_seq_frame = (ui_cfg
@@ -672,24 +715,30 @@ impl ZoidCraftApp {
         core_settings
             .validate()
             .map_err(|err| format!("Invalid export settings: {err}"))?;
-        let needs_ffmpeg = !matches!(
-            core_settings.container,
-            CoreExportContainer::PngSequence | CoreExportContainer::Wav
-        );
-        if needs_ffmpeg && !self.workspace.panels.export_status.ffmpeg_available {
-            return Err(if self.ffmpeg_probe_rx.is_some() {
-                "Still checking FFmpeg availability; please try exporting again in a moment."
-                    .to_owned()
-            } else {
-                format!(
-                    "Cannot start export: FFmpeg is unavailable ({}).",
-                    self.workspace.panels.export_status.ffmpeg_version
-                )
-            });
+        #[cfg(target_arch = "wasm32")]
+        return self.validate_web_export(&core_settings);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let needs_ffmpeg = !matches!(
+                core_settings.container,
+                CoreExportContainer::PngSequence | CoreExportContainer::Wav
+            );
+            if needs_ffmpeg && !self.workspace.panels.export_status.ffmpeg_available {
+                return Err(if self.ffmpeg_probe_rx.is_some() {
+                    "Still checking FFmpeg availability; please try exporting again in a moment."
+                        .to_owned()
+                } else {
+                    format!(
+                        "Cannot start export: FFmpeg is unavailable ({}).",
+                        self.workspace.panels.export_status.ffmpeg_version
+                    )
+                });
+            }
+            Ok(())
         }
-        Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn prompt_export_output_path(
         &mut self,
         ui_cfg: &UiExportSettings,
@@ -890,6 +939,17 @@ impl ZoidCraftApp {
             active_composition_id.as_deref(),
         );
 
+        #[cfg(target_arch = "wasm32")]
+        let frame_settings;
+        #[cfg(target_arch = "wasm32")]
+        let (ui_cfg, single_frame) = if ui_cfg.mode == ExportMode::Frame {
+            let frame = self.session.playback.current_frame;
+            frame_settings = web::frame_export_settings(ui_cfg, frame);
+            (&frame_settings, Some(frame))
+        } else {
+            (ui_cfg, None)
+        };
+
         let start_seq_frame = ui_cfg.start_frame.round().max(0.0) as u32;
         let end_seq_frame = (ui_cfg
             .end_frame
@@ -898,19 +958,33 @@ impl ZoidCraftApp {
         let core_settings =
             convert_export_settings(ui_cfg, seq_fps, start_seq_frame, end_seq_frame, output_path)
                 .map_err(|err| format!("Invalid export settings: {err}"))?;
+        #[cfg(target_arch = "wasm32")]
+        let core_settings = if single_frame.is_some() {
+            CoreExportSettings {
+                end_frame: 1,
+                ..core_settings
+            }
+        } else {
+            core_settings
+        };
         core_settings
             .validate()
             .map_err(|err| format!("Invalid export settings: {err}"))?;
 
-        let needs_ffmpeg = !matches!(
-            core_settings.container,
-            CoreExportContainer::PngSequence | CoreExportContainer::Wav
-        );
-        if needs_ffmpeg && !self.workspace.panels.export_status.ffmpeg_available {
-            return Err(format!(
-                "Cannot start export: FFmpeg is unavailable ({}).",
-                self.workspace.panels.export_status.ffmpeg_version
-            ));
+        #[cfg(target_arch = "wasm32")]
+        self.validate_web_export(&core_settings)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let needs_ffmpeg = !matches!(
+                core_settings.container,
+                CoreExportContainer::PngSequence | CoreExportContainer::Wav
+            );
+            if needs_ffmpeg && !self.workspace.panels.export_status.ffmpeg_available {
+                return Err(format!(
+                    "Cannot start export: FFmpeg is unavailable ({}).",
+                    self.workspace.panels.export_status.ffmpeg_version
+                ));
+            }
         }
 
         // Share only in-range decoded audio Arcs (zero PCM deep-copy) from the snapshot or live session.
@@ -928,6 +1002,24 @@ impl ZoidCraftApp {
         let cancel_worker = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel::<ExportWorkerEvent>();
 
+        #[cfg(target_arch = "wasm32")]
+        web::launch_export(
+            self.renderer.as_ref(),
+            web::BrowserExport {
+                settings: core_settings,
+                project: export_project,
+                plugins: export_plugins,
+                audio_buffers: export_audio_buffers,
+                seq_fps,
+                start_seq_frame,
+                end_seq_frame,
+                single_frame,
+                cancel: cancel_worker,
+                events: tx,
+            },
+        )?;
+
+        #[cfg(not(target_arch = "wasm32"))]
         let handle = thread::Builder::new()
             .name("zc-export-worker".to_owned())
             .spawn(move || {
@@ -999,25 +1091,22 @@ impl ZoidCraftApp {
                 let _ = tx.send(ExportWorkerEvent::Finished(result));
             });
 
-        match handle {
-            Ok(join_handle) => {
-                self.workspace.panels.export_status.exporting = true;
-                self.workspace.panels.export_status.progress = 0.0;
-                self.workspace.panels.export_status.live_fps = None;
-                self.workspace.panels.export_status.eta_secs = None;
-                self.workspace.panels.export_status.status_message =
-                    "Starting export worker...".to_owned();
-                self.active_export = Some(ActiveExportJob {
-                    cancel,
-                    rx,
-                    handle: Some(join_handle),
-                    started_at: Instant::now(),
-                    queue_job_id,
-                });
-                Ok(())
-            }
-            Err(err) => Err(format!("Failed to spawn export worker: {err}")),
-        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let join_handle = handle.map_err(|err| format!("Failed to spawn export worker: {err}"))?;
+        self.workspace.panels.export_status.exporting = true;
+        self.workspace.panels.export_status.progress = 0.0;
+        self.workspace.panels.export_status.live_fps = None;
+        self.workspace.panels.export_status.eta_secs = None;
+        self.workspace.panels.export_status.status_message = "Starting export worker...".into();
+        self.active_export = Some(ActiveExportJob {
+            cancel,
+            rx,
+            #[cfg(not(target_arch = "wasm32"))]
+            handle: Some(join_handle),
+            started_at: Instant::now(),
+            queue_job_id,
+        });
+        Ok(())
     }
 
     pub(crate) fn cancel_active_export(&mut self) {
@@ -1054,6 +1143,7 @@ impl ZoidCraftApp {
         self.workspace.panels.export_status.status_message = "Ready".to_owned();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn handle_open_output_folder(&mut self, path: &Path) {
         if let Err(err) = open_output_folder_in_os(path) {
             self.show_toast(format!("Failed to open output folder: {err}"));

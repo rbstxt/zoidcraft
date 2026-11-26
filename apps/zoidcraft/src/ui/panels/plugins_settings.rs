@@ -281,6 +281,8 @@ pub(super) fn show_restore_tab(
                         actions.push(PanelAction::NewProject);
                     }
 
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new("Disk autosave snapshots")
@@ -363,10 +365,12 @@ pub(super) fn show_restore_tab(
                                 });
                         }
                     }
+                    }
                 });
         });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn format_snapshot_bytes(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
@@ -377,6 +381,7 @@ fn format_snapshot_bytes(bytes: u64) -> String {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn format_unix_timestamp_utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;

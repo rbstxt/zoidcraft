@@ -2,6 +2,7 @@
 //! animated Elevator rail, File & Playback toolbars, Audio Level Meter,
 //! and global shortcut dispatcher (Spec 01 §1 & §6).
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
 use egui::{
@@ -851,6 +852,10 @@ pub enum UiAction {
         include_assets: bool,
     },
     ImportMedia,
+    #[cfg(target_arch = "wasm32")]
+    RelinkWebAsset(String),
+    #[cfg(target_arch = "wasm32")]
+    ImportWebSvg(zc_project::Uuid),
     OpenGraphEditor,
     PickAssetForProperty {
         target_id: String,
@@ -865,9 +870,13 @@ pub enum UiAction {
     AddToExportQueue(ExportSettings),
     RunExportQueue,
     CancelExport,
+    #[cfg(not(target_arch = "wasm32"))]
     OpenOutputFolder(PathBuf),
+    #[cfg(not(target_arch = "wasm32"))]
     SaveRecoverySnapshotNow,
+    #[cfg(not(target_arch = "wasm32"))]
     RestoreRecoverySnapshot(PathBuf),
+    #[cfg(not(target_arch = "wasm32"))]
     DeleteRecoverySnapshot(PathBuf),
     EyedropperActivate {
         target_id: String,
@@ -1604,15 +1613,23 @@ impl Cm3Workspace {
             actions.push(match act {
                 PanelAction::NewProject => UiAction::NewProject,
                 PanelAction::ImportMedia => UiAction::ImportMedia,
+                #[cfg(target_arch = "wasm32")]
+                PanelAction::RelinkWebAsset(id) => UiAction::RelinkWebAsset(id),
+                #[cfg(target_arch = "wasm32")]
+                PanelAction::ImportWebSvg(id) => UiAction::ImportWebSvg(id),
                 PanelAction::StartExport(cfg) => UiAction::StartExport(cfg),
                 PanelAction::AddToExportQueue(cfg) => UiAction::AddToExportQueue(cfg),
                 PanelAction::RunExportQueue => UiAction::RunExportQueue,
                 PanelAction::CancelExport => UiAction::CancelExport,
+                #[cfg(not(target_arch = "wasm32"))]
                 PanelAction::OpenOutputFolder(path) => UiAction::OpenOutputFolder(path),
+                #[cfg(not(target_arch = "wasm32"))]
                 PanelAction::SaveRecoverySnapshotNow => UiAction::SaveRecoverySnapshotNow,
+                #[cfg(not(target_arch = "wasm32"))]
                 PanelAction::RestoreRecoverySnapshot(path) => {
                     UiAction::RestoreRecoverySnapshot(path)
                 }
+                #[cfg(not(target_arch = "wasm32"))]
                 PanelAction::DeleteRecoverySnapshot(path) => UiAction::DeleteRecoverySnapshot(path),
                 PanelAction::EyedropperActivate {
                     target_id,

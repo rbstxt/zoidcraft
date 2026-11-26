@@ -650,7 +650,9 @@ pub(super) fn show_export_tab(
                                 actions.push(PanelAction::CancelExport);
                             }
                         });
-                } else if let Some(completed_path) =
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if !state.export_status.exporting && let Some(completed_path) =
                     state.export_status.last_completed_output.clone()
                 {
                     Frame::NONE
@@ -715,6 +717,10 @@ pub(super) fn show_export_tab(
 
                     // FFmpeg status bar (shown for video device render modes)
                     if needs_ffmpeg {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let encoding_status = format!("FFmpeg: {}", state.export_status.ffmpeg_version);
+                        #[cfg(target_arch = "wasm32")]
+                        let encoding_status = &state.export_status.ffmpeg_version;
                         let ff_color = if state.export_status.ffmpeg_available {
                             TEXT_PRIMARY
                         } else {
@@ -727,10 +733,7 @@ pub(super) fn show_export_tab(
                             .show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
                                 ui.label(
-                                    egui::RichText::new(format!(
-                                        "FFmpeg: {}",
-                                        state.export_status.ffmpeg_version
-                                    ))
+                                    egui::RichText::new(encoding_status)
                                     .font(theme.font(FONT_SMALL))
                                     .color(ff_color),
                                 );
@@ -1250,10 +1253,14 @@ pub(super) fn show_export_tab(
                                 theme.font(FONT_BODY),
                                 TEXT_DISABLED,
                             );
-                            resp.on_hover_cursor(CursorIcon::NotAllowed)
-                                .on_hover_text("FFmpeg is not available; install FFmpeg or export PNG Sequence, WAV Audio, or Single Frame.");
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let reason = "FFmpeg is not available; install FFmpeg or export PNG Sequence, WAV Audio, or Single Frame.";
+                            #[cfg(target_arch = "wasm32")]
+                            let reason = "This browser does not expose WebCodecs encoding. Choose PNG Sequence, WAV Audio, or Single Frame.";
+                            resp.on_hover_cursor(CursorIcon::NotAllowed).on_hover_text(reason);
                         }
 
+                        #[cfg(not(target_arch = "wasm32"))]
                         if let Some(completed_path) =
                             state.export_status.last_completed_output.clone()
                         {
@@ -1456,6 +1463,7 @@ fn show_export_queue_section(
                             remove_idx = Some(idx);
                         }
                     }
+                    #[cfg(not(target_arch = "wasm32"))]
                     if job.status == ExportJobStatus::Completed
                         && cm3_prop_button(ui, "Open Folder", ButtonVariant::Normal, false, theme)
                             .clicked()

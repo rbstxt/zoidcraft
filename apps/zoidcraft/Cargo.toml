@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "zoidcraft"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
@@ -23,9 +30,20 @@ zc-export = { workspace = true }
 zc-session = { workspace = true }
 serde_json = { workspace = true }
 egui = { workspace = true }
-eframe = { workspace = true }
 egui-wgpu = { workspace = true }
 wgpu = { workspace = true }
-rfd = { workspace = true }
 tracing = { workspace = true }
+
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+eframe = { workspace = true, features = ["x11", "wayland"] }
+rfd = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true }
+web-time = { workspace = true }

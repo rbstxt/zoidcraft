@@ -174,6 +174,11 @@ fn show_shape_plus_objects_tab(
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 3.0);
+                #[cfg(target_arch = "wasm32")]
+                if ui.small_button("Import SVG...").clicked() {
+                    actions.push(PanelAction::ImportWebSvg(cid));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
                 if ui.small_button("Import SVG...").clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .add_filter("SVG Vector", &["svg"])

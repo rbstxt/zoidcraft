@@ -14,3 +14,5 @@
 .vscode/
 *.swp
 tmp/
+/web/dist/
+/web/node_modules/

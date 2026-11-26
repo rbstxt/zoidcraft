@@ -54,6 +54,28 @@ pub fn zc_webcodecs_get_video_frame(
         .ok()
 }
 
+/// Whether a browser cache lookup returned the requested frame rather than a nearby frame.
+pub fn web_video_frame_is_exact(asset_hash: u64, time_secs: f64, width: u32, height: u32) -> bool {
+    let get = || {
+        let bridge = Reflect::get(&js_sys::global(), &"__zcWebCodecs".into()).ok()?;
+        let method = Reflect::get(&bridge, &"isExactVideoFrame".into())
+            .ok()?
+            .dyn_into::<Function>()
+            .ok()?;
+        method
+            .call4(
+                &bridge,
+                &format!("{asset_hash:016x}").into(),
+                &time_secs.into(),
+                &width.into(),
+                &height.into(),
+            )
+            .ok()?
+            .as_bool()
+    };
+    get().unwrap_or(false)
+}
+
 fn decode_frame_bytes(
     key: VideoStreamKey,
     meta: &VideoMetadata,

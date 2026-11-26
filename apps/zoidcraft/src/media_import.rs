@@ -5,12 +5,15 @@ use super::*;
 
 /// Video files at or below 64 MiB (and within remaining embedded budget) are embedded in the
 /// project alongside their canonical local `url`; larger files are linked as external local assets.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const VIDEO_INLINE_EMBED_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Maximum WAV byte cap when extracting embedded audio from a video container via `ffmpeg`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const VIDEO_AUDIO_EXTRACT_MAX_BYTES: usize = 120 * 1024 * 1024;
 
 /// Number of leading file bytes sampled when deriving a fast deterministic external asset ID.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const EXTERNAL_ID_HEADER_SAMPLE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,12 +54,14 @@ pub(crate) fn is_video_extension(ext: &str) -> bool {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn is_video_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(is_video_extension)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn canonical_local_url(path: &Path) -> String {
     fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
@@ -64,6 +69,7 @@ pub(crate) fn canonical_local_url(path: &Path) -> String {
         .into_owned()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn compute_external_asset_id(
     canonical_path: &str,
     file_len: u64,
@@ -88,9 +94,11 @@ pub(crate) struct ProbedVideoInfo {
     #[allow(dead_code)]
     pub(crate) fps: Option<f64>,
     pub(crate) duration_secs: Option<f64>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) has_audio: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn probe_video_with_ffprobe(path: &Path) -> ProbedVideoInfo {
     if let Some(meta) = zc_render::video::probe_video_metadata(path) {
         return ProbedVideoInfo {
@@ -104,6 +112,7 @@ pub(crate) fn probe_video_with_ffprobe(path: &Path) -> ProbedVideoInfo {
     ProbedVideoInfo::default()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn extract_video_audio_off_thread(
     path: &Path,
     ext: &str,
@@ -162,6 +171,7 @@ pub(crate) struct PendingMediaImport {
     pub(crate) rx: Receiver<MediaImportOutcome>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn build_external_video_record(
     path: &Path,
     filename: String,
@@ -193,6 +203,7 @@ pub(crate) fn build_external_video_record(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn prepare_video_import_work(
     path: &Path,
     existing_embedded_bytes: u64,
@@ -343,6 +354,29 @@ pub(crate) fn choose_audio_clip_placement(
     }
 }
 
+pub(crate) fn asset_filename_and_kind(path: &Path) -> (String, String, AssetKind) {
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("asset")
+        .to_owned();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let kind = match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "webp" | "gif" => AssetKind::Image,
+        e if is_audio_extension(e) || is_video_extension(e) => AssetKind::Av,
+        "obj" | "gltf" | "glb" => AssetKind::Geometry,
+        "ttf" | "otf" => AssetKind::Font,
+        _ => AssetKind::Misc,
+    };
+
+    (filename, ext, kind)
+}
+
 impl ZoidCraftApp {
     pub(crate) fn existing_embedded_asset_bytes(&self) -> u64 {
         self.session
@@ -354,6 +388,7 @@ impl ZoidCraftApp {
             .fold(0_u64, u64::saturating_add)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn read_asset_bytes_within_budget(
         &self,
         path: &Path,
@@ -387,25 +422,7 @@ impl ZoidCraftApp {
             ));
         }
 
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("asset")
-            .to_owned();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-
-        let kind = match ext.as_str() {
-            "png" | "jpg" | "jpeg" | "webp" | "gif" => AssetKind::Image,
-            e if is_audio_extension(e) || is_video_extension(e) => AssetKind::Av,
-            "obj" | "gltf" | "glb" => AssetKind::Geometry,
-            "ttf" | "otf" => AssetKind::Font,
-            _ => AssetKind::Misc,
-        };
-
+        let (filename, ext, kind) = asset_filename_and_kind(path);
         Ok((filename, ext, kind, bytes))
     }
 
@@ -440,6 +457,7 @@ impl ZoidCraftApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn handle_pick_asset_for_property(
         &mut self,
         target_id: String,
@@ -469,7 +487,7 @@ impl ZoidCraftApp {
             return;
         };
 
-        let (filename, ext, kind, prepared_record) = if is_video_path(&path) {
+        let (ext, prepared_record) = if is_video_path(&path) {
             let existing = self.existing_embedded_asset_bytes();
             let desired_start = self.session.playback.current_frame.round().max(0.0);
             match prepare_video_import_work(&path, existing, desired_start) {
@@ -479,12 +497,7 @@ impl ZoidCraftApp {
                         .and_then(|e| e.to_str())
                         .unwrap_or("")
                         .to_ascii_lowercase();
-                    (
-                        payload.filename,
-                        ext,
-                        AssetKind::Av,
-                        Some(payload.asset_record),
-                    )
+                    (ext, Some(payload.asset_record))
                 }
                 Err(msg) => {
                     self.show_toast(msg);
@@ -509,7 +522,7 @@ impl ZoidCraftApp {
                         size,
                         preserved: BTreeMap::new(),
                     };
-                    (filename, ext, kind, Some(rec))
+                    (ext, Some(rec))
                 }
                 Err(msg) => {
                     self.show_toast(msg);
@@ -522,6 +535,18 @@ impl ZoidCraftApp {
             return;
         };
 
+        self.assign_media_to_property(target_id, property, asset_record, &ext);
+    }
+
+    pub(crate) fn assign_media_to_property(
+        &mut self,
+        target_id: String,
+        property: String,
+        asset_record: AssetRecord,
+        ext: &str,
+    ) {
+        let filename = asset_record.filename.clone();
+        let kind = asset_record.kind;
         // Close any open inspector transaction before starting an atomic asset-assign transaction
         // so failures roll back cleanly and never leak unreferenced assets.
         if self.session.history.is_in_transaction() {
@@ -555,7 +580,7 @@ impl ZoidCraftApp {
                     let _ = self.session.commit_transaction(true);
                 }
                 self.invalidate_project_hash_caches();
-                self.cache_decoded_audio_for_asset(&asset_id, &ext);
+                self.cache_decoded_audio_for_asset(&asset_id, ext);
                 self.show_toast(format!("Assigned {filename}"));
             }
             Err(err) => {
@@ -568,6 +593,7 @@ impl ZoidCraftApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn spawn_video_import(&mut self, path: PathBuf) -> String {
         let filename = path
             .file_name()
@@ -804,6 +830,7 @@ impl ZoidCraftApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn handle_import_media(&mut self) {
         self.pause_playback_for_modal_dialog();
         let chosen = rfd::FileDialog::new()
@@ -829,6 +856,7 @@ impl ZoidCraftApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn import_media_from_path(&mut self, path: &Path) -> Result<String, String> {
         if is_video_path(path) {
             let existing = self.existing_embedded_asset_bytes();
@@ -839,6 +867,17 @@ impl ZoidCraftApp {
 
         let (filename, ext, kind, bytes) = self.read_asset_bytes_within_budget(path)?;
 
+        self.import_media_bytes(filename, ext, kind, bytes, Some(canonical_local_url(path)))
+    }
+
+    pub(crate) fn import_media_bytes(
+        &mut self,
+        filename: String,
+        ext: String,
+        kind: AssetKind,
+        bytes: Vec<u8>,
+        url: Option<String>,
+    ) -> Result<String, String> {
         let is_audio_ext = is_audio_extension(&ext);
         let maybe_audio = if is_audio_ext {
             match decode_audio_bytes(&bytes, Some(&ext)) {
@@ -865,7 +904,7 @@ impl ZoidCraftApp {
             .project
             .insert_binary_asset(kind, filename.clone(), bytes);
         if let Some(rec) = self.session.project.assets.get_mut(&asset_id) {
-            rec.url = Some(canonical_local_url(path));
+            rec.url = url;
         }
         self.session.project.media.push(MediaItem {
             id: Uuid::new_v4(),
@@ -1004,6 +1043,7 @@ impl ZoidCraftApp {
         Ok(placement_warning.unwrap_or_else(|| format!("Imported {filename}")))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn handle_dropped_files(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;

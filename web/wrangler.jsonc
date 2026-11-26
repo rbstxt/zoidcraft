@@ -1,0 +1,16 @@
+{
+  "name": "zoidcraft",
+  "compatibility_date": "2026-11-26",
+  "account_id": "06a22facf684f7266a7e1722c236cd18",
+  "assets": {
+    "directory": "./dist",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "single-page-application"
+  },
+  "routes": [
+    {
+      "pattern": "zoidcraft.1zworks.com",
+      "custom_domain": true
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#1d1d1d">
+    <title>ZoidCraft</title>
+    <link rel="icon" type="image/png" href="./icons/zoidcraft-256.png?v=__ZC_BUILD_ID__">
+    <style>
+        html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #1d1d1d; }
+        canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+        #loading { position: fixed; inset: 0; display: grid; place-content: center; padding: 24px;
+            text-align: center; background: #1d1d1d; color: #f2f2f2; font-family: system-ui, sans-serif; }
+        #loading[hidden] { display: none; }
+        #loading img { width: 72px; height: 72px; margin: 0 auto 16px; }
+        h1 { margin: 0; font-size: 1.5rem; font-weight: 600; }
+        p { max-width: 34rem; margin: 10px auto 0; color: #c0c0c0; font-size: .9rem; line-height: 1.5; }
+        #error { color: #ffb4a8; overflow-wrap: anywhere; }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "mp4box": "./vendor/mp4box.js?v=__ZC_BUILD_ID__",
+                "mp4-muxer": "./vendor/mp4-muxer.js?v=__ZC_BUILD_ID__",
+                "webm-muxer": "./vendor/webm-muxer.js?v=__ZC_BUILD_ID__",
+                "fflate": "./vendor/fflate.js?v=__ZC_BUILD_ID__"
+            }
+        }
+    </script>
+</head>
+<body>
+    <canvas id="zoidcraft_canvas" aria-label="ZoidCraft editor"></canvas>
+    <div id="loading" role="status">
+        <img src="./icons/zoidcraft-256.png?v=__ZC_BUILD_ID__" alt="">
+        <h1>ZoidCraft</h1>
+        <p id="status">Checking browser graphics and video support…</p>
+        <p id="error" hidden></p>
+        <noscript><p>Enable JavaScript to open the ZoidCraft editor.</p></noscript>
+    </div>
+    <script type="module">
+        const status = document.querySelector("#status");
+        const error = document.querySelector("#error");
+        const loading = document.querySelector("#loading");
+        const canvasId = "zoidcraft_canvas";
+        const version = "__ZC_BUILD_ID__";
+
+        function supportsWebGl2() {
+            try {
+                const context = document.createElement("canvas").getContext("webgl2");
+                context?.getExtension("WEBGL_lose_context")?.loseContext();
+                return !!context;
+            } catch {
+                return false;
+            }
+        }
+
+        try {
+            const webGl = supportsWebGl2();
+            if (!navigator.gpu && !webGl) {
+                throw new Error("This browser could not start WebGPU or WebGL2. Enable hardware acceleration and reload.");
+            }
+            await import(`./zc_web_runtime.js?v=${version}`);
+            const codecs = globalThis.__zcWebCodecs.isSupported() ? "WebCodecs available" : "WebCodecs unavailable";
+            const graphics = navigator.gpu ? "WebGPU" : "WebGL2";
+            status.textContent = `Starting ${graphics} · ${codecs}`;
+            const { default: init, start_zoidcraft_web } = await import(`./pkg/zoidcraft.js?v=${version}`);
+            await init({ module_or_path: `./pkg/zoidcraft_bg.wasm?v=${version}` });
+            try {
+                await start_zoidcraft_web(canvasId, !navigator.gpu);
+            } catch (gpuError) {
+                if (!navigator.gpu || !webGl) throw gpuError;
+                status.textContent = `Starting WebGL2 · ${codecs}`;
+                // Browsers only allow one type of graphics context per canvas.
+                const canvas = document.getElementById(canvasId);
+                canvas.replaceWith(canvas.cloneNode(false));
+                await start_zoidcraft_web(canvasId, true);
+            }
+            loading.hidden = true;
+        } catch (failure) {
+            status.textContent = "Could not start the editor.";
+            error.textContent = failure?.message ?? String(failure);
+            error.hidden = false;
+        }
+    </script>
+</body>
+</html>

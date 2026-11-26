@@ -19,7 +19,7 @@ pub use native::{
 pub use web::{
     VideoDecoderPool, VideoStreamSession, ffprobe_binary_available, probe_video_metadata,
     register_web_video_metadata, resolve_ffmpeg_binary_path, resolve_ffprobe_binary_path,
-    zc_webcodecs_get_video_frame,
+    web_video_frame_is_exact, zc_webcodecs_get_video_frame,
 };
 
 /// Maximum number of simultaneously active persistent `ffmpeg` decoder sessions (LRU evicted).

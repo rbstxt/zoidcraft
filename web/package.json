@@ -1,0 +1,17 @@
+{
+  "name": "zoidcraft-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test zc_web_runtime.test.js"
+  },
+  "dependencies": {
+    "fflate": "0.8.2",
+    "mp4-muxer": "5.2.2",
+    "mp4box": "2.3.0",
+    "webm-muxer": "5.1.4"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

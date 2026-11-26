@@ -1663,3 +1663,15 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
+
+## Web Edition JavaScript
+
+The static bundle includes the following modules. The build copies each full license
+and copyright notice into `web/dist/vendor/`.
+
+| Module | License | Source |
+| --- | --- | --- |
+| fflate | MIT | https://github.com/101arrowz/fflate |
+| mp4box.js | BSD-3-Clause | https://github.com/gpac/mp4box.js |
+| mp4-muxer | MIT | https://github.com/Vanilagy/mp4-muxer |
+| webm-muxer | MIT | https://github.com/Vanilagy/webm-muxer |

@@ -132,9 +132,11 @@ where
     write_fn(&mut writer)?;
     writer.flush()?;
 
-    let file = writer.into_inner().map_err(|err| err.into_error())?;
-    file.sync_all()?;
-    drop(file);
+    // Close the file before renaming it, including on Windows.
+    writer
+        .into_inner()
+        .map_err(|err| err.into_error())?
+        .sync_all()?;
 
     fs::rename(&tmp_path, target)?;
     guard.disarm();

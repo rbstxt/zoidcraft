@@ -10,7 +10,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
@@ -100,6 +102,7 @@ pub fn write_system_clipboard(ctx: &egui::Context, text: &str) -> bool {
 ///   (defeating `egui-winit`'s stale in-memory clipboard stub).
 /// - Drops `Event::Paste(CLIPBOARD_SENTINEL)` when the OS clipboard is empty.
 /// - Synthesizes `Event::Paste(os_text)` when `Cmd/Ctrl+V` arrives without an `Event::Paste`.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn bridge_raw_input_paste(
     raw_input: &mut egui::RawInput,
     read_os: &mut dyn FnMut() -> Option<String>,
@@ -153,6 +156,20 @@ pub fn bridge_raw_input_paste(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn bridge_web_paste(input: &mut egui::RawInput) {
+    let has_browser_paste = input
+        .events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Paste(_)));
+    if !has_browser_paste && input.events.iter().any(|event| matches!(
+        event,
+        egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. } if modifiers.command_only()
+    )) && let Some(text) = read_system_clipboard() {
+        input.events.push(egui::Event::Paste(text));
+    }
+}
+
 /// Mirrors `egui::OutputCommand::CopyText` (such as `Cmd+C`/`Cmd+X` inside any focused
 /// `TextEdit`) to the native OS clipboard, skipping [`CLIPBOARD_SENTINEL`] and any text
 /// already piped via [`write_system_clipboard`] during the same frame.
@@ -185,6 +202,10 @@ pub fn read_system_clipboard() -> Option<String> {
 
 /// Writes `text` directly to the OS system clipboard (without requiring an `egui::Context`).
 pub fn write_os_clipboard_raw(text: &str) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::web::call("__zcClipboard", "writeText", &[text.into()]).is_ok()
+    }
     #[cfg(target_os = "macos")]
     {
         pipe_to_command("pbcopy", &[], text)
@@ -204,6 +225,12 @@ pub fn write_os_clipboard_raw(text: &str) -> bool {
 /// Reads UTF-8 text directly from the OS system clipboard.
 #[must_use]
 pub fn read_os_clipboard_raw() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::web::call("__zcClipboard", "readText", &[])
+            .ok()?
+            .as_string()
+    }
     #[cfg(target_os = "macos")]
     {
         read_from_command("pbpaste", &[])
@@ -223,6 +250,7 @@ pub fn read_os_clipboard_raw() -> Option<String> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn pipe_to_command(program: &str, args: &[&str], text: &str) -> bool {
     let Ok(mut child) = Command::new(program)
         .args(args)
@@ -243,6 +271,7 @@ fn pipe_to_command(program: &str, args: &[&str], text: &str) -> bool {
     child.wait().is_ok_and(|s| s.success())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn read_from_command(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program)
         .args(args)

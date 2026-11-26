@@ -372,6 +372,10 @@ impl ProjectRenderEngine {
                 )
                 .ok()?
         };
+        #[cfg(target_arch = "wasm32")]
+        if !crate::video::web_video_frame_is_exact(base_hash, clamped_time, dec_w, dec_h) {
+            return Some(Arc::new(target));
+        }
         Some(self.insert_cached_texture(key, target))
     }
 

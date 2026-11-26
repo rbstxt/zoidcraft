@@ -368,14 +368,22 @@ pub enum ProjectAction {
 #[derive(Debug, Clone)]
 pub enum PanelAction {
     ImportMedia,
+    #[cfg(target_arch = "wasm32")]
+    RelinkWebAsset(String),
+    #[cfg(target_arch = "wasm32")]
+    ImportWebSvg(zc_project::Uuid),
     NewProject,
     StartExport(ExportSettings),
     AddToExportQueue(ExportSettings),
     RunExportQueue,
     CancelExport,
+    #[cfg(not(target_arch = "wasm32"))]
     OpenOutputFolder(PathBuf),
+    #[cfg(not(target_arch = "wasm32"))]
     SaveRecoverySnapshotNow,
+    #[cfg(not(target_arch = "wasm32"))]
     RestoreRecoverySnapshot(PathBuf),
+    #[cfg(not(target_arch = "wasm32"))]
     DeleteRecoverySnapshot(PathBuf),
     EyedropperActivate {
         target_id: String,

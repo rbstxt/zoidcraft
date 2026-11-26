@@ -5,8 +5,10 @@ use super::*;
 
 pub(crate) const TOAST_LIFETIME: Duration = Duration::from_secs(4);
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const MAX_RECOVERY_SNAPSHOTS: usize = 10;
 
 /// Key stored in `Sequence::preserved` inside `.zcraft` saves (stripped on `.pz` export) to
@@ -15,6 +17,7 @@ pub(crate) const ZOIDCRAFT_ENABLED_PLUGINS_KEY: &str = "zoidcraftEnabledPlugins"
 
 /// Assets larger than 8 MiB with a local file `url` are converted to lightweight external
 /// references inside periodic recovery snapshots so autosave never copies or gzips huge videos.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -25,7 +28,10 @@ pub(crate) const AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) enum PendingUnsavedAction {
     NewProject,
     OpenProject,
+    #[cfg(not(target_arch = "wasm32"))]
     OpenDroppedProject(PathBuf),
+    #[cfg(target_arch = "wasm32")]
+    OpenDroppedWebProject(web::File),
     CloseWindow,
 }
 
@@ -206,6 +212,7 @@ pub(crate) fn collect_disabled_required_plugins(session: &Session) -> Vec<String
 // Real Disk Autosave & Crash Recovery Helpers (Zero External Crates)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn default_recovery_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -239,6 +246,7 @@ pub(crate) fn default_recovery_dir() -> PathBuf {
     std::env::temp_dir().join("zoidcraft-recovery")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn parse_autosave_timestamp_secs(filename: &str, fallback_secs: u64) -> u64 {
     let Some(stem) = filename
         .strip_prefix("autosave-")
@@ -250,6 +258,7 @@ pub(crate) fn parse_autosave_timestamp_secs(filename: &str, fallback_secs: u64) 
     head.parse::<u64>().unwrap_or(fallback_secs)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn list_recovery_snapshots_in_dir(dir: &Path) -> Vec<RecoverySnapshotInfo> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -289,6 +298,7 @@ pub(crate) fn list_recovery_snapshots_in_dir(dir: &Path) -> Vec<RecoverySnapshot
     snapshots
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn save_recovery_snapshot_to_dir(
     project: &Project,
     dir: &Path,
@@ -326,6 +336,7 @@ pub(crate) fn save_recovery_snapshot_to_dir(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
@@ -347,6 +358,7 @@ pub(crate) fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
     false
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn validate_save_without_assets_target(
     current_file: Option<&Path>,
     target_path: &Path,
@@ -397,6 +409,7 @@ pub(crate) fn prepare_project_for_zcraft_save(session: &Session) -> Project {
 /// without copying or gzipping embedded assets larger than
 /// [`AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES`] when they already have a local `url`.
 /// Leaves `session.project` completely untouched.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn prepare_project_for_autosave(session: &Session) -> Project {
     let src = &session.project;
     let mut assets = BTreeMap::new();
@@ -618,7 +631,12 @@ impl ZoidCraftApp {
     pub(crate) fn perform_new_project(&mut self) {
         self.detach_active_export();
         self.pending_media_imports.clear();
-        self.pending_autosave = None;
+        #[cfg(target_arch = "wasm32")]
+        self.web.clear_pending();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.pending_autosave = None;
+        }
         if self.session.history.is_in_transaction() {
             let _ = self.session.cancel_transaction();
         }
@@ -664,6 +682,7 @@ impl ZoidCraftApp {
         self.perform_open_project();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn perform_open_project(&mut self) {
         self.pause_playback_for_modal_dialog();
         let chosen = rfd::FileDialog::new()
@@ -676,82 +695,104 @@ impl ZoidCraftApp {
         self.open_project_from_path(&path);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn open_project_from_path(&mut self, path: &Path) {
         let is_pz = path
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("pz"));
 
-        let plugins = self.session.plugins.clone();
         if is_pz {
-            match import_pz(path) {
-                Ok(imported) => {
-                    let warn_count = imported.warnings.len();
-                    let missing_plugins =
-                        plugins.missing_required_plugins(&imported.project.plugin_requirements);
-                    self.load_project_into_session(imported.project, None);
-                    if !missing_plugins.is_empty() {
-                        let missing_labels: Vec<&str> = missing_plugins
-                            .iter()
-                            .map(|id| plugins.get(id).map_or(id.as_str(), |p| p.name.as_str()))
-                            .collect();
-                        self.workspace.panels.plugin_notice = Some(format!(
-                            "Imported project references disabled plugins: {}",
-                            missing_labels.join(", ")
-                        ));
-                    }
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("project.pz");
-                    if warn_count > 0 {
-                        self.show_toast(format!(
-                            "Imported {name} ({warn_count} compatibility warning(s))"
-                        ));
-                    } else {
-                        self.show_toast(format!("Imported {name}"));
-                    }
-                }
-                Err(err) => self.show_toast(format!("Failed to import .pz: {err}")),
-            }
+            self.finish_open_pz(path, import_pz(path));
         } else {
-            match load_zcraft(path) {
-                Ok(project) => {
-                    self.load_project_into_session(project, Some(path.to_path_buf()));
-                    let missing_plugins = self
-                        .session
-                        .plugins
-                        .missing_required_plugins(&self.session.project.plugin_requirements);
-                    if !missing_plugins.is_empty() {
-                        let missing_labels: Vec<&str> = missing_plugins
-                            .iter()
-                            .map(|id| {
-                                self.session
-                                    .plugins
-                                    .get(id)
-                                    .map_or(id.as_str(), |p| p.name.as_str())
-                            })
-                            .collect();
-                        self.workspace.panels.plugin_notice = Some(format!(
-                            "Loaded project requires disabled plugins: {}",
-                            missing_labels.join(", ")
-                        ));
-                    }
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("project.zcraft");
-                    self.show_toast(format!("Opened {name}"));
+            self.finish_open_zcraft(path, load_zcraft(path));
+        }
+    }
+
+    pub(crate) fn finish_open_pz(
+        &mut self,
+        path: &Path,
+        result: Result<zc_project::PzImportResult, zc_project::ProjectError>,
+    ) {
+        let plugins = self.session.plugins.clone();
+        match result {
+            Ok(imported) => {
+                let warn_count = imported.warnings.len();
+                let missing_plugins =
+                    plugins.missing_required_plugins(&imported.project.plugin_requirements);
+                self.load_project_into_session(imported.project, None);
+                if !missing_plugins.is_empty() {
+                    let missing_labels: Vec<&str> = missing_plugins
+                        .iter()
+                        .map(|id| plugins.get(id).map_or(id.as_str(), |p| p.name.as_str()))
+                        .collect();
+                    self.workspace.panels.plugin_notice = Some(format!(
+                        "Imported project references disabled plugins: {}",
+                        missing_labels.join(", ")
+                    ));
                 }
-                Err(err) => self.show_toast(format!("Failed to open .zcraft: {err}")),
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("project.pz");
+                if warn_count > 0 {
+                    self.show_toast(format!(
+                        "Imported {name} ({warn_count} compatibility warning(s))"
+                    ));
+                } else {
+                    self.show_toast(format!("Imported {name}"));
+                }
             }
+            Err(err) => self.show_toast(format!("Failed to import .pz: {err}")),
+        }
+    }
+
+    pub(crate) fn finish_open_zcraft(
+        &mut self,
+        path: &Path,
+        result: Result<Project, zc_project::ProjectError>,
+    ) {
+        match result {
+            Ok(project) => {
+                self.load_project_into_session(project, Some(path.to_path_buf()));
+                let missing_plugins = self
+                    .session
+                    .plugins
+                    .missing_required_plugins(&self.session.project.plugin_requirements);
+                if !missing_plugins.is_empty() {
+                    let missing_labels: Vec<&str> = missing_plugins
+                        .iter()
+                        .map(|id| {
+                            self.session
+                                .plugins
+                                .get(id)
+                                .map_or(id.as_str(), |p| p.name.as_str())
+                        })
+                        .collect();
+                    self.workspace.panels.plugin_notice = Some(format!(
+                        "Loaded project requires disabled plugins: {}",
+                        missing_labels.join(", ")
+                    ));
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("project.zcraft");
+                self.show_toast(format!("Opened {name}"));
+            }
+            Err(err) => self.show_toast(format!("Failed to open .zcraft: {err}")),
         }
     }
 
     pub(crate) fn load_project_into_session(&mut self, project: Project, path: Option<PathBuf>) {
         self.detach_active_export();
         self.pending_media_imports.clear();
-        self.pending_autosave = None;
+        #[cfg(target_arch = "wasm32")]
+        self.web.clear_pending();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.pending_autosave = None;
+        }
         let mut plugins = self.session.plugins.clone();
         // Automatically re-enable safe built-in plugins recorded when this `.zcraft` was saved
         // so reopening a saved project renders identically without a false warning banner.
@@ -775,6 +816,8 @@ impl ZoidCraftApp {
         self.last_audio_epoch = self.session.playback.epoch_id;
         self.last_audio_frame = self.session.playback.current_frame;
         self.rebuild_audio_caches();
+        #[cfg(target_arch = "wasm32")]
+        self.register_web_project_videos();
         self.reset_ephemeral_ui_state();
         self.viewport.camera.reset();
         self.force_single_render = true;
@@ -804,6 +847,9 @@ impl ZoidCraftApp {
             } else {
                 format!("{base}-no-assets.zcraft")
             };
+            #[cfg(target_arch = "wasm32")]
+            let chosen = Some(PathBuf::from(default_name));
+            #[cfg(not(target_arch = "wasm32"))]
             let chosen = rfd::FileDialog::new()
                 .add_filter("ZoidCraft Project", &["zcraft"])
                 .set_file_name(default_name)
@@ -827,6 +873,7 @@ impl ZoidCraftApp {
             let _ = self.session.commit_transaction(true);
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         if !include_assets
             && let Err(msg) =
                 validate_save_without_assets_target(self.current_file.as_deref(), target_path)
@@ -849,7 +896,15 @@ impl ZoidCraftApp {
             }
         }
 
-        match save_zcraft(&project_to_save, target_path) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let result = save_zcraft(&project_to_save, target_path).map_err(|err| err.to_string());
+        #[cfg(target_arch = "wasm32")]
+        let result = web::download_project(
+            &project_to_save,
+            target_path,
+            zc_project::save_zcraft_to_bytes,
+        );
+        match result {
             Ok(()) => {
                 if include_assets {
                     self.current_file = Some(target_path.to_path_buf());
@@ -888,6 +943,9 @@ impl ZoidCraftApp {
         self.pause_playback_for_modal_dialog();
         let base = sanitize_filename(&self.session.document().project_name);
         let default_name = format!("{base}.pz");
+        #[cfg(target_arch = "wasm32")]
+        let chosen = Some(PathBuf::from(default_name));
+        #[cfg(not(target_arch = "wasm32"))]
         let chosen = rfd::FileDialog::new()
             .add_filter("Project Archive (.pz)", &["pz"])
             .set_file_name(default_name)
@@ -898,7 +956,15 @@ impl ZoidCraftApp {
         };
 
         let project_to_export = prepare_project_for_pz_export(&self.session);
-        match export_pz(&project_to_export, &target_path) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let result = export_pz(&project_to_export, &target_path).map_err(|err| err.to_string());
+        #[cfg(target_arch = "wasm32")]
+        let result = web::download_project(
+            &project_to_export,
+            &target_path,
+            zc_project::export_pz_to_bytes,
+        );
+        match result {
             Ok(()) => {
                 let name = target_path
                     .file_name()
@@ -914,11 +980,13 @@ impl ZoidCraftApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn refresh_recovery_snapshots(&mut self) {
         self.workspace.panels.recovery_snapshots =
             list_recovery_snapshots_in_dir(&self.recovery_dir);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn poll_pending_autosave(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.pending_autosave.as_ref() else {
             return;
@@ -942,6 +1010,7 @@ impl ZoidCraftApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn maybe_periodic_autosave(&mut self, ctx: &egui::Context) {
         self.poll_pending_autosave(ctx);
         if self.pending_autosave.is_some() {
@@ -986,6 +1055,7 @@ impl ZoidCraftApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn handle_save_recovery_snapshot_now(&mut self) {
         if self.session.history.is_in_transaction() {
             let _ = self.session.commit_transaction(true);
@@ -1008,6 +1078,7 @@ impl ZoidCraftApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn handle_restore_recovery_snapshot(&mut self, path: &Path) {
         match load_zcraft(path) {
             Ok(project) => {
@@ -1086,6 +1157,7 @@ impl ZoidCraftApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn handle_delete_recovery_snapshot(&mut self, path: &Path) {
         match fs::remove_file(path) {
             Ok(()) => {
@@ -1115,9 +1187,11 @@ impl ZoidCraftApp {
 
         let action_label = match &pending {
             PendingUnsavedAction::NewProject => "creating a new project",
-            PendingUnsavedAction::OpenProject | PendingUnsavedAction::OpenDroppedProject(_) => {
-                "opening another project"
-            }
+            PendingUnsavedAction::OpenProject => "opening another project",
+            #[cfg(not(target_arch = "wasm32"))]
+            PendingUnsavedAction::OpenDroppedProject(_) => "opening another project",
+            #[cfg(target_arch = "wasm32")]
+            PendingUnsavedAction::OpenDroppedWebProject(_) => "opening another project",
             PendingUnsavedAction::CloseWindow => "closing ZoidCraft",
         };
 
@@ -1269,8 +1343,13 @@ impl ZoidCraftApp {
                     match pending {
                         PendingUnsavedAction::NewProject => self.perform_new_project(),
                         PendingUnsavedAction::OpenProject => self.perform_open_project(),
+                        #[cfg(not(target_arch = "wasm32"))]
                         PendingUnsavedAction::OpenDroppedProject(path) => {
                             self.open_project_from_path(&path);
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        PendingUnsavedAction::OpenDroppedWebProject(file) => {
+                            self.open_web_project(file)
                         }
                         PendingUnsavedAction::CloseWindow => {
                             self.detach_active_export();
@@ -1288,8 +1367,13 @@ impl ZoidCraftApp {
                 match pending {
                     PendingUnsavedAction::NewProject => self.perform_new_project(),
                     PendingUnsavedAction::OpenProject => self.perform_open_project(),
+                    #[cfg(not(target_arch = "wasm32"))]
                     PendingUnsavedAction::OpenDroppedProject(path) => {
                         self.open_project_from_path(&path);
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    PendingUnsavedAction::OpenDroppedWebProject(file) => {
+                        self.open_web_project(file)
                     }
                     PendingUnsavedAction::CloseWindow => {
                         self.detach_active_export();
@@ -1561,6 +1645,7 @@ impl ZoidCraftApp {
             recovery_banner_extra_bottom_inset =
                 (banner_resp.response.rect.height() + 10.0).max(46.0);
             if restore_clicked {
+                #[cfg(not(target_arch = "wasm32"))]
                 self.handle_restore_recovery_snapshot(&snap.path);
             } else if dismiss_clicked {
                 self.startup_recovery_banner = None;
